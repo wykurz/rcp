@@ -14,18 +14,30 @@ async fn copy_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
 }
 
 #[async_recursion]
-pub async fn copy(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+pub async fn copy(src: &std::path::Path, dst: &std::path::Path, max_width: usize) -> Result<()> {
     if is_file(src).await? {
         return copy_file(src, dst).await;
     }
     tokio::fs::create_dir(dst).await?;
     let mut entries = tokio::fs::read_dir(src).await?;
+    let mut copies = vec![];
     while let Some(entry) = entries.next_entry().await? {
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
-        copy(&entry_path, &dst_path).await?;
+        let do_copy = || async move {
+            let entry_path = entry_path;
+            let dst_path = dst_path;
+            copy(&entry_path, &dst_path, max_width).await
+        };
+        copies.push(do_copy());
+        if copies.len() >= max_width {
+            let mut copy_now = vec![];
+            std::mem::swap(&mut copies, &mut copy_now);
+            futures::future::try_join_all(copy_now).await?;
+        }
     }
+    futures::future::try_join_all(copies).await?;
     Ok(())
 }
 
@@ -98,7 +110,7 @@ mod tests {
     async fn check_basic_copy() -> Result<()> {
         let tmp_dir = setup().await?;
         let test_path = tmp_dir.as_path();
-        copy(&test_path.join("foo"), &test_path.join("bar")).await?;
+        copy(&test_path.join("foo"), &test_path.join("bar"), 1).await?;
         check_dirs_identical(&test_path.join("foo"), &test_path.join("bar")).await?;
         Ok(())
     }

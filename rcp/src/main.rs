@@ -18,6 +18,10 @@ struct Args {
     /// Output file/directory
     #[structopt()]
     dst: String,
+
+    /// Maximum number of parallel file copies from within a single directory
+    #[structopt(short, long, default_value = "100000")]
+    max_width: usize,
 }
 
 #[tokio::main]
@@ -46,5 +50,5 @@ async fn main() -> Result<()> {
             ));
         }
     }
-    common::copy(&args.src, &dst).await
+    common::copy(&args.src, &dst, args.max_width).await
 }
