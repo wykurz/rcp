@@ -1,12 +1,13 @@
-[package]
-name = "rcp"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+members = [
+  "rcp",
+]
 
-[dependencies]
-anyhow = "1.0"
-async-recursion = "1.0.4"
-env_logger = "0.10"
-log = "0.4"
-structopt = "0.3"
-tokio = { version = "1.28", features = ["full", "parking_lot"] }
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+codegen-units = 8 # default 16
+debug = 1
+lto = "thin"
