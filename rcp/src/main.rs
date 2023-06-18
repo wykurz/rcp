@@ -1,7 +1,6 @@
 #[macro_use]
 extern crate log;
 
-use async_recursion::async_recursion;
 use anyhow::{Context, Result};
 use structopt::StructOpt;
 
@@ -19,34 +18,6 @@ struct Args {
     /// Output file/directory
     #[structopt()]
     dst: String,
-}
-
-async fn is_file(path: &std::path::Path) -> Result<bool> {
-    let md = tokio::fs::metadata(path).await?;
-    Ok(md.is_file())
-}
-
-async fn copy_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
-    let mut reader = tokio::fs::File::open(src).await?;
-    let mut writer = tokio::fs::File::create(dst).await?;
-    tokio::io::copy(&mut reader, &mut writer).await?;
-    Ok(())
-}
-
-#[async_recursion]
-async fn copy(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
-    if is_file(src).await? {
-        return copy_file(src, dst).await;
-    }
-    tokio::fs::create_dir(dst).await?;
-    let mut entries = tokio::fs::read_dir(src).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let entry_path = entry.path();
-        let entry_name = entry_path.file_name().unwrap();
-        let dst_path = dst.join(entry_name);
-        copy(&entry_path, &dst_path).await?;
-    }
-    Ok(())
 }
 
 #[tokio::main]
@@ -69,5 +40,5 @@ async fn main() -> Result<()> {
             return Err(anyhow::anyhow!("Destination {:?} already exists, use --overwrite to overwrite", dst));
         }
     }
-    copy(&args.src, &dst).await
+    common::copy(&args.src, &dst).await
 }

@@ -94,6 +94,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-recursion",
+ "log",
+ "tokio",
+]
+
+[[package]]
 name = "env_logger"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -326,7 +336,7 @@ name = "rcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-recursion",
+ "common",
  "env_logger",
  "log",
  "structopt",
