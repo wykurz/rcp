@@ -1,0 +1,10 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+async-recursion = "1.0.4"
+log = "0.4"
+tokio = { version = "1.28", features = ["full", "parking_lot"] }
