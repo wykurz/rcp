@@ -28,7 +28,10 @@ async fn main() -> Result<()> {
     let dst = if args.dst.ends_with('/') {
         // rcp foo bar/ -> copy foo to bar/foo
         let dst_dir = std::path::PathBuf::from(args.dst);
-        let src_file = args.src.file_name().context(format!("Source {:?} is not a file", args.src))?;
+        let src_file = args
+            .src
+            .file_name()
+            .context(format!("Source {:?} is not a file", args.src))?;
         dst_dir.join(src_file)
     } else {
         std::path::PathBuf::from(args.dst)
@@ -37,7 +40,10 @@ async fn main() -> Result<()> {
         if args.overwrite {
             tokio::fs::remove_dir_all(&dst).await?;
         } else {
-            return Err(anyhow::anyhow!("Destination {:?} already exists, use --overwrite to overwrite", dst));
+            return Err(anyhow::anyhow!(
+                "Destination {:?} already exists, use --overwrite to overwrite",
+                dst
+            ));
         }
     }
     common::copy(&args.src, &dst).await
