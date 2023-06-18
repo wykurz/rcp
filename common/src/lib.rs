@@ -33,10 +33,26 @@ pub async fn copy(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    async fn create_temp_dir() -> Result<std::path::PathBuf> {
+        let mut idx = 0;
+        loop {
+            let tmp_dir = std::env::temp_dir().join(format!("rcp_test{}", &idx));
+            if let Err(error) = tokio::fs::create_dir(&tmp_dir).await {
+                match error.kind() {
+                    std::io::ErrorKind::AlreadyExists => {
+                        idx += 1;
+                    }
+                    _ => return Err(error.into()),
+                }
+            } else {
+                return Ok(tmp_dir);
+            }
+        }
+    }
+
     async fn setup() -> Result<std::path::PathBuf> {
         // create a temporary directory
-        let tmp_dir = std::env::temp_dir().join("rcp_test");
-        tokio::fs::create_dir(&tmp_dir).await.unwrap();
+        let tmp_dir = create_temp_dir().await?;
         // foo
         // |- 0.txt
         // |- bar
