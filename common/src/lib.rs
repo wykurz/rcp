@@ -15,13 +15,20 @@ async fn copy_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
 
 #[async_recursion]
 pub async fn copy(src: &std::path::Path, dst: &std::path::Path, max_width: usize) -> Result<()> {
+    assert!(max_width > 0);
     if is_file(src).await? {
         return copy_file(src, dst).await;
     }
     tokio::fs::create_dir(dst).await?;
     let mut entries = tokio::fs::read_dir(src).await?;
-    let mut copies = vec![];
+    let mut join_set = tokio::task::JoinSet::new();
     while let Some(entry) = entries.next_entry().await? {
+        if join_set.len() >= max_width {
+            join_set
+                .join_next()
+                .await
+                .expect("JoinSet must not be empty here!")??;
+        }
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
@@ -30,14 +37,11 @@ pub async fn copy(src: &std::path::Path, dst: &std::path::Path, max_width: usize
             let dst_path = dst_path;
             copy(&entry_path, &dst_path, max_width).await
         };
-        copies.push(do_copy());
-        if copies.len() >= max_width {
-            let mut copy_now = vec![];
-            std::mem::swap(&mut copies, &mut copy_now);
-            futures::future::try_join_all(copy_now).await?;
-        }
+        join_set.spawn(do_copy());
     }
-    futures::future::try_join_all(copies).await?;
+    while let Some(res) = join_set.join_next().await {
+        res??
+    }
     Ok(())
 }
 
@@ -70,8 +74,10 @@ mod tests {
         // |- bar
         //    |- 1.txt
         //    |- 2.txt
-        // |- baz
         //    |- 3.txt
+        // |- baz
+        //    |- 4.txt
+        //    |- 5.txt
         let foo_path = tmp_dir.join("foo");
         tokio::fs::create_dir(&foo_path).await.unwrap();
         tokio::fs::write(foo_path.join("0.txt"), "0").await.unwrap();
@@ -79,9 +85,11 @@ mod tests {
         tokio::fs::create_dir(&bar_path).await.unwrap();
         tokio::fs::write(bar_path.join("1.txt"), "1").await.unwrap();
         tokio::fs::write(bar_path.join("2.txt"), "2").await.unwrap();
+        tokio::fs::write(bar_path.join("3.txt"), "3").await.unwrap();
         let baz_path = foo_path.join("baz");
         tokio::fs::create_dir(&baz_path).await.unwrap();
-        tokio::fs::write(baz_path.join("3.txt"), "3").await.unwrap();
+        tokio::fs::write(baz_path.join("4.txt"), "4").await.unwrap();
+        tokio::fs::write(baz_path.join("5.txt"), "5").await.unwrap();
         Ok(tmp_dir)
     }
 
