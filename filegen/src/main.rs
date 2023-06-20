@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
+use rand::Rng;
 use structopt::StructOpt;
 
 #[derive(Debug)]
@@ -54,7 +55,7 @@ async fn filegen(
     numfiles: usize,
     filesize: u64,
 ) -> Result<()> {
-    let numdirs = dirwidth.first().unwrap_or(&0).clone();
+    let numdirs = *dirwidth.first().unwrap_or(&0);
     let mut join_set = tokio::task::JoinSet::new();
     // generate directories and recurse into them
     for i in 0..numdirs {
@@ -71,8 +72,11 @@ async fn filegen(
     // generate files
     for i in 0..numfiles {
         let path = root.join(format!("file{}", i));
+        let mut rng = rand::thread_rng();
+        let mut bytes = vec![0u8; filesize as usize];
+        rng.fill(&mut bytes[..]);
         let create_file = || async move {
-            tokio::fs::write(path, "foo")
+            tokio::fs::write(path, &bytes)
                 .await
                 .map_err(anyhow::Error::msg)
         };
