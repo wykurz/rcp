@@ -32,11 +32,7 @@ pub async fn copy(src: &std::path::Path, dst: &std::path::Path, max_width: usize
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
-        let do_copy = || async move {
-            let entry_path = entry_path;
-            let dst_path = dst_path;
-            copy(&entry_path, &dst_path, max_width).await
-        };
+        let do_copy = || async move { copy(&entry_path, &dst_path, max_width).await };
         join_set.spawn(do_copy());
     }
     while let Some(res) = join_set.join_next().await {
