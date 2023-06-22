@@ -42,7 +42,12 @@ async fn main() -> Result<()> {
     };
     if dst.exists() {
         if args.overwrite {
-            tokio::fs::remove_dir_all(&dst).await?;
+            // TODO: is this the right behavior?
+            if tokio::fs::metadata(&dst).await?.is_file() {
+                tokio::fs::remove_file(&dst).await?;
+            } else {
+                tokio::fs::remove_dir_all(&dst).await?;
+            }
         } else {
             return Err(anyhow::anyhow!(
                 "Destination {:?} already exists, use --overwrite to overwrite",

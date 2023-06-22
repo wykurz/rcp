@@ -1,3 +1,5 @@
+#[macro_use]
+extern crate log;
 use anyhow::Result;
 use async_recursion::async_recursion;
 
@@ -12,7 +14,7 @@ async fn copy_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
         Err(error) => {
             // ignore permission denied on READ errors
             if error.kind() == std::io::ErrorKind::PermissionDenied {
-                println!(
+                warn!(
                     "rcp: cannot open '{}' for reading: Permission denied",
                     src.display()
                 );
@@ -57,7 +59,9 @@ pub async fn copy(src: &std::path::Path, dst: &std::path::Path, max_width: usize
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
     use std::os::unix::prelude::PermissionsExt;
+    use test_log::test;
 
     use super::*;
 
@@ -112,8 +116,13 @@ mod tests {
             let src_entry_path = src_entry.path();
             let src_entry_name = src_entry_path.file_name().unwrap();
             let dst_entry_path = dst.join(src_entry_name);
-            let src_md = tokio::fs::metadata(&src_entry_path).await?;
-            let dst_md = tokio::fs::metadata(&dst_entry_path).await?;
+            let src_md = tokio::fs::metadata(&src_entry_path)
+                .await
+                .context(format!("Source file {:?} is missing!", &src_entry_path))?;
+            let dst_md = tokio::fs::metadata(&dst_entry_path).await.context(format!(
+                "Destination file {:?} is missing!",
+                &dst_entry_path
+            ))?;
             assert_eq!(src_md.is_file(), dst_md.is_file());
             if src_md.is_file() {
                 let src_contents = tokio::fs::read_to_string(&src_entry_path).await?;
@@ -135,18 +144,34 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn no_read_permission() -> Result<()> {
         let tmp_dir = setup().await?;
         let test_path = tmp_dir.as_path();
-        let filepath = test_path.join("foo").join("0.txt");
-        // change file permissions to not readable
-        tokio::fs::set_permissions(&filepath, std::fs::Permissions::from_mode(0o000)).await?;
-        copy(&test_path.join("foo"), &test_path.join("bar"), 1).await?;
-        // check foo/0.txt was NOT copied
-        assert!(tokio::fs::metadata(&test_path.join("bar").join("0.txt"))
+        let filepaths = vec![
+            test_path.join("foo").join("0.txt"),
+            test_path.join("foo").join("baz"),
+        ];
+        for fpath in &filepaths {
+            // change file permissions to not readable
+            tokio::fs::set_permissions(&fpath, std::fs::Permissions::from_mode(0o000)).await?;
+        }
+        if copy(&test_path.join("foo"), &test_path.join("bar"), 1)
             .await
-            .is_err());
+            .is_ok()
+        {
+            panic!("Expected the copy to error!");
+        }
+        // make source directory same as what we expect destination to be
+        for fpath in &filepaths {
+            tokio::fs::set_permissions(&fpath, std::fs::Permissions::from_mode(0o700)).await?;
+            if tokio::fs::metadata(fpath).await?.is_file() {
+                tokio::fs::remove_file(fpath).await?;
+            } else {
+                tokio::fs::remove_dir_all(fpath).await?;
+            }
+        }
+        check_dirs_identical(&test_path.join("foo"), &test_path.join("bar")).await?;
         Ok(())
     }
 }
