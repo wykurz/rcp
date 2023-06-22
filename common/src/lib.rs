@@ -13,10 +13,10 @@ async fn is_file(path: &std::path::Path) -> Result<bool> {
 async fn copy_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     let mut reader = tokio::fs::File::open(src)
         .await
-        .with_context(|| format!("rcp: cannot open '{:?}' for reading", src))?;
+        .with_context(|| format!("rcp: cannot open {:?} for reading", src))?;
     let mut writer = tokio::fs::File::create(dst)
         .await
-        .with_context(|| format!("rcp: cannot open '{:?}' for writing", dst))?;
+        .with_context(|| format!("rcp: cannot open {:?} for writing", dst))?;
     tokio::io::copy(&mut reader, &mut writer).await?;
     Ok(())
 }
@@ -30,10 +30,10 @@ pub async fn copy(src: &std::path::Path, dst: &std::path::Path, max_width: usize
     }
     let mut entries = tokio::fs::read_dir(src)
         .await
-        .with_context(|| format!("rcp: cannot open directory '{:?}' for reading", src))?;
+        .with_context(|| format!("rcp: cannot open directory {:?} for reading", src))?;
     tokio::fs::create_dir(dst)
         .await
-        .with_context(|| format!("rcp: cannot create directory '{:?}'", dst))?;
+        .with_context(|| format!("rcp: cannot create directory {:?}", dst))?;
     let mut join_set = tokio::task::JoinSet::new();
     let mut errors = vec![];
     while let Some(entry) = entries.next_entry().await? {
