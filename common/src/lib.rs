@@ -1,6 +1,8 @@
 #[macro_use]
 extern crate log;
-use anyhow::Result;
+use std::vec;
+
+use anyhow::{Context, Result};
 use async_recursion::async_recursion;
 
 async fn is_file(path: &std::path::Path) -> Result<bool> {
@@ -9,55 +11,40 @@ async fn is_file(path: &std::path::Path) -> Result<bool> {
 }
 
 async fn copy_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
-    let mut reader = match tokio::fs::File::open(src).await {
-        Ok(reader) => reader,
-        Err(error) => {
-            // ignore permission denied on READ errors
-            if error.kind() == std::io::ErrorKind::PermissionDenied {
-                warn!(
-                    "rcp: cannot open '{}' for reading: Permission denied",
-                    src.display()
-                );
-                return Ok(());
-            } else {
-                return Err(error.into());
-            }
-        }
-    };
-    let mut writer = tokio::fs::File::create(dst).await?;
+    let mut reader = tokio::fs::File::open(src)
+        .await
+        .with_context(|| format!("rcp: cannot open '{:?}' for reading", src))?;
+    let mut writer = tokio::fs::File::create(dst)
+        .await
+        .with_context(|| format!("rcp: cannot open '{:?}' for writing", dst))?;
     tokio::io::copy(&mut reader, &mut writer).await?;
     Ok(())
 }
 
 #[async_recursion]
 pub async fn copy(src: &std::path::Path, dst: &std::path::Path, max_width: usize) -> Result<()> {
+    debug!("copy: {:?} -> {:?}", src, dst);
     assert!(max_width > 0);
     if is_file(src).await? {
         return copy_file(src, dst).await;
     }
-    let mut entries = match tokio::fs::read_dir(src).await {
-        Ok(entries) => entries,
-        Err(error) => {
-            // ignore permission denied on READ errors
-            if error.kind() == std::io::ErrorKind::PermissionDenied {
-                warn!(
-                    "rcp: cannot open '{}' for reading: Permission denied",
-                    src.display()
-                );
-                return Ok(());
-            } else {
-                return Err(error.into());
-            }
-        }
-    };
-    tokio::fs::create_dir(dst).await?;
+    let mut entries = tokio::fs::read_dir(src)
+        .await
+        .with_context(|| format!("rcp: cannot open directory '{:?}' for reading", src))?;
+    tokio::fs::create_dir(dst)
+        .await
+        .with_context(|| format!("rcp: cannot create directory '{:?}'", dst))?;
     let mut join_set = tokio::task::JoinSet::new();
+    let mut errors = vec![];
     while let Some(entry) = entries.next_entry().await? {
         if join_set.len() >= max_width {
-            join_set
+            if let Err(error) = join_set
                 .join_next()
                 .await
-                .expect("JoinSet must not be empty here!")??;
+                .expect("JoinSet must not be empty here!")?
+            {
+                errors.push(error);
+            }
         }
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
@@ -66,8 +53,15 @@ pub async fn copy(src: &std::path::Path, dst: &std::path::Path, max_width: usize
         join_set.spawn(do_copy());
     }
     while let Some(res) = join_set.join_next().await {
-        res??
+        if let Err(error) = res? {
+            errors.push(error);
+        }
     }
+    if !errors.is_empty() {
+        debug!("copy: {:?} -> {:?} failed with: {:?}", src, dst, &errors);
+        return Err(anyhow::anyhow!("{:?}", &errors));
+    }
+    debug!("copy: {:?} -> {:?} succeeded!", src, dst);
     Ok(())
 }
 
@@ -170,11 +164,11 @@ mod tests {
             // change file permissions to not readable
             tokio::fs::set_permissions(&fpath, std::fs::Permissions::from_mode(0o000)).await?;
         }
-        if copy(&test_path.join("foo"), &test_path.join("bar"), 1)
-            .await
-            .is_ok()
-        {
-            panic!("Expected the copy to error!");
+        match copy(&test_path.join("foo"), &test_path.join("bar"), 1).await {
+            Ok(_) => panic!("Expected the copy to error!"),
+            Err(error) => {
+                info!("{}", &error);
+            }
         }
         // make source directory same as what we expect destination to be
         for fpath in &filepaths {
