@@ -35,8 +35,22 @@ pub async fn copy(src: &std::path::Path, dst: &std::path::Path, max_width: usize
     if is_file(src).await? {
         return copy_file(src, dst).await;
     }
+    let mut entries = match tokio::fs::read_dir(src).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            // ignore permission denied on READ errors
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                warn!(
+                    "rcp: cannot open '{}' for reading: Permission denied",
+                    src.display()
+                );
+                return Ok(());
+            } else {
+                return Err(error.into());
+            }
+        }
+    };
     tokio::fs::create_dir(dst).await?;
-    let mut entries = tokio::fs::read_dir(src).await?;
     let mut join_set = tokio::task::JoinSet::new();
     while let Some(entry) = entries.next_entry().await? {
         if join_set.len() >= max_width {
