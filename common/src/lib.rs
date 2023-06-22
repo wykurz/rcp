@@ -7,7 +7,21 @@ async fn is_file(path: &std::path::Path) -> Result<bool> {
 }
 
 async fn copy_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
-    let mut reader = tokio::fs::File::open(src).await?;
+    let mut reader = match tokio::fs::File::open(src).await {
+        Ok(reader) => reader,
+        Err(error) => {
+            // ignore permission denied on READ errors
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                println!(
+                    "rcp: cannot open '{}' for reading: Permission denied",
+                    src.display()
+                );
+                return Ok(());
+            } else {
+                return Err(error.into());
+            }
+        }
+    };
     let mut writer = tokio::fs::File::create(dst).await?;
     tokio::io::copy(&mut reader, &mut writer).await?;
     Ok(())
@@ -43,6 +57,8 @@ pub async fn copy(src: &std::path::Path, dst: &std::path::Path, max_width: usize
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::prelude::PermissionsExt;
+
     use super::*;
 
     async fn create_temp_dir() -> Result<std::path::PathBuf> {
@@ -116,6 +132,21 @@ mod tests {
         let test_path = tmp_dir.as_path();
         copy(&test_path.join("foo"), &test_path.join("bar"), 1).await?;
         check_dirs_identical(&test_path.join("foo"), &test_path.join("bar")).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_read_permission() -> Result<()> {
+        let tmp_dir = setup().await?;
+        let test_path = tmp_dir.as_path();
+        let filepath = test_path.join("foo").join("0.txt");
+        // change file permissions to not readable
+        tokio::fs::set_permissions(&filepath, std::fs::Permissions::from_mode(0o000)).await?;
+        copy(&test_path.join("foo"), &test_path.join("bar"), 1).await?;
+        // check foo/0.txt was NOT copied
+        assert!(tokio::fs::metadata(&test_path.join("bar").join("0.txt"))
+            .await
+            .is_err());
         Ok(())
     }
 }
