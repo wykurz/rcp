@@ -152,8 +152,7 @@ mod tests {
         Ok(())
     }
 
-    #[test(tokio::test)]
-    async fn no_read_permission() -> Result<()> {
+    async fn no_read_permission(max_width: usize) -> Result<()> {
         let tmp_dir = setup().await?;
         let test_path = tmp_dir.as_path();
         let filepaths = vec![
@@ -164,7 +163,7 @@ mod tests {
             // change file permissions to not readable
             tokio::fs::set_permissions(&fpath, std::fs::Permissions::from_mode(0o000)).await?;
         }
-        match copy(&test_path.join("foo"), &test_path.join("bar"), 1).await {
+        match copy(&test_path.join("foo"), &test_path.join("bar"), max_width).await {
             Ok(_) => panic!("Expected the copy to error!"),
             Err(error) => {
                 info!("{}", &error);
@@ -181,5 +180,21 @@ mod tests {
         }
         check_dirs_identical(&test_path.join("foo"), &test_path.join("bar")).await?;
         Ok(())
+    }
+
+    // parametrize the tests to run with different max_width values
+    #[test(tokio::test)]
+    async fn no_read_permission_1() -> Result<()> {
+        no_read_permission(1).await
+    }
+
+    #[test(tokio::test)]
+    async fn no_read_permission_2() -> Result<()> {
+        no_read_permission(2).await
+    }
+
+    #[test(tokio::test)]
+    async fn no_read_permission_10() -> Result<()> {
+        no_read_permission(10).await
     }
 }
