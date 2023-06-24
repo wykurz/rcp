@@ -5,11 +5,6 @@ use std::vec;
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
 
-async fn is_file(path: &std::path::Path) -> Result<bool> {
-    let md = tokio::fs::metadata(path).await?;
-    Ok(md.is_file())
-}
-
 async fn copy_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     let mut reader = tokio::fs::File::open(src)
         .await
@@ -25,9 +20,15 @@ async fn copy_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
 pub async fn copy(src: &std::path::Path, dst: &std::path::Path, max_width: usize) -> Result<()> {
     debug!("copy: {:?} -> {:?}", src, dst);
     assert!(max_width > 0);
-    if is_file(src).await? {
+    let metadata = tokio::fs::symlink_metadata(src).await?;
+    if metadata.is_file() {
         return copy_file(src, dst).await;
+    } else if metadata.is_symlink() {
+        let link = tokio::fs::read_link(src).await?;
+        tokio::fs::symlink(link, dst).await?;
+        return Ok(());
     }
+    assert!(metadata.is_dir());
     let mut entries = tokio::fs::read_dir(src)
         .await
         .with_context(|| format!("rcp: cannot open directory {:?} for reading", src))?;
@@ -102,6 +103,7 @@ mod tests {
         // |- baz
         //    |- 4.txt
         //    |- 5.txt
+        //    |- 6.txt -> ../bar/3.txt
         let foo_path = tmp_dir.join("foo");
         tokio::fs::create_dir(&foo_path).await.unwrap();
         tokio::fs::write(foo_path.join("0.txt"), "0").await.unwrap();
@@ -113,7 +115,12 @@ mod tests {
         let baz_path = foo_path.join("baz");
         tokio::fs::create_dir(&baz_path).await.unwrap();
         tokio::fs::write(baz_path.join("4.txt"), "4").await.unwrap();
-        tokio::fs::write(baz_path.join("5.txt"), "5").await.unwrap();
+        tokio::fs::symlink("../bar/2.txt", baz_path.join("5.txt"))
+            .await
+            .unwrap();
+        tokio::fs::symlink(bar_path.join("3.txt"), baz_path.join("6.txt"))
+            .await
+            .unwrap();
         Ok(tmp_dir)
     }
 
@@ -124,18 +131,24 @@ mod tests {
             let src_entry_path = src_entry.path();
             let src_entry_name = src_entry_path.file_name().unwrap();
             let dst_entry_path = dst.join(src_entry_name);
-            let src_md = tokio::fs::metadata(&src_entry_path)
+            let src_md = tokio::fs::symlink_metadata(&src_entry_path)
                 .await
                 .context(format!("Source file {:?} is missing!", &src_entry_path))?;
-            let dst_md = tokio::fs::metadata(&dst_entry_path).await.context(format!(
-                "Destination file {:?} is missing!",
-                &dst_entry_path
-            ))?;
-            assert_eq!(src_md.is_file(), dst_md.is_file());
+            let dst_md = tokio::fs::symlink_metadata(&dst_entry_path)
+                .await
+                .context(format!(
+                    "Destination file {:?} is missing!",
+                    &dst_entry_path
+                ))?;
+            assert_eq!(src_md.file_type(), dst_md.file_type());
             if src_md.is_file() {
                 let src_contents = tokio::fs::read_to_string(&src_entry_path).await?;
                 let dst_contents = tokio::fs::read_to_string(&dst_entry_path).await?;
                 assert_eq!(src_contents, dst_contents);
+            } else if src_md.file_type().is_symlink() {
+                let src_link = tokio::fs::read_link(&src_entry_path).await?;
+                let dst_link = tokio::fs::read_link(&dst_entry_path).await?;
+                assert_eq!(src_link, dst_link);
             } else {
                 check_dirs_identical(&src_entry_path, &dst_entry_path).await?;
             }
