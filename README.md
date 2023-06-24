@@ -1,4 +1,4 @@
-![CI](https://github.com/wykurz/rcp/actions/workflows/rust.yml/badge.svg)
+[![Build status](https://github.com/wykurz/rcp/actions/workflows/rust.yml/badge.svg)](https://github.com/wykurz/rcp/actions)
 
 - https://mpifileutils.readthedocs.io/en/v0.11.1/dsync.1.html
 - https://github.com/wtsi-ssg/pcp
