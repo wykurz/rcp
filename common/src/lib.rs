@@ -185,7 +185,7 @@ mod tests {
         // make source directory same as what we expect destination to be
         for fpath in &filepaths {
             tokio::fs::set_permissions(&fpath, std::fs::Permissions::from_mode(0o700)).await?;
-            if tokio::fs::metadata(fpath).await?.is_file() {
+            if tokio::fs::symlink_metadata(fpath).await?.is_file() {
                 tokio::fs::remove_file(fpath).await?;
             } else {
                 tokio::fs::remove_dir_all(fpath).await?;
