@@ -1,5 +1,6 @@
 #[macro_use]
 extern crate log;
+use std::os::unix::prelude::PermissionsExt;
 use std::vec;
 
 use anyhow::{Context, Result};
@@ -13,6 +14,10 @@ async fn copy_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
         .await
         .with_context(|| format!("rcp: cannot open {:?} for writing", dst))?;
     tokio::io::copy(&mut reader, &mut writer).await?;
+    let src_permissions = reader.metadata().await?.permissions();
+    // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
+    let permissions = std::fs::Permissions::from_mode(src_permissions.mode() & 0o0777);
+    tokio::fs::set_permissions(dst, permissions).await?;
     Ok(())
 }
 
@@ -69,7 +74,6 @@ pub async fn copy(src: &std::path::Path, dst: &std::path::Path, max_width: usize
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use std::os::unix::prelude::PermissionsExt;
     use test_log::test;
 
     use super::*;
@@ -102,8 +106,8 @@ mod tests {
         //    |- 3.txt
         // |- baz
         //    |- 4.txt
-        //    |- 5.txt
-        //    |- 6.txt -> ../bar/3.txt
+        //    |- 5.txt -> ../bar/2.txt
+        //    |- 6.txt -> (absolute path) .../foo/bar/3.txt
         let foo_path = tmp_dir.join("foo");
         tokio::fs::create_dir(&foo_path).await.unwrap();
         tokio::fs::write(foo_path.join("0.txt"), "0").await.unwrap();
@@ -141,6 +145,7 @@ mod tests {
                     &dst_entry_path
                 ))?;
             assert_eq!(src_md.file_type(), dst_md.file_type());
+            assert_eq!(src_md.permissions(), dst_md.permissions());
             if src_md.is_file() {
                 let src_contents = tokio::fs::read_to_string(&src_entry_path).await?;
                 let dst_contents = tokio::fs::read_to_string(&dst_entry_path).await?;
@@ -209,5 +214,35 @@ mod tests {
     #[test(tokio::test)]
     async fn no_read_permission_10() -> Result<()> {
         no_read_permission(10).await
+    }
+
+    #[test(tokio::test)]
+    async fn check_default_mode() -> Result<()> {
+        let tmp_dir = setup().await?;
+        // set file to executable
+        tokio::fs::set_permissions(
+            tmp_dir.join("foo").join("0.txt"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .await?;
+        // set file executable AND also set sticky bit, setuid and setgid
+        let exec_sticky_file = tmp_dir.join("foo").join("bar").join("1.txt");
+        tokio::fs::set_permissions(&exec_sticky_file, std::fs::Permissions::from_mode(0o3770))
+            .await?;
+        let test_path = tmp_dir.as_path();
+        copy(&test_path.join("foo"), &test_path.join("bar"), 1).await?;
+        // clear the setuid, setgid and sticky bit for comparison
+        tokio::fs::set_permissions(
+            &exec_sticky_file,
+            std::fs::Permissions::from_mode(
+                std::fs::symlink_metadata(&exec_sticky_file)?
+                    .permissions()
+                    .mode()
+                    & 0o0777,
+            ),
+        )
+        .await?;
+        check_dirs_identical(&test_path.join("foo"), &test_path.join("bar")).await?;
+        Ok(())
     }
 }
