@@ -19,7 +19,7 @@ struct Args {
     #[structopt()]
     dst: String,
 
-    /// Maximum number of parallel file copies from within a single directory
+    /// Maximum number of parallel file copies from within a single directory, 0 means unlimited
     #[structopt(short, long, default_value = "100000")]
     max_width: usize,
 }
@@ -55,5 +55,10 @@ async fn main() -> Result<()> {
             ));
         }
     }
-    common::copy(&args.src, &dst, args.max_width).await
+    let max_width = if args.max_width == 0 {
+        usize::MAX
+    } else {
+        args.max_width
+    };
+    common::copy(&args.src, &dst, max_width).await
 }
