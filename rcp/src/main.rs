@@ -11,6 +11,10 @@ struct Args {
     #[structopt(short, long)]
     overwrite: bool,
 
+    /// Shwo progress
+    #[structopt(short, long)]
+    progress: bool,
+
     /// Input file/directory
     #[structopt(parse(from_os_str))]
     src: std::path::PathBuf,
@@ -60,5 +64,5 @@ async fn main() -> Result<()> {
     } else {
         args.max_width
     };
-    common::copy(&args.src, &dst, max_width).await
+    common::copy(args.progress, &args.src, &dst, max_width).await
 }
