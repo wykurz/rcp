@@ -5,14 +5,15 @@ use std::vec;
 
 use crate::progress;
 
-async fn copy_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+async fn copy_file(src: &std::path::Path, dst: &std::path::Path, read_buffer: usize) -> Result<()> {
     let mut reader = tokio::fs::File::open(src)
         .await
         .with_context(|| format!("rcp: cannot open {:?} for reading", src))?;
+    let mut buf_reader = tokio::io::BufReader::with_capacity(read_buffer, &mut reader);
     let mut writer = tokio::fs::File::create(dst)
         .await
         .with_context(|| format!("rcp: cannot open {:?} for writing", dst))?;
-    tokio::io::copy(&mut reader, &mut writer).await?;
+    tokio::io::copy_buf(&mut buf_reader, &mut writer).await?;
     let src_permissions = reader.metadata().await?.permissions();
     // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
     let permissions = std::fs::Permissions::from_mode(src_permissions.mode() & 0o0777);
@@ -26,13 +27,14 @@ pub async fn copy(
     src: &std::path::Path,
     dst: &std::path::Path,
     max_width: usize,
+    read_buffer: usize,
 ) -> Result<()> {
     debug!("copy: {:?} -> {:?}", src, dst);
     assert!(max_width > 0);
     let _guard = prog_track.guard();
     let metadata = tokio::fs::symlink_metadata(src).await?;
     if metadata.is_file() {
-        return copy_file(src, dst).await;
+        return copy_file(src, dst, read_buffer).await;
     } else if metadata.is_symlink() {
         let link = tokio::fs::read_link(src).await?;
         tokio::fs::symlink(link, dst).await?;
@@ -60,7 +62,9 @@ pub async fn copy(
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
-        let do_copy = || async move { copy(prog_track, &entry_path, &dst_path, max_width).await };
+        let do_copy = || async move {
+            copy(prog_track, &entry_path, &dst_path, max_width, read_buffer).await
+        };
         join_set.spawn(do_copy());
     }
     while let Some(res) = join_set.join_next().await {
@@ -174,7 +178,14 @@ mod tests {
     async fn check_basic_copy() -> Result<()> {
         let tmp_dir = setup().await?;
         let test_path = tmp_dir.as_path();
-        copy(&PROGRESS, &test_path.join("foo"), &test_path.join("bar"), 1).await?;
+        copy(
+            &PROGRESS,
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            1,
+            10,
+        )
+        .await?;
         check_dirs_identical(&test_path.join("foo"), &test_path.join("bar")).await?;
         Ok(())
     }
@@ -194,6 +205,7 @@ mod tests {
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
+            5,
             max_width,
         )
         .await
@@ -246,7 +258,14 @@ mod tests {
         tokio::fs::set_permissions(&exec_sticky_file, std::fs::Permissions::from_mode(0o3770))
             .await?;
         let test_path = tmp_dir.as_path();
-        copy(&PROGRESS, &test_path.join("foo"), &test_path.join("bar"), 1).await?;
+        copy(
+            &PROGRESS,
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            1,
+            7,
+        )
+        .await?;
         // clear the setuid, setgid and sticky bit for comparison
         tokio::fs::set_permissions(
             &exec_sticky_file,

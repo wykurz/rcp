@@ -24,8 +24,12 @@ struct Args {
     dst: String,
 
     /// Maximum number of parallel file copies from within a single directory, 0 means unlimited
-    #[structopt(short, long, default_value = "100000")]
+    #[structopt(long, default_value = "100000")]
     max_width: usize,
+
+    /// File copy read buffer size
+    #[structopt(long, default_value = "128KiB")]
+    read_buffer: String,
 }
 
 #[tokio::main]
@@ -64,5 +68,10 @@ async fn main() -> Result<()> {
     } else {
         args.max_width
     };
-    common::copy(args.progress, &args.src, &dst, max_width).await
+    let read_buffer = args
+        .read_buffer
+        .parse::<bytesize::ByteSize>()
+        .unwrap()
+        .as_u64() as usize;
+    common::copy(args.progress, &args.src, &dst, max_width, read_buffer).await
 }

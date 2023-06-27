@@ -1,4 +1,5 @@
 pub struct TlsCounter {
+    // mutex is used primarily from one thread, so it's not a bottleneck
     count: thread_local::ThreadLocal<std::sync::Mutex<u64>>,
 }
 
