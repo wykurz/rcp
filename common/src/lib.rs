@@ -5,6 +5,7 @@ extern crate lazy_static;
 extern crate log;
 
 use anyhow::Result;
+use std::fmt::Write;
 
 mod copy;
 mod progress;
@@ -26,6 +27,11 @@ pub async fn copy(
             return;
         }
         let pbar = indicatif::ProgressBar::new(0);
+        pbar.set_style(indicatif::ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {items}/{total_items} ({eta})")
+            .unwrap()
+            .with_key("eta", |state: &indicatif::ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
+            .progress_chars("#>-"));
         loop {
             if done_clone.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
