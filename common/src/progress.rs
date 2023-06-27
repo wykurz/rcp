@@ -64,12 +64,12 @@ impl TlsProgress {
             started: self.started.get(),
             finished: self.finished.get(),
         };
-        if status.started > status.finished {
+        if status.finished > status.started {
             debug!(
                 "Progress inversion - started: {}, finished {}",
                 status.started, status.finished
             );
-            status.finished = status.started;
+            status.started = status.finished;
         }
         status
     }

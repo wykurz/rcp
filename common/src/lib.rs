@@ -5,7 +5,6 @@ extern crate lazy_static;
 extern crate log;
 
 use anyhow::Result;
-use std::fmt::Write;
 
 mod copy;
 mod progress;
@@ -26,19 +25,31 @@ pub async fn copy(
         if !show_progress {
             return;
         }
-        let pbar = indicatif::ProgressBar::new(0);
-        pbar.set_style(indicatif::ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {items}/{total_items} ({eta})")
-            .unwrap()
-            .with_key("eta", |state: &indicatif::ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
-            .progress_chars("#>-"));
+        let pbar = indicatif::ProgressBar::new_spinner();
+        pbar.set_style(
+            indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        );
+        let time_started = std::time::Instant::now();
+        let mut last_update = time_started;
         loop {
             if done_clone.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
             let progress_status = PROGRESS.get();
-            pbar.set_length(progress_status.started);
-            pbar.set_position(progress_status.finished);
+            let time_now = std::time::Instant::now();
+            let finished = progress_status.finished;
+            let copying = progress_status.started - progress_status.finished;
+            let avarage_rate = finished as f64 / time_started.elapsed().as_secs_f64();
+            let current_rate =
+                (finished - pbar.position()) as f64 / (time_now - last_update).as_secs_f64();
+            pbar.set_position(finished);
+            pbar.set_message(format!(
+                "done: {} | copying: {} | average: {:.2} items/s | current: {:.2} items/s",
+                finished, copying, avarage_rate, current_rate
+            ));
+            last_update = time_now;
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
     });
