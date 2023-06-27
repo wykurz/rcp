@@ -11,7 +11,7 @@ struct Args {
     #[structopt(short, long)]
     overwrite: bool,
 
-    /// Shwo progress
+    /// Show progress
     #[structopt(short, long)]
     progress: bool,
 
