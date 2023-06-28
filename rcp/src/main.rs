@@ -15,6 +15,10 @@ struct Args {
     #[structopt(short, long)]
     progress: bool,
 
+    /// Preserve additional file attributes: file owner, group and setuid and setgid bits
+    #[structopt(short, long)]
+    preserve: bool,
+
     /// Input file/directory
     #[structopt(parse(from_os_str))]
     src: std::path::PathBuf,
@@ -73,5 +77,13 @@ async fn main() -> Result<()> {
         .parse::<bytesize::ByteSize>()
         .unwrap()
         .as_u64() as usize;
-    common::copy(args.progress, &args.src, &dst, max_width, read_buffer).await
+    common::copy(
+        args.progress,
+        &args.src,
+        &dst,
+        args.preserve,
+        max_width,
+        read_buffer,
+    )
+    .await
 }

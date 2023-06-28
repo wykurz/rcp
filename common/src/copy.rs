@@ -1,11 +1,39 @@
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
 use std::vec;
 
 use crate::progress;
 
-async fn copy_file(src: &std::path::Path, dst: &std::path::Path, read_buffer: usize) -> Result<()> {
+async fn set_uid_gid(dst: &std::path::Path, uid: u32, gid: u32) -> Result<()> {
+    let dst_owned = dst.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        nix::unistd::fchownat(
+            None,
+            &dst_owned,
+            Some(uid.into()),
+            Some(gid.into()),
+            nix::unistd::FchownatFlags::NoFollowSymlink,
+        )
+        .map_err(anyhow::Error::from)?;
+        Ok(())
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "rcp: cannot set {:?} owner to {} and/or group id to {}",
+            &dst, &uid, &gid
+        )
+    })?
+}
+
+async fn copy_file(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    preserve: bool,
+    read_buffer: usize,
+) -> Result<()> {
     let mut reader = tokio::fs::File::open(src)
         .await
         .with_context(|| format!("rcp: cannot open {:?} for reading", src))?;
@@ -16,22 +44,38 @@ async fn copy_file(src: &std::path::Path, dst: &std::path::Path, read_buffer: us
     tokio::io::copy_buf(&mut buf_reader, &mut writer)
         .await
         .with_context(|| format!("rcp: failed copying data to {:?}", &dst))?;
-    let src_permissions = reader
+    let src_metadata = reader
         .metadata()
         .await
-        .with_context(|| format!("rcp: failed reading metadata from {:?}", &src))?
-        .permissions();
+        .with_context(|| format!("rcp: failed reading metadata from {:?}", &src))?;
     // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
-    let permissions = std::fs::Permissions::from_mode(src_permissions.mode() & 0o0777);
+    let permissions = if preserve {
+        src_metadata.permissions()
+    } else {
+        std::fs::Permissions::from_mode(src_metadata.permissions().mode() & 0o0777)
+    };
     writer
         .set_permissions(permissions.clone())
         .await
         .with_context(|| {
             format!(
                 "rcp: cannot set {:?} permissions to {:?}",
-                &dst, permissions
+                &dst, &permissions
             )
         })?;
+    if preserve {
+        // modify the uid and gid of the file as well
+        let src_uid = src_metadata.uid();
+        let src_gid = src_metadata.gid();
+        set_uid_gid(dst, src_uid, src_gid).await.with_context(|| {
+            format!(
+                "rcp: cannot set {:?} owner to {} and/or group id to {}",
+                &dst,
+                &src_metadata.uid(),
+                &src_metadata.gid()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -40,6 +84,7 @@ pub async fn copy(
     prog_track: &'static progress::TlsProgress,
     src: &std::path::Path,
     dst: &std::path::Path,
+    preserve: bool,
     max_width: usize,
     read_buffer: usize,
 ) -> Result<()> {
@@ -50,7 +95,7 @@ pub async fn copy(
         .await
         .with_context(|| format!("rcp: failed reading metadata from {:?}", &src))?;
     if src_metadata.is_file() {
-        return copy_file(src, dst, read_buffer).await;
+        return copy_file(src, dst, preserve, read_buffer).await;
     } else if src_metadata.is_symlink() {
         let link = tokio::fs::read_link(src)
             .await
@@ -87,7 +132,15 @@ pub async fn copy(
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
         let do_copy = || async move {
-            copy(prog_track, &entry_path, &dst_path, max_width, read_buffer).await
+            copy(
+                prog_track,
+                &entry_path,
+                &dst_path,
+                preserve,
+                max_width,
+                read_buffer,
+            )
+            .await
         };
         join_set.spawn(do_copy());
     }
@@ -101,7 +154,11 @@ pub async fn copy(
         return Err(anyhow::anyhow!("{:?}", &errors));
     }
     // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
-    let permissions = std::fs::Permissions::from_mode(src_metadata.permissions().mode() & 0o0777);
+    let permissions = if preserve {
+        src_metadata.permissions()
+    } else {
+        std::fs::Permissions::from_mode(src_metadata.permissions().mode() & 0o0777)
+    };
     tokio::fs::set_permissions(dst, permissions.clone())
         .await
         .with_context(|| {
@@ -110,6 +167,19 @@ pub async fn copy(
                 &dst, &permissions
             )
         })?;
+    if preserve {
+        // modify the uid and gid of the file as well
+        let src_uid = src_metadata.uid();
+        let src_gid = src_metadata.gid();
+        set_uid_gid(dst, src_uid, src_gid).await.with_context(|| {
+            format!(
+                "rcp: cannot set {:?} owner to {} and/or group id to {}",
+                &dst,
+                &src_metadata.uid(),
+                &src_metadata.gid()
+            )
+        })?;
+    }
     debug!("copy: {:?} -> {:?} succeeded!", src, dst);
     Ok(())
 }
@@ -216,6 +286,7 @@ mod tests {
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
+            false,
             1,
             10,
         )
@@ -239,6 +310,7 @@ mod tests {
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
+            false,
             5,
             max_width,
         )
@@ -296,6 +368,7 @@ mod tests {
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
+            false,
             1,
             7,
         )
@@ -338,6 +411,7 @@ mod tests {
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
+            false,
             3,
             8,
         )
