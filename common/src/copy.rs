@@ -13,11 +13,25 @@ async fn copy_file(src: &std::path::Path, dst: &std::path::Path, read_buffer: us
     let mut writer = tokio::fs::File::create(dst)
         .await
         .with_context(|| format!("rcp: cannot open {:?} for writing", dst))?;
-    tokio::io::copy_buf(&mut buf_reader, &mut writer).await?;
-    let src_permissions = reader.metadata().await?.permissions();
+    tokio::io::copy_buf(&mut buf_reader, &mut writer)
+        .await
+        .with_context(|| format!("rcp: failed copying data to {:?}", &dst))?;
+    let src_permissions = reader
+        .metadata()
+        .await
+        .with_context(|| format!("rcp: failed reading metadata from {:?}", &src))?
+        .permissions();
     // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
     let permissions = std::fs::Permissions::from_mode(src_permissions.mode() & 0o0777);
-    tokio::fs::set_permissions(dst, permissions).await?;
+    writer
+        .set_permissions(permissions.clone())
+        .await
+        .with_context(|| {
+            format!(
+                "rcp: cannot set {:?} permissions to {:?}",
+                &dst, permissions
+            )
+        })?;
     Ok(())
 }
 
@@ -32,15 +46,21 @@ pub async fn copy(
     debug!("copy: {:?} -> {:?}", src, dst);
     assert!(max_width > 0);
     let _guard = prog_track.guard();
-    let metadata = tokio::fs::symlink_metadata(src).await?;
-    if metadata.is_file() {
+    let src_metadata = tokio::fs::symlink_metadata(src)
+        .await
+        .with_context(|| format!("rcp: failed reading metadata from {:?}", &src))?;
+    if src_metadata.is_file() {
         return copy_file(src, dst, read_buffer).await;
-    } else if metadata.is_symlink() {
-        let link = tokio::fs::read_link(src).await?;
-        tokio::fs::symlink(link, dst).await?;
+    } else if src_metadata.is_symlink() {
+        let link = tokio::fs::read_link(src)
+            .await
+            .with_context(|| format!("rcp: failed reading symlink {:?}", &src))?;
+        tokio::fs::symlink(link, dst)
+            .await
+            .with_context(|| format!("rcp: failed creating symlink {:?}", &dst))?;
         return Ok(());
     }
-    assert!(metadata.is_dir());
+    assert!(src_metadata.is_dir());
     let mut entries = tokio::fs::read_dir(src)
         .await
         .with_context(|| format!("rcp: cannot open directory {:?} for reading", src))?;
@@ -49,7 +69,11 @@ pub async fn copy(
         .with_context(|| format!("rcp: cannot create directory {:?}", dst))?;
     let mut join_set = tokio::task::JoinSet::new();
     let mut errors = vec![];
-    while let Some(entry) = entries.next_entry().await? {
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| format!("rcp: failed traversing directory {:?}", &dst))?
+    {
         if join_set.len() >= max_width {
             if let Err(error) = join_set
                 .join_next()
@@ -76,6 +100,16 @@ pub async fn copy(
         debug!("copy: {:?} -> {:?} failed with: {:?}", src, dst, &errors);
         return Err(anyhow::anyhow!("{:?}", &errors));
     }
+    // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
+    let permissions = std::fs::Permissions::from_mode(src_metadata.permissions().mode() & 0o0777);
+    tokio::fs::set_permissions(dst, permissions.clone())
+        .await
+        .with_context(|| {
+            format!(
+                "rcp: cannot set {:?} permissions to {:?}",
+                &dst, &permissions
+            )
+        })?;
     debug!("copy: {:?} -> {:?} succeeded!", src, dst);
     Ok(())
 }
@@ -275,6 +309,37 @@ mod tests {
                     .mode()
                     & 0o0777,
             ),
+        )
+        .await?;
+        check_dirs_identical(&test_path.join("foo"), &test_path.join("bar")).await?;
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn no_write_permission() -> Result<()> {
+        let tmp_dir = setup().await?;
+        let test_path = tmp_dir.as_path();
+        // directory - readable and non-executable
+        let non_exec_dir = &test_path.join("foo").join("bogey");
+        tokio::fs::create_dir(&non_exec_dir).await?;
+        // directory - readable and executable
+        tokio::fs::set_permissions(
+            &test_path.join("foo").join("baz"),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .await?;
+        // file
+        tokio::fs::set_permissions(
+            &test_path.join("foo").join("baz").join("4.txt"),
+            std::fs::Permissions::from_mode(0o440),
+        )
+        .await?;
+        copy(
+            &PROGRESS,
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            3,
+            8,
         )
         .await?;
         check_dirs_identical(&test_path.join("foo"), &test_path.join("bar")).await?;
