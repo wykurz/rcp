@@ -51,7 +51,8 @@ async fn main() -> Result<()> {
                 let src_path = std::path::PathBuf::from(src);
                 let src_file = src_path
                     .file_name()
-                    .context(format!("Source {:?} is not a file", &src_path)).unwrap();
+                    .context(format!("Source {:?} is not a file", &src_path))
+                    .unwrap();
                 (src_path.to_owned(), dst_dir.join(src_file))
             })
             .collect()
@@ -116,5 +117,6 @@ async fn main() -> Result<()> {
     if !errors.is_empty() {
         return Err(anyhow::anyhow!("{:?}", &errors));
     }
+    log::error!("test test");
     Ok(())
 }
