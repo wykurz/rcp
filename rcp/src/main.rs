@@ -95,8 +95,11 @@ async fn async_main(args: Args) -> Result<()> {
                 args.progress,
                 &src_path,
                 &dst_path,
-                args.preserve,
-                read_buffer,
+                &common::copy::Settings {
+                    preserve: args.preserve,
+                    read_buffer,
+                    dereference: false,
+                },
             )
             .await
         };

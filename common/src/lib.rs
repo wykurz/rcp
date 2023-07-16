@@ -6,7 +6,7 @@ extern crate log;
 
 use anyhow::Result;
 
-mod copy;
+pub mod copy;
 mod progress;
 
 lazy_static! {
@@ -17,8 +17,7 @@ pub async fn copy(
     show_progress: bool,
     src: &std::path::Path,
     dst: &std::path::Path,
-    preserve: bool,
-    read_buffer: usize,
+    settings: &copy::Settings,
 ) -> Result<()> {
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let done_clone = done.clone();
@@ -54,7 +53,7 @@ pub async fn copy(
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
     });
-    copy::copy(&PROGRESS, src, dst, preserve, read_buffer).await?;
+    copy::copy(&PROGRESS, src, dst, settings).await?;
     done.store(true, std::sync::atomic::Ordering::SeqCst);
     pbar_thread.join().unwrap();
     Ok(())

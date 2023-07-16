@@ -6,6 +6,13 @@ use std::vec;
 
 use crate::progress;
 
+#[derive(Debug, Clone)]
+pub struct Settings {
+    pub preserve: bool,
+    pub read_buffer: usize,
+    pub dereference: bool,
+}
+
 async fn set_uid_gid(dst: &std::path::Path, uid: u32, gid: u32) -> Result<()> {
     let dst_owned = dst.to_owned();
     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -31,13 +38,12 @@ async fn set_uid_gid(dst: &std::path::Path, uid: u32, gid: u32) -> Result<()> {
 async fn copy_file(
     src: &std::path::Path,
     dst: &std::path::Path,
-    preserve: bool,
-    read_buffer: usize,
+    settings: &Settings,
 ) -> Result<()> {
     let mut reader = tokio::fs::File::open(src)
         .await
         .with_context(|| format!("rcp: cannot open {:?} for reading", src))?;
-    let mut buf_reader = tokio::io::BufReader::with_capacity(read_buffer, &mut reader);
+    let mut buf_reader = tokio::io::BufReader::with_capacity(settings.read_buffer, &mut reader);
     let mut writer = tokio::fs::File::create(dst)
         .await
         .with_context(|| format!("rcp: cannot open {:?} for writing", dst))?;
@@ -49,7 +55,7 @@ async fn copy_file(
         .await
         .with_context(|| format!("rcp: failed reading metadata from {:?}", &src))?;
     // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
-    let permissions = if preserve {
+    let permissions = if settings.preserve {
         src_metadata.permissions()
     } else {
         std::fs::Permissions::from_mode(src_metadata.permissions().mode() & 0o0777)
@@ -63,7 +69,7 @@ async fn copy_file(
                 &dst, &permissions
             )
         })?;
-    if preserve {
+    if settings.preserve {
         // modify the uid and gid of the file as well
         let src_uid = src_metadata.uid();
         let src_gid = src_metadata.gid();
@@ -84,8 +90,7 @@ pub async fn copy(
     prog_track: &'static progress::TlsProgress,
     src: &std::path::Path,
     dst: &std::path::Path,
-    preserve: bool,
-    read_buffer: usize,
+    settings: &Settings,
 ) -> Result<()> {
     debug!("copy: {:?} -> {:?}", src, dst);
     let _guard = prog_track.guard();
@@ -93,7 +98,7 @@ pub async fn copy(
         .await
         .with_context(|| format!("rcp: failed reading metadata from {:?}", &src))?;
     if src_metadata.is_file() {
-        return copy_file(src, dst, preserve, read_buffer).await;
+        return copy_file(src, dst, settings).await;
     } else if src_metadata.is_symlink() {
         let link = tokio::fs::read_link(src)
             .await
@@ -120,8 +125,8 @@ pub async fn copy(
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
-        let do_copy =
-            || async move { copy(prog_track, &entry_path, &dst_path, preserve, read_buffer).await };
+        let settings = settings.clone();
+        let do_copy = || async move { copy(prog_track, &entry_path, &dst_path, &settings).await };
         join_set.spawn(do_copy());
     }
     while let Some(res) = join_set.join_next().await {
@@ -134,7 +139,7 @@ pub async fn copy(
         return Err(anyhow::anyhow!("{:?}", &errors));
     }
     // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
-    let permissions = if preserve {
+    let permissions = if settings.preserve {
         src_metadata.permissions()
     } else {
         std::fs::Permissions::from_mode(src_metadata.permissions().mode() & 0o0777)
@@ -147,7 +152,7 @@ pub async fn copy(
                 &dst, &permissions
             )
         })?;
-    if preserve {
+    if settings.preserve {
         // modify the uid and gid of the file as well
         let src_uid = src_metadata.uid();
         let src_gid = src_metadata.gid();
@@ -266,8 +271,11 @@ mod tests {
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            false,
-            10,
+            &Settings {
+                preserve: false,
+                read_buffer: 10,
+                dereference: false,
+            },
         )
         .await?;
         check_dirs_identical(&test_path.join("foo"), &test_path.join("bar")).await?;
@@ -289,8 +297,11 @@ mod tests {
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            false,
-            5,
+            &Settings {
+                preserve: false,
+                read_buffer: 5,
+                dereference: false,
+            },
         )
         .await
         {
@@ -346,8 +357,11 @@ mod tests {
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            false,
-            7,
+            &Settings {
+                preserve: false,
+                read_buffer: 7,
+                dereference: false,
+            },
         )
         .await?;
         // clear the setuid, setgid and sticky bit for comparison
@@ -388,8 +402,11 @@ mod tests {
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            false,
-            8,
+            &Settings {
+                preserve: false,
+                read_buffer: 8,
+                dereference: false,
+            },
         )
         .await?;
         check_dirs_identical(&test_path.join("foo"), &test_path.join("bar")).await?;

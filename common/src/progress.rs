@@ -21,6 +21,13 @@ impl TlsCounter {
     }
 }
 
+impl Default for TlsCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Default)]
 pub struct TlsProgress {
     started: TlsCounter,
     finished: TlsCounter,
