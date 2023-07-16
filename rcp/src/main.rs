@@ -78,6 +78,9 @@ async fn main() -> Result<()> {
         .parse::<bytesize::ByteSize>()
         .unwrap()
         .as_u64() as usize;
+    if !sysinfo::set_open_files_limit(isize::MAX) {
+        log::info!("Failed to update the open files limit (expeted on non-linux targets)");
+    }
     let mut join_set = tokio::task::JoinSet::new();
     for (src_path, dst_path) in src_dst {
         let do_copy = || async move {
@@ -117,6 +120,5 @@ async fn main() -> Result<()> {
     if !errors.is_empty() {
         return Err(anyhow::anyhow!("{:?}", &errors));
     }
-    log::error!("test test");
     Ok(())
 }
