@@ -13,7 +13,7 @@ pub struct Settings {
     pub dereference: bool,
 }
 
-async fn set_uid_gid(dst: &std::path::Path, uid: u32, gid: u32) -> Result<()> {
+async fn set_uid_gid(dst: &std::path::Path, uid: u32, gid: u32, dereference: bool) -> Result<()> {
     let dst_owned = dst.to_owned();
     tokio::task::spawn_blocking(move || -> Result<()> {
         nix::unistd::fchownat(
@@ -21,7 +21,11 @@ async fn set_uid_gid(dst: &std::path::Path, uid: u32, gid: u32) -> Result<()> {
             &dst_owned,
             Some(uid.into()),
             Some(gid.into()),
-            nix::unistd::FchownatFlags::NoFollowSymlink,
+            if dereference {
+                nix::unistd::FchownatFlags::FollowSymlink
+            } else {
+                nix::unistd::FchownatFlags::NoFollowSymlink
+            },
         )
         .map_err(anyhow::Error::from)?;
         Ok(())
@@ -73,14 +77,16 @@ async fn copy_file(
         // modify the uid and gid of the file as well
         let src_uid = src_metadata.uid();
         let src_gid = src_metadata.gid();
-        set_uid_gid(dst, src_uid, src_gid).await.with_context(|| {
-            format!(
-                "rcp: cannot set {:?} owner to {} and/or group id to {}",
-                &dst,
-                &src_metadata.uid(),
-                &src_metadata.gid()
-            )
-        })?;
+        set_uid_gid(dst, src_uid, src_gid, settings.dereference)
+            .await
+            .with_context(|| {
+                format!(
+                    "rcp: cannot set {:?} owner to {} and/or group id to {}",
+                    &dst,
+                    &src_metadata.uid(),
+                    &src_metadata.gid()
+                )
+            })?;
     }
     Ok(())
 }
@@ -97,7 +103,7 @@ pub async fn copy(
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("rcp: failed reading metadata from {:?}", &src))?;
-    if src_metadata.is_file() {
+    if src_metadata.is_file() || (src_metadata.is_symlink() && settings.dereference) {
         return copy_file(src, dst, settings).await;
     } else if src_metadata.is_symlink() {
         let link = tokio::fs::read_link(src)
@@ -156,14 +162,16 @@ pub async fn copy(
         // modify the uid and gid of the file as well
         let src_uid = src_metadata.uid();
         let src_gid = src_metadata.gid();
-        set_uid_gid(dst, src_uid, src_gid).await.with_context(|| {
-            format!(
-                "rcp: cannot set {:?} owner to {} and/or group id to {}",
-                &dst,
-                &src_metadata.uid(),
-                &src_metadata.gid()
-            )
-        })?;
+        set_uid_gid(dst, src_uid, src_gid, settings.dereference)
+            .await
+            .with_context(|| {
+                format!(
+                    "rcp: cannot set {:?} owner to {} and/or group id to {}",
+                    &dst,
+                    &src_metadata.uid(),
+                    &src_metadata.gid()
+                )
+            })?;
     }
     debug!("copy: {:?} -> {:?} succeeded!", src, dst);
     Ok(())
@@ -410,6 +418,46 @@ mod tests {
         )
         .await?;
         check_dirs_identical(&test_path.join("foo"), &test_path.join("bar")).await?;
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn dereference() -> Result<()> {
+        let tmp_dir = setup().await?;
+        let test_path = tmp_dir.as_path();
+        // make files pointed to by symlinks have different permissions than the symlink itself
+        let src1 = &test_path.join("foo").join("bar").join("2.txt");
+        let src2 = &test_path.join("foo").join("bar").join("3.txt");
+        let test_mode = 0o440;
+        for f in vec![src1, src2] {
+            tokio::fs::set_permissions(f, std::fs::Permissions::from_mode(test_mode)).await?;
+        }
+        copy(
+            &PROGRESS,
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            &Settings {
+                preserve: false,
+                read_buffer: 10,
+                dereference: true, // <- important!
+            },
+        )
+        .await?;
+        // ...
+        // |- baz
+        //    |- 4.txt
+        //    |- 5.txt -> ../bar/2.txt
+        //    |- 6.txt -> (absolute path) .../foo/bar/3.txt
+        let dst1 = &test_path.join("bar").join("baz").join("5.txt");
+        let dst2 = &test_path.join("bar").join("baz").join("6.txt");
+        for f in vec![dst1, dst2] {
+            let metadata = tokio::fs::symlink_metadata(f)
+                .await
+                .with_context(|| format!("rcp: failed reading metadata from {:?}", &f))?;
+            assert!(metadata.is_file());
+            // check that the permissions are the same as the source file modulo no sticky bit, setuid and setgid
+            assert_eq!(metadata.permissions().mode() & 0o777, test_mode);
+        }
         Ok(())
     }
 }

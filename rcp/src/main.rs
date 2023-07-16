@@ -18,11 +18,15 @@ struct Args {
     #[structopt(short, long)]
     preserve: bool,
 
+    /// Always follow symbolic links in source
+    #[structopt(short = "-L", long)]
+    dereference: bool,
+
     /// Source path(s) and destination path
     #[structopt()]
     paths: Vec<String>,
 
-    /// Number of worker threads, 0 means default (number of cores).
+    /// Number of worker threads, 0 means default (number of cores)
     #[structopt(long, default_value = "0")]
     max_workers: usize,
 
@@ -98,7 +102,7 @@ async fn async_main(args: Args) -> Result<()> {
                 &common::copy::Settings {
                     preserve: args.preserve,
                     read_buffer,
-                    dereference: false,
+                    dereference: args.dereference,
                 },
             )
             .await
