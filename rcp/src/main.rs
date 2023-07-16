@@ -22,6 +22,10 @@ struct Args {
     #[structopt()]
     paths: Vec<String>,
 
+    /// Number of worker threads, 0 means default (number of cores).
+    #[structopt(long, default_value = "0")]
+    max_workers: usize,
+
     /// Maximum number of parallel file copies from within a single directory, 0 means unlimited
     #[structopt(long, default_value = "100000")]
     max_width: usize,
@@ -31,10 +35,7 @@ struct Args {
     read_buffer: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::init();
-    let args = Args::from_args();
+async fn async_main(args: Args) -> Result<()> {
     if args.paths.len() < 2 {
         return Err(anyhow::anyhow!(
             "You must specify at least one source and destination path!"
@@ -121,4 +122,16 @@ async fn main() -> Result<()> {
         return Err(anyhow::anyhow!("{:?}", &errors));
     }
     Ok(())
+}
+
+fn main() -> Result<()> {
+    env_logger::init();
+    let args = Args::from_args();
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if args.max_workers > 0 {
+        builder.worker_threads(args.max_workers);
+    }
+    let runtime = builder.build().unwrap();
+    runtime.block_on(async_main(args))
 }
