@@ -26,10 +26,6 @@ struct Args {
     #[structopt(long, default_value = "0")]
     max_workers: usize,
 
-    /// Maximum number of parallel file copies from within a single directory, 0 means unlimited
-    #[structopt(long, default_value = "100000")]
-    max_width: usize,
-
     /// File copy read buffer size
     #[structopt(long, default_value = "128KiB")]
     read_buffer: String,
@@ -69,11 +65,6 @@ async fn async_main(args: Args) -> Result<()> {
             std::path::PathBuf::from(dst_string),
         )]
     };
-    let max_width = if args.max_width == 0 {
-        usize::MAX
-    } else {
-        args.max_width
-    };
     let read_buffer = args
         .read_buffer
         .parse::<bytesize::ByteSize>()
@@ -105,7 +96,6 @@ async fn async_main(args: Args) -> Result<()> {
                 &src_path,
                 &dst_path,
                 args.preserve,
-                max_width,
                 read_buffer,
             )
             .await

@@ -85,11 +85,9 @@ pub async fn copy(
     src: &std::path::Path,
     dst: &std::path::Path,
     preserve: bool,
-    max_width: usize,
     read_buffer: usize,
 ) -> Result<()> {
     debug!("copy: {:?} -> {:?}", src, dst);
-    assert!(max_width > 0);
     let _guard = prog_track.guard();
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
@@ -119,29 +117,11 @@ pub async fn copy(
         .await
         .with_context(|| format!("rcp: failed traversing directory {:?}", &dst))?
     {
-        if join_set.len() >= max_width {
-            if let Err(error) = join_set
-                .join_next()
-                .await
-                .expect("JoinSet must not be empty here!")?
-            {
-                errors.push(error);
-            }
-        }
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
-        let do_copy = || async move {
-            copy(
-                prog_track,
-                &entry_path,
-                &dst_path,
-                preserve,
-                max_width,
-                read_buffer,
-            )
-            .await
-        };
+        let do_copy =
+            || async move { copy(prog_track, &entry_path, &dst_path, preserve, read_buffer).await };
         join_set.spawn(do_copy());
     }
     while let Some(res) = join_set.join_next().await {
@@ -287,7 +267,6 @@ mod tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             false,
-            1,
             10,
         )
         .await?;
@@ -295,7 +274,7 @@ mod tests {
         Ok(())
     }
 
-    async fn no_read_permission(max_width: usize) -> Result<()> {
+    async fn no_read_permission() -> Result<()> {
         let tmp_dir = setup().await?;
         let test_path = tmp_dir.as_path();
         let filepaths = vec![
@@ -312,7 +291,6 @@ mod tests {
             &test_path.join("bar"),
             false,
             5,
-            max_width,
         )
         .await
         {
@@ -337,17 +315,17 @@ mod tests {
     // parametrize the tests to run with different max_width values
     #[test(tokio::test)]
     async fn no_read_permission_1() -> Result<()> {
-        no_read_permission(1).await
+        no_read_permission().await
     }
 
     #[test(tokio::test)]
     async fn no_read_permission_2() -> Result<()> {
-        no_read_permission(2).await
+        no_read_permission().await
     }
 
     #[test(tokio::test)]
     async fn no_read_permission_10() -> Result<()> {
-        no_read_permission(10).await
+        no_read_permission().await
     }
 
     #[test(tokio::test)]
@@ -369,7 +347,6 @@ mod tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             false,
-            1,
             7,
         )
         .await?;
@@ -412,7 +389,6 @@ mod tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             false,
-            3,
             8,
         )
         .await?;

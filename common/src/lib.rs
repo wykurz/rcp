@@ -18,7 +18,6 @@ pub async fn copy(
     src: &std::path::Path,
     dst: &std::path::Path,
     preserve: bool,
-    max_width: usize,
     read_buffer: usize,
 ) -> Result<()> {
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -55,7 +54,7 @@ pub async fn copy(
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
     });
-    copy::copy(&PROGRESS, src, dst, preserve, max_width, read_buffer).await?;
+    copy::copy(&PROGRESS, src, dst, preserve, read_buffer).await?;
     done.store(true, std::sync::atomic::Ordering::SeqCst);
     pbar_thread.join().unwrap();
     Ok(())
