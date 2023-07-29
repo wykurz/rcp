@@ -460,4 +460,83 @@ mod tests {
         }
         Ok(())
     }
+
+    async fn cp_compare(cp_args: &[&str], rcp_settings: &Settings) -> Result<()> {
+        let tmp_dir = setup().await?;
+        let test_path = tmp_dir.as_path();
+        // run a cp command to copy the files
+        let cp_output = tokio::process::Command::new("cp")
+            .args(cp_args)
+            .arg(test_path.join("foo"))
+            .arg(test_path.join("bar"))
+            .output()
+            .await?;
+        assert!(cp_output.status.success());
+        // now run rcp
+        copy(
+            &PROGRESS,
+            &test_path.join("foo"),
+            &test_path.join("baz"),
+            rcp_settings,
+        )
+        .await?;
+        check_dirs_identical(&test_path.join("bar"), &test_path.join("baz")).await?;
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn test_cp_compat() -> Result<()> {
+        cp_compare(
+            &["-r"],
+            &Settings {
+                preserve: false,
+                read_buffer: 100,
+                dereference: false,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn test_cp_compat_preserve() -> Result<()> {
+        cp_compare(
+            &["-r", "-p"],
+            &Settings {
+                preserve: true,
+                read_buffer: 100,
+                dereference: false,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn test_cp_compat_dereference() -> Result<()> {
+        cp_compare(
+            &["-r", "-L"],
+            &Settings {
+                preserve: false,
+                read_buffer: 100,
+                dereference: true,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn test_cp_compat_preserve_and_dereference() -> Result<()> {
+        cp_compare(
+            &["-r", "-p", "-L"],
+            &Settings {
+                preserve: true,
+                read_buffer: 100,
+                dereference: true,
+            },
+        )
+        .await?;
+        Ok(())
+    }
 }
