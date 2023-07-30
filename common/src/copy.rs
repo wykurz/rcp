@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
+use nix::sys::time::TimeValLike;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
 use std::vec;
@@ -13,30 +14,41 @@ pub struct Settings {
     pub dereference: bool,
 }
 
-async fn set_uid_gid(dst: &std::path::Path, uid: u32, gid: u32, dereference: bool) -> Result<()> {
-    let dst_owned = dst.to_owned();
+async fn set_owner_and_time(dst: &std::path::Path, metadata: &std::fs::Metadata) -> Result<()> {
+    let dst = dst.to_owned();
+    let metadata = metadata.to_owned();
     tokio::task::spawn_blocking(move || -> Result<()> {
+        // set user and group
+        let uid = metadata.uid();
+        let gid = metadata.gid();
         nix::unistd::fchownat(
             None,
-            &dst_owned,
+            &dst,
             Some(uid.into()),
             Some(gid.into()),
-            if dereference {
-                nix::unistd::FchownatFlags::FollowSymlink
-            } else {
-                nix::unistd::FchownatFlags::NoFollowSymlink
-            },
+            nix::unistd::FchownatFlags::FollowSymlink,
         )
+        .with_context(|| {
+            format!(
+                "rcp: cannot set {:?} owner to {} and/or group id to {}",
+                &dst, &uid, &gid
+            )
+        })
         .map_err(anyhow::Error::from)?;
+        // set timestamps
+        let atime = nix::sys::time::TimeSpec::nanoseconds(metadata.atime_nsec());
+        let mtime = nix::sys::time::TimeSpec::nanoseconds(metadata.mtime_nsec());
+        nix::sys::stat::utimensat(
+            None,
+            &dst,
+            &atime,
+            &mtime,
+            nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+        )
+        .with_context(|| format!("rcp: failed setting timestamps for {:?}", &dst))?;
         Ok(())
     })
-    .await
-    .with_context(|| {
-        format!(
-            "rcp: cannot set {:?} owner to {} and/or group id to {}",
-            &dst, &uid, &gid
-        )
-    })?
+    .await?
 }
 
 async fn copy_file(
@@ -58,10 +70,10 @@ async fn copy_file(
         .metadata()
         .await
         .with_context(|| format!("rcp: failed reading metadata from {:?}", &src))?;
-    // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
     let permissions = if settings.preserve {
         src_metadata.permissions()
     } else {
+        // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
         std::fs::Permissions::from_mode(src_metadata.permissions().mode() & 0o0777)
     };
     writer
@@ -75,18 +87,7 @@ async fn copy_file(
         })?;
     if settings.preserve {
         // modify the uid and gid of the file as well
-        let src_uid = src_metadata.uid();
-        let src_gid = src_metadata.gid();
-        set_uid_gid(dst, src_uid, src_gid, settings.dereference)
-            .await
-            .with_context(|| {
-                format!(
-                    "rcp: cannot set {:?} owner to {} and/or group id to {}",
-                    &dst,
-                    &src_metadata.uid(),
-                    &src_metadata.gid()
-                )
-            })?;
+        set_owner_and_time(dst, &src_metadata).await?;
     }
     Ok(())
 }
@@ -105,13 +106,17 @@ pub async fn copy(
         .with_context(|| format!("rcp: failed reading metadata from {:?}", &src))?;
     if src_metadata.is_file() || (src_metadata.is_symlink() && settings.dereference) {
         return copy_file(src, dst, settings).await;
-    } else if src_metadata.is_symlink() {
+    }
+    if src_metadata.is_symlink() {
         let link = tokio::fs::read_link(src)
             .await
             .with_context(|| format!("rcp: failed reading symlink {:?}", &src))?;
         tokio::fs::symlink(link, dst)
             .await
             .with_context(|| format!("rcp: failed creating symlink {:?}", &dst))?;
+        if settings.preserve {
+            set_owner_and_time(dst, &src_metadata).await?;
+        }
         return Ok(());
     }
     assert!(src_metadata.is_dir());
@@ -144,10 +149,10 @@ pub async fn copy(
         debug!("copy: {:?} -> {:?} failed with: {:?}", src, dst, &errors);
         return Err(anyhow::anyhow!("{:?}", &errors));
     }
-    // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
     let permissions = if settings.preserve {
         src_metadata.permissions()
     } else {
+        // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
         std::fs::Permissions::from_mode(src_metadata.permissions().mode() & 0o0777)
     };
     tokio::fs::set_permissions(dst, permissions.clone())
@@ -159,19 +164,7 @@ pub async fn copy(
             )
         })?;
     if settings.preserve {
-        // modify the uid and gid of the file as well
-        let src_uid = src_metadata.uid();
-        let src_gid = src_metadata.gid();
-        set_uid_gid(dst, src_uid, src_gid, settings.dereference)
-            .await
-            .with_context(|| {
-                format!(
-                    "rcp: cannot set {:?} owner to {} and/or group id to {}",
-                    &dst,
-                    &src_metadata.uid(),
-                    &src_metadata.gid()
-                )
-            })?;
+        set_owner_and_time(dst, &src_metadata).await?;
     }
     debug!("copy: {:?} -> {:?} succeeded!", src, dst);
     Ok(())
@@ -235,11 +228,16 @@ mod tests {
         tokio::fs::symlink(bar_path.join("3.txt"), baz_path.join("6.txt"))
             .await
             .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         Ok(tmp_dir)
     }
 
     #[async_recursion]
-    async fn check_dirs_identical(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    async fn check_dirs_identical(
+        src: &std::path::Path,
+        dst: &std::path::Path,
+        check_times: bool,
+    ) -> Result<()> {
         let mut src_entries = tokio::fs::read_dir(src).await?;
         while let Some(src_entry) = src_entries.next_entry().await? {
             let src_entry_path = src_entry.path();
@@ -254,8 +252,8 @@ mod tests {
                     "Destination file {:?} is missing!",
                     &dst_entry_path
                 ))?;
+            // compare file type and content
             assert_eq!(src_md.file_type(), dst_md.file_type());
-            assert_eq!(src_md.permissions(), dst_md.permissions());
             if src_md.is_file() {
                 let src_contents = tokio::fs::read_to_string(&src_entry_path).await?;
                 let dst_contents = tokio::fs::read_to_string(&dst_entry_path).await?;
@@ -265,8 +263,22 @@ mod tests {
                 let dst_link = tokio::fs::read_link(&dst_entry_path).await?;
                 assert_eq!(src_link, dst_link);
             } else {
-                check_dirs_identical(&src_entry_path, &dst_entry_path).await?;
+                check_dirs_identical(&src_entry_path, &dst_entry_path, check_times).await?;
             }
+            // compare permissions
+            assert_eq!(src_md.permissions(), dst_md.permissions());
+            if !check_times {
+                continue;
+            }
+            // compare timestamps
+            // NOTE: skip comparing "atime" - we read the file few times when comparing agaisnt "cp"
+            assert_eq!(
+                src_md.mtime_nsec(),
+                dst_md.mtime_nsec(),
+                "mtime doesn't match for {:?} {:?}",
+                src_entry_path,
+                dst_entry_path
+            );
         }
         Ok(())
     }
@@ -286,7 +298,7 @@ mod tests {
             },
         )
         .await?;
-        check_dirs_identical(&test_path.join("foo"), &test_path.join("bar")).await?;
+        check_dirs_identical(&test_path.join("foo"), &test_path.join("bar"), false).await?;
         Ok(())
     }
 
@@ -327,7 +339,7 @@ mod tests {
                 tokio::fs::remove_dir_all(fpath).await?;
             }
         }
-        check_dirs_identical(&test_path.join("foo"), &test_path.join("bar")).await?;
+        check_dirs_identical(&test_path.join("foo"), &test_path.join("bar"), false).await?;
         Ok(())
     }
 
@@ -383,7 +395,7 @@ mod tests {
             ),
         )
         .await?;
-        check_dirs_identical(&test_path.join("foo"), &test_path.join("bar")).await?;
+        check_dirs_identical(&test_path.join("foo"), &test_path.join("bar"), false).await?;
         Ok(())
     }
 
@@ -417,7 +429,7 @@ mod tests {
             },
         )
         .await?;
-        check_dirs_identical(&test_path.join("foo"), &test_path.join("bar")).await?;
+        check_dirs_identical(&test_path.join("foo"), &test_path.join("bar"), false).await?;
         Ok(())
     }
 
@@ -480,7 +492,12 @@ mod tests {
             rcp_settings,
         )
         .await?;
-        check_dirs_identical(&test_path.join("bar"), &test_path.join("baz")).await?;
+        check_dirs_identical(
+            &test_path.join("bar"),
+            &test_path.join("baz"),
+            rcp_settings.preserve,
+        )
+        .await?;
         Ok(())
     }
 

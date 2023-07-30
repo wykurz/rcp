@@ -14,7 +14,7 @@ struct Args {
     #[structopt(short, long)]
     progress: bool,
 
-    /// Preserve additional file attributes: file owner, group and setuid and setgid bits
+    /// Preserve additional file attributes: file owner, group, setuid, setgid, mtime and atime
     #[structopt(short, long)]
     preserve: bool,
 

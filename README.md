@@ -17,7 +17,7 @@ FLAGS:
     -L, --dereference    Always follow symbolic links in source
     -h, --help           Prints help information
     -o, --overwrite      Overwrite existing files/directories
-    -p, --preserve       Preserve additional file attributes: file owner, group and setuid and setgid bits
+    -p, --preserve       Preserve additional file attributes: file owner, group, setuid, setgid, mtime and atime
     -p, --progress       Show progress
     -V, --version        Prints version information
 
