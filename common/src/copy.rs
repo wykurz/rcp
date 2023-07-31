@@ -18,7 +18,18 @@ async fn set_owner_and_time(dst: &std::path::Path, metadata: &std::fs::Metadata)
     let dst = dst.to_owned();
     let metadata = metadata.to_owned();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        // set user and group
+        // set timestamps first - those are unlikely to fail
+        let atime = nix::sys::time::TimeSpec::nanoseconds(metadata.atime_nsec());
+        let mtime = nix::sys::time::TimeSpec::nanoseconds(metadata.mtime_nsec());
+        nix::sys::stat::utimensat(
+            None,
+            &dst,
+            &atime,
+            &mtime,
+            nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+        )
+        .with_context(|| format!("rcp: failed setting timestamps for {:?}", &dst))?;
+        // set user and group - set those last, if those fail we at least have the timestamps set
         let uid = metadata.uid();
         let gid = metadata.gid();
         nix::unistd::fchownat(
@@ -35,17 +46,6 @@ async fn set_owner_and_time(dst: &std::path::Path, metadata: &std::fs::Metadata)
             )
         })
         .map_err(anyhow::Error::from)?;
-        // set timestamps
-        let atime = nix::sys::time::TimeSpec::nanoseconds(metadata.atime_nsec());
-        let mtime = nix::sys::time::TimeSpec::nanoseconds(metadata.mtime_nsec());
-        nix::sys::stat::utimensat(
-            None,
-            &dst,
-            &atime,
-            &mtime,
-            nix::sys::stat::UtimensatFlags::NoFollowSymlink,
-        )
-        .with_context(|| format!("rcp: failed setting timestamps for {:?}", &dst))?;
         Ok(())
     })
     .await?
