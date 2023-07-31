@@ -26,7 +26,7 @@ struct Args {
     #[structopt()]
     paths: Vec<String>,
 
-    /// Number of worker threads, 0 means default (number of cores)
+    /// Number of worker threads, 0 means number of cores
     #[structopt(long, default_value = "0")]
     max_workers: usize,
 

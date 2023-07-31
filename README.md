@@ -22,7 +22,7 @@ FLAGS:
     -V, --version        Prints version information
 
 OPTIONS:
-        --max-workers <max-workers>    Number of worker threads, 0 means default (number of cores) [default: 0]
+        --max-workers <max-workers>    Number of worker threads, 0 means number of cores [default: 0]
         --read-buffer <read-buffer>    File copy read buffer size [default: 128KiB]
 
 ARGS:
