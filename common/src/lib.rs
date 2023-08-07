@@ -7,8 +7,8 @@ extern crate log;
 use anyhow::Result;
 
 mod copy;
-mod rm;
 mod progress;
+mod rm;
 
 pub use copy::Settings as CopySettings;
 pub use rm::Settings as RmSettings;

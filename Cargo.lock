@@ -766,6 +766,7 @@ dependencies = [
  "env_logger",
  "log",
  "structopt",
+ "sysinfo",
  "tokio",
 ]
 

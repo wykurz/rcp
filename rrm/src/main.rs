@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+#[macro_use]
+extern crate log;
 
 use anyhow::Result;
 use structopt::StructOpt;
@@ -24,7 +25,7 @@ struct Args {
 
     /// Source path(s) and destination path
     #[structopt()]
-    paths: Vec<PathBuf>,
+    paths: Vec<std::path::PathBuf>,
 
     /// Number of worker threads, 0 means number of cores
     #[structopt(long, default_value = "0")]
@@ -35,7 +36,9 @@ struct Args {
 async fn main() -> Result<()> {
     env_logger::init();
     let args = Args::from_args();
-
+    if !sysinfo::set_open_files_limit(isize::MAX) {
+        info!("Failed to update the open files limit (expeted on non-linux targets)");
+    }
     let mut join_set = tokio::task::JoinSet::new();
     for path in args.paths {
         let settings = common::RmSettings {
