@@ -3,6 +3,7 @@ members = [
   "common",
   "filegen",
   "rcp",
+  "rrm",
 ]
 
 [profile.dev]

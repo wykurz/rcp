@@ -1,3 +1,4 @@
+#[macro_use]
 extern crate log;
 
 use anyhow::{Context, Result};
@@ -9,6 +10,10 @@ struct Args {
     /// Overwrite existing files/directories
     #[structopt(short, long)]
     overwrite: bool,
+
+    /// Exit on first error
+    #[structopt(short = "-e", long = "fail-early")]
+    _fail_early: bool, // TODO: implement
 
     /// Show progress
     #[structopt(short, long)]
@@ -83,7 +88,7 @@ async fn async_main(args: Args) -> Result<()> {
         .unwrap()
         .as_u64() as usize;
     if !sysinfo::set_open_files_limit(isize::MAX) {
-        log::info!("Failed to update the open files limit (expeted on non-linux targets)");
+        info!("Failed to update the open files limit (expeted on non-linux targets)");
     }
     let mut join_set = tokio::task::JoinSet::new();
     for (src_path, dst_path) in src_dst {
@@ -107,7 +112,7 @@ async fn async_main(args: Args) -> Result<()> {
                 args.progress,
                 &src_path,
                 &dst_path,
-                &common::copy::Settings {
+                &common::CopySettings {
                     preserve: args.preserve,
                     read_buffer,
                     dereference: args.dereference,

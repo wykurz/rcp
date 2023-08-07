@@ -37,7 +37,7 @@ async fn set_owner_and_time(dst: &std::path::Path, metadata: &std::fs::Metadata)
             &dst,
             Some(uid.into()),
             Some(gid.into()),
-            nix::unistd::FchownatFlags::FollowSymlink,
+            nix::unistd::FchownatFlags::NoFollowSymlink,
         )
         .with_context(|| {
             format!(

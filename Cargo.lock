@@ -757,6 +757,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "436b050e76ed2903236f032a59761c1eb99e1b0aead2c257922771dab1fc8c78"
 
 [[package]]
+name = "rrm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-recursion",
+ "common",
+ "env_logger",
+ "log",
+ "structopt",
+ "tokio",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
