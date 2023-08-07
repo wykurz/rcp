@@ -22,6 +22,14 @@ struct Args {
     #[structopt(short = "-L", long)]
     dereference: bool,
 
+    /// Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+    #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
+    verbose: u8,
+
+    /// Quiet mode, don't report errors
+    #[structopt(short = "q", long = "quiet")]
+    quiet: bool,
+
     /// Source path(s) and destination path
     #[structopt()]
     paths: Vec<String>,
@@ -122,13 +130,35 @@ async fn async_main(args: Args) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
     let args = Args::from_args();
+    let quiet = args.quiet;
+    if !quiet {
+        env_logger::Builder::new()
+            .filter_level(match args.verbose {
+                0 => log::LevelFilter::Error,
+                1 => log::LevelFilter::Info,
+                2 => log::LevelFilter::Debug,
+                _ => log::LevelFilter::Trace,
+            })
+            .init();
+    } else {
+        assert!(
+            args.verbose == 0,
+            "Quiet mode and verbose mode are mutually exclusive"
+        );
+    }
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
     if args.max_workers > 0 {
         builder.worker_threads(args.max_workers);
     }
     let runtime = builder.build().unwrap();
-    runtime.block_on(async_main(args))
+    let res = runtime.block_on(async_main(args));
+    if let Err(error) = res {
+        if !quiet {
+            eprintln!("{}", error);
+        }
+        std::process::exit(1);
+    }
+    std::process::exit(0);
 }
