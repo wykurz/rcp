@@ -172,6 +172,7 @@ pub async fn copy(
 
 #[cfg(test)]
 mod tests {
+    use crate::testutils;
     use anyhow::Context;
     use test_log::test;
 
@@ -179,57 +180,6 @@ mod tests {
 
     lazy_static! {
         static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
-    }
-
-    async fn create_temp_dir() -> Result<std::path::PathBuf> {
-        let mut idx = 0;
-        loop {
-            let tmp_dir = std::env::temp_dir().join(format!("rcp_test{}", &idx));
-            if let Err(error) = tokio::fs::create_dir(&tmp_dir).await {
-                match error.kind() {
-                    std::io::ErrorKind::AlreadyExists => {
-                        idx += 1;
-                    }
-                    _ => return Err(error.into()),
-                }
-            } else {
-                return Ok(tmp_dir);
-            }
-        }
-    }
-
-    async fn setup() -> Result<std::path::PathBuf> {
-        // create a temporary directory
-        let tmp_dir = create_temp_dir().await?;
-        // foo
-        // |- 0.txt
-        // |- bar
-        //    |- 1.txt
-        //    |- 2.txt
-        //    |- 3.txt
-        // |- baz
-        //    |- 4.txt
-        //    |- 5.txt -> ../bar/2.txt
-        //    |- 6.txt -> (absolute path) .../foo/bar/3.txt
-        let foo_path = tmp_dir.join("foo");
-        tokio::fs::create_dir(&foo_path).await.unwrap();
-        tokio::fs::write(foo_path.join("0.txt"), "0").await.unwrap();
-        let bar_path = foo_path.join("bar");
-        tokio::fs::create_dir(&bar_path).await.unwrap();
-        tokio::fs::write(bar_path.join("1.txt"), "1").await.unwrap();
-        tokio::fs::write(bar_path.join("2.txt"), "2").await.unwrap();
-        tokio::fs::write(bar_path.join("3.txt"), "3").await.unwrap();
-        let baz_path = foo_path.join("baz");
-        tokio::fs::create_dir(&baz_path).await.unwrap();
-        tokio::fs::write(baz_path.join("4.txt"), "4").await.unwrap();
-        tokio::fs::symlink("../bar/2.txt", baz_path.join("5.txt"))
-            .await
-            .unwrap();
-        tokio::fs::symlink(bar_path.join("3.txt"), baz_path.join("6.txt"))
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        Ok(tmp_dir)
     }
 
     #[async_recursion]
@@ -285,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_basic_copy() -> Result<()> {
-        let tmp_dir = setup().await?;
+        let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         copy(
             &PROGRESS,
@@ -303,7 +253,7 @@ mod tests {
     }
 
     async fn no_read_permission() -> Result<()> {
-        let tmp_dir = setup().await?;
+        let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         let filepaths = vec![
             test_path.join("foo").join("0.txt"),
@@ -360,7 +310,7 @@ mod tests {
 
     #[test(tokio::test)]
     async fn check_default_mode() -> Result<()> {
-        let tmp_dir = setup().await?;
+        let tmp_dir = testutils::setup_test_dir().await?;
         // set file to executable
         tokio::fs::set_permissions(
             tmp_dir.join("foo").join("0.txt"),
@@ -400,7 +350,7 @@ mod tests {
 
     #[test(tokio::test)]
     async fn no_write_permission() -> Result<()> {
-        let tmp_dir = setup().await?;
+        let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         // directory - readable and non-executable
         let non_exec_dir = &test_path.join("foo").join("bogey");
@@ -434,7 +384,7 @@ mod tests {
 
     #[test(tokio::test)]
     async fn dereference() -> Result<()> {
-        let tmp_dir = setup().await?;
+        let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         // make files pointed to by symlinks have different permissions than the symlink itself
         let src1 = &test_path.join("foo").join("bar").join("2.txt");
@@ -473,7 +423,7 @@ mod tests {
     }
 
     async fn cp_compare(cp_args: &[&str], rcp_settings: &Settings) -> Result<()> {
-        let tmp_dir = setup().await?;
+        let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         // run a cp command to copy the files
         let cp_output = tokio::process::Command::new("cp")
