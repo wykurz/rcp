@@ -343,7 +343,6 @@ mod tests {
         Ok(())
     }
 
-    // parametrize the tests to run with different max_width values
     #[test(tokio::test)]
     async fn no_read_permission_1() -> Result<()> {
         no_read_permission().await

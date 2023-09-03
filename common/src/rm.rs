@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
+use std::os::unix::fs::PermissionsExt;
 
 use crate::progress;
 
@@ -24,9 +25,28 @@ pub async fn rm(
             .await
             .with_context(|| format!("rrm: failed removing {:?}", &path));
     }
-    let mut entries = tokio::fs::read_dir(path)
-        .await
-        .with_context(|| format!("rrm: cannot open directory {:?} for reading", path))?;
+    let mut entries = match tokio::fs::read_dir(path).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::PermissionDenied {
+                return Err(error)
+                    .with_context(|| format!("rrm: failed reading directory {:?}", &path));
+            }
+            // if we don't have read permissions, change permissions to read and try again
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
+                .await
+                .with_context(|| {
+                    format!(
+                        "rrm: while removing non-empty directory with no read permissions \
+                            failed to modify to read permissions for {:?}",
+                        &path
+                    )
+                })?;
+            tokio::fs::read_dir(path)
+                .await
+                .with_context(|| format!("rrm: cannot open directory {:?} for reading", path))?
+        }
+    };
     let mut join_set = tokio::task::JoinSet::new();
     let mut errors = vec![];
     while let Some(entry) = entries
@@ -53,4 +73,38 @@ pub async fn rm(
         .with_context(|| format!("rrm: failed removing directory {:?}", &path))?;
     debug!("remove: {:?} succeeded!", path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutils;
+    use test_log::test;
+
+    lazy_static! {
+        static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
+    }
+
+    #[test(tokio::test)]
+    async fn no_write_permission() -> Result<()> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let filepaths = vec![
+            test_path.join("foo").join("0.txt"),
+            test_path.join("foo").join("bar").join("2.txt"),
+            test_path.join("foo").join("baz"),
+        ];
+        for fpath in &filepaths {
+            // change file permissions to not readable and not writable
+            tokio::fs::set_permissions(&fpath, std::fs::Permissions::from_mode(0o000)).await?;
+        }
+        rm(
+            &PROGRESS,
+            &test_path.join("foo"),
+            &Settings { fail_early: false },
+        )
+        .await?;
+        assert!(!test_path.join("foo").exists());
+        Ok(())
+    }
 }

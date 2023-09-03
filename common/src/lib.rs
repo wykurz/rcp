@@ -9,6 +9,7 @@ use anyhow::Result;
 mod copy;
 mod progress;
 mod rm;
+mod testutils;
 
 pub use copy::Settings as CopySettings;
 pub use rm::Settings as RmSettings;
