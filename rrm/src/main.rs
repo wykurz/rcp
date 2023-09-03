@@ -5,7 +5,7 @@ use anyhow::Result;
 use structopt::StructOpt;
 
 #[derive(StructOpt, Debug)]
-#[structopt(name = "rcp")]
+#[structopt(name = "rrm")]
 struct Args {
     /// Exit on first error
     #[structopt(short = "-e", long = "fail-early")]
