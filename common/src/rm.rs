@@ -25,28 +25,18 @@ pub async fn rm(
             .await
             .with_context(|| format!("rrm: failed removing {:?}", &path));
     }
-    let mut entries = match tokio::fs::read_dir(path).await {
-        Ok(entries) => entries,
-        Err(error) => {
-            if error.kind() != std::io::ErrorKind::PermissionDenied {
-                return Err(error)
-                    .with_context(|| format!("rrm: failed reading directory {:?}", &path));
-            }
-            // if we don't have read permissions, change permissions to read and try again
-            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
-                .await
-                .with_context(|| {
-                    format!(
-                        "rrm: while removing non-empty directory with no read permissions \
-                            failed to modify to read permissions for {:?}",
-                        &path
-                    )
-                })?;
-            tokio::fs::read_dir(path)
-                .await
-                .with_context(|| format!("rrm: cannot open directory {:?} for reading", path))?
-        }
-    };
+    if src_metadata.permissions().readonly() {
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
+            .await
+            .with_context(|| {
+                format!(
+                    "rrm: while removing non-empty directory with no read permissions \
+                    failed to modify to read permissions for {:?}",
+                    &path
+                )
+            })?;
+    }
+    let mut entries = tokio::fs::read_dir(path).await?;
     let mut join_set = tokio::task::JoinSet::new();
     let mut errors = vec![];
     while let Some(entry) = entries
@@ -92,11 +82,12 @@ mod tests {
         let filepaths = vec![
             test_path.join("foo").join("0.txt"),
             test_path.join("foo").join("bar").join("2.txt"),
+            test_path.join("foo").join("baz").join("4.txt"),
             test_path.join("foo").join("baz"),
         ];
         for fpath in &filepaths {
             // change file permissions to not readable and not writable
-            tokio::fs::set_permissions(&fpath, std::fs::Permissions::from_mode(0o000)).await?;
+            tokio::fs::set_permissions(&fpath, std::fs::Permissions::from_mode(0o555)).await?;
         }
         rm(
             &PROGRESS,
