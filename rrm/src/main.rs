@@ -6,7 +6,7 @@ use structopt::StructOpt;
 struct Args {
     /// Exit on first error
     #[structopt(short = "-e", long = "fail-early")]
-    _fail_early: bool, // TODO: implement
+    fail_early: bool,
 
     /// Show progress
     #[structopt(short, long)]
@@ -33,7 +33,7 @@ async fn async_main(args: Args) -> Result<()> {
     let mut join_set = tokio::task::JoinSet::new();
     for path in args.paths {
         let settings = common::RmSettings {
-            fail_early: args._fail_early,
+            fail_early: args.fail_early,
         };
         let do_rm = || async move { common::rm(args.progress, &path, &settings).await };
         join_set.spawn(do_rm());

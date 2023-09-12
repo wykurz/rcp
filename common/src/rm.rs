@@ -51,6 +51,9 @@ pub async fn rm(
     }
     while let Some(res) = join_set.join_next().await {
         if let Err(error) = res? {
+            if settings.fail_early {
+                return Err(error);
+            }
             errors.push(error);
         }
     }

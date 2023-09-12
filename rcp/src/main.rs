@@ -10,7 +10,7 @@ struct Args {
 
     /// Exit on first error
     #[structopt(short = "-e", long = "fail-early")]
-    _fail_early: bool, // TODO: implement
+    fail_early: bool,
 
     /// Show progress
     #[structopt(short, long)]
@@ -110,6 +110,7 @@ async fn async_main(args: Args) -> Result<()> {
                     preserve: args.preserve,
                     read_buffer,
                     dereference: args.dereference,
+                    fail_early: args.fail_early,
                 },
             )
             .await

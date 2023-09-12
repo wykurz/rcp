@@ -12,6 +12,7 @@ pub struct Settings {
     pub preserve: bool,
     pub read_buffer: usize,
     pub dereference: bool,
+    pub fail_early: bool,
 }
 
 async fn set_owner_and_time(dst: &std::path::Path, metadata: &std::fs::Metadata) -> Result<()> {
@@ -142,6 +143,9 @@ pub async fn copy(
     }
     while let Some(res) = join_set.join_next().await {
         if let Err(error) = res? {
+            if settings.fail_early {
+                return Err(error);
+            }
             errors.push(error);
         }
     }
@@ -245,6 +249,7 @@ mod tests {
                 preserve: false,
                 read_buffer: 10,
                 dereference: false,
+                fail_early: false,
             },
         )
         .await?;
@@ -271,6 +276,7 @@ mod tests {
                 preserve: false,
                 read_buffer: 5,
                 dereference: false,
+                fail_early: false,
             },
         )
         .await
@@ -330,6 +336,7 @@ mod tests {
                 preserve: false,
                 read_buffer: 7,
                 dereference: false,
+                fail_early: false,
             },
         )
         .await?;
@@ -375,6 +382,7 @@ mod tests {
                 preserve: false,
                 read_buffer: 8,
                 dereference: false,
+                fail_early: false,
             },
         )
         .await?;
@@ -401,6 +409,7 @@ mod tests {
                 preserve: false,
                 read_buffer: 10,
                 dereference: true, // <- important!
+                fail_early: false,
             },
         )
         .await?;
@@ -458,6 +467,7 @@ mod tests {
                 preserve: false,
                 read_buffer: 100,
                 dereference: false,
+                fail_early: false,
             },
         )
         .await?;
@@ -472,6 +482,7 @@ mod tests {
                 preserve: true,
                 read_buffer: 100,
                 dereference: false,
+                fail_early: false,
             },
         )
         .await?;
@@ -486,6 +497,7 @@ mod tests {
                 preserve: false,
                 read_buffer: 100,
                 dereference: true,
+                fail_early: false,
             },
         )
         .await?;
@@ -500,6 +512,7 @@ mod tests {
                 preserve: true,
                 read_buffer: 100,
                 dereference: true,
+                fail_early: false,
             },
         )
         .await?;
