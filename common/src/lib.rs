@@ -130,6 +130,9 @@ where
     if max_workers > 0 {
         builder.worker_threads(max_workers);
     }
+    if !sysinfo::set_open_files_limit(isize::MAX) {
+        info!("Failed to update the open files limit (expeted on non-linux targets)");
+    }
     let runtime = builder.build()?;
     let res = runtime.block_on(func());
     if let Err(error) = res {

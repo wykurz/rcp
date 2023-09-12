@@ -1,10 +1,7 @@
-#[macro_use]
-extern crate log;
-
 use anyhow::Result;
 use structopt::StructOpt;
 
-#[derive(StructOpt, Debug)]
+#[derive(StructOpt, Debug, Clone)]
 #[structopt(name = "rrm")]
 struct Args {
     /// Exit on first error
@@ -17,11 +14,11 @@ struct Args {
 
     /// Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
     #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
-    _verbose: u8, // TODO: implement
+    verbose: u8,
 
     /// Quiet mode, don't report errors
     #[structopt(short = "q", long = "quiet")]
-    _quiet: bool, // TODO: implement
+    quiet: bool,
 
     /// Source path(s) and destination path
     #[structopt()]
@@ -29,16 +26,10 @@ struct Args {
 
     /// Number of worker threads, 0 means number of cores
     #[structopt(long, default_value = "0")]
-    _max_workers: usize, // TODO: implement
+    max_workers: usize,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::init();
-    let args = Args::from_args();
-    if !sysinfo::set_open_files_limit(isize::MAX) {
-        info!("Failed to update the open files limit (expeted on non-linux targets)");
-    }
+async fn async_main(args: Args) -> Result<()> {
     let mut join_set = tokio::task::JoinSet::new();
     for path in args.paths {
         let settings = common::RmSettings {
@@ -56,5 +47,15 @@ async fn main() -> Result<()> {
     if !errors.is_empty() {
         return Err(anyhow::anyhow!("{:?}", &errors));
     }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = Args::from_args();
+    let func = {
+        let args = args.clone();
+        || async_main(args)
+    };
+    common::run(args.quiet, args.verbose, args.max_workers, func)?;
     Ok(())
 }

@@ -1,6 +1,3 @@
-#[macro_use]
-extern crate log;
-
 use anyhow::{Context, Result};
 use structopt::StructOpt;
 
@@ -87,9 +84,6 @@ async fn async_main(args: Args) -> Result<()> {
         .parse::<bytesize::ByteSize>()
         .unwrap()
         .as_u64() as usize;
-    if !sysinfo::set_open_files_limit(isize::MAX) {
-        info!("Failed to update the open files limit (expeted on non-linux targets)");
-    }
     let mut join_set = tokio::task::JoinSet::new();
     for (src_path, dst_path) in src_dst {
         let do_copy = || async move {

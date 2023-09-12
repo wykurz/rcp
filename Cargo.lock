@@ -147,6 +147,7 @@ dependencies = [
  "lazy_static",
  "log",
  "nix",
+ "sysinfo",
  "test-log",
  "thread_local",
  "tokio",
@@ -726,7 +727,6 @@ dependencies = [
  "env_logger",
  "log",
  "structopt",
- "sysinfo",
  "tokio",
 ]
 
@@ -766,7 +766,6 @@ dependencies = [
  "env_logger",
  "log",
  "structopt",
- "sysinfo",
  "tokio",
 ]
 
