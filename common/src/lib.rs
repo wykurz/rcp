@@ -5,6 +5,7 @@ extern crate lazy_static;
 extern crate log;
 
 use anyhow::Result;
+use std::future::Future;
 
 mod copy;
 mod progress;
@@ -98,4 +99,44 @@ pub async fn rm(
     };
     rm::rm(&PROGRESS, path, settings).await?;
     Ok(())
+}
+
+pub fn run<Fut>(
+    quiet: bool,
+    verbose: u8,
+    max_workers: usize,
+    func: impl FnOnce() -> Fut,
+) -> Result<()>
+where
+    Fut: Future<Output = Result<()>>,
+{
+    if !quiet {
+        env_logger::Builder::new()
+            .filter_level(match verbose {
+                0 => log::LevelFilter::Error,
+                1 => log::LevelFilter::Info,
+                2 => log::LevelFilter::Debug,
+                _ => log::LevelFilter::Trace,
+            })
+            .init();
+    } else {
+        assert!(
+            verbose == 0,
+            "Quiet mode and verbose mode are mutually exclusive"
+        );
+    }
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if max_workers > 0 {
+        builder.worker_threads(max_workers);
+    }
+    let runtime = builder.build()?;
+    let res = runtime.block_on(func());
+    if let Err(error) = res {
+        if !quiet {
+            eprintln!("{}", error);
+        }
+        std::process::exit(1);
+    }
+    std::process::exit(0);
 }

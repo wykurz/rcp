@@ -4,7 +4,7 @@ extern crate log;
 use anyhow::{Context, Result};
 use structopt::StructOpt;
 
-#[derive(StructOpt, Debug)]
+#[derive(StructOpt, Debug, Clone)]
 #[structopt(name = "rcp")]
 struct Args {
     /// Overwrite existing files/directories
@@ -136,34 +136,10 @@ async fn async_main(args: Args) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::from_args();
-    let quiet = args.quiet;
-    if !quiet {
-        env_logger::Builder::new()
-            .filter_level(match args.verbose {
-                0 => log::LevelFilter::Error,
-                1 => log::LevelFilter::Info,
-                2 => log::LevelFilter::Debug,
-                _ => log::LevelFilter::Trace,
-            })
-            .init();
-    } else {
-        assert!(
-            args.verbose == 0,
-            "Quiet mode and verbose mode are mutually exclusive"
-        );
-    }
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder.enable_all();
-    if args.max_workers > 0 {
-        builder.worker_threads(args.max_workers);
-    }
-    let runtime = builder.build().unwrap();
-    let res = runtime.block_on(async_main(args));
-    if let Err(error) = res {
-        if !quiet {
-            eprintln!("{}", error);
-        }
-        std::process::exit(1);
-    }
-    std::process::exit(0);
+    let func = {
+        let args = args.clone();
+        || async_main(args)
+    };
+    common::run(args.quiet, args.verbose, args.max_workers, func)?;
+    Ok(())
 }
