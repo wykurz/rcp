@@ -62,7 +62,7 @@ async fn async_main(args: Args) -> Result<()> {
                 let src_path = std::path::PathBuf::from(src);
                 let src_file = src_path
                     .file_name()
-                    .context(format!("Source {:?} is not a file", &src_path))
+                    .context(format!("source {:?} is not a file", &src_path))
                     .unwrap();
                 (src_path.to_owned(), dst_dir.join(src_file))
             })
@@ -97,7 +97,7 @@ async fn async_main(args: Args) -> Result<()> {
                     }
                 } else {
                     return Err(anyhow::anyhow!(
-                        "Destination {:?} already exists, use --overwrite to overwrite",
+                        "destination {:?} already exists, use --overwrite to overwrite",
                         dst_path
                     ));
                 }
@@ -117,14 +117,18 @@ async fn async_main(args: Args) -> Result<()> {
         };
         join_set.spawn(do_copy());
     }
-    let mut errors = vec![];
+    let mut success = true;
     while let Some(res) = join_set.join_next().await {
         if let Err(error) = res? {
-            errors.push(error);
+            log::error!("{}", &error);
+            if args.fail_early {
+                return Err(error);
+            }
+            success = false;
         }
     }
-    if !errors.is_empty() {
-        return Err(anyhow::anyhow!("{:?}", &errors));
+    if !success {
+        return Err(anyhow::anyhow!("rcp encountered errors"));
     }
     Ok(())
 }

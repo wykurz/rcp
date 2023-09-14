@@ -3,7 +3,6 @@ use async_recursion::async_recursion;
 use nix::sys::time::TimeValLike;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
-use std::vec;
 
 use crate::progress;
 
@@ -29,7 +28,7 @@ async fn set_owner_and_time(dst: &std::path::Path, metadata: &std::fs::Metadata)
             &mtime,
             nix::sys::stat::UtimensatFlags::NoFollowSymlink,
         )
-        .with_context(|| format!("rcp: failed setting timestamps for {:?}", &dst))?;
+        .with_context(|| format!("failed setting timestamps for {:?}", &dst))?;
         // set user and group - set those last, if those fail we at least have the timestamps set
         let uid = metadata.uid();
         let gid = metadata.gid();
@@ -42,7 +41,7 @@ async fn set_owner_and_time(dst: &std::path::Path, metadata: &std::fs::Metadata)
         )
         .with_context(|| {
             format!(
-                "rcp: cannot set {:?} owner to {} and/or group id to {}",
+                "cannot set {:?} owner to {} and/or group id to {}",
                 &dst, &uid, &gid
             )
         })
@@ -59,18 +58,18 @@ async fn copy_file(
 ) -> Result<()> {
     let mut reader = tokio::fs::File::open(src)
         .await
-        .with_context(|| format!("rcp: cannot open {:?} for reading", src))?;
+        .with_context(|| format!("cannot open {:?} for reading", src))?;
     let mut buf_reader = tokio::io::BufReader::with_capacity(settings.read_buffer, &mut reader);
     let mut writer = tokio::fs::File::create(dst)
         .await
-        .with_context(|| format!("rcp: cannot open {:?} for writing", dst))?;
+        .with_context(|| format!("cannot open {:?} for writing", dst))?;
     tokio::io::copy_buf(&mut buf_reader, &mut writer)
         .await
-        .with_context(|| format!("rcp: failed copying data to {:?}", &dst))?;
+        .with_context(|| format!("failed copying data to {:?}", &dst))?;
     let src_metadata = reader
         .metadata()
         .await
-        .with_context(|| format!("rcp: failed reading metadata from {:?}", &src))?;
+        .with_context(|| format!("failed reading metadata from {:?}", &src))?;
     let permissions = if settings.preserve {
         src_metadata.permissions()
     } else {
@@ -80,12 +79,7 @@ async fn copy_file(
     writer
         .set_permissions(permissions.clone())
         .await
-        .with_context(|| {
-            format!(
-                "rcp: cannot set {:?} permissions to {:?}",
-                &dst, &permissions
-            )
-        })?;
+        .with_context(|| format!("cannot set {:?} permissions to {:?}", &dst, &permissions))?;
     if settings.preserve {
         // modify the uid and gid of the file as well
         set_owner_and_time(dst, &src_metadata).await?;
@@ -104,17 +98,17 @@ pub async fn copy(
     let _guard = prog_track.guard();
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
-        .with_context(|| format!("rcp: failed reading metadata from {:?}", &src))?;
+        .with_context(|| format!("failed reading metadata from {:?}", &src))?;
     if src_metadata.is_file() || (src_metadata.is_symlink() && settings.dereference) {
         return copy_file(src, dst, settings).await;
     }
     if src_metadata.is_symlink() {
         let link = tokio::fs::read_link(src)
             .await
-            .with_context(|| format!("rcp: failed reading symlink {:?}", &src))?;
+            .with_context(|| format!("failed reading symlink {:?}", &src))?;
         tokio::fs::symlink(link, dst)
             .await
-            .with_context(|| format!("rcp: failed creating symlink {:?}", &dst))?;
+            .with_context(|| format!("failed creating symlink {:?}", &dst))?;
         if settings.preserve {
             set_owner_and_time(dst, &src_metadata).await?;
         }
@@ -123,16 +117,16 @@ pub async fn copy(
     assert!(src_metadata.is_dir());
     let mut entries = tokio::fs::read_dir(src)
         .await
-        .with_context(|| format!("rcp: cannot open directory {:?} for reading", src))?;
+        .with_context(|| format!("cannot open directory {:?} for reading", src))?;
     tokio::fs::create_dir(dst)
         .await
-        .with_context(|| format!("rcp: cannot create directory {:?}", dst))?;
+        .with_context(|| format!("cannot create directory {:?}", dst))?;
     let mut join_set = tokio::task::JoinSet::new();
-    let mut errors = vec![];
+    let mut success = true;
     while let Some(entry) = entries
         .next_entry()
         .await
-        .with_context(|| format!("rcp: failed traversing directory {:?}", &dst))?
+        .with_context(|| format!("failed traversing directory {:?}", &dst))?
     {
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
@@ -143,15 +137,15 @@ pub async fn copy(
     }
     while let Some(res) = join_set.join_next().await {
         if let Err(error) = res? {
+            error!("copy: {:?} -> {:?} failed with: {}", src, dst, &error);
             if settings.fail_early {
                 return Err(error);
             }
-            errors.push(error);
+            success = false;
         }
     }
-    if !errors.is_empty() {
-        debug!("copy: {:?} -> {:?} failed with: {:?}", src, dst, &errors);
-        return Err(anyhow::anyhow!("{:?}", &errors));
+    if !success {
+        return Err(anyhow::anyhow!("copy: {:?} -> {:?} failed!", src, dst));
     }
     let permissions = if settings.preserve {
         src_metadata.permissions()
@@ -161,12 +155,7 @@ pub async fn copy(
     };
     tokio::fs::set_permissions(dst, permissions.clone())
         .await
-        .with_context(|| {
-            format!(
-                "rcp: cannot set {:?} permissions to {:?}",
-                &dst, &permissions
-            )
-        })?;
+        .with_context(|| format!("cannot set {:?} permissions to {:?}", &dst, &permissions))?;
     if settings.preserve {
         set_owner_and_time(dst, &src_metadata).await?;
     }
@@ -423,7 +412,7 @@ mod tests {
         for f in vec![dst1, dst2] {
             let metadata = tokio::fs::symlink_metadata(f)
                 .await
-                .with_context(|| format!("rcp: failed reading metadata from {:?}", &f))?;
+                .with_context(|| format!("failed reading metadata from {:?}", &f))?;
             assert!(metadata.is_file());
             // check that the permissions are the same as the source file modulo no sticky bit, setuid and setgid
             assert_eq!(metadata.permissions().mode() & 0o777, test_mode);

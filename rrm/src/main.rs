@@ -38,14 +38,18 @@ async fn async_main(args: Args) -> Result<()> {
         let do_rm = || async move { common::rm(args.progress, &path, &settings).await };
         join_set.spawn(do_rm());
     }
-    let mut errors = vec![];
+    let mut success = true;
     while let Some(res) = join_set.join_next().await {
         if let Err(error) = res? {
-            errors.push(error);
+            log::error!("{}", &error);
+            if args.fail_early {
+                return Err(error);
+            }
+            success = false;
         }
     }
-    if !errors.is_empty() {
-        return Err(anyhow::anyhow!("{:?}", &errors));
+    if !success {
+        return Err(anyhow::anyhow!("rrm encountered errors"));
     }
     Ok(())
 }
