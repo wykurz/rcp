@@ -112,6 +112,7 @@ where
 {
     if !quiet {
         env_logger::Builder::new()
+            .target(env_logger::Target::Stdout)
             .filter_level(match verbose {
                 0 => log::LevelFilter::Error,
                 1 => log::LevelFilter::Info,
