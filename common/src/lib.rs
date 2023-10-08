@@ -101,6 +101,21 @@ pub async fn rm(
     Ok(())
 }
 
+pub async fn link(
+    show_progress: bool,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    update: &Option<std::path::PathBuf>,
+    settings: &copy::Settings,
+) -> Result<()> {
+    let _progress = match show_progress {
+        true => Some(ProgressTracker::new("copy")),
+        false => None,
+    };
+    copy::link(&PROGRESS, src, dst, update, settings).await?;
+    Ok(())
+}
+
 pub fn run<Fut>(
     quiet: bool,
     verbose: u8,

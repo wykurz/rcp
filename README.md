@@ -62,3 +62,35 @@ OPTIONS:
 ARGS:
     <paths>...    Source path(s) and destination path
 ```
+
+rlink
+=====
+
+`rlink` allows hard-linking large number of files. A common pattern is to also provide the `--update <path>` that overrides any paths in `src` to intead be copied over from there.
+
+```
+rlink 0.1.0
+
+USAGE:
+    rlink [FLAGS] [OPTIONS] <src> <dst>
+
+FLAGS:
+    -L, --dereference    Always follow symbolic links in source
+    -e, --fail-early     Exit on first error
+    -h, --help           Prints help information
+    -p, --preserve       Preserve additional file attributes: file owner, group, setuid, setgid, mtime and atime
+    -p, --progress       Show progress
+    -q, --quiet          Quiet mode, don't report errors
+    -V, --version        Prints version information
+    -v, --verbose        Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+
+OPTIONS:
+        --max-workers <max-workers>    Number of worker threads, 0 means number of cores [default: 0]
+        --read-buffer <read-buffer>    File copy read buffer size [default: 128KiB]
+        --update <update>              Directory with updated contents of `link`
+
+ARGS:
+    <src>    Directory with contents we want to update into `dst`
+    <dst>    Directory where we put either a hard-link of a file from `link` if it was unchanged, or a copy of a
+             file from `new` if it's been modified
+```

@@ -1,0 +1,13 @@
+[package]
+name = "rlink"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+bytesize = "1.2"
+common = { path = "../common" }
+env_logger = "0.10"
+log = "0.4"
+structopt = "0.3"
+tokio = { version = "1.29", features = ["full", "parking_lot"] }

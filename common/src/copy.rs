@@ -126,7 +126,7 @@ pub async fn copy(
     while let Some(entry) = entries
         .next_entry()
         .await
-        .with_context(|| format!("failed traversing directory {:?}", &dst))?
+        .with_context(|| format!("failed traversing directory {:?}", &src))?
     {
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
@@ -164,7 +164,7 @@ pub async fn copy(
 }
 
 #[cfg(test)]
-mod tests {
+mod copy_tests {
     use crate::testutils;
     use anyhow::Context;
     use test_log::test;
@@ -505,6 +505,298 @@ mod tests {
             },
         )
         .await?;
+        Ok(())
+    }
+}
+
+// check if two files are identical
+fn is_unchanged(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
+    md1.atime_nsec() == md2.atime_nsec()
+        && md1.mtime_nsec() == md2.mtime_nsec()
+        && md1.permissions() == md2.permissions()
+        && md1.uid() == md2.uid()
+        && md1.gid() == md2.gid()
+}
+
+#[async_recursion]
+pub async fn link(
+    prog_track: &'static progress::TlsProgress,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    update: &Option<std::path::PathBuf>,
+    settings: &Settings,
+) -> Result<()> {
+    debug!("link: {:?} {:?} -> {:?}", src, update, dst);
+    let _guard = prog_track.guard();
+    let src_metadata = tokio::fs::symlink_metadata(src)
+        .await
+        .with_context(|| format!("failed reading metadata from {:?}", &src))?;
+    let update_metadata_opt = match update {
+        Some(update) => {
+            let update_metadata_res = tokio::fs::symlink_metadata(update).await;
+            match update_metadata_res {
+                Ok(update_metadata) => Some(update_metadata),
+                Err(error) => {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        None
+                    } else {
+                        return Err(error).with_context(|| {
+                            format!("failed reading metadata from {:?}", &update)
+                        });
+                    }
+                }
+            }
+        }
+        None => None,
+    };
+    if let Some(update_metadata) = update_metadata_opt.as_ref() {
+        let update = update.as_ref().unwrap();
+        if src_metadata.file_type() != update_metadata.file_type() {
+            // file type changed, just copy the updated one
+            return copy(prog_track, update, dst, settings).await;
+        }
+        if update_metadata.is_file() {
+            // check if the file is unchanged and if so hard-link, otherwise copy from the updated one
+            if is_unchanged(&src_metadata, update_metadata) {
+                tokio::fs::hard_link(src, dst).await?;
+            } else {
+                copy_file(update, dst, settings).await?;
+            }
+            return Ok(());
+        }
+        if update_metadata.is_symlink() {
+            // just symlink the updated one, no need to check if it's changed
+            let update_symlink = tokio::fs::read_link(update)
+                .await
+                .with_context(|| format!("failed reading symlink {:?}", &update))?;
+            tokio::fs::symlink(update_symlink, dst)
+                .await
+                .with_context(|| format!("failed creating symlink {:?}", &dst))?;
+            return Ok(());
+        }
+    } else {
+        // update hasn't been specified, if this is a file just hard-link the source or symlink if it's a symlink
+        if src_metadata.is_file() {
+            tokio::fs::hard_link(src, dst).await?;
+            return Ok(());
+        }
+        if src_metadata.is_symlink() {
+            let src_symlink = tokio::fs::read_link(src)
+                .await
+                .with_context(|| format!("failed reading symlink {:?}", &src))?;
+            tokio::fs::symlink(src_symlink, dst)
+                .await
+                .with_context(|| format!("failed creating symlink {:?}", &dst))?;
+            return Ok(());
+        }
+    }
+    assert!(src_metadata.is_dir());
+    assert!(update_metadata_opt.is_none() || update_metadata_opt.as_ref().unwrap().is_dir());
+    let mut src_entries = tokio::fs::read_dir(src)
+        .await
+        .with_context(|| format!("cannot open directory {:?} for reading", src))?;
+    tokio::fs::create_dir(dst)
+        .await
+        .with_context(|| format!("cannot create directory {:?}", dst))?;
+    let mut join_set = tokio::task::JoinSet::new();
+    let mut success = true;
+    // iterate through src entries and recursively call "link" on each one
+    while let Some(src_entry) = src_entries
+        .next_entry()
+        .await
+        .with_context(|| format!("failed traversing directory {:?}", &src))?
+    {
+        let entry_path = src_entry.path();
+        let entry_name = entry_path.file_name().unwrap();
+        let dst_path = dst.join(entry_name);
+        let update_path = update.as_ref().map(|s| s.join(entry_name));
+        let settings = settings.clone();
+        let do_copy = || async move {
+            link(prog_track, &entry_path, &dst_path, &update_path, &settings).await
+        };
+        join_set.spawn(do_copy());
+    }
+    // only process update if it the path was provided and the directory is present
+    if update_metadata_opt.is_some() {
+        let update = update.as_ref().unwrap();
+        let mut update_entries = tokio::fs::read_dir(update)
+            .await
+            .with_context(|| format!("cannot open directory {:?} for reading", &update))?;
+        // iterate through update entries and for each one that's not present in src call "copy"
+        while let Some(update_entry) = update_entries
+            .next_entry()
+            .await
+            .with_context(|| format!("failed traversing directory {:?}", &update))?
+        {
+            let entry_path = update_entry.path();
+            let entry_name = entry_path.file_name().unwrap();
+            let src_path = src.join(entry_name);
+            let dst_path = dst.join(entry_name);
+            let update_path = update.join(entry_name);
+            let settings = settings.clone();
+            let do_copy = || async move {
+                if tokio::fs::symlink_metadata(src_path).await.is_ok() {
+                    // we already must have considered this file, skip it
+                    return Ok(());
+                }
+                copy(prog_track, &update_path, &dst_path, &settings).await
+            };
+            join_set.spawn(do_copy());
+        }
+    }
+    while let Some(res) = join_set.join_next().await {
+        if let Err(error) = res? {
+            error!(
+                "link: {:?} {:?} -> {:?} failed with: {}",
+                src, update, dst, &error
+            );
+            if settings.fail_early {
+                return Err(error);
+            }
+            success = false;
+        }
+    }
+    if !success {
+        return Err(anyhow::anyhow!(
+            "link: {:?} {:?} -> {:?} failed!",
+            src,
+            update,
+            dst
+        ));
+    }
+    let preserve_metadata = if let Some(update_metadata) = update_metadata_opt.as_ref() {
+        update_metadata
+    } else {
+        &src_metadata
+    };
+    let permissions = if settings.preserve {
+        preserve_metadata.permissions()
+    } else {
+        // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
+        std::fs::Permissions::from_mode(preserve_metadata.permissions().mode() & 0o0777)
+    };
+    tokio::fs::set_permissions(dst, permissions.clone())
+        .await
+        .with_context(|| format!("cannot set {:?} permissions to {:?}", &dst, &permissions))?;
+    if settings.preserve {
+        set_owner_and_time(dst, preserve_metadata).await?;
+    }
+    debug!("link: {:?} {:?} -> {:?} succeeded!", src, update, dst);
+    Ok(())
+}
+
+#[cfg(test)]
+mod link_tests {
+    use crate::testutils;
+    use test_log::test;
+
+    use super::*;
+
+    lazy_static! {
+        static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
+    }
+
+    const COMMON_SETTINGS: Settings = Settings {
+        preserve: false,
+        read_buffer: 10,
+        dereference: false,
+        fail_early: false,
+    };
+
+    #[test(tokio::test)]
+    async fn check_basic_link() -> Result<()> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        link(
+            &PROGRESS,
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            &None,
+            &COMMON_SETTINGS,
+        )
+        .await?;
+        testutils::check_dirs_identical(&test_path.join("foo"), &test_path.join("bar"), false)
+            .await?;
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn check_basic_link_update() -> Result<()> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        link(
+            &PROGRESS,
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            &Some(test_path.join("foo")),
+            &COMMON_SETTINGS,
+        )
+        .await?;
+        testutils::check_dirs_identical(&test_path.join("foo"), &test_path.join("bar"), false)
+            .await?;
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn check_basic_link_empty_src() -> Result<()> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        tokio::fs::create_dir(tmp_dir.join("baz")).await?;
+        let test_path = tmp_dir.as_path();
+        link(
+            &PROGRESS,
+            &test_path.join("baz"), // empty source
+            &test_path.join("bar"),
+            &Some(test_path.join("foo")),
+            &COMMON_SETTINGS,
+        )
+        .await?;
+        testutils::check_dirs_identical(&test_path.join("foo"), &test_path.join("bar"), false)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn setup_update_dir(tmp_dir: &std::path::PathBuf) -> Result<()> {
+        // update
+        // |- 0.txt
+        // |- bar
+        //    |- 1.txt
+        //    |- 2.txt -> ../0.txt
+        let foo_path = tmp_dir.join("update");
+        tokio::fs::create_dir(&foo_path).await.unwrap();
+        tokio::fs::write(foo_path.join("0.txt"), "0").await.unwrap();
+        let bar_path = foo_path.join("bar");
+        tokio::fs::create_dir(&bar_path).await.unwrap();
+        tokio::fs::write(bar_path.join("1.txt"), "1").await.unwrap();
+        tokio::fs::symlink("../1.txt", bar_path.join("2.txt"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn check_link_update1() -> Result<()> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        setup_update_dir(&tmp_dir).await?;
+        let test_path = tmp_dir.as_path();
+        link(
+            &PROGRESS,
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            &Some(test_path.join("update")),
+            &COMMON_SETTINGS,
+        )
+        .await?;
+        // compare subset of src and dst
+        testutils::check_dirs_identical(
+            &test_path.join("foo").join("baz"),
+            &test_path.join("bar").join("baz"),
+            false,
+        )
+        .await?;
+        // compare update and dst
+        testutils::check_dirs_identical(&test_path.join("update"), &test_path.join("bar"), false)
+            .await?;
         Ok(())
     }
 }

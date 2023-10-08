@@ -5,6 +5,7 @@ members = [
   "common",
   "filegen",
   "rcp",
+  "rlink",
   "rrm",
 ]
 
