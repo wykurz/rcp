@@ -572,6 +572,9 @@ pub async fn link(
             tokio::fs::symlink(update_symlink, dst)
                 .await
                 .with_context(|| format!("failed creating symlink {:?}", &dst))?;
+            if settings.preserve {
+                set_owner_and_time(dst, update_metadata).await?;
+            }
             return Ok(());
         }
     } else {
@@ -587,6 +590,9 @@ pub async fn link(
             tokio::fs::symlink(src_symlink, dst)
                 .await
                 .with_context(|| format!("failed creating symlink {:?}", &dst))?;
+            if settings.preserve {
+                set_owner_and_time(dst, &src_metadata).await?;
+            }
             return Ok(());
         }
     }
@@ -763,10 +769,14 @@ mod link_tests {
         //    |- 2.txt -> ../0.txt
         let foo_path = tmp_dir.join("update");
         tokio::fs::create_dir(&foo_path).await.unwrap();
-        tokio::fs::write(foo_path.join("0.txt"), "0").await.unwrap();
+        tokio::fs::write(foo_path.join("0.txt"), "0-new")
+            .await
+            .unwrap();
         let bar_path = foo_path.join("bar");
         tokio::fs::create_dir(&bar_path).await.unwrap();
-        tokio::fs::write(bar_path.join("1.txt"), "1").await.unwrap();
+        tokio::fs::write(bar_path.join("1.txt"), "1-new")
+            .await
+            .unwrap();
         tokio::fs::symlink("../1.txt", bar_path.join("2.txt"))
             .await
             .unwrap();
@@ -775,7 +785,7 @@ mod link_tests {
     }
 
     #[test(tokio::test)]
-    async fn check_link_update1() -> Result<()> {
+    async fn check_link_update() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         setup_update_dir(&tmp_dir).await?;
         let test_path = tmp_dir.as_path();
@@ -796,6 +806,35 @@ mod link_tests {
         .await?;
         // compare update and dst
         testutils::check_dirs_identical(&test_path.join("update"), &test_path.join("bar"), false)
+            .await?;
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn check_link_update_preserve() -> Result<()> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        setup_update_dir(&tmp_dir).await?;
+        let test_path = tmp_dir.as_path();
+        let mut settings = COMMON_SETTINGS.clone();
+        settings.preserve = true;
+        link(
+            &PROGRESS,
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            &Some(test_path.join("update")),
+            &settings,
+        )
+        .await?;
+        // compare subset of src and dst
+        testutils::check_dirs_identical(
+            &test_path.join("foo").join("baz"),
+            &test_path.join("bar").join("baz"),
+            true,
+        )
+        .await?;
+        // compare update and dst
+        testutils::check_dirs_identical(&test_path.join("update"), &test_path.join("bar"), true)
             .await?;
         Ok(())
     }
