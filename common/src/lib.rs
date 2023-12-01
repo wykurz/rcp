@@ -120,6 +120,7 @@ pub fn run<Fut>(
     quiet: bool,
     verbose: u8,
     max_workers: usize,
+    max_blocking_threads: usize,
     func: impl FnOnce() -> Fut,
 ) -> Result<()>
 where
@@ -145,6 +146,9 @@ where
     builder.enable_all();
     if max_workers > 0 {
         builder.worker_threads(max_workers);
+    }
+    if max_blocking_threads > 0 {
+        builder.max_blocking_threads(max_blocking_threads);
     }
     if !sysinfo::set_open_files_limit(isize::MAX) {
         info!("Failed to update the open files limit (expeted on non-linux targets)");

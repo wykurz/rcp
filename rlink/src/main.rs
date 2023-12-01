@@ -44,6 +44,10 @@ struct Args {
     #[structopt(long, default_value = "0")]
     max_workers: usize,
 
+    /// Number of blocking worker threads, 0 means Tokio runtime default (512)
+    #[structopt(long, default_value = "0")]
+    max_blocking_threads: usize,
+
     /// File copy read buffer size
     #[structopt(long, default_value = "128KiB")]
     read_buffer: String,
@@ -94,6 +98,12 @@ fn main() -> Result<()> {
         let args = args.clone();
         || async_main(args)
     };
-    common::run(args.quiet, args.verbose, args.max_workers, func)?;
+    common::run(
+        args.quiet,
+        args.verbose,
+        args.max_workers,
+        args.max_blocking_threads,
+        func,
+    )?;
     Ok(())
 }
