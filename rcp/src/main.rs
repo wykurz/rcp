@@ -107,7 +107,6 @@ async fn async_main(args: Args) -> Result<()> {
                 }
             }
             common::copy(
-                args.progress,
                 &src_path,
                 &dst_path,
                 &common::CopySettings {
@@ -144,6 +143,7 @@ fn main() -> Result<()> {
         || async_main(args)
     };
     common::run(
+        if args.progress { Some("copy") } else { None },
         args.quiet,
         args.verbose,
         args.max_workers,

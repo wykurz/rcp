@@ -78,7 +78,6 @@ async fn async_main(args: Args) -> Result<()> {
         .unwrap()
         .as_u64() as usize;
     common::link(
-        args.progress,
         &args.src,
         &args.dst,
         &args.update,
@@ -99,6 +98,7 @@ fn main() -> Result<()> {
         || async_main(args)
     };
     common::run(
+        if args.progress { Some("rlink") } else { None },
         args.quiet,
         args.verbose,
         args.max_workers,

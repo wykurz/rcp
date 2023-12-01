@@ -39,7 +39,7 @@ async fn async_main(args: Args) -> Result<()> {
         let settings = common::RmSettings {
             fail_early: args.fail_early,
         };
-        let do_rm = || async move { common::rm(args.progress, &path, &settings).await };
+        let do_rm = || async move { common::rm(&path, &settings).await };
         join_set.spawn(do_rm());
     }
     let mut success = true;
@@ -65,6 +65,7 @@ fn main() -> Result<()> {
         || async_main(args)
     };
     common::run(
+        if args.progress { Some("rm") } else { None },
         args.quiet,
         args.verbose,
         args.max_workers,

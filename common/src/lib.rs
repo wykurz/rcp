@@ -75,48 +75,31 @@ impl Drop for ProgressTracker {
 }
 
 pub async fn copy(
-    show_progress: bool,
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &copy::Settings,
 ) -> Result<()> {
-    let _progress = match show_progress {
-        true => Some(ProgressTracker::new("copy")),
-        false => None,
-    };
     copy::copy(&PROGRESS, src, dst, settings).await?;
     Ok(())
 }
 
-pub async fn rm(
-    show_progress: bool,
-    path: &std::path::Path,
-    settings: &rm::Settings,
-) -> Result<()> {
-    let _progress = match show_progress {
-        true => Some(ProgressTracker::new("remove")),
-        false => None,
-    };
+pub async fn rm(path: &std::path::Path, settings: &rm::Settings) -> Result<()> {
     rm::rm(&PROGRESS, path, settings).await?;
     Ok(())
 }
 
 pub async fn link(
-    show_progress: bool,
     src: &std::path::Path,
     dst: &std::path::Path,
     update: &Option<std::path::PathBuf>,
     settings: &copy::Settings,
 ) -> Result<()> {
-    let _progress = match show_progress {
-        true => Some(ProgressTracker::new("copy")),
-        false => None,
-    };
     copy::link(&PROGRESS, src, dst, update, settings).await?;
     Ok(())
 }
 
 pub fn run<Fut>(
+    progress_op_name: Option<&str>,
     quiet: bool,
     verbose: u8,
     max_workers: usize,
@@ -126,6 +109,7 @@ pub fn run<Fut>(
 where
     Fut: Future<Output = Result<()>>,
 {
+    let _progress = progress_op_name.map(ProgressTracker::new);
     if !quiet {
         env_logger::Builder::new()
             .target(env_logger::Target::Stdout)
