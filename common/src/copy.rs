@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
-use nix::sys::time::TimeValLike;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
 
@@ -19,8 +18,8 @@ async fn set_owner_and_time(dst: &std::path::Path, metadata: &std::fs::Metadata)
     let metadata = metadata.to_owned();
     tokio::task::spawn_blocking(move || -> Result<()> {
         // set timestamps first - those are unlikely to fail
-        let atime = nix::sys::time::TimeSpec::nanoseconds(metadata.atime_nsec());
-        let mtime = nix::sys::time::TimeSpec::nanoseconds(metadata.mtime_nsec());
+        let atime = nix::sys::time::TimeSpec::new(metadata.atime(), metadata.atime_nsec());
+        let mtime = nix::sys::time::TimeSpec::new(metadata.mtime(), metadata.mtime_nsec());
         nix::sys::stat::utimensat(
             None,
             &dst,
