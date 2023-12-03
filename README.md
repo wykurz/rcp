@@ -72,7 +72,7 @@ ARGS:
 rlink
 =====
 
-`rlink` allows hard-linking large number of files. A common pattern is to also provide the `--update <path>` that overrides any paths in `src` to intead be copied over from there.
+`rlink` allows hard-linking large number of files. A common pattern is to also provide `--update <path>` that overrides any paths in `src` to instead be copied over from there.
 
 ```
 rlink 0.1.0
