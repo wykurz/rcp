@@ -563,6 +563,13 @@ pub async fn link(
         let update = update.as_ref().unwrap();
         if src_metadata.file_type() != update_metadata.file_type() {
             // file type changed, just copy the updated one
+            debug!(
+                "link: file type of {:?} ({:?}) and {:?} ({:?}) differs - copying from update",
+                src,
+                src_metadata.file_type(),
+                update,
+                update_metadata.file_type()
+            );
             return copy(prog_track, update, dst, settings).await;
         }
         if update_metadata.is_file() {
