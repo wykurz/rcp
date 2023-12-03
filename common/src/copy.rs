@@ -557,6 +557,10 @@ pub async fn link(
             if is_unchanged(&src_metadata, update_metadata) {
                 tokio::fs::hard_link(src, dst).await?;
             } else {
+                debug!(
+                    "link: {:?} metadata has changed, copying from {:?}",
+                    src, update
+                );
                 copy_file(update, dst, settings).await?;
             }
             return Ok(());
