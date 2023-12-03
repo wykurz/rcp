@@ -627,10 +627,10 @@ pub async fn link(
         let dst_path = dst.join(entry_name);
         let update_path = update.as_ref().map(|s| s.join(entry_name));
         let settings = settings.clone();
-        let do_copy = || async move {
+        let do_link = || async move {
             link(prog_track, &entry_path, &dst_path, &update_path, &settings).await
         };
-        join_set.spawn(do_copy());
+        join_set.spawn(do_link());
     }
     // only process update if it the path was provided and the directory is present
     if update_metadata_opt.is_some() {
@@ -731,8 +731,12 @@ mod link_tests {
             &COMMON_SETTINGS,
         )
         .await?;
-        testutils::check_dirs_identical(&test_path.join("foo"), &test_path.join("bar"), false)
-            .await?;
+        testutils::check_dirs_identical(
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            testutils::FileEqualityCheck::Basic,
+        )
+        .await?;
         Ok(())
     }
 
@@ -748,8 +752,12 @@ mod link_tests {
             &COMMON_SETTINGS,
         )
         .await?;
-        testutils::check_dirs_identical(&test_path.join("foo"), &test_path.join("bar"), false)
-            .await?;
+        testutils::check_dirs_identical(
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            testutils::FileEqualityCheck::Basic,
+        )
+        .await?;
         Ok(())
     }
 
@@ -766,8 +774,12 @@ mod link_tests {
             &COMMON_SETTINGS,
         )
         .await?;
-        testutils::check_dirs_identical(&test_path.join("foo"), &test_path.join("bar"), false)
-            .await?;
+        testutils::check_dirs_identical(
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            testutils::FileEqualityCheck::Basic,
+        )
+        .await?;
         Ok(())
     }
 
@@ -799,24 +811,30 @@ mod link_tests {
         let tmp_dir = testutils::setup_test_dir().await?;
         setup_update_dir(&tmp_dir).await?;
         let test_path = tmp_dir.as_path();
+        let mut settings = COMMON_SETTINGS.clone();
+        settings.preserve = true;
         link(
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Some(test_path.join("update")),
-            &COMMON_SETTINGS,
+            &settings,
         )
         .await?;
         // compare subset of src and dst
         testutils::check_dirs_identical(
             &test_path.join("foo").join("baz"),
             &test_path.join("bar").join("baz"),
-            false,
+            testutils::FileEqualityCheck::HardLink,
         )
         .await?;
         // compare update and dst
-        testutils::check_dirs_identical(&test_path.join("update"), &test_path.join("bar"), false)
-            .await?;
+        testutils::check_dirs_identical(
+            &test_path.join("update"),
+            &test_path.join("bar"),
+            testutils::FileEqualityCheck::Timestamp,
+        )
+        .await?;
         Ok(())
     }
 
@@ -840,12 +858,16 @@ mod link_tests {
         testutils::check_dirs_identical(
             &test_path.join("foo").join("baz"),
             &test_path.join("bar").join("baz"),
-            true,
+            testutils::FileEqualityCheck::HardLink,
         )
         .await?;
         // compare update and dst
-        testutils::check_dirs_identical(&test_path.join("update"), &test_path.join("bar"), true)
-            .await?;
+        testutils::check_dirs_identical(
+            &test_path.join("update"),
+            &test_path.join("bar"),
+            testutils::FileEqualityCheck::Timestamp,
+        )
+        .await?;
         Ok(())
     }
 }

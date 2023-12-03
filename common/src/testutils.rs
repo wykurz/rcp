@@ -55,11 +55,18 @@ pub async fn setup_test_dir() -> Result<std::path::PathBuf> {
     Ok(tmp_dir)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileEqualityCheck {
+    Basic,
+    Timestamp,
+    HardLink,
+}
+
 #[async_recursion]
 pub async fn check_dirs_identical(
     src: &std::path::Path,
     dst: &std::path::Path,
-    check_times: bool,
+    file_eqality_check: FileEqualityCheck,
 ) -> Result<()> {
     let mut src_entries = tokio::fs::read_dir(src).await?;
     while let Some(src_entry) = src_entries.next_entry().await? {
@@ -78,19 +85,23 @@ pub async fn check_dirs_identical(
         // compare file type and content
         assert_eq!(src_md.file_type(), dst_md.file_type());
         if src_md.is_file() {
-            let src_contents = tokio::fs::read_to_string(&src_entry_path).await?;
-            let dst_contents = tokio::fs::read_to_string(&dst_entry_path).await?;
-            assert_eq!(src_contents, dst_contents);
+            if file_eqality_check == FileEqualityCheck::HardLink {
+                assert_eq!(src_md.ino(), dst_md.ino());
+            } else {
+                let src_contents = tokio::fs::read_to_string(&src_entry_path).await?;
+                let dst_contents = tokio::fs::read_to_string(&dst_entry_path).await?;
+                assert_eq!(src_contents, dst_contents);
+            }
         } else if src_md.file_type().is_symlink() {
             let src_link = tokio::fs::read_link(&src_entry_path).await?;
             let dst_link = tokio::fs::read_link(&dst_entry_path).await?;
             assert_eq!(src_link, dst_link);
         } else {
-            check_dirs_identical(&src_entry_path, &dst_entry_path, check_times).await?;
+            check_dirs_identical(&src_entry_path, &dst_entry_path, file_eqality_check).await?;
         }
         // compare permissions
         assert_eq!(src_md.permissions(), dst_md.permissions());
-        if !check_times {
+        if file_eqality_check != FileEqualityCheck::Timestamp {
             continue;
         }
         // compare timestamps
