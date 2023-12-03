@@ -490,7 +490,8 @@ fn is_file_type_same(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
 }
 
 fn is_unchanged(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
-    if md1.atime() != md2.atime()
+    if md1.size() != md2.size()
+        || md1.atime() != md2.atime()
         || md1.mtime() != md2.mtime()
         || md1.permissions() != md2.permissions()
         || md1.uid() != md2.uid()
