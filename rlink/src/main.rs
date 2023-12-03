@@ -12,10 +12,6 @@ struct Args {
     #[structopt(short, long)]
     progress: bool,
 
-    /// Preserve additional file attributes: file owner, group, setuid, setgid, mtime and atime
-    #[structopt(short, long)]
-    preserve: bool,
-
     /// Always follow symbolic links in source
     #[structopt(short = "-L", long)]
     dereference: bool,
@@ -82,7 +78,7 @@ async fn async_main(args: Args) -> Result<()> {
         &args.dst,
         &args.update,
         &common::CopySettings {
-            preserve: args.preserve,
+            preserve: true, // ALWAYS preserve metadata
             read_buffer,
             dereference: args.dereference,
             fail_early: args.fail_early,

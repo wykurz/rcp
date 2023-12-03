@@ -484,9 +484,9 @@ mod copy_tests {
 fn is_file_type_same(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
     let ft1 = md1.file_type();
     let ft2 = md2.file_type();
-    return ft1.is_dir() == ft2.is_dir()
+    ft1.is_dir() == ft2.is_dir()
         && ft1.is_file() == ft2.is_file()
-        && ft1.is_symlink() == ft2.is_symlink();
+        && ft1.is_symlink() == ft2.is_symlink()
 }
 
 fn is_unchanged(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
@@ -700,7 +700,7 @@ mod link_tests {
     }
 
     const COMMON_SETTINGS: Settings = Settings {
-        preserve: false,
+        preserve: true,
         read_buffer: 10,
         dereference: false,
         fail_early: false,
@@ -721,7 +721,7 @@ mod link_tests {
         testutils::check_dirs_identical(
             &test_path.join("foo"),
             &test_path.join("bar"),
-            testutils::FileEqualityCheck::Basic,
+            testutils::FileEqualityCheck::Timestamp,
         )
         .await?;
         Ok(())
@@ -742,7 +742,7 @@ mod link_tests {
         testutils::check_dirs_identical(
             &test_path.join("foo"),
             &test_path.join("bar"),
-            testutils::FileEqualityCheck::Basic,
+            testutils::FileEqualityCheck::Timestamp,
         )
         .await?;
         Ok(())
@@ -764,7 +764,7 @@ mod link_tests {
         testutils::check_dirs_identical(
             &test_path.join("foo"),
             &test_path.join("bar"),
-            testutils::FileEqualityCheck::Basic,
+            testutils::FileEqualityCheck::Timestamp,
         )
         .await?;
         Ok(())
@@ -798,47 +798,12 @@ mod link_tests {
         let tmp_dir = testutils::setup_test_dir().await?;
         setup_update_dir(&tmp_dir).await?;
         let test_path = tmp_dir.as_path();
-        let mut settings = COMMON_SETTINGS.clone();
-        settings.preserve = true;
         link(
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Some(test_path.join("update")),
-            &settings,
-        )
-        .await?;
-        // compare subset of src and dst
-        testutils::check_dirs_identical(
-            &test_path.join("foo").join("baz"),
-            &test_path.join("bar").join("baz"),
-            testutils::FileEqualityCheck::HardLink,
-        )
-        .await?;
-        // compare update and dst
-        testutils::check_dirs_identical(
-            &test_path.join("update"),
-            &test_path.join("bar"),
-            testutils::FileEqualityCheck::Timestamp,
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[test(tokio::test)]
-    async fn check_link_update_preserve() -> Result<()> {
-        let tmp_dir = testutils::setup_test_dir().await?;
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        setup_update_dir(&tmp_dir).await?;
-        let test_path = tmp_dir.as_path();
-        let mut settings = COMMON_SETTINGS.clone();
-        settings.preserve = true;
-        link(
-            &PROGRESS,
-            &test_path.join("foo"),
-            &test_path.join("bar"),
-            &Some(test_path.join("update")),
-            &settings,
+            &COMMON_SETTINGS,
         )
         .await?;
         // compare subset of src and dst
