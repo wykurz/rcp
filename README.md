@@ -30,8 +30,11 @@ FLAGS:
     -v, --verbose        Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
 
 OPTIONS:
-        --max-workers <max-workers>    Number of worker threads, 0 means number of cores [default: 0]
-        --read-buffer <read-buffer>    File copy read buffer size [default: 128KiB]
+        --max-blocking-threads <max-blocking-threads>
+            Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
+
+        --max-workers <max-workers>                      Number of worker threads, 0 means number of cores [default: 0]
+        --read-buffer <read-buffer>                      File copy read buffer size [default: 128KiB]
 
 ARGS:
     <paths>...    Source path(s) and destination path
@@ -57,7 +60,10 @@ FLAGS:
     -v, --verbose       Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
 
 OPTIONS:
-        --max-workers <max-workers>    Number of worker threads, 0 means number of cores [default: 0]
+        --max-blocking-threads <max-blocking-threads>
+            Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
+
+        --max-workers <max-workers>                      Number of worker threads, 0 means number of cores [default: 0]
 
 ARGS:
     <paths>...    Source path(s) and destination path
@@ -78,16 +84,18 @@ FLAGS:
     -L, --dereference    Always follow symbolic links in source
     -e, --fail-early     Exit on first error
     -h, --help           Prints help information
-    -p, --preserve       Preserve additional file attributes: file owner, group, setuid, setgid, mtime and atime
     -p, --progress       Show progress
     -q, --quiet          Quiet mode, don't report errors
     -V, --version        Prints version information
     -v, --verbose        Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
 
 OPTIONS:
-        --max-workers <max-workers>    Number of worker threads, 0 means number of cores [default: 0]
-        --read-buffer <read-buffer>    File copy read buffer size [default: 128KiB]
-        --update <update>              Directory with updated contents of `link`
+        --max-blocking-threads <max-blocking-threads>
+            Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
+
+        --max-workers <max-workers>                      Number of worker threads, 0 means number of cores [default: 0]
+        --read-buffer <read-buffer>                      File copy read buffer size [default: 128KiB]
+        --update <update>                                Directory with updated contents of `link`
 
 ARGS:
     <src>    Directory with contents we want to update into `dst`
