@@ -174,57 +174,6 @@ mod copy_tests {
         static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
     }
 
-    #[async_recursion]
-    async fn check_dirs_identical(
-        src: &std::path::Path,
-        dst: &std::path::Path,
-        check_times: bool,
-    ) -> Result<()> {
-        let mut src_entries = tokio::fs::read_dir(src).await?;
-        while let Some(src_entry) = src_entries.next_entry().await? {
-            let src_entry_path = src_entry.path();
-            let src_entry_name = src_entry_path.file_name().unwrap();
-            let dst_entry_path = dst.join(src_entry_name);
-            let src_md = tokio::fs::symlink_metadata(&src_entry_path)
-                .await
-                .context(format!("Source file {:?} is missing!", &src_entry_path))?;
-            let dst_md = tokio::fs::symlink_metadata(&dst_entry_path)
-                .await
-                .context(format!(
-                    "Destination file {:?} is missing!",
-                    &dst_entry_path
-                ))?;
-            // compare file type and content
-            assert_eq!(src_md.file_type(), dst_md.file_type());
-            if src_md.is_file() {
-                let src_contents = tokio::fs::read_to_string(&src_entry_path).await?;
-                let dst_contents = tokio::fs::read_to_string(&dst_entry_path).await?;
-                assert_eq!(src_contents, dst_contents);
-            } else if src_md.file_type().is_symlink() {
-                let src_link = tokio::fs::read_link(&src_entry_path).await?;
-                let dst_link = tokio::fs::read_link(&dst_entry_path).await?;
-                assert_eq!(src_link, dst_link);
-            } else {
-                check_dirs_identical(&src_entry_path, &dst_entry_path, check_times).await?;
-            }
-            // compare permissions
-            assert_eq!(src_md.permissions(), dst_md.permissions());
-            if !check_times {
-                continue;
-            }
-            // compare timestamps
-            // NOTE: skip comparing "atime" - we read the file few times when comparing agaisnt "cp"
-            assert_eq!(
-                src_md.mtime_nsec(),
-                dst_md.mtime_nsec(),
-                "mtime doesn't match for {:?} {:?}",
-                src_entry_path,
-                dst_entry_path
-            );
-        }
-        Ok(())
-    }
-
     #[tokio::test]
     async fn check_basic_copy() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
@@ -241,7 +190,12 @@ mod copy_tests {
             },
         )
         .await?;
-        check_dirs_identical(&test_path.join("foo"), &test_path.join("bar"), false).await?;
+        testutils::check_dirs_identical(
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            testutils::FileEqualityCheck::Basic,
+        )
+        .await?;
         Ok(())
     }
 
@@ -283,7 +237,12 @@ mod copy_tests {
                 tokio::fs::remove_dir_all(fpath).await?;
             }
         }
-        check_dirs_identical(&test_path.join("foo"), &test_path.join("bar"), false).await?;
+        testutils::check_dirs_identical(
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            testutils::FileEqualityCheck::Basic,
+        )
+        .await?;
         Ok(())
     }
 
@@ -339,7 +298,12 @@ mod copy_tests {
             ),
         )
         .await?;
-        check_dirs_identical(&test_path.join("foo"), &test_path.join("bar"), false).await?;
+        testutils::check_dirs_identical(
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            testutils::FileEqualityCheck::Basic,
+        )
+        .await?;
         Ok(())
     }
 
@@ -374,7 +338,12 @@ mod copy_tests {
             },
         )
         .await?;
-        check_dirs_identical(&test_path.join("foo"), &test_path.join("bar"), false).await?;
+        testutils::check_dirs_identical(
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            testutils::FileEqualityCheck::Basic,
+        )
+        .await?;
         Ok(())
     }
 
@@ -438,10 +407,14 @@ mod copy_tests {
             rcp_settings,
         )
         .await?;
-        check_dirs_identical(
+        testutils::check_dirs_identical(
             &test_path.join("bar"),
             &test_path.join("baz"),
-            rcp_settings.preserve,
+            if rcp_settings.preserve {
+                testutils::FileEqualityCheck::Timestamp
+            } else {
+                testutils::FileEqualityCheck::Basic
+            },
         )
         .await?;
         Ok(())
