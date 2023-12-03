@@ -510,11 +510,22 @@ mod copy_tests {
 
 // check if two files are identical
 fn is_unchanged(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
-    md1.atime_nsec() == md2.atime_nsec()
-        && md1.mtime_nsec() == md2.mtime_nsec()
-        && md1.permissions() == md2.permissions()
-        && md1.uid() == md2.uid()
-        && md1.gid() == md2.gid()
+    if md1.atime() != md2.atime()
+        || md1.mtime() != md2.mtime()
+        || md1.permissions() != md2.permissions()
+        || md1.uid() != md2.uid()
+        || md1.gid() != md2.gid()
+    {
+        return false;
+    }
+    // some filesystems do not support nanosecond precision, so we only compare nanoseconds if both files have them
+    if md1.atime_nsec() != 0 && md2.atime_nsec() != 0 && md1.atime_nsec() != md2.atime_nsec() {
+        return false;
+    }
+    if md1.mtime_nsec() != 0 && md2.mtime_nsec() != 0 && md1.mtime_nsec() != md2.mtime_nsec() {
+        return false;
+    }
+    true
 }
 
 #[async_recursion]
