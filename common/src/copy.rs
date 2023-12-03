@@ -481,7 +481,14 @@ mod copy_tests {
     }
 }
 
-// check if two files are identical
+fn is_file_type_same(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
+    let ft1 = md1.file_type();
+    let ft2 = md2.file_type();
+    return ft1.is_dir() == ft2.is_dir()
+        && ft1.is_file() == ft2.is_file()
+        && ft1.is_symlink() == ft2.is_symlink();
+}
+
 fn is_unchanged(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
     if md1.atime() != md2.atime()
         || md1.mtime() != md2.mtime()
@@ -534,7 +541,7 @@ pub async fn link(
     };
     if let Some(update_metadata) = update_metadata_opt.as_ref() {
         let update = update.as_ref().unwrap();
-        if src_metadata.file_type() != update_metadata.file_type() {
+        if !is_file_type_same(&src_metadata, update_metadata) {
             // file type changed, just copy the updated one
             debug!(
                 "link: file type of {:?} ({:?}) and {:?} ({:?}) differs - copying from update",
