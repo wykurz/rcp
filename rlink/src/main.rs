@@ -9,7 +9,7 @@ struct Args {
     fail_early: bool,
 
     /// Show progress
-    #[structopt(short, long)]
+    #[structopt(long)]
     progress: bool,
 
     /// Always follow symbolic links in source

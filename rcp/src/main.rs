@@ -13,7 +13,7 @@ struct Args {
     fail_early: bool,
 
     /// Show progress
-    #[structopt(short, long)]
+    #[structopt(long)]
     progress: bool,
 
     /// Preserve additional file attributes: file owner, group, setuid, setgid, mtime and atime

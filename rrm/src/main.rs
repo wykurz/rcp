@@ -9,7 +9,7 @@ struct Args {
     fail_early: bool,
 
     /// Show progress
-    #[structopt(short, long)]
+    #[structopt(long)]
     progress: bool,
 
     /// Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))

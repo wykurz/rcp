@@ -24,7 +24,7 @@ FLAGS:
     -h, --help           Prints help information
     -o, --overwrite      Overwrite existing files/directories
     -p, --preserve       Preserve additional file attributes: file owner, group, setuid, setgid, mtime and atime
-    -p, --progress       Show progress
+        --progress       Show progress
     -q, --quiet          Quiet mode, don't report errors
     -V, --version        Prints version information
     -v, --verbose        Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
@@ -54,7 +54,7 @@ USAGE:
 FLAGS:
     -e, --fail-early    Exit on first error
     -h, --help          Prints help information
-    -p, --progress      Show progress
+        --progress      Show progress
     -q, --quiet         Quiet mode, don't report errors
     -V, --version       Prints version information
     -v, --verbose       Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
@@ -84,7 +84,7 @@ FLAGS:
     -L, --dereference    Always follow symbolic links in source
     -e, --fail-early     Exit on first error
     -h, --help           Prints help information
-    -p, --progress       Show progress
+        --progress       Show progress
     -q, --quiet          Quiet mode, don't report errors
     -V, --version        Prints version information
     -v, --verbose        Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
