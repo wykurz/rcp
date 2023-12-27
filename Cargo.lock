@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "filegen"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "rcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bytesize",
@@ -747,7 +747,7 @@ checksum = "436b050e76ed2903236f032a59761c1eb99e1b0aead2c257922771dab1fc8c78"
 
 [[package]]
 name = "rlink"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bytesize",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "rrm"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-recursion",
