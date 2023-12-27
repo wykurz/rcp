@@ -1,0 +1,11 @@
+[package]
+name = "tests"
+version = "0.3.0"
+edition = "2021"
+
+[dev-dependencies]
+assert_cmd = "2"
+
+[[test]]
+name = "tests"
+path = "tests.rs"
