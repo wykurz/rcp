@@ -7,7 +7,6 @@ members = [
   "rcp",
   "rlink",
   "rrm",
-  "tests",
 ]
 
 [profile.dev]

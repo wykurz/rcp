@@ -299,6 +299,7 @@ name = "filegen"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "assert_cmd",
  "async-recursion",
  "bytesize",
  "env_logger",
@@ -792,6 +793,7 @@ name = "rcp"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "assert_cmd",
  "bytesize",
  "common",
  "env_logger",
@@ -837,6 +839,7 @@ name = "rlink"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "assert_cmd",
  "bytesize",
  "common",
  "env_logger",
@@ -850,6 +853,7 @@ name = "rrm"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "assert_cmd",
  "async-recursion",
  "common",
  "env_logger",
@@ -1020,13 +1024,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
-]
-
-[[package]]
-name = "tests"
-version = "0.4.0"
-dependencies = [
- "assert_cmd",
 ]
 
 [[package]]
