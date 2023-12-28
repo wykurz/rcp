@@ -13,8 +13,6 @@ Inspired by tools like [dsync](https://mpifileutils.readthedocs.io/en/v0.11.1/ds
 [pcp](https://github.com/wtsi-ssg/pcp).
 
 ```
-rcp 0.1.0
-
 USAGE:
     rcp [FLAGS] [OPTIONS] [paths]...
 
@@ -46,8 +44,6 @@ rrm
 `rrm` is a simple tool to remove large numbers of files. Note the basic usage is equivalent to `rm -rf`.
 
 ```
-rrm 0.1.0
-
 USAGE:
     rrm [FLAGS] [OPTIONS] [paths]...
 
@@ -75,8 +71,6 @@ rlink
 `rlink` allows hard-linking large number of files. A common pattern is to also provide `--update <path>` that overrides any paths in `src` to instead be copied over from there.
 
 ```
-rlink 0.1.0
-
 USAGE:
     rlink [FLAGS] [OPTIONS] <src> <dst>
 
