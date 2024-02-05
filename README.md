@@ -24,8 +24,9 @@ FLAGS:
     -p, --preserve       Preserve additional file attributes: file owner, group, setuid, setgid, mtime and atime
         --progress       Show progress
     -q, --quiet          Quiet mode, don't report errors
+        --summary        Print summary at the end
     -V, --version        Prints version information
-    -v, --verbose        Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+    -v, --verbose        Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
 
 OPTIONS:
         --max-blocking-threads <max-blocking-threads>
@@ -52,8 +53,9 @@ FLAGS:
     -h, --help          Prints help information
         --progress      Show progress
     -q, --quiet         Quiet mode, don't report errors
+        --summary       Print summary at the end
     -V, --version       Prints version information
-    -v, --verbose       Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+    -v, --verbose       Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
 
 OPTIONS:
         --max-blocking-threads <max-blocking-threads>
@@ -80,8 +82,9 @@ FLAGS:
     -h, --help           Prints help information
         --progress       Show progress
     -q, --quiet          Quiet mode, don't report errors
+        --summary        Print summary at the end
     -V, --version        Prints version information
-    -v, --verbose        Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+    -v, --verbose        Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
 
 OPTIONS:
         --max-blocking-threads <max-blocking-threads>

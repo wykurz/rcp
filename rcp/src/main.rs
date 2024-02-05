@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use common::CopySummary;
 use structopt::StructOpt;
 
 #[derive(StructOpt, Debug, Clone)]
@@ -24,9 +25,13 @@ struct Args {
     #[structopt(short = "-L", long)]
     dereference: bool,
 
-    /// Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+    /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
     #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
     verbose: u8,
+
+    /// Print summary at the end
+    #[structopt(long)]
+    summary: bool,
 
     /// Quiet mode, don't report errors
     #[structopt(short = "q", long = "quiet")]
@@ -49,7 +54,7 @@ struct Args {
     read_buffer: String,
 }
 
-async fn async_main(args: Args) -> Result<()> {
+async fn async_main(args: Args) -> Result<CopySummary> {
     if args.paths.len() < 2 {
         return Err(anyhow::anyhow!(
             "You must specify at least one source and destination path!"
@@ -121,19 +126,23 @@ async fn async_main(args: Args) -> Result<()> {
         join_set.spawn(do_copy());
     }
     let mut success = true;
+    let mut copy_summary = CopySummary::default();
     while let Some(res) = join_set.join_next().await {
-        if let Err(error) = res? {
-            log::error!("{}", &error);
-            if args.fail_early {
-                return Err(error);
+        match res? {
+            Ok(summary) => copy_summary = copy_summary + summary,
+            Err(error) => {
+                log::error!("{}", &error);
+                if args.fail_early {
+                    return Err(error);
+                }
+                success = false;
             }
-            success = false;
         }
     }
     if !success {
         return Err(anyhow::anyhow!("rcp encountered errors"));
     }
-    Ok(())
+    Ok(copy_summary)
 }
 
 fn main() -> Result<()> {
@@ -146,6 +155,7 @@ fn main() -> Result<()> {
         if args.progress { Some("copy") } else { None },
         args.quiet,
         args.verbose,
+        args.summary,
         args.max_workers,
         args.max_blocking_threads,
         func,

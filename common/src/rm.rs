@@ -9,21 +9,51 @@ pub struct Settings {
     pub fail_early: bool,
 }
 
+#[derive(Copy, Clone, Default)]
+pub struct RmSummary {
+    pub files_removed: usize,
+    pub directories_removed: usize,
+}
+
+impl std::ops::Add for RmSummary {
+    type Output = Self;
+    fn add(self, other: Self) -> Self {
+        Self {
+            files_removed: self.files_removed + other.files_removed,
+            directories_removed: self.directories_removed + other.directories_removed,
+        }
+    }
+}
+
+impl std::fmt::Display for RmSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "files removed: {}\ndirectories removed: {}",
+            self.files_removed, self.directories_removed
+        )
+    }
+}
+
 #[async_recursion]
 pub async fn rm(
     prog_track: &'static progress::TlsProgress,
     path: &std::path::Path,
     settings: &Settings,
-) -> Result<()> {
+) -> Result<RmSummary> {
     debug!("remove: {:?}", path);
     let _guard = prog_track.guard();
     let src_metadata = tokio::fs::symlink_metadata(path)
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &path))?;
     if !src_metadata.is_dir() {
-        return tokio::fs::remove_file(path)
+        tokio::fs::remove_file(path)
             .await
-            .with_context(|| format!("failed removing {:?}", &path));
+            .with_context(|| format!("failed removing {:?}", &path))?;
+        return Ok(RmSummary {
+            files_removed: 1,
+            ..Default::default()
+        });
     }
     if src_metadata.permissions().readonly() {
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
@@ -49,13 +79,20 @@ pub async fn rm(
         let do_rm = || async move { rm(prog_track, &entry_path, &settings).await };
         join_set.spawn(do_rm());
     }
+    let mut rm_summary = RmSummary {
+        directories_removed: 1,
+        ..Default::default()
+    };
     while let Some(res) = join_set.join_next().await {
-        if let Err(error) = res? {
-            error!("remove: {:?} failed with: {}", path, &error);
-            if settings.fail_early {
-                return Err(error);
+        match res? {
+            Ok(summary) => rm_summary = rm_summary + summary,
+            Err(error) => {
+                error!("remove: {:?} failed with: {}", path, &error);
+                if settings.fail_early {
+                    return Err(error);
+                }
+                success = false;
             }
-            success = false;
         }
     }
     if !success {
@@ -65,7 +102,7 @@ pub async fn rm(
         .await
         .with_context(|| format!("failed removing directory {:?}", &path))?;
     debug!("remove: {:?} succeeded!", path);
-    Ok(())
+    Ok(rm_summary)
 }
 
 #[cfg(test)]
@@ -92,13 +129,15 @@ mod tests {
             // change file permissions to not readable and not writable
             tokio::fs::set_permissions(&fpath, std::fs::Permissions::from_mode(0o555)).await?;
         }
-        rm(
+        let summary = rm(
             &PROGRESS,
             &test_path.join("foo"),
             &Settings { fail_early: false },
         )
         .await?;
         assert!(!test_path.join("foo").exists());
+        assert_eq!(summary.files_removed, 7); // we cound symlinks (there are 2) as files
+        assert_eq!(summary.directories_removed, 3);
         Ok(())
     }
 }

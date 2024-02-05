@@ -86,20 +86,52 @@ async fn copy_file(
     Ok(())
 }
 
+#[derive(Copy, Clone, Default)]
+pub struct CopySummary {
+    pub files_copied: usize,
+    pub symlinks_created: usize,
+    pub directories_created: usize,
+}
+
+impl std::ops::Add for CopySummary {
+    type Output = Self;
+    fn add(self, other: Self) -> Self {
+        Self {
+            files_copied: self.files_copied + other.files_copied,
+            symlinks_created: self.symlinks_created + other.symlinks_created,
+            directories_created: self.directories_created + other.directories_created,
+        }
+    }
+}
+
+impl std::fmt::Display for CopySummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "files copied: {}\nsymlinks created: {}\ndirectories created: {}",
+            self.files_copied, self.symlinks_created, self.directories_created
+        )
+    }
+}
+
 #[async_recursion]
 pub async fn copy(
     prog_track: &'static progress::TlsProgress,
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &Settings,
-) -> Result<()> {
+) -> Result<CopySummary> {
     debug!("copy: {:?} -> {:?}", src, dst);
     let _guard = prog_track.guard();
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))?;
     if src_metadata.is_file() || (src_metadata.is_symlink() && settings.dereference) {
-        return copy_file(src, dst, settings).await;
+        copy_file(src, dst, settings).await?;
+        return Ok(CopySummary {
+            files_copied: 1,
+            ..Default::default()
+        });
     }
     if src_metadata.is_symlink() {
         let link = tokio::fs::read_link(src)
@@ -111,7 +143,10 @@ pub async fn copy(
         if settings.preserve {
             set_owner_and_time(dst, &src_metadata).await?;
         }
-        return Ok(());
+        return Ok(CopySummary {
+            symlinks_created: 1,
+            ..Default::default()
+        });
     }
     assert!(src_metadata.is_dir());
     let mut entries = tokio::fs::read_dir(src)
@@ -134,13 +169,20 @@ pub async fn copy(
         let do_copy = || async move { copy(prog_track, &entry_path, &dst_path, &settings).await };
         join_set.spawn(do_copy());
     }
+    let mut copy_summary = CopySummary {
+        directories_created: 1,
+        ..Default::default()
+    };
     while let Some(res) = join_set.join_next().await {
-        if let Err(error) = res? {
-            error!("copy: {:?} -> {:?} failed with: {}", src, dst, &error);
-            if settings.fail_early {
-                return Err(error);
+        match res? {
+            Ok(summary) => copy_summary = copy_summary + summary,
+            Err(error) => {
+                error!("copy: {:?} -> {:?} failed with: {}", src, dst, &error);
+                if settings.fail_early {
+                    return Err(error);
+                }
+                success = false;
             }
-            success = false;
         }
     }
     if !success {
@@ -159,7 +201,7 @@ pub async fn copy(
         set_owner_and_time(dst, &src_metadata).await?;
     }
     debug!("copy: {:?} -> {:?} succeeded!", src, dst);
-    Ok(())
+    Ok(copy_summary)
 }
 
 #[cfg(test)]
@@ -178,7 +220,7 @@ mod copy_tests {
     async fn check_basic_copy() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
-        copy(
+        let summary = copy(
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
@@ -190,6 +232,9 @@ mod copy_tests {
             },
         )
         .await?;
+        assert_eq!(summary.files_copied, 5);
+        assert_eq!(summary.symlinks_created, 2);
+        assert_eq!(summary.directories_created, 3);
         testutils::check_dirs_identical(
             &test_path.join("foo"),
             &test_path.join("bar"),
@@ -275,7 +320,7 @@ mod copy_tests {
         tokio::fs::set_permissions(&exec_sticky_file, std::fs::Permissions::from_mode(0o3770))
             .await?;
         let test_path = tmp_dir.as_path();
-        copy(
+        let summary = copy(
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
@@ -287,6 +332,9 @@ mod copy_tests {
             },
         )
         .await?;
+        assert_eq!(summary.files_copied, 5);
+        assert_eq!(summary.symlinks_created, 2);
+        assert_eq!(summary.directories_created, 3);
         // clear the setuid, setgid and sticky bit for comparison
         tokio::fs::set_permissions(
             &exec_sticky_file,
@@ -326,7 +374,7 @@ mod copy_tests {
             std::fs::Permissions::from_mode(0o440),
         )
         .await?;
-        copy(
+        let summary = copy(
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
@@ -338,6 +386,9 @@ mod copy_tests {
             },
         )
         .await?;
+        assert_eq!(summary.files_copied, 5);
+        assert_eq!(summary.symlinks_created, 2);
+        assert_eq!(summary.directories_created, 4);
         testutils::check_dirs_identical(
             &test_path.join("foo"),
             &test_path.join("bar"),
@@ -358,7 +409,7 @@ mod copy_tests {
         for f in vec![src1, src2] {
             tokio::fs::set_permissions(f, std::fs::Permissions::from_mode(test_mode)).await?;
         }
-        copy(
+        let summary = copy(
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
@@ -370,6 +421,9 @@ mod copy_tests {
             },
         )
         .await?;
+        assert_eq!(summary.files_copied, 7);
+        assert_eq!(summary.symlinks_created, 0);
+        assert_eq!(summary.directories_created, 3);
         // ...
         // |- baz
         //    |- 4.txt
@@ -400,13 +454,21 @@ mod copy_tests {
             .await?;
         assert!(cp_output.status.success());
         // now run rcp
-        copy(
+        let summary = copy(
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("baz"),
             rcp_settings,
         )
         .await?;
+        if rcp_settings.dereference {
+            assert_eq!(summary.files_copied, 7);
+            assert_eq!(summary.symlinks_created, 0);
+        } else {
+            assert_eq!(summary.files_copied, 5);
+            assert_eq!(summary.symlinks_created, 2);
+        }
+        assert_eq!(summary.directories_created, 3);
         testutils::check_dirs_identical(
             &test_path.join("bar"),
             &test_path.join("baz"),
@@ -509,6 +571,32 @@ fn is_unchanged(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
     true
 }
 
+#[derive(Copy, Clone, Default)]
+pub struct LinkSummary {
+    pub files_hard_linked: usize,
+    pub copy_summary: CopySummary,
+}
+
+impl std::ops::Add for LinkSummary {
+    type Output = Self;
+    fn add(self, other: Self) -> Self {
+        Self {
+            files_hard_linked: self.files_hard_linked + other.files_hard_linked,
+            copy_summary: self.copy_summary + other.copy_summary,
+        }
+    }
+}
+
+impl std::fmt::Display for LinkSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "files hard-linked: {}\n{}",
+            self.files_hard_linked, &self.copy_summary
+        )
+    }
+}
+
 #[async_recursion]
 pub async fn link(
     prog_track: &'static progress::TlsProgress,
@@ -516,7 +604,7 @@ pub async fn link(
     dst: &std::path::Path,
     update: &Option<std::path::PathBuf>,
     settings: &Settings,
-) -> Result<()> {
+) -> Result<LinkSummary> {
     debug!("link: {:?} {:?} -> {:?}", src, update, dst);
     let _guard = prog_track.guard();
     let src_metadata = tokio::fs::symlink_metadata(src)
@@ -551,20 +639,34 @@ pub async fn link(
                 update,
                 update_metadata.file_type()
             );
-            return copy(prog_track, update, dst, settings).await;
+            let copy_summary = copy(prog_track, update, dst, settings).await?;
+            return Ok(LinkSummary {
+                copy_summary,
+                ..Default::default()
+            });
         }
         if update_metadata.is_file() {
             // check if the file is unchanged and if so hard-link, otherwise copy from the updated one
             if is_unchanged(&src_metadata, update_metadata) {
                 tokio::fs::hard_link(src, dst).await?;
+                return Ok(LinkSummary {
+                    files_hard_linked: 1,
+                    ..Default::default()
+                });
             } else {
                 debug!(
                     "link: {:?} metadata has changed, copying from {:?}",
                     src, update
                 );
                 copy_file(update, dst, settings).await?;
+                return Ok(LinkSummary {
+                    copy_summary: CopySummary {
+                        files_copied: 1,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
             }
-            return Ok(());
         }
         if update_metadata.is_symlink() {
             // just symlink the updated one, no need to check if it's changed
@@ -577,13 +679,22 @@ pub async fn link(
             if settings.preserve {
                 set_owner_and_time(dst, update_metadata).await?;
             }
-            return Ok(());
+            return Ok(LinkSummary {
+                copy_summary: CopySummary {
+                    symlinks_created: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
         }
     } else {
         // update hasn't been specified, if this is a file just hard-link the source or symlink if it's a symlink
         if src_metadata.is_file() {
             tokio::fs::hard_link(src, dst).await?;
-            return Ok(());
+            return Ok(LinkSummary {
+                files_hard_linked: 1,
+                ..Default::default()
+            });
         }
         if src_metadata.is_symlink() {
             let src_symlink = tokio::fs::read_link(src)
@@ -595,7 +706,13 @@ pub async fn link(
             if settings.preserve {
                 set_owner_and_time(dst, &src_metadata).await?;
             }
-            return Ok(());
+            return Ok(LinkSummary {
+                copy_summary: CopySummary {
+                    symlinks_created: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
         }
     }
     assert!(src_metadata.is_dir());
@@ -645,23 +762,37 @@ pub async fn link(
             let do_copy = || async move {
                 if tokio::fs::symlink_metadata(src_path).await.is_ok() {
                     // we already must have considered this file, skip it
-                    return Ok(());
+                    return Ok(LinkSummary::default());
                 }
-                copy(prog_track, &update_path, &dst_path, &settings).await
+                let copy_summary = copy(prog_track, &update_path, &dst_path, &settings).await?;
+                Ok(LinkSummary {
+                    copy_summary,
+                    ..Default::default()
+                })
             };
             join_set.spawn(do_copy());
         }
     }
+    let mut link_summary = LinkSummary {
+        copy_summary: CopySummary {
+            directories_created: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     while let Some(res) = join_set.join_next().await {
-        if let Err(error) = res? {
-            error!(
-                "link: {:?} {:?} -> {:?} failed with: {}",
-                src, update, dst, &error
-            );
-            if settings.fail_early {
-                return Err(error);
+        match res? {
+            Ok(summary) => link_summary = link_summary + summary,
+            Err(error) => {
+                error!(
+                    "link: {:?} {:?} -> {:?} failed with: {}",
+                    src, update, dst, &error
+                );
+                if settings.fail_early {
+                    return Err(error);
+                }
+                success = false;
             }
-            success = false;
         }
     }
     if !success {
@@ -690,7 +821,7 @@ pub async fn link(
         set_owner_and_time(dst, preserve_metadata).await?;
     }
     debug!("link: {:?} {:?} -> {:?} succeeded!", src, update, dst);
-    Ok(())
+    Ok(link_summary)
 }
 
 #[cfg(test)]
@@ -715,7 +846,7 @@ mod link_tests {
     async fn check_basic_link() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
-        link(
+        let summary = link(
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
@@ -723,6 +854,10 @@ mod link_tests {
             &COMMON_SETTINGS,
         )
         .await?;
+        assert_eq!(summary.files_hard_linked, 5);
+        assert_eq!(summary.copy_summary.files_copied, 0);
+        assert_eq!(summary.copy_summary.symlinks_created, 2);
+        assert_eq!(summary.copy_summary.directories_created, 3);
         testutils::check_dirs_identical(
             &test_path.join("foo"),
             &test_path.join("bar"),
@@ -736,7 +871,7 @@ mod link_tests {
     async fn check_basic_link_update() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
-        link(
+        let summary = link(
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
@@ -744,6 +879,10 @@ mod link_tests {
             &COMMON_SETTINGS,
         )
         .await?;
+        assert_eq!(summary.files_hard_linked, 5);
+        assert_eq!(summary.copy_summary.files_copied, 0);
+        assert_eq!(summary.copy_summary.symlinks_created, 2);
+        assert_eq!(summary.copy_summary.directories_created, 3);
         testutils::check_dirs_identical(
             &test_path.join("foo"),
             &test_path.join("bar"),
@@ -758,7 +897,7 @@ mod link_tests {
         let tmp_dir = testutils::setup_test_dir().await?;
         tokio::fs::create_dir(tmp_dir.join("baz")).await?;
         let test_path = tmp_dir.as_path();
-        link(
+        let summary = link(
             &PROGRESS,
             &test_path.join("baz"), // empty source
             &test_path.join("bar"),
@@ -766,6 +905,10 @@ mod link_tests {
             &COMMON_SETTINGS,
         )
         .await?;
+        assert_eq!(summary.files_hard_linked, 0);
+        assert_eq!(summary.copy_summary.files_copied, 5);
+        assert_eq!(summary.copy_summary.symlinks_created, 2);
+        assert_eq!(summary.copy_summary.directories_created, 3);
         testutils::check_dirs_identical(
             &test_path.join("foo"),
             &test_path.join("bar"),
@@ -803,7 +946,7 @@ mod link_tests {
         let tmp_dir = testutils::setup_test_dir().await?;
         setup_update_dir(&tmp_dir).await?;
         let test_path = tmp_dir.as_path();
-        link(
+        let summary = link(
             &PROGRESS,
             &test_path.join("foo"),
             &test_path.join("bar"),
@@ -811,6 +954,10 @@ mod link_tests {
             &COMMON_SETTINGS,
         )
         .await?;
+        assert_eq!(summary.files_hard_linked, 2);
+        assert_eq!(summary.copy_summary.files_copied, 2);
+        assert_eq!(summary.copy_summary.symlinks_created, 3);
+        assert_eq!(summary.copy_summary.directories_created, 3);
         // compare subset of src and dst
         testutils::check_dirs_identical(
             &test_path.join("foo").join("baz"),

@@ -12,7 +12,10 @@ mod progress;
 mod rm;
 mod testutils;
 
+pub use copy::CopySummary;
+pub use copy::LinkSummary;
 pub use copy::Settings as CopySettings;
+pub use rm::RmSummary;
 pub use rm::Settings as RmSettings;
 
 lazy_static! {
@@ -78,14 +81,12 @@ pub async fn copy(
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &copy::Settings,
-) -> Result<()> {
-    copy::copy(&PROGRESS, src, dst, settings).await?;
-    Ok(())
+) -> Result<CopySummary> {
+    copy::copy(&PROGRESS, src, dst, settings).await
 }
 
-pub async fn rm(path: &std::path::Path, settings: &rm::Settings) -> Result<()> {
-    rm::rm(&PROGRESS, path, settings).await?;
-    Ok(())
+pub async fn rm(path: &std::path::Path, settings: &rm::Settings) -> Result<RmSummary> {
+    rm::rm(&PROGRESS, path, settings).await
 }
 
 pub async fn link(
@@ -93,21 +94,22 @@ pub async fn link(
     dst: &std::path::Path,
     update: &Option<std::path::PathBuf>,
     settings: &copy::Settings,
-) -> Result<()> {
-    copy::link(&PROGRESS, src, dst, update, settings).await?;
-    Ok(())
+) -> Result<LinkSummary> {
+    copy::link(&PROGRESS, src, dst, update, settings).await
 }
 
-pub fn run<Fut>(
+pub fn run<Fut, Summary>(
     progress_op_name: Option<&str>,
     quiet: bool,
     verbose: u8,
+    summary: bool,
     max_workers: usize,
     max_blocking_threads: usize,
     func: impl FnOnce() -> Fut,
-) -> Result<()>
+) -> Result<Summary>
 where
-    Fut: Future<Output = Result<()>>,
+    Summary: std::fmt::Display,
+    Fut: Future<Output = Result<Summary>>,
 {
     let _progress = progress_op_name.map(ProgressTracker::new);
     if !quiet {
@@ -144,6 +146,9 @@ where
             eprintln!("{}", error);
         }
         std::process::exit(1);
+    }
+    if summary || verbose > 0 {
+        println!("{}", res.unwrap());
     }
     std::process::exit(0);
 }

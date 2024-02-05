@@ -12,9 +12,13 @@ struct Args {
     #[structopt(long)]
     progress: bool,
 
-    /// Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+    /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
     #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
     verbose: u8,
+
+    /// Print summary at the end
+    #[structopt(long)]
+    summary: bool,
 
     /// Quiet mode, don't report errors
     #[structopt(short = "q", long = "quiet")]
@@ -33,7 +37,7 @@ struct Args {
     max_blocking_threads: usize,
 }
 
-async fn async_main(args: Args) -> Result<()> {
+async fn async_main(args: Args) -> Result<common::RmSummary> {
     let mut join_set = tokio::task::JoinSet::new();
     for path in args.paths {
         let settings = common::RmSettings {
@@ -43,19 +47,23 @@ async fn async_main(args: Args) -> Result<()> {
         join_set.spawn(do_rm());
     }
     let mut success = true;
+    let mut rm_summary = common::RmSummary::default();
     while let Some(res) = join_set.join_next().await {
-        if let Err(error) = res? {
-            log::error!("{}", &error);
-            if args.fail_early {
-                return Err(error);
+        match res? {
+            Ok(summary) => rm_summary = rm_summary + summary,
+            Err(error) => {
+                log::error!("{}", &error);
+                if args.fail_early {
+                    return Err(error);
+                }
+                success = false;
             }
-            success = false;
         }
     }
     if !success {
         return Err(anyhow::anyhow!("rrm encountered errors"));
     }
-    Ok(())
+    Ok(rm_summary)
 }
 
 fn main() -> Result<()> {
@@ -68,6 +76,7 @@ fn main() -> Result<()> {
         if args.progress { Some("rm") } else { None },
         args.quiet,
         args.verbose,
+        args.summary,
         args.max_workers,
         args.max_blocking_threads,
         func,

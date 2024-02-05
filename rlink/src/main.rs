@@ -1,4 +1,5 @@
 use anyhow::Result;
+use common::LinkSummary;
 use structopt::StructOpt;
 
 #[derive(StructOpt, Debug, Clone)]
@@ -16,9 +17,13 @@ struct Args {
     #[structopt(short = "-L", long)]
     dereference: bool,
 
-    /// Verbose level: -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+    /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
     #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
     verbose: u8,
+
+    /// Print summary at the end
+    #[structopt(long)]
+    summary: bool,
 
     /// Quiet mode, don't report errors
     #[structopt(short = "q", long = "quiet")]
@@ -49,7 +54,7 @@ struct Args {
     read_buffer: String,
 }
 
-async fn async_main(args: Args) -> Result<()> {
+async fn async_main(args: Args) -> Result<LinkSummary> {
     let mut inputs = vec![&args.src];
     if let Some(update) = &args.update {
         inputs.push(update);
@@ -97,6 +102,7 @@ fn main() -> Result<()> {
         if args.progress { Some("rlink") } else { None },
         args.quiet,
         args.verbose,
+        args.summary,
         args.max_workers,
         args.max_blocking_threads,
         func,
