@@ -552,12 +552,7 @@ fn is_file_type_same(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
 }
 
 fn is_unchanged(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
-    if md1.size() != md2.size()
-        || md1.mtime() != md2.mtime()
-        || md1.permissions() != md2.permissions()
-        || md1.uid() != md2.uid()
-        || md1.gid() != md2.gid()
-    {
+    if md1.size() != md2.size() || md1.mtime() != md2.mtime() {
         return false;
     }
     // some filesystems do not support nanosecond precision, so we only compare nanoseconds if both files have them
