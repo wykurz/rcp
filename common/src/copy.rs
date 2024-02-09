@@ -716,6 +716,8 @@ pub async fn link(
         .with_context(|| format!("cannot create directory {:?}", dst))?;
     let mut join_set = tokio::task::JoinSet::new();
     let mut success = true;
+    // create a set of all the files we already processed
+    let mut processed_files = std::collections::HashSet::new();
     // iterate through src entries and recursively call "link" on each one
     while let Some(src_entry) = src_entries
         .next_entry()
@@ -724,6 +726,7 @@ pub async fn link(
     {
         let entry_path = src_entry.path();
         let entry_name = entry_path.file_name().unwrap();
+        processed_files.insert(entry_name.to_owned());
         let dst_path = dst.join(entry_name);
         let update_path = update.as_ref().map(|s| s.join(entry_name));
         let settings = settings.clone();
@@ -746,6 +749,10 @@ pub async fn link(
         {
             let entry_path = update_entry.path();
             let entry_name = entry_path.file_name().unwrap();
+            if processed_files.contains(entry_name) {
+                // we already must have considered this file, skip it
+                continue;
+            }
             let src_path = src.join(entry_name);
             let dst_path = dst.join(entry_name);
             let update_path = update.join(entry_name);
