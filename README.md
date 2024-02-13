@@ -5,6 +5,17 @@ This repo contains tools to efficiently copy, remove and link large filesets.
 
 [![Build status](https://github.com/wykurz/rcp/actions/workflows/rust.yml/badge.svg)](https://github.com/wykurz/rcp/actions)
 
+installation
+============
+
+All tools are available via nixpkgs under `rcp` package name.
+
+The following command will install all the tools on your system:
+
+```shell
+nix-env -iA nixpkgs.rcp
+```
+
 rcp
 ===
 
