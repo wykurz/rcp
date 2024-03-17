@@ -68,14 +68,20 @@ async fn async_main(args: Args) -> Result<CopySummary> {
         src_strings
             .iter()
             .map(|src| {
+                if src == "." || src.ends_with("/.") {
+                    return Err(anyhow::anyhow!(
+                        "expanding source directory ({:?}) using dot operator ('.') is not supported",
+                        std::path::PathBuf::from(src)
+                    ));
+                }
                 let src_path = std::path::PathBuf::from(src);
                 let src_file = src_path
                     .file_name()
-                    .context(format!("source {:?} is not a file", &src_path))
+                    .context(format!("source {:?} does not have a basename", &src_path))
                     .unwrap();
-                (src_path.to_owned(), dst_dir.join(src_file))
+                Ok((src_path.to_owned(), dst_dir.join(src_file)))
             })
-            .collect()
+            .collect::<Result<Vec<(std::path::PathBuf, std::path::PathBuf)>>>()?
     } else {
         if src_strings.len() > 1 {
             return Err(anyhow::anyhow!(
