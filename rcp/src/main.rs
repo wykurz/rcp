@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use common::CopySummary;
 use structopt::StructOpt;
+use tracing::{event, instrument, Level};
 
 #[derive(StructOpt, Debug, Clone)]
 #[structopt(name = "rcp")]
@@ -54,6 +55,7 @@ struct Args {
     read_buffer: String,
 }
 
+#[instrument]
 async fn async_main(args: Args) -> Result<CopySummary> {
     if args.paths.len() < 2 {
         return Err(anyhow::anyhow!(
@@ -137,7 +139,7 @@ async fn async_main(args: Args) -> Result<CopySummary> {
         match res? {
             Ok(summary) => copy_summary = copy_summary + summary,
             Err(error) => {
-                log::error!("{}", &error);
+                event!(Level::ERROR, "{}", &error);
                 if args.fail_early {
                     return Err(error);
                 }

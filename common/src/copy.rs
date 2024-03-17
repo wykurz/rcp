@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use async_recursion::async_recursion;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
+use tracing::{event, instrument, Level};
 
 use crate::progress;
 
@@ -13,11 +14,13 @@ pub struct Settings {
     pub fail_early: bool,
 }
 
+#[instrument]
 async fn set_owner_and_time(dst: &std::path::Path, metadata: &std::fs::Metadata) -> Result<()> {
     let dst = dst.to_owned();
     let metadata = metadata.to_owned();
     tokio::task::spawn_blocking(move || -> Result<()> {
         // set timestamps first - those are unlikely to fail
+        event!(Level::DEBUG, "setting timestamps");
         let atime = nix::sys::time::TimeSpec::new(metadata.atime(), metadata.atime_nsec());
         let mtime = nix::sys::time::TimeSpec::new(metadata.mtime(), metadata.mtime_nsec());
         nix::sys::stat::utimensat(
@@ -29,6 +32,7 @@ async fn set_owner_and_time(dst: &std::path::Path, metadata: &std::fs::Metadata)
         )
         .with_context(|| format!("failed setting timestamps for {:?}", &dst))?;
         // set user and group - set those last, if those fail we at least have the timestamps set
+        event!(Level::DEBUG, "setting uid ang gid");
         let uid = metadata.uid();
         let gid = metadata.gid();
         nix::unistd::fchownat(
@@ -50,11 +54,16 @@ async fn set_owner_and_time(dst: &std::path::Path, metadata: &std::fs::Metadata)
     .await?
 }
 
+#[instrument]
 async fn copy_file(
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &Settings,
 ) -> Result<()> {
+    event!(
+        Level::DEBUG,
+        "opening 'src' for reading and 'dst' for writing"
+    );
     let mut reader = tokio::fs::File::open(src)
         .await
         .with_context(|| format!("cannot open {:?} for reading", src))?;
@@ -62,9 +71,11 @@ async fn copy_file(
     let mut writer = tokio::fs::File::create(dst)
         .await
         .with_context(|| format!("cannot open {:?} for writing", dst))?;
+    event!(Level::DEBUG, "copying data");
     tokio::io::copy_buf(&mut buf_reader, &mut writer)
         .await
         .with_context(|| format!("failed copying data to {:?}", &dst))?;
+    event!(Level::DEBUG, "setting permissions");
     let src_metadata = reader
         .metadata()
         .await
@@ -114,6 +125,7 @@ impl std::fmt::Display for CopySummary {
     }
 }
 
+#[instrument(skip(prog_track))]
 #[async_recursion]
 pub async fn copy(
     prog_track: &'static progress::TlsProgress,
@@ -121,8 +133,8 @@ pub async fn copy(
     dst: &std::path::Path,
     settings: &Settings,
 ) -> Result<CopySummary> {
-    debug!("copy: {:?} -> {:?}", src, dst);
     let _guard = prog_track.guard();
+    event!(Level::DEBUG, "reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))?;
@@ -149,6 +161,7 @@ pub async fn copy(
         });
     }
     assert!(src_metadata.is_dir());
+    event!(Level::DEBUG, "process contents of 'src' directory");
     let mut entries = tokio::fs::read_dir(src)
         .await
         .with_context(|| format!("cannot open directory {:?} for reading", src))?;
@@ -177,7 +190,13 @@ pub async fn copy(
         match res? {
             Ok(summary) => copy_summary = copy_summary + summary,
             Err(error) => {
-                error!("copy: {:?} -> {:?} failed with: {}", src, dst, &error);
+                event!(
+                    Level::ERROR,
+                    "copy: {:?} -> {:?} failed with: {}",
+                    src,
+                    dst,
+                    &error
+                );
                 if settings.fail_early {
                     return Err(error);
                 }
@@ -188,6 +207,7 @@ pub async fn copy(
     if !success {
         return Err(anyhow::anyhow!("copy: {:?} -> {:?} failed!", src, dst));
     }
+    event!(Level::DEBUG, "set 'dst' directory metadata");
     let permissions = if settings.preserve {
         src_metadata.permissions()
     } else {
@@ -200,7 +220,6 @@ pub async fn copy(
     if settings.preserve {
         set_owner_and_time(dst, &src_metadata).await?;
     }
-    debug!("copy: {:?} -> {:?} succeeded!", src, dst);
     Ok(copy_summary)
 }
 
@@ -208,7 +227,7 @@ pub async fn copy(
 mod copy_tests {
     use crate::testutils;
     use anyhow::Context;
-    use test_log::test;
+    use tracing_test::traced_test;
 
     use super::*;
 
@@ -217,6 +236,7 @@ mod copy_tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn check_basic_copy() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
@@ -270,7 +290,7 @@ mod copy_tests {
         {
             Ok(_) => panic!("Expected the copy to error!"),
             Err(error) => {
-                info!("{}", &error);
+                event!(Level::INFO, "{}", &error);
             }
         }
         // make source directory same as what we expect destination to be
@@ -291,22 +311,26 @@ mod copy_tests {
         Ok(())
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
+    #[traced_test]
     async fn no_read_permission_1() -> Result<()> {
         no_read_permission().await
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
+    #[traced_test]
     async fn no_read_permission_2() -> Result<()> {
         no_read_permission().await
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
+    #[traced_test]
     async fn no_read_permission_10() -> Result<()> {
         no_read_permission().await
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
+    #[traced_test]
     async fn check_default_mode() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         // set file to executable
@@ -355,7 +379,8 @@ mod copy_tests {
         Ok(())
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
+    #[traced_test]
     async fn no_write_permission() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
@@ -398,7 +423,8 @@ mod copy_tests {
         Ok(())
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
+    #[traced_test]
     async fn dereference() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
@@ -482,7 +508,8 @@ mod copy_tests {
         Ok(())
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
+    #[traced_test]
     async fn test_cp_compat() -> Result<()> {
         cp_compare(
             &["-r"],
@@ -497,7 +524,8 @@ mod copy_tests {
         Ok(())
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
+    #[traced_test]
     async fn test_cp_compat_preserve() -> Result<()> {
         cp_compare(
             &["-r", "-p"],
@@ -512,7 +540,8 @@ mod copy_tests {
         Ok(())
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
+    #[traced_test]
     async fn test_cp_compat_dereference() -> Result<()> {
         cp_compare(
             &["-r", "-L"],
@@ -527,7 +556,8 @@ mod copy_tests {
         Ok(())
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
+    #[traced_test]
     async fn test_cp_compat_preserve_and_dereference() -> Result<()> {
         cp_compare(
             &["-r", "-p", "-L"],
@@ -543,6 +573,7 @@ mod copy_tests {
     }
 }
 
+#[instrument]
 fn is_file_type_same(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
     let ft1 = md1.file_type();
     let ft2 = md2.file_type();
@@ -551,6 +582,7 @@ fn is_file_type_same(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
         && ft1.is_symlink() == ft2.is_symlink()
 }
 
+#[instrument]
 fn is_unchanged(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
     if md1.size() != md2.size() || md1.mtime() != md2.mtime() {
         return false;
@@ -588,6 +620,7 @@ impl std::fmt::Display for LinkSummary {
     }
 }
 
+#[instrument(skip(prog_track))]
 #[async_recursion]
 pub async fn link(
     prog_track: &'static progress::TlsProgress,
@@ -596,13 +629,14 @@ pub async fn link(
     update: &Option<std::path::PathBuf>,
     settings: &Settings,
 ) -> Result<LinkSummary> {
-    debug!("link: {:?} {:?} -> {:?}", src, update, dst);
     let _guard = prog_track.guard();
+    event!(Level::DEBUG, "reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))?;
     let update_metadata_opt = match update {
         Some(update) => {
+            event!(Level::DEBUG, "reading 'update' metadata");
             let update_metadata_res = tokio::fs::symlink_metadata(update).await;
             match update_metadata_res {
                 Ok(update_metadata) => Some(update_metadata),
@@ -623,7 +657,8 @@ pub async fn link(
         let update = update.as_ref().unwrap();
         if !is_file_type_same(&src_metadata, update_metadata) {
             // file type changed, just copy the updated one
-            debug!(
+            event!(
+                Level::DEBUG,
                 "link: file type of {:?} ({:?}) and {:?} ({:?}) differs - copying from update",
                 src,
                 src_metadata.file_type(),
@@ -639,15 +674,18 @@ pub async fn link(
         if update_metadata.is_file() {
             // check if the file is unchanged and if so hard-link, otherwise copy from the updated one
             if is_unchanged(&src_metadata, update_metadata) {
+                event!(Level::DEBUG, "no change, hard links 'src'");
                 tokio::fs::hard_link(src, dst).await?;
                 return Ok(LinkSummary {
                     files_hard_linked: 1,
                     ..Default::default()
                 });
             } else {
-                debug!(
+                event!(
+                    Level::DEBUG,
                     "link: {:?} metadata has changed, copying from {:?}",
-                    src, update
+                    src,
+                    update
                 );
                 copy_file(update, dst, settings).await?;
                 return Ok(LinkSummary {
@@ -661,6 +699,7 @@ pub async fn link(
         }
         if update_metadata.is_symlink() {
             // just symlink the updated one, no need to check if it's changed
+            event!(Level::DEBUG, "'update' is a symlink so just symlink that");
             let update_symlink = tokio::fs::read_link(update)
                 .await
                 .with_context(|| format!("failed reading symlink {:?}", &update))?;
@@ -680,7 +719,9 @@ pub async fn link(
         }
     } else {
         // update hasn't been specified, if this is a file just hard-link the source or symlink if it's a symlink
+        event!(Level::DEBUG, "no 'update' specified");
         if src_metadata.is_file() {
+            event!(Level::DEBUG, "'src' is a file, hard link it");
             tokio::fs::hard_link(src, dst).await?;
             return Ok(LinkSummary {
                 files_hard_linked: 1,
@@ -688,6 +729,7 @@ pub async fn link(
             });
         }
         if src_metadata.is_symlink() {
+            event!(Level::DEBUG, "'src' is a symlink so just symlink that");
             let src_symlink = tokio::fs::read_link(src)
                 .await
                 .with_context(|| format!("failed reading symlink {:?}", &src))?;
@@ -708,6 +750,7 @@ pub async fn link(
     }
     assert!(src_metadata.is_dir());
     assert!(update_metadata_opt.is_none() || update_metadata_opt.as_ref().unwrap().is_dir());
+    event!(Level::DEBUG, "process contents of 'src' directory");
     let mut src_entries = tokio::fs::read_dir(src)
         .await
         .with_context(|| format!("cannot open directory {:?} for reading", src))?;
@@ -738,6 +781,7 @@ pub async fn link(
     // only process update if it the path was provided and the directory is present
     if update_metadata_opt.is_some() {
         let update = update.as_ref().unwrap();
+        event!(Level::DEBUG, "process contents of 'update' directory");
         let mut update_entries = tokio::fs::read_dir(update)
             .await
             .with_context(|| format!("cannot open directory {:?} for reading", &update))?;
@@ -753,15 +797,11 @@ pub async fn link(
                 // we already must have considered this file, skip it
                 continue;
             }
-            let src_path = src.join(entry_name);
+            event!(Level::DEBUG, "found a new entry in the 'update' directory");
             let dst_path = dst.join(entry_name);
             let update_path = update.join(entry_name);
             let settings = settings.clone();
             let do_copy = || async move {
-                if tokio::fs::symlink_metadata(src_path).await.is_ok() {
-                    // we already must have considered this file, skip it
-                    return Ok(LinkSummary::default());
-                }
                 let copy_summary = copy(prog_track, &update_path, &dst_path, &settings).await?;
                 Ok(LinkSummary {
                     copy_summary,
@@ -782,9 +822,13 @@ pub async fn link(
         match res? {
             Ok(summary) => link_summary = link_summary + summary,
             Err(error) => {
-                error!(
+                event!(
+                    Level::ERROR,
                     "link: {:?} {:?} -> {:?} failed with: {}",
-                    src, update, dst, &error
+                    src,
+                    update,
+                    dst,
+                    &error
                 );
                 if settings.fail_early {
                     return Err(error);
@@ -801,6 +845,7 @@ pub async fn link(
             dst
         ));
     }
+    event!(Level::DEBUG, "set 'dst' directory metadata");
     let preserve_metadata = if let Some(update_metadata) = update_metadata_opt.as_ref() {
         update_metadata
     } else {
@@ -818,14 +863,13 @@ pub async fn link(
     if settings.preserve {
         set_owner_and_time(dst, preserve_metadata).await?;
     }
-    debug!("link: {:?} {:?} -> {:?} succeeded!", src, update, dst);
     Ok(link_summary)
 }
 
 #[cfg(test)]
 mod link_tests {
     use crate::testutils;
-    use test_log::test;
+    use tracing_test::traced_test;
 
     use super::*;
 
@@ -840,7 +884,8 @@ mod link_tests {
         fail_early: false,
     };
 
-    #[test(tokio::test)]
+    #[tokio::test]
+    #[traced_test]
     async fn check_basic_link() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
@@ -865,7 +910,8 @@ mod link_tests {
         Ok(())
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
+    #[traced_test]
     async fn check_basic_link_update() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
@@ -890,7 +936,8 @@ mod link_tests {
         Ok(())
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
+    #[traced_test]
     async fn check_basic_link_empty_src() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         tokio::fs::create_dir(tmp_dir.join("baz")).await?;
@@ -939,7 +986,8 @@ mod link_tests {
         Ok(())
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
+    #[traced_test]
     async fn check_link_update() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         setup_update_dir(&tmp_dir).await?;
