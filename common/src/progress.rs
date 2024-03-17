@@ -1,3 +1,6 @@
+use tracing::{event, instrument, Level};
+
+#[derive(Debug)]
 pub struct TlsCounter {
     // mutex is used primarily from one thread, so it's not a bottleneck
     count: thread_local::ThreadLocal<std::sync::Mutex<u64>>,
@@ -27,7 +30,7 @@ impl Default for TlsCounter {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct TlsProgress {
     started: TlsCounter,
     finished: TlsCounter,
@@ -67,15 +70,18 @@ impl TlsProgress {
         ProgressGuard::new(self)
     }
 
+    #[instrument]
     pub fn get(&self) -> Status {
         let mut status = Status {
             started: self.started.get(),
             finished: self.finished.get(),
         };
         if status.finished > status.started {
-            debug!(
+            event!(
+                Level::DEBUG,
                 "Progress inversion - started: {}, finished {}",
-                status.started, status.finished
+                status.started,
+                status.finished
             );
             status.started = status.finished;
         }

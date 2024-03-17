@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
 use std::os::unix::fs::PermissionsExt;
+use tracing::{event, instrument, Level};
 
 use crate::progress;
 
@@ -35,18 +36,20 @@ impl std::fmt::Display for RmSummary {
     }
 }
 
+#[instrument(skip(prog_track))]
 #[async_recursion]
 pub async fn rm(
     prog_track: &'static progress::TlsProgress,
     path: &std::path::Path,
     settings: &Settings,
 ) -> Result<RmSummary> {
-    debug!("remove: {:?}", path);
     let _guard = prog_track.guard();
+    event!(Level::DEBUG, "read path metadata");
     let src_metadata = tokio::fs::symlink_metadata(path)
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &path))?;
     if !src_metadata.is_dir() {
+        event!(Level::DEBUG, "not a directory, just remove");
         tokio::fs::remove_file(path)
             .await
             .with_context(|| format!("failed removing {:?}", &path))?;
@@ -55,7 +58,12 @@ pub async fn rm(
             ..Default::default()
         });
     }
+    event!(Level::DEBUG, "remove contents of the directory first");
     if src_metadata.permissions().readonly() {
+        event!(
+            Level::DEBUG,
+            "directory is read-only - change the permissions"
+        );
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
             .await
             .with_context(|| {
@@ -87,7 +95,7 @@ pub async fn rm(
         match res? {
             Ok(summary) => rm_summary = rm_summary + summary,
             Err(error) => {
-                error!("remove: {:?} failed with: {}", path, &error);
+                event!(Level::ERROR, "remove: {:?} failed with: {}", path, &error);
                 if settings.fail_early {
                     return Err(error);
                 }
@@ -98,10 +106,10 @@ pub async fn rm(
     if !success {
         return Err(anyhow::anyhow!("rm: {:?} failed!", &path));
     }
+    event!(Level::DEBUG, "finally remove the empty directory");
     tokio::fs::remove_dir(path)
         .await
         .with_context(|| format!("failed removing directory {:?}", &path))?;
-    debug!("remove: {:?} succeeded!", path);
     Ok(rm_summary)
 }
 
@@ -109,13 +117,14 @@ pub async fn rm(
 mod tests {
     use super::*;
     use crate::testutils;
-    use test_log::test;
+    use tracing_test::traced_test;
 
     lazy_static! {
         static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
     }
 
-    #[test(tokio::test)]
+    #[tokio::test]
+    #[traced_test]
     async fn no_write_permission() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();

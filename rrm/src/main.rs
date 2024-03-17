@@ -1,5 +1,6 @@
 use anyhow::Result;
 use structopt::StructOpt;
+use tracing::{event, instrument, Level};
 
 #[derive(StructOpt, Debug, Clone)]
 #[structopt(name = "rrm")]
@@ -37,6 +38,7 @@ struct Args {
     max_blocking_threads: usize,
 }
 
+#[instrument]
 async fn async_main(args: Args) -> Result<common::RmSummary> {
     let mut join_set = tokio::task::JoinSet::new();
     for path in args.paths {
@@ -52,7 +54,7 @@ async fn async_main(args: Args) -> Result<common::RmSummary> {
         match res? {
             Ok(summary) => rm_summary = rm_summary + summary,
             Err(error) => {
-                log::error!("{}", &error);
+                event!(Level::ERROR, "{}", &error);
                 if args.fail_early {
                     return Err(error);
                 }

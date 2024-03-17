@@ -1,11 +1,11 @@
 #[macro_use]
 extern crate lazy_static;
 
-#[macro_use]
-extern crate log;
-
 use anyhow::Result;
 use std::future::Future;
+use tracing::{event, instrument, Level};
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::prelude::*;
 
 mod copy;
 mod progress;
@@ -98,6 +98,7 @@ pub async fn link(
     copy::link(&PROGRESS, src, dst, update, settings).await
 }
 
+#[instrument(skip(func))] // "func" is not Debug printable
 pub fn run<Fut, Summary>(
     progress_op_name: Option<&str>,
     quiet: bool,
@@ -113,14 +114,21 @@ where
 {
     let _progress = progress_op_name.map(ProgressTracker::new);
     if !quiet {
-        env_logger::Builder::new()
-            .target(env_logger::Target::Stdout)
-            .filter_level(match verbose {
-                0 => log::LevelFilter::Error,
-                1 => log::LevelFilter::Info,
-                2 => log::LevelFilter::Debug,
-                _ => log::LevelFilter::Trace,
-            })
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_new(match verbose {
+                    0 => "error",
+                    1 => "info",
+                    2 => "debug",
+                    _ => "trace",
+                })
+                .unwrap(),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(true)
+                    .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE),
+            )
             .init();
     } else {
         assert!(
@@ -137,7 +145,10 @@ where
         builder.max_blocking_threads(max_blocking_threads);
     }
     if !sysinfo::set_open_files_limit(isize::MAX) {
-        info!("Failed to update the open files limit (expeted on non-linux targets)");
+        event!(
+            Level::INFO,
+            "Failed to update the open files limit (expeted on non-linux targets)"
+        );
     }
     let runtime = builder.build()?;
     let res = runtime.block_on(func());

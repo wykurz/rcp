@@ -90,7 +90,7 @@ async fn filegen(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
     let args = Args::from_args();
     let filesize = args
         .filesize
