@@ -23,6 +23,7 @@ in
       cargo-udeps
       gdb
       llvmPackages.bintools
+      tokio-console
     ];
     RUST_SRC_PATH = "${myrust}/lib/rustlib/src/rust/src";
   }

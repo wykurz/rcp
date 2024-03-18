@@ -674,7 +674,7 @@ pub async fn link(
         if update_metadata.is_file() {
             // check if the file is unchanged and if so hard-link, otherwise copy from the updated one
             if is_unchanged(&src_metadata, update_metadata) {
-                event!(Level::DEBUG, "no change, hard links 'src'");
+                event!(Level::DEBUG, "no change, hard link 'src'");
                 tokio::fs::hard_link(src, dst).await?;
                 return Ok(LinkSummary {
                     files_hard_linked: 1,
