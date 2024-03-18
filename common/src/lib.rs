@@ -98,6 +98,16 @@ pub async fn link(
     copy::link(&PROGRESS, src, dst, update, settings).await
 }
 
+fn read_env_or_default<T: std::str::FromStr>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Ok(val) => match val.parse() {
+            Ok(val) => val,
+            Err(_) => default,
+        },
+        Err(_) => default,
+    }
+}
+
 #[instrument(skip(func))] // "func" is not Debug printable
 pub fn run<Fut, Summary>(
     progress_op_name: Option<&str>,
@@ -114,8 +124,10 @@ where
 {
     let _progress = progress_op_name.map(ProgressTracker::new);
     if !quiet {
-        tracing_subscriber::registry()
-            .with(
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_target(true)
+            .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+            .with_filter(
                 tracing_subscriber::EnvFilter::try_new(match verbose {
                     0 => "error",
                     1 => "info",
@@ -123,13 +135,28 @@ where
                     _ => "trace",
                 })
                 .unwrap(),
-            )
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_target(true)
-                    .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE),
-            )
-            .init();
+            );
+
+        let is_console_enabled = match std::env::var("RCP_TOKIO_TRACING_CONSOLE_ENABLED") {
+            Ok(val) => matches!(val.to_lowercase().as_str(), "true" | "1"),
+            Err(_) => false,
+        };
+
+        let subscriber = tracing_subscriber::registry().with(fmt_layer);
+
+        if is_console_enabled {
+            let console_port: u16 =
+                read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_SERVER_PORT", 6669);
+            let retention_seconds: u64 =
+                read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS", 60);
+            let console_layer = console_subscriber::ConsoleLayer::builder()
+                .retention(std::time::Duration::from_secs(retention_seconds))
+                .server_addr(([127, 0, 0, 1], console_port))
+                .spawn();
+            subscriber.with(console_layer).init();
+        } else {
+            subscriber.init();
+        };
     } else {
         assert!(
             verbose == 0,
