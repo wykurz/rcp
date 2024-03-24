@@ -16,6 +16,23 @@ The following command will install all the tools on your system:
 nix-env -iA nixpkgs.rcp
 ```
 
+tracing and tokio-console
+=========================
+
+The `rcp` tools now use the `tracing` crate for logging and support sending data to the `tokio-console` subscriber.
+
+## enabling
+
+To enable the `console-subscriber` you need to set the environment variable `RCP_TOKIO_TRACING_CONSOLE_ENABLED=1` (or `true` with any case).
+
+## sever port
+
+By default port `6669` is used (`tokio-console` default) but this can be changed by setting `RCP_TOKIO_TRACING_CONSOLE_SERVER_PORT=1234`.
+
+## retention time
+
+The trace events are retained for 60s. This can be modified by setting `RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS=120`.
+
 rcp
 ===
 
