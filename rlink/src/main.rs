@@ -5,6 +5,10 @@ use structopt::StructOpt;
 #[derive(StructOpt, Debug, Clone)]
 #[structopt(name = "rlink")]
 struct Args {
+    /// Overwrite existing files/directories
+    #[structopt(short, long)]
+    overwrite: bool,
+
     /// Exit on first error
     #[structopt(short = "-e", long = "fail-early")]
     fail_early: bool,
@@ -87,6 +91,7 @@ async fn async_main(args: Args) -> Result<LinkSummary> {
             read_buffer,
             dereference: args.dereference,
             fail_early: args.fail_early,
+            overwrite: args.overwrite,
         },
     )
     .await

@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
+use std::os::linux::fs::MetadataExt as LinuxMetadataExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
 use tracing::{event, instrument, Level};
 
 use crate::progress;
+use crate::rm;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -12,6 +14,28 @@ pub struct Settings {
     pub read_buffer: usize,
     pub dereference: bool,
     pub fail_early: bool,
+    pub overwrite: bool,
+}
+
+#[instrument]
+fn is_metadata_equal(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
+    if md1.size() != md2.size() || md1.mtime() != md2.mtime() {
+        return false;
+    }
+    // some filesystems do not support nanosecond precision, so we only compare nanoseconds if both files have them
+    if md1.mtime_nsec() != 0 && md2.mtime_nsec() != 0 && md1.mtime_nsec() != md2.mtime_nsec() {
+        return false;
+    }
+    true
+}
+
+#[instrument]
+fn is_file_type_same(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
+    let ft1 = md1.file_type();
+    let ft2 = md2.file_type();
+    ft1.is_dir() == ft2.is_dir()
+        && ft1.is_file() == ft2.is_file()
+        && ft1.is_symlink() == ft2.is_symlink()
 }
 
 #[instrument]
@@ -54,12 +78,13 @@ async fn set_owner_and_time(dst: &std::path::Path, metadata: &std::fs::Metadata)
     .await?
 }
 
-#[instrument]
+#[instrument(skip(prog_track))]
 async fn copy_file(
+    prog_track: &'static progress::TlsProgress,
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &Settings,
-) -> Result<()> {
+) -> Result<CopySummary> {
     event!(
         Level::DEBUG,
         "opening 'src' for reading and 'dst' for writing"
@@ -67,11 +92,49 @@ async fn copy_file(
     let mut reader = tokio::fs::File::open(src)
         .await
         .with_context(|| format!("cannot open {:?} for reading", src))?;
-    let mut buf_reader = tokio::io::BufReader::with_capacity(settings.read_buffer, &mut reader);
-    let mut writer = tokio::fs::File::create(dst)
-        .await
-        .with_context(|| format!("cannot open {:?} for writing", dst))?;
+    let mut rm_summary = rm::RmSummary::default();
+    let mut writer = {
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dst)
+            .await
+        {
+            Ok(writer) => writer,
+            Err(error) => {
+                if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
+                    event!(Level::DEBUG, "file exists, check if it's identical");
+                    let md1 = reader.metadata().await?;
+                    let md2 = tokio::fs::symlink_metadata(dst)
+                        .await
+                        .with_context(|| format!("failed reading metadata from {:?}", &dst))?;
+                    if is_file_type_same(&md1, &md2) && is_metadata_equal(&md1, &md2) {
+                        event!(Level::DEBUG, "file is identical, skipping");
+                        return Ok(CopySummary {
+                            files_unchanged: 1,
+                            ..Default::default()
+                        });
+                    }
+                    event!(Level::DEBUG, "file is different, removing existing file");
+                    rm_summary = rm::rm(
+                        prog_track,
+                        dst,
+                        &rm::Settings {
+                            fail_early: settings.fail_early,
+                        },
+                    )
+                    .await?;
+                    tokio::fs::File::create(dst)
+                        .await
+                        .with_context(|| format!("cannot create file {:?}", dst))?
+                } else {
+                    return Err(error).with_context(|| format!("cannot create file {:?}", dst));
+                }
+            }
+        }
+    };
     event!(Level::DEBUG, "copying data");
+    let mut buf_reader = tokio::io::BufReader::with_capacity(settings.read_buffer, &mut reader);
     tokio::io::copy_buf(&mut buf_reader, &mut writer)
         .await
         .with_context(|| format!("failed copying data to {:?}", &dst))?;
@@ -94,23 +157,35 @@ async fn copy_file(
         // modify the uid and gid of the file as well
         set_owner_and_time(dst, &src_metadata).await?;
     }
-    Ok(())
+    Ok(CopySummary {
+        rm_summary,
+        files_copied: 1,
+        ..Default::default()
+    })
 }
 
 #[derive(Copy, Clone, Default)]
 pub struct CopySummary {
+    pub rm_summary: rm::RmSummary,
     pub files_copied: usize,
     pub symlinks_created: usize,
     pub directories_created: usize,
+    pub files_unchanged: usize,
+    pub symlinks_unchanged: usize,
+    pub directories_unchanged: usize,
 }
 
 impl std::ops::Add for CopySummary {
     type Output = Self;
     fn add(self, other: Self) -> Self {
         Self {
+            rm_summary: self.rm_summary + other.rm_summary,
             files_copied: self.files_copied + other.files_copied,
             symlinks_created: self.symlinks_created + other.symlinks_created,
             directories_created: self.directories_created + other.directories_created,
+            files_unchanged: self.files_unchanged + other.files_unchanged,
+            symlinks_unchanged: self.symlinks_unchanged + other.symlinks_unchanged,
+            directories_unchanged: self.directories_unchanged + other.directories_unchanged,
         }
     }
 }
@@ -119,8 +194,8 @@ impl std::fmt::Display for CopySummary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "files copied: {}\nsymlinks created: {}\ndirectories created: {}",
-            self.files_copied, self.symlinks_created, self.directories_created
+            "{}files copied: {}\nsymlinks created: {}\ndirectories created: {}\nfiles_unchanged: {}\ndirectories_unchanged: {}\n",
+            &self.rm_summary, self.files_copied, self.symlinks_created, self.directories_created, self.files_unchanged, self.directories_unchanged
         )
     }
 }
@@ -139,23 +214,76 @@ pub async fn copy(
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))?;
     if src_metadata.is_file() || (src_metadata.is_symlink() && settings.dereference) {
-        copy_file(src, dst, settings).await?;
-        return Ok(CopySummary {
-            files_copied: 1,
-            ..Default::default()
-        });
+        return copy_file(prog_track, src, dst, settings).await;
     }
     if src_metadata.is_symlink() {
+        let mut rm_summary = rm::RmSummary::default();
         let link = tokio::fs::read_link(src)
             .await
             .with_context(|| format!("failed reading symlink {:?}", &src))?;
-        tokio::fs::symlink(link, dst)
-            .await
-            .with_context(|| format!("failed creating symlink {:?}", &dst))?;
+        // try creating a symlink, if dst path exists and overwrite is set - remove and try again
+        if let Err(error) = tokio::fs::symlink(&link, dst).await {
+            if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
+                let dst_metadata = tokio::fs::symlink_metadata(dst)
+                    .await
+                    .with_context(|| format!("failed reading metadata from {:?}", &dst))?;
+                if is_file_type_same(&src_metadata, &dst_metadata) {
+                    let dst_link = tokio::fs::read_link(dst)
+                        .await
+                        .with_context(|| format!("failed reading symlink {:?}", &dst))?;
+                    if link == dst_link {
+                        event!(
+                            Level::DEBUG,
+                            "'dst' is a symlink and points to the same location as 'src'"
+                        );
+                        if settings.preserve {
+                            // do we need to update the metadata for this symlink?
+                            let dst_metadata =
+                                tokio::fs::symlink_metadata(dst).await.with_context(|| {
+                                    format!("failed reading metadata from {:?}", &dst)
+                                })?;
+                            if !is_metadata_equal(&src_metadata, &dst_metadata) {
+                                event!(Level::DEBUG, "'dst' metadata is different, updating");
+                                set_owner_and_time(dst, &src_metadata).await?;
+                                return Ok(CopySummary {
+                                    symlinks_created: 1,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                        event!(Level::DEBUG, "symlink already exists, skipping");
+                        return Ok(CopySummary {
+                            symlinks_unchanged: 1,
+                            ..Default::default()
+                        });
+                    }
+                    event!(
+                        Level::DEBUG,
+                        "'dst' is a symlink but points to a different path, updating"
+                    );
+                } else {
+                    event!(Level::DEBUG, "'dst' is not a symlink, updating");
+                }
+                rm_summary = rm::rm(
+                    prog_track,
+                    dst,
+                    &rm::Settings {
+                        fail_early: settings.fail_early,
+                    },
+                )
+                .await?;
+                tokio::fs::symlink(&link, dst)
+                    .await
+                    .with_context(|| format!("failed creating symlink {:?}", &dst))?;
+            } else {
+                return Err(error).with_context(|| format!("failed creating symlink {:?}", &dst));
+            }
+        }
         if settings.preserve {
             set_owner_and_time(dst, &src_metadata).await?;
         }
         return Ok(CopySummary {
+            rm_summary,
             symlinks_created: 1,
             ..Default::default()
         });
@@ -165,9 +293,56 @@ pub async fn copy(
     let mut entries = tokio::fs::read_dir(src)
         .await
         .with_context(|| format!("cannot open directory {:?} for reading", src))?;
-    tokio::fs::create_dir(dst)
-        .await
-        .with_context(|| format!("cannot create directory {:?}", dst))?;
+    let mut copy_summary = {
+        if let Err(error) = tokio::fs::create_dir(dst).await {
+            if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
+                // check if the destination is a directory - if so, leave it
+                //
+                // N.B. the permissions may prevent us from writing to it but the alternative is to open up the directory
+                // while we're writing to it which isn't safe
+                let dst_metadata = tokio::fs::metadata(dst)
+                    .await
+                    .with_context(|| format!("failed reading metadata from {:?}", &dst))?;
+                if dst_metadata.is_dir() {
+                    event!(Level::DEBUG, "'dst' is a directory, leaving it as is");
+                    CopySummary {
+                        directories_unchanged: 1,
+                        ..Default::default()
+                    }
+                } else {
+                    event!(
+                        Level::DEBUG,
+                        "'dst' is not a directory, removing and creating a new one"
+                    );
+                    let rm_summary = rm::rm(
+                        prog_track,
+                        dst,
+                        &rm::Settings {
+                            fail_early: settings.fail_early,
+                        },
+                    )
+                    .await
+                    .with_context(|| format!("cannot remove conflicting path {:?}", dst))?;
+                    tokio::fs::create_dir(dst)
+                        .await
+                        .with_context(|| format!("cannot create directory {:?}", dst))?;
+                    CopySummary {
+                        rm_summary,
+                        directories_created: 1,
+                        ..Default::default()
+                    }
+                }
+            } else {
+                return Err(error).with_context(|| format!("cannot create directory {:?}", dst));
+            }
+        } else {
+            // new directory created, no conflicts
+            CopySummary {
+                directories_created: 1,
+                ..Default::default()
+            }
+        }
+    };
     let mut join_set = tokio::task::JoinSet::new();
     let mut success = true;
     while let Some(entry) = entries
@@ -182,10 +357,6 @@ pub async fn copy(
         let do_copy = || async move { copy(prog_track, &entry_path, &dst_path, &settings).await };
         join_set.spawn(do_copy());
     }
-    let mut copy_summary = CopySummary {
-        directories_created: 1,
-        ..Default::default()
-    };
     while let Some(res) = join_set.join_next().await {
         match res? {
             Ok(summary) => copy_summary = copy_summary + summary,
@@ -249,6 +420,7 @@ mod copy_tests {
                 read_buffer: 10,
                 dereference: false,
                 fail_early: false,
+                overwrite: false,
             },
         )
         .await?;
@@ -284,6 +456,7 @@ mod copy_tests {
                 read_buffer: 5,
                 dereference: false,
                 fail_early: false,
+                overwrite: false,
             },
         )
         .await
@@ -353,6 +526,7 @@ mod copy_tests {
                 read_buffer: 7,
                 dereference: false,
                 fail_early: false,
+                overwrite: false,
             },
         )
         .await?;
@@ -408,6 +582,7 @@ mod copy_tests {
                 read_buffer: 8,
                 dereference: false,
                 fail_early: false,
+                overwrite: false,
             },
         )
         .await?;
@@ -444,6 +619,7 @@ mod copy_tests {
                 read_buffer: 10,
                 dereference: true, // <- important!
                 fail_early: false,
+                overwrite: false,
             },
         )
         .await?;
@@ -518,6 +694,7 @@ mod copy_tests {
                 read_buffer: 100,
                 dereference: false,
                 fail_early: false,
+                overwrite: false,
             },
         )
         .await?;
@@ -534,6 +711,7 @@ mod copy_tests {
                 read_buffer: 100,
                 dereference: false,
                 fail_early: false,
+                overwrite: false,
             },
         )
         .await?;
@@ -550,6 +728,7 @@ mod copy_tests {
                 read_buffer: 100,
                 dereference: true,
                 fail_early: false,
+                overwrite: false,
             },
         )
         .await?;
@@ -566,37 +745,293 @@ mod copy_tests {
                 read_buffer: 100,
                 dereference: true,
                 fail_early: false,
+                overwrite: false,
             },
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn setup_test_dir_and_copy() -> Result<std::path::PathBuf> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let summary = copy(
+            &PROGRESS,
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            &Settings {
+                preserve: true,
+                read_buffer: 10,
+                dereference: false,
+                fail_early: false,
+                overwrite: false,
+            },
+        )
+        .await?;
+        assert_eq!(summary.files_copied, 5);
+        assert_eq!(summary.symlinks_created, 2);
+        assert_eq!(summary.directories_created, 3);
+        Ok(tmp_dir)
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_cp_overwrite_basic() -> Result<()> {
+        let tmp_dir = setup_test_dir_and_copy().await?;
+        let output_path = &tmp_dir.join("bar");
+        {
+            // bar
+            // |- 0.txt
+            // |- bar  <---------------------------------------- REMOVE
+            //    |- 1.txt  <----------------------------------- REMOVE
+            //    |- 2.txt  <----------------------------------- REMOVE
+            //    |- 3.txt  <----------------------------------- REMOVE
+            // |- baz
+            //    |- 4.txt
+            //    |- 5.txt -> ../bar/2.txt <-------------------- REMOVE
+            //    |- 6.txt -> (absolute path) .../foo/bar/3.txt
+            let summary = rm::rm(
+                &PROGRESS,
+                &output_path.join("bar"),
+                &rm::Settings { fail_early: false },
+            )
+            .await?
+                + rm::rm(
+                    &PROGRESS,
+                    &output_path.join("baz").join("5.txt"),
+                    &rm::Settings { fail_early: false },
+                )
+                .await?;
+            assert_eq!(summary.files_removed, 3);
+            assert_eq!(summary.symlinks_removed, 1);
+            assert_eq!(summary.directories_removed, 1);
+        }
+        let summary = copy(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &output_path,
+            &Settings {
+                preserve: true,
+                read_buffer: 10,
+                dereference: false,
+                fail_early: false,
+                overwrite: true, // <- important!
+            },
+        )
+        .await?;
+        assert_eq!(summary.files_copied, 3);
+        assert_eq!(summary.symlinks_created, 1);
+        assert_eq!(summary.directories_created, 1);
+        testutils::check_dirs_identical(
+            &tmp_dir.join("foo"),
+            &output_path,
+            testutils::FileEqualityCheck::Timestamp,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_cp_overwrite_dir_file() -> Result<()> {
+        let tmp_dir = setup_test_dir_and_copy().await?;
+        let output_path = &tmp_dir.join("bar");
+        {
+            // bar
+            // |- 0.txt
+            // |- bar
+            //    |- 1.txt  <------------------------------------- REMOVE
+            //    |- 2.txt
+            //    |- 3.txt
+            // |- baz  <------------------------------------------ REMOVE
+            //    |- 4.txt  <------------------------------------- REMOVE
+            //    |- 5.txt -> ../bar/2.txt <---------------------- REMOVE
+            //    |- 6.txt -> (absolute path) .../foo/bar/3.txt <- REMOVE
+            let summary = rm::rm(
+                &PROGRESS,
+                &output_path.join("bar").join("1.txt"),
+                &rm::Settings { fail_early: false },
+            )
+            .await?
+                + rm::rm(
+                    &PROGRESS,
+                    &output_path.join("baz"),
+                    &rm::Settings { fail_early: false },
+                )
+                .await?;
+            assert_eq!(summary.files_removed, 2);
+            assert_eq!(summary.symlinks_removed, 2);
+            assert_eq!(summary.directories_removed, 1);
+        }
+        {
+            // replace bar/1.txt file with a directory
+            tokio::fs::create_dir(&output_path.join("bar").join("1.txt")).await?;
+            // replace baz directory with a file
+            tokio::fs::write(&output_path.join("baz"), "baz").await?;
+        }
+        let summary = copy(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &output_path,
+            &Settings {
+                preserve: true,
+                read_buffer: 10,
+                dereference: false,
+                fail_early: false,
+                overwrite: true, // <- important!
+            },
+        )
+        .await?;
+        assert_eq!(summary.rm_summary.files_removed, 1);
+        assert_eq!(summary.rm_summary.symlinks_removed, 0);
+        assert_eq!(summary.rm_summary.directories_removed, 1);
+        assert_eq!(summary.files_copied, 2);
+        assert_eq!(summary.symlinks_created, 2);
+        assert_eq!(summary.directories_created, 1);
+        testutils::check_dirs_identical(
+            &tmp_dir.join("foo"),
+            &output_path,
+            testutils::FileEqualityCheck::Timestamp,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_cp_overwrite_symlink_file() -> Result<()> {
+        let tmp_dir = setup_test_dir_and_copy().await?;
+        let output_path = &tmp_dir.join("bar");
+        {
+            // bar
+            // |- 0.txt
+            // |- baz
+            //    |- 4.txt  <------------------------------------- REMOVE
+            //    |- 5.txt -> ../bar/2.txt <---------------------- REMOVE
+            // ...
+            let summary = rm::rm(
+                &PROGRESS,
+                &output_path.join("baz").join("4.txt"),
+                &rm::Settings { fail_early: false },
+            )
+            .await?
+                + rm::rm(
+                    &PROGRESS,
+                    &output_path.join("baz").join("5.txt"),
+                    &rm::Settings { fail_early: false },
+                )
+                .await?;
+            assert_eq!(summary.files_removed, 1);
+            assert_eq!(summary.symlinks_removed, 1);
+            assert_eq!(summary.directories_removed, 0);
+        }
+        {
+            // replace baz/4.txt file with a symlink
+            tokio::fs::symlink("../0.txt", &output_path.join("baz").join("4.txt")).await?;
+            // replace baz/5.txt symlink with a file
+            tokio::fs::write(&output_path.join("baz").join("5.txt"), "baz").await?;
+        }
+        let summary = copy(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &output_path,
+            &Settings {
+                preserve: true,
+                read_buffer: 10,
+                dereference: false,
+                fail_early: false,
+                overwrite: true, // <- important!
+            },
+        )
+        .await?;
+        assert_eq!(summary.rm_summary.files_removed, 1);
+        assert_eq!(summary.rm_summary.symlinks_removed, 1);
+        assert_eq!(summary.rm_summary.directories_removed, 0);
+        assert_eq!(summary.files_copied, 1);
+        assert_eq!(summary.symlinks_created, 1);
+        assert_eq!(summary.directories_created, 0);
+        testutils::check_dirs_identical(
+            &tmp_dir.join("foo"),
+            &output_path,
+            testutils::FileEqualityCheck::Timestamp,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_cp_overwrite_symlink_dir() -> Result<()> {
+        let tmp_dir = setup_test_dir_and_copy().await?;
+        let output_path = &tmp_dir.join("bar");
+        {
+            // bar
+            // |- 0.txt
+            // |- bar  <------------------------------------------ REMOVE
+            //    |- 1.txt  <------------------------------------- REMOVE
+            //    |- 2.txt  <------------------------------------- REMOVE
+            //    |- 3.txt  <------------------------------------- REMOVE
+            // |- baz
+            //    |- 5.txt -> ../bar/2.txt <---------------------- REMOVE
+            // ...
+            let summary = rm::rm(
+                &PROGRESS,
+                &output_path.join("bar"),
+                &rm::Settings { fail_early: false },
+            )
+            .await?
+                + rm::rm(
+                    &PROGRESS,
+                    &output_path.join("baz").join("5.txt"),
+                    &rm::Settings { fail_early: false },
+                )
+                .await?;
+            assert_eq!(summary.files_removed, 3);
+            assert_eq!(summary.symlinks_removed, 1);
+            assert_eq!(summary.directories_removed, 1);
+        }
+        {
+            // replace bar directory with a symlink
+            tokio::fs::symlink("0.txt", &output_path.join("bar")).await?;
+            // replace baz/5.txt symlink with a directory
+            tokio::fs::create_dir(&output_path.join("baz").join("5.txt")).await?;
+        }
+        let summary = copy(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &output_path,
+            &Settings {
+                preserve: true,
+                read_buffer: 10,
+                dereference: false,
+                fail_early: false,
+                overwrite: true, // <- important!
+            },
+        )
+        .await?;
+        assert_eq!(summary.rm_summary.files_removed, 0);
+        assert_eq!(summary.rm_summary.symlinks_removed, 1);
+        assert_eq!(summary.rm_summary.directories_removed, 1);
+        assert_eq!(summary.files_copied, 3);
+        assert_eq!(summary.symlinks_created, 1);
+        assert_eq!(summary.directories_created, 1);
+        assert_eq!(summary.files_unchanged, 2);
+        assert_eq!(summary.symlinks_unchanged, 1);
+        assert_eq!(summary.directories_unchanged, 2);
+        testutils::check_dirs_identical(
+            &tmp_dir.join("foo"),
+            &output_path,
+            testutils::FileEqualityCheck::Timestamp,
         )
         .await?;
         Ok(())
     }
 }
 
-#[instrument]
-fn is_file_type_same(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
-    let ft1 = md1.file_type();
-    let ft2 = md2.file_type();
-    ft1.is_dir() == ft2.is_dir()
-        && ft1.is_file() == ft2.is_file()
-        && ft1.is_symlink() == ft2.is_symlink()
-}
-
-#[instrument]
-fn is_unchanged(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
-    if md1.size() != md2.size() || md1.mtime() != md2.mtime() {
-        return false;
-    }
-    // some filesystems do not support nanosecond precision, so we only compare nanoseconds if both files have them
-    if md1.mtime_nsec() != 0 && md2.mtime_nsec() != 0 && md1.mtime_nsec() != md2.mtime_nsec() {
-        return false;
-    }
-    true
-}
-
 #[derive(Copy, Clone, Default)]
 pub struct LinkSummary {
-    pub files_hard_linked: usize,
+    pub hard_links_created: usize,
+    pub hard_links_unchanged: usize,
     pub copy_summary: CopySummary,
 }
 
@@ -604,7 +1039,8 @@ impl std::ops::Add for LinkSummary {
     type Output = Self;
     fn add(self, other: Self) -> Self {
         Self {
-            files_hard_linked: self.files_hard_linked + other.files_hard_linked,
+            hard_links_created: self.hard_links_created + other.hard_links_created,
+            hard_links_unchanged: self.hard_links_unchanged + other.hard_links_unchanged,
             copy_summary: self.copy_summary + other.copy_summary,
         }
     }
@@ -614,10 +1050,57 @@ impl std::fmt::Display for LinkSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "files hard-linked: {}\n{}",
-            self.files_hard_linked, &self.copy_summary
+            "hard-links created: {}\n{}",
+            self.hard_links_created, &self.copy_summary
         )
     }
+}
+
+fn is_hard_link(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
+    is_file_type_same(md1, md2) && md2.st_dev() == md1.st_dev() && md2.st_ino() == md1.st_ino()
+}
+
+#[instrument]
+async fn hard_link_helper(
+    prog_track: &'static progress::TlsProgress,
+    src: &std::path::Path,
+    src_metadata: &std::fs::Metadata,
+    dst: &std::path::Path,
+    settings: &Settings,
+) -> Result<LinkSummary> {
+    if let Err(error) = tokio::fs::hard_link(src, dst).await {
+        if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
+            event!(
+                Level::DEBUG,
+                "'dst' already exists, check if we need to update"
+            );
+            let dst_metadata = tokio::fs::symlink_metadata(dst).await?;
+            if is_hard_link(src_metadata, &dst_metadata) {
+                event!(Level::DEBUG, "no change, leaving file as is");
+                return Ok(LinkSummary {
+                    hard_links_unchanged: 1,
+                    ..Default::default()
+                });
+            }
+            event!(
+                Level::DEBUG,
+                "'dst' file type changed, removing and hard-linking"
+            );
+            rm::rm(
+                prog_track,
+                dst,
+                &rm::Settings {
+                    fail_early: settings.fail_early,
+                },
+            )
+            .await?;
+            tokio::fs::hard_link(src, dst).await?;
+        }
+    }
+    Ok(LinkSummary {
+        hard_links_created: 1,
+        ..Default::default()
+    })
 }
 
 #[instrument(skip(prog_track))]
@@ -673,13 +1156,9 @@ pub async fn link(
         }
         if update_metadata.is_file() {
             // check if the file is unchanged and if so hard-link, otherwise copy from the updated one
-            if is_unchanged(&src_metadata, update_metadata) {
+            if is_metadata_equal(&src_metadata, update_metadata) {
                 event!(Level::DEBUG, "no change, hard link 'src'");
-                tokio::fs::hard_link(src, dst).await?;
-                return Ok(LinkSummary {
-                    files_hard_linked: 1,
-                    ..Default::default()
-                });
+                return hard_link_helper(prog_track, src, &src_metadata, dst, settings).await;
             } else {
                 event!(
                     Level::DEBUG,
@@ -687,33 +1166,18 @@ pub async fn link(
                     src,
                     update
                 );
-                copy_file(update, dst, settings).await?;
                 return Ok(LinkSummary {
-                    copy_summary: CopySummary {
-                        files_copied: 1,
-                        ..Default::default()
-                    },
+                    copy_summary: copy_file(prog_track, update, dst, settings).await?,
                     ..Default::default()
                 });
             }
         }
         if update_metadata.is_symlink() {
-            // just symlink the updated one, no need to check if it's changed
             event!(Level::DEBUG, "'update' is a symlink so just symlink that");
-            let update_symlink = tokio::fs::read_link(update)
-                .await
-                .with_context(|| format!("failed reading symlink {:?}", &update))?;
-            tokio::fs::symlink(update_symlink, dst)
-                .await
-                .with_context(|| format!("failed creating symlink {:?}", &dst))?;
-            if settings.preserve {
-                set_owner_and_time(dst, update_metadata).await?;
-            }
+            // use "copy" function to handle the overwrite logic
+            let copy_summary = copy(prog_track, update, dst, settings).await?;
             return Ok(LinkSummary {
-                copy_summary: CopySummary {
-                    symlinks_created: 1,
-                    ..Default::default()
-                },
+                copy_summary,
                 ..Default::default()
             });
         }
@@ -721,29 +1185,14 @@ pub async fn link(
         // update hasn't been specified, if this is a file just hard-link the source or symlink if it's a symlink
         event!(Level::DEBUG, "no 'update' specified");
         if src_metadata.is_file() {
-            event!(Level::DEBUG, "'src' is a file, hard link it");
-            tokio::fs::hard_link(src, dst).await?;
-            return Ok(LinkSummary {
-                files_hard_linked: 1,
-                ..Default::default()
-            });
+            return hard_link_helper(prog_track, src, &src_metadata, dst, settings).await;
         }
         if src_metadata.is_symlink() {
             event!(Level::DEBUG, "'src' is a symlink so just symlink that");
-            let src_symlink = tokio::fs::read_link(src)
-                .await
-                .with_context(|| format!("failed reading symlink {:?}", &src))?;
-            tokio::fs::symlink(src_symlink, dst)
-                .await
-                .with_context(|| format!("failed creating symlink {:?}", &dst))?;
-            if settings.preserve {
-                set_owner_and_time(dst, &src_metadata).await?;
-            }
+            // use "copy" function to handle the overwrite logic
+            let copy_summary = copy(prog_track, src, dst, settings).await?;
             return Ok(LinkSummary {
-                copy_summary: CopySummary {
-                    symlinks_created: 1,
-                    ..Default::default()
-                },
+                copy_summary,
                 ..Default::default()
             });
         }
@@ -754,9 +1203,56 @@ pub async fn link(
     let mut src_entries = tokio::fs::read_dir(src)
         .await
         .with_context(|| format!("cannot open directory {:?} for reading", src))?;
-    tokio::fs::create_dir(dst)
-        .await
-        .with_context(|| format!("cannot create directory {:?}", dst))?;
+    let copy_summary = {
+        if let Err(error) = tokio::fs::create_dir(dst).await {
+            if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
+                // check if the destination is a directory - if so, leave it
+                //
+                // N.B. the permissions may prevent us from writing to it but the alternative is to open up the directory
+                // while we're writing to it which isn't safe
+                let dst_metadata = tokio::fs::metadata(dst)
+                    .await
+                    .with_context(|| format!("failed reading metadata from {:?}", &dst))?;
+                if dst_metadata.is_dir() {
+                    event!(Level::DEBUG, "'dst' is a directory, leaving it as is");
+                    CopySummary {
+                        directories_unchanged: 1,
+                        ..Default::default()
+                    }
+                } else {
+                    event!(
+                        Level::DEBUG,
+                        "'dst' is not a directory, removing and creating a new one"
+                    );
+                    let rm_summary = rm::rm(
+                        prog_track,
+                        dst,
+                        &rm::Settings {
+                            fail_early: settings.fail_early,
+                        },
+                    )
+                    .await
+                    .with_context(|| format!("cannot remove conflicting path {:?}", dst))?;
+                    tokio::fs::create_dir(dst)
+                        .await
+                        .with_context(|| format!("cannot create directory {:?}", dst))?;
+                    CopySummary {
+                        rm_summary,
+                        directories_created: 1,
+                        ..Default::default()
+                    }
+                }
+            } else {
+                return Err(error).with_context(|| format!("cannot create directory {:?}", dst));
+            }
+        } else {
+            // new directory created, no conflicts
+            CopySummary {
+                directories_created: 1,
+                ..Default::default()
+            }
+        }
+    };
     let mut join_set = tokio::task::JoinSet::new();
     let mut success = true;
     // create a set of all the files we already processed
@@ -778,7 +1274,7 @@ pub async fn link(
         };
         join_set.spawn(do_link());
     }
-    // only process update if it the path was provided and the directory is present
+    // only process update if the path was provided and the directory is present
     if update_metadata_opt.is_some() {
         let update = update.as_ref().unwrap();
         event!(Level::DEBUG, "process contents of 'update' directory");
@@ -812,10 +1308,7 @@ pub async fn link(
         }
     }
     let mut link_summary = LinkSummary {
-        copy_summary: CopySummary {
-            directories_created: 1,
-            ..Default::default()
-        },
+        copy_summary,
         ..Default::default()
     };
     while let Some(res) = join_set.join_next().await {
@@ -882,11 +1375,12 @@ mod link_tests {
         read_buffer: 10,
         dereference: false,
         fail_early: false,
+        overwrite: false,
     };
 
     #[tokio::test]
     #[traced_test]
-    async fn check_basic_link() -> Result<()> {
+    async fn test_basic_link() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         let summary = link(
@@ -897,7 +1391,7 @@ mod link_tests {
             &COMMON_SETTINGS,
         )
         .await?;
-        assert_eq!(summary.files_hard_linked, 5);
+        assert_eq!(summary.hard_links_created, 5);
         assert_eq!(summary.copy_summary.files_copied, 0);
         assert_eq!(summary.copy_summary.symlinks_created, 2);
         assert_eq!(summary.copy_summary.directories_created, 3);
@@ -912,7 +1406,7 @@ mod link_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn check_basic_link_update() -> Result<()> {
+    async fn test_basic_link_update() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         let summary = link(
@@ -923,7 +1417,7 @@ mod link_tests {
             &COMMON_SETTINGS,
         )
         .await?;
-        assert_eq!(summary.files_hard_linked, 5);
+        assert_eq!(summary.hard_links_created, 5);
         assert_eq!(summary.copy_summary.files_copied, 0);
         assert_eq!(summary.copy_summary.symlinks_created, 2);
         assert_eq!(summary.copy_summary.directories_created, 3);
@@ -938,7 +1432,7 @@ mod link_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn check_basic_link_empty_src() -> Result<()> {
+    async fn test_basic_link_empty_src() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         tokio::fs::create_dir(tmp_dir.join("baz")).await?;
         let test_path = tmp_dir.as_path();
@@ -950,7 +1444,7 @@ mod link_tests {
             &COMMON_SETTINGS,
         )
         .await?;
-        assert_eq!(summary.files_hard_linked, 0);
+        assert_eq!(summary.hard_links_created, 0);
         assert_eq!(summary.copy_summary.files_copied, 5);
         assert_eq!(summary.copy_summary.symlinks_created, 2);
         assert_eq!(summary.copy_summary.directories_created, 3);
@@ -988,7 +1482,7 @@ mod link_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn check_link_update() -> Result<()> {
+    async fn test_link_update() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         setup_update_dir(&tmp_dir).await?;
         let test_path = tmp_dir.as_path();
@@ -1000,7 +1494,7 @@ mod link_tests {
             &COMMON_SETTINGS,
         )
         .await?;
-        assert_eq!(summary.files_hard_linked, 2);
+        assert_eq!(summary.hard_links_created, 2);
         assert_eq!(summary.copy_summary.files_copied, 2);
         assert_eq!(summary.copy_summary.symlinks_created, 3);
         assert_eq!(summary.copy_summary.directories_created, 3);
@@ -1016,6 +1510,243 @@ mod link_tests {
             &test_path.join("update"),
             &test_path.join("bar"),
             testutils::FileEqualityCheck::Timestamp,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn setup_test_dir_and_link() -> Result<std::path::PathBuf> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let summary = link(
+            &PROGRESS,
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            &None,
+            &Settings {
+                preserve: true,
+                read_buffer: 10,
+                dereference: false,
+                fail_early: false,
+                overwrite: false,
+            },
+        )
+        .await?;
+        assert_eq!(summary.hard_links_created, 5);
+        assert_eq!(summary.copy_summary.symlinks_created, 2);
+        assert_eq!(summary.copy_summary.directories_created, 3);
+        Ok(tmp_dir)
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_link_overwrite_basic() -> Result<()> {
+        let tmp_dir = setup_test_dir_and_link().await?;
+        let output_path = &tmp_dir.join("bar");
+        {
+            // bar
+            // |- 0.txt
+            // |- bar  <---------------------------------------- REMOVE
+            //    |- 1.txt  <----------------------------------- REMOVE
+            //    |- 2.txt  <----------------------------------- REMOVE
+            //    |- 3.txt  <----------------------------------- REMOVE
+            // |- baz
+            //    |- 4.txt
+            //    |- 5.txt -> ../bar/2.txt <-------------------- REMOVE
+            //    |- 6.txt -> (absolute path) .../foo/bar/3.txt
+            let summary = rm::rm(
+                &PROGRESS,
+                &output_path.join("bar"),
+                &rm::Settings { fail_early: false },
+            )
+            .await?
+                + rm::rm(
+                    &PROGRESS,
+                    &output_path.join("baz").join("5.txt"),
+                    &rm::Settings { fail_early: false },
+                )
+                .await?;
+            assert_eq!(summary.files_removed, 3);
+            assert_eq!(summary.symlinks_removed, 1);
+            assert_eq!(summary.directories_removed, 1);
+        }
+        let summary = link(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &output_path,
+            &None,
+            &Settings {
+                preserve: true,
+                read_buffer: 10,
+                dereference: false,
+                fail_early: false,
+                overwrite: true, // <- important!
+            },
+        )
+        .await?;
+        assert_eq!(summary.hard_links_created, 3);
+        assert_eq!(summary.copy_summary.symlinks_created, 1);
+        assert_eq!(summary.copy_summary.directories_created, 1);
+        testutils::check_dirs_identical(
+            &tmp_dir.join("foo"),
+            &output_path,
+            testutils::FileEqualityCheck::Timestamp,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_link_update_overwrite_basic() -> Result<()> {
+        let tmp_dir = setup_test_dir_and_link().await?;
+        let output_path = &tmp_dir.join("bar");
+        {
+            // bar
+            // |- 0.txt
+            // |- bar  <---------------------------------------- REMOVE
+            //    |- 1.txt  <----------------------------------- REMOVE
+            //    |- 2.txt  <----------------------------------- REMOVE
+            //    |- 3.txt  <----------------------------------- REMOVE
+            // |- baz
+            //    |- 4.txt
+            //    |- 5.txt -> ../bar/2.txt <-------------------- REMOVE
+            //    |- 6.txt -> (absolute path) .../foo/bar/3.txt
+            let summary = rm::rm(
+                &PROGRESS,
+                &output_path.join("bar"),
+                &rm::Settings { fail_early: false },
+            )
+            .await?
+                + rm::rm(
+                    &PROGRESS,
+                    &output_path.join("baz").join("5.txt"),
+                    &rm::Settings { fail_early: false },
+                )
+                .await?;
+            assert_eq!(summary.files_removed, 3);
+            assert_eq!(summary.symlinks_removed, 1);
+            assert_eq!(summary.directories_removed, 1);
+        }
+        setup_update_dir(&tmp_dir).await?;
+        // update
+        // |- 0.txt
+        // |- bar
+        //    |- 1.txt
+        //    |- 2.txt -> ../0.txt
+        let summary = link(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &output_path,
+            &Some(tmp_dir.join("update")),
+            &Settings {
+                preserve: true,
+                read_buffer: 10,
+                dereference: false,
+                fail_early: false,
+                overwrite: true, // <- important!
+            },
+        )
+        .await?;
+        assert_eq!(summary.hard_links_created, 1); // 3.txt
+        assert_eq!(summary.copy_summary.files_copied, 2); // 0.txt, 1.txt
+        assert_eq!(summary.copy_summary.symlinks_created, 2); // 2.txt, 5.txt
+        assert_eq!(summary.copy_summary.directories_created, 1);
+        // compare subset of src and dst
+        testutils::check_dirs_identical(
+            &tmp_dir.join("foo").join("baz"),
+            &tmp_dir.join("bar").join("baz"),
+            testutils::FileEqualityCheck::HardLink,
+        )
+        .await?;
+        // compare update and dst
+        testutils::check_dirs_identical(
+            &tmp_dir.join("update"),
+            &tmp_dir.join("bar"),
+            testutils::FileEqualityCheck::Timestamp,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_link_overwrite_hardlink_file() -> Result<()> {
+        let tmp_dir = setup_test_dir_and_link().await?;
+        let output_path = &tmp_dir.join("bar");
+        {
+            // bar
+            // |- 0.txt
+            // |- bar
+            //    |- 1.txt  <----------------------------------- REPLACE W/ FILE
+            //    |- 2.txt  <----------------------------------- REPLACE W/ SYMLINK
+            //    |- 3.txt  <----------------------------------- REPLACE W/ DIRECTORY
+            // |- baz    <-------------------------------------- REPLACE W/ FILE
+            //    |- ...
+            let bar_path = output_path.join("bar");
+            let summary = rm::rm(
+                &PROGRESS,
+                &bar_path.join("1.txt"),
+                &rm::Settings { fail_early: false },
+            )
+            .await?
+                + rm::rm(
+                    &PROGRESS,
+                    &bar_path.join("2.txt"),
+                    &rm::Settings { fail_early: false },
+                )
+                .await?
+                + rm::rm(
+                    &PROGRESS,
+                    &bar_path.join("3.txt"),
+                    &rm::Settings { fail_early: false },
+                )
+                .await?
+                + rm::rm(
+                    &PROGRESS,
+                    &output_path.join("baz"),
+                    &rm::Settings { fail_early: false },
+                )
+                .await?;
+            assert_eq!(summary.files_removed, 4);
+            assert_eq!(summary.symlinks_removed, 2);
+            assert_eq!(summary.directories_removed, 1);
+            // REPLACE with a file, a symlink, a directory and a file
+            tokio::fs::write(bar_path.join("1.txt"), "1-new")
+                .await
+                .unwrap();
+            tokio::fs::symlink("../0.txt", bar_path.join("2.txt"))
+                .await
+                .unwrap();
+            tokio::fs::create_dir(&bar_path.join("3.txt"))
+                .await
+                .unwrap();
+            tokio::fs::write(&output_path.join("baz"), "baz")
+                .await
+                .unwrap();
+        }
+        let summary = link(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &output_path,
+            &None,
+            &Settings {
+                preserve: true,
+                read_buffer: 10,
+                dereference: false,
+                fail_early: false,
+                overwrite: true, // <- important!
+            },
+        )
+        .await?;
+        assert_eq!(summary.hard_links_created, 4);
+        assert_eq!(summary.copy_summary.files_copied, 0);
+        assert_eq!(summary.copy_summary.symlinks_created, 2);
+        assert_eq!(summary.copy_summary.directories_created, 1);
+        testutils::check_dirs_identical(
+            &tmp_dir.join("foo"),
+            &tmp_dir.join("bar"),
+            testutils::FileEqualityCheck::HardLink,
         )
         .await?;
         Ok(())

@@ -104,21 +104,6 @@ async fn async_main(args: Args) -> Result<CopySummary> {
     let mut join_set = tokio::task::JoinSet::new();
     for (src_path, dst_path) in src_dst {
         let do_copy = || async move {
-            if dst_path.exists() {
-                if args.overwrite {
-                    // TODO: is this the right behavior?
-                    if tokio::fs::metadata(&dst_path).await?.is_file() {
-                        tokio::fs::remove_file(&dst_path).await?;
-                    } else {
-                        tokio::fs::remove_dir_all(&dst_path).await?;
-                    }
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "destination {:?} already exists, use --overwrite to overwrite",
-                        dst_path
-                    ));
-                }
-            }
             common::copy(
                 &src_path,
                 &dst_path,
@@ -127,6 +112,7 @@ async fn async_main(args: Args) -> Result<CopySummary> {
                     read_buffer,
                     dereference: args.dereference,
                     fail_early: args.fail_early,
+                    overwrite: args.overwrite,
                 },
             )
             .await
