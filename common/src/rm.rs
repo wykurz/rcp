@@ -13,6 +13,7 @@ pub struct Settings {
 #[derive(Copy, Clone, Default)]
 pub struct RmSummary {
     pub files_removed: usize,
+    pub symlinks_removed: usize,
     pub directories_removed: usize,
 }
 
@@ -21,6 +22,7 @@ impl std::ops::Add for RmSummary {
     fn add(self, other: Self) -> Self {
         Self {
             files_removed: self.files_removed + other.files_removed,
+            symlinks_removed: self.symlinks_removed + other.symlinks_removed,
             directories_removed: self.directories_removed + other.directories_removed,
         }
     }
@@ -30,8 +32,8 @@ impl std::fmt::Display for RmSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "files removed: {}\ndirectories removed: {}",
-            self.files_removed, self.directories_removed
+            "files removed: {}\nsymlinks removed: {}\ndirectories removed: {}",
+            self.files_removed, self.symlinks_removed, self.directories_removed
         )
     }
 }
@@ -53,6 +55,12 @@ pub async fn rm(
         tokio::fs::remove_file(path)
             .await
             .with_context(|| format!("failed removing {:?}", &path))?;
+        if src_metadata.file_type().is_symlink() {
+            return Ok(RmSummary {
+                symlinks_removed: 1,
+                ..Default::default()
+            });
+        }
         return Ok(RmSummary {
             files_removed: 1,
             ..Default::default()
@@ -145,7 +153,8 @@ mod tests {
         )
         .await?;
         assert!(!test_path.join("foo").exists());
-        assert_eq!(summary.files_removed, 7); // we cound symlinks (there are 2) as files
+        assert_eq!(summary.files_removed, 5);
+        assert_eq!(summary.symlinks_removed, 2);
         assert_eq!(summary.directories_removed, 3);
         Ok(())
     }
