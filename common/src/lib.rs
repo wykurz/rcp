@@ -8,13 +8,14 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::prelude::*;
 
 mod copy;
+mod link;
 mod progress;
 mod rm;
 mod testutils;
 
 pub use copy::CopySummary;
-pub use copy::LinkSummary;
 pub use copy::Settings as CopySettings;
+pub use link::LinkSummary;
 pub use rm::RmSummary;
 pub use rm::Settings as RmSettings;
 
@@ -95,7 +96,7 @@ pub async fn link(
     update: &Option<std::path::PathBuf>,
     settings: &copy::Settings,
 ) -> Result<LinkSummary> {
-    copy::link(&PROGRESS, src, dst, update, settings).await
+    link::link(&PROGRESS, src, dst, update, settings).await
 }
 
 fn read_env_or_default<T: std::str::FromStr>(name: &str, default: T) -> T {
