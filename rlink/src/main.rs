@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use common::LinkSummary;
 use structopt::StructOpt;
 
@@ -39,7 +39,7 @@ struct Args {
 
     /// Directory where we put either a hard-link of a file from `link` if it was unchanged, or a copy of a file from `new` if it's been modified
     #[structopt()]
-    dst: std::path::PathBuf,
+    dst: String, // must be a string to allow for parsing trailing slash
 
     /// Directory with updated contents of `link`
     #[structopt(long)]
@@ -59,24 +59,30 @@ struct Args {
 }
 
 async fn async_main(args: Args) -> Result<LinkSummary> {
-    let mut inputs = vec![&args.src];
-    if let Some(update) = &args.update {
-        inputs.push(update);
-    }
-    for path in inputs {
-        if !tokio::fs::metadata(path).await?.is_dir() {
+    for src in &args.src {
+        if src == "."
+            || src
+                .to_str()
+                .expect("input path cannot be converted to string?!")
+                .ends_with("/.")
+        {
             return Err(anyhow::anyhow!(
-                "Input paths must be directories, but {:?} is not a directory",
-                path
+                "expanding source directory ({:?}) using dot operator ('.') is not supported, please use absolute path or '*' instead",
+                std::path::PathBuf::from(src)
             ));
         }
     }
-    if tokio::fs::metadata(&args.dst).await.is_ok() {
-        return Err(anyhow::anyhow!(
-            "Destination path must not exist but {:?} is present",
-            &args.dst
-        ));
-    }
+    let dst = if args.dst.ends_with('/') {
+        let src_file = args
+            .src
+            .file_name()
+            .context(format!("source {:?} does not have a basename", &args.src))
+            .unwrap();
+        let dst_dir = std::path::PathBuf::from(args.dst);
+        dst_dir.join(src_file)
+    } else {
+        std::path::PathBuf::from(args.dst)
+    };
     let read_buffer = args
         .read_buffer
         .parse::<bytesize::ByteSize>()
@@ -84,7 +90,7 @@ async fn async_main(args: Args) -> Result<LinkSummary> {
         .as_u64() as usize;
     common::link(
         &args.src,
-        &args.dst,
+        &dst,
         &args.update,
         &common::CopySettings {
             preserve: true, // ALWAYS preserve metadata

@@ -63,6 +63,14 @@ async fn async_main(args: Args) -> Result<CopySummary> {
         ));
     }
     let src_strings = &args.paths[0..args.paths.len() - 1];
+    for src in src_strings {
+        if src == "." || src.ends_with("/.") {
+            return Err(anyhow::anyhow!(
+                "expanding source directory ({:?}) using dot operator ('.') is not supported, please use absolute path or '*' instead",
+                std::path::PathBuf::from(src)
+            ));
+        }
+    }
     let dst_string = args.paths.last().unwrap();
     let src_dst: Vec<(std::path::PathBuf, std::path::PathBuf)> = if dst_string.ends_with('/') {
         // rcp foo bar baz/ -> copy foo to baz/foo and bar to baz/bar
@@ -70,12 +78,6 @@ async fn async_main(args: Args) -> Result<CopySummary> {
         src_strings
             .iter()
             .map(|src| {
-                if src == "." || src.ends_with("/.") {
-                    return Err(anyhow::anyhow!(
-                        "expanding source directory ({:?}) using dot operator ('.') is not supported",
-                        std::path::PathBuf::from(src)
-                    ));
-                }
                 let src_path = std::path::PathBuf::from(src);
                 let src_file = src_path
                     .file_name()
