@@ -194,7 +194,7 @@ impl std::fmt::Display for CopySummary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "{}files copied: {}\nsymlinks created: {}\ndirectories created: {}\nfiles_unchanged: {}\ndirectories_unchanged: {}\n",
+            "{}\nfiles copied: {}\nsymlinks created: {}\ndirectories created: {}\nfiles_unchanged: {}\ndirectories_unchanged: {}\n",
             &self.rm_summary, self.files_copied, self.symlinks_created, self.directories_created, self.files_unchanged, self.directories_unchanged
         )
     }
@@ -1050,8 +1050,8 @@ impl std::fmt::Display for LinkSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "hard-links created: {}\n{}",
-            self.hard_links_created, &self.copy_summary
+            "{}\nhard-links created: {}\nhard links unchanged: {}",
+            &self.copy_summary, self.hard_links_created, self.hard_links_unchanged
         )
     }
 }
