@@ -89,6 +89,7 @@ async fn hard_link_helper(
 #[async_recursion]
 pub async fn link(
     prog_track: &'static progress::TlsProgress,
+    cwd: &std::path::Path,
     src: &std::path::Path,
     dst: &std::path::Path,
     update: &Option<std::path::PathBuf>,
@@ -130,7 +131,7 @@ pub async fn link(
                 update,
                 update_metadata.file_type()
             );
-            let copy_summary = copy::copy(prog_track, update, dst, settings).await?;
+            let copy_summary = copy::copy(prog_track, cwd, update, dst, settings).await?;
             return Ok(LinkSummary {
                 copy_summary,
                 ..Default::default()
@@ -157,7 +158,7 @@ pub async fn link(
         if update_metadata.is_symlink() {
             event!(Level::DEBUG, "'update' is a symlink so just symlink that");
             // use "copy" function to handle the overwrite logic
-            let copy_summary = copy::copy(prog_track, update, dst, settings).await?;
+            let copy_summary = copy::copy(prog_track, cwd, update, dst, settings).await?;
             return Ok(LinkSummary {
                 copy_summary,
                 ..Default::default()
@@ -172,7 +173,7 @@ pub async fn link(
         if src_metadata.is_symlink() {
             event!(Level::DEBUG, "'src' is a symlink so just symlink that");
             // use "copy" function to handle the overwrite logic
-            let copy_summary = copy::copy(prog_track, src, dst, settings).await?;
+            let copy_summary = copy::copy(prog_track, cwd, src, dst, settings).await?;
             return Ok(LinkSummary {
                 copy_summary,
                 ..Default::default()
@@ -245,6 +246,7 @@ pub async fn link(
         .await
         .with_context(|| format!("failed traversing directory {:?}", &src))?
     {
+        let cwd_path = cwd.to_owned();
         let entry_path = src_entry.path();
         let entry_name = entry_path.file_name().unwrap();
         processed_files.insert(entry_name.to_owned());
@@ -252,7 +254,15 @@ pub async fn link(
         let update_path = update.as_ref().map(|s| s.join(entry_name));
         let settings = settings.clone();
         let do_link = || async move {
-            link(prog_track, &entry_path, &dst_path, &update_path, &settings).await
+            link(
+                prog_track,
+                &cwd_path,
+                &entry_path,
+                &dst_path,
+                &update_path,
+                &settings,
+            )
+            .await
         };
         join_set.spawn(do_link());
     }
@@ -269,6 +279,7 @@ pub async fn link(
             .await
             .with_context(|| format!("failed traversing directory {:?}", &update))?
         {
+            let cwd_path = cwd.to_owned();
             let entry_path = update_entry.path();
             let entry_name = entry_path.file_name().unwrap();
             if processed_files.contains(entry_name) {
@@ -281,7 +292,7 @@ pub async fn link(
             let settings = settings.clone();
             let do_copy = || async move {
                 let copy_summary =
-                    copy::copy(prog_track, &update_path, &dst_path, &settings).await?;
+                    copy::copy(prog_track, &cwd_path, &update_path, &dst_path, &settings).await?;
                 Ok(LinkSummary {
                     copy_summary,
                     ..Default::default()
@@ -368,6 +379,7 @@ mod link_tests {
         let test_path = tmp_dir.as_path();
         let summary = link(
             &PROGRESS,
+            &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &None,
@@ -394,6 +406,7 @@ mod link_tests {
         let test_path = tmp_dir.as_path();
         let summary = link(
             &PROGRESS,
+            &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Some(test_path.join("foo")),
@@ -421,6 +434,7 @@ mod link_tests {
         let test_path = tmp_dir.as_path();
         let summary = link(
             &PROGRESS,
+            &test_path,
             &test_path.join("baz"), // empty source
             &test_path.join("bar"),
             &Some(test_path.join("foo")),
@@ -471,6 +485,7 @@ mod link_tests {
         let test_path = tmp_dir.as_path();
         let summary = link(
             &PROGRESS,
+            &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Some(test_path.join("update")),
@@ -503,6 +518,7 @@ mod link_tests {
         let test_path = tmp_dir.as_path();
         let summary = link(
             &PROGRESS,
+            &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &None,
@@ -555,6 +571,7 @@ mod link_tests {
         }
         let summary = link(
             &PROGRESS,
+            &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
             &None,
@@ -619,6 +636,7 @@ mod link_tests {
         //    |- 2.txt -> ../0.txt
         let summary = link(
             &PROGRESS,
+            &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
             &Some(tmp_dir.join("update")),
@@ -710,6 +728,7 @@ mod link_tests {
         }
         let summary = link(
             &PROGRESS,
+            &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
             &None,

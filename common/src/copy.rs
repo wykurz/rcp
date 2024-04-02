@@ -203,6 +203,7 @@ impl std::fmt::Display for CopySummary {
 #[async_recursion]
 pub async fn copy(
     prog_track: &'static progress::TlsProgress,
+    cwd: &std::path::Path,
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &Settings,
@@ -211,8 +212,28 @@ pub async fn copy(
     event!(Level::DEBUG, "reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
-        .with_context(|| format!("failed reading metadata from {:?}", &src))?;
-    if src_metadata.is_file() || (src_metadata.is_symlink() && settings.dereference) {
+        .with_context(|| format!("failed reading metadata from src: {:?}", &src))?;
+    if settings.dereference && src_metadata.is_symlink() {
+        let link = tokio::fs::read_link(&src)
+            .await
+            .with_context(|| format!("failed reading src symlink {:?}", &src))?;
+        let abs_link = if link.is_relative() {
+            cwd.join(link)
+        } else {
+            link
+        };
+        let new_cwd = abs_link
+            .parent()
+            .with_context(|| {
+                format!(
+                    "the source symlink {:?} does not have a parent directory",
+                    &src
+                )
+            })
+            .unwrap();
+        return copy(prog_track, new_cwd, &abs_link, dst, settings).await;
+    }
+    if src_metadata.is_file() {
         return copy_file(prog_track, src, dst, settings).await;
     }
     if src_metadata.is_symlink() {
@@ -225,11 +246,11 @@ pub async fn copy(
             if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
                 let dst_metadata = tokio::fs::symlink_metadata(dst)
                     .await
-                    .with_context(|| format!("failed reading metadata from {:?}", &dst))?;
+                    .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))?;
                 if is_file_type_same(&src_metadata, &dst_metadata) {
                     let dst_link = tokio::fs::read_link(dst)
                         .await
-                        .with_context(|| format!("failed reading symlink {:?}", &dst))?;
+                        .with_context(|| format!("failed reading dst symlink: {:?}", &dst))?;
                     if link == dst_link {
                         event!(
                             Level::DEBUG,
@@ -239,7 +260,7 @@ pub async fn copy(
                             // do we need to update the metadata for this symlink?
                             let dst_metadata =
                                 tokio::fs::symlink_metadata(dst).await.with_context(|| {
-                                    format!("failed reading metadata from {:?}", &dst)
+                                    format!("failed reading metadata from dst: {:?}", &dst)
                                 })?;
                             if !is_metadata_equal(&src_metadata, &dst_metadata) {
                                 event!(Level::DEBUG, "'dst' metadata is different, updating");
@@ -301,7 +322,7 @@ pub async fn copy(
                 // while we're writing to it which isn't safe
                 let dst_metadata = tokio::fs::metadata(dst)
                     .await
-                    .with_context(|| format!("failed reading metadata from {:?}", &dst))?;
+                    .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))?;
                 if dst_metadata.is_dir() {
                     event!(Level::DEBUG, "'dst' is a directory, leaving it as is");
                     CopySummary {
@@ -347,13 +368,15 @@ pub async fn copy(
     while let Some(entry) = entries
         .next_entry()
         .await
-        .with_context(|| format!("failed traversing directory {:?}", &src))?
+        .with_context(|| format!("failed traversing src directory {:?}", &src))?
     {
+        let cwd_path = src.to_owned();
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
         let settings = settings.clone();
-        let do_copy = || async move { copy(prog_track, &entry_path, &dst_path, &settings).await };
+        let do_copy =
+            || async move { copy(prog_track, &cwd_path, &entry_path, &dst_path, &settings).await };
         join_set.spawn(do_copy());
     }
     while let Some(res) = join_set.join_next().await {
@@ -412,6 +435,7 @@ mod copy_tests {
         let test_path = tmp_dir.as_path();
         let summary = copy(
             &PROGRESS,
+            &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -448,6 +472,7 @@ mod copy_tests {
         }
         match copy(
             &PROGRESS,
+            &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -518,6 +543,7 @@ mod copy_tests {
         let test_path = tmp_dir.as_path();
         let summary = copy(
             &PROGRESS,
+            &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -574,6 +600,7 @@ mod copy_tests {
         .await?;
         let summary = copy(
             &PROGRESS,
+            &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -611,6 +638,7 @@ mod copy_tests {
         }
         let summary = copy(
             &PROGRESS,
+            &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -657,6 +685,7 @@ mod copy_tests {
         // now run rcp
         let summary = copy(
             &PROGRESS,
+            &test_path,
             &test_path.join("foo"),
             &test_path.join("baz"),
             rcp_settings,
@@ -756,6 +785,7 @@ mod copy_tests {
         let test_path = tmp_dir.as_path();
         let summary = copy(
             &PROGRESS,
+            &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -807,6 +837,7 @@ mod copy_tests {
         }
         let summary = copy(
             &PROGRESS,
+            &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
             &Settings {
@@ -870,6 +901,7 @@ mod copy_tests {
         }
         let summary = copy(
             &PROGRESS,
+            &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
             &Settings {
@@ -932,6 +964,7 @@ mod copy_tests {
         }
         let summary = copy(
             &PROGRESS,
+            &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
             &Settings {
@@ -997,6 +1030,7 @@ mod copy_tests {
         }
         let summary = copy(
             &PROGRESS,
+            &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
             &Settings {
@@ -1021,6 +1055,47 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             &output_path,
             testutils::FileEqualityCheck::Timestamp,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_cp_dereference_dir() -> Result<()> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        {
+            // symlink bar to baz
+            tokio::fs::symlink("bar", &tmp_dir.join("foo").join("bar-link")).await?;
+        }
+        let summary = copy(
+            &PROGRESS,
+            &tmp_dir,
+            &tmp_dir.join("foo"),
+            &tmp_dir.join("bar"),
+            &Settings {
+                preserve: true,
+                read_buffer: 10,
+                dereference: true, // <- important!
+                fail_early: false,
+                overwrite: false,
+            },
+        )
+        .await?;
+        assert_eq!(summary.files_copied, 10); // 0.txt, 2x bar/(1.txt, 2.txt, 3.txt), baz/4.txt
+        assert_eq!(summary.symlinks_created, 0); // dereference is set
+        assert_eq!(summary.directories_created, 4);
+        // check_dirs_identical doesn't handle dereference so let's do it manually
+        tokio::process::Command::new("cp")
+            .args(&["-r", "-L"])
+            .arg(tmp_dir.join("foo"))
+            .arg(tmp_dir.join("bar-cp"))
+            .output()
+            .await?;
+        testutils::check_dirs_identical(
+            &tmp_dir.join("bar"),
+            &tmp_dir.join("bar-cp"),
+            testutils::FileEqualityCheck::Basic,
         )
         .await?;
         Ok(())
