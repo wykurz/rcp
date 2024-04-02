@@ -83,7 +83,8 @@ pub async fn copy(
     dst: &std::path::Path,
     settings: &copy::Settings,
 ) -> Result<CopySummary> {
-    copy::copy(&PROGRESS, src, dst, settings).await
+    let cwd = std::env::current_dir()?;
+    copy::copy(&PROGRESS, &cwd, src, dst, settings).await
 }
 
 pub async fn rm(path: &std::path::Path, settings: &rm::Settings) -> Result<RmSummary> {
@@ -96,7 +97,8 @@ pub async fn link(
     update: &Option<std::path::PathBuf>,
     settings: &copy::Settings,
 ) -> Result<LinkSummary> {
-    link::link(&PROGRESS, src, dst, update, settings).await
+    let cwd = std::env::current_dir()?;
+    link::link(&PROGRESS, &cwd, src, dst, update, settings).await
 }
 
 fn read_env_or_default<T: std::str::FromStr>(name: &str, default: T) -> T {
@@ -127,6 +129,7 @@ where
     if !quiet {
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_target(true)
+            .with_line_number(true)
             .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
             .with_filter(
                 tracing_subscriber::EnvFilter::try_new(match verbose {
