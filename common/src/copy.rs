@@ -1064,10 +1064,10 @@ mod copy_tests {
     #[traced_test]
     async fn test_cp_dereference_dir() -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
-        {
-            // symlink bar to baz
-            tokio::fs::symlink("bar", &tmp_dir.join("foo").join("bar-link")).await?;
-        }
+        // symlink bar to bar-link
+        tokio::fs::symlink("bar", &tmp_dir.join("foo").join("bar-link")).await?;
+        // symlink bar-link to bar-link-link
+        tokio::fs::symlink("bar-link", &tmp_dir.join("foo").join("bar-link-link")).await?;
         let summary = copy(
             &PROGRESS,
             &tmp_dir,
@@ -1082,9 +1082,9 @@ mod copy_tests {
             },
         )
         .await?;
-        assert_eq!(summary.files_copied, 10); // 0.txt, 2x bar/(1.txt, 2.txt, 3.txt), baz/4.txt
+        assert_eq!(summary.files_copied, 13); // 0.txt, 3x bar/(1.txt, 2.txt, 3.txt), baz/(4.txt, 5.txt, 6.txt)
         assert_eq!(summary.symlinks_created, 0); // dereference is set
-        assert_eq!(summary.directories_created, 4);
+        assert_eq!(summary.directories_created, 5);
         // check_dirs_identical doesn't handle dereference so let's do it manually
         tokio::process::Command::new("cp")
             .args(&["-r", "-L"])
