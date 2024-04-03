@@ -17,10 +17,6 @@ struct Args {
     #[structopt(long)]
     progress: bool,
 
-    /// Always follow symbolic links in source
-    #[structopt(short = "-L", long)]
-    dereference: bool,
-
     /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
     #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
     verbose: u8,
@@ -95,7 +91,7 @@ async fn async_main(args: Args) -> Result<LinkSummary> {
         &common::CopySettings {
             preserve: true, // ALWAYS preserve metadata
             read_buffer,
-            dereference: args.dereference,
+            dereference: false, // currently not supported
             fail_early: args.fail_early,
             overwrite: args.overwrite,
         },

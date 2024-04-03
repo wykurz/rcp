@@ -105,7 +105,6 @@ USAGE:
     rlink [FLAGS] [OPTIONS] <src> <dst>
 
 FLAGS:
-    -L, --dereference    Always follow symbolic links in source
     -e, --fail-early     Exit on first error
     -h, --help           Prints help information
         --progress       Show progress
