@@ -4,28 +4,18 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
 use tracing::{event, instrument, Level};
 
+use crate::filecmp;
 use crate::progress;
 use crate::rm;
 
-#[derive(Debug, Clone)]
-pub struct Settings {
+#[derive(Debug, Copy, Clone)]
+pub struct CopySettings {
     pub preserve: bool,
     pub read_buffer: usize,
     pub dereference: bool,
     pub fail_early: bool,
     pub overwrite: bool,
-}
-
-#[instrument]
-pub fn is_metadata_equal(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
-    if md1.size() != md2.size() || md1.mtime() != md2.mtime() {
-        return false;
-    }
-    // some filesystems do not support nanosecond precision, so we only compare nanoseconds if both files have them
-    if md1.mtime_nsec() != 0 && md2.mtime_nsec() != 0 && md1.mtime_nsec() != md2.mtime_nsec() {
-        return false;
-    }
-    true
+    pub overwrite_compare: filecmp::MetadataCmpSettings,
 }
 
 #[instrument]
@@ -82,7 +72,7 @@ pub async fn copy_file(
     prog_track: &'static progress::TlsProgress,
     src: &std::path::Path,
     dst: &std::path::Path,
-    settings: &Settings,
+    settings: &CopySettings,
 ) -> Result<CopySummary> {
     event!(
         Level::DEBUG,
@@ -107,7 +97,9 @@ pub async fn copy_file(
                     let md2 = tokio::fs::symlink_metadata(dst)
                         .await
                         .with_context(|| format!("failed reading metadata from {:?}", &dst))?;
-                    if is_file_type_same(&md1, &md2) && is_metadata_equal(&md1, &md2) {
+                    if is_file_type_same(&md1, &md2)
+                        && filecmp::metadata_equal(&settings.overwrite_compare, &md1, &md2)
+                    {
                         event!(Level::DEBUG, "file is identical, skipping");
                         return Ok(CopySummary {
                             files_unchanged: 1,
@@ -206,7 +198,7 @@ pub async fn copy(
     cwd: &std::path::Path,
     src: &std::path::Path,
     dst: &std::path::Path,
-    settings: &Settings,
+    settings: &CopySettings,
 ) -> Result<CopySummary> {
     let _guard = prog_track.guard();
     event!(Level::DEBUG, "reading source metadata");
@@ -262,7 +254,11 @@ pub async fn copy(
                                 tokio::fs::symlink_metadata(dst).await.with_context(|| {
                                     format!("failed reading metadata from dst: {:?}", &dst)
                                 })?;
-                            if !is_metadata_equal(&src_metadata, &dst_metadata) {
+                            if !filecmp::metadata_equal(
+                                &settings.overwrite_compare,
+                                &src_metadata,
+                                &dst_metadata,
+                            ) {
                                 event!(Level::DEBUG, "'dst' metadata is different, updating");
                                 set_owner_and_time(dst, &src_metadata).await?;
                                 return Ok(CopySummary {
@@ -374,7 +370,7 @@ pub async fn copy(
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
-        let settings = settings.clone();
+        let settings = *settings;
         let do_copy =
             || async move { copy(prog_track, &cwd_path, &entry_path, &dst_path, &settings).await };
         join_set.spawn(do_copy());
@@ -438,12 +434,17 @@ mod copy_tests {
             &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            &Settings {
+            &CopySettings {
                 preserve: false,
                 read_buffer: 10,
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         )
         .await?;
@@ -475,12 +476,17 @@ mod copy_tests {
             &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            &Settings {
+            &CopySettings {
                 preserve: false,
                 read_buffer: 5,
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         )
         .await
@@ -546,12 +552,17 @@ mod copy_tests {
             &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            &Settings {
+            &CopySettings {
                 preserve: false,
                 read_buffer: 7,
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         )
         .await?;
@@ -603,12 +614,17 @@ mod copy_tests {
             &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            &Settings {
+            &CopySettings {
                 preserve: false,
                 read_buffer: 8,
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         )
         .await?;
@@ -641,12 +657,17 @@ mod copy_tests {
             &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            &Settings {
+            &CopySettings {
                 preserve: false,
                 read_buffer: 10,
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         )
         .await?;
@@ -671,7 +692,7 @@ mod copy_tests {
         Ok(())
     }
 
-    async fn cp_compare(cp_args: &[&str], rcp_settings: &Settings) -> Result<()> {
+    async fn cp_compare(cp_args: &[&str], rcp_settings: &CopySettings) -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         // run a cp command to copy the files
@@ -717,12 +738,17 @@ mod copy_tests {
     async fn test_cp_compat() -> Result<()> {
         cp_compare(
             &["-r"],
-            &Settings {
+            &CopySettings {
                 preserve: false,
                 read_buffer: 100,
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         )
         .await?;
@@ -734,12 +760,17 @@ mod copy_tests {
     async fn test_cp_compat_preserve() -> Result<()> {
         cp_compare(
             &["-r", "-p"],
-            &Settings {
+            &CopySettings {
                 preserve: true,
                 read_buffer: 100,
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         )
         .await?;
@@ -751,12 +782,17 @@ mod copy_tests {
     async fn test_cp_compat_dereference() -> Result<()> {
         cp_compare(
             &["-r", "-L"],
-            &Settings {
+            &CopySettings {
                 preserve: false,
                 read_buffer: 100,
                 dereference: true,
                 fail_early: false,
                 overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         )
         .await?;
@@ -768,12 +804,17 @@ mod copy_tests {
     async fn test_cp_compat_preserve_and_dereference() -> Result<()> {
         cp_compare(
             &["-r", "-p", "-L"],
-            &Settings {
+            &CopySettings {
                 preserve: true,
                 read_buffer: 100,
                 dereference: true,
                 fail_early: false,
                 overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         )
         .await?;
@@ -788,12 +829,17 @@ mod copy_tests {
             &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            &Settings {
+            &CopySettings {
                 preserve: true,
                 read_buffer: 10,
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         )
         .await?;
@@ -840,12 +886,17 @@ mod copy_tests {
             &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
-            &Settings {
+            &CopySettings {
                 preserve: true,
                 read_buffer: 10,
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         )
         .await?;
@@ -904,12 +955,17 @@ mod copy_tests {
             &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
-            &Settings {
+            &CopySettings {
                 preserve: true,
                 read_buffer: 10,
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         )
         .await?;
@@ -967,12 +1023,17 @@ mod copy_tests {
             &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
-            &Settings {
+            &CopySettings {
                 preserve: true,
                 read_buffer: 10,
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         )
         .await?;
@@ -1033,12 +1094,17 @@ mod copy_tests {
             &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
-            &Settings {
+            &CopySettings {
                 preserve: true,
                 read_buffer: 10,
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         )
         .await?;
@@ -1073,12 +1139,17 @@ mod copy_tests {
             &tmp_dir,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &Settings {
+            &CopySettings {
                 preserve: true,
                 read_buffer: 10,
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         )
         .await?;

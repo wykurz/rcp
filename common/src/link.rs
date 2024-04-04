@@ -5,8 +5,16 @@ use std::os::unix::prelude::PermissionsExt;
 use tracing::{event, instrument, Level};
 
 use crate::copy;
+use crate::filecmp;
 use crate::progress;
 use crate::rm;
+use crate::CopySettings;
+
+#[derive(Debug, Copy, Clone)]
+pub struct LinkSettings {
+    pub copy_settings: CopySettings,
+    pub update_compare: filecmp::MetadataCmpSettings,
+}
 
 #[derive(Copy, Clone, Default)]
 pub struct LinkSummary {
@@ -30,7 +38,7 @@ impl std::fmt::Display for LinkSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "{}\nhard-links created: {}\nhard links unchanged: {}",
+            "{}hard-links created: {}\nhard links unchanged: {}",
             &self.copy_summary, self.hard_links_created, self.hard_links_unchanged
         )
     }
@@ -48,10 +56,10 @@ async fn hard_link_helper(
     src: &std::path::Path,
     src_metadata: &std::fs::Metadata,
     dst: &std::path::Path,
-    settings: &copy::Settings,
+    settings: &LinkSettings,
 ) -> Result<LinkSummary> {
     if let Err(error) = tokio::fs::hard_link(src, dst).await {
-        if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
+        if settings.copy_settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
             event!(
                 Level::DEBUG,
                 "'dst' already exists, check if we need to update"
@@ -72,7 +80,7 @@ async fn hard_link_helper(
                 prog_track,
                 dst,
                 &rm::Settings {
-                    fail_early: settings.fail_early,
+                    fail_early: settings.copy_settings.fail_early,
                 },
             )
             .await?;
@@ -93,7 +101,7 @@ pub async fn link(
     src: &std::path::Path,
     dst: &std::path::Path,
     update: &Option<std::path::PathBuf>,
-    settings: &copy::Settings,
+    settings: &LinkSettings,
 ) -> Result<LinkSummary> {
     let _guard = prog_track.guard();
     event!(Level::DEBUG, "reading source metadata");
@@ -131,7 +139,8 @@ pub async fn link(
                 update,
                 update_metadata.file_type()
             );
-            let copy_summary = copy::copy(prog_track, cwd, update, dst, settings).await?;
+            let copy_summary =
+                copy::copy(prog_track, cwd, update, dst, &settings.copy_settings).await?;
             return Ok(LinkSummary {
                 copy_summary,
                 ..Default::default()
@@ -139,7 +148,7 @@ pub async fn link(
         }
         if update_metadata.is_file() {
             // check if the file is unchanged and if so hard-link, otherwise copy from the updated one
-            if copy::is_metadata_equal(&src_metadata, update_metadata) {
+            if filecmp::metadata_equal(&settings.update_compare, &src_metadata, update_metadata) {
                 event!(Level::DEBUG, "no change, hard link 'src'");
                 return hard_link_helper(prog_track, src, &src_metadata, dst, settings).await;
             } else {
@@ -150,7 +159,8 @@ pub async fn link(
                     update
                 );
                 return Ok(LinkSummary {
-                    copy_summary: copy::copy_file(prog_track, update, dst, settings).await?,
+                    copy_summary: copy::copy_file(prog_track, update, dst, &settings.copy_settings)
+                        .await?,
                     ..Default::default()
                 });
             }
@@ -158,7 +168,8 @@ pub async fn link(
         if update_metadata.is_symlink() {
             event!(Level::DEBUG, "'update' is a symlink so just symlink that");
             // use "copy" function to handle the overwrite logic
-            let copy_summary = copy::copy(prog_track, cwd, update, dst, settings).await?;
+            let copy_summary =
+                copy::copy(prog_track, cwd, update, dst, &settings.copy_settings).await?;
             return Ok(LinkSummary {
                 copy_summary,
                 ..Default::default()
@@ -173,7 +184,8 @@ pub async fn link(
         if src_metadata.is_symlink() {
             event!(Level::DEBUG, "'src' is a symlink so just symlink that");
             // use "copy" function to handle the overwrite logic
-            let copy_summary = copy::copy(prog_track, cwd, src, dst, settings).await?;
+            let copy_summary =
+                copy::copy(prog_track, cwd, src, dst, &settings.copy_settings).await?;
             return Ok(LinkSummary {
                 copy_summary,
                 ..Default::default()
@@ -188,7 +200,8 @@ pub async fn link(
         .with_context(|| format!("cannot open directory {:?} for reading", src))?;
     let copy_summary = {
         if let Err(error) = tokio::fs::create_dir(dst).await {
-            if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
+            if settings.copy_settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists
+            {
                 // check if the destination is a directory - if so, leave it
                 //
                 // N.B. the permissions may prevent us from writing to it but the alternative is to open up the directory
@@ -211,7 +224,7 @@ pub async fn link(
                         prog_track,
                         dst,
                         &rm::Settings {
-                            fail_early: settings.fail_early,
+                            fail_early: settings.copy_settings.fail_early,
                         },
                     )
                     .await
@@ -252,7 +265,7 @@ pub async fn link(
         processed_files.insert(entry_name.to_owned());
         let dst_path = dst.join(entry_name);
         let update_path = update.as_ref().map(|s| s.join(entry_name));
-        let settings = settings.clone();
+        let settings = *settings;
         let do_link = || async move {
             link(
                 prog_track,
@@ -289,10 +302,16 @@ pub async fn link(
             event!(Level::DEBUG, "found a new entry in the 'update' directory");
             let dst_path = dst.join(entry_name);
             let update_path = update.join(entry_name);
-            let settings = settings.clone();
+            let settings = *settings;
             let do_copy = || async move {
-                let copy_summary =
-                    copy::copy(prog_track, &cwd_path, &update_path, &dst_path, &settings).await?;
+                let copy_summary = copy::copy(
+                    prog_track,
+                    &cwd_path,
+                    &update_path,
+                    &dst_path,
+                    &settings.copy_settings,
+                )
+                .await?;
                 Ok(LinkSummary {
                     copy_summary,
                     ..Default::default()
@@ -317,7 +336,7 @@ pub async fn link(
                     dst,
                     &error
                 );
-                if settings.fail_early {
+                if settings.copy_settings.fail_early {
                     return Err(error);
                 }
                 success = false;
@@ -338,7 +357,7 @@ pub async fn link(
     } else {
         &src_metadata
     };
-    let permissions = if settings.preserve {
+    let permissions = if settings.copy_settings.preserve {
         preserve_metadata.permissions()
     } else {
         // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
@@ -347,7 +366,7 @@ pub async fn link(
     tokio::fs::set_permissions(dst, permissions.clone())
         .await
         .with_context(|| format!("cannot set {:?} permissions to {:?}", &dst, &permissions))?;
-    if settings.preserve {
+    if settings.copy_settings.preserve {
         copy::set_owner_and_time(dst, preserve_metadata).await?;
     }
     Ok(link_summary)
@@ -364,13 +383,27 @@ mod link_tests {
         static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
     }
 
-    const COMMON_SETTINGS: copy::Settings = copy::Settings {
-        preserve: true,
-        read_buffer: 10,
-        dereference: false,
-        fail_early: false,
-        overwrite: false,
-    };
+    fn common_settings(preserve: bool, dereference: bool, overwrite: bool) -> LinkSettings {
+        LinkSettings {
+            copy_settings: copy::CopySettings {
+                preserve,
+                read_buffer: 10,
+                dereference,
+                fail_early: false,
+                overwrite,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
+            },
+            update_compare: filecmp::MetadataCmpSettings {
+                size: true,
+                mtime: true,
+                ..Default::default()
+            },
+        }
+    }
 
     #[tokio::test]
     #[traced_test]
@@ -383,7 +416,7 @@ mod link_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &None,
-            &COMMON_SETTINGS,
+            &common_settings(true, false, false),
         )
         .await?;
         assert_eq!(summary.hard_links_created, 5);
@@ -410,7 +443,7 @@ mod link_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Some(test_path.join("foo")),
-            &COMMON_SETTINGS,
+            &common_settings(true, false, false),
         )
         .await?;
         assert_eq!(summary.hard_links_created, 5);
@@ -438,7 +471,7 @@ mod link_tests {
             &test_path.join("baz"), // empty source
             &test_path.join("bar"),
             &Some(test_path.join("foo")),
-            &COMMON_SETTINGS,
+            &common_settings(true, false, false),
         )
         .await?;
         assert_eq!(summary.hard_links_created, 0);
@@ -489,7 +522,7 @@ mod link_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Some(test_path.join("update")),
-            &COMMON_SETTINGS,
+            &common_settings(true, false, false),
         )
         .await?;
         assert_eq!(summary.hard_links_created, 2);
@@ -522,13 +555,7 @@ mod link_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &None,
-            &copy::Settings {
-                preserve: true,
-                read_buffer: 10,
-                dereference: false,
-                fail_early: false,
-                overwrite: false,
-            },
+            &common_settings(true, false, false),
         )
         .await?;
         assert_eq!(summary.hard_links_created, 5);
@@ -575,13 +602,7 @@ mod link_tests {
             &tmp_dir.join("foo"),
             &output_path,
             &None,
-            &copy::Settings {
-                preserve: true,
-                read_buffer: 10,
-                dereference: false,
-                fail_early: false,
-                overwrite: true, // <- important!
-            },
+            &common_settings(true, false, true), // overwrite!
         )
         .await?;
         assert_eq!(summary.hard_links_created, 3);
@@ -640,13 +661,7 @@ mod link_tests {
             &tmp_dir.join("foo"),
             &output_path,
             &Some(tmp_dir.join("update")),
-            &copy::Settings {
-                preserve: true,
-                read_buffer: 10,
-                dereference: false,
-                fail_early: false,
-                overwrite: true, // <- important!
-            },
+            &common_settings(true, false, true), // overwrite!
         )
         .await?;
         assert_eq!(summary.hard_links_created, 1); // 3.txt
@@ -732,13 +747,7 @@ mod link_tests {
             &tmp_dir.join("foo"),
             &output_path,
             &None,
-            &copy::Settings {
-                preserve: true,
-                read_buffer: 10,
-                dereference: false,
-                fail_early: false,
-                overwrite: true, // <- important!
-            },
+            &common_settings(true, false, true), // overwrite!
         )
         .await?;
         assert_eq!(summary.hard_links_created, 4);
