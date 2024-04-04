@@ -9,6 +9,10 @@ struct Args {
     #[structopt(short, long)]
     overwrite: bool,
 
+    /// Comma separated list of file attributes to compare when when deciding if files are "identical", used with --overwrite flag. Options are: uid, gid, size, mtime, ctime
+    #[structopt(long, default_value = "size,mtime")]
+    overwrite_compare: String,
+
     /// Exit on first error
     #[structopt(short = "-e", long = "fail-early")]
     fail_early: bool,
@@ -40,6 +44,10 @@ struct Args {
     /// Directory with updated contents of `link`
     #[structopt(long)]
     update: Option<std::path::PathBuf>,
+
+    /// Same as overwrite-compare, but for deciding if we can hard-link or if we need to copy a file from the update directory. Used with --update flag
+    #[structopt(long, default_value = "size,mtime")]
+    update_compare: String,
 
     /// Number of worker threads, 0 means number of cores
     #[structopt(long, default_value = "0")]
@@ -88,12 +96,16 @@ async fn async_main(args: Args) -> Result<LinkSummary> {
         &args.src,
         &dst,
         &args.update,
-        &common::CopySettings {
-            preserve: true, // ALWAYS preserve metadata
-            read_buffer,
-            dereference: false, // currently not supported
-            fail_early: args.fail_early,
-            overwrite: args.overwrite,
+        &common::LinkSettings {
+            copy_settings: common::CopySettings {
+                preserve: true, // ALWAYS preserve metadata
+                read_buffer,
+                dereference: false, // currently not supported
+                fail_early: args.fail_early,
+                overwrite: args.overwrite,
+                overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
+            },
+            update_compare: common::parse_metadata_cmp_settings(&args.update_compare)?,
         },
     )
     .await

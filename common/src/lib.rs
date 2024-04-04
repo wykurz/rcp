@@ -1,20 +1,22 @@
 #[macro_use]
 extern crate lazy_static;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::future::Future;
 use tracing::{event, instrument, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::prelude::*;
 
 mod copy;
+mod filecmp;
 mod link;
 mod progress;
 mod rm;
 mod testutils;
 
+pub use copy::CopySettings;
 pub use copy::CopySummary;
-pub use copy::Settings as CopySettings;
+pub use link::LinkSettings;
 pub use link::LinkSummary;
 pub use rm::RmSummary;
 pub use rm::Settings as RmSettings;
@@ -78,10 +80,27 @@ impl Drop for ProgressTracker {
     }
 }
 
+pub fn parse_metadata_cmp_settings(settings: &str) -> Result<filecmp::MetadataCmpSettings> {
+    let mut metadata_cmp_settings = filecmp::MetadataCmpSettings::default();
+    for setting in settings.split(',') {
+        match setting {
+            "uid" => metadata_cmp_settings.uid = true,
+            "gid" => metadata_cmp_settings.gid = true,
+            "size" => metadata_cmp_settings.size = true,
+            "mtime" => metadata_cmp_settings.mtime = true,
+            "ctime" => metadata_cmp_settings.ctime = true,
+            _ => {
+                return Err(anyhow!("Unknown metadata comparison setting: {}", setting));
+            }
+        }
+    }
+    Ok(metadata_cmp_settings)
+}
+
 pub async fn copy(
     src: &std::path::Path,
     dst: &std::path::Path,
-    settings: &copy::Settings,
+    settings: &copy::CopySettings,
 ) -> Result<CopySummary> {
     let cwd = std::env::current_dir()?;
     copy::copy(&PROGRESS, &cwd, src, dst, settings).await
@@ -95,7 +114,7 @@ pub async fn link(
     src: &std::path::Path,
     dst: &std::path::Path,
     update: &Option<std::path::PathBuf>,
-    settings: &copy::Settings,
+    settings: &link::LinkSettings,
 ) -> Result<LinkSummary> {
     let cwd = std::env::current_dir()?;
     link::link(&PROGRESS, &cwd, src, dst, update, settings).await

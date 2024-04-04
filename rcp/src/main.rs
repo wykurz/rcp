@@ -10,6 +10,10 @@ struct Args {
     #[structopt(short, long)]
     overwrite: bool,
 
+    /// Comma separated list of file attributes to compare when when deciding if files are "identical", used with --overwrite flag. Options are: uid, gid, size, mtime, ctime
+    #[structopt(long, default_value = "size,mtime")]
+    overwrite_compare: String,
+
     /// Exit on first error
     #[structopt(short = "-e", long = "fail-early")]
     fail_early: bool,
@@ -104,21 +108,16 @@ async fn async_main(args: Args) -> Result<CopySummary> {
         .unwrap()
         .as_u64() as usize;
     let mut join_set = tokio::task::JoinSet::new();
+    let settings = common::CopySettings {
+        preserve: args.preserve,
+        read_buffer,
+        dereference: args.dereference,
+        fail_early: args.fail_early,
+        overwrite: args.overwrite,
+        overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
+    };
     for (src_path, dst_path) in src_dst {
-        let do_copy = || async move {
-            common::copy(
-                &src_path,
-                &dst_path,
-                &common::CopySettings {
-                    preserve: args.preserve,
-                    read_buffer,
-                    dereference: args.dereference,
-                    fail_early: args.fail_early,
-                    overwrite: args.overwrite,
-                },
-            )
-            .await
-        };
+        let do_copy = || async move { common::copy(&src_path, &dst_path, &settings).await };
         join_set.spawn(do_copy());
     }
     let mut success = true;
