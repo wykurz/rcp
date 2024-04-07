@@ -61,6 +61,9 @@ OPTIONS:
             Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
 
         --max-workers <max-workers>                      Number of worker threads, 0 means number of cores [default: 0]
+        --overwrite-compare <overwrite-compare>
+            Comma separated list of file attributes to compare when when deciding if files are "identical", used with
+            --overwrite flag. Options are: uid, gid, size, mtime, ctime [default: size,mtime]
         --read-buffer <read-buffer>                      File copy read buffer size [default: 128KiB]
 
 ARGS:
@@ -105,21 +108,28 @@ USAGE:
     rlink [FLAGS] [OPTIONS] <src> <dst>
 
 FLAGS:
-    -e, --fail-early     Exit on first error
-    -h, --help           Prints help information
-        --progress       Show progress
-    -q, --quiet          Quiet mode, don't report errors
-        --summary        Print summary at the end
-    -V, --version        Prints version information
-    -v, --verbose        Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+    -e, --fail-early    Exit on first error
+    -h, --help          Prints help information
+    -o, --overwrite     Overwrite existing files/directories
+        --progress      Show progress
+    -q, --quiet         Quiet mode, don't report errors
+        --summary       Print summary at the end
+    -V, --version       Prints version information
+    -v, --verbose       Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
 
 OPTIONS:
         --max-blocking-threads <max-blocking-threads>
             Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
 
         --max-workers <max-workers>                      Number of worker threads, 0 means number of cores [default: 0]
+        --overwrite-compare <overwrite-compare>
+            Comma separated list of file attributes to compare when when deciding if files are "identical", used with
+            --overwrite flag. Options are: uid, gid, size, mtime, ctime [default: size,mtime]
         --read-buffer <read-buffer>                      File copy read buffer size [default: 128KiB]
         --update <update>                                Directory with updated contents of `link`
+        --update-compare <update-compare>
+            Same as overwrite-compare, but for deciding if we can hard-link or if we need to copy a file from the update
+            directory. Used with --update flag [default: size,mtime]
 
 ARGS:
     <src>    Directory with contents we want to update into `dst`
