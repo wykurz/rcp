@@ -98,7 +98,6 @@ async fn async_main(args: Args) -> Result<LinkSummary> {
         &args.update,
         &common::LinkSettings {
             copy_settings: common::CopySettings {
-                preserve: true, // ALWAYS preserve metadata
                 read_buffer,
                 dereference: false, // currently not supported
                 fail_early: args.fail_early,

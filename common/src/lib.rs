@@ -10,6 +10,7 @@ use tracing_subscriber::prelude::*;
 mod copy;
 mod filecmp;
 mod link;
+mod preserve;
 mod progress;
 mod rm;
 mod testutils;
@@ -18,6 +19,7 @@ pub use copy::CopySettings;
 pub use copy::CopySummary;
 pub use link::LinkSettings;
 pub use link::LinkSummary;
+pub use preserve::{preserve_all, preserve_default, PreserveSettings};
 pub use rm::RmSummary;
 pub use rm::Settings as RmSettings;
 
@@ -101,9 +103,10 @@ pub async fn copy(
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &copy::CopySettings,
+    preserve: &preserve::PreserveSettings,
 ) -> Result<CopySummary> {
     let cwd = std::env::current_dir()?;
-    copy::copy(&PROGRESS, &cwd, src, dst, settings).await
+    copy::copy(&PROGRESS, &cwd, src, dst, settings, preserve).await
 }
 
 pub async fn rm(path: &std::path::Path, settings: &rm::Settings) -> Result<RmSummary> {

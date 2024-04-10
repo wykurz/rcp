@@ -109,15 +109,20 @@ async fn async_main(args: Args) -> Result<CopySummary> {
         .as_u64() as usize;
     let mut join_set = tokio::task::JoinSet::new();
     let settings = common::CopySettings {
-        preserve: args.preserve,
         read_buffer,
         dereference: args.dereference,
         fail_early: args.fail_early,
         overwrite: args.overwrite,
         overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
     };
+    let preserve = if args.preserve {
+        common::preserve_all()
+    } else {
+        common::preserve_default()
+    };
     for (src_path, dst_path) in src_dst {
-        let do_copy = || async move { common::copy(&src_path, &dst_path, &settings).await };
+        let do_copy =
+            || async move { common::copy(&src_path, &dst_path, &settings, &preserve).await };
         join_set.spawn(do_copy());
     }
     let mut success = true;
