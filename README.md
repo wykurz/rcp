@@ -36,7 +36,7 @@ The trace events are retained for 60s. This can be modified by setting `RCP_TOKI
 rcp
 ===
 
-`rcp` is a tool for copying files similar `cp` but generally MUCH faster when dealing with large number of files.
+`rcp` is a tool for copying files similar to `cp` but generally MUCH faster when dealing with a large number of files.
 Inspired by tools like [dsync](https://mpifileutils.readthedocs.io/en/v0.11.1/dsync.1.html) and
 [pcp](https://github.com/wtsi-ssg/pcp).
 
@@ -73,7 +73,7 @@ ARGS:
 rrm
 ===
 
-`rrm` is a simple tool to remove large numbers of files. Note the basic usage is equivalent to `rm -rf`.
+`rrm` is a simple tool for removing large numbers of files. Note the basic usage is equivalent to `rm -rf`.
 
 ```
 USAGE:

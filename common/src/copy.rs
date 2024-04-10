@@ -1,16 +1,14 @@
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::prelude::PermissionsExt;
 use tracing::{event, instrument, Level};
 
 use crate::filecmp;
+use crate::preserve;
 use crate::progress;
 use crate::rm;
 
 #[derive(Debug, Copy, Clone)]
 pub struct CopySettings {
-    pub preserve: bool,
     pub read_buffer: usize,
     pub dereference: bool,
     pub fail_early: bool,
@@ -27,52 +25,13 @@ pub fn is_file_type_same(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bo
         && ft1.is_symlink() == ft2.is_symlink()
 }
 
-#[instrument]
-pub async fn set_owner_and_time(dst: &std::path::Path, metadata: &std::fs::Metadata) -> Result<()> {
-    let dst = dst.to_owned();
-    let metadata = metadata.to_owned();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        // set timestamps first - those are unlikely to fail
-        event!(Level::DEBUG, "setting timestamps");
-        let atime = nix::sys::time::TimeSpec::new(metadata.atime(), metadata.atime_nsec());
-        let mtime = nix::sys::time::TimeSpec::new(metadata.mtime(), metadata.mtime_nsec());
-        nix::sys::stat::utimensat(
-            None,
-            &dst,
-            &atime,
-            &mtime,
-            nix::sys::stat::UtimensatFlags::NoFollowSymlink,
-        )
-        .with_context(|| format!("failed setting timestamps for {:?}", &dst))?;
-        // set user and group - set those last, if those fail we at least have the timestamps set
-        event!(Level::DEBUG, "setting uid ang gid");
-        let uid = metadata.uid();
-        let gid = metadata.gid();
-        nix::unistd::fchownat(
-            None,
-            &dst,
-            Some(uid.into()),
-            Some(gid.into()),
-            nix::unistd::FchownatFlags::NoFollowSymlink,
-        )
-        .with_context(|| {
-            format!(
-                "cannot set {:?} owner to {} and/or group id to {}",
-                &dst, &uid, &gid
-            )
-        })
-        .map_err(anyhow::Error::from)?;
-        Ok(())
-    })
-    .await?
-}
-
 #[instrument(skip(prog_track))]
 pub async fn copy_file(
     prog_track: &'static progress::TlsProgress,
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &CopySettings,
+    preserve: &preserve::PreserveSettings,
 ) -> Result<CopySummary> {
     event!(
         Level::DEBUG,
@@ -134,20 +93,7 @@ pub async fn copy_file(
         .metadata()
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))?;
-    let permissions = if settings.preserve {
-        src_metadata.permissions()
-    } else {
-        // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
-        std::fs::Permissions::from_mode(src_metadata.permissions().mode() & 0o0777)
-    };
-    writer
-        .set_permissions(permissions.clone())
-        .await
-        .with_context(|| format!("cannot set {:?} permissions to {:?}", &dst, &permissions))?;
-    if settings.preserve {
-        // modify the uid and gid of the file as well
-        set_owner_and_time(dst, &src_metadata).await?;
-    }
+    preserve::set_file_permissions(preserve, &src_metadata, &writer, dst).await?;
     Ok(CopySummary {
         rm_summary,
         files_copied: 1,
@@ -199,6 +145,7 @@ pub async fn copy(
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &CopySettings,
+    preserve: &preserve::PreserveSettings,
 ) -> Result<CopySummary> {
     let _guard = prog_track.guard();
     event!(Level::DEBUG, "reading source metadata");
@@ -223,10 +170,10 @@ pub async fn copy(
                 )
             })
             .unwrap();
-        return copy(prog_track, new_cwd, &abs_link, dst, settings).await;
+        return copy(prog_track, new_cwd, &abs_link, dst, settings, preserve).await;
     }
     if src_metadata.is_file() {
-        return copy_file(prog_track, src, dst, settings).await;
+        return copy_file(prog_track, src, dst, settings, preserve).await;
     }
     if src_metadata.is_symlink() {
         let mut rm_summary = rm::RmSummary::default();
@@ -248,7 +195,7 @@ pub async fn copy(
                             Level::DEBUG,
                             "'dst' is a symlink and points to the same location as 'src'"
                         );
-                        if settings.preserve {
+                        if preserve.symlink.any() {
                             // do we need to update the metadata for this symlink?
                             let dst_metadata =
                                 tokio::fs::symlink_metadata(dst).await.with_context(|| {
@@ -260,7 +207,8 @@ pub async fn copy(
                                 &dst_metadata,
                             ) {
                                 event!(Level::DEBUG, "'dst' metadata is different, updating");
-                                set_owner_and_time(dst, &src_metadata).await?;
+                                preserve::set_symlink_permissions(preserve, &src_metadata, dst)
+                                    .await?;
                                 return Ok(CopySummary {
                                     symlinks_created: 1,
                                     ..Default::default()
@@ -295,9 +243,7 @@ pub async fn copy(
                 return Err(error).with_context(|| format!("failed creating symlink {:?}", &dst));
             }
         }
-        if settings.preserve {
-            set_owner_and_time(dst, &src_metadata).await?;
-        }
+        preserve::set_symlink_permissions(preserve, &src_metadata, dst).await?;
         return Ok(CopySummary {
             rm_summary,
             symlinks_created: 1,
@@ -371,8 +317,18 @@ pub async fn copy(
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
         let settings = *settings;
-        let do_copy =
-            || async move { copy(prog_track, &cwd_path, &entry_path, &dst_path, &settings).await };
+        let preserve = *preserve;
+        let do_copy = || async move {
+            copy(
+                prog_track,
+                &cwd_path,
+                &entry_path,
+                &dst_path,
+                &settings,
+                &preserve,
+            )
+            .await
+        };
         join_set.spawn(do_copy());
     }
     while let Some(res) = join_set.join_next().await {
@@ -397,18 +353,7 @@ pub async fn copy(
         return Err(anyhow::anyhow!("copy: {:?} -> {:?} failed!", src, dst));
     }
     event!(Level::DEBUG, "set 'dst' directory metadata");
-    let permissions = if settings.preserve {
-        src_metadata.permissions()
-    } else {
-        // remove sticky bit, setuid and setgid from permissions to mimic behavior of cp
-        std::fs::Permissions::from_mode(src_metadata.permissions().mode() & 0o0777)
-    };
-    tokio::fs::set_permissions(dst, permissions.clone())
-        .await
-        .with_context(|| format!("cannot set {:?} permissions to {:?}", &dst, &permissions))?;
-    if settings.preserve {
-        set_owner_and_time(dst, &src_metadata).await?;
-    }
+    preserve::set_dir_permissions(preserve, &src_metadata, dst).await?;
     Ok(copy_summary)
 }
 
@@ -416,12 +361,15 @@ pub async fn copy(
 mod copy_tests {
     use crate::testutils;
     use anyhow::Context;
+    use std::os::unix::fs::PermissionsExt;
     use tracing_test::traced_test;
 
     use super::*;
 
     lazy_static! {
         static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
+        static ref NO_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_default();
+        static ref DO_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_all();
     }
 
     #[tokio::test]
@@ -435,7 +383,6 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &CopySettings {
-                preserve: false,
                 read_buffer: 10,
                 dereference: false,
                 fail_early: false,
@@ -446,6 +393,7 @@ mod copy_tests {
                     ..Default::default()
                 },
             },
+            &NO_PRESERVE_SETTINGS,
         )
         .await?;
         assert_eq!(summary.files_copied, 5);
@@ -477,7 +425,6 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &CopySettings {
-                preserve: false,
                 read_buffer: 5,
                 dereference: false,
                 fail_early: false,
@@ -488,6 +435,7 @@ mod copy_tests {
                     ..Default::default()
                 },
             },
+            &NO_PRESERVE_SETTINGS,
         )
         .await
         {
@@ -553,7 +501,6 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &CopySettings {
-                preserve: false,
                 read_buffer: 7,
                 dereference: false,
                 fail_early: false,
@@ -564,6 +511,7 @@ mod copy_tests {
                     ..Default::default()
                 },
             },
+            &NO_PRESERVE_SETTINGS,
         )
         .await?;
         assert_eq!(summary.files_copied, 5);
@@ -615,7 +563,6 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &CopySettings {
-                preserve: false,
                 read_buffer: 8,
                 dereference: false,
                 fail_early: false,
@@ -626,6 +573,7 @@ mod copy_tests {
                     ..Default::default()
                 },
             },
+            &NO_PRESERVE_SETTINGS,
         )
         .await?;
         assert_eq!(summary.files_copied, 5);
@@ -658,7 +606,6 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &CopySettings {
-                preserve: false,
                 read_buffer: 10,
                 dereference: true, // <- important!
                 fail_early: false,
@@ -669,6 +616,7 @@ mod copy_tests {
                     ..Default::default()
                 },
             },
+            &NO_PRESERVE_SETTINGS,
         )
         .await?;
         assert_eq!(summary.files_copied, 7);
@@ -692,7 +640,11 @@ mod copy_tests {
         Ok(())
     }
 
-    async fn cp_compare(cp_args: &[&str], rcp_settings: &CopySettings) -> Result<()> {
+    async fn cp_compare(
+        cp_args: &[&str],
+        rcp_settings: &CopySettings,
+        preserve: bool,
+    ) -> Result<()> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         // run a cp command to copy the files
@@ -710,6 +662,11 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("baz"),
             rcp_settings,
+            if preserve {
+                &DO_PRESERVE_SETTINGS
+            } else {
+                &NO_PRESERVE_SETTINGS
+            },
         )
         .await?;
         if rcp_settings.dereference {
@@ -723,7 +680,7 @@ mod copy_tests {
         testutils::check_dirs_identical(
             &test_path.join("bar"),
             &test_path.join("baz"),
-            if rcp_settings.preserve {
+            if preserve {
                 testutils::FileEqualityCheck::Timestamp
             } else {
                 testutils::FileEqualityCheck::Basic
@@ -739,7 +696,6 @@ mod copy_tests {
         cp_compare(
             &["-r"],
             &CopySettings {
-                preserve: false,
                 read_buffer: 100,
                 dereference: false,
                 fail_early: false,
@@ -750,6 +706,7 @@ mod copy_tests {
                     ..Default::default()
                 },
             },
+            false,
         )
         .await?;
         Ok(())
@@ -761,7 +718,6 @@ mod copy_tests {
         cp_compare(
             &["-r", "-p"],
             &CopySettings {
-                preserve: true,
                 read_buffer: 100,
                 dereference: false,
                 fail_early: false,
@@ -772,6 +728,7 @@ mod copy_tests {
                     ..Default::default()
                 },
             },
+            true,
         )
         .await?;
         Ok(())
@@ -783,7 +740,6 @@ mod copy_tests {
         cp_compare(
             &["-r", "-L"],
             &CopySettings {
-                preserve: false,
                 read_buffer: 100,
                 dereference: true,
                 fail_early: false,
@@ -794,6 +750,7 @@ mod copy_tests {
                     ..Default::default()
                 },
             },
+            false,
         )
         .await?;
         Ok(())
@@ -805,7 +762,6 @@ mod copy_tests {
         cp_compare(
             &["-r", "-p", "-L"],
             &CopySettings {
-                preserve: true,
                 read_buffer: 100,
                 dereference: true,
                 fail_early: false,
@@ -816,6 +772,7 @@ mod copy_tests {
                     ..Default::default()
                 },
             },
+            true,
         )
         .await?;
         Ok(())
@@ -830,7 +787,6 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &CopySettings {
-                preserve: true,
                 read_buffer: 10,
                 dereference: false,
                 fail_early: false,
@@ -841,6 +797,7 @@ mod copy_tests {
                     ..Default::default()
                 },
             },
+            &DO_PRESERVE_SETTINGS,
         )
         .await?;
         assert_eq!(summary.files_copied, 5);
@@ -887,7 +844,6 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             &output_path,
             &CopySettings {
-                preserve: true,
                 read_buffer: 10,
                 dereference: false,
                 fail_early: false,
@@ -898,6 +854,7 @@ mod copy_tests {
                     ..Default::default()
                 },
             },
+            &DO_PRESERVE_SETTINGS,
         )
         .await?;
         assert_eq!(summary.files_copied, 3);
@@ -956,7 +913,6 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             &output_path,
             &CopySettings {
-                preserve: true,
                 read_buffer: 10,
                 dereference: false,
                 fail_early: false,
@@ -967,6 +923,7 @@ mod copy_tests {
                     ..Default::default()
                 },
             },
+            &DO_PRESERVE_SETTINGS,
         )
         .await?;
         assert_eq!(summary.rm_summary.files_removed, 1);
@@ -1024,7 +981,6 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             &output_path,
             &CopySettings {
-                preserve: true,
                 read_buffer: 10,
                 dereference: false,
                 fail_early: false,
@@ -1035,6 +991,7 @@ mod copy_tests {
                     ..Default::default()
                 },
             },
+            &DO_PRESERVE_SETTINGS,
         )
         .await?;
         assert_eq!(summary.rm_summary.files_removed, 1);
@@ -1095,7 +1052,6 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             &output_path,
             &CopySettings {
-                preserve: true,
                 read_buffer: 10,
                 dereference: false,
                 fail_early: false,
@@ -1106,6 +1062,7 @@ mod copy_tests {
                     ..Default::default()
                 },
             },
+            &DO_PRESERVE_SETTINGS,
         )
         .await?;
         assert_eq!(summary.rm_summary.files_removed, 0);
@@ -1140,7 +1097,6 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
             &CopySettings {
-                preserve: true,
                 read_buffer: 10,
                 dereference: true, // <- important!
                 fail_early: false,
@@ -1151,6 +1107,7 @@ mod copy_tests {
                     ..Default::default()
                 },
             },
+            &DO_PRESERVE_SETTINGS,
         )
         .await?;
         assert_eq!(summary.files_copied, 13); // 0.txt, 3x bar/(1.txt, 2.txt, 3.txt), baz/(4.txt, 5.txt, 6.txt)
