@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate lazy_static;
 
+use anyhow::Context;
 use anyhow::{anyhow, Result};
 use std::future::Future;
 use tracing::{event, instrument, Level};
@@ -97,6 +98,67 @@ pub fn parse_metadata_cmp_settings(settings: &str) -> Result<filecmp::MetadataCm
         }
     }
     Ok(metadata_cmp_settings)
+}
+
+fn parse_type_settings(
+    settings: &str,
+) -> Result<(preserve::UserAndTimeSettings, Option<preserve::ModeMask>)> {
+    let mut user_and_time = preserve::UserAndTimeSettings::default();
+    let mut mode_mask = None;
+    for setting in settings.split(',') {
+        match setting {
+            "uid" => user_and_time.uid = true,
+            "gid" => user_and_time.gid = true,
+            "time" => user_and_time.time = true,
+            _ => {
+                if let Ok(mask) = u32::from_str_radix(setting, 8) {
+                    mode_mask = Some(mask);
+                } else {
+                    return Err(anyhow!("Unknown preserve attribute specified: {}", setting));
+                }
+            }
+        }
+    }
+    Ok((user_and_time, mode_mask))
+}
+
+pub fn parse_preserve_settings(settings: &str) -> Result<preserve::PreserveSettings> {
+    let mut preserve_settings = preserve::PreserveSettings::default();
+    for type_settings in settings.split(' ') {
+        if let Some((file_type, settings)) = type_settings.split_once(':') {
+            let (user_and_time_settings, mode_opt) =
+                parse_type_settings(settings).context(format!(
+                    "parsing preserve settings: {}, type: {}",
+                    settings, file_type
+                ))?;
+            match file_type {
+                "f" | "file" => {
+                    preserve_settings.file = preserve::FileSettings::default();
+                    preserve_settings.file.user_and_time = user_and_time_settings;
+                    if let Some(mode) = mode_opt {
+                        preserve_settings.file.mode_mask = mode;
+                    };
+                }
+                "d" | "dir" | "directory" => {
+                    preserve_settings.dir = preserve::DirSettings::default();
+                    preserve_settings.dir.user_and_time = user_and_time_settings;
+                    if let Some(mode) = mode_opt {
+                        preserve_settings.dir.mode_mask = mode;
+                    };
+                }
+                "l" | "link" | "symlink" => {
+                    preserve_settings.symlink = preserve::SymlinkSettings::default();
+                    preserve_settings.symlink.user_and_time = user_and_time_settings;
+                }
+                _ => {
+                    return Err(anyhow!("Unknown file type: {}", file_type));
+                }
+            }
+        } else {
+            return Err(anyhow!("Invalid preserve settings: {}", settings));
+        }
+    }
+    Ok(preserve_settings)
 }
 
 pub async fn copy(

@@ -10,7 +10,8 @@ struct Args {
     #[structopt(short, long)]
     overwrite: bool,
 
-    /// Comma separated list of file attributes to compare when when deciding if files are "identical", used with --overwrite flag. Options are: uid, gid, size, mtime, ctime
+    /// Comma separated list of file attributes to compare when when deciding if files are "identical", used with --overwrite flag.
+    /// Options are: uid, gid, size, mtime, ctime
     #[structopt(long, default_value = "size,mtime")]
     overwrite_compare: String,
 
@@ -25,6 +26,19 @@ struct Args {
     /// Preserve additional file attributes: file owner, group, setuid, setgid, mtime and atime
     #[structopt(short, long)]
     preserve: bool,
+
+    /// Specify exactly what attributes to preserve.
+    ///
+    /// If specified, the "preserve" flag is ignored.
+    ///
+    /// The format is: "<type1>:<attributes1> <type2>:<attributes2> ..."
+    /// Where <type> is one of: "f" (file), "d" (directory), "l" (symlink)
+    /// And <attributes> is a comma separated list of: "uid", "gid", "time", <mode mask>
+    /// Where <mode mask> is a 4 digit octal number
+    ///
+    /// Example: "f:uid,gid,time,0777 d:uid,gid,time,0777 l:uid,gid,time"
+    #[structopt(long)]
+    preserve_settings: Option<String>,
 
     /// Always follow symbolic links in source
     #[structopt(short = "-L", long)]
@@ -115,11 +129,21 @@ async fn async_main(args: Args) -> Result<CopySummary> {
         overwrite: args.overwrite,
         overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
     };
-    let preserve = if args.preserve {
+    event!(Level::DEBUG, "copy settings: {:?}", &settings);
+    if args.preserve_settings.is_some() && args.preserve {
+        event!(
+            Level::WARN,
+            "The --preserve flag is ignored when --preserve-settings is specified!"
+        );
+    }
+    let preserve = if let Some(preserve_settings) = args.preserve_settings {
+        common::parse_preserve_settings(&preserve_settings)?
+    } else if args.preserve {
         common::preserve_all()
     } else {
         common::preserve_default()
     };
+    event!(Level::DEBUG, "preserve settings: {:?}", &preserve);
     for (src_path, dst_path) in src_dst {
         let do_copy =
             || async move { common::copy(&src_path, &dst_path, &settings, &preserve).await };
