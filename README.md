@@ -45,29 +45,64 @@ USAGE:
     rcp [FLAGS] [OPTIONS] [paths]...
 
 FLAGS:
-    -L, --dereference    Always follow symbolic links in source
-    -e, --fail-early     Exit on first error
-    -h, --help           Prints help information
-    -o, --overwrite      Overwrite existing files/directories
-    -p, --preserve       Preserve additional file attributes: file owner, group, setuid, setgid, mtime and atime
-        --progress       Show progress
-    -q, --quiet          Quiet mode, don't report errors
-        --summary        Print summary at the end
-    -V, --version        Prints version information
-    -v, --verbose        Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+    -L, --dereference
+            Always follow symbolic links in source
+
+    -e, --fail-early
+            Exit on first error
+
+    -h, --help
+            Prints help information
+
+    -o, --overwrite
+            Overwrite existing files/directories
+
+    -p, --preserve
+            Preserve additional file attributes: file owner, group, setuid, setgid, mtime and atime
+
+        --progress
+            Show progress
+
+    -q, --quiet
+            Quiet mode, don't report errors
+
+        --summary
+            Print summary at the end
+
+    -V, --version
+            Prints version information
+
+    -v, --verbose
+            Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+
 
 OPTIONS:
         --max-blocking-threads <max-blocking-threads>
             Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
 
-        --max-workers <max-workers>                      Number of worker threads, 0 means number of cores [default: 0]
+        --max-workers <max-workers>
+            Number of worker threads, 0 means number of cores [default: 0]
+
         --overwrite-compare <overwrite-compare>
             Comma separated list of file attributes to compare when when deciding if files are "identical", used with
             --overwrite flag. Options are: uid, gid, size, mtime, ctime [default: size,mtime]
-        --read-buffer <read-buffer>                      File copy read buffer size [default: 128KiB]
+        --preserve-settings <preserve-settings>
+            Specify exactly what attributes to preserve.
+
+            If specified, the "preserve" flag is ignored.
+
+            The format is: "<type1>:<attributes1> <type2>:<attributes2> ..." Where <type> is one of: "f" (file), "d"
+            (directory), "l" (symlink) And <attributes> is a comma separated list of: "uid", "gid", "time", <mode mask>
+            Where <mode mask> is a 4 digit octal number
+
+            Example: "f:uid,gid,time,0777 d:uid,gid,time,0777 l:uid,gid,time"
+        --read-buffer <read-buffer>
+            File copy read buffer size [default: 128KiB]
+
 
 ARGS:
-    <paths>...    Source path(s) and destination path
+    <paths>...
+            Source path(s) and destination path
 ```
 
 rrm

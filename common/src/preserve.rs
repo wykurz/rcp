@@ -16,16 +16,36 @@ impl UserAndTimeSettings {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+pub type ModeMask = u32;
+
+#[derive(Copy, Clone, Debug)]
 pub struct FileSettings {
     pub user_and_time: UserAndTimeSettings,
-    pub mode_mask: u32,
+    pub mode_mask: ModeMask,
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+impl Default for FileSettings {
+    fn default() -> Self {
+        Self {
+            user_and_time: UserAndTimeSettings::default(),
+            mode_mask: 0o0777, // remove sticky bit, setuid and setgid to mimic "cp" tool
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
 pub struct DirSettings {
     pub user_and_time: UserAndTimeSettings,
-    pub mode_mask: u32,
+    pub mode_mask: ModeMask,
+}
+
+impl Default for DirSettings {
+    fn default() -> Self {
+        Self {
+            user_and_time: UserAndTimeSettings::default(),
+            mode_mask: 0o0777,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -171,21 +191,5 @@ pub fn preserve_all() -> PreserveSettings {
 }
 
 pub fn preserve_default() -> PreserveSettings {
-    let user_and_time = UserAndTimeSettings {
-        uid: false,
-        gid: false,
-        time: false,
-    };
-
-    PreserveSettings {
-        file: FileSettings {
-            user_and_time,
-            mode_mask: 0o0777, // remove sticky bit, setuid and setgid to mimic "cp" tool
-        },
-        dir: DirSettings {
-            user_and_time,
-            mode_mask: 0o0777,
-        },
-        symlink: SymlinkSettings { user_and_time },
-    }
+    PreserveSettings::default()
 }
