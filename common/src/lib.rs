@@ -3,11 +3,13 @@ extern crate lazy_static;
 
 use anyhow::Context;
 use anyhow::{anyhow, Result};
+use cmp::ObjType;
 use std::future::Future;
 use tracing::{event, instrument, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::prelude::*;
 
+mod cmp;
 mod copy;
 mod filecmp;
 mod link;
@@ -16,6 +18,10 @@ mod progress;
 mod rm;
 mod testutils;
 
+pub use cmp::CmpSettings;
+pub use cmp::CmpSummary;
+pub use cmp::LogWriter;
+pub use cmp::ObjCmpSettings;
 pub use copy::CopySettings;
 pub use copy::CopySummary;
 pub use link::LinkSettings;
@@ -89,6 +95,7 @@ pub fn parse_metadata_cmp_settings(settings: &str) -> Result<filecmp::MetadataCm
         match setting {
             "uid" => metadata_cmp_settings.uid = true,
             "gid" => metadata_cmp_settings.gid = true,
+            "mode" => metadata_cmp_settings.mode = true,
             "size" => metadata_cmp_settings.size = true,
             "mtime" => metadata_cmp_settings.mtime = true,
             "ctime" => metadata_cmp_settings.ctime = true,
@@ -125,13 +132,13 @@ fn parse_type_settings(
 pub fn parse_preserve_settings(settings: &str) -> Result<preserve::PreserveSettings> {
     let mut preserve_settings = preserve::PreserveSettings::default();
     for type_settings in settings.split(' ') {
-        if let Some((file_type, settings)) = type_settings.split_once(':') {
+        if let Some((obj_type, obj_settings)) = type_settings.split_once(':') {
             let (user_and_time_settings, mode_opt) =
-                parse_type_settings(settings).context(format!(
+                parse_type_settings(obj_settings).context(format!(
                     "parsing preserve settings: {}, type: {}",
-                    settings, file_type
+                    obj_settings, obj_type
                 ))?;
-            match file_type {
+            match obj_type {
                 "f" | "file" => {
                     preserve_settings.file = preserve::FileSettings::default();
                     preserve_settings.file.user_and_time = user_and_time_settings;
@@ -151,7 +158,7 @@ pub fn parse_preserve_settings(settings: &str) -> Result<preserve::PreserveSetti
                     preserve_settings.symlink.user_and_time = user_and_time_settings;
                 }
                 _ => {
-                    return Err(anyhow!("Unknown file type: {}", file_type));
+                    return Err(anyhow!("Unknown object type: {}", obj_type));
                 }
             }
         } else {
@@ -159,6 +166,39 @@ pub fn parse_preserve_settings(settings: &str) -> Result<preserve::PreserveSetti
         }
     }
     Ok(preserve_settings)
+}
+
+pub fn parse_compare_settings(settings: &str) -> Result<ObjCmpSettings> {
+    let mut cmp_settings = ObjCmpSettings::default();
+    for type_settings in settings.split(' ') {
+        if let Some((obj_type, obj_settings)) = type_settings.split_once(':') {
+            let obj_cmp_settings = parse_metadata_cmp_settings(obj_settings).context(format!(
+                "parsing preserve settings: {}, type: {}",
+                obj_settings, obj_type
+            ))?;
+            let obj_type = match obj_type {
+                "f" | "file" => ObjType::File,
+                "d" | "dir" | "directory" => ObjType::Dir,
+                "l" | "link" | "symlink" => ObjType::Symlink,
+                _ => {
+                    return Err(anyhow!("Unknown obj type: {}", obj_type));
+                }
+            };
+            cmp_settings[obj_type] = obj_cmp_settings;
+        } else {
+            return Err(anyhow!("Invalid preserve settings: {}", settings));
+        }
+    }
+    Ok(cmp_settings)
+}
+
+pub async fn cmp(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    log: &cmp::LogWriter,
+    settings: &cmp::CmpSettings,
+) -> Result<CmpSummary> {
+    cmp::cmp(&PROGRESS, src, dst, log, settings).await
 }
 
 pub async fn copy(
@@ -269,7 +309,7 @@ where
     let res = runtime.block_on(func());
     if let Err(error) = res {
         if !quiet {
-            eprintln!("{}", error);
+            eprintln!("{:#}", error);
         }
         std::process::exit(1);
     }

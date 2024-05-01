@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use common::LinkSummary;
 use structopt::StructOpt;
 
 #[derive(StructOpt, Debug, Clone)]
@@ -9,7 +8,7 @@ struct Args {
     #[structopt(short, long)]
     overwrite: bool,
 
-    /// Comma separated list of file attributes to compare when when deciding if files are "identical", used with --overwrite flag. Options are: uid, gid, size, mtime, ctime
+    /// Comma separated list of file attributes to compare when when deciding if files are "identical", used with --overwrite flag. Options are: uid, gid, mode, size, mtime, ctime
     #[structopt(long, default_value = "size,mtime")]
     overwrite_compare: String,
 
@@ -62,7 +61,7 @@ struct Args {
     read_buffer: String,
 }
 
-async fn async_main(args: Args) -> Result<LinkSummary> {
+async fn async_main(args: Args) -> Result<common::LinkSummary> {
     for src in &args.src {
         if src == "."
             || src

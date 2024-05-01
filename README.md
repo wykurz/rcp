@@ -171,3 +171,66 @@ ARGS:
     <dst>    Directory where we put either a hard-link of a file from `link` if it was unchanged, or a copy of a
              file from `new` if it's been modified
 ```
+
+rcmp
+=====
+
+`rcmp` is a tool for comparing large filesets. Currently, it only supports comparing metadata (no content checking).
+
+```
+USAGE:
+    rcmp [FLAGS] [OPTIONS] <log> <src> <dst>
+
+FLAGS:
+    -m, --exit-early
+            Exit on first mismatch
+
+    -e, --fail-early
+            Exit on first error
+
+    -h, --help
+            Prints help information
+
+        --progress
+            Show progress
+
+    -q, --quiet
+            Quiet mode, don't report errors
+
+        --summary
+            Print summary at the end
+
+    -V, --version
+            Prints version information
+
+    -v, --verbose
+            Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+
+
+OPTIONS:
+        --max-blocking-threads <max-blocking-threads>
+            Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
+
+        --max-workers <max-workers>
+            Number of worker threads, 0 means number of cores [default: 0]
+
+        --metadata-compare <metadata-compare>
+            Attributes to compare when when deciding if objects are "identical". Options are: uid, gid, mode, size,
+            mtime, ctime
+
+            The format is: "<type1>:<attributes1> <type2>:<attributes2> ..." Where <type> is one of: "f" (file), "d"
+            (directory), "l" (symlink) And <attributes> is a comma separated list of: uid, gid, size, mtime, ctime
+
+            Example: "f:mtime,ctime,mode,size d:mtime,ctime,mode l:mtime,ctime,mode" [default: f:mtime,size d:mtime
+            l:mtime]
+
+ARGS:
+    <log>
+            File where we store comparison mismatch output
+
+    <src>
+            File or directory to compare
+
+    <dst>
+            File or directory to compare
+```
