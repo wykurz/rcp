@@ -5,6 +5,7 @@ use tracing::instrument;
 pub struct MetadataCmpSettings {
     pub uid: bool,
     pub gid: bool,
+    pub mode: bool,
     pub size: bool,
     pub mtime: bool,
     pub ctime: bool,
@@ -20,6 +21,9 @@ pub fn metadata_equal(
         return false;
     }
     if settings.gid && metadata1.gid() != metadata2.gid() {
+        return false;
+    }
+    if settings.mode && metadata1.mode() != metadata2.mode() {
         return false;
     }
     if settings.size && metadata1.size() != metadata2.size() {

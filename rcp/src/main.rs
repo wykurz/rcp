@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use common::CopySummary;
 use structopt::StructOpt;
 use tracing::{event, instrument, Level};
 
@@ -11,7 +10,7 @@ struct Args {
     overwrite: bool,
 
     /// Comma separated list of file attributes to compare when when deciding if files are "identical", used with --overwrite flag.
-    /// Options are: uid, gid, size, mtime, ctime
+    /// Options are: uid, gid, mode, size, mtime, ctime
     #[structopt(long, default_value = "size,mtime")]
     overwrite_compare: String,
 
@@ -32,8 +31,8 @@ struct Args {
     /// If specified, the "preserve" flag is ignored.
     ///
     /// The format is: "<type1>:<attributes1> <type2>:<attributes2> ..."
-    /// Where <type> is one of: "f" (file), "d" (directory), "l" (symlink)
-    /// And <attributes> is a comma separated list of: "uid", "gid", "time", <mode mask>
+    /// Where <type> is one of: f (file), d (directory), l (symlink)
+    /// And <attributes> is a comma separated list of: uid, gid, time, <mode mask>
     /// Where <mode mask> is a 4 digit octal number
     ///
     /// Example: "f:uid,gid,time,0777 d:uid,gid,time,0777 l:uid,gid,time"
@@ -74,7 +73,7 @@ struct Args {
 }
 
 #[instrument]
-async fn async_main(args: Args) -> Result<CopySummary> {
+async fn async_main(args: Args) -> Result<common::CopySummary> {
     if args.paths.len() < 2 {
         return Err(anyhow::anyhow!(
             "You must specify at least one source and destination path!"
@@ -150,7 +149,7 @@ async fn async_main(args: Args) -> Result<CopySummary> {
         join_set.spawn(do_copy());
     }
     let mut success = true;
-    let mut copy_summary = CopySummary::default();
+    let mut copy_summary = common::CopySummary::default();
     while let Some(res) = join_set.join_next().await {
         match res? {
             Ok(summary) => copy_summary = copy_summary + summary,
