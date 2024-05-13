@@ -76,20 +76,6 @@ async fn set_owner_and_time(
     let dst = path.to_owned();
     let metadata = metadata.to_owned();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        // set timestamps first - those are unlikely to fail
-        if settings.time {
-            event!(Level::DEBUG, "setting timestamps");
-            let atime = nix::sys::time::TimeSpec::new(metadata.atime(), metadata.atime_nsec());
-            let mtime = nix::sys::time::TimeSpec::new(metadata.mtime(), metadata.mtime_nsec());
-            nix::sys::stat::utimensat(
-                None,
-                &dst,
-                &atime,
-                &mtime,
-                nix::sys::stat::UtimensatFlags::NoFollowSymlink,
-            )
-            .with_context(|| format!("failed setting timestamps for {:?}", &dst))?;
-        }
         if settings.uid || settings.gid {
             // set user and group - set those last, if those fail we at least have the timestamps set
             event!(Level::DEBUG, "setting uid ang gid");
@@ -117,6 +103,20 @@ async fn set_owner_and_time(
                 )
             })
             .map_err(anyhow::Error::from)?;
+        }
+        // set timestamps last - modifying other file metadata can change them
+        if settings.time {
+            event!(Level::DEBUG, "setting timestamps");
+            let atime = nix::sys::time::TimeSpec::new(metadata.atime(), metadata.atime_nsec());
+            let mtime = nix::sys::time::TimeSpec::new(metadata.mtime(), metadata.mtime_nsec());
+            nix::sys::stat::utimensat(
+                None,
+                &dst,
+                &atime,
+                &mtime,
+                nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+            )
+            .with_context(|| format!("failed setting timestamps for {:?}", &dst))?;
         }
         Ok(())
     })
