@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
+use tokio::io::AsyncWriteExt;
 use tracing::{event, instrument, Level};
 
 use crate::filecmp;
@@ -93,7 +94,10 @@ pub async fn copy_file(
         .metadata()
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))?;
-    preserve::set_file_permissions(preserve, &src_metadata, &writer, dst).await?;
+    if preserve.file.user_and_time.time {
+        writer.flush().await?; // flush all writes to avoid a race with the timestamp update
+    }
+    preserve::set_file_metadata(preserve, &src_metadata, &writer, dst).await?;
     Ok(CopySummary {
         rm_summary,
         files_copied: 1,
@@ -207,7 +211,7 @@ pub async fn copy(
                                 &dst_metadata,
                             ) {
                                 event!(Level::DEBUG, "'dst' metadata is different, updating");
-                                preserve::set_symlink_permissions(preserve, &src_metadata, dst)
+                                preserve::set_symlink_metadata(preserve, &src_metadata, dst)
                                     .await?;
                                 return Ok(CopySummary {
                                     symlinks_created: 1,
@@ -243,7 +247,7 @@ pub async fn copy(
                 return Err(error).with_context(|| format!("failed creating symlink {:?}", &dst));
             }
         }
-        preserve::set_symlink_permissions(preserve, &src_metadata, dst).await?;
+        preserve::set_symlink_metadata(preserve, &src_metadata, dst).await?;
         return Ok(CopySummary {
             rm_summary,
             symlinks_created: 1,
@@ -353,7 +357,7 @@ pub async fn copy(
         return Err(anyhow::anyhow!("copy: {:?} -> {:?} failed!", src, dst));
     }
     event!(Level::DEBUG, "set 'dst' directory metadata");
-    preserve::set_dir_permissions(preserve, &src_metadata, dst).await?;
+    preserve::set_dir_metadata(preserve, &src_metadata, dst).await?;
     Ok(copy_summary)
 }
 

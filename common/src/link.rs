@@ -389,7 +389,7 @@ pub async fn link(
     } else {
         &src_metadata
     };
-    preserve::set_dir_permissions(&RLINK_PRESERVE_SETTINGS, preserve_metadata, dst).await?;
+    preserve::set_dir_metadata(&RLINK_PRESERVE_SETTINGS, preserve_metadata, dst).await?;
     Ok(link_summary)
 }
 

@@ -123,7 +123,7 @@ async fn set_owner_and_time(
     .await?
 }
 
-pub async fn set_file_permissions(
+pub async fn set_file_metadata(
     settings: &PreserveSettings,
     metadata: &std::fs::Metadata,
     file: &tokio::fs::File,
@@ -142,7 +142,7 @@ pub async fn set_file_permissions(
     Ok(())
 }
 
-pub async fn set_dir_permissions(
+pub async fn set_dir_metadata(
     settings: &PreserveSettings,
     metadata: &std::fs::Metadata,
     path: &std::path::Path,
@@ -160,7 +160,7 @@ pub async fn set_dir_permissions(
     Ok(())
 }
 
-pub async fn set_symlink_permissions(
+pub async fn set_symlink_metadata(
     settings: &PreserveSettings,
     metadata: &std::fs::Metadata,
     path: &std::path::Path,
