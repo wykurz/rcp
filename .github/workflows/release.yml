@@ -41,9 +41,10 @@ jobs:
 
     - name: Upload to GitHub Release
       uses: actions/upload-release-asset@v1
+      env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        release_id: ${{ github.event.release.id }}
+        upload_url: ${{ github.event.release.upload_url }}
         asset_path: target/debian/*.deb
         asset_name: rcp_${{ github.event.release.tag_name }}.deb
         asset_content_type: application/octet-stream
