@@ -314,6 +314,7 @@ mod cmp_tests {
         // drop 1 (other) file from dst
         tokio::fs::remove_file(&tmp_dir.join("bar").join("bar").join("2.txt")).await?;
         // modify 1 file in dst
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await; // sleep to ensure mtime is different
         truncate_file(
             &tmp_dir
                 .join("bar")
