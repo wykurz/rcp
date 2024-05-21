@@ -1,6 +1,8 @@
 [package]
 name = "rlink"
 version = "0.10.0"
+description = "Tool for hard-linking files inspired by pcp/dsync."
+license = "MIT"
 edition = "2021"
 
 [dev-dependencies]
@@ -12,3 +14,9 @@ bytesize = "1.3"
 common = { path = "../common" }
 structopt = "0.3"
 tokio = { version = "1.34", features = ["full", "parking_lot", "tracing"] }
+
+[package.metadata.deb]
+maintainer = "Mateusz Wykurz <wykurz@gmail.com>"
+copyright = "2023, Mateusz Wykurz <wykurz@gmail.com>"
+depends = "libc6 (>= 2.27)"
+section = "utility"

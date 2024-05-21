@@ -1,6 +1,8 @@
 [package]
 name = "filegen"
 version = "0.10.0"
+description = "Tool for generating filesets typically used for testing."
+license = "MIT"
 edition = "2021"
 
 [dev-dependencies]
@@ -14,3 +16,9 @@ rand = "0.8"
 structopt = "0.3"
 tokio = { version = "1.34", features = ["full", "parking_lot", "tracing"] }
 tracing-subscriber = "0.3"
+
+[package.metadata.deb]
+maintainer = "Mateusz Wykurz <wykurz@gmail.com>"
+copyright = "2023, Mateusz Wykurz <wykurz@gmail.com>"
+depends = "libc6 (>= 2.27)"
+section = "utility"

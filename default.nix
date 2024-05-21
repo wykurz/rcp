@@ -14,6 +14,7 @@ in
       binutils
       # cargo-audit
       cargo-bloat
+      cargo-deb
       cargo-deny
       cargo-edit
       cargo-expand
