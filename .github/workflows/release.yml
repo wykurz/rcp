@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        profile: minimal
+
+    - name: Install cargo-deb
+      run: cargo install cargo-deb
+
+    - name: Build Debian package
+      run: cargo deb
+
+    - name: Upload Debian package
+      uses: actions/upload-artifact@v3
+      with:
+        name: debian-package
+        path: target/debian/*.deb
+
+    - name: Upload to GitHub Release
+      uses: actions/upload-release-asset@v3
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        release_id: ${{ github.event.release.id }}
+        asset_path: target/debian/*.deb
+        asset_name: rcp_${{ github.event.release.tag_name }}.deb
+        asset_content_type: application/octet-stream
