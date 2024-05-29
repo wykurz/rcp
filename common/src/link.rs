@@ -223,7 +223,14 @@ pub async fn link(
             });
         }
     }
-    assert!(src_metadata.is_dir());
+    if !src_metadata.is_dir() {
+        return Err(anyhow::anyhow!(
+            "copy: {:?} -> {:?} failed, unsupported src file type: {:?}",
+            src,
+            dst,
+            src_metadata.file_type()
+        ));
+    }
     assert!(update_metadata_opt.is_none() || update_metadata_opt.as_ref().unwrap().is_dir());
     event!(Level::DEBUG, "process contents of 'src' directory");
     let mut src_entries = tokio::fs::read_dir(src)

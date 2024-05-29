@@ -254,7 +254,14 @@ pub async fn copy(
             ..Default::default()
         });
     }
-    assert!(src_metadata.is_dir());
+    if !src_metadata.is_dir() {
+        return Err(anyhow::anyhow!(
+            "copy: {:?} -> {:?} failed, unsupported src file type: {:?}",
+            src,
+            dst,
+            src_metadata.file_type()
+        ));
+    }
     event!(Level::DEBUG, "process contents of 'src' directory");
     let mut entries = tokio::fs::read_dir(src)
         .await
