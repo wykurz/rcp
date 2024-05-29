@@ -2,7 +2,12 @@ use anyhow::{Context, Result};
 use structopt::StructOpt;
 
 #[derive(StructOpt, Debug, Clone)]
-#[structopt(name = "rlink")]
+#[structopt(
+    name = "rlink",
+    about = "`rlink` allows hard-linking large number of files.
+
+A common pattern is to also provide `--update <path>` that overrides any paths in `src` to instead be copied over from there."
+)]
 struct Args {
     /// Overwrite existing files/directories
     #[structopt(short, long)]

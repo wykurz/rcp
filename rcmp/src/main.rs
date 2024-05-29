@@ -2,7 +2,12 @@ use anyhow::Result;
 use structopt::StructOpt;
 
 #[derive(StructOpt, Debug, Clone)]
-#[structopt(name = "rcmp")]
+#[structopt(
+    name = "rcmp",
+    about = "`rcmp` is a tool for comparing large filesets.
+
+Currently, it only supports comparing metadata (no content checking)."
+)]
 struct Args {
     /// Attributes to compare when when deciding if objects are "identical". Options are: uid, gid, mode, size, mtime, ctime
     ///

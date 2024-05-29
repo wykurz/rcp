@@ -3,7 +3,12 @@ use structopt::StructOpt;
 use tracing::{event, instrument, Level};
 
 #[derive(StructOpt, Debug, Clone)]
-#[structopt(name = "rrm")]
+#[structopt(
+    name = "rrm",
+    about = "`rrm` is a simple tool for removing large numbers of files.
+
+Note the basic usage is equivalent to `rm -rf`."
+)]
 struct Args {
     /// Exit on first error
     #[structopt(short = "-e", long = "fail-early")]

@@ -3,7 +3,15 @@ use structopt::StructOpt;
 use tracing::{event, instrument, Level};
 
 #[derive(StructOpt, Debug, Clone)]
-#[structopt(name = "rcp")]
+#[structopt(
+    name = "rcp",
+    about = "`rcp` is a tool for copying files similar to `cp` but generally MUCH faster when dealing with a large number of files.
+
+Inspired by tools like `dsync`(1) and `pcp`(2).
+
+1) https://mpifileutils.readthedocs.io/en/v0.11.1/dsync.1.html
+2) https://github.com/wtsi-ssg/pcp"
+)]
 struct Args {
     /// Overwrite existing files/directories
     #[structopt(short, long)]
