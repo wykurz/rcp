@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use async_recursion::async_recursion;
 use rand::Rng;
 use structopt::StructOpt;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug)]
 struct Dirwidth {
@@ -20,7 +21,7 @@ impl std::str::FromStr for Dirwidth {
 }
 
 #[derive(StructOpt, Debug)]
-#[structopt(name = "rcp")]
+#[structopt(name = "filegen")]
 struct Args {
     /// Root directory where files are generated
     #[structopt(parse(from_os_str))]
@@ -46,6 +47,34 @@ struct Args {
     /// Size of each file. Accepts suffixes like "1K", "1M", "1G"
     #[structopt()]
     filesize: String,
+
+    /// Size of the buffer used to write to each file. Accepts suffixes like "1K", "1M", "1G"
+    #[structopt(default_value = "4K")]
+    bufsize: String,
+}
+
+async fn write_file(path: std::path::PathBuf, mut filesize: usize, bufsize: usize) -> Result<()> {
+    let mut bytes = vec![0u8; bufsize];
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .await
+        .context(format!("Error opening {:?}", &path))?;
+    while filesize > 0 {
+        {
+            // make sure rng falls out of scope before await
+            let mut rng = rand::thread_rng();
+            rng.fill(&mut bytes[..]);
+        }
+        let writesize = std::cmp::min(filesize, bufsize) as usize;
+        file.write_all(&bytes[..writesize])
+            .await
+            .context(format!("Error writing to {:?}", &path))?;
+        filesize -= writesize;
+    }
+    Ok(())
 }
 
 #[async_recursion]
@@ -53,7 +82,8 @@ async fn filegen(
     root: &std::path::Path,
     dirwidth: &[usize],
     numfiles: usize,
-    filesize: u64,
+    filesize: usize,
+    writebuf: usize,
 ) -> Result<()> {
     let numdirs = *dirwidth.first().unwrap_or(&0);
     let mut join_set = tokio::task::JoinSet::new();
@@ -65,22 +95,14 @@ async fn filegen(
             tokio::fs::create_dir(&path)
                 .await
                 .map_err(anyhow::Error::msg)?;
-            filegen(&path, &dirwidth, numfiles, filesize).await
+            filegen(&path, &dirwidth, numfiles, filesize, writebuf).await
         };
         join_set.spawn(recurse());
     }
     // generate files
     for i in 0..numfiles {
         let path = root.join(format!("file{}", i));
-        let mut rng = rand::thread_rng();
-        let mut bytes = vec![0u8; filesize as usize];
-        rng.fill(&mut bytes[..]);
-        let create_file = || async move {
-            tokio::fs::write(path, &bytes)
-                .await
-                .map_err(anyhow::Error::msg)
-        };
-        join_set.spawn(create_file());
+        join_set.spawn(write_file(path.clone(), filesize, writebuf));
     }
     while let Some(res) = join_set.join_next().await {
         res??
@@ -96,11 +118,19 @@ async fn main() -> Result<()> {
         .filesize
         .parse::<bytesize::ByteSize>()
         .unwrap()
-        .as_u64();
+        .as_u64() as usize;
+    let writebuf = args.bufsize.parse::<bytesize::ByteSize>().unwrap().as_u64() as usize;
     let root = args.root.join("filegen");
     tokio::fs::create_dir(&root)
         .await
         .context(format!("Error creating {:?}", &root))?;
-    filegen(&root, &args.dirwidth.value, args.numfiles, filesize).await?;
+    filegen(
+        &root,
+        &args.dirwidth.value,
+        args.numfiles,
+        filesize,
+        writebuf,
+    )
+    .await?;
     Ok(())
 }
