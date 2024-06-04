@@ -14,6 +14,6 @@ filegen -- $root_dir $dirwidth $num_files $file_size
 
 echo $cwd
 echo $pwd
-strace -fttt rcp --progress --summary --overwrite $root_dir/filegen $root_dir/filegen-test 2> /tmp/strace.log
+strace -fttt rcp --progress --summary --overwrite $root_dir/filegen $root_dir/filegen-test 2> $root_dir/strace.log
 
-scripts/parse-strace.sh /tmp/strace.log
+scripts/parse-strace.sh $root_dir/strace.log
