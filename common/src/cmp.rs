@@ -311,10 +311,9 @@ mod cmp_tests {
         let tmp_dir = setup_test_dirs(true).await?;
         // drop 1 file from src
         tokio::fs::remove_file(&tmp_dir.join("foo").join("bar").join("1.txt")).await?;
-        // drop 1 (other) file from dst
-        tokio::fs::remove_file(&tmp_dir.join("bar").join("bar").join("2.txt")).await?;
-        // modify 1 file in dst
+        // sleep to ensure mtime is different, this acts as a poor-mans barrier
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await; // sleep to ensure mtime is different
+                                                                          // modify 1 file in dst
         truncate_file(
             &tmp_dir
                 .join("bar")
@@ -324,6 +323,8 @@ mod cmp_tests {
                 .unwrap(),
         )
         .await?;
+        // drop 1 (other) file from dst
+        tokio::fs::remove_file(&tmp_dir.join("bar").join("bar").join("2.txt")).await?;
         // create one more file in dst -- this will also modify the mtime of the directory
         tokio::fs::File::create(&tmp_dir.join("bar").join("baz").join("7.txt")).await?;
         let compare_settings = CmpSettings {
@@ -361,8 +362,8 @@ mod cmp_tests {
                 CmpResult::DstMissing => 1,
             },
             ObjType::Dir => enum_map! {
-                CmpResult::Different => 1,
-                CmpResult::Same => 2,
+                CmpResult::Different => 2,
+                CmpResult::Same => 1,
                 CmpResult::SrcMissing => 0,
                 CmpResult::DstMissing => 0,
             },
