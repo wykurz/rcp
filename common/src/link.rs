@@ -106,6 +106,7 @@ pub async fn link(
     dst: &std::path::Path,
     update: &Option<std::path::PathBuf>,
     settings: &LinkSettings,
+    mut is_fresh: bool,
 ) -> Result<LinkSummary> {
     let _guard = prog_track.guard();
     event!(Level::DEBUG, "reading source metadata");
@@ -150,6 +151,7 @@ pub async fn link(
                 dst,
                 &settings.copy_settings,
                 &RLINK_PRESERVE_SETTINGS,
+                is_fresh,
             )
             .await?;
             return Ok(LinkSummary {
@@ -176,6 +178,7 @@ pub async fn link(
                         dst,
                         &settings.copy_settings,
                         &RLINK_PRESERVE_SETTINGS,
+                        is_fresh,
                     )
                     .await?,
                     ..Default::default()
@@ -192,6 +195,7 @@ pub async fn link(
                 dst,
                 &settings.copy_settings,
                 &RLINK_PRESERVE_SETTINGS,
+                is_fresh,
             )
             .await?;
             return Ok(LinkSummary {
@@ -215,6 +219,7 @@ pub async fn link(
                 dst,
                 &settings.copy_settings,
                 &RLINK_PRESERVE_SETTINGS,
+                is_fresh,
             )
             .await?;
             return Ok(LinkSummary {
@@ -238,6 +243,7 @@ pub async fn link(
         .with_context(|| format!("cannot open directory {:?} for reading", src))?;
     let copy_summary = {
         if let Err(error) = tokio::fs::create_dir(dst).await {
+            assert!(!is_fresh, "unexpected error creating directory: {:?}", &dst);
             if settings.copy_settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists
             {
                 // check if the destination is a directory - if so, leave it
@@ -270,6 +276,8 @@ pub async fn link(
                     tokio::fs::create_dir(dst)
                         .await
                         .with_context(|| format!("cannot create directory {:?}", dst))?;
+                    // anythingg copied into dst may assume they don't need to check for conflicts
+                    is_fresh = true;
                     copy::CopySummary {
                         rm_summary,
                         directories_created: 1,
@@ -280,7 +288,8 @@ pub async fn link(
                 return Err(error).with_context(|| format!("cannot create directory {:?}", dst));
             }
         } else {
-            // new directory created, no conflicts
+            // new directory created, anythingg copied into dst may assume they don't need to check for conflicts
+            is_fresh = true;
             copy::CopySummary {
                 directories_created: 1,
                 ..Default::default()
@@ -312,6 +321,7 @@ pub async fn link(
                 &dst_path,
                 &update_path,
                 &settings,
+                is_fresh,
             )
             .await
         };
@@ -349,6 +359,7 @@ pub async fn link(
                     &dst_path,
                     &settings.copy_settings,
                     &RLINK_PRESERVE_SETTINGS,
+                    is_fresh,
                 )
                 .await?;
                 Ok(LinkSummary {
@@ -444,6 +455,7 @@ mod link_tests {
             &test_path.join("bar"),
             &None,
             &common_settings(false, false),
+            false,
         )
         .await?;
         assert_eq!(summary.hard_links_created, 5);
@@ -471,6 +483,7 @@ mod link_tests {
             &test_path.join("bar"),
             &Some(test_path.join("foo")),
             &common_settings(false, false),
+            false,
         )
         .await?;
         assert_eq!(summary.hard_links_created, 5);
@@ -499,6 +512,7 @@ mod link_tests {
             &test_path.join("bar"),
             &Some(test_path.join("foo")),
             &common_settings(false, false),
+            false,
         )
         .await?;
         assert_eq!(summary.hard_links_created, 0);
@@ -550,6 +564,7 @@ mod link_tests {
             &test_path.join("bar"),
             &Some(test_path.join("update")),
             &common_settings(false, false),
+            false,
         )
         .await?;
         assert_eq!(summary.hard_links_created, 2);
@@ -583,6 +598,7 @@ mod link_tests {
             &test_path.join("bar"),
             &None,
             &common_settings(false, false),
+            false,
         )
         .await?;
         assert_eq!(summary.hard_links_created, 5);
@@ -630,6 +646,7 @@ mod link_tests {
             &output_path,
             &None,
             &common_settings(false, true), // overwrite!
+            false,
         )
         .await?;
         assert_eq!(summary.hard_links_created, 3);
@@ -689,6 +706,7 @@ mod link_tests {
             &output_path,
             &Some(tmp_dir.join("update")),
             &common_settings(false, true), // overwrite!
+            false,
         )
         .await?;
         assert_eq!(summary.hard_links_created, 1); // 3.txt
@@ -775,6 +793,7 @@ mod link_tests {
             &output_path,
             &None,
             &common_settings(false, true), // overwrite!
+            false,
         )
         .await?;
         assert_eq!(summary.hard_links_created, 4);

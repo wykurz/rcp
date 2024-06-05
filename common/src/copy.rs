@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
-use tokio::io::AsyncWriteExt;
 use tracing::{event, instrument, Level};
 
 use crate::filecmp;
@@ -33,70 +32,59 @@ pub async fn copy_file(
     dst: &std::path::Path,
     settings: &CopySettings,
     preserve: &preserve::PreserveSettings,
+    is_fresh: bool,
 ) -> Result<CopySummary> {
     event!(
         Level::DEBUG,
         "opening 'src' for reading and 'dst' for writing"
     );
-    let mut reader = tokio::fs::File::open(src)
+    let reader = tokio::fs::File::open(src)
         .await
         .with_context(|| format!("cannot open {:?} for reading", src))?;
     let mut rm_summary = rm::RmSummary::default();
-    let mut writer = {
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(dst)
-            .await
-        {
-            Ok(writer) => writer,
-            Err(error) => {
-                if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
-                    event!(Level::DEBUG, "file exists, check if it's identical");
-                    let md1 = reader.metadata().await?;
-                    let md2 = tokio::fs::symlink_metadata(dst)
-                        .await
-                        .with_context(|| format!("failed reading metadata from {:?}", &dst))?;
-                    if is_file_type_same(&md1, &md2)
-                        && filecmp::metadata_equal(&settings.overwrite_compare, &md1, &md2)
-                    {
-                        event!(Level::DEBUG, "file is identical, skipping");
-                        return Ok(CopySummary {
-                            files_unchanged: 1,
-                            ..Default::default()
-                        });
-                    }
-                    event!(Level::DEBUG, "file is different, removing existing file");
-                    rm_summary = rm::rm(
-                        prog_track,
-                        dst,
-                        &rm::Settings {
-                            fail_early: settings.fail_early,
-                        },
-                    )
-                    .await?;
-                    tokio::fs::File::create(dst)
-                        .await
-                        .with_context(|| format!("cannot create file {:?}", dst))?
-                } else {
-                    return Err(error).with_context(|| format!("cannot create file {:?}", dst));
-                }
+    if !is_fresh && dst.exists() {
+        if settings.overwrite {
+            event!(Level::DEBUG, "file exists, check if it's identical");
+            let md1 = reader.metadata().await?;
+            let md2 = tokio::fs::symlink_metadata(dst)
+                .await
+                .with_context(|| format!("failed reading metadata from {:?}", &dst))?;
+            if is_file_type_same(&md1, &md2)
+                && filecmp::metadata_equal(&settings.overwrite_compare, &md1, &md2)
+            {
+                event!(Level::DEBUG, "file is identical, skipping");
+                return Ok(CopySummary {
+                    files_unchanged: 1,
+                    ..Default::default()
+                });
             }
+            event!(Level::DEBUG, "file is different, removing existing file");
+            // note tokio::fs::overwrite cannot handle this path being e.g. a directory
+            rm_summary = rm::rm(
+                prog_track,
+                dst,
+                &rm::Settings {
+                    fail_early: settings.fail_early,
+                },
+            )
+            .await?;
+        } else {
+            return Err(anyhow::anyhow!(
+                "destination {:?} already exists, did you intend to specify --overwrite?",
+                dst
+            ));
         }
-    };
+    }
     event!(Level::DEBUG, "copying data");
-    let mut buf_reader = tokio::io::BufReader::with_capacity(settings.read_buffer, &mut reader);
-    tokio::io::copy_buf(&mut buf_reader, &mut writer)
+    tokio::fs::copy(src, dst)
         .await
-        .with_context(|| format!("failed copying data to {:?}", &dst))?;
+        .with_context(|| format!("failed copying {:?} to {:?}", &src, &dst))?;
     event!(Level::DEBUG, "setting permissions");
     let src_metadata = reader
         .metadata()
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))?;
-    if preserve.file.user_and_time.time {
-        writer.flush().await?; // flush all writes to avoid a race with the timestamp update
-    }
+    let writer = tokio::fs::File::open(dst).await?;
     preserve::set_file_metadata(preserve, &src_metadata, &writer, dst).await?;
     Ok(CopySummary {
         rm_summary,
@@ -150,6 +138,7 @@ pub async fn copy(
     dst: &std::path::Path,
     settings: &CopySettings,
     preserve: &preserve::PreserveSettings,
+    mut is_fresh: bool,
 ) -> Result<CopySummary> {
     let _guard = prog_track.guard();
     event!(Level::DEBUG, "reading source metadata");
@@ -174,10 +163,13 @@ pub async fn copy(
                 )
             })
             .unwrap();
-        return copy(prog_track, new_cwd, &abs_link, dst, settings, preserve).await;
+        return copy(
+            prog_track, new_cwd, &abs_link, dst, settings, preserve, is_fresh,
+        )
+        .await;
     }
     if src_metadata.is_file() {
-        return copy_file(prog_track, src, dst, settings, preserve).await;
+        return copy_file(prog_track, src, dst, settings, preserve, is_fresh).await;
     }
     if src_metadata.is_symlink() {
         let mut rm_summary = rm::RmSummary::default();
@@ -268,6 +260,7 @@ pub async fn copy(
         .with_context(|| format!("cannot open directory {:?} for reading", src))?;
     let mut copy_summary = {
         if let Err(error) = tokio::fs::create_dir(dst).await {
+            assert!(!is_fresh, "unexpected error creating directory: {:?}", &dst);
             if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
                 // check if the destination is a directory - if so, leave it
                 //
@@ -299,6 +292,8 @@ pub async fn copy(
                     tokio::fs::create_dir(dst)
                         .await
                         .with_context(|| format!("cannot create directory {:?}", dst))?;
+                    // anythingg copied into dst may assume they don't need to check for conflicts
+                    is_fresh = true;
                     CopySummary {
                         rm_summary,
                         directories_created: 1,
@@ -309,7 +304,8 @@ pub async fn copy(
                 return Err(error).with_context(|| format!("cannot create directory {:?}", dst));
             }
         } else {
-            // new directory created, no conflicts
+            // new directory created, anythingg copied into dst may assume they don't need to check for conflicts
+            is_fresh = true;
             CopySummary {
                 directories_created: 1,
                 ..Default::default()
@@ -337,6 +333,7 @@ pub async fn copy(
                 &dst_path,
                 &settings,
                 &preserve,
+                is_fresh,
             )
             .await
         };
@@ -405,6 +402,7 @@ mod copy_tests {
                 },
             },
             &NO_PRESERVE_SETTINGS,
+            false,
         )
         .await?;
         assert_eq!(summary.files_copied, 5);
@@ -447,6 +445,7 @@ mod copy_tests {
                 },
             },
             &NO_PRESERVE_SETTINGS,
+            false,
         )
         .await
         {
@@ -523,6 +522,7 @@ mod copy_tests {
                 },
             },
             &NO_PRESERVE_SETTINGS,
+            false,
         )
         .await?;
         assert_eq!(summary.files_copied, 5);
@@ -585,6 +585,7 @@ mod copy_tests {
                 },
             },
             &NO_PRESERVE_SETTINGS,
+            false,
         )
         .await?;
         assert_eq!(summary.files_copied, 5);
@@ -628,6 +629,7 @@ mod copy_tests {
                 },
             },
             &NO_PRESERVE_SETTINGS,
+            false,
         )
         .await?;
         assert_eq!(summary.files_copied, 7);
@@ -678,6 +680,7 @@ mod copy_tests {
             } else {
                 &NO_PRESERVE_SETTINGS
             },
+            false,
         )
         .await?;
         if rcp_settings.dereference {
@@ -809,6 +812,7 @@ mod copy_tests {
                 },
             },
             &DO_PRESERVE_SETTINGS,
+            false,
         )
         .await?;
         assert_eq!(summary.files_copied, 5);
@@ -866,6 +870,7 @@ mod copy_tests {
                 },
             },
             &DO_PRESERVE_SETTINGS,
+            false,
         )
         .await?;
         assert_eq!(summary.files_copied, 3);
@@ -935,6 +940,7 @@ mod copy_tests {
                 },
             },
             &DO_PRESERVE_SETTINGS,
+            false,
         )
         .await?;
         assert_eq!(summary.rm_summary.files_removed, 1);
@@ -1003,6 +1009,7 @@ mod copy_tests {
                 },
             },
             &DO_PRESERVE_SETTINGS,
+            false,
         )
         .await?;
         assert_eq!(summary.rm_summary.files_removed, 1);
@@ -1074,6 +1081,7 @@ mod copy_tests {
                 },
             },
             &DO_PRESERVE_SETTINGS,
+            false,
         )
         .await?;
         assert_eq!(summary.rm_summary.files_removed, 0);
@@ -1119,6 +1127,7 @@ mod copy_tests {
                 },
             },
             &DO_PRESERVE_SETTINGS,
+            false,
         )
         .await?;
         assert_eq!(summary.files_copied, 13); // 0.txt, 3x bar/(1.txt, 2.txt, 3.txt), baz/(4.txt, 5.txt, 6.txt)
