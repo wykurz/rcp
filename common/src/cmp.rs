@@ -294,6 +294,7 @@ mod cmp_tests {
             } else {
                 &NO_PRESERVE_SETTINGS
             },
+            false,
         )
         .await?;
         Ok(tmp_dir)

@@ -208,7 +208,7 @@ pub async fn copy(
     preserve: &preserve::PreserveSettings,
 ) -> Result<CopySummary> {
     let cwd = std::env::current_dir()?;
-    copy::copy(&PROGRESS, &cwd, src, dst, settings, preserve).await
+    copy::copy(&PROGRESS, &cwd, src, dst, settings, preserve, false).await
 }
 
 pub async fn rm(path: &std::path::Path, settings: &rm::Settings) -> Result<RmSummary> {
@@ -222,7 +222,7 @@ pub async fn link(
     settings: &link::LinkSettings,
 ) -> Result<LinkSummary> {
     let cwd = std::env::current_dir()?;
-    link::link(&PROGRESS, &cwd, src, dst, update, settings).await
+    link::link(&PROGRESS, &cwd, src, dst, update, settings, false).await
 }
 
 fn read_env_or_default<T: std::str::FromStr>(name: &str, default: T) -> T {
