@@ -74,10 +74,6 @@ struct Args {
     /// Number of blocking worker threads, 0 means Tokio runtime default (512)
     #[structopt(long, default_value = "0")]
     max_blocking_threads: usize,
-
-    /// File copy read buffer size
-    #[structopt(long, default_value = "128KiB")]
-    read_buffer: String,
 }
 
 #[instrument]
@@ -123,14 +119,8 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
             std::path::PathBuf::from(dst_string),
         )]
     };
-    let read_buffer = args
-        .read_buffer
-        .parse::<bytesize::ByteSize>()
-        .unwrap()
-        .as_u64() as usize;
     let mut join_set = tokio::task::JoinSet::new();
     let settings = common::CopySettings {
-        read_buffer,
         dereference: args.dereference,
         fail_early: args.fail_early,
         overwrite: args.overwrite,

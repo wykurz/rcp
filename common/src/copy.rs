@@ -9,7 +9,6 @@ use crate::rm;
 
 #[derive(Debug, Copy, Clone)]
 pub struct CopySettings {
-    pub read_buffer: usize,
     pub dereference: bool,
     pub fail_early: bool,
     pub overwrite: bool,
@@ -391,7 +390,6 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &CopySettings {
-                read_buffer: 10,
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -434,7 +432,6 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &CopySettings {
-                read_buffer: 5,
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -511,7 +508,6 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &CopySettings {
-                read_buffer: 7,
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -574,7 +570,6 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &CopySettings {
-                read_buffer: 8,
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -618,7 +613,6 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &CopySettings {
-                read_buffer: 10,
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -710,7 +704,6 @@ mod copy_tests {
         cp_compare(
             &["-r"],
             &CopySettings {
-                read_buffer: 100,
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -732,7 +725,6 @@ mod copy_tests {
         cp_compare(
             &["-r", "-p"],
             &CopySettings {
-                read_buffer: 100,
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -754,7 +746,6 @@ mod copy_tests {
         cp_compare(
             &["-r", "-L"],
             &CopySettings {
-                read_buffer: 100,
                 dereference: true,
                 fail_early: false,
                 overwrite: false,
@@ -776,7 +767,6 @@ mod copy_tests {
         cp_compare(
             &["-r", "-p", "-L"],
             &CopySettings {
-                read_buffer: 100,
                 dereference: true,
                 fail_early: false,
                 overwrite: false,
@@ -801,7 +791,6 @@ mod copy_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &CopySettings {
-                read_buffer: 10,
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -859,7 +848,6 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             &output_path,
             &CopySettings {
-                read_buffer: 10,
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -929,7 +917,6 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             &output_path,
             &CopySettings {
-                read_buffer: 10,
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -998,7 +985,6 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             &output_path,
             &CopySettings {
-                read_buffer: 10,
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -1070,7 +1056,6 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             &output_path,
             &CopySettings {
-                read_buffer: 10,
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -1116,7 +1101,6 @@ mod copy_tests {
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
             &CopySettings {
-                read_buffer: 10,
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
