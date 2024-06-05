@@ -10,11 +10,11 @@ assert_cmd = "2"
 
 [dependencies]
 anyhow = "1.0"
-async-recursion = "1.0"
+async-recursion = "1.1"
 bytesize = "1.3"
 rand = "0.8"
 structopt = "0.3"
-tokio = { version = "1.34", features = ["full", "parking_lot", "tracing"] }
+tokio = { version = "1.38", features = ["full", "parking_lot", "tracing"] }
 tracing-subscriber = "0.3"
 
 [package.metadata.deb]
