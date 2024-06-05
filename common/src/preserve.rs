@@ -94,7 +94,7 @@ async fn set_owner_and_time(
                 &dst,
                 uid,
                 gid,
-                nix::unistd::FchownatFlags::NoFollowSymlink,
+                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
             )
             .with_context(|| {
                 format!(
