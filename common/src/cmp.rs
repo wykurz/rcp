@@ -279,7 +279,6 @@ mod cmp_tests {
             &test_path.join("foo"),
             &test_path.join("bar"),
             &copy::CopySettings {
-                read_buffer: 10,
                 dereference: false,
                 fail_early: false,
                 overwrite: false,

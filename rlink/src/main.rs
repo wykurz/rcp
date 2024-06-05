@@ -60,10 +60,6 @@ struct Args {
     /// Number of blocking worker threads, 0 means Tokio runtime default (512)
     #[structopt(long, default_value = "0")]
     max_blocking_threads: usize,
-
-    /// File copy read buffer size
-    #[structopt(long, default_value = "128KiB")]
-    read_buffer: String,
 }
 
 async fn async_main(args: Args) -> Result<common::LinkSummary> {
@@ -91,18 +87,12 @@ async fn async_main(args: Args) -> Result<common::LinkSummary> {
     } else {
         std::path::PathBuf::from(args.dst)
     };
-    let read_buffer = args
-        .read_buffer
-        .parse::<bytesize::ByteSize>()
-        .unwrap()
-        .as_u64() as usize;
     common::link(
         &args.src,
         &dst,
         &args.update,
         &common::LinkSettings {
             copy_settings: common::CopySettings {
-                read_buffer,
                 dereference: false, // currently not supported
                 fail_early: args.fail_early,
                 overwrite: args.overwrite,

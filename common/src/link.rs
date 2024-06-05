@@ -425,7 +425,6 @@ mod link_tests {
     fn common_settings(dereference: bool, overwrite: bool) -> LinkSettings {
         LinkSettings {
             copy_settings: copy::CopySettings {
-                read_buffer: 10,
                 dereference,
                 fail_early: false,
                 overwrite,
