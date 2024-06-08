@@ -312,8 +312,8 @@ mod cmp_tests {
         // drop 1 file from src
         tokio::fs::remove_file(&tmp_dir.join("foo").join("bar").join("1.txt")).await?;
         // sleep to ensure mtime is different, this acts as a poor-mans barrier
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await; // sleep to ensure mtime is different
-                                                                          // modify 1 file in dst
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        // modify 1 file in dst
         truncate_file(
             &tmp_dir
                 .join("bar")
