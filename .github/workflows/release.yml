@@ -10,37 +10,69 @@ on:
         required: true
 
 jobs:
-  build:
+  build-deb-package:
     runs-on: ubuntu-latest
     permissions: write-all
-
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-
     - name: Set up Rust
       uses: actions-rs/toolchain@v1
       with:
         toolchain: stable
         profile: minimal
-
-    - name: Install cargo-deb
+    - name: Install builders
       run: cargo install cargo-deb
-
     - name: Build Debian package
       run: |
         cargo deb -p rcp
         cargo deb -p rlink
         cargo deb -p rrm
         cargo deb -p rcmp
-        zip rcp-debian-amd64-${{ github.event.release.tag_name }} target/debian/*.deb
-
+        cargo deb -p filegen
+        zip rcp-deb-amd64-${{ github.event.release.tag_name }}.zip target/debian/*.deb
+        echo $(pwd)/rcp-deb-amd64-${{ github.event.release.tag_name }}
+        ls -ld $(pwd)/rcp-deb-amd64-${{ github.event.release.tag_name }}*
     - name: Upload to GitHub Release
       uses: actions/upload-release-asset@v1
       env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./rcp-debian-amd64-${{ github.event.release.tag_name }}.zip
-        asset_name: rcp-debian-amd64-${{ github.event.release.tag_name }}.zip
+        asset_path: ./rcp-deb-amd64-${{ github.event.release.tag_name }}.zip
+        asset_name: rcp-deb-amd64-${{ github.event.release.tag_name }}.zip
+        asset_content_type: application/zip
+
+  build-rpm-package:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Set up Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        profile: minimal
+    - name: Install builders
+      run: cargo install cargo-generate-rpm
+    - name: Build RPM package
+      run: |
+        cargo build --release
+        cargo generate-rpm -p rcp
+        cargo generate-rpm -p rlink
+        cargo generate-rpm -p rrm
+        cargo generate-rpm -p rcmp
+        cargo generate-rpm -p filegen
+        zip rcp-rpm-amd64-${{ github.event.release.tag_name }}.zip target/generate-rpm/*.rpm
+        echo $(pwd)/rcp-rpm-amd64-${{ github.event.release.tag_name }}
+        ls -ld $(pwd)/rcp-rpm-amd64-${{ github.event.release.tag_name }}*
+    - name: Upload to GitHub Release
+      uses: actions/upload-release-asset@v1
+      env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ./rcp-rpm-amd64-${{ github.event.release.tag_name }}.zip
+        asset_name: rcp-rpm-amd64-${{ github.event.release.tag_name }}.zip
         asset_content_type: application/zip

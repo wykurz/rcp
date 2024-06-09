@@ -21,3 +21,6 @@ maintainer = "Mateusz Wykurz <wykurz@gmail.com>"
 copyright = "2023, Mateusz Wykurz <wykurz@gmail.com>"
 depends = "libc6 (>= 2.27)"
 section = "utility"
+
+[package.metadata.generate-rpm]
+assets = [ { source = "target/release/rrm", dest = "/usr/bin/rrm", mode = "755" } ]
