@@ -8,6 +8,9 @@ This repo contains tools to efficiently copy, remove and link large filesets.
 installation
 ============
 
+nixpkgs
+-------
+
 All tools are available via nixpkgs under `rcp` package name.
 
 The following command will install all the tools on your system:
@@ -15,6 +18,11 @@ The following command will install all the tools on your system:
 ```shell
 nix-env -iA nixpkgs.rcp
 ```
+
+debian / rhel
+-------------
+
+Starting with release `v0.10.1` .deb and .rpm packages are available as part of each release.
 
 tracing and tokio-console
 =========================
@@ -96,8 +104,6 @@ OPTIONS:
             Where <mode mask> is a 4 digit octal number
 
             Example: "f:uid,gid,time,0777 d:uid,gid,time,0777 l:uid,gid,time"
-        --read-buffer <read-buffer>
-            File copy read buffer size [default: 128KiB]
 
 
 ARGS:
@@ -160,7 +166,6 @@ OPTIONS:
         --overwrite-compare <overwrite-compare>
             Comma separated list of file attributes to compare when when deciding if files are "identical", used with
             --overwrite flag. Options are: uid, gid, size, mtime, ctime [default: size,mtime]
-        --read-buffer <read-buffer>                      File copy read buffer size [default: 128KiB]
         --update <update>                                Directory with updated contents of `link`
         --update-compare <update-compare>
             Same as overwrite-compare, but for deciding if we can hard-link or if we need to copy a file from the update
