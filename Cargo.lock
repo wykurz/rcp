@@ -279,6 +279,7 @@ dependencies = [
  "lazy_static",
  "nix",
  "sysinfo",
+ "thiserror",
  "thread_local",
  "tokio",
  "tracing",
@@ -454,6 +455,7 @@ dependencies = [
  "bytesize",
  "rand",
  "structopt",
+ "thiserror",
  "tokio",
  "tracing-subscriber",
 ]
@@ -1192,6 +1194,7 @@ dependencies = [
  "bytesize",
  "common",
  "structopt",
+ "thiserror",
  "tokio",
  "tracing",
 ]
@@ -1205,6 +1208,7 @@ dependencies = [
  "bytesize",
  "common",
  "structopt",
+ "thiserror",
  "tokio",
  "tracing",
 ]
@@ -1271,6 +1275,7 @@ dependencies = [
  "bytesize",
  "common",
  "structopt",
+ "thiserror",
  "tokio",
 ]
 
@@ -1283,6 +1288,7 @@ dependencies = [
  "async-recursion",
  "common",
  "structopt",
+ "thiserror",
  "tokio",
  "tracing",
 ]
@@ -1471,6 +1477,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d326610f408c7a4eb6f51c37c330e496b08506c9457c9d34287ecc38809fb060"
 dependencies = [
  "unicode-width",
+]
+
+[[package]]
+name = "thiserror"
+version = "1.0.55"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e3de26b0965292219b4287ff031fcba86837900fe9cd2b34ea8ad893c0953d2"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.55"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "268026685b2be38d7103e9e507c938a1fcb3d7e6eb15e87870b617bf37b6d581"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.39",
 ]
 
 [[package]]
