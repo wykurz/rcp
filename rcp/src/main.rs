@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use structopt::StructOpt;
 use tracing::{event, instrument, Level};
 
@@ -79,17 +79,17 @@ struct Args {
 #[instrument]
 async fn async_main(args: Args) -> Result<common::CopySummary> {
     if args.paths.len() < 2 {
-        return Err(anyhow::anyhow!(
+        return Err(anyhow!(
             "You must specify at least one source and destination path!"
         ));
     }
     let src_strings = &args.paths[0..args.paths.len() - 1];
     for src in src_strings {
         if src == "." || src.ends_with("/.") {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow!(
                 "expanding source directory ({:?}) using dot operator ('.') is not supported, please use absolute path or '*' instead",
-                std::path::PathBuf::from(src)
-            ));
+                std::path::PathBuf::from(src))
+            );
         }
     }
     let dst_string = args.paths.last().unwrap();
@@ -104,12 +104,12 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
                     .file_name()
                     .context(format!("source {:?} does not have a basename", &src_path))
                     .unwrap();
-                Ok((src_path.to_owned(), dst_dir.join(src_file)))
+                (src_path.to_owned(), dst_dir.join(src_file))
             })
-            .collect::<Result<Vec<(std::path::PathBuf, std::path::PathBuf)>>>()?
+            .collect::<Vec<(std::path::PathBuf, std::path::PathBuf)>>()
     } else {
         if src_strings.len() > 1 {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow!(
                 "Multiple sources can only be copied to a directory; if this is your intent follow the destination path with a trailing slash"
             ));
         }
@@ -124,7 +124,8 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
         dereference: args.dereference,
         fail_early: args.fail_early,
         overwrite: args.overwrite,
-        overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
+        overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)
+            .map_err(|err| common::CopyError::new(err, Default::default()))?,
     };
     event!(Level::DEBUG, "copy settings: {:?}", &settings);
     if args.preserve_settings.is_some() && args.preserve {
@@ -134,7 +135,8 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
         );
     }
     let preserve = if let Some(preserve_settings) = args.preserve_settings {
-        common::parse_preserve_settings(&preserve_settings)?
+        common::parse_preserve_settings(&preserve_settings)
+            .map_err(|err| common::CopyError::new(err, Default::default()))?
     } else if args.preserve {
         common::preserve_all()
     } else {
@@ -149,24 +151,41 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
     let mut success = true;
     let mut copy_summary = common::CopySummary::default();
     while let Some(res) = join_set.join_next().await {
-        match res? {
-            Ok(summary) => copy_summary = copy_summary + summary,
-            Err(error) => {
-                event!(Level::ERROR, "{}", &error);
-                if args.fail_early {
-                    return Err(error);
+        match res {
+            Ok(result) => match result {
+                Ok(summary) => copy_summary = copy_summary + summary,
+                Err(error) => {
+                    event!(Level::ERROR, "{}", &error);
+                    copy_summary = copy_summary + error.summary;
+                    if args.fail_early {
+                        if args.summary {
+                            return Err(anyhow!("{}\n\n{}", error, &copy_summary));
+                        }
+                        return Err(anyhow!("{}", error));
+                    }
+                    success = false;
                 }
-                success = false;
+            },
+            Err(error) => {
+                if settings.fail_early {
+                    if args.summary {
+                        return Err(anyhow!("{}\n\n{}", error, &copy_summary));
+                    }
+                    return Err(anyhow!("{}", error));
+                }
             }
         }
     }
     if !success {
-        return Err(anyhow::anyhow!("rcp encountered errors"));
+        if args.summary {
+            return Err(anyhow!("rcp encountered errors\n\n{}", &copy_summary));
+        }
+        return Err(anyhow!("rcp encountered errors"));
     }
     Ok(copy_summary)
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<(), anyhow::Error> {
     let args = Args::from_args();
     let func = {
         let args = args.clone();

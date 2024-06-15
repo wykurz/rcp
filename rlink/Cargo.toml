@@ -15,6 +15,7 @@ common = { path = "../common" }
 structopt = "0.3"
 thiserror = "1.0"
 tokio = { version = "1.38", features = ["full", "parking_lot", "tracing"] }
+tracing = "0.1"
 
 [package.metadata.deb]
 maintainer = "Mateusz Wykurz <wykurz@gmail.com>"

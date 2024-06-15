@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use structopt::StructOpt;
 use tracing::{event, instrument, Level};
 
@@ -60,15 +60,22 @@ async fn async_main(args: Args) -> Result<common::RmSummary> {
             Ok(summary) => rm_summary = rm_summary + summary,
             Err(error) => {
                 event!(Level::ERROR, "{}", &error);
+                rm_summary = rm_summary + error.summary;
                 if args.fail_early {
-                    return Err(error);
+                    if args.summary {
+                        return Err(anyhow!("{}\n\n{}", error, &rm_summary));
+                    }
+                    return Err(anyhow!("{}", error));
                 }
                 success = false;
             }
         }
     }
     if !success {
-        return Err(anyhow::anyhow!("rrm encountered errors"));
+        if args.summary {
+            return Err(anyhow!("rrm encountered errors\n\n{}", &rm_summary));
+        }
+        return Err(anyhow!("rrm encountered errors"));
     }
     Ok(rm_summary)
 }

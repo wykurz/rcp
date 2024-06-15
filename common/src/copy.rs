@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context};
 use async_recursion::async_recursion;
 use tracing::{event, instrument, Level};
 
@@ -6,6 +6,22 @@ use crate::filecmp;
 use crate::preserve;
 use crate::progress;
 use crate::rm;
+use crate::RmSettings;
+use crate::RmSummary;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+pub struct CopyError {
+    #[source]
+    pub source: anyhow::Error,
+    pub summary: CopySummary,
+}
+
+impl CopyError {
+    pub fn new(source: anyhow::Error, summary: CopySummary) -> Self {
+        CopyError { source, summary }
+    }
+}
 
 #[derive(Debug, Copy, Clone)]
 pub struct CopySettings {
@@ -32,22 +48,27 @@ pub async fn copy_file(
     settings: &CopySettings,
     preserve: &preserve::PreserveSettings,
     is_fresh: bool,
-) -> Result<CopySummary> {
+) -> Result<CopySummary, CopyError> {
     event!(
         Level::DEBUG,
         "opening 'src' for reading and 'dst' for writing"
     );
     let reader = tokio::fs::File::open(src)
         .await
-        .with_context(|| format!("cannot open {:?} for reading", src))?;
-    let mut rm_summary = rm::RmSummary::default();
+        .with_context(|| format!("cannot open {:?} for reading", src))
+        .map_err(|err| CopyError::new(err, Default::default()))?;
+    let mut rm_summary = RmSummary::default();
     if !is_fresh && dst.exists() {
         if settings.overwrite {
             event!(Level::DEBUG, "file exists, check if it's identical");
-            let md1 = reader.metadata().await?;
+            let md1 = reader
+                .metadata()
+                .await
+                .map_err(|err| CopyError::new(anyhow::Error::msg(err), Default::default()))?;
             let md2 = tokio::fs::symlink_metadata(dst)
                 .await
-                .with_context(|| format!("failed reading metadata from {:?}", &dst))?;
+                .with_context(|| format!("failed reading metadata from {:?}", &dst))
+                .map_err(|err| CopyError::new(anyhow::Error::msg(err), Default::default()))?;
             if is_file_type_same(&md1, &md2)
                 && filecmp::metadata_equal(&settings.overwrite_compare, &md1, &md2)
             {
@@ -62,39 +83,57 @@ pub async fn copy_file(
             rm_summary = rm::rm(
                 prog_track,
                 dst,
-                &rm::Settings {
+                &RmSettings {
                     fail_early: settings.fail_early,
                 },
             )
-            .await?;
+            .await
+            .map_err(|err| {
+                let rm_summary = err.summary;
+                let copy_summary = CopySummary {
+                    rm_summary,
+                    ..Default::default()
+                };
+                CopyError::new(anyhow::Error::msg(err), copy_summary)
+            })?;
         } else {
-            return Err(anyhow::anyhow!(
-                "destination {:?} already exists, did you intend to specify --overwrite?",
-                dst
+            return Err(CopyError::new(
+                anyhow!(
+                    "destination {:?} already exists, did you intend to specify --overwrite?",
+                    dst
+                ),
+                Default::default(),
             ));
         }
     }
     event!(Level::DEBUG, "copying data");
+    let mut copy_summary = CopySummary {
+        rm_summary,
+        ..Default::default()
+    };
     tokio::fs::copy(src, dst)
         .await
-        .with_context(|| format!("failed copying {:?} to {:?}", &src, &dst))?;
+        .with_context(|| format!("failed copying {:?} to {:?}", &src, &dst))
+        .map_err(|err| CopyError::new(err, copy_summary))?;
     event!(Level::DEBUG, "setting permissions");
     let src_metadata = reader
         .metadata()
         .await
-        .with_context(|| format!("failed reading metadata from {:?}", &src))?;
-    let writer = tokio::fs::File::open(dst).await?;
-    preserve::set_file_metadata(preserve, &src_metadata, &writer, dst).await?;
-    Ok(CopySummary {
-        rm_summary,
-        files_copied: 1,
-        ..Default::default()
-    })
+        .with_context(|| format!("failed reading metadata from {:?}", &src))
+        .map_err(|err| CopyError::new(err, copy_summary))?;
+    let writer = tokio::fs::File::open(dst)
+        .await
+        .map_err(|err| CopyError::new(anyhow::Error::msg(err), copy_summary))?;
+    preserve::set_file_metadata(preserve, &src_metadata, &writer, dst)
+        .await
+        .map_err(|err| CopyError::new(err, copy_summary))?;
+    copy_summary.files_copied += 1; // we mark files as "copied" only after all metadata is set as well
+    Ok(copy_summary)
 }
 
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct CopySummary {
-    pub rm_summary: rm::RmSummary,
+    pub rm_summary: RmSummary,
     pub files_copied: usize,
     pub symlinks_created: usize,
     pub directories_created: usize,
@@ -138,16 +177,18 @@ pub async fn copy(
     settings: &CopySettings,
     preserve: &preserve::PreserveSettings,
     mut is_fresh: bool,
-) -> Result<CopySummary> {
+) -> Result<CopySummary, CopyError> {
     let _guard = prog_track.guard();
     event!(Level::DEBUG, "reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
-        .with_context(|| format!("failed reading metadata from src: {:?}", &src))?;
+        .with_context(|| format!("failed reading metadata from src: {:?}", &src))
+        .map_err(|err| CopyError::new(err, Default::default()))?;
     if settings.dereference && src_metadata.is_symlink() {
         let link = tokio::fs::read_link(&src)
             .await
-            .with_context(|| format!("failed reading src symlink {:?}", &src))?;
+            .with_context(|| format!("failed reading src symlink {:?}", &src))
+            .map_err(|err| CopyError::new(err, Default::default()))?;
         let abs_link = if link.is_relative() {
             cwd.join(link)
         } else {
@@ -171,20 +212,23 @@ pub async fn copy(
         return copy_file(prog_track, src, dst, settings, preserve, is_fresh).await;
     }
     if src_metadata.is_symlink() {
-        let mut rm_summary = rm::RmSummary::default();
+        let mut rm_summary = RmSummary::default();
         let link = tokio::fs::read_link(src)
             .await
-            .with_context(|| format!("failed reading symlink {:?}", &src))?;
+            .with_context(|| format!("failed reading symlink {:?}", &src))
+            .map_err(|err| CopyError::new(err, Default::default()))?;
         // try creating a symlink, if dst path exists and overwrite is set - remove and try again
         if let Err(error) = tokio::fs::symlink(&link, dst).await {
             if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
                 let dst_metadata = tokio::fs::symlink_metadata(dst)
                     .await
-                    .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))?;
+                    .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))
+                    .map_err(|err| CopyError::new(err, Default::default()))?;
                 if is_file_type_same(&src_metadata, &dst_metadata) {
                     let dst_link = tokio::fs::read_link(dst)
                         .await
-                        .with_context(|| format!("failed reading dst symlink: {:?}", &dst))?;
+                        .with_context(|| format!("failed reading dst symlink: {:?}", &dst))
+                        .map_err(|err| CopyError::new(err, Default::default()))?;
                     if link == dst_link {
                         event!(
                             Level::DEBUG,
@@ -192,10 +236,12 @@ pub async fn copy(
                         );
                         if preserve.symlink.any() {
                             // do we need to update the metadata for this symlink?
-                            let dst_metadata =
-                                tokio::fs::symlink_metadata(dst).await.with_context(|| {
+                            let dst_metadata = tokio::fs::symlink_metadata(dst)
+                                .await
+                                .with_context(|| {
                                     format!("failed reading metadata from dst: {:?}", &dst)
-                                })?;
+                                })
+                                .map_err(|err| CopyError::new(err, Default::default()))?;
                             if !filecmp::metadata_equal(
                                 &settings.overwrite_compare,
                                 &src_metadata,
@@ -203,8 +249,13 @@ pub async fn copy(
                             ) {
                                 event!(Level::DEBUG, "'dst' metadata is different, updating");
                                 preserve::set_symlink_metadata(preserve, &src_metadata, dst)
-                                    .await?;
+                                    .await
+                                    .map_err(|err| CopyError::new(err, Default::default()))?;
                                 return Ok(CopySummary {
+                                    rm_summary: RmSummary {
+                                        symlinks_removed: 1,
+                                        ..Default::default()
+                                    },
                                     symlinks_created: 1,
                                     ..Default::default()
                                 });
@@ -226,19 +277,45 @@ pub async fn copy(
                 rm_summary = rm::rm(
                     prog_track,
                     dst,
-                    &rm::Settings {
+                    &RmSettings {
                         fail_early: settings.fail_early,
                     },
                 )
-                .await?;
+                .await
+                .map_err(|err| {
+                    let rm_summary = err.summary;
+                    let copy_summary = CopySummary {
+                        rm_summary,
+                        ..Default::default()
+                    };
+                    CopyError::new(err.source, copy_summary)
+                })?;
                 tokio::fs::symlink(&link, dst)
                     .await
-                    .with_context(|| format!("failed creating symlink {:?}", &dst))?;
+                    .with_context(|| format!("failed creating symlink {:?}", &dst))
+                    .map_err(|err| {
+                        let copy_summary = CopySummary {
+                            rm_summary,
+                            ..Default::default()
+                        };
+                        CopyError::new(err, copy_summary)
+                    })?;
             } else {
-                return Err(error).with_context(|| format!("failed creating symlink {:?}", &dst));
+                return Err(CopyError::new(
+                    anyhow!("failed creating symlink {:?}", &dst),
+                    Default::default(),
+                ));
             }
         }
-        preserve::set_symlink_metadata(preserve, &src_metadata, dst).await?;
+        preserve::set_symlink_metadata(preserve, &src_metadata, dst)
+            .await
+            .map_err(|err| {
+                let copy_summary = CopySummary {
+                    rm_summary,
+                    ..Default::default()
+                };
+                CopyError::new(err, copy_summary)
+            })?;
         return Ok(CopySummary {
             rm_summary,
             symlinks_created: 1,
@@ -246,17 +323,21 @@ pub async fn copy(
         });
     }
     if !src_metadata.is_dir() {
-        return Err(anyhow::anyhow!(
-            "copy: {:?} -> {:?} failed, unsupported src file type: {:?}",
-            src,
-            dst,
-            src_metadata.file_type()
+        return Err(CopyError::new(
+            anyhow!(
+                "copy: {:?} -> {:?} failed, unsupported src file type: {:?}",
+                src,
+                dst,
+                src_metadata.file_type()
+            ),
+            Default::default(),
         ));
     }
     event!(Level::DEBUG, "process contents of 'src' directory");
     let mut entries = tokio::fs::read_dir(src)
         .await
-        .with_context(|| format!("cannot open directory {:?} for reading", src))?;
+        .with_context(|| format!("cannot open directory {:?} for reading", src))
+        .map_err(|err| CopyError::new(err, Default::default()))?;
     let mut copy_summary = {
         if let Err(error) = tokio::fs::create_dir(dst).await {
             assert!(!is_fresh, "unexpected error creating directory: {:?}", &dst);
@@ -267,7 +348,8 @@ pub async fn copy(
                 // while we're writing to it which isn't safe
                 let dst_metadata = tokio::fs::metadata(dst)
                     .await
-                    .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))?;
+                    .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))
+                    .map_err(|err| CopyError::new(err, Default::default()))?;
                 if dst_metadata.is_dir() {
                     event!(Level::DEBUG, "'dst' is a directory, leaving it as is");
                     CopySummary {
@@ -282,15 +364,29 @@ pub async fn copy(
                     let rm_summary = rm::rm(
                         prog_track,
                         dst,
-                        &rm::Settings {
+                        &RmSettings {
                             fail_early: settings.fail_early,
                         },
                     )
                     .await
-                    .with_context(|| format!("cannot remove conflicting path {:?}", dst))?;
+                    .map_err(|err| {
+                        let rm_summary = err.summary;
+                        let copy_summary = CopySummary {
+                            rm_summary,
+                            ..Default::default()
+                        };
+                        CopyError::new(err.source, copy_summary)
+                    })?;
                     tokio::fs::create_dir(dst)
                         .await
-                        .with_context(|| format!("cannot create directory {:?}", dst))?;
+                        .with_context(|| format!("cannot create directory {:?}", dst))
+                        .map_err(|err| {
+                            let copy_summary = CopySummary {
+                                rm_summary,
+                                ..Default::default()
+                            };
+                            CopyError::new(anyhow::Error::msg(err), copy_summary)
+                        })?;
                     // anythingg copied into dst may assume they don't need to check for conflicts
                     is_fresh = true;
                     CopySummary {
@@ -300,7 +396,11 @@ pub async fn copy(
                     }
                 }
             } else {
-                return Err(error).with_context(|| format!("cannot create directory {:?}", dst));
+                event!(Level::ERROR, "{}", &error);
+                return Err(CopyError::new(
+                    anyhow!("cannot create directory {:?}", dst),
+                    Default::default(),
+                ));
             }
         } else {
             // new directory created, anythingg copied into dst may assume they don't need to check for conflicts
@@ -316,7 +416,8 @@ pub async fn copy(
     while let Some(entry) = entries
         .next_entry()
         .await
-        .with_context(|| format!("failed traversing src directory {:?}", &src))?
+        .with_context(|| format!("failed traversing src directory {:?}", &src))
+        .map_err(|err| CopyError::new(err, copy_summary))?
     {
         let cwd_path = src.to_owned();
         let entry_path = entry.path();
@@ -339,28 +440,41 @@ pub async fn copy(
         join_set.spawn(do_copy());
     }
     while let Some(res) = join_set.join_next().await {
-        match res? {
-            Ok(summary) => copy_summary = copy_summary + summary,
-            Err(error) => {
-                event!(
-                    Level::ERROR,
-                    "copy: {:?} -> {:?} failed with: {}",
-                    src,
-                    dst,
-                    &error
-                );
-                if settings.fail_early {
-                    return Err(error);
+        match res {
+            Ok(result) => match result {
+                Ok(summary) => copy_summary = copy_summary + summary,
+                Err(error) => {
+                    event!(
+                        Level::ERROR,
+                        "copy: {:?} -> {:?} failed with: {}",
+                        src,
+                        dst,
+                        &error
+                    );
+                    copy_summary = copy_summary + error.summary;
+                    if settings.fail_early {
+                        return Err(CopyError::new(error.source, copy_summary));
+                    }
+                    success = false;
                 }
-                success = false;
+            },
+            Err(error) => {
+                if settings.fail_early {
+                    return Err(CopyError::new(anyhow::Error::msg(error), copy_summary));
+                }
             }
         }
     }
     if !success {
-        return Err(anyhow::anyhow!("copy: {:?} -> {:?} failed!", src, dst));
+        return Err(CopyError::new(
+            anyhow!("copy: {:?} -> {:?} failed!", src, dst),
+            copy_summary,
+        ))?;
     }
     event!(Level::DEBUG, "set 'dst' directory metadata");
-    preserve::set_dir_metadata(preserve, &src_metadata, dst).await?;
+    preserve::set_dir_metadata(preserve, &src_metadata, dst)
+        .await
+        .map_err(|err| CopyError::new(err, copy_summary))?;
     Ok(copy_summary)
 }
 
@@ -381,7 +495,7 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn check_basic_copy() -> Result<()> {
+    async fn check_basic_copy() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         let summary = copy(
@@ -415,7 +529,9 @@ mod copy_tests {
         Ok(())
     }
 
-    async fn no_read_permission() -> Result<()> {
+    #[tokio::test]
+    #[traced_test]
+    async fn no_read_permission() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         let filepaths = vec![
@@ -449,6 +565,19 @@ mod copy_tests {
             Ok(_) => panic!("Expected the copy to error!"),
             Err(error) => {
                 event!(Level::INFO, "{}", &error);
+                // foo
+                // |- 0.txt  // <- no read permission
+                // |- bar
+                //    |- 1.txt
+                //    |- 2.txt
+                //    |- 3.txt
+                // |- baz   // <- no read permission
+                //    |- 4.txt
+                //    |- 5.txt -> ../bar/2.txt
+                //    |- 6.txt -> (absolute path) .../foo/bar/3.txt
+                assert_eq!(error.summary.files_copied, 3);
+                assert_eq!(error.summary.symlinks_created, 0);
+                assert_eq!(error.summary.directories_created, 2);
             }
         }
         // make source directory same as what we expect destination to be
@@ -471,25 +600,7 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn no_read_permission_1() -> Result<()> {
-        no_read_permission().await
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn no_read_permission_2() -> Result<()> {
-        no_read_permission().await
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn no_read_permission_10() -> Result<()> {
-        no_read_permission().await
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn check_default_mode() -> Result<()> {
+    async fn check_default_mode() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         // set file to executable
         tokio::fs::set_permissions(
@@ -546,12 +657,13 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn no_write_permission() -> Result<()> {
+    async fn no_write_permission() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         // directory - readable and non-executable
-        let non_exec_dir = &test_path.join("foo").join("bogey");
+        let non_exec_dir = test_path.join("foo").join("bogey");
         tokio::fs::create_dir(&non_exec_dir).await?;
+        tokio::fs::set_permissions(&non_exec_dir, std::fs::Permissions::from_mode(0o400)).await?;
         // directory - readable and executable
         tokio::fs::set_permissions(
             &test_path.join("foo").join("baz"),
@@ -597,7 +709,7 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn dereference() -> Result<()> {
+    async fn dereference() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         // make files pointed to by symlinks have different permissions than the symlink itself
@@ -651,7 +763,7 @@ mod copy_tests {
         cp_args: &[&str],
         rcp_settings: &CopySettings,
         preserve: bool,
-    ) -> Result<()> {
+    ) -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         // run a cp command to copy the files
@@ -700,7 +812,7 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_cp_compat() -> Result<()> {
+    async fn test_cp_compat() -> Result<(), anyhow::Error> {
         cp_compare(
             &["-r"],
             &CopySettings {
@@ -721,7 +833,7 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_cp_compat_preserve() -> Result<()> {
+    async fn test_cp_compat_preserve() -> Result<(), anyhow::Error> {
         cp_compare(
             &["-r", "-p"],
             &CopySettings {
@@ -742,7 +854,7 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_cp_compat_dereference() -> Result<()> {
+    async fn test_cp_compat_dereference() -> Result<(), anyhow::Error> {
         cp_compare(
             &["-r", "-L"],
             &CopySettings {
@@ -763,7 +875,7 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_cp_compat_preserve_and_dereference() -> Result<()> {
+    async fn test_cp_compat_preserve_and_dereference() -> Result<(), anyhow::Error> {
         cp_compare(
             &["-r", "-p", "-L"],
             &CopySettings {
@@ -782,7 +894,7 @@ mod copy_tests {
         Ok(())
     }
 
-    async fn setup_test_dir_and_copy() -> Result<std::path::PathBuf> {
+    async fn setup_test_dir_and_copy() -> Result<std::path::PathBuf, anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         let summary = copy(
@@ -812,7 +924,7 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_cp_overwrite_basic() -> Result<()> {
+    async fn test_cp_overwrite_basic() -> Result<(), anyhow::Error> {
         let tmp_dir = setup_test_dir_and_copy().await?;
         let output_path = &tmp_dir.join("bar");
         {
@@ -829,13 +941,13 @@ mod copy_tests {
             let summary = rm::rm(
                 &PROGRESS,
                 &output_path.join("bar"),
-                &rm::Settings { fail_early: false },
+                &RmSettings { fail_early: false },
             )
             .await?
                 + rm::rm(
                     &PROGRESS,
                     &output_path.join("baz").join("5.txt"),
-                    &rm::Settings { fail_early: false },
+                    &RmSettings { fail_early: false },
                 )
                 .await?;
             assert_eq!(summary.files_removed, 3);
@@ -875,7 +987,7 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_cp_overwrite_dir_file() -> Result<()> {
+    async fn test_cp_overwrite_dir_file() -> Result<(), anyhow::Error> {
         let tmp_dir = setup_test_dir_and_copy().await?;
         let output_path = &tmp_dir.join("bar");
         {
@@ -892,13 +1004,13 @@ mod copy_tests {
             let summary = rm::rm(
                 &PROGRESS,
                 &output_path.join("bar").join("1.txt"),
-                &rm::Settings { fail_early: false },
+                &RmSettings { fail_early: false },
             )
             .await?
                 + rm::rm(
                     &PROGRESS,
                     &output_path.join("baz"),
-                    &rm::Settings { fail_early: false },
+                    &RmSettings { fail_early: false },
                 )
                 .await?;
             assert_eq!(summary.files_removed, 2);
@@ -947,7 +1059,7 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_cp_overwrite_symlink_file() -> Result<()> {
+    async fn test_cp_overwrite_symlink_file() -> Result<(), anyhow::Error> {
         let tmp_dir = setup_test_dir_and_copy().await?;
         let output_path = &tmp_dir.join("bar");
         {
@@ -960,13 +1072,13 @@ mod copy_tests {
             let summary = rm::rm(
                 &PROGRESS,
                 &output_path.join("baz").join("4.txt"),
-                &rm::Settings { fail_early: false },
+                &RmSettings { fail_early: false },
             )
             .await?
                 + rm::rm(
                     &PROGRESS,
                     &output_path.join("baz").join("5.txt"),
-                    &rm::Settings { fail_early: false },
+                    &RmSettings { fail_early: false },
                 )
                 .await?;
             assert_eq!(summary.files_removed, 1);
@@ -1015,7 +1127,7 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_cp_overwrite_symlink_dir() -> Result<()> {
+    async fn test_cp_overwrite_symlink_dir() -> Result<(), anyhow::Error> {
         let tmp_dir = setup_test_dir_and_copy().await?;
         let output_path = &tmp_dir.join("bar");
         {
@@ -1031,13 +1143,13 @@ mod copy_tests {
             let summary = rm::rm(
                 &PROGRESS,
                 &output_path.join("bar"),
-                &rm::Settings { fail_early: false },
+                &RmSettings { fail_early: false },
             )
             .await?
                 + rm::rm(
                     &PROGRESS,
                     &output_path.join("baz").join("5.txt"),
-                    &rm::Settings { fail_early: false },
+                    &RmSettings { fail_early: false },
                 )
                 .await?;
             assert_eq!(summary.files_removed, 3);
@@ -1089,7 +1201,88 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_cp_dereference_dir() -> Result<()> {
+    async fn test_cp_overwrite_error() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let summary = copy(
+            &PROGRESS,
+            &test_path,
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            &CopySettings {
+                dereference: false,
+                fail_early: false,
+                overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
+            },
+            &NO_PRESERVE_SETTINGS, // we want timestamps to differ!
+            false,
+        )
+        .await?;
+        assert_eq!(summary.files_copied, 5);
+        assert_eq!(summary.symlinks_created, 2);
+        assert_eq!(summary.directories_created, 3);
+        let source_path = &test_path.join("foo");
+        let output_path = &tmp_dir.join("bar");
+        // unreadable
+        tokio::fs::set_permissions(
+            &source_path.join("bar"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .await?;
+        tokio::fs::set_permissions(
+            &source_path.join("baz").join("4.txt"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .await?;
+        // bar
+        // |- 0.txt
+        // |- bar  <---------------------------------------- NON READABLE
+        // |- baz
+        //    |- 4.txt  <----------------------------------- NON READABLE
+        //    |- 5.txt -> ../bar/2.txt
+        //    |- 6.txt -> (absolute path) .../foo/bar/3.txt
+        match copy(
+            &PROGRESS,
+            &tmp_dir,
+            &tmp_dir.join("foo"),
+            &output_path,
+            &CopySettings {
+                dereference: false,
+                fail_early: false,
+                overwrite: true, // <- important!
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
+            },
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await
+        {
+            Ok(_) => panic!("Expected the copy to error!"),
+            Err(error) => {
+                event!(Level::INFO, "{}", &error);
+                assert_eq!(error.summary.files_copied, 1);
+                assert_eq!(error.summary.symlinks_created, 2);
+                assert_eq!(error.summary.directories_created, 0);
+                assert_eq!(error.summary.rm_summary.files_removed, 1);
+                assert_eq!(error.summary.rm_summary.symlinks_removed, 2);
+                assert_eq!(error.summary.rm_summary.directories_removed, 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_cp_dereference_dir() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         // symlink bar to bar-link
         tokio::fs::symlink("bar", &tmp_dir.join("foo").join("bar-link")).await?;
