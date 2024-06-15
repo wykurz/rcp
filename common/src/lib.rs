@@ -1,8 +1,8 @@
 #[macro_use]
 extern crate lazy_static;
 
+use anyhow::anyhow;
 use anyhow::Context;
-use anyhow::{anyhow, Result};
 use cmp::ObjType;
 use std::future::Future;
 use tracing::{event, instrument, Level};
@@ -22,13 +22,16 @@ pub use cmp::CmpSettings;
 pub use cmp::CmpSummary;
 pub use cmp::LogWriter;
 pub use cmp::ObjCmpSettings;
+pub use copy::CopyError;
 pub use copy::CopySettings;
 pub use copy::CopySummary;
+pub use link::LinkError;
 pub use link::LinkSettings;
 pub use link::LinkSummary;
 pub use preserve::{preserve_all, preserve_default, PreserveSettings};
+pub use rm::RmError;
+pub use rm::RmSettings;
 pub use rm::RmSummary;
-pub use rm::Settings as RmSettings;
 
 lazy_static! {
     static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
@@ -89,7 +92,9 @@ impl Drop for ProgressTracker {
     }
 }
 
-pub fn parse_metadata_cmp_settings(settings: &str) -> Result<filecmp::MetadataCmpSettings> {
+pub fn parse_metadata_cmp_settings(
+    settings: &str,
+) -> Result<filecmp::MetadataCmpSettings, anyhow::Error> {
     let mut metadata_cmp_settings = filecmp::MetadataCmpSettings::default();
     for setting in settings.split(',') {
         match setting {
@@ -109,7 +114,7 @@ pub fn parse_metadata_cmp_settings(settings: &str) -> Result<filecmp::MetadataCm
 
 fn parse_type_settings(
     settings: &str,
-) -> Result<(preserve::UserAndTimeSettings, Option<preserve::ModeMask>)> {
+) -> Result<(preserve::UserAndTimeSettings, Option<preserve::ModeMask>), anyhow::Error> {
     let mut user_and_time = preserve::UserAndTimeSettings::default();
     let mut mode_mask = None;
     for setting in settings.split(',') {
@@ -129,7 +134,9 @@ fn parse_type_settings(
     Ok((user_and_time, mode_mask))
 }
 
-pub fn parse_preserve_settings(settings: &str) -> Result<preserve::PreserveSettings> {
+pub fn parse_preserve_settings(
+    settings: &str,
+) -> Result<preserve::PreserveSettings, anyhow::Error> {
     let mut preserve_settings = preserve::PreserveSettings::default();
     for type_settings in settings.split(' ') {
         if let Some((obj_type, obj_settings)) = type_settings.split_once(':') {
@@ -168,7 +175,7 @@ pub fn parse_preserve_settings(settings: &str) -> Result<preserve::PreserveSetti
     Ok(preserve_settings)
 }
 
-pub fn parse_compare_settings(settings: &str) -> Result<ObjCmpSettings> {
+pub fn parse_compare_settings(settings: &str) -> Result<ObjCmpSettings, anyhow::Error> {
     let mut cmp_settings = ObjCmpSettings::default();
     for type_settings in settings.split(' ') {
         if let Some((obj_type, obj_settings)) = type_settings.split_once(':') {
@@ -197,7 +204,7 @@ pub async fn cmp(
     dst: &std::path::Path,
     log: &cmp::LogWriter,
     settings: &cmp::CmpSettings,
-) -> Result<CmpSummary> {
+) -> Result<CmpSummary, anyhow::Error> {
     cmp::cmp(&PROGRESS, src, dst, log, settings).await
 }
 
@@ -206,12 +213,13 @@ pub async fn copy(
     dst: &std::path::Path,
     settings: &copy::CopySettings,
     preserve: &preserve::PreserveSettings,
-) -> Result<CopySummary> {
-    let cwd = std::env::current_dir()?;
+) -> Result<CopySummary, CopyError> {
+    let cwd = std::env::current_dir()
+        .map_err(|err| CopyError::new(anyhow::Error::msg(err), CopySummary::default()))?;
     copy::copy(&PROGRESS, &cwd, src, dst, settings, preserve, false).await
 }
 
-pub async fn rm(path: &std::path::Path, settings: &rm::Settings) -> Result<RmSummary> {
+pub async fn rm(path: &std::path::Path, settings: &rm::RmSettings) -> Result<RmSummary, RmError> {
     rm::rm(&PROGRESS, path, settings).await
 }
 
@@ -220,8 +228,9 @@ pub async fn link(
     dst: &std::path::Path,
     update: &Option<std::path::PathBuf>,
     settings: &link::LinkSettings,
-) -> Result<LinkSummary> {
-    let cwd = std::env::current_dir()?;
+) -> Result<LinkSummary, LinkError> {
+    let cwd = std::env::current_dir()
+        .map_err(|err| LinkError::new(anyhow::Error::msg(err), LinkSummary::default()))?;
     link::link(&PROGRESS, &cwd, src, dst, update, settings, false).await
 }
 
@@ -236,7 +245,7 @@ fn read_env_or_default<T: std::str::FromStr>(name: &str, default: T) -> T {
 }
 
 #[instrument(skip(func))] // "func" is not Debug printable
-pub fn run<Fut, Summary>(
+pub fn run<Fut, Summary, Error>(
     progress_op_name: Option<&str>,
     quiet: bool,
     verbose: u8,
@@ -244,10 +253,11 @@ pub fn run<Fut, Summary>(
     max_workers: usize,
     max_blocking_threads: usize,
     func: impl FnOnce() -> Fut,
-) -> Result<Summary>
+) -> Result<Summary, anyhow::Error>
 where
     Summary: std::fmt::Display,
-    Fut: Future<Output = Result<Summary>>,
+    Error: std::fmt::Display + std::fmt::Debug,
+    Fut: Future<Output = Result<Summary, Error>>,
 {
     let _progress = progress_op_name.map(ProgressTracker::new);
     if !quiet {
@@ -309,7 +319,7 @@ where
     let res = runtime.block_on(func());
     if let Err(error) = res {
         if !quiet {
-            eprintln!("{:#}", error);
+            eprintln!("{:#}", error); // TODO: extract summary and print it regardless of quiet
         }
         std::process::exit(1);
     }

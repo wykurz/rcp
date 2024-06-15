@@ -1,5 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use structopt::StructOpt;
+use tracing::{event, Level};
 
 #[derive(StructOpt, Debug, Clone)]
 #[structopt(
@@ -70,7 +71,7 @@ async fn async_main(args: Args) -> Result<common::LinkSummary> {
                 .expect("input path cannot be converted to string?!")
                 .ends_with("/.")
         {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow!(
                 "expanding source directory ({:?}) using dot operator ('.') is not supported, please use absolute path or '*' instead",
                 std::path::PathBuf::from(src)
             ));
@@ -87,7 +88,7 @@ async fn async_main(args: Args) -> Result<common::LinkSummary> {
     } else {
         std::path::PathBuf::from(args.dst)
     };
-    common::link(
+    let result = common::link(
         &args.src,
         &dst,
         &args.update,
@@ -101,7 +102,17 @@ async fn async_main(args: Args) -> Result<common::LinkSummary> {
             update_compare: common::parse_metadata_cmp_settings(&args.update_compare)?,
         },
     )
-    .await
+    .await;
+    match result {
+        Ok(summary) => Ok(summary),
+        Err(error) => {
+            event!(Level::ERROR, "{}", &error);
+            if args.summary {
+                return Err(anyhow!("rlink encountered errors\n\n{}", &error.summary));
+            }
+            Err(anyhow!("rlink encountered errors"))
+        }
+    }
 }
 
 fn main() -> Result<()> {

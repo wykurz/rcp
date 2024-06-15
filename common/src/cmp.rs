@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_recursion::async_recursion;
 use enum_map::{Enum, EnumMap};
 use tokio::io::AsyncWriteExt;
@@ -249,7 +249,7 @@ pub async fn cmp(
         }
     }
     if !success {
-        return Err(anyhow::anyhow!("cmp: {:?} vs {:?} failed!", src, dst));
+        return Err(anyhow!("cmp: {:?} vs {:?} failed!", src, dst));
     }
     Ok(cmp_summary)
 }

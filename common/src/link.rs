@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context};
 use async_recursion::async_recursion;
 use std::os::linux::fs::MetadataExt as LinuxMetadataExt;
 use tracing::{event, instrument, Level};
@@ -9,9 +9,24 @@ use crate::preserve;
 use crate::progress;
 use crate::rm;
 use crate::CopySettings;
+use crate::CopySummary;
 
 lazy_static! {
     static ref RLINK_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_all();
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+pub struct LinkError {
+    #[source]
+    pub source: anyhow::Error,
+    pub summary: LinkSummary,
+}
+
+impl LinkError {
+    pub fn new(source: anyhow::Error, summary: LinkSummary) -> Self {
+        LinkError { source, summary }
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -20,11 +35,11 @@ pub struct LinkSettings {
     pub update_compare: filecmp::MetadataCmpSettings,
 }
 
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct LinkSummary {
     pub hard_links_created: usize,
     pub hard_links_unchanged: usize,
-    pub copy_summary: copy::CopySummary,
+    pub copy_summary: CopySummary,
 }
 
 impl std::ops::Add for LinkSummary {
@@ -61,14 +76,18 @@ async fn hard_link_helper(
     src_metadata: &std::fs::Metadata,
     dst: &std::path::Path,
     settings: &LinkSettings,
-) -> Result<LinkSummary> {
+) -> Result<LinkSummary, LinkError> {
+    let mut link_summary = LinkSummary::default();
     if let Err(error) = tokio::fs::hard_link(src, dst).await {
         if settings.copy_settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
             event!(
                 Level::DEBUG,
                 "'dst' already exists, check if we need to update"
             );
-            let dst_metadata = tokio::fs::symlink_metadata(dst).await?;
+            let dst_metadata = tokio::fs::symlink_metadata(dst)
+                .await
+                .with_context(|| format!("cannot read {:?} metadata", dst))
+                .map_err(|err| LinkError::new(err, Default::default()))?;
             if is_hard_link(src_metadata, &dst_metadata) {
                 event!(Level::DEBUG, "no change, leaving file as is");
                 return Ok(LinkSummary {
@@ -80,21 +99,27 @@ async fn hard_link_helper(
                 Level::DEBUG,
                 "'dst' file type changed, removing and hard-linking"
             );
-            rm::rm(
+            let rm_summary = rm::rm(
                 prog_track,
                 dst,
-                &rm::Settings {
+                &rm::RmSettings {
                     fail_early: settings.copy_settings.fail_early,
                 },
             )
-            .await?;
-            tokio::fs::hard_link(src, dst).await?;
+            .await
+            .map_err(|err| {
+                let rm_summary = err.summary;
+                link_summary.copy_summary.rm_summary = rm_summary;
+                LinkError::new(anyhow::Error::msg(err), link_summary)
+            })?;
+            link_summary.copy_summary.rm_summary = rm_summary;
+            tokio::fs::hard_link(src, dst)
+                .await
+                .map_err(|err| LinkError::new(anyhow::Error::msg(err), link_summary))?;
         }
     }
-    Ok(LinkSummary {
-        hard_links_created: 1,
-        ..Default::default()
-    })
+    link_summary.hard_links_created = 1;
+    Ok(link_summary)
 }
 
 #[instrument(skip(prog_track))]
@@ -107,12 +132,13 @@ pub async fn link(
     update: &Option<std::path::PathBuf>,
     settings: &LinkSettings,
     mut is_fresh: bool,
-) -> Result<LinkSummary> {
+) -> Result<LinkSummary, LinkError> {
     let _guard = prog_track.guard();
     event!(Level::DEBUG, "reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
-        .with_context(|| format!("failed reading metadata from {:?}", &src))?;
+        .with_context(|| format!("failed reading metadata from {:?}", &src))
+        .map_err(|err| LinkError::new(err, Default::default()))?;
     let update_metadata_opt = match update {
         Some(update) => {
             event!(Level::DEBUG, "reading 'update' metadata");
@@ -123,9 +149,10 @@ pub async fn link(
                     if error.kind() == std::io::ErrorKind::NotFound {
                         None
                     } else {
-                        return Err(error).with_context(|| {
-                            format!("failed reading metadata from {:?}", &update)
-                        });
+                        return Err(LinkError::new(
+                            anyhow!("failed reading metadata from {:?}", &update),
+                            Default::default(),
+                        ));
                     }
                 }
             }
@@ -153,7 +180,15 @@ pub async fn link(
                 &RLINK_PRESERVE_SETTINGS,
                 is_fresh,
             )
-            .await?;
+            .await
+            .map_err(|err| {
+                let copy_summary = err.summary;
+                let link_summary = LinkSummary {
+                    copy_summary,
+                    ..Default::default()
+                };
+                LinkError::new(err.source, link_summary)
+            })?;
             return Ok(LinkSummary {
                 copy_summary,
                 ..Default::default()
@@ -180,7 +215,15 @@ pub async fn link(
                         &RLINK_PRESERVE_SETTINGS,
                         is_fresh,
                     )
-                    .await?,
+                    .await
+                    .map_err(|err| {
+                        let copy_summary = err.summary;
+                        let link_summary = LinkSummary {
+                            copy_summary,
+                            ..Default::default()
+                        };
+                        LinkError::new(err.source, link_summary)
+                    })?,
                     ..Default::default()
                 });
             }
@@ -197,7 +240,15 @@ pub async fn link(
                 &RLINK_PRESERVE_SETTINGS,
                 is_fresh,
             )
-            .await?;
+            .await
+            .map_err(|err| {
+                let copy_summary = err.summary;
+                let link_summary = LinkSummary {
+                    copy_summary,
+                    ..Default::default()
+                };
+                LinkError::new(err.source, link_summary)
+            })?;
             return Ok(LinkSummary {
                 copy_summary,
                 ..Default::default()
@@ -221,7 +272,15 @@ pub async fn link(
                 &RLINK_PRESERVE_SETTINGS,
                 is_fresh,
             )
-            .await?;
+            .await
+            .map_err(|err| {
+                let copy_summary = err.summary;
+                let link_summary = LinkSummary {
+                    copy_summary,
+                    ..Default::default()
+                };
+                LinkError::new(err.source, link_summary)
+            })?;
             return Ok(LinkSummary {
                 copy_summary,
                 ..Default::default()
@@ -229,18 +288,22 @@ pub async fn link(
         }
     }
     if !src_metadata.is_dir() {
-        return Err(anyhow::anyhow!(
-            "copy: {:?} -> {:?} failed, unsupported src file type: {:?}",
-            src,
-            dst,
-            src_metadata.file_type()
+        return Err(LinkError::new(
+            anyhow!(
+                "copy: {:?} -> {:?} failed, unsupported src file type: {:?}",
+                src,
+                dst,
+                src_metadata.file_type()
+            ),
+            Default::default(),
         ));
     }
     assert!(update_metadata_opt.is_none() || update_metadata_opt.as_ref().unwrap().is_dir());
     event!(Level::DEBUG, "process contents of 'src' directory");
     let mut src_entries = tokio::fs::read_dir(src)
         .await
-        .with_context(|| format!("cannot open directory {:?} for reading", src))?;
+        .with_context(|| format!("cannot open directory {:?} for reading", src))
+        .map_err(|err| LinkError::new(err, Default::default()))?;
     let copy_summary = {
         if let Err(error) = tokio::fs::create_dir(dst).await {
             assert!(!is_fresh, "unexpected error creating directory: {:?}", &dst);
@@ -252,10 +315,11 @@ pub async fn link(
                 // while we're writing to it which isn't safe
                 let dst_metadata = tokio::fs::metadata(dst)
                     .await
-                    .with_context(|| format!("failed reading metadata from {:?}", &dst))?;
+                    .with_context(|| format!("failed reading metadata from {:?}", &dst))
+                    .map_err(|err| LinkError::new(err, Default::default()))?;
                 if dst_metadata.is_dir() {
                     event!(Level::DEBUG, "'dst' is a directory, leaving it as is");
-                    copy::CopySummary {
+                    CopySummary {
                         directories_unchanged: 1,
                         ..Default::default()
                     }
@@ -264,37 +328,64 @@ pub async fn link(
                         Level::DEBUG,
                         "'dst' is not a directory, removing and creating a new one"
                     );
+                    let mut copy_summary = CopySummary::default();
                     let rm_summary = rm::rm(
                         prog_track,
                         dst,
-                        &rm::Settings {
+                        &rm::RmSettings {
                             fail_early: settings.copy_settings.fail_early,
                         },
                     )
                     .await
-                    .with_context(|| format!("cannot remove conflicting path {:?}", dst))?;
+                    .map_err(|err| {
+                        let rm_summary = err.summary;
+                        copy_summary.rm_summary = rm_summary;
+                        LinkError::new(
+                            anyhow::Error::msg(err),
+                            LinkSummary {
+                                copy_summary,
+                                ..Default::default()
+                            },
+                        )
+                    })?;
                     tokio::fs::create_dir(dst)
                         .await
-                        .with_context(|| format!("cannot create directory {:?}", dst))?;
+                        .with_context(|| format!("cannot create directory {:?}", dst))
+                        .map_err(|err| {
+                            copy_summary.rm_summary = rm_summary;
+                            LinkError::new(
+                                anyhow::Error::msg(err),
+                                LinkSummary {
+                                    copy_summary,
+                                    ..Default::default()
+                                },
+                            )
+                        })?;
                     // anythingg copied into dst may assume they don't need to check for conflicts
                     is_fresh = true;
-                    copy::CopySummary {
+                    CopySummary {
                         rm_summary,
                         directories_created: 1,
                         ..Default::default()
                     }
                 }
             } else {
-                return Err(error).with_context(|| format!("cannot create directory {:?}", dst));
+                return Err(error)
+                    .with_context(|| format!("cannot create directory {:?}", dst))
+                    .map_err(|err| LinkError::new(err, Default::default()))?;
             }
         } else {
             // new directory created, anythingg copied into dst may assume they don't need to check for conflicts
             is_fresh = true;
-            copy::CopySummary {
+            CopySummary {
                 directories_created: 1,
                 ..Default::default()
             }
         }
+    };
+    let mut link_summary = LinkSummary {
+        copy_summary,
+        ..Default::default()
     };
     let mut join_set = tokio::task::JoinSet::new();
     let mut success = true;
@@ -304,7 +395,8 @@ pub async fn link(
     while let Some(src_entry) = src_entries
         .next_entry()
         .await
-        .with_context(|| format!("failed traversing directory {:?}", &src))?
+        .with_context(|| format!("failed traversing directory {:?}", &src))
+        .map_err(|err| LinkError::new(err, link_summary))?
     {
         let cwd_path = cwd.to_owned();
         let entry_path = src_entry.path();
@@ -333,12 +425,14 @@ pub async fn link(
         event!(Level::DEBUG, "process contents of 'update' directory");
         let mut update_entries = tokio::fs::read_dir(update)
             .await
-            .with_context(|| format!("cannot open directory {:?} for reading", &update))?;
+            .with_context(|| format!("cannot open directory {:?} for reading", &update))
+            .map_err(|err| LinkError::new(err, link_summary))?;
         // iterate through update entries and for each one that's not present in src call "copy"
         while let Some(update_entry) = update_entries
             .next_entry()
             .await
-            .with_context(|| format!("failed traversing directory {:?}", &update))?
+            .with_context(|| format!("failed traversing directory {:?}", &update))
+            .map_err(|err| LinkError::new(err, link_summary))?
         {
             let cwd_path = cwd.to_owned();
             let entry_path = update_entry.path();
@@ -361,7 +455,11 @@ pub async fn link(
                     &RLINK_PRESERVE_SETTINGS,
                     is_fresh,
                 )
-                .await?;
+                .await
+                .map_err(|err| {
+                    link_summary.copy_summary = link_summary.copy_summary + err.summary;
+                    LinkError::new(err.source, link_summary)
+                })?;
                 Ok(LinkSummary {
                     copy_summary,
                     ..Default::default()
@@ -370,36 +468,37 @@ pub async fn link(
             join_set.spawn(do_copy());
         }
     }
-    let mut link_summary = LinkSummary {
-        copy_summary,
-        ..Default::default()
-    };
     while let Some(res) = join_set.join_next().await {
-        match res? {
-            Ok(summary) => link_summary = link_summary + summary,
-            Err(error) => {
-                event!(
-                    Level::ERROR,
-                    "link: {:?} {:?} -> {:?} failed with: {}",
-                    src,
-                    update,
-                    dst,
-                    &error
-                );
-                if settings.copy_settings.fail_early {
-                    return Err(error);
+        match res {
+            Ok(result) => match result {
+                Ok(summary) => link_summary = link_summary + summary,
+                Err(error) => {
+                    event!(
+                        Level::ERROR,
+                        "link: {:?} {:?} -> {:?} failed with: {}",
+                        src,
+                        update,
+                        dst,
+                        &error
+                    );
+                    if settings.copy_settings.fail_early {
+                        return Err(error);
+                    }
+                    success = false;
                 }
-                success = false;
+            },
+            Err(error) => {
+                if settings.copy_settings.fail_early {
+                    return Err(LinkError::new(anyhow::Error::msg(error), link_summary));
+                }
             }
         }
     }
     if !success {
-        return Err(anyhow::anyhow!(
-            "link: {:?} {:?} -> {:?} failed!",
-            src,
-            update,
-            dst
-        ));
+        return Err(LinkError::new(
+            anyhow!("link: {:?} {:?} -> {:?} failed!", src, update, dst),
+            link_summary,
+        ))?;
     }
     event!(Level::DEBUG, "set 'dst' directory metadata");
     let preserve_metadata = if let Some(update_metadata) = update_metadata_opt.as_ref() {
@@ -407,13 +506,16 @@ pub async fn link(
     } else {
         &src_metadata
     };
-    preserve::set_dir_metadata(&RLINK_PRESERVE_SETTINGS, preserve_metadata, dst).await?;
+    preserve::set_dir_metadata(&RLINK_PRESERVE_SETTINGS, preserve_metadata, dst)
+        .await
+        .map_err(|err| LinkError::new(err, link_summary))?;
     Ok(link_summary)
 }
 
 #[cfg(test)]
 mod link_tests {
     use crate::testutils;
+    use std::os::unix::fs::PermissionsExt;
     use tracing_test::traced_test;
 
     use super::*;
@@ -424,7 +526,7 @@ mod link_tests {
 
     fn common_settings(dereference: bool, overwrite: bool) -> LinkSettings {
         LinkSettings {
-            copy_settings: copy::CopySettings {
+            copy_settings: CopySettings {
                 dereference,
                 fail_early: false,
                 overwrite,
@@ -444,7 +546,7 @@ mod link_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_basic_link() -> Result<()> {
+    async fn test_basic_link() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         let summary = link(
@@ -472,7 +574,7 @@ mod link_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_basic_link_update() -> Result<()> {
+    async fn test_basic_link_update() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         let summary = link(
@@ -500,7 +602,7 @@ mod link_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_basic_link_empty_src() -> Result<()> {
+    async fn test_basic_link_empty_src() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         tokio::fs::create_dir(tmp_dir.join("baz")).await?;
         let test_path = tmp_dir.as_path();
@@ -527,7 +629,7 @@ mod link_tests {
         Ok(())
     }
 
-    pub async fn setup_update_dir(tmp_dir: &std::path::PathBuf) -> Result<()> {
+    pub async fn setup_update_dir(tmp_dir: &std::path::PathBuf) -> Result<(), anyhow::Error> {
         // update
         // |- 0.txt
         // |- bar
@@ -552,7 +654,7 @@ mod link_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_link_update() -> Result<()> {
+    async fn test_link_update() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         setup_update_dir(&tmp_dir).await?;
         let test_path = tmp_dir.as_path();
@@ -587,7 +689,7 @@ mod link_tests {
         Ok(())
     }
 
-    async fn setup_test_dir_and_link() -> Result<std::path::PathBuf> {
+    async fn setup_test_dir_and_link() -> Result<std::path::PathBuf, anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         let summary = link(
@@ -608,7 +710,7 @@ mod link_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_link_overwrite_basic() -> Result<()> {
+    async fn test_link_overwrite_basic() -> Result<(), anyhow::Error> {
         let tmp_dir = setup_test_dir_and_link().await?;
         let output_path = &tmp_dir.join("bar");
         {
@@ -625,13 +727,13 @@ mod link_tests {
             let summary = rm::rm(
                 &PROGRESS,
                 &output_path.join("bar"),
-                &rm::Settings { fail_early: false },
+                &rm::RmSettings { fail_early: false },
             )
             .await?
                 + rm::rm(
                     &PROGRESS,
                     &output_path.join("baz").join("5.txt"),
-                    &rm::Settings { fail_early: false },
+                    &rm::RmSettings { fail_early: false },
                 )
                 .await?;
             assert_eq!(summary.files_removed, 3);
@@ -662,7 +764,7 @@ mod link_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_link_update_overwrite_basic() -> Result<()> {
+    async fn test_link_update_overwrite_basic() -> Result<(), anyhow::Error> {
         let tmp_dir = setup_test_dir_and_link().await?;
         let output_path = &tmp_dir.join("bar");
         {
@@ -679,13 +781,13 @@ mod link_tests {
             let summary = rm::rm(
                 &PROGRESS,
                 &output_path.join("bar"),
-                &rm::Settings { fail_early: false },
+                &rm::RmSettings { fail_early: false },
             )
             .await?
                 + rm::rm(
                     &PROGRESS,
                     &output_path.join("baz").join("5.txt"),
-                    &rm::Settings { fail_early: false },
+                    &rm::RmSettings { fail_early: false },
                 )
                 .await?;
             assert_eq!(summary.files_removed, 3);
@@ -731,7 +833,7 @@ mod link_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_link_overwrite_hardlink_file() -> Result<()> {
+    async fn test_link_overwrite_hardlink_file() -> Result<(), anyhow::Error> {
         let tmp_dir = setup_test_dir_and_link().await?;
         let output_path = &tmp_dir.join("bar");
         {
@@ -747,25 +849,25 @@ mod link_tests {
             let summary = rm::rm(
                 &PROGRESS,
                 &bar_path.join("1.txt"),
-                &rm::Settings { fail_early: false },
+                &rm::RmSettings { fail_early: false },
             )
             .await?
                 + rm::rm(
                     &PROGRESS,
                     &bar_path.join("2.txt"),
-                    &rm::Settings { fail_early: false },
+                    &rm::RmSettings { fail_early: false },
                 )
                 .await?
                 + rm::rm(
                     &PROGRESS,
                     &bar_path.join("3.txt"),
-                    &rm::Settings { fail_early: false },
+                    &rm::RmSettings { fail_early: false },
                 )
                 .await?
                 + rm::rm(
                     &PROGRESS,
                     &output_path.join("baz"),
-                    &rm::Settings { fail_early: false },
+                    &rm::RmSettings { fail_early: false },
                 )
                 .await?;
             assert_eq!(summary.files_removed, 4);
@@ -805,6 +907,98 @@ mod link_tests {
             testutils::FileEqualityCheck::HardLink,
         )
         .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_link_overwrite_error() -> Result<(), anyhow::Error> {
+        let tmp_dir = setup_test_dir_and_link().await?;
+        let output_path = &tmp_dir.join("bar");
+        {
+            // bar
+            // |- 0.txt
+            // |- bar
+            //    |- 1.txt  <----------------------------------- REPLACE W/ FILE
+            //    |- 2.txt  <----------------------------------- REPLACE W/ SYMLINK
+            //    |- 3.txt  <----------------------------------- REPLACE W/ DIRECTORY
+            // |- baz    <-------------------------------------- REPLACE W/ FILE
+            //    |- ...
+            let bar_path = output_path.join("bar");
+            let summary = rm::rm(
+                &PROGRESS,
+                &bar_path.join("1.txt"),
+                &rm::RmSettings { fail_early: false },
+            )
+            .await?
+                + rm::rm(
+                    &PROGRESS,
+                    &bar_path.join("2.txt"),
+                    &rm::RmSettings { fail_early: false },
+                )
+                .await?
+                + rm::rm(
+                    &PROGRESS,
+                    &bar_path.join("3.txt"),
+                    &rm::RmSettings { fail_early: false },
+                )
+                .await?
+                + rm::rm(
+                    &PROGRESS,
+                    &output_path.join("baz"),
+                    &rm::RmSettings { fail_early: false },
+                )
+                .await?;
+            assert_eq!(summary.files_removed, 4);
+            assert_eq!(summary.symlinks_removed, 2);
+            assert_eq!(summary.directories_removed, 1);
+            // REPLACE with a file, a symlink, a directory and a file
+            tokio::fs::write(bar_path.join("1.txt"), "1-new")
+                .await
+                .unwrap();
+            tokio::fs::symlink("../0.txt", bar_path.join("2.txt"))
+                .await
+                .unwrap();
+            tokio::fs::create_dir(&bar_path.join("3.txt"))
+                .await
+                .unwrap();
+            tokio::fs::write(&output_path.join("baz"), "baz")
+                .await
+                .unwrap();
+        }
+        let source_path = &tmp_dir.join("foo");
+        // unreadable
+        tokio::fs::set_permissions(
+            &source_path.join("baz"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .await?;
+        // bar
+        // |- ...
+        // |- baz <- NON READABLE
+        match link(
+            &PROGRESS,
+            &tmp_dir,
+            &tmp_dir.join("foo"),
+            &output_path,
+            &None,
+            &common_settings(false, true), // overwrite!
+            false,
+        )
+        .await
+        {
+            Ok(_) => panic!("Expected the link to error!"),
+            Err(error) => {
+                event!(Level::INFO, "{}", &error);
+                assert_eq!(error.summary.hard_links_created, 3);
+                assert_eq!(error.summary.copy_summary.files_copied, 0);
+                assert_eq!(error.summary.copy_summary.symlinks_created, 0);
+                assert_eq!(error.summary.copy_summary.directories_created, 0);
+                assert_eq!(error.summary.copy_summary.rm_summary.files_removed, 1);
+                assert_eq!(error.summary.copy_summary.rm_summary.directories_removed, 1);
+                assert_eq!(error.summary.copy_summary.rm_summary.symlinks_removed, 1);
+            }
+        }
         Ok(())
     }
 }
