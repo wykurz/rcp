@@ -260,7 +260,6 @@ where
     Error: std::fmt::Display + std::fmt::Debug,
     Fut: Future<Output = Result<Summary, Error>>,
 {
-    let _progress = progress_op_name.map(ProgressTracker::new);
     if !quiet {
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_target(true)
@@ -317,7 +316,10 @@ where
         );
     }
     let runtime = builder.build()?;
-    let res = runtime.block_on(func());
+    let res = {
+        let _progress = progress_op_name.map(ProgressTracker::new);
+        runtime.block_on(func())
+    };
     if let Err(error) = res {
         if !quiet {
             eprintln!("{:#}", error);
