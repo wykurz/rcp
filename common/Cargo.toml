@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 async-recursion = "1.1"
+atty = "0.2"
+chrono = "0.4"
 console-subscriber = "0.2"
 enum-map = "2.7"
 futures = "0.3"
