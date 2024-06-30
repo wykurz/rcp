@@ -42,40 +42,78 @@ struct ProgressTracker {
     pbar_thread: Option<std::thread::JoinHandle<()>>,
 }
 
+fn progress_bar(is_done: std::sync::Arc<std::sync::atomic::AtomicBool>, op_name: &str) {
+    let pbar = indicatif::ProgressBar::new_spinner();
+    pbar.set_style(
+        indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    let time_started = std::time::Instant::now();
+    let mut last_update = time_started;
+    loop {
+        if is_done.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        let progress_status = PROGRESS.get();
+        let time_now = std::time::Instant::now();
+        let finished = progress_status.finished;
+        let in_progress = progress_status.started - progress_status.finished;
+        let avarage_rate = finished as f64 / time_started.elapsed().as_secs_f64();
+        let current_rate =
+            (finished - pbar.position()) as f64 / (time_now - last_update).as_secs_f64();
+        pbar.set_position(finished);
+        pbar.set_message(format!(
+            "done: {} | {}: {} | average: {:.2} items/s | current: {:.2} items/s",
+            finished, op_name, in_progress, avarage_rate, current_rate
+        ));
+        last_update = time_now;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    pbar.finish_and_clear();
+}
+
+fn text_updates(is_done: std::sync::Arc<std::sync::atomic::AtomicBool>, op_name: &str) {
+    let time_started = std::time::Instant::now();
+    let mut last_update = time_started;
+    let mut prev_finished = 0;
+    loop {
+        if is_done.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        let progress_status = PROGRESS.get();
+        let time_now = std::time::Instant::now();
+        let finished = progress_status.finished;
+        let in_progress = progress_status.started - progress_status.finished;
+        let avarage_rate = finished as f64 / time_started.elapsed().as_secs_f64();
+        let current_rate =
+            (finished - prev_finished) as f64 / (time_now - last_update).as_secs_f64();
+        prev_finished = finished;
+        eprintln!(
+            "{} :: done: {} | {}: {} | average: {:.2} items/s | current: {:.2} items/s",
+            chrono::Local::now(),
+            finished,
+            op_name,
+            in_progress,
+            avarage_rate,
+            current_rate
+        );
+        last_update = time_now;
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    }
+}
+
 impl ProgressTracker {
     pub fn new(op_name: &str) -> Self {
         let op_name = op_name.to_string();
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done_clone = done.clone();
         let pbar_thread = std::thread::spawn(move || {
-            let pbar = indicatif::ProgressBar::new_spinner();
-            pbar.set_style(
-                indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
-                    .unwrap()
-                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-            );
-            let time_started = std::time::Instant::now();
-            let mut last_update = time_started;
-            loop {
-                if done_clone.load(std::sync::atomic::Ordering::SeqCst) {
-                    break;
-                }
-                let progress_status = PROGRESS.get();
-                let time_now = std::time::Instant::now();
-                let finished = progress_status.finished;
-                let in_progress = progress_status.started - progress_status.finished;
-                let avarage_rate = finished as f64 / time_started.elapsed().as_secs_f64();
-                let current_rate =
-                    (finished - pbar.position()) as f64 / (time_now - last_update).as_secs_f64();
-                pbar.set_position(finished);
-                pbar.set_message(format!(
-                    "done: {} | {}: {} | average: {:.2} items/s | current: {:.2} items/s",
-                    finished, op_name, in_progress, avarage_rate, current_rate
-                ));
-                last_update = time_now;
-                std::thread::sleep(std::time::Duration::from_millis(200));
+            if atty::is(atty::Stream::Stderr) {
+                progress_bar(done_clone, &op_name);
+            } else {
+                text_updates(done_clone, &op_name);
             }
-            pbar.finish_and_clear();
         });
         Self {
             done,
