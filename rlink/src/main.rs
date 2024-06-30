@@ -121,7 +121,7 @@ fn main() -> Result<()> {
         let args = args.clone();
         || async_main(args)
     };
-    common::run(
+    let res = common::run(
         if args.progress { Some("rlink") } else { None },
         args.quiet,
         args.verbose,
@@ -129,6 +129,9 @@ fn main() -> Result<()> {
         args.max_workers,
         args.max_blocking_threads,
         func,
-    )?;
-    Ok(())
+    );
+    match res {
+        Ok(_) => std::process::exit(0),
+        Err(_) => std::process::exit(1),
+    }
 }

@@ -75,6 +75,7 @@ impl ProgressTracker {
                 last_update = time_now;
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
+            pbar.finish_and_clear();
         });
         Self {
             done,
@@ -253,7 +254,7 @@ pub fn run<Fut, Summary, Error>(
     max_workers: usize,
     max_blocking_threads: usize,
     func: impl FnOnce() -> Fut,
-) -> Result<Summary, anyhow::Error>
+) -> Result<(), anyhow::Error>
 where
     Summary: std::fmt::Display,
     Error: std::fmt::Display + std::fmt::Debug,
@@ -319,12 +320,12 @@ where
     let res = runtime.block_on(func());
     if let Err(error) = res {
         if !quiet {
-            eprintln!("{:#}", error); // TODO: extract summary and print it regardless of quiet
+            eprintln!("{:#}", error);
         }
-        std::process::exit(1);
+        return Err(anyhow!("{}", error));
     }
     if summary || verbose > 0 {
         println!("{}", res.unwrap());
     }
-    std::process::exit(0);
+    Ok(())
 }
