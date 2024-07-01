@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use common::ProgressType;
 use structopt::StructOpt;
 use tracing::{event, Level};
 
@@ -25,6 +26,15 @@ struct Args {
     /// Show progress
     #[structopt(long)]
     progress: bool,
+
+    /// Toggles the type of progress to show.
+    ///
+    /// If specified, --progress flag is implied.
+    ///
+    /// Options are: ProgressBar (animated progress bar), TextUpdates (appropriate for logging), Auto (default, will
+    /// choose between ProgressBar or TextUpdates depending on the type of terminal attached to stderr)
+    #[structopt(long)]
+    progress_type: Option<ProgressType>,
 
     /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
     #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
@@ -122,7 +132,11 @@ fn main() -> Result<()> {
         || async_main(args)
     };
     let res = common::run(
-        if args.progress { Some("rlink") } else { None },
+        if args.progress || args.progress_type.is_some() {
+            Some(("link", args.progress_type.unwrap_or_default()))
+        } else {
+            None
+        },
         args.quiet,
         args.verbose,
         args.summary,
