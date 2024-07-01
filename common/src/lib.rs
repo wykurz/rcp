@@ -4,7 +4,7 @@ extern crate lazy_static;
 use anyhow::anyhow;
 use anyhow::Context;
 use cmp::ObjType;
-use std::future::Future;
+use std::fmt;
 use tracing::{event, instrument, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::prelude::*;
@@ -40,6 +40,47 @@ lazy_static! {
 struct ProgressTracker {
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pbar_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Copy, Clone, Default)]
+pub enum ProgressType {
+    #[default]
+    Auto,
+    ProgressBar,
+    TextUpdates,
+}
+
+impl std::fmt::Debug for ProgressType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProgressType::Auto => write!(f, "Auto"),
+            ProgressType::ProgressBar => write!(f, "ProgressBar"),
+            ProgressType::TextUpdates => write!(f, "TextUpdates"),
+        }
+    }
+}
+
+impl fmt::Display for ProgressType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ProgressType::Auto => write!(f, "Auto"),
+            ProgressType::ProgressBar => write!(f, "ProgressBar"),
+            ProgressType::TextUpdates => write!(f, "TextUpdates"),
+        }
+    }
+}
+
+impl std::str::FromStr for ProgressType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" | "Auto" => Ok(ProgressType::Auto),
+            "ProgressBar" => Ok(ProgressType::ProgressBar),
+            "TextUpdates" => Ok(ProgressType::TextUpdates),
+            _ => Err(anyhow!("Invalid progress type: {}", s)),
+        }
+    }
 }
 
 fn progress_bar(is_done: std::sync::Arc<std::sync::atomic::AtomicBool>, op_name: &str) {
@@ -104,12 +145,17 @@ fn text_updates(is_done: std::sync::Arc<std::sync::atomic::AtomicBool>, op_name:
 }
 
 impl ProgressTracker {
-    pub fn new(op_name: &str) -> Self {
+    pub fn new(progress_type: ProgressType, op_name: &str) -> Self {
         let op_name = op_name.to_string();
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done_clone = done.clone();
         let pbar_thread = std::thread::spawn(move || {
-            if atty::is(atty::Stream::Stderr) {
+            let interactive = match progress_type {
+                ProgressType::Auto => atty::is(atty::Stream::Stdout),
+                ProgressType::ProgressBar => true,
+                ProgressType::TextUpdates => false,
+            };
+            if interactive {
                 progress_bar(done_clone, &op_name);
             } else {
                 text_updates(done_clone, &op_name);
@@ -285,7 +331,7 @@ fn read_env_or_default<T: std::str::FromStr>(name: &str, default: T) -> T {
 
 #[instrument(skip(func))] // "func" is not Debug printable
 pub fn run<Fut, Summary, Error>(
-    progress_op_name: Option<&str>,
+    progress: Option<(&str, ProgressType)>,
     quiet: bool,
     verbose: u8,
     summary: bool,
@@ -296,7 +342,7 @@ pub fn run<Fut, Summary, Error>(
 where
     Summary: std::fmt::Display,
     Error: std::fmt::Display + std::fmt::Debug,
-    Fut: Future<Output = Result<Summary, Error>>,
+    Fut: std::future::Future<Output = Result<Summary, Error>>,
 {
     if !quiet {
         let fmt_layer = tracing_subscriber::fmt::layer()
@@ -355,7 +401,8 @@ where
     }
     let runtime = builder.build()?;
     let res = {
-        let _progress = progress_op_name.map(ProgressTracker::new);
+        let _progress =
+            progress.map(|(op_name, progress_type)| ProgressTracker::new(progress_type, op_name));
         runtime.block_on(func())
     };
     if let Err(error) = res {
