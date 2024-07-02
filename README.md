@@ -43,10 +43,12 @@ The trace events are retained for 60s. This can be modified by setting `RCP_TOKI
 
 rcp
 ===
-
 `rcp` is a tool for copying files similar to `cp` but generally MUCH faster when dealing with a large number of files.
-Inspired by tools like [dsync](https://mpifileutils.readthedocs.io/en/v0.11.1/dsync.1.html) and
-[pcp](https://github.com/wtsi-ssg/pcp).
+
+Inspired by tools like `dsync`(1) and `pcp`(2).
+
+1) https://mpifileutils.readthedocs.io/en/v0.11.1/dsync.1.html
+2) https://github.com/wtsi-ssg/pcp
 
 ```
 USAGE:
@@ -93,18 +95,24 @@ OPTIONS:
 
         --overwrite-compare <overwrite-compare>
             Comma separated list of file attributes to compare when when deciding if files are "identical", used with
-            --overwrite flag. Options are: uid, gid, size, mtime, ctime [default: size,mtime]
+            --overwrite flag. Options are: uid, gid, mode, size, mtime, ctime [default: size,mtime]
         --preserve-settings <preserve-settings>
             Specify exactly what attributes to preserve.
 
             If specified, the "preserve" flag is ignored.
 
-            The format is: "<type1>:<attributes1> <type2>:<attributes2> ..." Where <type> is one of: "f" (file), "d"
-            (directory), "l" (symlink) And <attributes> is a comma separated list of: "uid", "gid", "time", <mode mask>
-            Where <mode mask> is a 4 digit octal number
+            The format is: "<type1>:<attributes1> <type2>:<attributes2> ..." Where <type> is one of: f (file), d
+            (directory), l (symlink) And <attributes> is a comma separated list of: uid, gid, time, <mode mask> Where
+            <mode mask> is a 4 digit octal number
 
             Example: "f:uid,gid,time,0777 d:uid,gid,time,0777 l:uid,gid,time"
+        --progress-type <progress-type>
+            Toggles the type of progress to show.
 
+            If specified, --progress flag is implied.
+
+            Options are: ProgressBar (animated progress bar), TextUpdates (appropriate for logging), Auto (default, will
+            choose between ProgressBar or TextUpdates depending on the type of terminal attached to stderr)
 
 ARGS:
     <paths>...
@@ -113,74 +121,132 @@ ARGS:
 
 rrm
 ===
+`rrm` is a simple tool for removing large numbers of files.
 
-`rrm` is a simple tool for removing large numbers of files. Note the basic usage is equivalent to `rm -rf`.
+Note the basic usage is equivalent to `rm -rf`.
 
 ```
 USAGE:
     rrm [FLAGS] [OPTIONS] [paths]...
 
 FLAGS:
-    -e, --fail-early    Exit on first error
-    -h, --help          Prints help information
-        --progress      Show progress
-    -q, --quiet         Quiet mode, don't report errors
-        --summary       Print summary at the end
-    -V, --version       Prints version information
-    -v, --verbose       Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+    -e, --fail-early
+            Exit on first error
+
+    -h, --help
+            Prints help information
+
+        --progress
+            Show progress
+
+    -q, --quiet
+            Quiet mode, don't report errors
+
+        --summary
+            Print summary at the end
+
+    -V, --version
+            Prints version information
+
+    -v, --verbose
+            Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+
 
 OPTIONS:
         --max-blocking-threads <max-blocking-threads>
             Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
 
-        --max-workers <max-workers>                      Number of worker threads, 0 means number of cores [default: 0]
+        --max-workers <max-workers>
+            Number of worker threads, 0 means number of cores [default: 0]
+
+        --progress-type <progress-type>
+            Toggles the type of progress to show.
+
+            If specified, --progress flag is implied.
+
+            Options are: ProgressBar (animated progress bar), TextUpdates (appropriate for logging), Auto (default, will
+            choose between ProgressBar or TextUpdates depending on the type of terminal attached to stderr)
 
 ARGS:
-    <paths>...    Source path(s) and destination path
+    <paths>...
+            Source path(s) and destination path
 ```
 
 rlink
 =====
+`rlink` allows hard-linking large number of files.
 
-`rlink` allows hard-linking large number of files. A common pattern is to also provide `--update <path>` that overrides any paths in `src` to instead be copied over from there.
+A common pattern is to also provide `--update <path>` that overrides any paths in `src` to instead be copied over from
+there.
 
 ```
 USAGE:
     rlink [FLAGS] [OPTIONS] <src> <dst>
 
 FLAGS:
-    -e, --fail-early    Exit on first error
-    -h, --help          Prints help information
-    -o, --overwrite     Overwrite existing files/directories
-        --progress      Show progress
-    -q, --quiet         Quiet mode, don't report errors
-        --summary       Print summary at the end
-    -V, --version       Prints version information
-    -v, --verbose       Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+    -e, --fail-early
+            Exit on first error
+
+    -h, --help
+            Prints help information
+
+    -o, --overwrite
+            Overwrite existing files/directories
+
+        --progress
+            Show progress
+
+    -q, --quiet
+            Quiet mode, don't report errors
+
+        --summary
+            Print summary at the end
+
+    -V, --version
+            Prints version information
+
+    -v, --verbose
+            Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+
 
 OPTIONS:
         --max-blocking-threads <max-blocking-threads>
             Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
 
-        --max-workers <max-workers>                      Number of worker threads, 0 means number of cores [default: 0]
+        --max-workers <max-workers>
+            Number of worker threads, 0 means number of cores [default: 0]
+
         --overwrite-compare <overwrite-compare>
             Comma separated list of file attributes to compare when when deciding if files are "identical", used with
-            --overwrite flag. Options are: uid, gid, size, mtime, ctime [default: size,mtime]
-        --update <update>                                Directory with updated contents of `link`
+            --overwrite flag. Options are: uid, gid, mode, size, mtime, ctime [default: size,mtime]
+        --progress-type <progress-type>
+            Toggles the type of progress to show.
+
+            If specified, --progress flag is implied.
+
+            Options are: ProgressBar (animated progress bar), TextUpdates (appropriate for logging), Auto (default, will
+            choose between ProgressBar or TextUpdates depending on the type of terminal attached to stderr)
+        --update <update>
+            Directory with updated contents of `link`
+
         --update-compare <update-compare>
             Same as overwrite-compare, but for deciding if we can hard-link or if we need to copy a file from the update
             directory. Used with --update flag [default: size,mtime]
 
 ARGS:
-    <src>    Directory with contents we want to update into `dst`
-    <dst>    Directory where we put either a hard-link of a file from `link` if it was unchanged, or a copy of a
-             file from `new` if it's been modified
+    <src>
+            Directory with contents we want to update into `dst`
+
+    <dst>
+            Directory where we put either a hard-link of a file from `link` if it was unchanged, or a copy of a file
+            from `new` if it's been modified
 ```
 
 rcmp
 =====
+`rcmp` is a tool for comparing large filesets.
 
-`rcmp` is a tool for comparing large filesets. Currently, it only supports comparing metadata (no content checking).
+Currently, it only supports comparing metadata (no content checking).
 
 ```
 USAGE:
@@ -228,6 +294,13 @@ OPTIONS:
 
             Example: "f:mtime,ctime,mode,size d:mtime,ctime,mode l:mtime,ctime,mode" [default: f:mtime,size d:mtime
             l:mtime]
+        --progress-type <progress-type>
+            Toggles the type of progress to show.
+
+            If specified, --progress flag is implied.
+
+            Options are: ProgressBar (animated progress bar), TextUpdates (appropriate for logging), Auto (default, will
+            choose between ProgressBar or TextUpdates depending on the type of terminal attached to stderr)
 
 ARGS:
     <log>
