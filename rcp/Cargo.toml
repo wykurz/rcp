@@ -1,6 +1,6 @@
 [package]
 name = "rcp"
-version = "0.11.0"
+version = "0.12.0"
 description = "Tool for copying files similar to cp but MUCH faster."
 license = "MIT"
 edition = "2021"
