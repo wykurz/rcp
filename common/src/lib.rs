@@ -5,6 +5,7 @@ use anyhow::anyhow;
 use anyhow::Context;
 use cmp::ObjType;
 use std::fmt;
+use std::io::IsTerminal;
 use tracing::{event, instrument, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::prelude::*;
@@ -151,7 +152,7 @@ impl ProgressTracker {
         let done_clone = done.clone();
         let pbar_thread = std::thread::spawn(move || {
             let interactive = match progress_type {
-                ProgressType::Auto => atty::is(atty::Stream::Stdout),
+                ProgressType::Auto => std::io::stderr().is_terminal(),
                 ProgressType::ProgressBar => true,
                 ProgressType::TextUpdates => false,
             };
