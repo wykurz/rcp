@@ -24,6 +24,36 @@ debian / rhel
 
 Starting with release `v0.10.1` .deb and .rpm packages are available as part of each release.
 
+general controls
+================
+
+## error handling
+
+- `rcp` tools will log non-terminal errors and continue
+- to fail immediately on any error use the `--fail-early` flag
+
+## terminal output
+
+**Log messages**
+- sent to `stdout`
+- by default only errors are logged
+- verbosity controlled using `-v`/`-vv`/`-vvv` for INFO/DEBUG/TRACE and `-q`/`--quiet` to disable
+
+**Progress**
+- sent to `stderr` (both `ProgressBar` and `TextUpdates`)
+- by default disabled
+- enabled using `-p`/`--progress` with optional `--progress-type=...` override
+
+**Summary**
+- sent to `stdout`
+- by default disabled
+- enabled using `--summary`
+
+## overwrite
+
+`rcp` tools will not-overwrite pre-existing data unless used with the `--overwrite` flag.
+
+
 tracing and tokio-console
 =========================
 

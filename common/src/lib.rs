@@ -408,7 +408,7 @@ where
     };
     if let Err(error) = res {
         if !quiet {
-            eprintln!("{:#}", error);
+            println!("{:#}", error);
         }
         return Err(anyhow!("{}", error));
     }
