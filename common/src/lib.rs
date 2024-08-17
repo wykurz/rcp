@@ -339,10 +339,12 @@ fn print_runtime_stats() -> Result<(), anyhow::Error> {
     let ticks_to_duration = |ticks: u64| {
         std::time::Duration::from_secs_f64(ticks as f64 / clock_ticks_per_second as f64)
     };
+    let vmhwm = process.status()?.vmhwm.unwrap_or(0);
     println!("walltime       : {:.2?}", &PROGRESS.get_duration(),);
     println!("cpu total time : {:.2?}", ticks_to_duration(stat.utime + stat.stime));
     println!("cpu user time  : {:.2?}", ticks_to_duration(stat.utime));
     println!("cpu kernel time: {:.2?}", ticks_to_duration(stat.stime));
+    println!("peak RSS memory: {:.2?}", bytesize::ByteSize(vmhwm));
     Ok(())
 }
 
