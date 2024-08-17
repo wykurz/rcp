@@ -30,10 +30,17 @@ impl Default for TlsCounter {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TlsProgress {
     started: TlsCounter,
     finished: TlsCounter,
+    start_time: std::time::Instant,
+}
+
+impl Default for TlsProgress {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct ProgressGuard<'a> {
@@ -63,6 +70,7 @@ impl TlsProgress {
         Self {
             started: TlsCounter::new(),
             finished: TlsCounter::new(),
+            start_time: std::time::Instant::now(),
         }
     }
 
@@ -86,6 +94,10 @@ impl TlsProgress {
             status.started = status.finished;
         }
         status
+    }
+
+    pub fn get_duration(&self) -> std::time::Duration {
+        self.start_time.elapsed()
     }
 }
 

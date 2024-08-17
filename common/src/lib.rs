@@ -409,11 +409,15 @@ where
     if let Err(error) = res {
         if !quiet {
             println!("{:#}", error);
+            println!("walltime: {:.2?}", PROGRESS.get_duration());
         }
         return Err(anyhow!("{}", error));
     }
     if summary || verbose > 0 {
         println!("{}", res.unwrap());
+    }
+    if !quiet {
+        println!("walltime: {:.2?}", PROGRESS.get_duration());
     }
     Ok(())
 }
