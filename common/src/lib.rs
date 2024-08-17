@@ -330,6 +330,22 @@ fn read_env_or_default<T: std::str::FromStr>(name: &str, default: T) -> T {
     }
 }
 
+#[rustfmt::skip]
+fn print_runtime_stats() -> Result<(), anyhow::Error> {
+    let process = procfs::process::Process::myself()?;
+    let stat = process.stat()?;
+    // The time is in clock ticks, so we need to convert it to seconds
+    let clock_ticks_per_second = procfs::ticks_per_second();
+    let ticks_to_duration = |ticks: u64| {
+        std::time::Duration::from_secs_f64(ticks as f64 / clock_ticks_per_second as f64)
+    };
+    println!("walltime       : {:.2?}", &PROGRESS.get_duration(),);
+    println!("cpu total time : {:.2?}", ticks_to_duration(stat.utime + stat.stime));
+    println!("cpu user time  : {:.2?}", ticks_to_duration(stat.utime));
+    println!("cpu kernel time: {:.2?}", ticks_to_duration(stat.stime));
+    Ok(())
+}
+
 #[instrument(skip(func))] // "func" is not Debug printable
 pub fn run<Fut, Summary, Error>(
     progress: Option<(&str, ProgressType)>,
@@ -409,7 +425,7 @@ where
     if let Err(error) = res {
         if !quiet {
             println!("{:#}", error);
-            println!("walltime: {:.2?}", PROGRESS.get_duration());
+            print_runtime_stats()?;
         }
         return Err(anyhow!("{}", error));
     }
@@ -417,7 +433,7 @@ where
         println!("{}", res.unwrap());
     }
     if !quiet {
-        println!("walltime: {:.2?}", PROGRESS.get_duration());
+        print_runtime_stats()?;
     }
     Ok(())
 }
