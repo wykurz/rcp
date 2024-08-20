@@ -59,7 +59,7 @@ pub async fn rm(
     path: &std::path::Path,
     settings: &RmSettings,
 ) -> Result<RmSummary, RmError> {
-    let _guard = prog_track.guard();
+    let _prog_guard = prog_track.guard();
     event!(Level::DEBUG, "read path metadata");
     let src_metadata = tokio::fs::symlink_metadata(path)
         .await

@@ -51,6 +51,10 @@ struct Args {
     /// Number of blocking worker threads, 0 means Tokio runtime default (512)
     #[structopt(long, default_value = "0")]
     max_blocking_threads: usize,
+
+    /// Maximum number of open files, 0 means no limit
+    #[structopt(long, default_value = "0")]
+    max_open_files: usize,
 }
 
 #[instrument]
@@ -107,6 +111,7 @@ fn main() -> Result<()> {
         args.summary,
         args.max_workers,
         args.max_blocking_threads,
+        args.max_open_files,
         func,
     );
     match res {

@@ -18,6 +18,7 @@ mod preserve;
 mod progress;
 mod rm;
 mod testutils;
+mod throttle;
 
 pub use cmp::CmpSettings;
 pub use cmp::CmpSummary;
@@ -347,6 +348,7 @@ fn print_runtime_stats() -> Result<(), anyhow::Error> {
 }
 
 #[instrument(skip(func))] // "func" is not Debug printable
+#[allow(clippy::too_many_arguments)]
 pub fn run<Fut, Summary, Error>(
     progress: Option<(&str, ProgressType)>,
     quiet: bool,
@@ -354,6 +356,7 @@ pub fn run<Fut, Summary, Error>(
     summary: bool,
     max_workers: usize,
     max_blocking_threads: usize,
+    max_open_files: usize,
     func: impl FnOnce() -> Fut,
 ) -> Result<(), anyhow::Error>
 where
@@ -409,6 +412,9 @@ where
     }
     if max_blocking_threads > 0 {
         builder.max_blocking_threads(max_blocking_threads);
+    }
+    if max_open_files > 0 {
+        throttle::set_max_open_files(max_open_files);
     }
     if !sysinfo::set_open_files_limit(isize::MAX) {
         event!(
