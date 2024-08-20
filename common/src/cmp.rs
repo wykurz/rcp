@@ -130,7 +130,7 @@ pub async fn cmp(
     log: &LogWriter,
     settings: &CmpSettings,
 ) -> Result<CmpSummary> {
-    let _guard = prog_track.guard();
+    let _prog_guard = prog_track.guard();
     event!(Level::DEBUG, "reading source metadata");
     // it is impossible for src not exist other than user passing invalid path (which is an error)
     let src_metadata = tokio::fs::symlink_metadata(src)

@@ -133,7 +133,7 @@ pub async fn link(
     settings: &LinkSettings,
     mut is_fresh: bool,
 ) -> Result<LinkSummary, LinkError> {
-    let _guard = prog_track.guard();
+    let _prog_guard = prog_track.guard();
     event!(Level::DEBUG, "reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await

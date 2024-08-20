@@ -6,6 +6,7 @@ use crate::filecmp;
 use crate::preserve;
 use crate::progress;
 use crate::rm;
+use crate::throttle;
 use crate::RmSettings;
 use crate::RmSummary;
 
@@ -49,6 +50,7 @@ pub async fn copy_file(
     preserve: &preserve::PreserveSettings,
     is_fresh: bool,
 ) -> Result<CopySummary, CopyError> {
+    let _open_file_guard = throttle::open_file_permit().await;
     event!(
         Level::DEBUG,
         "opening 'src' for reading and 'dst' for writing"
@@ -178,7 +180,7 @@ pub async fn copy(
     preserve: &preserve::PreserveSettings,
     mut is_fresh: bool,
 ) -> Result<CopySummary, CopyError> {
-    let _guard = prog_track.guard();
+    let _prog_guard = prog_track.guard();
     event!(Level::DEBUG, "reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
