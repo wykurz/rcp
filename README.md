@@ -86,18 +86,10 @@ USAGE:
 
 FLAGS:
     -L, --dereference
-            Always follow symbolic links in source
-
-    -e, --fail-early
-            Exit on first error
-
-    -h, --help
-            Prints help information
-
-    -o, --overwrite
-            Overwrite existing files/directories
-
-    -p, --preserve
+            Always follow symbolic links in source                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          -e, --fail-early
+            Exit on first error                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             -h, --help
+            Prints help information                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         -o, --overwrite
+            Overwrite existing files/directories                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            -p, --preserve
             Preserve additional file attributes: file owner, group, setuid, setgid, mtime and atime
 
         --progress
@@ -119,6 +111,9 @@ FLAGS:
 OPTIONS:
         --max-blocking-threads <max-blocking-threads>
             Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
+
+        --max-open-files <max-open-files>
+            Maximum number of open files, 0 means no limit [default: 0]
 
         --max-workers <max-workers>
             Number of worker threads, 0 means number of cores [default: 0]
@@ -186,6 +181,9 @@ OPTIONS:
         --max-blocking-threads <max-blocking-threads>
             Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
 
+        --max-open-files <max-open-files>
+            Maximum number of open files, 0 means no limit [default: 0]
+
         --max-workers <max-workers>
             Number of worker threads, 0 means number of cores [default: 0]
 
@@ -232,6 +230,9 @@ FLAGS:
         --summary
             Print summary at the end
 
+        --update-exclusive
+            Hard-link only the files that are in the update directory
+
     -V, --version
             Prints version information
 
@@ -242,6 +243,9 @@ FLAGS:
 OPTIONS:
         --max-blocking-threads <max-blocking-threads>
             Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
+
+        --max-open-files <max-open-files>
+            Maximum number of open files, 0 means no limit [default: 0]
 
         --max-workers <max-workers>
             Number of worker threads, 0 means number of cores [default: 0]
@@ -311,6 +315,9 @@ FLAGS:
 OPTIONS:
         --max-blocking-threads <max-blocking-threads>
             Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
+
+        --max-open-files <max-open-files>
+            Maximum number of open files, 0 means no limit [default: 0]
 
         --max-workers <max-workers>
             Number of worker threads, 0 means number of cores [default: 0]
