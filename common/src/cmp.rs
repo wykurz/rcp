@@ -208,7 +208,7 @@ pub async fn cmp(
     let mut dst_entries = tokio::fs::read_dir(dst)
         .await
         .with_context(|| format!("cannot open directory {:?} for reading", &dst))?;
-    // iterate through update entries and for each one that's not present in src call "copy"
+    // iterate through update entries and log each one that's not present in src
     while let Some(dst_entry) = dst_entries
         .next_entry()
         .await
@@ -227,8 +227,14 @@ pub async fn cmp(
             .with_context(|| format!("failed reading metadata from {:?}", &dst_path))?;
         let dst_obj_type = obj_type(&dst_entry_metadata);
         cmp_summary.mismatch[dst_obj_type][CmpResult::SrcMissing] += 1;
-        log.log_mismatch(CmpResult::SrcMissing, None, src, Some(dst_obj_type), dst)
-            .await?;
+        log.log_mismatch(
+            CmpResult::SrcMissing,
+            None,
+            &src.join(entry_name),
+            Some(dst_obj_type),
+            &dst_path,
+        )
+        .await?;
     }
     while let Some(res) = join_set.join_next().await {
         match res? {
