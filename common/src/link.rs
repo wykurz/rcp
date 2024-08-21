@@ -33,6 +33,7 @@ impl LinkError {
 pub struct LinkSettings {
     pub copy_settings: CopySettings,
     pub update_compare: filecmp::MetadataCmpSettings,
+    pub update_exclusive: bool,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -147,6 +148,10 @@ pub async fn link(
                 Ok(update_metadata) => Some(update_metadata),
                 Err(error) => {
                     if error.kind() == std::io::ErrorKind::NotFound {
+                        if settings.update_exclusive {
+                            // the path is missing from update, we're done
+                            return Ok(Default::default());
+                        }
                         None
                     } else {
                         return Err(LinkError::new(
@@ -541,6 +546,7 @@ mod link_tests {
                 mtime: true,
                 ..Default::default()
             },
+            update_exclusive: false,
         }
     }
 
@@ -679,6 +685,43 @@ mod link_tests {
             testutils::FileEqualityCheck::HardLink,
         )
         .await?;
+        // compare update and dst
+        testutils::check_dirs_identical(
+            &test_path.join("update"),
+            &test_path.join("bar"),
+            testutils::FileEqualityCheck::Timestamp,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_link_update_exclusive() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        setup_update_dir(&tmp_dir).await?;
+        let test_path = tmp_dir.as_path();
+        let mut settings = common_settings(false, false);
+        settings.update_exclusive = true;
+        let summary = link(
+            &PROGRESS,
+            &test_path,
+            &test_path.join("foo"),
+            &test_path.join("bar"),
+            &Some(test_path.join("update")),
+            &settings,
+            false,
+        )
+        .await?;
+        // we should end up with same directory as the update
+        // |- 0.txt
+        // |- bar
+        //    |- 1.txt
+        //    |- 2.txt -> ../0.txt
+        assert_eq!(summary.hard_links_created, 0);
+        assert_eq!(summary.copy_summary.files_copied, 2);
+        assert_eq!(summary.copy_summary.symlinks_created, 1);
+        assert_eq!(summary.copy_summary.directories_created, 2);
         // compare update and dst
         testutils::check_dirs_identical(
             &test_path.join("update"),

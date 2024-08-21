@@ -60,6 +60,10 @@ struct Args {
     #[structopt(long)]
     update: Option<std::path::PathBuf>,
 
+    /// Hard-link only the files that are in the update directory
+    #[structopt(long)]
+    update_exclusive: bool,
+
     /// Same as overwrite-compare, but for deciding if we can hard-link or if we need to copy a file from the update directory. Used with --update flag
     #[structopt(long, default_value = "size,mtime")]
     update_compare: String,
@@ -114,6 +118,7 @@ async fn async_main(args: Args) -> Result<common::LinkSummary> {
                 overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
             },
             update_compare: common::parse_metadata_cmp_settings(&args.update_compare)?,
+            update_exclusive: args.update_exclusive,
         },
     )
     .await;
