@@ -55,24 +55,24 @@ pub async fn copy_file(
         Level::DEBUG,
         "opening 'src' for reading and 'dst' for writing"
     );
-    let reader = tokio::fs::File::open(src)
+    let src_metadata = tokio::fs::symlink_metadata(src)
         .await
-        .with_context(|| format!("cannot open {:?} for reading", src))
+        .with_context(|| format!("failed reading metadata from {:?}", &src))
         .map_err(|err| CopyError::new(err, Default::default()))?;
     let mut rm_summary = RmSummary::default();
     if !is_fresh && dst.exists() {
         if settings.overwrite {
             event!(Level::DEBUG, "file exists, check if it's identical");
-            let md1 = reader
-                .metadata()
-                .await
-                .map_err(|err| CopyError::new(anyhow::Error::msg(err), Default::default()))?;
-            let md2 = tokio::fs::symlink_metadata(dst)
+            let dst_metadata = tokio::fs::symlink_metadata(dst)
                 .await
                 .with_context(|| format!("failed reading metadata from {:?}", &dst))
-                .map_err(|err| CopyError::new(anyhow::Error::msg(err), Default::default()))?;
-            if is_file_type_same(&md1, &md2)
-                && filecmp::metadata_equal(&settings.overwrite_compare, &md1, &md2)
+                .map_err(|err| CopyError::new(err, Default::default()))?;
+            if is_file_type_same(&src_metadata, &dst_metadata)
+                && filecmp::metadata_equal(
+                    &settings.overwrite_compare,
+                    &src_metadata,
+                    &dst_metadata,
+                )
             {
                 event!(Level::DEBUG, "file is identical, skipping");
                 return Ok(CopySummary {
@@ -118,11 +118,6 @@ pub async fn copy_file(
         .with_context(|| format!("failed copying {:?} to {:?}", &src, &dst))
         .map_err(|err| CopyError::new(err, copy_summary))?;
     event!(Level::DEBUG, "setting permissions");
-    let src_metadata = reader
-        .metadata()
-        .await
-        .with_context(|| format!("failed reading metadata from {:?}", &src))
-        .map_err(|err| CopyError::new(err, copy_summary))?;
     let writer = tokio::fs::File::open(dst)
         .await
         .map_err(|err| CopyError::new(anyhow::Error::msg(err), copy_summary))?;
@@ -1274,7 +1269,7 @@ mod copy_tests {
                 assert_eq!(error.summary.files_copied, 1);
                 assert_eq!(error.summary.symlinks_created, 2);
                 assert_eq!(error.summary.directories_created, 0);
-                assert_eq!(error.summary.rm_summary.files_removed, 1);
+                assert_eq!(error.summary.rm_summary.files_removed, 2);
                 assert_eq!(error.summary.rm_summary.symlinks_removed, 2);
                 assert_eq!(error.summary.rm_summary.directories_removed, 0);
             }
