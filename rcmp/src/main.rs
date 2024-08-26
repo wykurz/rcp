@@ -17,6 +17,8 @@ struct Args {
     /// And <attributes> is a comma separated list of: uid, gid, size, mtime, ctime
     ///
     /// Example: "f:mtime,ctime,mode,size d:mtime,ctime,mode l:mtime,ctime,mode"
+    ///
+    /// Will return error code 1 if there are differences, 2 if there were errors.
     #[structopt(long, default_value = "f:mtime,size d:mtime l:mtime")]
     metadata_compare: String,
 
@@ -45,6 +47,10 @@ struct Args {
     #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
     verbose: u8,
 
+    /// Return non-zero exit code only if there were errors performing the comparison.
+    #[structopt(long)]
+    no_check: bool,
+
     /// Print summary at the end
     #[structopt(long)]
     summary: bool,
@@ -53,7 +59,7 @@ struct Args {
     #[structopt(short = "q", long = "quiet")]
     quiet: bool,
 
-    /// File where we store comparison mismatch output, implies --check if omitted
+    /// File name where to store comparison mismatch output
     #[structopt()]
     log: Option<std::path::PathBuf>,
 
@@ -116,7 +122,22 @@ fn main() -> Result<()> {
         func,
     );
     match res {
-        Ok(_) => std::process::exit(0),
-        Err(_) => std::process::exit(1),
+        Ok(summary) => match args.no_check {
+            // when --no-check is specified, return error code only if there were errors
+            true => std::process::exit(0),
+            false => {
+                // if there are any differences, return error code 1
+                for (_, cmp_result) in &summary.mismatch {
+                    let different = cmp_result[common::CmpResult::Different] > 0
+                        || cmp_result[common::CmpResult::SrcMissing] > 0
+                        || cmp_result[common::CmpResult::DstMissing] > 0;
+                    if different {
+                        std::process::exit(1);
+                    }
+                }
+                std::process::exit(0);
+            }
+        },
+        Err(_) => std::process::exit(2),
     }
 }

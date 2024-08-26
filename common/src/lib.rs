@@ -20,6 +20,7 @@ mod rm;
 mod testutils;
 mod throttle;
 
+pub use cmp::CmpResult;
 pub use cmp::CmpSettings;
 pub use cmp::CmpSummary;
 pub use cmp::LogWriter;
@@ -367,12 +368,12 @@ pub fn run<Fut, Summary, Error>(
     progress: Option<(&str, ProgressType)>,
     quiet: bool,
     verbose: u8,
-    summary: bool,
+    print_summary: bool,
     max_workers: usize,
     max_blocking_threads: usize,
     max_open_files: Option<usize>,
     func: impl FnOnce() -> Fut,
-) -> Result<(), anyhow::Error>
+) -> Result<Summary, anyhow::Error>
 where
     Summary: std::fmt::Display,
     Error: std::fmt::Display + std::fmt::Debug,
@@ -462,11 +463,12 @@ where
         }
         return Err(anyhow!("{}", error));
     }
-    if summary || verbose > 0 {
-        println!("{}", res.unwrap());
+    let summary = res.unwrap();
+    if print_summary || verbose > 0 {
+        println!("{}", &summary);
     }
     if !quiet {
         print_runtime_stats()?;
     }
-    Ok(())
+    Ok(summary)
 }
