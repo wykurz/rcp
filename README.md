@@ -290,6 +290,8 @@ rcmp
 
 Currently, it only supports comparing metadata (no content checking).
 
+Returns error code 1 if there are differences, 2 if there were errors.
+
 ```
 USAGE:
     rcmp [FLAGS] [OPTIONS] <src> <dst>

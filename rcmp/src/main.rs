@@ -7,7 +7,9 @@ use structopt::StructOpt;
     name = "rcmp",
     about = "`rcmp` is a tool for comparing large filesets.
 
-Currently, it only supports comparing metadata (no content checking)."
+Currently, it only supports comparing metadata (no content checking).
+
+Returns error code 1 if there are differences, 2 if there were errors."
 )]
 struct Args {
     /// Attributes to compare when when deciding if objects are "identical". Options are: uid, gid, mode, size, mtime, ctime
@@ -17,8 +19,6 @@ struct Args {
     /// And <attributes> is a comma separated list of: uid, gid, size, mtime, ctime
     ///
     /// Example: "f:mtime,ctime,mode,size d:mtime,ctime,mode l:mtime,ctime,mode"
-    ///
-    /// Will return error code 1 if there are differences, 2 if there were errors.
     #[structopt(long, default_value = "f:mtime,size d:mtime l:mtime")]
     metadata_compare: String,
 
