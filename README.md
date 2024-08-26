@@ -81,50 +81,75 @@ Inspired by tools like `dsync`(1) and `pcp`(2).
 2) https://github.com/wtsi-ssg/pcp
 
 ```
-Usage: cargo run [OPTIONS] [ARGS]...
+USAGE:
+    rcp [FLAGS] [OPTIONS] [paths]...
 
-Arguments:
-  [ARGS]...  Arguments for the binary or example to run
+FLAGS:
+    -L, --dereference
+            Always follow symbolic links in source
 
-Options:
-      --message-format <FMT>  Error format
-  -v, --verbose...            Use verbose output (-vv very verbose/build.rs output)
-  -q, --quiet                 Do not print cargo log messages
-      --color <WHEN>          Coloring: auto, always, never
-      --config <KEY=VALUE>    Override a configuration value
-  -Z <FLAG>                   Unstable (nightly-only) flags to Cargo, see 'cargo -Z help' for details
-  -h, --help                  Print help
+    -e, --fail-early
+            Exit on first error
 
-Package Selection:
-  -p, --package [<SPEC>]  Package with the target to run
+    -h, --help
+            Prints help information
 
-Target Selection:
-      --bin [<NAME>]      Name of the bin target to run
-      --example [<NAME>]  Name of the example target to run
+    -o, --overwrite
+            Overwrite existing files/directories
 
-Feature Selection:
-  -F, --features <FEATURES>  Space or comma separated list of features to activate
-      --all-features         Activate all available features
-      --no-default-features  Do not activate the `default` feature
+    -p, --preserve
+            Preserve additional file attributes: file owner, group, setuid, setgid, mtime and atime
 
-Compilation Options:
-  -j, --jobs <N>                Number of parallel jobs, defaults to # of CPUs.
-      --keep-going              Do not abort the build as soon as there is an error
-  -r, --release                 Build artifacts in release mode, with optimizations
-      --profile <PROFILE-NAME>  Build artifacts with the specified profile
-      --target [<TRIPLE>]       Build for the target triple
-      --target-dir <DIRECTORY>  Directory for all generated artifacts
-      --unit-graph              Output build graph in JSON (unstable)
-      --timings[=<FMTS>]        Timing output formats (unstable) (comma separated): html, json
+        --progress
+            Show progress
 
-Manifest Options:
-      --manifest-path <PATH>  Path to Cargo.toml
-      --ignore-rust-version   Ignore `rust-version` specification in packages
-      --locked                Assert that `Cargo.lock` will remain unchanged
-      --offline               Run without accessing the network
-      --frozen                Equivalent to specifying both --locked and --offline
+    -q, --quiet
+            Quiet mode, don't report errors
 
-Run `cargo help run` for more detailed information.
+        --summary
+            Print summary at the end
+
+    -V, --version
+            Prints version information
+
+    -v, --verbose
+            Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+
+
+OPTIONS:
+        --max-blocking-threads <max-blocking-threads>
+            Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
+
+        --max-open-files <max-open-files>
+            Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system
+            limit
+        --max-workers <max-workers>
+            Number of worker threads, 0 means number of cores [default: 0]
+
+        --overwrite-compare <overwrite-compare>
+            Comma separated list of file attributes to compare when when deciding if files are "identical", used with
+            --overwrite flag. Options are: uid, gid, mode, size, mtime, ctime [default: size,mtime]
+        --preserve-settings <preserve-settings>
+            Specify exactly what attributes to preserve.
+
+            If specified, the "preserve" flag is ignored.
+
+            The format is: "<type1>:<attributes1> <type2>:<attributes2> ..." Where <type> is one of: f (file), d
+            (directory), l (symlink) And <attributes> is a comma separated list of: uid, gid, time, <mode mask> Where
+            <mode mask> is a 4 digit octal number
+
+            Example: "f:uid,gid,time,0777 d:uid,gid,time,0777 l:uid,gid,time"
+        --progress-type <progress-type>
+            Toggles the type of progress to show.
+
+            If specified, --progress flag is implied.
+
+            Options are: ProgressBar (animated progress bar), TextUpdates (appropriate for logging), Auto (default, will
+            choose between ProgressBar or TextUpdates depending on the type of terminal attached to stderr)
+
+ARGS:
+    <paths>...
+            Source path(s) and destination path
 ```
 
 rrm
@@ -134,50 +159,53 @@ rrm
 Note the basic usage is equivalent to `rm -rf`.
 
 ```
-Usage: cargo run [OPTIONS] [ARGS]...
+USAGE:
+    rrm [FLAGS] [OPTIONS] [paths]...
 
-Arguments:
-  [ARGS]...  Arguments for the binary or example to run
+FLAGS:
+    -e, --fail-early
+            Exit on first error
 
-Options:
-      --message-format <FMT>  Error format
-  -v, --verbose...            Use verbose output (-vv very verbose/build.rs output)
-  -q, --quiet                 Do not print cargo log messages
-      --color <WHEN>          Coloring: auto, always, never
-      --config <KEY=VALUE>    Override a configuration value
-  -Z <FLAG>                   Unstable (nightly-only) flags to Cargo, see 'cargo -Z help' for details
-  -h, --help                  Print help
+    -h, --help
+            Prints help information
 
-Package Selection:
-  -p, --package [<SPEC>]  Package with the target to run
+        --progress
+            Show progress
 
-Target Selection:
-      --bin [<NAME>]      Name of the bin target to run
-      --example [<NAME>]  Name of the example target to run
+    -q, --quiet
+            Quiet mode, don't report errors
 
-Feature Selection:
-  -F, --features <FEATURES>  Space or comma separated list of features to activate
-      --all-features         Activate all available features
-      --no-default-features  Do not activate the `default` feature
+        --summary
+            Print summary at the end
 
-Compilation Options:
-  -j, --jobs <N>                Number of parallel jobs, defaults to # of CPUs.
-      --keep-going              Do not abort the build as soon as there is an error
-  -r, --release                 Build artifacts in release mode, with optimizations
-      --profile <PROFILE-NAME>  Build artifacts with the specified profile
-      --target [<TRIPLE>]       Build for the target triple
-      --target-dir <DIRECTORY>  Directory for all generated artifacts
-      --unit-graph              Output build graph in JSON (unstable)
-      --timings[=<FMTS>]        Timing output formats (unstable) (comma separated): html, json
+    -V, --version
+            Prints version information
 
-Manifest Options:
-      --manifest-path <PATH>  Path to Cargo.toml
-      --ignore-rust-version   Ignore `rust-version` specification in packages
-      --locked                Assert that `Cargo.lock` will remain unchanged
-      --offline               Run without accessing the network
-      --frozen                Equivalent to specifying both --locked and --offline
+    -v, --verbose
+            Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
 
-Run `cargo help run` for more detailed information.
+
+OPTIONS:
+        --max-blocking-threads <max-blocking-threads>
+            Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
+
+        --max-open-files <max-open-files>
+            Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system
+            limit
+        --max-workers <max-workers>
+            Number of worker threads, 0 means number of cores [default: 0]
+
+        --progress-type <progress-type>
+            Toggles the type of progress to show.
+
+            If specified, --progress flag is implied.
+
+            Options are: ProgressBar (animated progress bar), TextUpdates (appropriate for logging), Auto (default, will
+            choose between ProgressBar or TextUpdates depending on the type of terminal attached to stderr)
+
+ARGS:
+    <paths>...
+            Source path(s) and destination path
 ```
 
 rlink
@@ -188,50 +216,72 @@ A common pattern is to also provide `--update <path>` that overrides any paths i
 there.
 
 ```
-Usage: cargo run [OPTIONS] [ARGS]...
+USAGE:
+    rlink [FLAGS] [OPTIONS] <src> <dst>
 
-Arguments:
-  [ARGS]...  Arguments for the binary or example to run
+FLAGS:
+    -e, --fail-early
+            Exit on first error
 
-Options:
-      --message-format <FMT>  Error format
-  -v, --verbose...            Use verbose output (-vv very verbose/build.rs output)
-  -q, --quiet                 Do not print cargo log messages
-      --color <WHEN>          Coloring: auto, always, never
-      --config <KEY=VALUE>    Override a configuration value
-  -Z <FLAG>                   Unstable (nightly-only) flags to Cargo, see 'cargo -Z help' for details
-  -h, --help                  Print help
+    -h, --help
+            Prints help information
 
-Package Selection:
-  -p, --package [<SPEC>]  Package with the target to run
+    -o, --overwrite
+            Overwrite existing files/directories
 
-Target Selection:
-      --bin [<NAME>]      Name of the bin target to run
-      --example [<NAME>]  Name of the example target to run
+        --progress
+            Show progress
 
-Feature Selection:
-  -F, --features <FEATURES>  Space or comma separated list of features to activate
-      --all-features         Activate all available features
-      --no-default-features  Do not activate the `default` feature
+    -q, --quiet
+            Quiet mode, don't report errors
 
-Compilation Options:
-  -j, --jobs <N>                Number of parallel jobs, defaults to # of CPUs.
-      --keep-going              Do not abort the build as soon as there is an error
-  -r, --release                 Build artifacts in release mode, with optimizations
-      --profile <PROFILE-NAME>  Build artifacts with the specified profile
-      --target [<TRIPLE>]       Build for the target triple
-      --target-dir <DIRECTORY>  Directory for all generated artifacts
-      --unit-graph              Output build graph in JSON (unstable)
-      --timings[=<FMTS>]        Timing output formats (unstable) (comma separated): html, json
+        --summary
+            Print summary at the end
 
-Manifest Options:
-      --manifest-path <PATH>  Path to Cargo.toml
-      --ignore-rust-version   Ignore `rust-version` specification in packages
-      --locked                Assert that `Cargo.lock` will remain unchanged
-      --offline               Run without accessing the network
-      --frozen                Equivalent to specifying both --locked and --offline
+        --update-exclusive
+            Hard-link only the files that are in the update directory
 
-Run `cargo help run` for more detailed information.
+    -V, --version
+            Prints version information
+
+    -v, --verbose
+            Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+
+
+OPTIONS:
+        --max-blocking-threads <max-blocking-threads>
+            Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
+
+        --max-open-files <max-open-files>
+            Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system
+            limit
+        --max-workers <max-workers>
+            Number of worker threads, 0 means number of cores [default: 0]
+
+        --overwrite-compare <overwrite-compare>
+            Comma separated list of file attributes to compare when when deciding if files are "identical", used with
+            --overwrite flag. Options are: uid, gid, mode, size, mtime, ctime [default: size,mtime]
+        --progress-type <progress-type>
+            Toggles the type of progress to show.
+
+            If specified, --progress flag is implied.
+
+            Options are: ProgressBar (animated progress bar), TextUpdates (appropriate for logging), Auto (default, will
+            choose between ProgressBar or TextUpdates depending on the type of terminal attached to stderr)
+        --update <update>
+            Directory with updated contents of `link`
+
+        --update-compare <update-compare>
+            Same as overwrite-compare, but for deciding if we can hard-link or if we need to copy a file from the update
+            directory. Used with --update flag [default: size,mtime]
+
+ARGS:
+    <src>
+            Directory with contents we want to update into `dst`
+
+    <dst>
+            Directory where we put either a hard-link of a file from `link` if it was unchanged, or a copy of a file
+            from `new` if it's been modified
 ```
 
 rcmp
@@ -241,48 +291,74 @@ rcmp
 Currently, it only supports comparing metadata (no content checking).
 
 ```
-Usage: cargo run [OPTIONS] [ARGS]...
+USAGE:
+    rcmp [FLAGS] [OPTIONS] <src> <dst>
 
-Arguments:
-  [ARGS]...  Arguments for the binary or example to run
+FLAGS:
+    -m, --exit-early
+            Exit on first mismatch
 
-Options:
-      --message-format <FMT>  Error format
-  -v, --verbose...            Use verbose output (-vv very verbose/build.rs output)
-  -q, --quiet                 Do not print cargo log messages
-      --color <WHEN>          Coloring: auto, always, never
-      --config <KEY=VALUE>    Override a configuration value
-  -Z <FLAG>                   Unstable (nightly-only) flags to Cargo, see 'cargo -Z help' for details
-  -h, --help                  Print help
+    -e, --fail-early
+            Exit on first error
 
-Package Selection:
-  -p, --package [<SPEC>]  Package with the target to run
+    -h, --help
+            Prints help information
 
-Target Selection:
-      --bin [<NAME>]      Name of the bin target to run
-      --example [<NAME>]  Name of the example target to run
+        --no-check
+            Return non-zero exit code only if there were errors performing the comparison
 
-Feature Selection:
-  -F, --features <FEATURES>  Space or comma separated list of features to activate
-      --all-features         Activate all available features
-      --no-default-features  Do not activate the `default` feature
+        --progress
+            Show progress
 
-Compilation Options:
-  -j, --jobs <N>                Number of parallel jobs, defaults to # of CPUs.
-      --keep-going              Do not abort the build as soon as there is an error
-  -r, --release                 Build artifacts in release mode, with optimizations
-      --profile <PROFILE-NAME>  Build artifacts with the specified profile
-      --target [<TRIPLE>]       Build for the target triple
-      --target-dir <DIRECTORY>  Directory for all generated artifacts
-      --unit-graph              Output build graph in JSON (unstable)
-      --timings[=<FMTS>]        Timing output formats (unstable) (comma separated): html, json
+    -q, --quiet
+            Quiet mode, don't report errors
 
-Manifest Options:
-      --manifest-path <PATH>  Path to Cargo.toml
-      --ignore-rust-version   Ignore `rust-version` specification in packages
-      --locked                Assert that `Cargo.lock` will remain unchanged
-      --offline               Run without accessing the network
-      --frozen                Equivalent to specifying both --locked and --offline
+        --summary
+            Print summary at the end
 
-Run `cargo help run` for more detailed information.
+    -V, --version
+            Prints version information
+
+    -v, --verbose
+            Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+
+
+OPTIONS:
+        --log <log>
+            File name where to store comparison mismatch output
+
+        --max-blocking-threads <max-blocking-threads>
+            Number of blocking worker threads, 0 means Tokio runtime default (512) [default: 0]
+
+        --max-open-files <max-open-files>
+            Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system
+            limit
+        --max-workers <max-workers>
+            Number of worker threads, 0 means number of cores [default: 0]
+
+        --metadata-compare <metadata-compare>
+            Attributes to compare when when deciding if objects are "identical". Options are: uid, gid, mode, size,
+            mtime, ctime
+
+            The format is: "<type1>:<attributes1> <type2>:<attributes2> ..." Where <type> is one of: "f" (file), "d"
+            (directory), "l" (symlink) And <attributes> is a comma separated list of: uid, gid, size, mtime, ctime
+
+            Example: "f:mtime,ctime,mode,size d:mtime,ctime,mode l:mtime,ctime,mode"
+
+            Will return error code 1 if there are differences, 2 if there were errors. [default: f:mtime,size d:mtime
+            l:mtime]
+        --progress-type <progress-type>
+            Toggles the type of progress to show.
+
+            If specified, --progress flag is implied.
+
+            Options are: ProgressBar (animated progress bar), TextUpdates (appropriate for logging), Auto (default, will
+            choose between ProgressBar or TextUpdates depending on the type of terminal attached to stderr)
+
+ARGS:
+    <src>
+            File or directory to compare
+
+    <dst>
+            File or directory to compare
 ```
