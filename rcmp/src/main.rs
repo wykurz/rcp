@@ -60,7 +60,7 @@ struct Args {
     quiet: bool,
 
     /// File name where to store comparison mismatch output
-    #[structopt()]
+    #[structopt(long)]
     log: Option<std::path::PathBuf>,
 
     /// File or directory to compare
