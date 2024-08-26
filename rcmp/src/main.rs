@@ -53,9 +53,9 @@ struct Args {
     #[structopt(short = "q", long = "quiet")]
     quiet: bool,
 
-    /// File where we store comparison mismatch output
+    /// File where we store comparison mismatch output, implies --check if omitted
     #[structopt()]
-    log: std::path::PathBuf,
+    log: Option<std::path::PathBuf>,
 
     /// File or directory to compare
     #[structopt()]
@@ -79,7 +79,7 @@ struct Args {
 }
 
 async fn async_main(args: Args) -> Result<common::CmpSummary> {
-    let log_handle = common::LogWriter::new(&args.log).await?;
+    let log_handle = common::LogWriter::new(args.log.as_deref()).await?;
     let summary = common::cmp(
         &args.src,
         &args.dst,

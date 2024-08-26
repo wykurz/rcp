@@ -65,19 +65,24 @@ impl std::fmt::Display for CmpSummary {
 
 #[derive(Debug, Clone)]
 pub struct LogWriter {
-    log: std::sync::Arc<tokio::sync::Mutex<tokio::io::BufWriter<tokio::fs::File>>>,
+    log_opt: Option<std::sync::Arc<tokio::sync::Mutex<tokio::io::BufWriter<tokio::fs::File>>>>,
 }
 
 impl LogWriter {
-    pub async fn new(log_path: &std::path::Path) -> Result<Self> {
-        let log_file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(log_path)
-            .await
-            .with_context(|| format!("Failed to open log file: {:?}", log_path))?;
-        let log = std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::BufWriter::new(log_file)));
-        Ok(Self { log })
+    pub async fn new(log_path_opt: Option<&std::path::Path>) -> Result<Self> {
+        if let Some(log_path) = log_path_opt {
+            let log_file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(log_path)
+                .await
+                .with_context(|| format!("Failed to open log file: {:?}", log_path))?;
+            let log =
+                std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::BufWriter::new(log_file)));
+            Ok(Self { log_opt: Some(log) })
+        } else {
+            Ok(Self { log_opt: None })
+        }
     }
 
     pub async fn log_mismatch(
@@ -96,16 +101,21 @@ impl LogWriter {
     }
 
     async fn write(&self, msg: &str) -> Result<()> {
-        let mut log = self.log.lock().await;
-        log.write_all(msg.as_bytes())
-            .await
-            .context("Failed to write to log file")?;
+        if let Some(log) = &self.log_opt {
+            let mut log = log.lock().await;
+            log.write_all(msg.as_bytes())
+                .await
+                .context("Failed to write to log file")?;
+        }
         Ok(())
     }
 
     pub async fn flush(&self) -> Result<()> {
-        let mut log = self.log.lock().await;
-        log.flush().await.context("Failed to flush log file")
+        if let Some(log) = &self.log_opt {
+            let mut log = log.lock().await;
+            log.flush().await.context("Failed to flush log file")?;
+        }
+        Ok(())
     }
 }
 
@@ -356,7 +366,7 @@ mod cmp_tests {
             &PROGRESS,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &LogWriter::new(&tmp_dir.join("cmp.log").as_path()).await?,
+            &LogWriter::new(Some(&tmp_dir.join("cmp.log").as_path())).await?,
             &compare_settings,
         )
         .await?;
