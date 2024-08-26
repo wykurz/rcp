@@ -13,6 +13,7 @@ enum-map = "2.7"
 futures = "0.3"
 indicatif = "0.17"
 lazy_static = "1.4"
+libc = "0.2"
 nix = { version = "0.29", features = ["fs", "user"] }
 procfs = "0.16"
 sysinfo = "0.30"

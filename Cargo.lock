@@ -314,6 +314,7 @@ dependencies = [
  "futures",
  "indicatif",
  "lazy_static",
+ "libc",
  "nix",
  "procfs",
  "sysinfo",

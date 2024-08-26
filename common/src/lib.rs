@@ -347,6 +347,20 @@ fn print_runtime_stats() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+fn get_max_open_files() -> Result<u64, std::io::Error> {
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // Safety: we pass a valid "rlim" pointer and the result is checked
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) };
+    if result == 0 {
+        Ok(rlim.rlim_cur)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 #[instrument(skip(func))] // "func" is not Debug printable
 #[allow(clippy::too_many_arguments)]
 pub fn run<Fut, Summary, Error>(
@@ -356,7 +370,7 @@ pub fn run<Fut, Summary, Error>(
     summary: bool,
     max_workers: usize,
     max_blocking_threads: usize,
-    max_open_files: usize,
+    max_open_files: Option<usize>,
     func: impl FnOnce() -> Fut,
 ) -> Result<(), anyhow::Error>
 where
@@ -413,14 +427,27 @@ where
     if max_blocking_threads > 0 {
         builder.max_blocking_threads(max_blocking_threads);
     }
-    if max_open_files > 0 {
-        throttle::set_max_open_files(max_open_files);
-    }
     if !sysinfo::set_open_files_limit(isize::MAX) {
         event!(
             Level::INFO,
             "Failed to update the open files limit (expeted on non-linux targets)"
         );
+    }
+    let set_max_open_files = max_open_files.unwrap_or_else(|| {
+        let limit = get_max_open_files().expect(
+            "We failed to query rlimit, if this is expected try specifying --max-open-files",
+        ) as usize;
+        80 * limit / 100 // ~80% of the max open files limit
+    });
+    if set_max_open_files > 0 {
+        event!(
+            Level::INFO,
+            "Setting max open files to: {}",
+            set_max_open_files
+        );
+        throttle::set_max_open_files(set_max_open_files);
+    } else {
+        event!(Level::INFO, "Not applying any limit to max open files!",);
     }
     let runtime = builder.build()?;
     let res = {
