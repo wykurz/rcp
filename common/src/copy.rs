@@ -118,10 +118,7 @@ pub async fn copy_file(
         .with_context(|| format!("failed copying {:?} to {:?}", &src, &dst))
         .map_err(|err| CopyError::new(err, copy_summary))?;
     event!(Level::DEBUG, "setting permissions");
-    let writer = tokio::fs::File::open(dst)
-        .await
-        .map_err(|err| CopyError::new(anyhow::Error::msg(err), copy_summary))?;
-    preserve::set_file_metadata(preserve, &src_metadata, &writer, dst)
+    preserve::set_file_metadata(preserve, &src_metadata, dst)
         .await
         .map_err(|err| CopyError::new(err, copy_summary))?;
     copy_summary.files_copied += 1; // we mark files as "copied" only after all metadata is set as well

@@ -77,7 +77,7 @@ async fn set_owner_and_time(
     let metadata = metadata.to_owned();
     tokio::task::spawn_blocking(move || -> Result<()> {
         if settings.uid || settings.gid {
-            // set user and group - set those last, if those fail we at least have the timestamps set
+            // set user and group
             event!(Level::DEBUG, "setting uid ang gid");
             let uid = if settings.uid {
                 Some(metadata.uid().into())
@@ -126,7 +126,6 @@ async fn set_owner_and_time(
 pub async fn set_file_metadata(
     settings: &PreserveSettings,
     metadata: &std::fs::Metadata,
-    file: &tokio::fs::File,
     path: &std::path::Path,
 ) -> Result<()> {
     let permissions = if settings.file.mode_mask == 0o7777 {
@@ -135,9 +134,12 @@ pub async fn set_file_metadata(
     } else {
         std::fs::Permissions::from_mode(metadata.permissions().mode() & settings.file.mode_mask)
     };
+    let file = tokio::fs::File::open(path).await?;
     file.set_permissions(permissions.clone())
         .await
         .with_context(|| format!("cannot set {:?} permissions to {:?}", &path, &permissions))?;
+    // close the file we don't accidentally race and have permissions applied after the timestamps, which would modify them!
+    drop(file);
     set_owner_and_time(&settings.file.user_and_time, path, metadata).await?;
     Ok(())
 }
