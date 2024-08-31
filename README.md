@@ -126,6 +126,9 @@ OPTIONS:
         --max-workers <max-workers>
             Number of worker threads, 0 means number of cores [default: 0]
 
+        --ops-throttle <ops-throttle>
+            Throttle the number of opearations per second, 0 means no throttle [default: 0]
+
         --overwrite-compare <overwrite-compare>
             Comma separated list of file attributes to compare when when deciding if files are "identical", used with
             --overwrite flag. Options are: uid, gid, mode, size, mtime, ctime [default: size,mtime]
@@ -195,6 +198,9 @@ OPTIONS:
         --max-workers <max-workers>
             Number of worker threads, 0 means number of cores [default: 0]
 
+        --ops-throttle <ops-throttle>
+            Throttle the number of opearations per second, 0 means no throttle [default: 0]
+
         --progress-type <progress-type>
             Toggles the type of progress to show.
 
@@ -257,6 +263,9 @@ OPTIONS:
             limit
         --max-workers <max-workers>
             Number of worker threads, 0 means number of cores [default: 0]
+
+        --ops-throttle <ops-throttle>
+            Throttle the number of opearations per second, 0 means no throttle [default: 0]
 
         --overwrite-compare <overwrite-compare>
             Comma separated list of file attributes to compare when when deciding if files are "identical", used with
@@ -345,10 +354,11 @@ OPTIONS:
             The format is: "<type1>:<attributes1> <type2>:<attributes2> ..." Where <type> is one of: "f" (file), "d"
             (directory), "l" (symlink) And <attributes> is a comma separated list of: uid, gid, size, mtime, ctime
 
-            Example: "f:mtime,ctime,mode,size d:mtime,ctime,mode l:mtime,ctime,mode"
-
-            Will return error code 1 if there are differences, 2 if there were errors. [default: f:mtime,size d:mtime
+            Example: "f:mtime,ctime,mode,size d:mtime,ctime,mode l:mtime,ctime,mode" [default: f:mtime,size d:mtime
             l:mtime]
+        --ops-throttle <ops-throttle>
+            Throttle the number of opearations per second, 0 means no throttle [default: 0]
+
         --progress-type <progress-type>
             Toggles the type of progress to show.
 

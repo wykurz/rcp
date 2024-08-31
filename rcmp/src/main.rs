@@ -82,6 +82,10 @@ struct Args {
     /// Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system limit
     #[structopt(long)]
     max_open_files: Option<usize>,
+
+    /// Throttle the number of opearations per second, 0 means no throttle
+    #[structopt(long, default_value = "0")]
+    ops_throttle: usize,
 }
 
 async fn async_main(args: Args) -> Result<common::CmpSummary> {
@@ -119,6 +123,7 @@ fn main() -> Result<()> {
         args.max_workers,
         args.max_blocking_threads,
         args.max_open_files,
+        args.ops_throttle,
         func,
     );
     match res {

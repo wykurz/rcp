@@ -7,6 +7,7 @@ use tracing::{event, instrument, Level};
 use crate::copy::is_file_type_same;
 use crate::filecmp;
 use crate::progress;
+use crate::throttle;
 
 #[derive(Copy, Clone, Debug, Enum)]
 pub enum CmpResult {
@@ -140,6 +141,7 @@ pub async fn cmp(
     log: &LogWriter,
     settings: &CmpSettings,
 ) -> Result<CmpSummary> {
+    throttle::get_token().await;
     let _prog_guard = prog_track.guard();
     event!(Level::DEBUG, "reading source metadata");
     // it is impossible for src not exist other than user passing invalid path (which is an error)

@@ -4,6 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use tracing::{event, instrument, Level};
 
 use crate::progress;
+use crate::throttle;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
@@ -59,6 +60,7 @@ pub async fn rm(
     path: &std::path::Path,
     settings: &RmSettings,
 ) -> Result<RmSummary, RmError> {
+    throttle::get_token().await;
     let _prog_guard = prog_track.guard();
     event!(Level::DEBUG, "read path metadata");
     let src_metadata = tokio::fs::symlink_metadata(path)
