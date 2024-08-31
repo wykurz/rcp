@@ -8,6 +8,7 @@ use crate::filecmp;
 use crate::preserve;
 use crate::progress;
 use crate::rm;
+use crate::throttle;
 use crate::CopySettings;
 use crate::CopySummary;
 
@@ -134,6 +135,7 @@ pub async fn link(
     settings: &LinkSettings,
     mut is_fresh: bool,
 ) -> Result<LinkSummary, LinkError> {
+    throttle::get_token().await;
     let _prog_guard = prog_track.guard();
     event!(Level::DEBUG, "reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)

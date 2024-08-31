@@ -172,6 +172,7 @@ pub async fn copy(
     preserve: &preserve::PreserveSettings,
     mut is_fresh: bool,
 ) -> Result<CopySummary, CopyError> {
+    throttle::get_token().await;
     let _prog_guard = prog_track.guard();
     event!(Level::DEBUG, "reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)

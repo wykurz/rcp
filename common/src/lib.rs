@@ -372,6 +372,7 @@ pub fn run<Fut, Summary, Error>(
     max_workers: usize,
     max_blocking_threads: usize,
     max_open_files: Option<usize>,
+    ops_throttle: usize,
     func: impl FnOnce() -> Fut,
 ) -> Result<Summary, anyhow::Error>
 where
@@ -451,6 +452,16 @@ where
         event!(Level::INFO, "Not applying any limit to max open files!",);
     }
     let runtime = builder.build()?;
+    if ops_throttle > 0 {
+        let mut replenish = ops_throttle;
+        let mut interval = std::time::Duration::from_secs(1);
+        while replenish > 100 && interval > std::time::Duration::from_millis(1) {
+            replenish /= 10;
+            interval /= 10;
+        }
+        throttle::set_init_tokens(replenish);
+        runtime.spawn(throttle::start_replenish_thread(replenish, interval));
+    }
     let res = {
         let _progress =
             progress.map(|(op_name, progress_type)| ProgressTracker::new(progress_type, op_name));
