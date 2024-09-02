@@ -1,6 +1,6 @@
 [package]
 name = "rlink"
-version = "0.13.0"
+version = "0.14.0"
 description = "Tool for hard-linking files inspired by pcp/dsync."
 license = "MIT"
 edition = "2021"

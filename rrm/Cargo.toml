@@ -1,6 +1,6 @@
 [package]
 name = "rrm"
-version = "0.13.0"
+version = "0.14.0"
 description = "Tool for removing files similar to rm but MUCH faster."
 license = "MIT"
 edition = "2021"
