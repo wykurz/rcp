@@ -41,7 +41,7 @@ lazy_static! {
 }
 
 struct ProgressTracker {
-    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    lock_cvar: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     pbar_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -86,7 +86,7 @@ impl std::str::FromStr for ProgressType {
     }
 }
 
-fn progress_bar(is_done: std::sync::Arc<std::sync::atomic::AtomicBool>, op_name: &str) {
+fn progress_bar(lock: &std::sync::Mutex<bool>, cvar: &std::sync::Condvar, op_name: &str) {
     let pbar = indicatif::ProgressBar::new_spinner();
     pbar.set_style(
         indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -95,10 +95,8 @@ fn progress_bar(is_done: std::sync::Arc<std::sync::atomic::AtomicBool>, op_name:
     );
     let time_started = std::time::Instant::now();
     let mut last_update = time_started;
+    let mut is_done = lock.lock().unwrap();
     loop {
-        if is_done.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
         let progress_status = PROGRESS.get();
         let time_now = std::time::Instant::now();
         let finished = progress_status.finished;
@@ -112,19 +110,23 @@ fn progress_bar(is_done: std::sync::Arc<std::sync::atomic::AtomicBool>, op_name:
             finished, op_name, in_progress, avarage_rate, current_rate
         ));
         last_update = time_now;
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        let result = cvar
+            .wait_timeout(is_done, std::time::Duration::from_millis(200))
+            .unwrap();
+        is_done = result.0;
+        if *is_done {
+            break;
+        }
     }
     pbar.finish_and_clear();
 }
 
-fn text_updates(is_done: std::sync::Arc<std::sync::atomic::AtomicBool>, op_name: &str) {
+fn text_updates(lock: &std::sync::Mutex<bool>, cvar: &std::sync::Condvar, op_name: &str) {
     let time_started = std::time::Instant::now();
     let mut last_update = time_started;
     let mut prev_finished = 0;
+    let mut is_done = lock.lock().unwrap();
     loop {
-        if is_done.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
         let progress_status = PROGRESS.get();
         let time_now = std::time::Instant::now();
         let finished = progress_status.finished;
@@ -143,29 +145,37 @@ fn text_updates(is_done: std::sync::Arc<std::sync::atomic::AtomicBool>, op_name:
             current_rate
         );
         last_update = time_now;
-        std::thread::sleep(std::time::Duration::from_secs(10));
+        let result = cvar
+            .wait_timeout(is_done, std::time::Duration::from_secs(10))
+            .unwrap();
+        is_done = result.0;
+        if *is_done {
+            break;
+        }
     }
 }
 
 impl ProgressTracker {
     pub fn new(progress_type: ProgressType, op_name: &str) -> Self {
         let op_name = op_name.to_string();
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let done_clone = done.clone();
+        let lock_cvar =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let lock_cvar_clone = lock_cvar.clone();
         let pbar_thread = std::thread::spawn(move || {
+            let (lock, cvar) = &*lock_cvar_clone;
             let interactive = match progress_type {
                 ProgressType::Auto => std::io::stderr().is_terminal(),
                 ProgressType::ProgressBar => true,
                 ProgressType::TextUpdates => false,
             };
             if interactive {
-                progress_bar(done_clone, &op_name);
+                progress_bar(lock, cvar, &op_name);
             } else {
-                text_updates(done_clone, &op_name);
+                text_updates(lock, cvar, &op_name);
             }
         });
         Self {
-            done,
+            lock_cvar,
             pbar_thread: Some(pbar_thread),
         }
     }
@@ -173,7 +183,11 @@ impl ProgressTracker {
 
 impl Drop for ProgressTracker {
     fn drop(&mut self) {
-        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (lock, cvar) = &*self.lock_cvar;
+        let mut is_done = lock.lock().unwrap();
+        *is_done = true;
+        cvar.notify_one();
+        drop(is_done);
         if let Some(pbar_thread) = self.pbar_thread.take() {
             pbar_thread.join().unwrap();
         }
