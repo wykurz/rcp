@@ -312,6 +312,7 @@ dependencies = [
  "console-subscriber",
  "enum-map",
  "futures",
+ "humantime",
  "indicatif",
  "lazy_static",
  "libc",

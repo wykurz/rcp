@@ -36,6 +36,17 @@ struct Args {
     #[structopt(long)]
     progress_type: Option<ProgressType>,
 
+    /// Sets the delay between progress updates.
+    ///
+    /// - For the interactive (--progress-type=ProgressBar), the default is 200ms.
+    /// - For the non-interactive (--progress-type=TextUpdates), the default is 10s.
+    ///
+    /// If specified, --progress flag is implied.
+    ///
+    /// This option accepts a human readable duration, e.g. "200ms", "10s", "5min" etc.
+    #[structopt(long)]
+    progress_delay: Option<String>,
+
     /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
     #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
     verbose: u8,
@@ -146,7 +157,11 @@ fn main() -> Result<()> {
     };
     let res = common::run(
         if args.progress || args.progress_type.is_some() {
-            Some(("link", args.progress_type.unwrap_or_default()))
+            Some(common::ProgressSettings {
+                op_name: "link".to_string(),
+                progress_type: args.progress_type.unwrap_or_default(),
+                progress_delay: args.progress_delay,
+            })
         } else {
             None
         },

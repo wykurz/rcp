@@ -86,8 +86,21 @@ impl std::str::FromStr for ProgressType {
     }
 }
 
-fn progress_bar(lock: &std::sync::Mutex<bool>, cvar: &std::sync::Condvar, op_name: &str) {
+#[derive(Debug)]
+pub struct ProgressSettings {
+    pub op_name: String,
+    pub progress_type: ProgressType,
+    pub progress_delay: Option<String>,
+}
+
+fn progress_bar(
+    lock: &std::sync::Mutex<bool>,
+    cvar: &std::sync::Condvar,
+    op_name: &str,
+    delay_opt: &Option<std::time::Duration>,
+) {
     let pbar = indicatif::ProgressBar::new_spinner();
+    let delay = delay_opt.unwrap_or(std::time::Duration::from_millis(200));
     pbar.set_style(
         indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
             .unwrap()
@@ -110,9 +123,7 @@ fn progress_bar(lock: &std::sync::Mutex<bool>, cvar: &std::sync::Condvar, op_nam
             finished, op_name, in_progress, avarage_rate, current_rate
         ));
         last_update = time_now;
-        let result = cvar
-            .wait_timeout(is_done, std::time::Duration::from_millis(200))
-            .unwrap();
+        let result = cvar.wait_timeout(is_done, delay).unwrap();
         is_done = result.0;
         if *is_done {
             break;
@@ -121,8 +132,14 @@ fn progress_bar(lock: &std::sync::Mutex<bool>, cvar: &std::sync::Condvar, op_nam
     pbar.finish_and_clear();
 }
 
-fn text_updates(lock: &std::sync::Mutex<bool>, cvar: &std::sync::Condvar, op_name: &str) {
+fn text_updates(
+    lock: &std::sync::Mutex<bool>,
+    cvar: &std::sync::Condvar,
+    op_name: &str,
+    delay_opt: &Option<std::time::Duration>,
+) {
     let time_started = std::time::Instant::now();
+    let delay = delay_opt.unwrap_or(std::time::Duration::from_secs(10));
     let mut last_update = time_started;
     let mut prev_finished = 0;
     let mut is_done = lock.lock().unwrap();
@@ -145,9 +162,7 @@ fn text_updates(lock: &std::sync::Mutex<bool>, cvar: &std::sync::Condvar, op_nam
             current_rate
         );
         last_update = time_now;
-        let result = cvar
-            .wait_timeout(is_done, std::time::Duration::from_secs(10))
-            .unwrap();
+        let result = cvar.wait_timeout(is_done, delay).unwrap();
         is_done = result.0;
         if *is_done {
             break;
@@ -156,7 +171,11 @@ fn text_updates(lock: &std::sync::Mutex<bool>, cvar: &std::sync::Condvar, op_nam
 }
 
 impl ProgressTracker {
-    pub fn new(progress_type: ProgressType, op_name: &str) -> Self {
+    pub fn new(
+        progress_type: ProgressType,
+        op_name: &str,
+        delay_opt: Option<std::time::Duration>,
+    ) -> Self {
         let op_name = op_name.to_string();
         let lock_cvar =
             std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
@@ -169,9 +188,9 @@ impl ProgressTracker {
                 ProgressType::TextUpdates => false,
             };
             if interactive {
-                progress_bar(lock, cvar, &op_name);
+                progress_bar(lock, cvar, &op_name, &delay_opt);
             } else {
-                text_updates(lock, cvar, &op_name);
+                text_updates(lock, cvar, &op_name, &delay_opt);
             }
         });
         Self {
@@ -379,7 +398,7 @@ fn get_max_open_files() -> Result<u64, std::io::Error> {
 #[instrument(skip(func))] // "func" is not Debug printable
 #[allow(clippy::too_many_arguments)]
 pub fn run<Fut, Summary, Error>(
-    progress: Option<(&str, ProgressType)>,
+    progress: Option<ProgressSettings>,
     quiet: bool,
     verbose: u8,
     print_summary: bool,
@@ -477,8 +496,13 @@ where
         runtime.spawn(throttle::start_replenish_thread(replenish, interval));
     }
     let res = {
-        let _progress =
-            progress.map(|(op_name, progress_type)| ProgressTracker::new(progress_type, op_name));
+        let _progress = progress.map(|settings| {
+            let delay = settings.progress_delay.map(|delay_str| {
+                humantime::parse_duration(&delay_str)
+                    .expect("Couldn't parse duration out of --progress-delay")
+            });
+            ProgressTracker::new(settings.progress_type, &settings.op_name, delay)
+        });
         runtime.block_on(func())
     };
     if let Err(error) = res {
