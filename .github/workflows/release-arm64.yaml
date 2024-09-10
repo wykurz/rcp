@@ -1,0 +1,91 @@
+name: Release ARM64
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag'
+        required: true
+
+jobs:
+  build-deb-package:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Set up Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+    - name: Add target
+      run: rustup target add aarch64-unknown-linux-gnu
+    - name: Install builders
+      run: cargo install cargo-deb
+    - name: Build
+      uses: actions-rs/cargo@v1
+      with:
+        use-cross: true
+        command: build
+        args: --release --target=aarch64-unknown-linux-gnu
+    - name: Build Debian package
+      run: |
+        cargo deb --target=aarch64-unknown-linux-gnu --no-build -p rcp
+        cargo deb --target=aarch64-unknown-linux-gnu --no-build -p rlink
+        cargo deb --target=aarch64-unknown-linux-gnu --no-build -p rrm
+        cargo deb --target=aarch64-unknown-linux-gnu --no-build -p rcmp
+        cargo deb --target=aarch64-unknown-linux-gnu --no-build -p filegen
+        zip rcp-deb-arm64-${{ github.event.release.tag_name }}.zip target/aarch64-unknown-linux-gnu/debian/*.deb
+        echo $(pwd)/rcp-deb-arm64-${{ github.event.release.tag_name }}
+        ls -ld $(pwd)/rcp-deb-arm64-${{ github.event.release.tag_name }}*
+    - name: Upload to GitHub Release
+      uses: actions/upload-release-asset@v1
+      env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ./rcp-deb-arm64-${{ github.event.release.tag_name }}.zip
+        asset_name: rcp-deb-arm64-${{ github.event.release.tag_name }}.zip
+        asset_content_type: application/zip
+
+  build-rpm-package:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Set up Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+    - name: Add target
+      run: rustup target add aarch64-unknown-linux-gnu
+    - name: Install builders
+      run: cargo install cargo-generate-rpm
+    - name: Build
+      uses: actions-rs/cargo@v1
+      with:
+        use-cross: true
+        command: build
+        args: --release --target=aarch64-unknown-linux-gnu
+    - name: Build RPM package
+      run: |
+        cargo generate-rpm --target-dir=target/aarch64-unknown-linux-gnu -p rcp
+        cargo generate-rpm --target-dir=target/aarch64-unknown-linux-gnu -p rlink
+        cargo generate-rpm --target-dir=target/aarch64-unknown-linux-gnu -p rrm
+        cargo generate-rpm --target-dir=target/aarch64-unknown-linux-gnu -p rcmp
+        cargo generate-rpm --target-dir=target/aarch64-unknown-linux-gnu -p filegen
+        zip rcp-rpm-arm64-${{ github.event.release.tag_name }}.zip target/aarch64-unknown-linux-gnu/generate-rpm/*.rpm
+        echo $(pwd)/rcp-rpm-arm64-${{ github.event.release.tag_name }}
+        ls -ld $(pwd)/rcp-rpm-arm64-${{ github.event.release.tag_name }}*
+    - name: Upload to GitHub Release
+      uses: actions/upload-release-asset@v1
+      env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ./rcp-rpm-arm64-${{ github.event.release.tag_name }}.zip
+        asset_name: rcp-rpm-arm64-${{ github.event.release.tag_name }}.zip
+        asset_content_type: application/zip
