@@ -6,9 +6,9 @@ use tracing::{event, instrument, Level};
 #[derive(StructOpt, Debug, Clone)]
 #[structopt(
     name = "rrm",
-    about = "`rrm` is a simple tool for removing large numbers of files.
+    about = "`rrm` is a tool for removing large number of files.
 
-Note the basic usage is equivalent to `rm -rf`."
+Basic usage is equivalent to `rm -rf`."
 )]
 struct Args {
     /// Exit on first error

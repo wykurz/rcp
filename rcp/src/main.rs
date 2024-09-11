@@ -51,7 +51,7 @@ struct Args {
     #[structopt(long)]
     progress_delay: Option<String>,
 
-    /// Preserve additional file attributes: file owner, group, setuid, setgid, mtime and atime
+    /// Preserve file metadata: file owner, group, setuid, setgid, mtime, atime and mode.
     #[structopt(short, long)]
     preserve: bool,
 
