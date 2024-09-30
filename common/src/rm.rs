@@ -56,7 +56,7 @@ impl std::fmt::Display for RmSummary {
 #[instrument(skip(prog_track))]
 #[async_recursion]
 pub async fn rm(
-    prog_track: &'static progress::TlsProgress,
+    prog_track: &'static progress::ProgressCounter,
     path: &std::path::Path,
     settings: &RmSettings,
 ) -> Result<RmSummary, RmError> {
@@ -152,7 +152,7 @@ mod tests {
     use tracing_test::traced_test;
 
     lazy_static! {
-        static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
+        static ref PROGRESS: progress::ProgressCounter = progress::ProgressCounter::new();
     }
 
     #[tokio::test]

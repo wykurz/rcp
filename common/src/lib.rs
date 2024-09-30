@@ -37,7 +37,7 @@ pub use rm::RmSettings;
 pub use rm::RmSummary;
 
 lazy_static! {
-    static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
+    static ref PROGRESS: progress::Progress = progress::Progress::new();
 }
 
 struct ProgressTracker {

@@ -31,24 +31,23 @@ impl Default for TlsCounter {
 }
 
 #[derive(Debug)]
-pub struct TlsProgress {
+pub struct ProgressCounter {
     started: TlsCounter,
     finished: TlsCounter,
-    start_time: std::time::Instant,
 }
 
-impl Default for TlsProgress {
+impl Default for ProgressCounter {
     fn default() -> Self {
         Self::new()
     }
 }
 
 pub struct ProgressGuard<'a> {
-    progress: &'a TlsProgress,
+    progress: &'a ProgressCounter,
 }
 
 impl<'a> ProgressGuard<'a> {
-    pub fn new(progress: &'a TlsProgress) -> Self {
+    pub fn new(progress: &'a ProgressCounter) -> Self {
         progress.started.inc();
         Self { progress }
     }
@@ -65,12 +64,11 @@ pub struct Status {
     pub finished: u64,
 }
 
-impl TlsProgress {
+impl ProgressCounter {
     pub fn new() -> Self {
         Self {
             started: TlsCounter::new(),
             finished: TlsCounter::new(),
-            start_time: std::time::Instant::now(),
         }
     }
 
@@ -94,6 +92,69 @@ impl TlsProgress {
             status.started = status.finished;
         }
         status
+    }
+}
+
+pub struct Progress {
+    ops: ProgressCounter,
+    bytes: ProgressCounter,
+    hard_links_created: ProgressCounter,
+    directories_created: ProgressCounter,
+    symlinks_created: ProgressCounter,
+    files_copied: ProgressCounter,
+    symlinks_removed: ProgressCounter,
+    files_removed: ProgressCounter,
+    directories_removed: ProgressCounter,
+    unchanged: ProgressCounter,
+    start_time: std::time::Instant,
+}
+
+impl Progress {
+    pub fn new() -> Self {
+        Self {
+            ops: Default::default(),
+            bytes: Default::default(),
+            hard_links_created: Default::default(),
+            directories_created: Default::default(),
+            symlinks_created: Default::default(),
+            files_copied: Default::default(),
+            symlinks_removed: Default::default(),
+            files_removed: Default::default(),
+            directories_removed: Default::default(),
+            unchanged: Default::default(),
+            start_time: std::time::Instant::now(),
+        }
+    }
+
+    // TODO: move to a CopyPrinter object (that implements Display) and store things like the last query time, last ops, etc.
+    pub fn print_copy_progress(&self, since: &std::time::Instant) -> String {
+
+        // let time_now = std::time::Instant::now();
+        // let finished = progress_status.finished;
+        // let in_progress = progress_status.started - progress_status.finished;
+        // let avarage_rate = finished as f64 / time_started.elapsed().as_secs_f64();
+        // let current_rate =
+        //     (finished - pbar.position()) as f64 / (time_now - last_update).as_secs_f64();
+
+        let time_now = std::time::Instant::now();
+        let ops = self.ops.get();
+        let avarage_rate = ops.finished as f64 / since.elapsed().as_secs_f64();
+        let current_rate =
+            (ops.finished - pbar.position()) as f64 / (time_now - last_update).as_secs_f64();
+
+        format!("pending: {} | average: {:.2} items/s | current: {:.2} items/s | copied: {} | hard_links_created: {} | directories_created: {} | symlinks_created: {} | files_copied: {} | symlinks_removed: {} | files_removed: {} | directories_removed: {} | unchanged: {} | duration: {:?}",
+        ops.started - ops.finished, // pending
+        avarage_rate, // average
+        self.bytes.get().started,
+        self.hard_links_created.get().started,
+        self.directories_created.get().started,
+        self.symlinks_created.get().started,
+        self.files_copied.get().started,
+        self.symlinks_removed.get().started,
+        self.files_removed.get().started,
+        self.directories_removed.get().started,
+        self.unchanged.get().started,
+        self.get_duration())
     }
 
     pub fn get_duration(&self) -> std::time::Duration {
@@ -135,7 +196,7 @@ mod tests {
 
     #[test]
     fn basic_guard() -> Result<()> {
-        let tls_progress = TlsProgress::new();
+        let tls_progress = ProgressCounter::new();
         let _guard = tls_progress.guard();
         Ok(())
     }

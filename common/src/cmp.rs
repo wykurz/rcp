@@ -135,7 +135,7 @@ fn obj_type(metadata: &std::fs::Metadata) -> ObjType {
 #[instrument(skip(prog_track))]
 #[async_recursion]
 pub async fn cmp(
-    prog_track: &'static progress::TlsProgress,
+    prog_track: &'static progress::ProgressCounter,
     src: &std::path::Path,
     dst: &std::path::Path,
     log: &LogWriter,
@@ -283,7 +283,7 @@ mod cmp_tests {
     use super::*;
 
     lazy_static! {
-        static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
+        static ref PROGRESS: progress::ProgressCounter = progress::ProgressCounter::new();
         static ref NO_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_default();
         static ref DO_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_all();
     }

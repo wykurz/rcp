@@ -73,7 +73,7 @@ fn is_hard_link(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
 
 #[instrument]
 async fn hard_link_helper(
-    prog_track: &'static progress::TlsProgress,
+    prog_track: &'static progress::ProgressCounter,
     src: &std::path::Path,
     src_metadata: &std::fs::Metadata,
     dst: &std::path::Path,
@@ -127,7 +127,7 @@ async fn hard_link_helper(
 #[instrument(skip(prog_track))]
 #[async_recursion]
 pub async fn link(
-    prog_track: &'static progress::TlsProgress,
+    prog_track: &'static progress::ProgressCounter,
     cwd: &std::path::Path,
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -528,7 +528,7 @@ mod link_tests {
     use super::*;
 
     lazy_static! {
-        static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
+        static ref PROGRESS: progress::ProgressCounter = progress::ProgressCounter::new();
     }
 
     fn common_settings(dereference: bool, overwrite: bool) -> LinkSettings {

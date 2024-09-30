@@ -43,7 +43,7 @@ pub fn is_file_type_same(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bo
 
 #[instrument(skip(prog_track))]
 pub async fn copy_file(
-    prog_track: &'static progress::TlsProgress,
+    prog_track: &'static progress::ProgressCounter,
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &CopySettings,
@@ -164,7 +164,7 @@ impl std::fmt::Display for CopySummary {
 #[instrument(skip(prog_track))]
 #[async_recursion]
 pub async fn copy(
-    prog_track: &'static progress::TlsProgress,
+    prog_track: &'static progress::ProgressCounter,
     cwd: &std::path::Path,
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -483,7 +483,7 @@ mod copy_tests {
     use super::*;
 
     lazy_static! {
-        static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
+        static ref PROGRESS: progress::ProgressCounter = progress::ProgressCounter::new();
         static ref NO_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_default();
         static ref DO_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_all();
     }
