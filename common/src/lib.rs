@@ -37,7 +37,7 @@ pub use rm::RmSettings;
 pub use rm::RmSummary;
 
 lazy_static! {
-    static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
+    static ref PROGRESS: progress::Progress = progress::Progress::new();
 }
 
 struct ProgressTracker {
@@ -88,7 +88,6 @@ impl std::str::FromStr for ProgressType {
 
 #[derive(Debug)]
 pub struct ProgressSettings {
-    pub op_name: String,
     pub progress_type: ProgressType,
     pub progress_delay: Option<String>,
 }
@@ -96,7 +95,6 @@ pub struct ProgressSettings {
 fn progress_bar(
     lock: &std::sync::Mutex<bool>,
     cvar: &std::sync::Condvar,
-    op_name: &str,
     delay_opt: &Option<std::time::Duration>,
 ) {
     let pbar = indicatif::ProgressBar::new_spinner();
@@ -106,23 +104,11 @@ fn progress_bar(
             .unwrap()
             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
     );
-    let time_started = std::time::Instant::now();
-    let mut last_update = time_started;
+    let mut prog_printer = progress::ProgressPrinter::new(&PROGRESS);
     let mut is_done = lock.lock().unwrap();
     loop {
-        let progress_status = PROGRESS.get();
-        let time_now = std::time::Instant::now();
-        let finished = progress_status.finished;
-        let in_progress = progress_status.started - progress_status.finished;
-        let avarage_rate = finished as f64 / time_started.elapsed().as_secs_f64();
-        let current_rate =
-            (finished - pbar.position()) as f64 / (time_now - last_update).as_secs_f64();
-        pbar.set_position(finished);
-        pbar.set_message(format!(
-            "done: {} | {}: {} | average: {:.2} items/s | current: {:.2} items/s",
-            finished, op_name, in_progress, avarage_rate, current_rate
-        ));
-        last_update = time_now;
+        pbar.set_position(pbar.position() + 1); // do we need to update?
+        pbar.set_message(prog_printer.print().unwrap());
         let result = cvar.wait_timeout(is_done, delay).unwrap();
         is_done = result.0;
         if *is_done {
@@ -135,33 +121,13 @@ fn progress_bar(
 fn text_updates(
     lock: &std::sync::Mutex<bool>,
     cvar: &std::sync::Condvar,
-    op_name: &str,
     delay_opt: &Option<std::time::Duration>,
 ) {
-    let time_started = std::time::Instant::now();
     let delay = delay_opt.unwrap_or(std::time::Duration::from_secs(10));
-    let mut last_update = time_started;
-    let mut prev_finished = 0;
+    let mut prog_printer = progress::ProgressPrinter::new(&PROGRESS);
     let mut is_done = lock.lock().unwrap();
     loop {
-        let progress_status = PROGRESS.get();
-        let time_now = std::time::Instant::now();
-        let finished = progress_status.finished;
-        let in_progress = progress_status.started - progress_status.finished;
-        let avarage_rate = finished as f64 / time_started.elapsed().as_secs_f64();
-        let current_rate =
-            (finished - prev_finished) as f64 / (time_now - last_update).as_secs_f64();
-        prev_finished = finished;
-        eprintln!(
-            "{} :: done: {} | {}: {} | average: {:.2} items/s | current: {:.2} items/s",
-            chrono::Local::now(),
-            finished,
-            op_name,
-            in_progress,
-            avarage_rate,
-            current_rate
-        );
-        last_update = time_now;
+        eprintln!("{}", prog_printer.print().unwrap());
         let result = cvar.wait_timeout(is_done, delay).unwrap();
         is_done = result.0;
         if *is_done {
@@ -171,12 +137,7 @@ fn text_updates(
 }
 
 impl ProgressTracker {
-    pub fn new(
-        progress_type: ProgressType,
-        op_name: &str,
-        delay_opt: Option<std::time::Duration>,
-    ) -> Self {
-        let op_name = op_name.to_string();
+    pub fn new(progress_type: ProgressType, delay_opt: Option<std::time::Duration>) -> Self {
         let lock_cvar =
             std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let lock_cvar_clone = lock_cvar.clone();
@@ -188,9 +149,9 @@ impl ProgressTracker {
                 ProgressType::TextUpdates => false,
             };
             if interactive {
-                progress_bar(lock, cvar, &op_name, &delay_opt);
+                progress_bar(lock, cvar, &delay_opt);
             } else {
-                text_updates(lock, cvar, &op_name, &delay_opt);
+                text_updates(lock, cvar, &delay_opt);
             }
         });
         Self {
@@ -501,7 +462,7 @@ where
                 humantime::parse_duration(&delay_str)
                     .expect("Couldn't parse duration out of --progress-delay")
             });
-            ProgressTracker::new(settings.progress_type, &settings.op_name, delay)
+            ProgressTracker::new(settings.progress_type, delay)
         });
         runtime.block_on(func())
     };

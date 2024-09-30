@@ -43,7 +43,7 @@ pub fn is_file_type_same(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bo
 
 #[instrument(skip(prog_track))]
 pub async fn copy_file(
-    prog_track: &'static progress::TlsProgress,
+    prog_track: &'static progress::Progress,
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &CopySettings,
@@ -75,6 +75,7 @@ pub async fn copy_file(
                 )
             {
                 event!(Level::DEBUG, "file is identical, skipping");
+                prog_track.files_unchanged.inc();
                 return Ok(CopySummary {
                     files_unchanged: 1,
                     ..Default::default()
@@ -117,36 +118,42 @@ pub async fn copy_file(
         .await
         .with_context(|| format!("failed copying {:?} to {:?}", &src, &dst))
         .map_err(|err| CopyError::new(err, copy_summary))?;
+    prog_track.files_copied.inc();
+    prog_track.bytes_copied.add(src_metadata.len());
     event!(Level::DEBUG, "setting permissions");
     preserve::set_file_metadata(preserve, &src_metadata, dst)
         .await
         .map_err(|err| CopyError::new(err, copy_summary))?;
-    copy_summary.files_copied += 1; // we mark files as "copied" only after all metadata is set as well
+    // we mark files as "copied" only after all metadata is set as well
+    copy_summary.bytes_copied += src_metadata.len();
+    copy_summary.files_copied += 1;
     Ok(copy_summary)
 }
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct CopySummary {
-    pub rm_summary: RmSummary,
+    pub bytes_copied: u64,
     pub files_copied: usize,
     pub symlinks_created: usize,
     pub directories_created: usize,
     pub files_unchanged: usize,
     pub symlinks_unchanged: usize,
     pub directories_unchanged: usize,
+    pub rm_summary: RmSummary,
 }
 
 impl std::ops::Add for CopySummary {
     type Output = Self;
     fn add(self, other: Self) -> Self {
         Self {
-            rm_summary: self.rm_summary + other.rm_summary,
+            bytes_copied: self.bytes_copied + other.bytes_copied,
             files_copied: self.files_copied + other.files_copied,
             symlinks_created: self.symlinks_created + other.symlinks_created,
             directories_created: self.directories_created + other.directories_created,
             files_unchanged: self.files_unchanged + other.files_unchanged,
             symlinks_unchanged: self.symlinks_unchanged + other.symlinks_unchanged,
             directories_unchanged: self.directories_unchanged + other.directories_unchanged,
+            rm_summary: self.rm_summary + other.rm_summary,
         }
     }
 }
@@ -155,8 +162,22 @@ impl std::fmt::Display for CopySummary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "{}\nfiles copied: {}\nsymlinks created: {}\ndirectories created: {}\nfiles_unchanged: {}\ndirectories_unchanged: {}\n",
-            &self.rm_summary, self.files_copied, self.symlinks_created, self.directories_created, self.files_unchanged, self.directories_unchanged
+            "bytes copied: {}\n\
+            files copied: {}\n\
+            symlinks created: {}\n\
+            directories created: {}\n\
+            files unchanged: {}\n\
+            symlinks unchanged: {}\n\
+            directories unchanged: {}\n\
+            {}",
+            bytesize::ByteSize(self.bytes_copied),
+            self.files_copied,
+            self.symlinks_created,
+            self.directories_created,
+            self.files_unchanged,
+            self.symlinks_unchanged,
+            self.directories_unchanged,
+            &self.rm_summary,
         )
     }
 }
@@ -164,7 +185,7 @@ impl std::fmt::Display for CopySummary {
 #[instrument(skip(prog_track))]
 #[async_recursion]
 pub async fn copy(
-    prog_track: &'static progress::TlsProgress,
+    prog_track: &'static progress::Progress,
     cwd: &std::path::Path,
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -173,7 +194,7 @@ pub async fn copy(
     mut is_fresh: bool,
 ) -> Result<CopySummary, CopyError> {
     throttle::get_token().await;
-    let _prog_guard = prog_track.guard();
+    let _ops_guard = prog_track.ops.guard();
     event!(Level::DEBUG, "reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
@@ -246,6 +267,8 @@ pub async fn copy(
                                 preserve::set_symlink_metadata(preserve, &src_metadata, dst)
                                     .await
                                     .map_err(|err| CopyError::new(err, Default::default()))?;
+                                prog_track.symlinks_removed.inc();
+                                prog_track.symlinks_created.inc();
                                 return Ok(CopySummary {
                                     rm_summary: RmSummary {
                                         symlinks_removed: 1,
@@ -257,6 +280,7 @@ pub async fn copy(
                             }
                         }
                         event!(Level::DEBUG, "symlink already exists, skipping");
+                        prog_track.symlinks_unchanged.inc();
                         return Ok(CopySummary {
                             symlinks_unchanged: 1,
                             ..Default::default()
@@ -311,6 +335,7 @@ pub async fn copy(
                 };
                 CopyError::new(err, copy_summary)
             })?;
+        prog_track.symlinks_created.inc();
         return Ok(CopySummary {
             rm_summary,
             symlinks_created: 1,
@@ -347,6 +372,7 @@ pub async fn copy(
                     .map_err(|err| CopyError::new(err, Default::default()))?;
                 if dst_metadata.is_dir() {
                     event!(Level::DEBUG, "'dst' is a directory, leaving it as is");
+                    prog_track.directories_unchanged.inc();
                     CopySummary {
                         directories_unchanged: 1,
                         ..Default::default()
@@ -384,6 +410,7 @@ pub async fn copy(
                         })?;
                     // anythingg copied into dst may assume they don't need to check for conflicts
                     is_fresh = true;
+                    prog_track.directories_created.inc();
                     CopySummary {
                         rm_summary,
                         directories_created: 1,
@@ -400,6 +427,7 @@ pub async fn copy(
         } else {
             // new directory created, anythingg copied into dst may assume they don't need to check for conflicts
             is_fresh = true;
+            prog_track.directories_created.inc();
             CopySummary {
                 directories_created: 1,
                 ..Default::default()
@@ -483,7 +511,7 @@ mod copy_tests {
     use super::*;
 
     lazy_static! {
-        static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
+        static ref PROGRESS: progress::Progress = progress::Progress::new();
         static ref NO_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_default();
         static ref DO_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_all();
     }

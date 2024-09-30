@@ -47,7 +47,9 @@ impl std::fmt::Display for RmSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "files removed: {}\nsymlinks removed: {}\ndirectories removed: {}",
+            "files removed: {}\n\
+            symlinks removed: {}\n\
+            directories removed: {}",
             self.files_removed, self.symlinks_removed, self.directories_removed
         )
     }
@@ -56,12 +58,12 @@ impl std::fmt::Display for RmSummary {
 #[instrument(skip(prog_track))]
 #[async_recursion]
 pub async fn rm(
-    prog_track: &'static progress::TlsProgress,
+    prog_track: &'static progress::Progress,
     path: &std::path::Path,
     settings: &RmSettings,
 ) -> Result<RmSummary, RmError> {
     throttle::get_token().await;
-    let _prog_guard = prog_track.guard();
+    let _ops_guard = prog_track.ops.guard();
     event!(Level::DEBUG, "read path metadata");
     let src_metadata = tokio::fs::symlink_metadata(path)
         .await
@@ -74,11 +76,13 @@ pub async fn rm(
             .with_context(|| format!("failed removing {:?}", &path))
             .map_err(|err| RmError::new(anyhow::Error::msg(err), Default::default()))?;
         if src_metadata.file_type().is_symlink() {
+            prog_track.symlinks_removed.inc();
             return Ok(RmSummary {
                 symlinks_removed: 1,
                 ..Default::default()
             });
         }
+        prog_track.files_removed.inc();
         return Ok(RmSummary {
             files_removed: 1,
             ..Default::default()
@@ -141,6 +145,7 @@ pub async fn rm(
         .await
         .with_context(|| format!("failed removing directory {:?}", &path))
         .map_err(|err| RmError::new(anyhow::Error::msg(err), rm_summary))?;
+    prog_track.directories_removed.inc();
     rm_summary.directories_removed += 1;
     Ok(rm_summary)
 }
@@ -152,7 +157,7 @@ mod tests {
     use tracing_test::traced_test;
 
     lazy_static! {
-        static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
+        static ref PROGRESS: progress::Progress = progress::Progress::new();
     }
 
     #[tokio::test]

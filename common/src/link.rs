@@ -71,9 +71,9 @@ fn is_hard_link(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
         && md2.st_ino() == md1.st_ino()
 }
 
-#[instrument]
+#[instrument(skip(prog_track))]
 async fn hard_link_helper(
-    prog_track: &'static progress::TlsProgress,
+    prog_track: &'static progress::Progress,
     src: &std::path::Path,
     src_metadata: &std::fs::Metadata,
     dst: &std::path::Path,
@@ -92,6 +92,7 @@ async fn hard_link_helper(
                 .map_err(|err| LinkError::new(err, Default::default()))?;
             if is_hard_link(src_metadata, &dst_metadata) {
                 event!(Level::DEBUG, "no change, leaving file as is");
+                prog_track.hard_links_unchanged.inc();
                 return Ok(LinkSummary {
                     hard_links_unchanged: 1,
                     ..Default::default()
@@ -120,6 +121,7 @@ async fn hard_link_helper(
                 .map_err(|err| LinkError::new(anyhow::Error::msg(err), link_summary))?;
         }
     }
+    prog_track.hard_links_created.inc();
     link_summary.hard_links_created = 1;
     Ok(link_summary)
 }
@@ -127,7 +129,7 @@ async fn hard_link_helper(
 #[instrument(skip(prog_track))]
 #[async_recursion]
 pub async fn link(
-    prog_track: &'static progress::TlsProgress,
+    prog_track: &'static progress::Progress,
     cwd: &std::path::Path,
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -136,7 +138,7 @@ pub async fn link(
     mut is_fresh: bool,
 ) -> Result<LinkSummary, LinkError> {
     throttle::get_token().await;
-    let _prog_guard = prog_track.guard();
+    let _prog_guard = prog_track.ops.guard();
     event!(Level::DEBUG, "reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
@@ -528,7 +530,7 @@ mod link_tests {
     use super::*;
 
     lazy_static! {
-        static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
+        static ref PROGRESS: progress::Progress = progress::Progress::new();
     }
 
     fn common_settings(dereference: bool, overwrite: bool) -> LinkSettings {
