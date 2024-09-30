@@ -135,14 +135,14 @@ fn obj_type(metadata: &std::fs::Metadata) -> ObjType {
 #[instrument(skip(prog_track))]
 #[async_recursion]
 pub async fn cmp(
-    prog_track: &'static progress::TlsProgress,
+    prog_track: &'static progress::Progress,
     src: &std::path::Path,
     dst: &std::path::Path,
     log: &LogWriter,
     settings: &CmpSettings,
 ) -> Result<CmpSummary> {
     throttle::get_token().await;
-    let _prog_guard = prog_track.guard();
+    let _prog_guard = prog_track.ops.guard();
     event!(Level::DEBUG, "reading source metadata");
     // it is impossible for src not exist other than user passing invalid path (which is an error)
     let src_metadata = tokio::fs::symlink_metadata(src)
@@ -283,7 +283,7 @@ mod cmp_tests {
     use super::*;
 
     lazy_static! {
-        static ref PROGRESS: progress::TlsProgress = progress::TlsProgress::new();
+        static ref PROGRESS: progress::Progress = progress::Progress::new();
         static ref NO_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_default();
         static ref DO_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_all();
     }

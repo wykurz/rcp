@@ -125,7 +125,6 @@ fn main() -> Result<()> {
     let res = common::run(
         if args.progress || args.progress_type.is_some() {
             Some(common::ProgressSettings {
-                op_name: "rcmp".to_string(),
                 progress_type: args.progress_type.unwrap_or_default(),
                 progress_delay: args.progress_delay,
             })
