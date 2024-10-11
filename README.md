@@ -40,6 +40,12 @@ Roughly equivalent to `cp -R --update=none <foo> <bar>`.
 ```
 Roughly equivalent to: `cp -pR <foo> <bar>`.
 
+### log tool output to a file while using progress bar
+Progress bar is sent to `stderr` while log messages go to `stdout`. This allows us to pipe `stdout` to a file to preserve the tool output while still viewing the interactive progress bar. This works for all RCP tools.
+```fish
+> rcp <foo> <bar> --progress --summary > copy.log
+```
+
 ### remove a path:
 ```fish
 > rrm <bar> --progress --summary
