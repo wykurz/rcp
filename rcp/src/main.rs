@@ -6,7 +6,8 @@ use tracing::{event, instrument, Level};
 #[derive(StructOpt, Debug, Clone)]
 #[structopt(
     name = "rcp",
-    about = "`rcp` is a tool for copying files similar to `cp` but generally MUCH faster when dealing with a large number of files.
+    about = "`rcp` is a tool for copying files similar to `cp` but generally MUCH faster when dealing with a large \
+    number of files.
 
 Inspired by tools like `dsync`(1) and `pcp`(2).
 
@@ -18,7 +19,8 @@ struct Args {
     #[structopt(short, long)]
     overwrite: bool,
 
-    /// Comma separated list of file attributes to compare when when deciding if files are "identical", used with --overwrite flag.
+    /// Comma separated list of file attributes to compare when when deciding if files are "identical", used with
+    /// --overwrite flag.
     /// Options are: uid, gid, mode, size, mtime, ctime
     #[structopt(long, default_value = "size,mtime")]
     overwrite_compare: String,
@@ -96,7 +98,8 @@ struct Args {
     #[structopt(long, default_value = "0")]
     max_blocking_threads: usize,
 
-    /// Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system limit
+    /// Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system
+    /// limit
     #[structopt(long)]
     max_open_files: Option<usize>,
 
@@ -116,7 +119,8 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
     for src in src_strings {
         if src == "." || src.ends_with("/.") {
             return Err(anyhow!(
-                "expanding source directory ({:?}) using dot operator ('.') is not supported, please use absolute path or '*' instead",
+                "expanding source directory ({:?}) using dot operator ('.') is not supported, please use absolute \
+                path or '*' instead",
                 std::path::PathBuf::from(src))
             );
         }
@@ -139,7 +143,16 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
     } else {
         if src_strings.len() > 1 {
             return Err(anyhow!(
-                "Multiple sources can only be copied to a directory; if this is your intent follow the destination path with a trailing slash"
+                "Multiple sources can only be copied INTO to a directory; if this is your intent follow the \
+                destination path with a trailing slash"
+            ));
+        }
+        let dst_path = std::path::PathBuf::from(dst_string);
+        if dst_path.exists() && !args.overwrite {
+            return Err(anyhow!(
+                "Destination path {dst_path:?} already exists! \n\
+                If you want to copy INTO it then follow the destination path with a trailing slash (/) or use \
+                --overwrite if you want to overwrite it"
             ));
         }
         assert_eq!(src_strings.len(), 1);

@@ -119,7 +119,15 @@ async fn async_main(args: Args) -> Result<common::LinkSummary> {
         let dst_dir = std::path::PathBuf::from(args.dst);
         dst_dir.join(src_file)
     } else {
-        std::path::PathBuf::from(args.dst)
+        let dst_path = std::path::PathBuf::from(args.dst);
+        if dst_path.exists() && !args.overwrite {
+            return Err(anyhow!(
+                "Destination path {dst_path:?} already exists! \n\
+                If you want to copy INTO it then follow the destination path with a trailing slash (/) or use \
+                --overwrite if you want to overwrite it"
+            ));
+        }
+        dst_path
     };
     let result = common::link(
         &args.src,
