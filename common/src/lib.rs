@@ -127,7 +127,7 @@ fn text_updates(
     let mut prog_printer = progress::ProgressPrinter::new(&PROGRESS);
     let mut is_done = lock.lock().unwrap();
     loop {
-        eprintln!("{}", prog_printer.print().unwrap());
+        eprintln!("--{}", prog_printer.print().unwrap());
         let result = cvar.wait_timeout(is_done, delay).unwrap();
         is_done = result.0;
         if *is_done {
