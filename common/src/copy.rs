@@ -114,10 +114,25 @@ pub async fn copy_file(
         rm_summary,
         ..Default::default()
     };
-    tokio::fs::copy(src, dst)
+    if let Err(err) = tokio::fs::copy(src, dst).await {
+        // let's try to copy using std::fs::copy, tokio::fs::copy is reported to have issues on
+        // some filesystems: https://github.com/wykurz/rcp/issues/26
+        event!(
+            Level::WARN,
+            "encountered an error using tokio::fs::copy ({}), trying std::fs::copy",
+            &err
+        );
+        let src = src.to_owned();
+        let dst = dst.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<(), CopyError> {
+            std::fs::copy(&src, &dst)
+                .with_context(|| format!("failed copying {:?} to {:?}", &src, &dst))
+                .map_err(|err| CopyError::new(err, copy_summary))?;
+            Ok(())
+        })
         .await
-        .with_context(|| format!("failed copying {:?} to {:?}", &src, &dst))
-        .map_err(|err| CopyError::new(err, copy_summary))?;
+        .expect("failed spawning a blocking task")?;
+    }
     prog_track.files_copied.inc();
     prog_track.bytes_copied.add(src_metadata.len());
     event!(Level::DEBUG, "setting permissions");
