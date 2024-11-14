@@ -1,7 +1,7 @@
 let
   rust_overlay = import (builtins.fetchTarball https://github.com/oxalica/rust-overlay/archive/master.tar.gz);
   nixpkgs = import <nixpkgs> { overlays = [ rust_overlay ]; };
-  myrust = nixpkgs.rust-bin.stable."1.81.0".default.override {
+  myrust = nixpkgs.rust-bin.stable."1.82.0".default.override {
     extensions = [ "rust-analysis" "rust-src" ];
   };
 in
@@ -14,7 +14,7 @@ in
       binutils
       # cargo-audit
       cargo-bloat
-      cargo-deb
+      # cargo-deb
       cargo-deny
       cargo-edit
       cargo-expand
