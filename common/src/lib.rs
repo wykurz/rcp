@@ -38,6 +38,7 @@ pub use rm::RmSummary;
 
 lazy_static! {
     static ref PROGRESS: progress::Progress = progress::Progress::new();
+    static ref PBAR: indicatif::ProgressBar = indicatif::ProgressBar::new_spinner();
 }
 
 struct ProgressTracker {
@@ -97,9 +98,8 @@ fn progress_bar(
     cvar: &std::sync::Condvar,
     delay_opt: &Option<std::time::Duration>,
 ) {
-    let pbar = indicatif::ProgressBar::new_spinner();
     let delay = delay_opt.unwrap_or(std::time::Duration::from_millis(200));
-    pbar.set_style(
+    PBAR.set_style(
         indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
             .unwrap()
             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
@@ -107,15 +107,15 @@ fn progress_bar(
     let mut prog_printer = progress::ProgressPrinter::new(&PROGRESS);
     let mut is_done = lock.lock().unwrap();
     loop {
-        pbar.set_position(pbar.position() + 1); // do we need to update?
-        pbar.set_message(prog_printer.print().unwrap());
+        PBAR.set_position(PBAR.position() + 1); // do we need to update?
+        PBAR.set_message(prog_printer.print().unwrap());
         let result = cvar.wait_timeout(is_done, delay).unwrap();
         is_done = result.0;
         if *is_done {
             break;
         }
     }
-    pbar.finish_and_clear();
+    PBAR.finish_and_clear();
 }
 
 fn text_updates(
@@ -356,6 +356,24 @@ fn get_max_open_files() -> Result<u64, std::io::Error> {
     }
 }
 
+struct ProgWriter {}
+
+impl ProgWriter {
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+impl std::io::Write for ProgWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        PBAR.suspend(|| std::io::stdout().write(buf))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stdout().flush()
+    }
+}
+
 #[instrument(skip(func))] // "func" is not Debug printable
 #[allow(clippy::too_many_arguments)]
 pub fn run<Fut, Summary, Error>(
@@ -379,6 +397,8 @@ where
             .with_target(true)
             .with_line_number(true)
             .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+            .pretty()
+            .with_writer(ProgWriter::new)
             .with_filter(
                 tracing_subscriber::EnvFilter::try_new(match verbose {
                     0 => "error",
