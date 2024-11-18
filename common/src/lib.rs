@@ -476,8 +476,6 @@ where
     let summary = res.unwrap();
     if print_summary || verbose > 0 {
         println!("{}", &summary);
-    }
-    if !quiet {
         print_runtime_stats()?;
     }
     Ok(summary)
