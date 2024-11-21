@@ -396,7 +396,7 @@ where
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_target(true)
             .with_line_number(true)
-            .with_span_events(if verbose > 1 {
+            .with_span_events(if verbose > 2 {
                 FmtSpan::NEW | FmtSpan::CLOSE
             } else {
                 FmtSpan::NONE
