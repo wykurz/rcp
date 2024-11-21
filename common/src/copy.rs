@@ -81,7 +81,7 @@ pub async fn copy_file(
                     ..Default::default()
                 });
             }
-            event!(Level::DEBUG, "file is different, removing existing file");
+            event!(Level::INFO, "file is different, removing existing file");
             // note tokio::fs::overwrite cannot handle this path being e.g. a directory
             rm_summary = rm::rm(
                 prog_track,
@@ -291,7 +291,7 @@ pub async fn copy(
                         "'dst' is a symlink but points to a different path, updating"
                     );
                 } else {
-                    event!(Level::DEBUG, "'dst' is not a symlink, updating");
+                    event!(Level::INFO, "'dst' is not a symlink, updating");
                 }
                 rm_summary = rm::rm(
                     prog_track,
@@ -379,7 +379,7 @@ pub async fn copy(
                     }
                 } else {
                     event!(
-                        Level::DEBUG,
+                        Level::INFO,
                         "'dst' is not a directory, removing and creating a new one"
                     );
                     let rm_summary = rm::rm(

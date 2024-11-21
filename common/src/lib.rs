@@ -396,7 +396,11 @@ where
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_target(true)
             .with_line_number(true)
-            .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+            .with_span_events(if verbose > 1 {
+                FmtSpan::NEW | FmtSpan::CLOSE
+            } else {
+                FmtSpan::NONE
+            })
             .pretty()
             .with_writer(ProgWriter::new)
             .with_filter(
@@ -446,7 +450,7 @@ where
     if !sysinfo::set_open_files_limit(isize::MAX) {
         event!(
             Level::INFO,
-            "Failed to update the open files limit (expeted on non-linux targets)"
+            "Failed to update the open files limit (expected on non-linux targets)"
         );
     }
     let set_max_open_files = max_open_files.unwrap_or_else(|| {

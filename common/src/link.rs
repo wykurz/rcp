@@ -99,7 +99,7 @@ async fn hard_link_helper(
                 });
             }
             event!(
-                Level::DEBUG,
+                Level::INFO,
                 "'dst' file type changed, removing and hard-linking"
             );
             let rm_summary = rm::rm(
@@ -334,7 +334,7 @@ pub async fn link(
                     }
                 } else {
                     event!(
-                        Level::DEBUG,
+                        Level::INFO,
                         "'dst' is not a directory, removing and creating a new one"
                     );
                     let mut copy_summary = CopySummary::default();
