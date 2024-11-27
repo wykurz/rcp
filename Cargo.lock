@@ -1334,6 +1334,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcpd"
+version = "0.16.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "bytesize",
+ "common",
+ "structopt",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
