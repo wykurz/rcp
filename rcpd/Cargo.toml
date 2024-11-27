@@ -1,6 +1,6 @@
 [package]
-name = "rcp"
-version = "0.17.0"
+name = "rcpd"
+version = "0.16.0"
 description = "Tool for copying files similar to cp but MUCH faster."
 license = "MIT"
 edition = "2021"
@@ -10,12 +10,13 @@ assert_cmd = "2"
 
 [dependencies]
 anyhow = "1.0"
+bytes = "1.10"
 bytesize = "1.3"
 common = { path = "../common" }
 quinn = "0.10"
-regex = "1.11"
-remote = { path = "../remote" }
 structopt = "0.3"
+rand = "0.8"
+remote = { path = "../remote" }
 thiserror = "1.0"
 tokio = { version = "1.38", features = ["full", "parking_lot", "tracing"] }
 tracing = "0.1"

@@ -1,0 +1,17 @@
+[package]
+name = "remote"
+version = "0.17.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+async-recursion = "1.1"
+bincode = "1.3"
+openssh = "0.11"
+quinn = "0.10"
+rcgen = "0.11"
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
+rustls-pemfile = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.38", features = ["full", "parking_lot", "tracing"] }
+tracing = "0.1"

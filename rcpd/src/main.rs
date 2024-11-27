@@ -1,0 +1,79 @@
+use structopt::StructOpt;
+use tracing::instrument;
+
+mod destination;
+mod source;
+
+#[derive(structopt::StructOpt, std::fmt::Debug, std::clone::Clone)]
+#[structopt(
+    name = "rcpd",
+    about = "`rcpd` is used by the `rcp` command for performing remote data copies. Please see `rcp` for more \
+information."
+)]
+struct Args {
+    /// The master (rcp) address to connect to
+    #[structopt(long, required = true)]
+    master_addr: std::net::SocketAddr,
+
+    /// The server name to use for the QUIC connection
+    #[structopt(long, required = true)]
+    server_name: String,
+
+    /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+    #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
+    verbose: u8,
+
+    /// Quiet mode, don't report errors
+    #[structopt(short = "q", long = "quiet")]
+    quiet: bool,
+
+    /// Number of worker threads, 0 means number of cores
+    #[structopt(long, default_value = "0")]
+    max_workers: usize,
+
+    /// Number of blocking worker threads, 0 means Tokio runtime default (512)
+    #[structopt(long, default_value = "0")]
+    max_blocking_threads: usize,
+
+    /// Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system
+    /// limit
+    #[structopt(long)]
+    max_open_files: Option<usize>,
+
+    /// Throttle the number of operations per second, 0 means no throttle
+    #[structopt(long, default_value = "0")]
+    ops_throttle: usize,
+}
+
+#[instrument]
+async fn async_main(args: Args) -> anyhow::Result<String> {
+    // master_endpoint
+    let client = remote::get_client()?;
+    let connection = client.connect(args.master_addr, &args.server_name)?.await?;
+    tracing::event!(tracing::Level::INFO, "Connected to master");
+    connection.send_datagram(bytes::Bytes::from("hello world"))?;
+    Ok("whee".to_string())
+}
+
+fn main() -> Result<(), anyhow::Error> {
+    let args = Args::from_args();
+    let func = {
+        let args = args.clone();
+        || async_main(args)
+    };
+    let res = common::run(
+        None,
+        args.quiet,
+        args.verbose,
+        false,
+        args.max_workers,
+        args.max_blocking_threads,
+        args.max_open_files,
+        args.ops_throttle,
+        func,
+    );
+    match res {
+        Ok(_) => std::process::exit(0),
+        Err(_) => std::process::exit(1),
+    }
+}
