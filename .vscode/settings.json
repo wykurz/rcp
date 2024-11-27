@@ -1,3 +1,9 @@
 {
-    "nixEnvSelector.nixFile": "${workspaceFolder}/default.nix"
+    "nixEnvSelector.nixFile": "${workspaceFolder}/default.nix",
+    "cSpell.words": [
+        "fchownat",
+        "fcntl",
+        "pemfile",
+        "unistd"
+    ]
 }

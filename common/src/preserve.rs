@@ -101,8 +101,7 @@ async fn set_owner_and_time(
                     "cannot set {:?} owner to {:?} and/or group id to {:?}",
                     &dst, &uid, &gid
                 )
-            })
-            .map_err(anyhow::Error::from)?;
+            })?;
         }
         // set timestamps last - modifying other file metadata can change them
         if settings.time {

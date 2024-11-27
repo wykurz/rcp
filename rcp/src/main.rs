@@ -3,6 +3,8 @@ use common::ProgressType;
 use structopt::StructOpt;
 use tracing::{event, instrument, Level};
 
+mod path;
+
 #[derive(StructOpt, Debug, Clone)]
 #[structopt(
     name = "rcp",
@@ -103,16 +105,49 @@ struct Args {
     #[structopt(long)]
     max_open_files: Option<usize>,
 
-    /// Throttle the number of opearations per second, 0 means no throttle
+    /// Throttle the number of operations per second, 0 means no throttle
     #[structopt(long, default_value = "0")]
     ops_throttle: usize,
+}
+
+#[instrument]
+async fn run_rcpd_master(
+    src: &path::RemotePath,
+    dst: &path::RemotePath,
+) -> Result<common::CopySummary> {
+    event!(Level::DEBUG, "running rcpd src/dst");
+    // open a port and wait from server & client hello, respond to client with server port
+    let max_concurrent_streams = 30;
+    let server_config = remote::configure_server(max_concurrent_streams)?;
+    let addr = "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap();
+    let endpoint =
+        quinn::Endpoint::server(server_config, addr).context("Failed to create QUIC endpoint")?;
+
+    // Get the local IP address by checking which interface would be used to connect to external servers
+    let local_ip = {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        socket.connect("8.8.8.8:80")?;
+        socket.local_addr()?.ip()
+    };
+
+    // Create master address using the real local IP and the port from the endpoint
+    let endpoint_addr = endpoint.local_addr()?;
+    let master_addr = std::net::SocketAddr::new(local_ip, endpoint_addr.port());
+    let master_server_name = "make-random-server-name".to_string();
+    // TODO: pass a side (source, destination) to rcpd. note we DON't know the ports yet. rcpd will communicate "side" when it's registering below
+    let rcpd_server = remote::start_rcpd(&src.session, &master_addr, &master_server_name).await?;
+    let rcpd_client = remote::start_rcpd(&dst.session, &master_addr, &master_server_name).await?;
+    // TODO: accept an incoming connection from source and destination rcpd processes, once we know source listening port -- pass it to the destination
+    remote::wait_for_rcpd_process(rcpd_server).await?;
+    remote::wait_for_rcpd_process(rcpd_client).await?;
+    Ok(common::CopySummary::default())
 }
 
 #[instrument]
 async fn async_main(args: Args) -> Result<common::CopySummary> {
     if args.paths.len() < 2 {
         return Err(anyhow!(
-            "You must specify at least one source and destination path!"
+            "You must specify at least one source path and one destination path!"
         ));
     }
     let src_strings = &args.paths[0..args.paths.len() - 1];
@@ -125,7 +160,41 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
             );
         }
     }
+    // pick the path type of the first source in the list and ensure all other sources match
+    let first_src_path_type = path::parse_path(&src_strings[0]);
+    for src in src_strings[1..].iter() {
+        let path_type = path::parse_path(src);
+        if path_type != first_src_path_type {
+            return Err(anyhow!(
+                "Cannot mix different path types in the source list: {:?} and {:?}",
+                first_src_path_type,
+                path_type
+            ));
+        }
+    }
     let dst_string = args.paths.last().unwrap();
+    let dst_path_type = path::parse_path(dst_string);
+    // if any of the src/dst paths are remote, we'll be using the rcpd
+    let remote_src_dst = match (first_src_path_type, dst_path_type) {
+        (path::PathType::Remote(src_remote), path::PathType::Remote(dst_remote)) => {
+            Some((src_remote, dst_remote))
+        }
+        (path::PathType::Remote(src_remote), path::PathType::Local(src_local)) => {
+            Some((src_remote, path::RemotePath::from_local(src_local)))
+        }
+        (path::PathType::Local(src_local), path::PathType::Remote(dst_remote)) => {
+            Some((path::RemotePath::from_local(src_local), dst_remote))
+        }
+        (path::PathType::Local(_), path::PathType::Local(_)) => None,
+    };
+    if let Some((remote_src, remote_dst)) = remote_src_dst {
+        if src_strings.len() > 1 {
+            return Err(anyhow!(
+                "Multiple sources are currently not supported when using remote paths!"
+            ));
+        }
+        return run_rcpd_master(&remote_src, &remote_dst).await;
+    }
     let src_dst: Vec<(std::path::PathBuf, std::path::PathBuf)> = if dst_string.ends_with('/') {
         // rcp foo bar baz/ -> copy foo to baz/foo and bar to baz/bar
         let dst_dir = std::path::PathBuf::from(dst_string);
@@ -143,7 +212,7 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
     } else {
         if src_strings.len() > 1 {
             return Err(anyhow!(
-                "Multiple sources can only be copied INTO to a directory; if this is your intent follow the \
+                "Multiple sources can only be copied INTO a directory; if this is your intent - follow the \
                 destination path with a trailing slash"
             ));
         }
@@ -151,7 +220,7 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
         if dst_path.exists() && !args.overwrite {
             return Err(anyhow!(
                 "Destination path {dst_path:?} already exists! \n\
-                If you want to copy INTO it then follow the destination path with a trailing slash (/) or use \
+                If you want to copy INTO it, then follow the destination path with a trailing slash (/). Use \
                 --overwrite if you want to overwrite it"
             ));
         }
@@ -161,7 +230,6 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
             std::path::PathBuf::from(dst_string),
         )]
     };
-    let mut join_set = tokio::task::JoinSet::new();
     let settings = common::CopySettings {
         dereference: args.dereference,
         fail_early: args.fail_early,
@@ -185,6 +253,7 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
         common::preserve_default()
     };
     event!(Level::DEBUG, "preserve settings: {:?}", &preserve);
+    let mut join_set = tokio::task::JoinSet::new();
     for (src_path, dst_path) in src_dst {
         let do_copy =
             || async move { common::copy(&src_path, &dst_path, &settings, &preserve).await };
@@ -242,7 +311,6 @@ fn main() -> Result<(), anyhow::Error> {
         } else {
             None
         },
-        // args.progress_delay,
         args.quiet,
         args.verbose,
         args.summary,

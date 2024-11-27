@@ -28,11 +28,11 @@ pub fn set_max_open_files(max_open_files: usize) {
     init_semaphore(max_open_files, &ENABLE_OPEN_FILES_LIMIT, &OPEN_FILES_SEM);
 }
 
-pub struct OpeFileGuard<'a> {
+pub struct OpenFileGuard<'a> {
     _permit: Option<tokio::sync::SemaphorePermit<'a>>,
 }
 
-impl<'a> OpeFileGuard<'a> {
+impl OpenFileGuard<'_> {
     async fn new() -> Self {
         if !ENABLE_OPEN_FILES_LIMIT.load(Ordering::Acquire) {
             return Self { _permit: None };
@@ -43,8 +43,8 @@ impl<'a> OpeFileGuard<'a> {
     }
 }
 
-pub async fn open_file_permit() -> OpeFileGuard<'static> {
-    OpeFileGuard::new().await
+pub async fn open_file_permit() -> OpenFileGuard<'static> {
+    OpenFileGuard::new().await
 }
 
 pub fn set_init_tokens(init_iops_tokens: usize) {
