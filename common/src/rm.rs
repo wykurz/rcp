@@ -49,7 +49,7 @@ impl std::fmt::Display for RmSummary {
             f,
             "files removed: {}\n\
             symlinks removed: {}\n\
-            directories removed: {}",
+            directories removed: {}\n",
             self.files_removed, self.symlinks_removed, self.directories_removed
         )
     }

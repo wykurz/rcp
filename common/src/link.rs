@@ -59,7 +59,7 @@ impl std::fmt::Display for LinkSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "{}hard-links created: {}\nhard links unchanged: {}",
+            "{}hard-links created: {}\nhard links unchanged: {}\n",
             &self.copy_summary, self.hard_links_created, self.hard_links_unchanged
         )
     }
