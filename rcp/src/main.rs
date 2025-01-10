@@ -197,7 +197,7 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
             Ok(result) => match result {
                 Ok(summary) => copy_summary = copy_summary + summary,
                 Err(error) => {
-                    event!(Level::ERROR, "{}", &error);
+                    event!(Level::ERROR, "{:?}", &error);
                     copy_summary = copy_summary + error.summary;
                     if args.fail_early {
                         if args.summary {

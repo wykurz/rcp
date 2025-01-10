@@ -216,6 +216,7 @@ pub async fn cmp(
             || async move { cmp(prog_track, &entry_path, &dst_path, &log, &settings).await };
         join_set.spawn(do_cmp());
     }
+
     event!(Level::DEBUG, "process contents of 'dst' directory");
     let mut dst_entries = tokio::fs::read_dir(dst)
         .await

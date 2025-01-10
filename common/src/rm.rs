@@ -128,7 +128,7 @@ pub async fn rm(
         match res.map_err(|err| RmError::new(anyhow::Error::msg(err), Default::default()))? {
             Ok(summary) => rm_summary = rm_summary + summary,
             Err(error) => {
-                event!(Level::ERROR, "remove: {:?} failed with: {}", path, &error);
+                event!(Level::ERROR, "remove: {:?} failed with: {:?}", path, &error);
                 rm_summary = rm_summary + error.summary;
                 if settings.fail_early {
                     return Err(RmError::new(error.source, rm_summary));

@@ -418,7 +418,7 @@ pub async fn copy(
                     }
                 }
             } else {
-                event!(Level::ERROR, "{}", &error);
+                event!(Level::ERROR, "{:?}", &error);
                 return Err(CopyError::new(
                     anyhow!("cannot create directory {:?}", dst),
                     Default::default(),

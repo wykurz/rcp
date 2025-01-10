@@ -148,7 +148,7 @@ async fn async_main(args: Args) -> Result<common::LinkSummary> {
     match result {
         Ok(summary) => Ok(summary),
         Err(error) => {
-            event!(Level::ERROR, "{}", &error);
+            event!(Level::ERROR, "{:?}", &error);
             if args.summary {
                 return Err(anyhow!("rlink encountered errors\n\n{}", &error.summary));
             }
