@@ -428,6 +428,9 @@ pub async fn link(
         };
         join_set.spawn(do_link());
     }
+    // unfortunately ReadDir is opening file-descriptors and there's not a good way to limit this,
+    // one thing we CAN do however is to drop it as soon as we're done with it
+    drop(src_entries);
     // only process update if the path was provided and the directory is present
     if update_metadata_opt.is_some() {
         let update = update.as_ref().unwrap();
@@ -476,6 +479,9 @@ pub async fn link(
             };
             join_set.spawn(do_copy());
         }
+        // unfortunately ReadDir is opening file-descriptors and there's not a good way to limit this,
+        // one thing we CAN do however is to drop it as soon as we're done with it
+        drop(update_entries);
     }
     while let Some(res) = join_set.join_next().await {
         match res {
