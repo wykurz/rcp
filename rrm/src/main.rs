@@ -88,7 +88,7 @@ async fn async_main(args: Args) -> Result<common::RmSummary> {
         match res? {
             Ok(summary) => rm_summary = rm_summary + summary,
             Err(error) => {
-                event!(Level::ERROR, "{}", &error);
+                event!(Level::ERROR, "{:?}", &error);
                 rm_summary = rm_summary + error.summary;
                 if args.fail_early {
                     if args.summary {

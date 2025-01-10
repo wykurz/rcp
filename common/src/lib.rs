@@ -492,7 +492,7 @@ where
     };
     if let Err(error) = res {
         if !quiet {
-            println!("{:#}", error);
+            println!("{:?}", error);
             print_runtime_stats()?;
         }
         return Err(anyhow!("{}", error));
