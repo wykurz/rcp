@@ -216,7 +216,9 @@ pub async fn cmp(
             || async move { cmp(prog_track, &entry_path, &dst_path, &log, &settings).await };
         join_set.spawn(do_cmp());
     }
-
+    // unfortunately ReadDir is opening file-descriptors and there's not a good way to limit this,
+    // one thing we CAN do however is to drop it as soon as we're done with it
+    drop(src_entries);
     event!(Level::DEBUG, "process contents of 'dst' directory");
     let mut dst_entries = tokio::fs::read_dir(dst)
         .await
@@ -249,6 +251,9 @@ pub async fn cmp(
         )
         .await?;
     }
+    // unfortunately ReadDir is opening file-descriptors and there's not a good way to limit this,
+    // one thing we CAN do however is to drop it as soon as we're done with it
+    drop(dst_entries);
     while let Some(res) = join_set.join_next().await {
         match res? {
             Ok(summary) => cmp_summary = cmp_summary + summary,

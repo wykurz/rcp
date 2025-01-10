@@ -120,6 +120,9 @@ pub async fn rm(
         let do_rm = || async move { rm(prog_track, &entry_path, &settings).await };
         join_set.spawn(do_rm());
     }
+    // unfortunately ReadDir is opening file-descriptors and there's not a good way to limit this,
+    // one thing we CAN do however is to drop it as soon as we're done with it
+    drop(entries);
     let mut rm_summary = RmSummary {
         directories_removed: 0,
         ..Default::default()
