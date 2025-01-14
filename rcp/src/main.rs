@@ -242,7 +242,6 @@ fn main() -> Result<(), anyhow::Error> {
         } else {
             None
         },
-        // args.progress_delay,
         args.quiet,
         args.verbose,
         args.summary,
