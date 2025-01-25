@@ -1,15 +1,59 @@
-use anyhow::{Context, Result};
+use anyhow::Context;
+use rand::{distributions::Alphanumeric, Rng};
 use structopt::StructOpt;
-use tokio::net::TcpListener;
 use tracing::{event, instrument, Level};
 
-#[derive(StructOpt, Debug, Clone)]
+#[derive(std::fmt::Debug, std::clone::Clone)]
+pub enum Side {
+    Source,
+    Destination {
+        src_endpoint: std::net::SocketAddr,
+        server_name: String,
+    },
+}
+
+impl std::str::FromStr for Side {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split('@').collect();
+        match parts.as_slice() {
+            ["source"] | ["src"] => Ok(Side::Source),
+            ["destination", rest] | ["dst", rest] => {
+                let addr_parts: Vec<&str> = rest.split(',').collect();
+                match addr_parts.as_slice() {
+                    [addr, server_name] => {
+                        let endpoint = addr.parse().map_err(|e| {
+                            anyhow::anyhow!("Invalid endpoint address '{}': {}", addr, e)
+                        })?;
+                        Ok(Side::Destination {
+                            src_endpoint: endpoint,
+                            server_name: server_name.to_string(),
+                        })
+                    }
+                    _ => Err(anyhow::anyhow!(
+                        "Destination format must include server name: 'destination@<host:port>,<server_name>'"
+                    )),
+                }
+            }
+            _ => Err(anyhow::anyhow!(
+                "Invalid side format: must be 'source' ('src') or 'destination@<host:port>,<server_name>'"
+            )),
+        }
+    }
+}
+
+#[derive(structopt::StructOpt, std::fmt::Debug, std::clone::Clone)]
 #[structopt(
     name = "rcpd",
     about = "`rcpd` is used by the `rcp` command for performing remote data copies. Please see `rcp` for more \
 information."
 )]
 struct Args {
+    /// Which side of the connection this daemon represents (source/destination)
+    #[structopt(long, required = true)]
+    side: Side,
+
     /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
     #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
     verbose: u8,
@@ -31,12 +75,17 @@ struct Args {
     #[structopt(long)]
     max_open_files: Option<usize>,
 
-    /// Throttle the number of opearations per second, 0 means no throttle
+    /// Throttle the number of operations per second, 0 means no throttle
     #[structopt(long, default_value = "0")]
     ops_throttle: usize,
+
+    /// Maximum number of concurrent QUIC streams, default is 1000
+    #[structopt(long, default_value = "1000")]
+    max_concurrent_streams: u32,
 }
 
-async fn handle_connection(socket: &mut tokio::net::TcpStream) -> Result<()> {
+#[instrument]
+async fn handle_connection(socket: &mut tokio::net::TcpStream) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
     // Send a simple OK response
     socket
@@ -46,24 +95,125 @@ async fn handle_connection(socket: &mut tokio::net::TcpStream) -> Result<()> {
     Ok(())
 }
 
-#[instrument]
-async fn async_main(args: Args) -> Result<String> {
-    let listener = TcpListener::bind("127.0.0.1:8080")
-        .await
-        .context("Failed to bind to port 8080")?;
-    event!(Level::INFO, "Server listening on 127.0.0.1:8080");
-    loop {
-        let (mut socket, addr) = listener
-            .accept()
-            .await
-            .context("Failed to accept connection")?;
-        event!(Level::INFO, "New connection from {}", addr);
-        // Spawn a new task for each connection
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(&mut socket).await {
-                event!(Level::ERROR, "Error handling connection: {}", e);
+async fn handle_quic_connection(conn: quinn::Connecting) -> anyhow::Result<()> {
+    let connection = conn.await?;
+    event!(Level::INFO, "QUIC connection established");
+
+    // Open a unidirectional stream for sending data
+    let mut send_stream = connection.open_uni().await?;
+    event!(Level::INFO, "Opened unidirectional stream");
+
+    // Send some test data
+    match send_stream.write_all(b"Hello from QUIC server!\n").await {
+        Ok(()) => {
+            event!(Level::INFO, "Data sent successfully");
+            // Properly finish the stream
+            send_stream.finish().await?;
+        }
+        Err(quinn::WriteError::ConnectionLost(e)) => {
+            return Err(anyhow::anyhow!("Connection lost: {}", e));
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("Failed to send data: {}", e));
+        }
+    }
+
+    Ok(())
+}
+
+fn configure_server(args: &Args) -> anyhow::Result<quinn::ServerConfig> {
+    // Generate a self-signed certificate for testing
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+    let key_der = cert.serialize_private_key_der();
+    let cert_der = cert.serialize_der()?;
+
+    let key = rustls::PrivateKey(key_der);
+    let cert = rustls::Certificate(cert_der);
+
+    let mut server_config = quinn::ServerConfig::with_single_cert(vec![cert], key)
+        .context("Failed to create server config")?;
+
+    // Configure the server for better performance
+    std::sync::Arc::get_mut(&mut server_config.transport)
+        .expect("Failed to get transport config")
+        .max_concurrent_uni_streams(args.max_concurrent_streams.into())
+        .max_idle_timeout(Some(tokio::time::Duration::from_secs(30).try_into()?));
+
+    Ok(server_config)
+}
+
+async fn async_main(args: Args) -> anyhow::Result<String> {
+    match &args.side {
+        Side::Source => {
+            // Configure QUIC server
+            let server_config = configure_server(&args)?;
+
+            // Bind to a random port by using port 0
+            let addr = "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap();
+            let endpoint = quinn::Endpoint::server(server_config, addr)
+                .context("Failed to create QUIC endpoint")?;
+
+            let bound_addr = endpoint
+                .local_addr()
+                .context("Failed to get local address")?;
+
+            event!(Level::INFO, "QUIC server listening on {}", bound_addr);
+
+            // Generate random server name
+            let server_name: String = rand::thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(20)
+                .map(char::from)
+                .collect();
+
+            // Print port and server name to stdout for the client to use
+            println!("{} {}", bound_addr.port(), server_name);
+
+            // Keep accepting connections
+            if let Some(conn) = endpoint.accept().await {
+                event!(Level::INFO, "New QUIC connection incoming");
+                handle_quic_connection(conn).await?;
             }
-        });
+
+            event!(Level::INFO, "QUIC server is done",);
+
+            Ok("whee".to_string())
+        }
+        Side::Destination {
+            src_endpoint,
+            server_name,
+        } => {
+            let dst_endpoint = "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap();
+            let endpoint =
+                quinn::Endpoint::client(dst_endpoint).context("Failed to create QUIC endpoint")?;
+
+            let connection = endpoint.connect(*src_endpoint, server_name)?.await?;
+            tracing::event!(tracing::Level::INFO, "Connected to QUIC server");
+
+            // Accept incoming unidirectional streams
+            while let Ok(mut recv_stream) = connection.accept_uni().await {
+                tracing::event!(tracing::Level::INFO, "Received new unidirectional stream");
+
+                // Read the incoming data
+                let mut buf = Vec::new();
+                match recv_stream.read_to_end(1024).await {
+                    Ok(data) => {
+                        buf.extend_from_slice(&data);
+                        tracing::event!(
+                            tracing::Level::INFO,
+                            "Received data: {}",
+                            String::from_utf8_lossy(&buf)
+                        );
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to read from stream: {}", e));
+                    }
+                }
+            }
+
+            tracing::event!(tracing::Level::INFO, "QUIC client finished");
+            Ok("QUIC client done".to_string())
+        }
     }
 }
 
