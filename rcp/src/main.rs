@@ -111,7 +111,8 @@ struct Args {
 async fn run_rcpd(host: &str, port: u16, side: &str) -> Result<()> {
     // Construct the SSH command to run rcpd on the remote host
     let rcpd_cmd = format!("rcpd --side {}", side);
-    
+
+    // use openssh create instead, ai!
     // Use ssh to execute rcpd on the remote host
     let status = tokio::process::Command::new("ssh")
         .arg("-p")
