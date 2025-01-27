@@ -109,22 +109,31 @@ struct Args {
 }
 
 async fn run_rcpd(host: &str, port: u16, side: &str) -> Result<()> {
-    // Construct the SSH command to run rcpd on the remote host
-    let rcpd_cmd = format!("rcpd --side {}", side);
+    // Create SSH session using openssh
+    let session = openssh::Session::connect(
+        format!("{}:{}", host, port),
+        openssh::KnownHosts::Accept,
+    )
+    .await
+    .context("Failed to establish SSH connection")?;
 
-    // use openssh create instead, ai!
-    // Use ssh to execute rcpd on the remote host
-    let status = tokio::process::Command::new("ssh")
-        .arg("-p")
-        .arg(port.to_string())
-        .arg(host)
-        .arg(rcpd_cmd)
-        .status()
+    // Run rcpd command remotely
+    let child = session
+        .command("rcpd")
+        .arg("--side")
+        .arg(side)
+        .spawn()
         .await
-        .context("Failed to execute SSH command")?;
+        .context("Failed to spawn rcpd command")?;
+
+    // Wait for command completion
+    let status = child
+        .wait()
+        .await
+        .context("Failed to wait for rcpd completion")?;
 
     if !status.success() {
-        return Err(anyhow!("Failed to run rcpd on remote host"));
+        return Err(anyhow!("rcpd command failed on remote host"));
     }
 
     Ok(())
