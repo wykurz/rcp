@@ -108,6 +108,8 @@ struct Args {
     ops_throttle: usize,
 }
 
+// add run_rcpd method that ssh's into the remote server and runs rcpd command with some arguments, ai!
+
 #[instrument]
 async fn async_main(args: Args) -> Result<common::CopySummary> {
     if args.paths.len() < 2 {
