@@ -108,7 +108,26 @@ struct Args {
     ops_throttle: usize,
 }
 
-// add run_rcpd method that ssh's into the remote server and runs rcpd command with some arguments, ai!
+async fn run_rcpd(host: &str, port: u16, side: &str) -> Result<()> {
+    // Construct the SSH command to run rcpd on the remote host
+    let rcpd_cmd = format!("rcpd --side {}", side);
+    
+    // Use ssh to execute rcpd on the remote host
+    let status = tokio::process::Command::new("ssh")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg(host)
+        .arg(rcpd_cmd)
+        .status()
+        .await
+        .context("Failed to execute SSH command")?;
+
+    if !status.success() {
+        return Err(anyhow!("Failed to run rcpd on remote host"));
+    }
+
+    Ok(())
+}
 
 #[instrument]
 async fn async_main(args: Args) -> Result<common::CopySummary> {
