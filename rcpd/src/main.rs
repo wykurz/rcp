@@ -3,46 +3,6 @@ use rand::{distributions::Alphanumeric, Rng};
 use structopt::StructOpt;
 use tracing::{event, instrument, Level};
 
-#[derive(std::fmt::Debug, std::clone::Clone)]
-pub enum Side {
-    Source,
-    Destination {
-        src_endpoint: std::net::SocketAddr,
-        server_name: String,
-    },
-}
-
-impl std::str::FromStr for Side {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split('@').collect();
-        match parts.as_slice() {
-            ["source"] | ["src"] => Ok(Side::Source),
-            ["destination", rest] | ["dst", rest] => {
-                let addr_parts: Vec<&str> = rest.split(',').collect();
-                match addr_parts.as_slice() {
-                    [addr, server_name] => {
-                        let endpoint = addr.parse().map_err(|e| {
-                            anyhow::anyhow!("Invalid endpoint address '{}': {}", addr, e)
-                        })?;
-                        Ok(Side::Destination {
-                            src_endpoint: endpoint,
-                            server_name: server_name.to_string(),
-                        })
-                    }
-                    _ => Err(anyhow::anyhow!(
-                        "Destination format must include server name: 'destination@<host:port>,<server_name>'"
-                    )),
-                }
-            }
-            _ => Err(anyhow::anyhow!(
-                "Invalid side format: must be 'source' ('src') or 'destination@<host:port>,<server_name>'"
-            )),
-        }
-    }
-}
-
 #[derive(structopt::StructOpt, std::fmt::Debug, std::clone::Clone)]
 #[structopt(
     name = "rcpd",
@@ -52,7 +12,7 @@ information."
 struct Args {
     /// Which side of the connection this daemon represents (source/destination)
     #[structopt(long, required = true)]
-    side: Side,
+    side: remote::Side,
 
     /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
     #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
@@ -144,7 +104,7 @@ fn configure_server(args: &Args) -> anyhow::Result<quinn::ServerConfig> {
 
 async fn async_main(args: Args) -> anyhow::Result<String> {
     match &args.side {
-        Side::Source => {
+        remote::Side::Source => {
             // Configure QUIC server
             let server_config = configure_server(&args)?;
 
@@ -179,7 +139,7 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
 
             Ok("whee".to_string())
         }
-        Side::Destination {
+        remote::Side::Destination {
             src_endpoint,
             server_name,
         } => {

@@ -16,6 +16,7 @@ quinn = "0.10"
 structopt = "0.3"
 rand = "0.8"
 rcgen = "0.11"
+remote = { path = "../remote" }
 rustls = { version = "0.21" }
 rustls-pemfile = "1.0"
 thiserror = "1.0"

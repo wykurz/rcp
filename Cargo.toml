@@ -11,9 +11,6 @@ members = [
   "rrm",
 ]
 
-[workspace.dependencies]
-openssh = "0.10.2"
-
 [profile.dev]
 panic = "abort"
 

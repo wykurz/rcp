@@ -108,37 +108,6 @@ struct Args {
     ops_throttle: usize,
 }
 
-async fn run_rcpd(host: &str, port: u16, side: &str) -> Result<()> {
-    // Create SSH session using openssh
-    let session = openssh::Session::connect(
-        format!("{}:{}", host, port),
-        openssh::KnownHosts::Accept,
-    )
-    .await
-    .context("Failed to establish SSH connection")?;
-
-    // Run rcpd command remotely
-    let child = session
-        .command("rcpd")
-        .arg("--side")
-        .arg(side)
-        .spawn()
-        .await
-        .context("Failed to spawn rcpd command")?;
-
-    // Wait for command completion
-    let status = child
-        .wait()
-        .await
-        .context("Failed to wait for rcpd completion")?;
-
-    if !status.success() {
-        return Err(anyhow!("rcpd command failed on remote host"));
-    }
-
-    Ok(())
-}
-
 #[instrument]
 async fn async_main(args: Args) -> Result<common::CopySummary> {
     if args.paths.len() < 2 {

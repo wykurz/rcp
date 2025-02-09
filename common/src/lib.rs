@@ -19,7 +19,6 @@ mod progress;
 mod rm;
 mod testutils;
 mod throttle;
-mod wire;
 
 pub use cmp::CmpResult;
 pub use cmp::CmpSettings;
