@@ -408,7 +408,7 @@ pub async fn copy(
                             };
                             CopyError::new(anyhow::Error::msg(err), copy_summary)
                         })?;
-                    // anythingg copied into dst may assume they don't need to check for conflicts
+                    // anything copied into dst may assume they don't need to check for conflicts
                     is_fresh = true;
                     prog_track.directories_created.inc();
                     CopySummary {
@@ -425,7 +425,7 @@ pub async fn copy(
                 ));
             }
         } else {
-            // new directory created, anythingg copied into dst may assume they don't need to check for conflicts
+            // new directory created, anything copied into dst may assume they don't need to check for conflicts
             is_fresh = true;
             prog_track.directories_created.inc();
             CopySummary {

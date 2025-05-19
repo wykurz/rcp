@@ -94,7 +94,7 @@ struct Args {
     #[structopt(long)]
     max_open_files: Option<usize>,
 
-    /// Throttle the number of opearations per second, 0 means no throttle
+    /// Throttle the number of operations per second, 0 means no throttle
     #[structopt(long, default_value = "0")]
     ops_throttle: usize,
 }

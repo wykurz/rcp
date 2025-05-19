@@ -544,10 +544,12 @@ dependencies = [
  "assert_cmd",
  "async-recursion",
  "bytesize",
+ "common",
  "rand",
  "structopt",
  "thiserror 1.0.55",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
