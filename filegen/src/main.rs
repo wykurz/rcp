@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
+use common::ProgressType;
 use rand::Rng;
 use structopt::StructOpt;
 use tokio::io::AsyncWriteExt;
+use tracing::instrument;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Dirwidth {
     value: Vec<usize>,
 }
@@ -20,7 +22,7 @@ impl std::str::FromStr for Dirwidth {
     }
 }
 
-#[derive(StructOpt, Debug)]
+#[derive(Clone, StructOpt, Debug)]
 #[structopt(name = "filegen")]
 struct Args {
     /// Root directory where files are generated
@@ -51,9 +53,65 @@ struct Args {
     /// Size of the buffer used to write to each file. Accepts suffixes like "1K", "1M", "1G"
     #[structopt(default_value = "4K")]
     bufsize: String,
+
+    /// Show progress
+    #[structopt(long)]
+    progress: bool,
+
+    /// Toggles the type of progress to show.
+    ///
+    /// If specified, --progress flag is implied.
+    ///
+    /// Options are: ProgressBar (animated progress bar), TextUpdates (appropriate for logging), Auto (default, will
+    /// choose between ProgressBar or TextUpdates depending on the type of terminal attached to stderr)
+    #[structopt(long)]
+    progress_type: Option<ProgressType>,
+
+    /// Sets the delay between progress updates.
+    ///
+    /// - For the interactive (--progress-type=ProgressBar), the default is 200ms.
+    /// - For the non-interactive (--progress-type=TextUpdates), the default is 10s.
+    ///
+    /// If specified, --progress flag is implied.
+    ///
+    /// This option accepts a human readable duration, e.g. "200ms", "10s", "5min" etc.
+    #[structopt(long)]
+    progress_delay: Option<String>,
+
+    /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
+    #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
+    verbose: u8,
+
+    /// Print summary at the end
+    #[structopt(long)]
+    summary: bool,
+
+    /// Quiet mode, don't report errors
+    #[structopt(short = "q", long = "quiet")]
+    quiet: bool,
+
+    /// Number of worker threads, 0 means number of cores
+    #[structopt(long, default_value = "0")]
+    max_workers: usize,
+
+    /// Number of blocking worker threads, 0 means Tokio runtime default (512)
+    #[structopt(long, default_value = "0")]
+    max_blocking_threads: usize,
+
+    /// Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system
+    /// limit
+    #[structopt(long)]
+    max_open_files: Option<usize>,
+
+    /// Throttle the number of operations per second, 0 means no throttle
+    #[structopt(long, default_value = "0")]
+    ops_throttle: usize,
 }
 
+#[instrument]
 async fn write_file(path: std::path::PathBuf, mut filesize: usize, bufsize: usize) -> Result<()> {
+    let _permit = common::open_file_permit().await;
+    common::get_throttle_token().await;
     let mut bytes = vec![0u8; bufsize];
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
@@ -78,6 +136,7 @@ async fn write_file(path: std::path::PathBuf, mut filesize: usize, bufsize: usiz
 }
 
 #[async_recursion]
+#[instrument]
 async fn filegen(
     root: &std::path::Path,
     dirwidth: &[usize],
@@ -110,10 +169,9 @@ async fn filegen(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-    let args = Args::from_args();
+// TODO: implement a FilegenSummary
+#[instrument]
+async fn async_main(args: Args) -> Result<String> {
     let filesize = args
         .filesize
         .parse::<bytesize::ByteSize>()
@@ -132,5 +190,35 @@ async fn main() -> Result<()> {
         writebuf,
     )
     .await?;
-    Ok(())
+    Ok("OK".to_string())
+}
+
+fn main() -> Result<(), anyhow::Error> {
+    let args = Args::from_args();
+    let func = {
+        let args = args.clone();
+        || async_main(args)
+    };
+    let res = common::run(
+        if args.progress || args.progress_type.is_some() {
+            Some(common::ProgressSettings {
+                progress_type: args.progress_type.unwrap_or_default(),
+                progress_delay: args.progress_delay,
+            })
+        } else {
+            None
+        },
+        args.quiet,
+        args.verbose,
+        args.summary,
+        args.max_workers,
+        args.max_blocking_threads,
+        args.max_open_files,
+        args.ops_throttle,
+        func,
+    );
+    match res {
+        Ok(_) => std::process::exit(0),
+        Err(_) => std::process::exit(1),
+    }
 }

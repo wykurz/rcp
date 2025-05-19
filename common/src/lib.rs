@@ -281,6 +281,14 @@ pub fn parse_compare_settings(settings: &str) -> Result<ObjCmpSettings, anyhow::
     Ok(cmp_settings)
 }
 
+pub async fn open_file_permit() -> throttle::OpenFileGuard<'static> {
+    throttle::open_file_permit().await
+}
+
+pub async fn get_throttle_token() {
+    throttle::get_token().await;
+}
+
 pub async fn cmp(
     src: &std::path::Path,
     dst: &std::path::Path,
