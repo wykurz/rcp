@@ -4,7 +4,7 @@ use common::ProgressType;
 use rand::Rng;
 use structopt::StructOpt;
 use tokio::io::AsyncWriteExt;
-use tracing::instrument;
+use tracing::{event, instrument, Level};
 
 #[derive(Clone, Debug)]
 struct Dirwidth {
@@ -106,12 +106,47 @@ struct Args {
     /// Throttle the number of operations per second, 0 means no throttle
     #[structopt(long, default_value = "0")]
     ops_throttle: usize,
+
+    /// Throttle the number of I/O operations per second, 0 means no throttle.
+    ///
+    /// I/O is calculated based on provided chunk size -- number of I/O operations for a file is calculated as:
+    /// ((file size - 1) / chunk size) + 1
+    #[structopt(long, default_value = "0")]
+    iops_throttle: usize,
+
+    /// Chunk size used to calculate number of I/O per file.
+    ///
+    /// Modifying this setting to a value > 0 is REQUIRED when using --iops-throttle.
+    #[structopt(long, default_value = "0")]
+    chunk_size: u64,
+
+    /// Throttle the number of bytes per second, 0 means no throttle
+    #[structopt(long, default_value = "0")]
+    tput_throttle: usize,
 }
 
 #[instrument]
-async fn write_file(path: std::path::PathBuf, mut filesize: usize, bufsize: usize) -> Result<()> {
-    let _permit = common::open_file_permit().await;
-    common::get_throttle_token().await;
+async fn write_file(
+    path: std::path::PathBuf,
+    mut filesize: usize,
+    bufsize: usize,
+    chunk_size: u64,
+) -> Result<()> {
+    let _permit = throttle::open_file_permit().await;
+    throttle::get_ops_token().await;
+    if chunk_size > 0 {
+        let tokens = 1 + (std::cmp::max(1, filesize) - 1) as u64 / chunk_size;
+        if tokens > u32::MAX as u64 {
+            event!(
+                Level::ERROR,
+                "chunk size: {} is too small to limit throughput for files this size: {}",
+                chunk_size,
+                filesize,
+            );
+        } else {
+            throttle::get_iops_tokens(tokens as u32).await;
+        }
+    }
     let mut bytes = vec![0u8; bufsize];
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
@@ -143,6 +178,7 @@ async fn filegen(
     numfiles: usize,
     filesize: usize,
     writebuf: usize,
+    chunk_size: u64,
 ) -> Result<()> {
     let numdirs = *dirwidth.first().unwrap_or(&0);
     let mut join_set = tokio::task::JoinSet::new();
@@ -154,14 +190,14 @@ async fn filegen(
             tokio::fs::create_dir(&path)
                 .await
                 .map_err(anyhow::Error::msg)?;
-            filegen(&path, &dirwidth, numfiles, filesize, writebuf).await
+            filegen(&path, &dirwidth, numfiles, filesize, writebuf, chunk_size).await
         };
         join_set.spawn(recurse());
     }
     // generate files
     for i in 0..numfiles {
         let path = root.join(format!("file{}", i));
-        join_set.spawn(write_file(path.clone(), filesize, writebuf));
+        join_set.spawn(write_file(path.clone(), filesize, writebuf, chunk_size));
     }
     while let Some(res) = join_set.join_next().await {
         res??
@@ -188,6 +224,7 @@ async fn async_main(args: Args) -> Result<String> {
         args.numfiles,
         filesize,
         writebuf,
+        args.chunk_size,
     )
     .await?;
     Ok("OK".to_string())
@@ -215,10 +252,13 @@ fn main() -> Result<(), anyhow::Error> {
         args.max_blocking_threads,
         args.max_open_files,
         args.ops_throttle,
+        args.iops_throttle,
+        args.chunk_size,
+        args.tput_throttle,
         func,
     );
-    match res {
-        Ok(_) => std::process::exit(0),
-        Err(_) => std::process::exit(1),
+    if res.is_none() {
+        std::process::exit(1);
     }
+    Ok(())
 }

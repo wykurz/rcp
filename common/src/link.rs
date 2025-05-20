@@ -8,7 +8,6 @@ use crate::filecmp;
 use crate::preserve;
 use crate::progress;
 use crate::rm;
-use crate::throttle;
 use crate::CopySettings;
 use crate::CopySummary;
 
@@ -137,7 +136,7 @@ pub async fn link(
     settings: &LinkSettings,
     mut is_fresh: bool,
 ) -> Result<LinkSummary, LinkError> {
-    throttle::get_token().await;
+    throttle::get_ops_token().await;
     let _prog_guard = prog_track.ops.guard();
     event!(Level::DEBUG, "reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)
@@ -370,7 +369,7 @@ pub async fn link(
                                 },
                             )
                         })?;
-                    // anythingg copied into dst may assume they don't need to check for conflicts
+                    // anything copied into dst may assume they don't need to check for conflicts
                     is_fresh = true;
                     CopySummary {
                         rm_summary,
@@ -384,7 +383,7 @@ pub async fn link(
                     .map_err(|err| LinkError::new(err, Default::default()))?;
             }
         } else {
-            // new directory created, anythingg copied into dst may assume they don't need to check for conflicts
+            // new directory created, anything copied into dst may assume they don't need to check for conflicts
             is_fresh = true;
             CopySummary {
                 directories_created: 1,
@@ -550,6 +549,7 @@ mod link_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             update_compare: filecmp::MetadataCmpSettings {
                 size: true,

@@ -9,6 +9,7 @@ members = [
   "rcpd",
   "rlink",
   "rrm",
+  "throttle",
 ]
 
 [profile.dev]

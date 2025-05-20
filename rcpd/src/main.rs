@@ -43,6 +43,23 @@ struct Args {
     /// Throttle the number of operations per second, 0 means no throttle
     #[structopt(long, default_value = "0")]
     ops_throttle: usize,
+
+    /// Throttle the number of I/O operations per second, 0 means no throttle.
+    ///
+    /// I/O is calculated based on provided chunk size -- number of I/O operations for a file is calculated as:
+    /// ((file size - 1) / chunk size) + 1
+    #[structopt(long, default_value = "0")]
+    iops_throttle: usize,
+
+    /// Chunk size used to calculate number of I/O per file.
+    ///
+    /// Modifying this setting to a value > 0 is REQUIRED when using --iops-throttle.
+    #[structopt(long, default_value = "0")]
+    chunk_size: u64,
+
+    /// Throttle the number of bytes per second, 0 means no throttle
+    #[structopt(long, default_value = "0")]
+    tput_throttle: usize,
 }
 
 #[instrument]
@@ -70,10 +87,13 @@ fn main() -> Result<(), anyhow::Error> {
         args.max_blocking_threads,
         args.max_open_files,
         args.ops_throttle,
+        args.iops_throttle,
+        args.chunk_size,
+        args.tput_throttle,
         func,
     );
-    match res {
-        Ok(_) => std::process::exit(0),
-        Err(_) => std::process::exit(1),
+    if res.is_none() {
+        std::process::exit(1);
     }
+    Ok(())
 }

@@ -97,6 +97,23 @@ struct Args {
     /// Throttle the number of operations per second, 0 means no throttle
     #[structopt(long, default_value = "0")]
     ops_throttle: usize,
+
+    /// Throttle the number of I/O operations per second, 0 means no throttle.
+    ///
+    /// I/O is calculated based on provided chunk size -- number of I/O operations for a file is calculated as:
+    /// ((file size - 1) / chunk size) + 1
+    #[structopt(long, default_value = "0")]
+    iops_throttle: usize,
+
+    /// Chunk size used to calculate number of I/O per file.
+    ///
+    /// Modifying this setting to a value > 0 is REQUIRED when using --iops-throttle.
+    #[structopt(long, default_value = "0")]
+    chunk_size: u64,
+
+    /// Throttle the number of bytes per second, 0 means no throttle
+    #[structopt(long, default_value = "0")]
+    tput_throttle: usize,
 }
 
 async fn async_main(args: Args) -> Result<common::CmpSummary> {
@@ -138,10 +155,13 @@ fn main() -> Result<()> {
         args.max_blocking_threads,
         args.max_open_files,
         args.ops_throttle,
+        args.iops_throttle,
+        args.chunk_size,
+        args.tput_throttle,
         func,
     );
     match res {
-        Ok(summary) => match args.no_check {
+        Some(summary) => match args.no_check {
             // when --no-check is specified, return error code only if there were errors
             true => std::process::exit(0),
             false => {
@@ -157,6 +177,6 @@ fn main() -> Result<()> {
                 std::process::exit(0);
             }
         },
-        Err(_) => std::process::exit(2),
+        None => std::process::exit(2),
     }
 }

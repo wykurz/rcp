@@ -108,6 +108,23 @@ struct Args {
     /// Throttle the number of operations per second, 0 means no throttle
     #[structopt(long, default_value = "0")]
     ops_throttle: usize,
+
+    /// Throttle the number of I/O operations per second, 0 means no throttle.
+    ///
+    /// I/O is calculated based on provided chunk size -- number of I/O operations for a file is calculated as:
+    /// ((file size - 1) / chunk size) + 1
+    #[structopt(long, default_value = "0")]
+    iops_throttle: usize,
+
+    /// Chunk size used to calculate number of I/O per file.
+    ///
+    /// Modifying this setting to a value > 0 is REQUIRED when using --iops-throttle.
+    #[structopt(long, default_value = "0")]
+    chunk_size: bytesize::ByteSize,
+
+    /// Throttle the number of bytes per second, 0 means no throttle
+    #[structopt(long, default_value = "0")]
+    tput_throttle: usize,
 }
 
 #[instrument]
@@ -122,15 +139,13 @@ async fn run_rcpd_master(
     let addr = "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap();
     let endpoint =
         quinn::Endpoint::server(server_config, addr).context("Failed to create QUIC endpoint")?;
-
-    // Get the local IP address by checking which interface would be used to connect to external servers
+    // get the local IP address by checking which interface would be used to connect to external servers
     let local_ip = {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
         socket.connect("8.8.8.8:80")?;
         socket.local_addr()?.ip()
     };
-
-    // Create master address using the real local IP and the port from the endpoint
+    // create master address using the real local IP and the port from the endpoint
     let endpoint_addr = endpoint.local_addr()?;
     let master_addr = std::net::SocketAddr::new(local_ip, endpoint_addr.port());
     let master_server_name = "make-random-server-name".to_string();
@@ -236,6 +251,7 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
         overwrite: args.overwrite,
         overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)
             .map_err(|err| common::CopyError::new(err, Default::default()))?,
+        chunk_size: args.chunk_size.0,
     };
     event!(Level::DEBUG, "copy settings: {:?}", &settings);
     if args.preserve_settings.is_some() && args.preserve {
@@ -318,10 +334,13 @@ fn main() -> Result<(), anyhow::Error> {
         args.max_blocking_threads,
         args.max_open_files,
         args.ops_throttle,
+        args.iops_throttle,
+        args.chunk_size.0,
+        args.tput_throttle,
         func,
     );
-    match res {
-        Ok(_) => std::process::exit(0),
-        Err(_) => std::process::exit(1),
+    if res.is_none() {
+        std::process::exit(1);
     }
+    Ok(())
 }

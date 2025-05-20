@@ -18,7 +18,6 @@ mod preserve;
 mod progress;
 mod rm;
 mod testutils;
-mod throttle;
 
 pub use cmp::CmpResult;
 pub use cmp::CmpSettings;
@@ -281,14 +280,6 @@ pub fn parse_compare_settings(settings: &str) -> Result<ObjCmpSettings, anyhow::
     Ok(cmp_settings)
 }
 
-pub async fn open_file_permit() -> throttle::OpenFileGuard<'static> {
-    throttle::open_file_permit().await
-}
-
-pub async fn get_throttle_token() {
-    throttle::get_token().await;
-}
-
 pub async fn cmp(
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -393,8 +384,12 @@ pub fn run<Fut, Summary, Error>(
     max_blocking_threads: usize,
     max_open_files: Option<usize>,
     ops_throttle: usize,
+    iops_throttle: usize,
+    chunk_size: u64,
+    tput_throttle: usize,
     func: impl FnOnce() -> Fut,
-) -> Result<Summary, anyhow::Error>
+) -> Option<Summary>
+// we return an Option rather than a Result to indicate that callers of this function will NOT print the error
 where
     Summary: std::fmt::Display,
     Error: std::fmt::Display + std::fmt::Debug,
@@ -477,16 +472,45 @@ where
     } else {
         event!(Level::INFO, "Not applying any limit to max open files!",);
     }
-    let runtime = builder.build()?;
-    if ops_throttle > 0 {
-        let mut replenish = ops_throttle;
+    let runtime = builder.build().expect("Failed to create runtime");
+    fn get_replenish_interval(replenish: usize) -> (usize, std::time::Duration) {
+        let mut replenish = replenish;
         let mut interval = std::time::Duration::from_secs(1);
         while replenish > 100 && interval > std::time::Duration::from_millis(1) {
             replenish /= 10;
             interval /= 10;
         }
-        throttle::set_init_tokens(replenish);
-        runtime.spawn(throttle::start_replenish_thread(replenish, interval));
+        (replenish, interval)
+    }
+    if ops_throttle > 0 {
+        let (replenish, interval) = get_replenish_interval(ops_throttle);
+        throttle::init_ops_tokens(replenish);
+        runtime.spawn(throttle::run_ops_replenish_thread(replenish, interval));
+    }
+    if iops_throttle > 0 {
+        if chunk_size == 0 {
+            event!(
+                Level::ERROR,
+                "Chunk size must be specified when using --iops-throttle"
+            );
+            return None;
+        }
+        let (replenish, interval) = get_replenish_interval(iops_throttle);
+        throttle::init_iops_tokens(replenish);
+        runtime.spawn(throttle::run_iops_replenish_thread(replenish, interval));
+    } else if chunk_size > 0 {
+        event!(
+            Level::ERROR,
+            "--chunk-size > 0 but --iops-throttle is 0 -- did you intend to use --iops-throttle?"
+        );
+        return None;
+    }
+    if tput_throttle > 0 {
+        event!(
+            Level::ERROR,
+            "Throughput throttling is not supported yet, please use --iops-throttle instead"
+        );
+        return None;
     }
     let res = {
         let _progress = progress.map(|settings| {
@@ -498,17 +522,22 @@ where
         });
         runtime.block_on(func())
     };
-    if let Err(error) = res {
-        if !quiet {
-            println!("{:?}", error);
-            print_runtime_stats()?;
+    match &res {
+        Ok(summary) => {
+            if print_summary || verbose > 0 {
+                println!("{}", &summary);
+            }
         }
-        return Err(anyhow!("{}", error));
+        Err(err) => {
+            if !quiet {
+                println!("{:?}", err);
+            }
+        }
     }
-    let summary = res.unwrap();
     if print_summary || verbose > 0 {
-        println!("{}", &summary);
-        print_runtime_stats()?;
+        if let Err(err) = print_runtime_stats() {
+            println!("Failed to print runtime stats: {:?}", err);
+        }
     }
-    Ok(summary)
+    res.ok()
 }
