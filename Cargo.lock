@@ -337,6 +337,7 @@ dependencies = [
  "sysinfo",
  "thiserror 1.0.55",
  "thread_local",
+ "throttle",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -548,6 +549,7 @@ dependencies = [
  "rand",
  "structopt",
  "thiserror 1.0.55",
+ "throttle",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1997,6 +1999,14 @@ checksum = "3fdd6f064ccff2d6567adcb3873ca630700f00b5ad3f060c25b5dcfd9a4ce152"
 dependencies = [
  "cfg-if",
  "once_cell",
+]
+
+[[package]]
+name = "throttle"
+version = "0.17.0"
+dependencies = [
+ "lazy_static",
+ "tokio",
 ]
 
 [[package]]

@@ -1,3 +1,5 @@
+use std::os::unix::fs::MetadataExt;
+
 use anyhow::{anyhow, Context};
 use async_recursion::async_recursion;
 use tracing::{event, instrument, Level};
@@ -6,7 +8,6 @@ use crate::filecmp;
 use crate::preserve;
 use crate::progress;
 use crate::rm;
-use crate::throttle;
 use crate::RmSettings;
 use crate::RmSummary;
 
@@ -30,6 +31,7 @@ pub struct CopySettings {
     pub fail_early: bool,
     pub overwrite: bool,
     pub overwrite_compare: filecmp::MetadataCmpSettings,
+    pub chunk_size: u64,
 }
 
 #[instrument]
@@ -59,6 +61,18 @@ pub async fn copy_file(
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))
         .map_err(|err| CopyError::new(err, Default::default()))?;
+    if settings.chunk_size > 0 {
+        let tokens = 1 + (std::cmp::max(1, src_metadata.size()) - 1) / settings.chunk_size;
+        if tokens > u32::MAX as u64 {
+            event!(
+                Level::ERROR,
+                "chunk size: {} is too small to limit throughput for files this big, file: {:?}, size: {}",
+                settings.chunk_size, &src, src_metadata.size(),
+            );
+        } else {
+            throttle::get_iops_tokens(tokens as u32).await;
+        }
+    }
     let mut rm_summary = RmSummary::default();
     if !is_fresh && dst.exists() {
         if settings.overwrite {
@@ -193,7 +207,7 @@ pub async fn copy(
     preserve: &preserve::PreserveSettings,
     mut is_fresh: bool,
 ) -> Result<CopySummary, CopyError> {
-    throttle::get_token().await;
+    throttle::get_ops_token().await;
     let _ops_guard = prog_track.ops.guard();
     event!(Level::DEBUG, "reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)
@@ -538,6 +552,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -582,6 +597,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -653,6 +669,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -716,6 +733,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -759,6 +777,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -850,6 +869,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             false,
         )
@@ -871,6 +891,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             true,
         )
@@ -892,6 +913,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             false,
         )
@@ -913,6 +935,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             true,
         )
@@ -937,6 +960,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -994,6 +1018,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1063,6 +1088,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1131,6 +1157,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1202,6 +1229,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1244,6 +1272,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             &NO_PRESERVE_SETTINGS, // we want timestamps to differ!
             false,
@@ -1286,6 +1315,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1328,6 +1358,7 @@ mod copy_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                chunk_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
