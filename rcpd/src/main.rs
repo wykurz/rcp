@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use structopt::StructOpt;
 use tracing::instrument;
 
@@ -11,6 +12,10 @@ mod source;
 information."
 )]
 struct Args {
+    /// Which side to run: source or destination
+    #[structopt(long)]
+    side: remote::Side,
+
     /// The master (rcp) address to connect to
     #[structopt(long, required = true)]
     master_addr: std::net::SocketAddr,
@@ -67,8 +72,9 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
     // master_endpoint
     let client = remote::get_client()?;
     let connection = client.connect(args.master_addr, &args.server_name)?.await?;
-    tracing::event!(tracing::Level::INFO, "Connected to master");
-    connection.send_datagram(bytes::Bytes::from("hello world"))?;
+    tracing::event!(tracing::Level::INFO, "Connected to master, sending side: {:?}", args.side);
+    let message = bincode::serialize(&args.side)?;
+    connection.send_datagram(Bytes::from(message))?;
     Ok("whee".to_string())
 }
 

@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
+use strum::EnumString;
 use tracing::{event, instrument, Level};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -32,16 +33,6 @@ pub enum FsObject {
     },
 }
 
-impl FsObject {
-    pub fn serialize(&self) -> Result<Vec<u8>, bincode::Error> {
-        bincode::serialize(self)
-    }
-
-    pub fn deserialize(bytes: &[u8]) -> Result<Self, bincode::Error> {
-        bincode::deserialize(bytes)
-    }
-}
-
 #[derive(Debug, PartialEq)]
 pub struct SshSession {
     pub user: Option<String>,
@@ -59,44 +50,10 @@ impl SshSession {
     }
 }
 
-#[derive(std::fmt::Debug, std::clone::Clone)]
+#[derive(Copy, Clone, Debug, EnumString, Serialize, Deserialize)]
 pub enum Side {
     Source,
-    Destination {
-        src_endpoint: std::net::SocketAddr,
-        server_name: String,
-    },
-}
-
-impl std::str::FromStr for Side {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split('@').collect();
-        match parts.as_slice() {
-            ["source"] | ["src"] => Ok(Side::Source),
-            ["destination", rest] | ["dst", rest] => {
-                let addr_parts: Vec<&str> = rest.split(',').collect();
-                match addr_parts.as_slice() {
-                    [addr, server_name] => {
-                        let endpoint = addr.parse().map_err(|e| {
-                            anyhow::anyhow!("Invalid endpoint address '{}': {}", addr, e)
-                        })?;
-                        Ok(Side::Destination {
-                            src_endpoint: endpoint,
-                            server_name: server_name.to_string(),
-                        })
-                    }
-                    _ => Err(anyhow::anyhow!(
-                        "Destination format must include server name: 'destination@<host:port>,<server_name>'"
-                    )),
-                }
-            }
-            _ => Err(anyhow::anyhow!(
-                "Invalid side format: must be 'source' ('src') or 'destination@<host:port>,<server_name>'"
-            )),
-        }
-    }
+    Destination,
 }
 
 async fn setup_ssh_session(
@@ -137,6 +94,7 @@ pub async fn wait_for_rcpd_process(
 
 #[instrument]
 pub async fn start_rcpd(
+    side: Side,
     session: &SshSession,
     master_addr: &std::net::SocketAddr,
     master_server_name: &str,
@@ -150,7 +108,9 @@ pub async fn start_rcpd(
         .context("Failed to get parent directory of current executable")?;
     // TODO: if that doesn't work, try an alternative path
     let mut cmd = session.arc_command(format!("{}/rcpd", bin_dir.display()));
-    cmd.arg("--master-addr")
+    cmd.arg("--side")
+        .arg(format!("{:?}", side))
+        .arg("--master-addr")
         .arg(master_addr.to_string())
         .arg("--server-name")
         .arg(master_server_name)
