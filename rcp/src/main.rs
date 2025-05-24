@@ -137,7 +137,7 @@ async fn run_rcpd_master(
     let max_concurrent_streams = 30;
     let server_config = remote::configure_server(max_concurrent_streams)?;
     let addr = "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap();
-    let endpoint =
+    let server_endpoint =
         quinn::Endpoint::server(server_config, addr).context("Failed to create QUIC endpoint")?;
     // get the local IP address by checking which interface would be used to connect to external servers
     let local_ip = {
@@ -146,13 +146,15 @@ async fn run_rcpd_master(
         socket.local_addr()?.ip()
     };
     // create master address using the real local IP and the port from the endpoint
-    let endpoint_addr = endpoint.local_addr()?;
+    let endpoint_addr = server_endpoint.local_addr()?;
     let master_addr = std::net::SocketAddr::new(local_ip, endpoint_addr.port());
     let master_server_name = "make-random-server-name".to_string();
     // TODO: pass a side (source, destination) to rcpd. note we DON't know the ports yet. rcpd will communicate "side" when it's registering below
     let rcpd_server = remote::start_rcpd(&src.session, &master_addr, &master_server_name).await?;
     let rcpd_client = remote::start_rcpd(&dst.session, &master_addr, &master_server_name).await?;
-    // TODO: accept an incoming connection from source and destination rcpd processes, once we know source listening port -- pass it to the destination
+
+    // TODO: accept an incoming connection from source and destination rcpd processes, once we know source listening port -- pass it to the destination, ai!
+
     remote::wait_for_rcpd_process(rcpd_server).await?;
     remote::wait_for_rcpd_process(rcpd_client).await?;
     Ok(common::CopySummary::default())
