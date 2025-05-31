@@ -66,6 +66,11 @@ async fn setup_ssh_session(
         (Some(user), None) => format!("ssh://{}@{}", user, host),
         (None, None) => format!("ssh://{}", host),
     };
+    event!(
+        Level::DEBUG,
+        "Connecting to SSH destination: {}",
+        destination
+    );
     let session = std::sync::Arc::new(
         openssh::Session::connect(destination, openssh::KnownHosts::Accept)
             .await
@@ -106,6 +111,12 @@ pub async fn start_rcpd(
     let bin_dir = current_exe
         .parent()
         .context("Failed to get parent directory of current executable")?;
+    event!(
+        Level::DEBUG,
+        "Running rcpd from: {:?}, side: {:?}",
+        bin_dir,
+        side
+    );
     // TODO: if that doesn't work, try an alternative path
     let mut cmd = session.arc_command(format!("{}/rcpd", bin_dir.display()));
     cmd.arg("--side")
