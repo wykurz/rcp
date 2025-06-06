@@ -1,0 +1,4 @@
+- For functions and types prefer to use fully qualified name, e.g. "std::net::SocketAddr".
+- Import macros and traits used in marcos, e.g. "use serde::{Deserialize, Serialize};" and then used in "#[derive(Debug, Serialize, Deserialize)]".
+- Prefer no empty lines in functions or type definitions.
+- When importing crates -- specify only major and minor version, don't specify patch e.g. 1.1 and not 1.1.12.
