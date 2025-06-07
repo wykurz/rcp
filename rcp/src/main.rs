@@ -141,7 +141,7 @@ async fn run_rcpd_master(
     let server_name = remote::get_random_server_name();
     let mut rcpds = vec![];
     for _ in 0..2 {
-        let rcpd = remote::start_rcpd(&src.session, &server_addr, &server_name).await?;
+        let rcpd = remote::start_rcpd(src.session(), &server_addr, &server_name).await?;
         rcpds.push(rcpd);
     }
     event!(
@@ -167,7 +167,7 @@ async fn run_rcpd_master(
     };
     source_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
         &remote::protocol::MasterHello::Source {
-            src: src.path.clone(),
+            src: src.path().to_path_buf(),
             source_config: remote::protocol::SourceConfig {
                 dereference: args.dereference,
             },
@@ -193,7 +193,7 @@ async fn run_rcpd_master(
         &remote::protocol::MasterHello::Destination {
             source_addr: source_hello.source_addr,
             server_name: source_hello.server_name.clone(),
-            dst: dst.path.clone(),
+            dst: dst.path().to_path_buf(),
             destination_config: remote::protocol::DestinationConfig {
                 overwrite: args.overwrite,
                 overwrite_compare: args.overwrite_compare.clone(),

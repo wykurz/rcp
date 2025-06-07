@@ -1,15 +1,30 @@
 #[derive(Debug)]
 pub struct RemotePath {
-    pub session: remote::SshSession,
-    pub path: std::path::PathBuf,
+    session: remote::SshSession,
+    path: std::path::PathBuf,
 }
 
 impl RemotePath {
+    pub fn new(session: remote::SshSession, path: std::path::PathBuf) -> anyhow::Result<Self> {
+        if !path.is_absolute() {
+            return Err(anyhow::anyhow!("Path must be absolute: {}", path.display()));
+        }
+        Ok(Self { session, path })
+    }
+
     pub fn from_local(path: &std::path::Path) -> Self {
         Self {
             session: remote::SshSession::local(),
             path: path.to_path_buf(),
         }
+    }
+
+    pub fn session(&self) -> &remote::SshSession {
+        &self.session
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 }
 
@@ -26,7 +41,7 @@ impl PartialEq for PathType {
             (PathType::Local(_), PathType::Remote(_)) => false,
             (PathType::Remote(_), PathType::Local(_)) => false,
             (PathType::Remote(remote1), PathType::Remote(remote2)) => {
-                remote1.session == remote2.session
+                remote1.session() == remote2.session()
             }
         }
     }
@@ -45,11 +60,20 @@ pub fn parse_path(path: &str) -> PathType {
         let port = captures
             .name("port")
             .and_then(|m| m.as_str().parse::<u16>().ok());
-        let remote_path = captures.name("path").unwrap().as_str().to_string();
-        PathType::Remote(RemotePath {
-            session: remote::SshSession { user, host, port },
-            path: remote_path.into(),
-        })
+        let remote_path = captures
+            .name("path")
+            .expect("Unable to extract file system path from provided remote path")
+            .as_str();
+        let remote_path = if std::path::Path::new(remote_path).is_absolute() {
+            std::path::Path::new(remote_path).to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+                .join(remote_path)
+        };
+        PathType::Remote(
+            RemotePath::new(remote::SshSession { user, host, port }, remote_path).unwrap(), // parse_path assumes valid paths for now
+        )
     } else {
         // It's a local path
         PathType::Local(path.into())
@@ -71,14 +95,11 @@ mod tests {
     #[test]
     fn test_parse_path_remote_basic() {
         match parse_path("host:/path/to/file") {
-            PathType::Remote(RemotePath {
-                session: remote::SshSession { user, host, port },
-                path,
-            }) => {
-                assert_eq!(user, None);
-                assert_eq!(host, "host");
-                assert_eq!(port, None);
-                assert_eq!(path.to_str().unwrap(), "/path/to/file");
+            PathType::Remote(remote_path) => {
+                assert_eq!(remote_path.session().user, None);
+                assert_eq!(remote_path.session().host, "host");
+                assert_eq!(remote_path.session().port, None);
+                assert_eq!(remote_path.path().to_str().unwrap(), "/path/to/file");
             }
             _ => panic!("Expected remote path"),
         }
@@ -87,14 +108,11 @@ mod tests {
     #[test]
     fn test_parse_path_remote_full() {
         match parse_path("user@host:22:/path/to/file") {
-            PathType::Remote(RemotePath {
-                session: remote::SshSession { user, host, port },
-                path,
-            }) => {
-                assert_eq!(user, Some("user".to_string()));
-                assert_eq!(host, "host");
-                assert_eq!(port, Some(22));
-                assert_eq!(path.to_str().unwrap(), "/path/to/file");
+            PathType::Remote(remote_path) => {
+                assert_eq!(remote_path.session().user, Some("user".to_string()));
+                assert_eq!(remote_path.session().host, "host");
+                assert_eq!(remote_path.session().port, Some(22));
+                assert_eq!(remote_path.path().to_str().unwrap(), "/path/to/file");
             }
             _ => panic!("Expected remote path"),
         }
@@ -103,14 +121,11 @@ mod tests {
     #[test]
     fn test_parse_path_ipv6() {
         match parse_path("[2001:db8::1]:/path/to/file") {
-            PathType::Remote(RemotePath {
-                session: remote::SshSession { user, host, port },
-                path,
-            }) => {
-                assert_eq!(user, None);
-                assert_eq!(host, "[2001:db8::1]");
-                assert_eq!(port, None);
-                assert_eq!(path.to_str().unwrap(), "/path/to/file");
+            PathType::Remote(remote_path) => {
+                assert_eq!(remote_path.session().user, None);
+                assert_eq!(remote_path.session().host, "[2001:db8::1]");
+                assert_eq!(remote_path.session().port, None);
+                assert_eq!(remote_path.path().to_str().unwrap(), "/path/to/file");
             }
             _ => panic!("Expected remote path"),
         }

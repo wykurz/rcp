@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use strum::EnumString;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum FsObject {
@@ -29,12 +28,6 @@ pub enum FsObject {
         mtime_nsec: i64,
         ctime_nsec: i64,
     },
-}
-
-#[derive(Copy, Clone, Debug, EnumString, Serialize, Deserialize)]
-pub enum Side {
-    Source,
-    Destination,
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
