@@ -149,26 +149,16 @@ async fn run_rcpd_master(
     let endpoint_addr = server_endpoint.local_addr()?;
     let master_addr = std::net::SocketAddr::new(local_ip, endpoint_addr.port());
     let master_server_name = "make-random-server-name".to_string();
-    // TODO: pass a side (source, destination) to rcpd. note we DON't know the ports yet. rcpd will communicate "side" when it's registering below
-    let rcpd_server = remote::start_rcpd(
-        remote::protocol::Side::Source,
-        &src.session,
-        &master_addr,
-        &master_server_name,
-    )
-    .await?;
-    let rcpd_client = remote::start_rcpd(
-        remote::protocol::Side::Destination,
-        &dst.session,
-        &master_addr,
-        &master_server_name,
-    )
-    .await?;
+    let mut rcpds = vec![];
+    for _ in 0..2 {
+        let rcpd = remote::start_rcpd(&src.session, &master_addr, &master_server_name).await?;
+        rcpds.push(rcpd);
+    }
     event!(
         Level::INFO,
         "Waiting for connections from rcpd processes..."
     );
-    // Accept connection from source
+    // accept connection from source
     let source_connecting = match server_endpoint.accept().await {
         Some(conn) => conn,
         None => return Err(anyhow!("Server endpoint closed before source connected")),
@@ -178,7 +168,11 @@ async fn run_rcpd_master(
     source_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
         &remote::protocol::Side::Source,
     )?))?;
-    // Accept connection from destination
+    let source_message = source_connection.read_datagram().await?;
+    let source_hello = bincode::deserialize::<remote::protocol::SourceMasterHello>(
+        &source_message,
+    )?;
+    // accept connection from destination
     let dest_connecting = match server_endpoint.accept().await {
         Some(conn) => conn,
         None => {
@@ -187,20 +181,26 @@ async fn run_rcpd_master(
             ))
         }
     };
-    let _dest_connection = dest_connecting.await?;
+    let dest_connection = dest_connecting.await?;
     event!(Level::INFO, "Destination rcpd connected");
     event!(Level::INFO, "Source rcpd connected");
-    source_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
+    dest_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
         &remote::protocol::Side::Destination,
     )?))?;
-
+    dest_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
+        &remote::protocol::MasterDestinationHello {
+            source_addr: source_hello.source_addr,
+            server_name: source_hello.server_name.clone(),
+        },
+    )?))?;
     event!(
         Level::INFO,
         "Forwarded source connection info to destination"
     );
-
-    remote::wait_for_rcpd_process(rcpd_server).await?;
-    remote::wait_for_rcpd_process(rcpd_client).await?;
+    for rcpd in rcpds {
+        event!(Level::INFO, "Waiting for rcpd process to finish: {:?}", rcpd);
+        remote::wait_for_rcpd_process(rcpd).await?;
+    }
     Ok(common::CopySummary::default())
 }
 

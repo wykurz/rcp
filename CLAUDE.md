@@ -49,6 +49,7 @@ From CONVENTIONS.md:
 - Import macros and traits used in macros explicitly
 - Avoid empty lines in functions or type definitions
 - Specify only major.minor versions for crate dependencies, not patch versions
+- Don't start comments from a capital letter and use dot only to separate multiple sentences.
 
 ## Testing
 
