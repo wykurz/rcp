@@ -126,6 +126,12 @@ impl rustls::client::ServerCertVerifier for AcceptAnyCertificate {
     }
 }
 
+pub fn get_local_ip() -> anyhow::Result<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("8.8.8.8:80")?;
+    Ok(socket.local_addr()?.ip())
+}
+
 pub fn get_client() -> anyhow::Result<quinn::Endpoint> {
     // Create a crypto backend that accepts any server certificate (for development only)
     let crypto = rustls::ClientConfig::builder()

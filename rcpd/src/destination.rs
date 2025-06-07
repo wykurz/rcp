@@ -1,4 +1,3 @@
-use anyhow::Context;
 use tracing::{instrument, Level};
 
 #[instrument]

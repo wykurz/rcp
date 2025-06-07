@@ -140,11 +140,7 @@ async fn run_rcpd_master(
     let server_endpoint =
         quinn::Endpoint::server(server_config, addr).context("Failed to create QUIC endpoint")?;
     // get the local IP address by checking which interface would be used to connect to external servers
-    let local_ip = {
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-        socket.connect("8.8.8.8:80")?;
-        socket.local_addr()?.ip()
-    };
+    let local_ip = remote::get_local_ip().context("Failed to get local IP address")?;
     // create master address using the real local IP and the port from the endpoint
     let endpoint_addr = server_endpoint.local_addr()?;
     let master_addr = std::net::SocketAddr::new(local_ip, endpoint_addr.port());
@@ -169,9 +165,8 @@ async fn run_rcpd_master(
         &remote::protocol::Side::Source,
     )?))?;
     let source_message = source_connection.read_datagram().await?;
-    let source_hello = bincode::deserialize::<remote::protocol::SourceMasterHello>(
-        &source_message,
-    )?;
+    let source_hello =
+        bincode::deserialize::<remote::protocol::SourceMasterHello>(&source_message)?;
     // accept connection from destination
     let dest_connecting = match server_endpoint.accept().await {
         Some(conn) => conn,
@@ -198,7 +193,11 @@ async fn run_rcpd_master(
         "Forwarded source connection info to destination"
     );
     for rcpd in rcpds {
-        event!(Level::INFO, "Waiting for rcpd process to finish: {:?}", rcpd);
+        event!(
+            Level::INFO,
+            "Waiting for rcpd process to finish: {:?}",
+            rcpd
+        );
         remote::wait_for_rcpd_process(rcpd).await?;
     }
     Ok(common::CopySummary::default())
