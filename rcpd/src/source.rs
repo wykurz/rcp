@@ -48,13 +48,13 @@ pub async fn run_source(
         .take(20)
         .map(char::from)
         .collect();
-    println!("{} {}", bound_addr.port(), server_name);
-    let master_hello = bincode::serialize(
-        &remote::protocol::SourceMasterHello {
-            source_addr: bound_addr,
-            server_name: server_name.clone(),
-        },
-    )?;
+    let local_ip = remote::get_local_ip().context("Failed to get local IP address")?;
+    let master_hello = remote::protocol::SourceMasterHello {
+        source_addr: std::net::SocketAddr::new(local_ip, bound_addr.port()),
+        server_name: server_name.clone(),
+    };
+    tracing::event!(Level::INFO, "Sending master hello: {:?}", master_hello);
+    let master_hello = bincode::serialize(&master_hello)?;
     master_connection.send_datagram(bytes::Bytes::from(master_hello))?;
     // start accepting connections from destination
     if let Some(conn) = endpoint.accept().await {
