@@ -6,14 +6,9 @@ pub async fn run_destination(
     src_endpoint: &std::net::SocketAddr,
     src_server_name: &str,
 ) -> anyhow::Result<String> {
-    // master_endpoint
-    let dst_endpoint = "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap();
-    let endpoint =
-        quinn::Endpoint::client(dst_endpoint).context("Failed to create QUIC endpoint")?;
-
-    let connection = endpoint.connect(*src_endpoint, src_server_name)?.await?;
+    let client = remote::get_client()?;
+    let connection = client.connect(*src_endpoint, src_server_name)?.await?;
     tracing::event!(Level::INFO, "Connected to QUIC server");
-
     // Accept incoming unidirectional streams
     while let Ok(mut recv_stream) = connection.accept_uni().await {
         tracing::event!(Level::INFO, "Received new unidirectional stream");

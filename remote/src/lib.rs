@@ -63,7 +63,6 @@ pub async fn wait_for_rcpd_process(
 
 #[instrument]
 pub async fn start_rcpd(
-    side: protocol::Side,
     session: &SshSession,
     master_addr: &std::net::SocketAddr,
     master_server_name: &str,
@@ -77,15 +76,12 @@ pub async fn start_rcpd(
         .context("Failed to get parent directory of current executable")?;
     event!(
         Level::DEBUG,
-        "Running rcpd from: {:?}, side: {:?}",
+        "Running rcpd from: {:?}",
         bin_dir,
-        side
     );
     // TODO: if that doesn't work, try an alternative path
     let mut cmd = session.arc_command(format!("{}/rcpd", bin_dir.display()));
-    cmd.arg("--side")
-        .arg(format!("{:?}", side))
-        .arg("--master-addr")
+    cmd.arg("--master-addr")
         .arg(master_addr.to_string())
         .arg("--server-name")
         .arg(master_server_name)

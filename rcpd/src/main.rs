@@ -11,10 +11,6 @@ mod source;
 information."
 )]
 struct Args {
-    /// Which side to run: source or destination
-    #[structopt(long)]
-    side: remote::protocol::Side,
-
     /// The master (rcp) address to connect to
     #[structopt(long, required = true)]
     master_addr: std::net::SocketAddr,
@@ -71,9 +67,32 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
     // master_endpoint
     let client = remote::get_client()?;
     let connection = client.connect(args.master_addr, &args.server_name)?.await?;
-    tracing::event!(tracing::Level::INFO, "Connected to master, sending side: {:?}", args.side);
-    let message = bincode::serialize(&args.side)?;
-    connection.send_datagram(bytes::Bytes::from(message))?;
+    tracing::event!(tracing::Level::INFO, "Connected to master");
+    let side_message = connection.read_datagram().await?;
+    let side = bincode::deserialize::<remote::protocol::Side>(&side_message)?;
+    tracing::event!(tracing::Level::INFO, "Received side: {:?}", side);
+    match side {
+        remote::protocol::Side::Source => {
+            tracing::event!(tracing::Level::INFO, "Starting source");
+            source::run_source(&connection, args.max_workers as u32).await?;
+        }
+        remote::protocol::Side::Destination => {
+            tracing::event!(
+                tracing::Level::INFO,
+                "Starting destination, need some more data from master"
+            );
+            let master_hello = connection.read_datagram().await?;
+            let master_hello: remote::protocol::MasterDestinationHello =
+                bincode::deserialize(&master_hello)?;
+            tracing::event!(
+                tracing::Level::INFO,
+                "Received master hello: {:?}, running destination",
+                master_hello
+            );
+            destination::run_destination(&master_hello.source_addr, &master_hello.server_name)
+                .await?;
+        }
+    }
     Ok("whee".to_string())
 }
 
