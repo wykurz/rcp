@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context};
+use rand::Rng;
 use tracing::{event, instrument, Level};
 
 pub mod protocol;
@@ -43,6 +44,7 @@ async fn setup_ssh_session(
     Ok(session)
 }
 
+#[instrument]
 pub async fn wait_for_rcpd_process(
     process: openssh::Child<std::sync::Arc<openssh::Session>>,
 ) -> anyhow::Result<()> {
@@ -74,11 +76,7 @@ pub async fn start_rcpd(
     let bin_dir = current_exe
         .parent()
         .context("Failed to get parent directory of current executable")?;
-    event!(
-        Level::DEBUG,
-        "Running rcpd from: {:?}",
-        bin_dir,
-    );
+    event!(Level::DEBUG, "Running rcpd from: {:?}", bin_dir,);
     // TODO: if that doesn't work, try an alternative path
     let mut cmd = session.arc_command(format!("{}/rcpd", bin_dir.display()));
     cmd.arg("--master-addr")
@@ -91,8 +89,7 @@ pub async fn start_rcpd(
         .context("Failed to spawn rcpd command")
 }
 
-#[instrument]
-pub fn configure_server(max_concurrent_streams: u32) -> anyhow::Result<quinn::ServerConfig> {
+fn configure_server(max_concurrent_streams: u32) -> anyhow::Result<quinn::ServerConfig> {
     event!(Level::INFO, "Configuring QUIC server");
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let key_der = cert.serialize_private_key_der();
@@ -106,6 +103,13 @@ pub fn configure_server(max_concurrent_streams: u32) -> anyhow::Result<quinn::Se
         .max_concurrent_uni_streams(max_concurrent_streams.into())
         .max_idle_timeout(Some(tokio::time::Duration::from_secs(30).try_into()?));
     Ok(server_config)
+}
+
+#[instrument]
+pub fn get_server(max_concurrent_streams: u32) -> anyhow::Result<quinn::Endpoint> {
+    let server_config = configure_server(max_concurrent_streams)?;
+    let addr = "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap();
+    quinn::Endpoint::server(server_config, addr).context("Failed to create QUIC endpoint")
 }
 
 // Certificate verifier that accepts any server certificate
@@ -126,12 +130,30 @@ impl rustls::client::ServerCertVerifier for AcceptAnyCertificate {
     }
 }
 
-pub fn get_local_ip() -> anyhow::Result<std::net::IpAddr> {
+fn get_local_ip() -> anyhow::Result<std::net::IpAddr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
     socket.connect("8.8.8.8:80")?;
     Ok(socket.local_addr()?.ip())
 }
 
+#[instrument]
+pub fn get_endpoint_addr(endpoint: &quinn::Endpoint) -> anyhow::Result<std::net::SocketAddr> {
+    // endpoint is bound to 0.0.0.0 so we need to get the local IP address
+    let local_ip = get_local_ip().context("Failed to get local IP address")?;
+    let endpoint_addr = endpoint.local_addr()?;
+    Ok(std::net::SocketAddr::new(local_ip, endpoint_addr.port()))
+}
+
+#[instrument]
+pub fn get_random_server_name() -> String {
+    rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(20)
+        .map(char::from)
+        .collect()
+}
+
+#[instrument]
 pub fn get_client() -> anyhow::Result<quinn::Endpoint> {
     // Create a crypto backend that accepts any server certificate (for development only)
     let crypto = rustls::ClientConfig::builder()

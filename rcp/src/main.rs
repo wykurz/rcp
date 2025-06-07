@@ -135,19 +135,12 @@ async fn run_rcpd_master(
     event!(Level::DEBUG, "running rcpd src/dst");
     // open a port and wait from server & client hello, respond to client with server port
     let max_concurrent_streams = 30;
-    let server_config = remote::configure_server(max_concurrent_streams)?;
-    let addr = "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap();
-    let server_endpoint =
-        quinn::Endpoint::server(server_config, addr).context("Failed to create QUIC endpoint")?;
-    // get the local IP address by checking which interface would be used to connect to external servers
-    let local_ip = remote::get_local_ip().context("Failed to get local IP address")?;
-    // create master address using the real local IP and the port from the endpoint
-    let endpoint_addr = server_endpoint.local_addr()?;
-    let master_addr = std::net::SocketAddr::new(local_ip, endpoint_addr.port());
-    let master_server_name = "make-random-server-name".to_string();
+    let server_endpoint = remote::get_server(max_concurrent_streams)?;
+    let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
+    let server_name = remote::get_random_server_name();
     let mut rcpds = vec![];
     for _ in 0..2 {
-        let rcpd = remote::start_rcpd(&src.session, &master_addr, &master_server_name).await?;
+        let rcpd = remote::start_rcpd(&src.session, &server_addr, &server_name).await?;
         rcpds.push(rcpd);
     }
     event!(
