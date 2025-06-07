@@ -164,21 +164,20 @@ async fn run_rcpd_master(
         &master_server_name,
     )
     .await?;
-
-    // Wait for connections from both rcpd processes
     event!(
         Level::INFO,
         "Waiting for connections from rcpd processes..."
     );
-
     // Accept connection from source
     let source_connecting = match server_endpoint.accept().await {
         Some(conn) => conn,
         None => return Err(anyhow!("Server endpoint closed before source connected")),
     };
-    let _source_connection = source_connecting.await?;
+    let source_connection = source_connecting.await?;
     event!(Level::INFO, "Source rcpd connected");
-
+    source_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
+        &remote::Side::Source,
+    )?))?;
     // Accept connection from destination
     let dest_connecting = match server_endpoint.accept().await {
         Some(conn) => conn,
@@ -190,6 +189,10 @@ async fn run_rcpd_master(
     };
     let _dest_connection = dest_connecting.await?;
     event!(Level::INFO, "Destination rcpd connected");
+    event!(Level::INFO, "Source rcpd connected");
+    source_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
+        &remote::Side::Destination,
+    )?))?;
 
     event!(
         Level::INFO,

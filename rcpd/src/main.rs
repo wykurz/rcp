@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use structopt::StructOpt;
 use tracing::instrument;
 
@@ -74,7 +73,7 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
     let connection = client.connect(args.master_addr, &args.server_name)?.await?;
     tracing::event!(tracing::Level::INFO, "Connected to master, sending side: {:?}", args.side);
     let message = bincode::serialize(&args.side)?;
-    connection.send_datagram(Bytes::from(message))?;
+    connection.send_datagram(bytes::Bytes::from(message))?;
     Ok("whee".to_string())
 }
 
