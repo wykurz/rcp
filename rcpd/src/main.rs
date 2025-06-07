@@ -13,7 +13,7 @@ information."
 struct Args {
     /// Which side to run: source or destination
     #[structopt(long)]
-    side: remote::Side,
+    side: remote::protocol::Side,
 
     /// The master (rcp) address to connect to
     #[structopt(long, required = true)]
