@@ -1,37 +1,7 @@
 use anyhow::{anyhow, Context};
-use serde::{Deserialize, Serialize};
-use strum::EnumString;
 use tracing::{event, instrument, Level};
 
-#[derive(Debug, Serialize, Deserialize)]
-pub enum FsObject {
-    Directory {
-        path: std::path::PathBuf,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-        mtime_nsec: i64,
-        ctime_nsec: i64,
-    },
-    // Implies files contents will be sent immediately after receiving this object
-    File {
-        path: std::path::PathBuf,
-        size: u64,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-        mtime_nsec: i64,
-        ctime_nsec: i64,
-    },
-    Symlink {
-        path: std::path::PathBuf,
-        target: std::path::PathBuf,
-        uid: u32,
-        gid: u32,
-        mtime_nsec: i64,
-        ctime_nsec: i64,
-    },
-}
+pub mod protocol;
 
 #[derive(Debug, PartialEq)]
 pub struct SshSession {
@@ -48,12 +18,6 @@ impl SshSession {
             port: None,
         }
     }
-}
-
-#[derive(Copy, Clone, Debug, EnumString, Serialize, Deserialize)]
-pub enum Side {
-    Source,
-    Destination,
 }
 
 async fn setup_ssh_session(
@@ -99,7 +63,7 @@ pub async fn wait_for_rcpd_process(
 
 #[instrument]
 pub async fn start_rcpd(
-    side: Side,
+    side: protocol::Side,
     session: &SshSession,
     master_addr: &std::net::SocketAddr,
     master_server_name: &str,

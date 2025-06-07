@@ -151,14 +151,14 @@ async fn run_rcpd_master(
     let master_server_name = "make-random-server-name".to_string();
     // TODO: pass a side (source, destination) to rcpd. note we DON't know the ports yet. rcpd will communicate "side" when it's registering below
     let rcpd_server = remote::start_rcpd(
-        remote::Side::Source,
+        remote::protocol::Side::Source,
         &src.session,
         &master_addr,
         &master_server_name,
     )
     .await?;
     let rcpd_client = remote::start_rcpd(
-        remote::Side::Destination,
+        remote::protocol::Side::Destination,
         &dst.session,
         &master_addr,
         &master_server_name,
@@ -176,7 +176,7 @@ async fn run_rcpd_master(
     let source_connection = source_connecting.await?;
     event!(Level::INFO, "Source rcpd connected");
     source_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
-        &remote::Side::Source,
+        &remote::protocol::Side::Source,
     )?))?;
     // Accept connection from destination
     let dest_connecting = match server_endpoint.accept().await {
@@ -191,7 +191,7 @@ async fn run_rcpd_master(
     event!(Level::INFO, "Destination rcpd connected");
     event!(Level::INFO, "Source rcpd connected");
     source_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
-        &remote::Side::Destination,
+        &remote::protocol::Side::Destination,
     )?))?;
 
     event!(
