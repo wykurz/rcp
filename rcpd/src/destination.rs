@@ -4,6 +4,9 @@ use tracing::{instrument, Level};
 pub async fn run_destination(
     src_endpoint: &std::net::SocketAddr,
     src_server_name: &str,
+    _dst: &std::path::Path,
+    _destination_config: &remote::protocol::DestinationConfig,
+    _rcpd_config: &remote::protocol::RcpdConfig,
 ) -> anyhow::Result<String> {
     let client = remote::get_client()?;
     let connection = client.connect(*src_endpoint, src_server_name)?.await?;

@@ -129,6 +129,7 @@ struct Args {
 
 #[instrument]
 async fn run_rcpd_master(
+    args: &Args,
     src: &path::RemotePath,
     dst: &path::RemotePath,
 ) -> Result<common::CopySummary> {
@@ -154,8 +155,24 @@ async fn run_rcpd_master(
     };
     let source_connection = source_connecting.await?;
     event!(Level::INFO, "Source rcpd connected");
+    let rcpd_config = remote::protocol::RcpdConfig {
+        fail_early: args.fail_early,
+        max_workers: args.max_workers,
+        max_blocking_threads: args.max_blocking_threads,
+        max_open_files: args.max_open_files,
+        ops_throttle: args.ops_throttle,
+        iops_throttle: args.iops_throttle,
+        chunk_size: args.chunk_size.0 as usize,
+        tput_throttle: args.tput_throttle,
+    };
     source_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
-        &remote::protocol::Side::Source,
+        &remote::protocol::MasterHello::Source {
+            src: src.path.clone(),
+            source_config: remote::protocol::SourceConfig {
+                dereference: args.dereference,
+            },
+            rcpd_config,
+        },
     )?))?;
     let source_message = source_connection.read_datagram().await?;
     let source_hello =
@@ -173,12 +190,17 @@ async fn run_rcpd_master(
     event!(Level::INFO, "Destination rcpd connected");
     event!(Level::INFO, "Source rcpd connected");
     dest_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
-        &remote::protocol::Side::Destination,
-    )?))?;
-    dest_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
-        &remote::protocol::MasterDestinationHello {
+        &remote::protocol::MasterHello::Destination {
             source_addr: source_hello.source_addr,
             server_name: source_hello.server_name.clone(),
+            dst: dst.path.clone(),
+            destination_config: remote::protocol::DestinationConfig {
+                overwrite: args.overwrite,
+                overwrite_compare: args.overwrite_compare.clone(),
+                preserve: args.preserve,
+                preserve_settings: args.preserve_settings.clone(),
+            },
+            rcpd_config,
         },
     )?))?;
     event!(
@@ -233,10 +255,10 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
             Some((src_remote, dst_remote))
         }
         (path::PathType::Remote(src_remote), path::PathType::Local(src_local)) => {
-            Some((src_remote, path::RemotePath::from_local(src_local)))
+            Some((src_remote, path::RemotePath::from_local(&src_local)))
         }
         (path::PathType::Local(src_local), path::PathType::Remote(dst_remote)) => {
-            Some((path::RemotePath::from_local(src_local), dst_remote))
+            Some((path::RemotePath::from_local(&src_local), dst_remote))
         }
         (path::PathType::Local(_), path::PathType::Local(_)) => None,
     };
@@ -246,7 +268,7 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
                 "Multiple sources are currently not supported when using remote paths!"
             ));
         }
-        return run_rcpd_master(&remote_src, &remote_dst).await;
+        return run_rcpd_master(&args, &remote_src, &remote_dst).await;
     }
     let src_dst: Vec<(std::path::PathBuf, std::path::PathBuf)> = if dst_string.ends_with('/') {
         // rcp foo bar baz/ -> copy foo to baz/foo and bar to baz/bar

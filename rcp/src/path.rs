@@ -1,23 +1,21 @@
 #[derive(Debug)]
 pub struct RemotePath {
     pub session: remote::SshSession,
-    // FIXME
-    #[allow(dead_code)]
-    pub path: String,
+    pub path: std::path::PathBuf,
 }
 
 impl RemotePath {
-    pub fn from_local(path: String) -> Self {
+    pub fn from_local(path: &std::path::Path) -> Self {
         Self {
             session: remote::SshSession::local(),
-            path,
+            path: path.to_path_buf(),
         }
     }
 }
 
 #[derive(Debug)]
 pub enum PathType {
-    Local(String),
+    Local(std::path::PathBuf),
     Remote(RemotePath),
 }
 
@@ -50,11 +48,11 @@ pub fn parse_path(path: &str) -> PathType {
         let remote_path = captures.name("path").unwrap().as_str().to_string();
         PathType::Remote(RemotePath {
             session: remote::SshSession { user, host, port },
-            path: remote_path,
+            path: remote_path.into(),
         })
     } else {
         // It's a local path
-        PathType::Local(path.to_string())
+        PathType::Local(path.into())
     }
 }
 
@@ -65,7 +63,7 @@ mod tests {
     #[test]
     fn test_parse_path_local() {
         match parse_path("/path/to/file") {
-            PathType::Local(path) => assert_eq!(path, "/path/to/file"),
+            PathType::Local(path) => assert_eq!(path.to_str().unwrap(), "/path/to/file"),
             _ => panic!("Expected local path"),
         }
     }
@@ -80,7 +78,7 @@ mod tests {
                 assert_eq!(user, None);
                 assert_eq!(host, "host");
                 assert_eq!(port, None);
-                assert_eq!(path, "/path/to/file");
+                assert_eq!(path.to_str().unwrap(), "/path/to/file");
             }
             _ => panic!("Expected remote path"),
         }
@@ -96,7 +94,7 @@ mod tests {
                 assert_eq!(user, Some("user".to_string()));
                 assert_eq!(host, "host");
                 assert_eq!(port, Some(22));
-                assert_eq!(path, "/path/to/file");
+                assert_eq!(path.to_str().unwrap(), "/path/to/file");
             }
             _ => panic!("Expected remote path"),
         }
@@ -112,7 +110,7 @@ mod tests {
                 assert_eq!(user, None);
                 assert_eq!(host, "[2001:db8::1]");
                 assert_eq!(port, None);
-                assert_eq!(path, "/path/to/file");
+                assert_eq!(path.to_str().unwrap(), "/path/to/file");
             }
             _ => panic!("Expected remote path"),
         }
