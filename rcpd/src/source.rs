@@ -27,6 +27,9 @@ async fn handle_connection(conn: quinn::Connecting) -> anyhow::Result<()> {
 pub async fn run_source(
     master_connection: &quinn::Connection,
     max_concurrent_streams: u32,
+    _src: &std::path::Path,
+    _source_config: &remote::protocol::SourceConfig,
+    _rcpd_config: &remote::protocol::RcpdConfig,
 ) -> anyhow::Result<String> {
     let server_endpoint = remote::get_server(max_concurrent_streams)?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;

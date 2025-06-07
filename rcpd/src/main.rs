@@ -68,29 +68,41 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
     let client = remote::get_client()?;
     let connection = client.connect(args.master_addr, &args.server_name)?.await?;
     tracing::event!(tracing::Level::INFO, "Connected to master");
-    let side_message = connection.read_datagram().await?;
-    let side = bincode::deserialize::<remote::protocol::Side>(&side_message)?;
-    tracing::event!(tracing::Level::INFO, "Received side: {:?}", side);
-    match side {
-        remote::protocol::Side::Source => {
+    let hello_message = connection.read_datagram().await?;
+    let master_hello = bincode::deserialize::<remote::protocol::MasterHello>(&hello_message)?;
+    tracing::event!(tracing::Level::INFO, "Received side: {:?}", master_hello);
+    match master_hello {
+        remote::protocol::MasterHello::Source {
+            src,
+            source_config,
+            rcpd_config,
+        } => {
             tracing::event!(tracing::Level::INFO, "Starting source");
-            source::run_source(&connection, args.max_workers as u32).await?;
+            source::run_source(
+                &connection,
+                args.max_workers as u32,
+                &src,
+                &source_config,
+                &rcpd_config,
+            )
+            .await?;
         }
-        remote::protocol::Side::Destination => {
-            tracing::event!(
-                tracing::Level::INFO,
-                "Starting destination, need some more data from master"
-            );
-            let master_hello = connection.read_datagram().await?;
-            let master_hello: remote::protocol::MasterDestinationHello =
-                bincode::deserialize(&master_hello)?;
-            tracing::event!(
-                tracing::Level::INFO,
-                "Received master hello: {:?}, running destination",
-                master_hello
-            );
-            destination::run_destination(&master_hello.source_addr, &master_hello.server_name)
-                .await?;
+        remote::protocol::MasterHello::Destination {
+            source_addr,
+            server_name,
+            dst,
+            destination_config,
+            rcpd_config,
+        } => {
+            tracing::event!(tracing::Level::INFO, "Starting destination");
+            destination::run_destination(
+                &source_addr,
+                &server_name,
+                &dst,
+                &destination_config,
+                &rcpd_config,
+            )
+            .await?;
         }
     }
     Ok("whee".to_string())
