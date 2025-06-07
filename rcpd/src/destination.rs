@@ -7,12 +7,9 @@ pub async fn run_destination(
 ) -> anyhow::Result<String> {
     let client = remote::get_client()?;
     let connection = client.connect(*src_endpoint, src_server_name)?.await?;
-    tracing::event!(Level::INFO, "Connected to QUIC server");
-    // Accept incoming unidirectional streams
+    tracing::event!(Level::INFO, "Connected to Source");
     while let Ok(mut recv_stream) = connection.accept_uni().await {
         tracing::event!(Level::INFO, "Received new unidirectional stream");
-
-        // Read the incoming data
         let mut buf = Vec::new();
         match recv_stream.read_to_end(1024).await {
             Ok(data) => {
@@ -28,7 +25,6 @@ pub async fn run_destination(
             }
         }
     }
-
-    tracing::event!(Level::INFO, "QUIC client finished");
-    Ok("QUIC client done".to_string())
+    tracing::event!(Level::INFO, "Destination is done");
+    Ok("destination OK".to_string())
 }
