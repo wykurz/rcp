@@ -4,10 +4,13 @@ use tracing::{instrument, Level};
 pub async fn run_destination(
     src_endpoint: &std::net::SocketAddr,
     src_server_name: &str,
-    _dst: &std::path::Path,
+    dst: &std::path::Path,
     _destination_config: &remote::protocol::DestinationConfig,
     _rcpd_config: &remote::protocol::RcpdConfig,
 ) -> anyhow::Result<String> {
+    if !dst.is_absolute() {
+        return Err(anyhow::anyhow!("Destination path must be absolute: {}", dst.display()));
+    }
     let client = remote::get_client()?;
     let connection = client.connect(*src_endpoint, src_server_name)?.await?;
     tracing::event!(Level::INFO, "Connected to Source");
