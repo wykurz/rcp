@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 pub enum FsObject {
     Directory {
-        path: std::path::PathBuf,
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
         mode: u32,
         uid: u32,
         gid: u32,

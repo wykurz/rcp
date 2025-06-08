@@ -1497,6 +1497,7 @@ version = "0.18.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "async-recursion",
  "bincode",
  "bytes",
  "bytesize",

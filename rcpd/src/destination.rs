@@ -9,7 +9,10 @@ pub async fn run_destination(
     _rcpd_config: &remote::protocol::RcpdConfig,
 ) -> anyhow::Result<String> {
     if !dst.is_absolute() {
-        return Err(anyhow::anyhow!("Destination path must be absolute: {}", dst.display()));
+        return Err(anyhow::anyhow!(
+            "Destination path must be absolute: {}",
+            dst.display()
+        ));
     }
     let client = remote::get_client()?;
     let connection = client.connect(*src_endpoint, src_server_name)?.await?;
