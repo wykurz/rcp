@@ -66,7 +66,7 @@ async fn handle_connection(conn: quinn::Connecting) -> anyhow::Result<()> {
     event!(Level::INFO, "Destination connection established");
     let mut send_stream = connection.open_uni().await?;
     event!(Level::INFO, "Opened unidirectional stream");
-    // TODO: send some test data
+    // TODO: run send_directory_structure
     match send_stream.write_all(b"Hello from QUIC server!\n").await {
         Ok(()) => {
             event!(Level::INFO, "Data sent successfully");
