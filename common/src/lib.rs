@@ -367,7 +367,6 @@ impl std::io::Write for ProgWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         PBAR.suspend(|| std::io::stdout().write(buf))
     }
-
     fn flush(&mut self) -> std::io::Result<()> {
         std::io::stdout().flush()
     }
@@ -415,14 +414,11 @@ where
                 })
                 .unwrap(),
             );
-
         let is_console_enabled = match std::env::var("RCP_TOKIO_TRACING_CONSOLE_ENABLED") {
             Ok(val) => matches!(val.to_lowercase().as_str(), "true" | "1"),
             Err(_) => false,
         };
-
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
-
         if is_console_enabled {
             let console_port: u16 =
                 read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_SERVER_PORT", 6669);
