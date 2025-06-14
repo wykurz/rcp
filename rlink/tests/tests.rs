@@ -322,15 +322,19 @@ fn test_complex_update_scenario() {
         0o644,
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(1000));
-
-    create_test_file(&update_subdir.join("modified.txt"), "old content", 0o644);
+    create_test_file(
+        &update_subdir.join("modified.txt"),
+        "new content of different length",
+        0o644,
+    );
     create_test_file(&update_subdir.join("added.txt"), "added content", 0o644);
 
     let dst_subdir = dst_dir.path().join("project");
 
     let mut cmd = assert_cmd::Command::cargo_bin("rlink").unwrap();
     cmd.args([
+        "--update-compare", // don't compare time to avoid false positives
+        "size",
         "--update",
         update_subdir.to_str().unwrap(),
         src_subdir.to_str().unwrap(),
@@ -349,7 +353,7 @@ fn test_complex_update_scenario() {
     ));
     assert_eq!(
         get_file_content(&dst_subdir.join("modified.txt")),
-        "old content"
+        "new content of different length"
     );
     assert!(are_files_hardlinked(
         &src_subdir.join("deleted.txt"),
