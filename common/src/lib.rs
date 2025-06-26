@@ -1,39 +1,24 @@
 #[macro_use]
 extern crate lazy_static;
 
+use crate::cmp::ObjType;
 use anyhow::anyhow;
 use anyhow::Context;
-use cmp::ObjType;
 use std::fmt;
 use std::io::IsTerminal;
 use tracing::{event, instrument, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::prelude::*;
 
-mod cmp;
-mod copy;
-mod filecmp;
-mod link;
-mod preserve;
-mod progress;
-mod rm;
-mod testutils;
+pub mod cmp;
+pub mod copy;
+pub mod link;
+pub mod preserve;
+pub mod rm;
 
-pub use cmp::CmpResult;
-pub use cmp::CmpSettings;
-pub use cmp::CmpSummary;
-pub use cmp::LogWriter;
-pub use cmp::ObjCmpSettings;
-pub use copy::CopyError;
-pub use copy::CopySettings;
-pub use copy::CopySummary;
-pub use link::LinkError;
-pub use link::LinkSettings;
-pub use link::LinkSummary;
-pub use preserve::{preserve_all, preserve_default, PreserveSettings};
-pub use rm::RmError;
-pub use rm::RmSettings;
-pub use rm::RmSummary;
+mod filecmp;
+mod progress;
+mod testutils;
 
 lazy_static! {
     static ref PROGRESS: progress::Progress = progress::Progress::new();
@@ -215,10 +200,8 @@ fn parse_type_settings(
     Ok((user_and_time, mode_mask))
 }
 
-pub fn parse_preserve_settings(
-    settings: &str,
-) -> Result<preserve::PreserveSettings, anyhow::Error> {
-    let mut preserve_settings = preserve::PreserveSettings::default();
+pub fn parse_preserve_settings(settings: &str) -> Result<preserve::Settings, anyhow::Error> {
+    let mut preserve_settings = preserve::Settings::default();
     for type_settings in settings.split(' ') {
         if let Some((obj_type, obj_settings)) = type_settings.split_once(':') {
             let (user_and_time_settings, mode_opt) =
@@ -256,8 +239,8 @@ pub fn parse_preserve_settings(
     Ok(preserve_settings)
 }
 
-pub fn parse_compare_settings(settings: &str) -> Result<ObjCmpSettings, anyhow::Error> {
-    let mut cmp_settings = ObjCmpSettings::default();
+pub fn parse_compare_settings(settings: &str) -> Result<cmp::ObjSettings, anyhow::Error> {
+    let mut cmp_settings = cmp::ObjSettings::default();
     for type_settings in settings.split(' ') {
         if let Some((obj_type, obj_settings)) = type_settings.split_once(':') {
             let obj_cmp_settings = parse_metadata_cmp_settings(obj_settings).context(format!(
@@ -284,23 +267,23 @@ pub async fn cmp(
     src: &std::path::Path,
     dst: &std::path::Path,
     log: &cmp::LogWriter,
-    settings: &cmp::CmpSettings,
-) -> Result<CmpSummary, anyhow::Error> {
+    settings: &cmp::Settings,
+) -> Result<cmp::Summary, anyhow::Error> {
     cmp::cmp(&PROGRESS, src, dst, log, settings).await
 }
 
 pub async fn copy(
     src: &std::path::Path,
     dst: &std::path::Path,
-    settings: &copy::CopySettings,
-    preserve: &preserve::PreserveSettings,
-) -> Result<CopySummary, CopyError> {
+    settings: &copy::Settings,
+    preserve: &preserve::Settings,
+) -> Result<copy::Summary, copy::Error> {
     let cwd = std::env::current_dir()
-        .map_err(|err| CopyError::new(anyhow::Error::msg(err), CopySummary::default()))?;
+        .map_err(|err| copy::Error::new(anyhow::Error::msg(err), copy::Summary::default()))?;
     copy::copy(&PROGRESS, &cwd, src, dst, settings, preserve, false).await
 }
 
-pub async fn rm(path: &std::path::Path, settings: &rm::RmSettings) -> Result<RmSummary, RmError> {
+pub async fn rm(path: &std::path::Path, settings: &rm::Settings) -> Result<rm::Summary, rm::Error> {
     rm::rm(&PROGRESS, path, settings).await
 }
 
@@ -308,10 +291,10 @@ pub async fn link(
     src: &std::path::Path,
     dst: &std::path::Path,
     update: &Option<std::path::PathBuf>,
-    settings: &link::LinkSettings,
-) -> Result<LinkSummary, LinkError> {
+    settings: &link::Settings,
+) -> Result<link::Summary, link::Error> {
     let cwd = std::env::current_dir()
-        .map_err(|err| LinkError::new(anyhow::Error::msg(err), LinkSummary::default()))?;
+        .map_err(|err| link::Error::new(anyhow::Error::msg(err), link::Summary::default()))?;
     link::link(&PROGRESS, &cwd, src, dst, update, settings, false).await
 }
 

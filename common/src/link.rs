@@ -4,46 +4,45 @@ use std::os::linux::fs::MetadataExt as LinuxMetadataExt;
 use tracing::{event, instrument, Level};
 
 use crate::copy;
+use crate::copy::{Settings as CopySettings, Summary as CopySummary};
 use crate::filecmp;
 use crate::preserve;
 use crate::progress;
 use crate::rm;
-use crate::CopySettings;
-use crate::CopySummary;
 
 lazy_static! {
-    static ref RLINK_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_all();
+    static ref RLINK_PRESERVE_SETTINGS: preserve::Settings = preserve::preserve_all();
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
-pub struct LinkError {
+pub struct Error {
     #[source]
     pub source: anyhow::Error,
-    pub summary: LinkSummary,
+    pub summary: Summary,
 }
 
-impl LinkError {
-    pub fn new(source: anyhow::Error, summary: LinkSummary) -> Self {
-        LinkError { source, summary }
+impl Error {
+    pub fn new(source: anyhow::Error, summary: Summary) -> Self {
+        Error { source, summary }
     }
 }
 
 #[derive(Debug, Copy, Clone)]
-pub struct LinkSettings {
+pub struct Settings {
     pub copy_settings: CopySettings,
     pub update_compare: filecmp::MetadataCmpSettings,
     pub update_exclusive: bool,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
-pub struct LinkSummary {
+pub struct Summary {
     pub hard_links_created: usize,
     pub hard_links_unchanged: usize,
     pub copy_summary: CopySummary,
 }
 
-impl std::ops::Add for LinkSummary {
+impl std::ops::Add for Summary {
     type Output = Self;
     fn add(self, other: Self) -> Self {
         Self {
@@ -54,7 +53,7 @@ impl std::ops::Add for LinkSummary {
     }
 }
 
-impl std::fmt::Display for LinkSummary {
+impl std::fmt::Display for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
@@ -76,9 +75,9 @@ async fn hard_link_helper(
     src: &std::path::Path,
     src_metadata: &std::fs::Metadata,
     dst: &std::path::Path,
-    settings: &LinkSettings,
-) -> Result<LinkSummary, LinkError> {
-    let mut link_summary = LinkSummary::default();
+    settings: &Settings,
+) -> Result<Summary, Error> {
+    let mut link_summary = Summary::default();
     if let Err(error) = tokio::fs::hard_link(src, dst).await {
         if settings.copy_settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
             event!(
@@ -88,11 +87,11 @@ async fn hard_link_helper(
             let dst_metadata = tokio::fs::symlink_metadata(dst)
                 .await
                 .with_context(|| format!("cannot read {:?} metadata", dst))
-                .map_err(|err| LinkError::new(err, Default::default()))?;
+                .map_err(|err| Error::new(err, Default::default()))?;
             if is_hard_link(src_metadata, &dst_metadata) {
                 event!(Level::DEBUG, "no change, leaving file as is");
                 prog_track.hard_links_unchanged.inc();
-                return Ok(LinkSummary {
+                return Ok(Summary {
                     hard_links_unchanged: 1,
                     ..Default::default()
                 });
@@ -104,7 +103,7 @@ async fn hard_link_helper(
             let rm_summary = rm::rm(
                 prog_track,
                 dst,
-                &rm::RmSettings {
+                &rm::Settings {
                     fail_early: settings.copy_settings.fail_early,
                 },
             )
@@ -112,12 +111,12 @@ async fn hard_link_helper(
             .map_err(|err| {
                 let rm_summary = err.summary;
                 link_summary.copy_summary.rm_summary = rm_summary;
-                LinkError::new(anyhow::Error::msg(err), link_summary)
+                Error::new(anyhow::Error::msg(err), link_summary)
             })?;
             link_summary.copy_summary.rm_summary = rm_summary;
             tokio::fs::hard_link(src, dst)
                 .await
-                .map_err(|err| LinkError::new(anyhow::Error::msg(err), link_summary))?;
+                .map_err(|err| Error::new(anyhow::Error::msg(err), link_summary))?;
         }
     }
     prog_track.hard_links_created.inc();
@@ -133,16 +132,16 @@ pub async fn link(
     src: &std::path::Path,
     dst: &std::path::Path,
     update: &Option<std::path::PathBuf>,
-    settings: &LinkSettings,
+    settings: &Settings,
     mut is_fresh: bool,
-) -> Result<LinkSummary, LinkError> {
+) -> Result<Summary, Error> {
     throttle::get_ops_token().await;
     let _prog_guard = prog_track.ops.guard();
     event!(Level::DEBUG, "reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))
-        .map_err(|err| LinkError::new(err, Default::default()))?;
+        .map_err(|err| Error::new(err, Default::default()))?;
     let update_metadata_opt = match update {
         Some(update) => {
             event!(Level::DEBUG, "reading 'update' metadata");
@@ -157,7 +156,7 @@ pub async fn link(
                         }
                         None
                     } else {
-                        return Err(LinkError::new(
+                        return Err(Error::new(
                             anyhow!("failed reading metadata from {:?}", &update),
                             Default::default(),
                         ));
@@ -191,13 +190,13 @@ pub async fn link(
             .await
             .map_err(|err| {
                 let copy_summary = err.summary;
-                let link_summary = LinkSummary {
+                let link_summary = Summary {
                     copy_summary,
                     ..Default::default()
                 };
-                LinkError::new(err.source, link_summary)
+                Error::new(err.source, link_summary)
             })?;
-            return Ok(LinkSummary {
+            return Ok(Summary {
                 copy_summary,
                 ..Default::default()
             });
@@ -214,7 +213,7 @@ pub async fn link(
                     src,
                     update
                 );
-                return Ok(LinkSummary {
+                return Ok(Summary {
                     copy_summary: copy::copy_file(
                         prog_track,
                         update,
@@ -226,11 +225,11 @@ pub async fn link(
                     .await
                     .map_err(|err| {
                         let copy_summary = err.summary;
-                        let link_summary = LinkSummary {
+                        let link_summary = Summary {
                             copy_summary,
                             ..Default::default()
                         };
-                        LinkError::new(err.source, link_summary)
+                        Error::new(err.source, link_summary)
                     })?,
                     ..Default::default()
                 });
@@ -251,13 +250,13 @@ pub async fn link(
             .await
             .map_err(|err| {
                 let copy_summary = err.summary;
-                let link_summary = LinkSummary {
+                let link_summary = Summary {
                     copy_summary,
                     ..Default::default()
                 };
-                LinkError::new(err.source, link_summary)
+                Error::new(err.source, link_summary)
             })?;
-            return Ok(LinkSummary {
+            return Ok(Summary {
                 copy_summary,
                 ..Default::default()
             });
@@ -283,20 +282,20 @@ pub async fn link(
             .await
             .map_err(|err| {
                 let copy_summary = err.summary;
-                let link_summary = LinkSummary {
+                let link_summary = Summary {
                     copy_summary,
                     ..Default::default()
                 };
-                LinkError::new(err.source, link_summary)
+                Error::new(err.source, link_summary)
             })?;
-            return Ok(LinkSummary {
+            return Ok(Summary {
                 copy_summary,
                 ..Default::default()
             });
         }
     }
     if !src_metadata.is_dir() {
-        return Err(LinkError::new(
+        return Err(Error::new(
             anyhow!(
                 "copy: {:?} -> {:?} failed, unsupported src file type: {:?}",
                 src,
@@ -311,7 +310,7 @@ pub async fn link(
     let mut src_entries = tokio::fs::read_dir(src)
         .await
         .with_context(|| format!("cannot open directory {:?} for reading", src))
-        .map_err(|err| LinkError::new(err, Default::default()))?;
+        .map_err(|err| Error::new(err, Default::default()))?;
     let copy_summary = {
         if let Err(error) = tokio::fs::create_dir(dst).await {
             assert!(!is_fresh, "unexpected error creating directory: {:?}", &dst);
@@ -324,7 +323,7 @@ pub async fn link(
                 let dst_metadata = tokio::fs::metadata(dst)
                     .await
                     .with_context(|| format!("failed reading metadata from {:?}", &dst))
-                    .map_err(|err| LinkError::new(err, Default::default()))?;
+                    .map_err(|err| Error::new(err, Default::default()))?;
                 if dst_metadata.is_dir() {
                     event!(Level::DEBUG, "'dst' is a directory, leaving it as is");
                     CopySummary {
@@ -340,7 +339,7 @@ pub async fn link(
                     let rm_summary = rm::rm(
                         prog_track,
                         dst,
-                        &rm::RmSettings {
+                        &rm::Settings {
                             fail_early: settings.copy_settings.fail_early,
                         },
                     )
@@ -348,9 +347,9 @@ pub async fn link(
                     .map_err(|err| {
                         let rm_summary = err.summary;
                         copy_summary.rm_summary = rm_summary;
-                        LinkError::new(
+                        Error::new(
                             anyhow::Error::msg(err),
-                            LinkSummary {
+                            Summary {
                                 copy_summary,
                                 ..Default::default()
                             },
@@ -361,9 +360,9 @@ pub async fn link(
                         .with_context(|| format!("cannot create directory {:?}", dst))
                         .map_err(|err| {
                             copy_summary.rm_summary = rm_summary;
-                            LinkError::new(
+                            Error::new(
                                 anyhow::Error::msg(err),
-                                LinkSummary {
+                                Summary {
                                     copy_summary,
                                     ..Default::default()
                                 },
@@ -380,7 +379,7 @@ pub async fn link(
             } else {
                 return Err(error)
                     .with_context(|| format!("cannot create directory {:?}", dst))
-                    .map_err(|err| LinkError::new(err, Default::default()))?;
+                    .map_err(|err| Error::new(err, Default::default()))?;
             }
         } else {
             // new directory created, anything copied into dst may assume they don't need to check for conflicts
@@ -391,7 +390,7 @@ pub async fn link(
             }
         }
     };
-    let mut link_summary = LinkSummary {
+    let mut link_summary = Summary {
         copy_summary,
         ..Default::default()
     };
@@ -404,7 +403,7 @@ pub async fn link(
         .next_entry()
         .await
         .with_context(|| format!("failed traversing directory {:?}", &src))
-        .map_err(|err| LinkError::new(err, link_summary))?
+        .map_err(|err| Error::new(err, link_summary))?
     {
         let cwd_path = cwd.to_owned();
         let entry_path = src_entry.path();
@@ -437,13 +436,13 @@ pub async fn link(
         let mut update_entries = tokio::fs::read_dir(update)
             .await
             .with_context(|| format!("cannot open directory {:?} for reading", &update))
-            .map_err(|err| LinkError::new(err, link_summary))?;
+            .map_err(|err| Error::new(err, link_summary))?;
         // iterate through update entries and for each one that's not present in src call "copy"
         while let Some(update_entry) = update_entries
             .next_entry()
             .await
             .with_context(|| format!("failed traversing directory {:?}", &update))
-            .map_err(|err| LinkError::new(err, link_summary))?
+            .map_err(|err| Error::new(err, link_summary))?
         {
             let cwd_path = cwd.to_owned();
             let entry_path = update_entry.path();
@@ -469,9 +468,9 @@ pub async fn link(
                 .await
                 .map_err(|err| {
                     link_summary.copy_summary = link_summary.copy_summary + err.summary;
-                    LinkError::new(err.source, link_summary)
+                    Error::new(err.source, link_summary)
                 })?;
-                Ok(LinkSummary {
+                Ok(Summary {
                     copy_summary,
                     ..Default::default()
                 })
@@ -503,13 +502,13 @@ pub async fn link(
             },
             Err(error) => {
                 if settings.copy_settings.fail_early {
-                    return Err(LinkError::new(anyhow::Error::msg(error), link_summary));
+                    return Err(Error::new(anyhow::Error::msg(error), link_summary));
                 }
             }
         }
     }
     if !success {
-        return Err(LinkError::new(
+        return Err(Error::new(
             anyhow!("link: {:?} {:?} -> {:?} failed!", src, update, dst),
             link_summary,
         ))?;
@@ -522,7 +521,7 @@ pub async fn link(
     };
     preserve::set_dir_metadata(&RLINK_PRESERVE_SETTINGS, preserve_metadata, dst)
         .await
-        .map_err(|err| LinkError::new(err, link_summary))?;
+        .map_err(|err| Error::new(err, link_summary))?;
     Ok(link_summary)
 }
 
@@ -538,8 +537,8 @@ mod link_tests {
         static ref PROGRESS: progress::Progress = progress::Progress::new();
     }
 
-    fn common_settings(dereference: bool, overwrite: bool) -> LinkSettings {
-        LinkSettings {
+    fn common_settings(dereference: bool, overwrite: bool) -> Settings {
+        Settings {
             copy_settings: CopySettings {
                 dereference,
                 fail_early: false,
@@ -780,13 +779,13 @@ mod link_tests {
             let summary = rm::rm(
                 &PROGRESS,
                 &output_path.join("bar"),
-                &rm::RmSettings { fail_early: false },
+                &rm::Settings { fail_early: false },
             )
             .await?
                 + rm::rm(
                     &PROGRESS,
                     &output_path.join("baz").join("5.txt"),
-                    &rm::RmSettings { fail_early: false },
+                    &rm::Settings { fail_early: false },
                 )
                 .await?;
             assert_eq!(summary.files_removed, 3);
@@ -834,13 +833,13 @@ mod link_tests {
             let summary = rm::rm(
                 &PROGRESS,
                 &output_path.join("bar"),
-                &rm::RmSettings { fail_early: false },
+                &rm::Settings { fail_early: false },
             )
             .await?
                 + rm::rm(
                     &PROGRESS,
                     &output_path.join("baz").join("5.txt"),
-                    &rm::RmSettings { fail_early: false },
+                    &rm::Settings { fail_early: false },
                 )
                 .await?;
             assert_eq!(summary.files_removed, 3);
@@ -902,25 +901,25 @@ mod link_tests {
             let summary = rm::rm(
                 &PROGRESS,
                 &bar_path.join("1.txt"),
-                &rm::RmSettings { fail_early: false },
+                &rm::Settings { fail_early: false },
             )
             .await?
                 + rm::rm(
                     &PROGRESS,
                     &bar_path.join("2.txt"),
-                    &rm::RmSettings { fail_early: false },
+                    &rm::Settings { fail_early: false },
                 )
                 .await?
                 + rm::rm(
                     &PROGRESS,
                     &bar_path.join("3.txt"),
-                    &rm::RmSettings { fail_early: false },
+                    &rm::Settings { fail_early: false },
                 )
                 .await?
                 + rm::rm(
                     &PROGRESS,
                     &output_path.join("baz"),
-                    &rm::RmSettings { fail_early: false },
+                    &rm::Settings { fail_early: false },
                 )
                 .await?;
             assert_eq!(summary.files_removed, 4);
@@ -981,25 +980,25 @@ mod link_tests {
             let summary = rm::rm(
                 &PROGRESS,
                 &bar_path.join("1.txt"),
-                &rm::RmSettings { fail_early: false },
+                &rm::Settings { fail_early: false },
             )
             .await?
                 + rm::rm(
                     &PROGRESS,
                     &bar_path.join("2.txt"),
-                    &rm::RmSettings { fail_early: false },
+                    &rm::Settings { fail_early: false },
                 )
                 .await?
                 + rm::rm(
                     &PROGRESS,
                     &bar_path.join("3.txt"),
-                    &rm::RmSettings { fail_early: false },
+                    &rm::Settings { fail_early: false },
                 )
                 .await?
                 + rm::rm(
                     &PROGRESS,
                     &output_path.join("baz"),
-                    &rm::RmSettings { fail_early: false },
+                    &rm::Settings { fail_early: false },
                 )
                 .await?;
             assert_eq!(summary.files_removed, 4);

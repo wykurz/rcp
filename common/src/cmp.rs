@@ -9,7 +9,7 @@ use crate::filecmp;
 use crate::progress;
 
 #[derive(Copy, Clone, Debug, Enum)]
-pub enum CmpResult {
+pub enum CompareResult {
     Same,
     Different,
     SrcMissing, // object missing in src but present in dst
@@ -23,23 +23,23 @@ pub enum ObjType {
     Symlink,
 }
 
-pub type ObjCmpSettings = EnumMap<ObjType, filecmp::MetadataCmpSettings>;
+pub type ObjSettings = EnumMap<ObjType, filecmp::MetadataCmpSettings>;
 
 #[derive(Debug, Copy, Clone)]
-pub struct CmpSettings {
-    pub compare: ObjCmpSettings,
+pub struct Settings {
+    pub compare: ObjSettings,
     pub fail_early: bool,
     pub exit_early: bool,
 }
 
-pub type Mismatch = EnumMap<ObjType, EnumMap<CmpResult, u64>>;
+pub type Mismatch = EnumMap<ObjType, EnumMap<CompareResult, u64>>;
 
 #[derive(Default)]
-pub struct CmpSummary {
+pub struct Summary {
     pub mismatch: Mismatch,
 }
 
-impl std::ops::Add for CmpSummary {
+impl std::ops::Add for Summary {
     type Output = Self;
     fn add(self, other: Self) -> Self {
         let mut mismatch = self.mismatch;
@@ -52,7 +52,7 @@ impl std::ops::Add for CmpSummary {
     }
 }
 
-impl std::fmt::Display for CmpSummary {
+impl std::fmt::Display for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         for (obj_type, &cmp_res_map) in &self.mismatch {
             for (cmp_res, &count) in &cmp_res_map {
@@ -87,7 +87,7 @@ impl LogWriter {
 
     pub async fn log_mismatch(
         &self,
-        cmp_result: CmpResult,
+        cmp_result: CompareResult,
         src_obj_type: Option<ObjType>,
         src: &std::path::Path,
         dst_obj_type: Option<ObjType>,
@@ -138,8 +138,8 @@ pub async fn cmp(
     src: &std::path::Path,
     dst: &std::path::Path,
     log: &LogWriter,
-    settings: &CmpSettings,
-) -> Result<CmpSummary> {
+    settings: &Settings,
+) -> Result<Summary> {
     throttle::get_ops_token().await;
     let _prog_guard = prog_track.ops.guard();
     event!(Level::DEBUG, "reading source metadata");
@@ -147,16 +147,22 @@ pub async fn cmp(
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))?;
-    let mut cmp_summary = CmpSummary::default();
+    let mut cmp_summary = Summary::default();
     let src_obj_type = obj_type(&src_metadata);
     let dst_metadata = {
         match tokio::fs::symlink_metadata(dst).await {
             Ok(metadata) => metadata,
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::NotFound {
-                    cmp_summary.mismatch[src_obj_type][CmpResult::DstMissing] += 1;
-                    log.log_mismatch(CmpResult::DstMissing, Some(src_obj_type), src, None, dst)
-                        .await?;
+                    cmp_summary.mismatch[src_obj_type][CompareResult::DstMissing] += 1;
+                    log.log_mismatch(
+                        CompareResult::DstMissing,
+                        Some(src_obj_type),
+                        src,
+                        None,
+                        dst,
+                    )
+                    .await?;
                     return Ok(cmp_summary);
                 }
                 return Err(err).context(format!("failed reading metadata from {:?}", &dst));
@@ -171,10 +177,10 @@ pub async fn cmp(
         )
     {
         // we use the src type for the summary attribution
-        cmp_summary.mismatch[src_obj_type][CmpResult::Different] += 1;
+        cmp_summary.mismatch[src_obj_type][CompareResult::Different] += 1;
         let dst_obj_type = obj_type(&dst_metadata);
         log.log_mismatch(
-            CmpResult::Different,
+            CompareResult::Different,
             Some(src_obj_type),
             src,
             Some(dst_obj_type),
@@ -185,7 +191,7 @@ pub async fn cmp(
             return Ok(cmp_summary);
         }
     } else {
-        cmp_summary.mismatch[src_obj_type][CmpResult::Same] += 1;
+        cmp_summary.mismatch[src_obj_type][CompareResult::Same] += 1;
     }
     if !src_metadata.is_dir() || !dst_metadata.is_dir() {
         // nothing more to do
@@ -240,9 +246,9 @@ pub async fn cmp(
             .await
             .with_context(|| format!("failed reading metadata from {:?}", &dst_path))?;
         let dst_obj_type = obj_type(&dst_entry_metadata);
-        cmp_summary.mismatch[dst_obj_type][CmpResult::SrcMissing] += 1;
+        cmp_summary.mismatch[dst_obj_type][CompareResult::SrcMissing] += 1;
         log.log_mismatch(
-            CmpResult::SrcMissing,
+            CompareResult::SrcMissing,
             None,
             &src.join(entry_name),
             Some(dst_obj_type),
@@ -289,8 +295,8 @@ mod cmp_tests {
 
     lazy_static! {
         static ref PROGRESS: progress::Progress = progress::Progress::new();
-        static ref NO_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_default();
-        static ref DO_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_all();
+        static ref NO_PRESERVE_SETTINGS: preserve::Settings = preserve::preserve_default();
+        static ref DO_PRESERVE_SETTINGS: preserve::Settings = preserve::preserve_all();
     }
 
     async fn setup_test_dirs(preserve: bool) -> Result<std::path::PathBuf> {
@@ -301,7 +307,7 @@ mod cmp_tests {
             &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            &copy::CopySettings {
+            &copy::Settings {
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -351,7 +357,7 @@ mod cmp_tests {
         tokio::fs::remove_file(&tmp_dir.join("bar").join("bar").join("2.txt")).await?;
         // create one more file in dst -- this will also modify the mtime of the directory
         tokio::fs::File::create(&tmp_dir.join("bar").join("baz").join("7.txt")).await?;
-        let compare_settings = CmpSettings {
+        let compare_settings = Settings {
             fail_early: false,
             exit_early: false,
             compare: enum_map! {
@@ -380,22 +386,22 @@ mod cmp_tests {
         .await?;
         let mismatch: Mismatch = enum_map! {
             ObjType::File => enum_map! {
-                CmpResult::Different => 1,
-                CmpResult::Same => 2,
-                CmpResult::SrcMissing => 2,
-                CmpResult::DstMissing => 1,
+                CompareResult::Different => 1,
+                CompareResult::Same => 2,
+                CompareResult::SrcMissing => 2,
+                CompareResult::DstMissing => 1,
             },
             ObjType::Dir => enum_map! {
-                CmpResult::Different => 2,
-                CmpResult::Same => 1,
-                CmpResult::SrcMissing => 0,
-                CmpResult::DstMissing => 0,
+                CompareResult::Different => 2,
+                CompareResult::Same => 1,
+                CompareResult::SrcMissing => 0,
+                CompareResult::DstMissing => 0,
             },
             ObjType::Symlink => enum_map! {
-                CmpResult::Different => 0,
-                CmpResult::Same => 2,
-                CmpResult::SrcMissing => 0,
-                CmpResult::DstMissing => 0,
+                CompareResult::Different => 0,
+                CompareResult::Same => 2,
+                CompareResult::SrcMissing => 0,
+                CompareResult::DstMissing => 0,
             },
         };
         assert_eq!(summary.mismatch, mismatch);

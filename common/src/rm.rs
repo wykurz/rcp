@@ -7,31 +7,31 @@ use crate::progress;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
-pub struct RmError {
+pub struct Error {
     #[source]
     pub source: anyhow::Error,
-    pub summary: RmSummary,
+    pub summary: Summary,
 }
 
-impl RmError {
-    fn new(source: anyhow::Error, summary: RmSummary) -> Self {
-        RmError { source, summary }
+impl Error {
+    fn new(source: anyhow::Error, summary: Summary) -> Self {
+        Error { source, summary }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct RmSettings {
+pub struct Settings {
     pub fail_early: bool,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
-pub struct RmSummary {
+pub struct Summary {
     pub files_removed: usize,
     pub symlinks_removed: usize,
     pub directories_removed: usize,
 }
 
-impl std::ops::Add for RmSummary {
+impl std::ops::Add for Summary {
     type Output = Self;
     fn add(self, other: Self) -> Self {
         Self {
@@ -42,7 +42,7 @@ impl std::ops::Add for RmSummary {
     }
 }
 
-impl std::fmt::Display for RmSummary {
+impl std::fmt::Display for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
@@ -59,30 +59,30 @@ impl std::fmt::Display for RmSummary {
 pub async fn rm(
     prog_track: &'static progress::Progress,
     path: &std::path::Path,
-    settings: &RmSettings,
-) -> Result<RmSummary, RmError> {
+    settings: &Settings,
+) -> Result<Summary, Error> {
     throttle::get_ops_token().await;
     let _ops_guard = prog_track.ops.guard();
     event!(Level::DEBUG, "read path metadata");
     let src_metadata = tokio::fs::symlink_metadata(path)
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &path))
-        .map_err(|err| RmError::new(anyhow::Error::msg(err), Default::default()))?;
+        .map_err(|err| Error::new(anyhow::Error::msg(err), Default::default()))?;
     if !src_metadata.is_dir() {
         event!(Level::DEBUG, "not a directory, just remove");
         tokio::fs::remove_file(path)
             .await
             .with_context(|| format!("failed removing {:?}", &path))
-            .map_err(|err| RmError::new(anyhow::Error::msg(err), Default::default()))?;
+            .map_err(|err| Error::new(anyhow::Error::msg(err), Default::default()))?;
         if src_metadata.file_type().is_symlink() {
             prog_track.symlinks_removed.inc();
-            return Ok(RmSummary {
+            return Ok(Summary {
                 symlinks_removed: 1,
                 ..Default::default()
             });
         }
         prog_track.files_removed.inc();
-        return Ok(RmSummary {
+        return Ok(Summary {
             files_removed: 1,
             ..Default::default()
         });
@@ -101,18 +101,18 @@ pub async fn rm(
                     &path
                 )
             })
-            .map_err(|err| RmError::new(anyhow::Error::msg(err), Default::default()))?;
+            .map_err(|err| Error::new(anyhow::Error::msg(err), Default::default()))?;
     }
     let mut entries = tokio::fs::read_dir(path)
         .await
-        .map_err(|err| RmError::new(anyhow::Error::msg(err), Default::default()))?;
+        .map_err(|err| Error::new(anyhow::Error::msg(err), Default::default()))?;
     let mut join_set = tokio::task::JoinSet::new();
     let mut success = true;
     while let Some(entry) = entries
         .next_entry()
         .await
         .with_context(|| format!("failed traversing directory {:?}", &path))
-        .map_err(|err| RmError::new(anyhow::Error::msg(err), Default::default()))?
+        .map_err(|err| Error::new(anyhow::Error::msg(err), Default::default()))?
     {
         let entry_path = entry.path();
         let settings = settings.clone();
@@ -122,31 +122,31 @@ pub async fn rm(
     // unfortunately ReadDir is opening file-descriptors and there's not a good way to limit this,
     // one thing we CAN do however is to drop it as soon as we're done with it
     drop(entries);
-    let mut rm_summary = RmSummary {
+    let mut rm_summary = Summary {
         directories_removed: 0,
         ..Default::default()
     };
     while let Some(res) = join_set.join_next().await {
-        match res.map_err(|err| RmError::new(anyhow::Error::msg(err), Default::default()))? {
+        match res.map_err(|err| Error::new(anyhow::Error::msg(err), Default::default()))? {
             Ok(summary) => rm_summary = rm_summary + summary,
             Err(error) => {
                 event!(Level::ERROR, "remove: {:?} failed with: {:?}", path, &error);
                 rm_summary = rm_summary + error.summary;
                 if settings.fail_early {
-                    return Err(RmError::new(error.source, rm_summary));
+                    return Err(Error::new(error.source, rm_summary));
                 }
                 success = false;
             }
         }
     }
     if !success {
-        return Err(RmError::new(anyhow!("rm: {:?} failed!", &path), rm_summary));
+        return Err(Error::new(anyhow!("rm: {:?} failed!", &path), rm_summary));
     }
     event!(Level::DEBUG, "finally remove the empty directory");
     tokio::fs::remove_dir(path)
         .await
         .with_context(|| format!("failed removing directory {:?}", &path))
-        .map_err(|err| RmError::new(anyhow::Error::msg(err), rm_summary))?;
+        .map_err(|err| Error::new(anyhow::Error::msg(err), rm_summary))?;
     prog_track.directories_removed.inc();
     rm_summary.directories_removed += 1;
     Ok(rm_summary)
@@ -180,7 +180,7 @@ mod tests {
         let summary = rm(
             &PROGRESS,
             &test_path.join("foo"),
-            &RmSettings { fail_early: false },
+            &Settings { fail_early: false },
         )
         .await?;
         assert!(!test_path.join("foo").exists());

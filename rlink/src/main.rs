@@ -113,7 +113,7 @@ struct Args {
     tput_throttle: usize,
 }
 
-async fn async_main(args: Args) -> Result<common::LinkSummary> {
+async fn async_main(args: Args) -> Result<common::link::Summary> {
     for src in &args.src {
         if src == "."
             || src
@@ -150,8 +150,8 @@ async fn async_main(args: Args) -> Result<common::LinkSummary> {
         &args.src,
         &dst,
         &args.update,
-        &common::LinkSettings {
-            copy_settings: common::CopySettings {
+        &common::link::Settings {
+            copy_settings: common::copy::Settings {
                 dereference: false, // currently not supported
                 fail_early: args.fail_early,
                 overwrite: args.overwrite,

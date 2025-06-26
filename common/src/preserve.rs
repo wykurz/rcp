@@ -60,7 +60,7 @@ impl SymlinkSettings {
 }
 
 #[derive(Copy, Clone, Debug, Default)]
-pub struct PreserveSettings {
+pub struct Settings {
     pub file: FileSettings,
     pub dir: DirSettings,
     pub symlink: SymlinkSettings,
@@ -123,7 +123,7 @@ async fn set_owner_and_time(
 }
 
 pub async fn set_file_metadata(
-    settings: &PreserveSettings,
+    settings: &Settings,
     metadata: &std::fs::Metadata,
     path: &std::path::Path,
 ) -> Result<()> {
@@ -144,7 +144,7 @@ pub async fn set_file_metadata(
 }
 
 pub async fn set_dir_metadata(
-    settings: &PreserveSettings,
+    settings: &Settings,
     metadata: &std::fs::Metadata,
     path: &std::path::Path,
 ) -> Result<()> {
@@ -162,7 +162,7 @@ pub async fn set_dir_metadata(
 }
 
 pub async fn set_symlink_metadata(
-    settings: &PreserveSettings,
+    settings: &Settings,
     metadata: &std::fs::Metadata,
     path: &std::path::Path,
 ) -> Result<()> {
@@ -171,14 +171,14 @@ pub async fn set_symlink_metadata(
     Ok(())
 }
 
-pub fn preserve_all() -> PreserveSettings {
+pub fn preserve_all() -> Settings {
     let user_and_time = UserAndTimeSettings {
         uid: true,
         gid: true,
         time: true,
     };
 
-    PreserveSettings {
+    Settings {
         file: FileSettings {
             user_and_time,
             mode_mask: 0o7777,
@@ -191,6 +191,6 @@ pub fn preserve_all() -> PreserveSettings {
     }
 }
 
-pub fn preserve_default() -> PreserveSettings {
-    PreserveSettings::default()
+pub fn preserve_default() -> Settings {
+    Settings::default()
 }

@@ -141,6 +141,12 @@ impl Progress {
     }
 }
 
+impl Default for Progress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct ProgressPrinter<'a> {
     progress: &'a Progress,
     last_ops: u64,
