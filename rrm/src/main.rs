@@ -90,17 +90,17 @@ struct Args {
 }
 
 #[instrument]
-async fn async_main(args: Args) -> Result<common::RmSummary> {
+async fn async_main(args: Args) -> Result<common::rm::Summary> {
     let mut join_set = tokio::task::JoinSet::new();
     for path in args.paths {
-        let settings = common::RmSettings {
+        let settings = common::rm::Settings {
             fail_early: args.fail_early,
         };
         let do_rm = || async move { common::rm(&path, &settings).await };
         join_set.spawn(do_rm());
     }
     let mut success = true;
-    let mut rm_summary = common::RmSummary::default();
+    let mut rm_summary = common::rm::Summary::default();
     while let Some(res) = join_set.join_next().await {
         match res? {
             Ok(summary) => rm_summary = rm_summary + summary,

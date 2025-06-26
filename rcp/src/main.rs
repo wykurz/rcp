@@ -132,7 +132,7 @@ async fn run_rcpd_master(
     args: &Args,
     src: &path::RemotePath,
     dst: &path::RemotePath,
-) -> Result<common::CopySummary> {
+) -> Result<common::copy::Summary> {
     event!(Level::DEBUG, "running rcpd src/dst");
     // open a port and wait from server & client hello, respond to client with server port
     let max_concurrent_streams = 30;
@@ -215,11 +215,11 @@ async fn run_rcpd_master(
         );
         remote::wait_for_rcpd_process(rcpd).await?;
     }
-    Ok(common::CopySummary::default())
+    Ok(common::copy::Summary::default())
 }
 
 #[instrument]
-async fn async_main(args: Args) -> Result<common::CopySummary> {
+async fn async_main(args: Args) -> Result<common::copy::Summary> {
     if args.paths.len() < 2 {
         return Err(anyhow!(
             "You must specify at least one source path and one destination path!"
@@ -305,12 +305,12 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
             std::path::PathBuf::from(dst_string),
         )]
     };
-    let settings = common::CopySettings {
+    let settings = common::copy::Settings {
         dereference: args.dereference,
         fail_early: args.fail_early,
         overwrite: args.overwrite,
         overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)
-            .map_err(|err| common::CopyError::new(err, Default::default()))?,
+            .map_err(|err| common::copy::Error::new(err, Default::default()))?,
         chunk_size: args.chunk_size.0,
     };
     event!(Level::DEBUG, "copy settings: {:?}", &settings);
@@ -322,11 +322,11 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
     }
     let preserve = if let Some(preserve_settings) = args.preserve_settings {
         common::parse_preserve_settings(&preserve_settings)
-            .map_err(|err| common::CopyError::new(err, Default::default()))?
+            .map_err(|err| common::copy::Error::new(err, Default::default()))?
     } else if args.preserve {
-        common::preserve_all()
+        common::preserve::preserve_all()
     } else {
-        common::preserve_default()
+        common::preserve::preserve_default()
     };
     event!(Level::DEBUG, "preserve settings: {:?}", &preserve);
     let mut join_set = tokio::task::JoinSet::new();
@@ -336,7 +336,7 @@ async fn async_main(args: Args) -> Result<common::CopySummary> {
         join_set.spawn(do_copy());
     }
     let mut success = true;
-    let mut copy_summary = common::CopySummary::default();
+    let mut copy_summary = common::copy::Summary::default();
     while let Some(res) = join_set.join_next().await {
         match res {
             Ok(result) => match result {

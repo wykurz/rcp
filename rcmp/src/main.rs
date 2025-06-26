@@ -116,13 +116,13 @@ struct Args {
     tput_throttle: usize,
 }
 
-async fn async_main(args: Args) -> Result<common::CmpSummary> {
-    let log_handle = common::LogWriter::new(args.log.as_deref()).await?;
+async fn async_main(args: Args) -> Result<common::cmp::Summary> {
+    let log_handle = common::cmp::LogWriter::new(args.log.as_deref()).await?;
     let summary = common::cmp(
         &args.src,
         &args.dst,
         &log_handle,
-        &common::CmpSettings {
+        &common::cmp::Settings {
             fail_early: args.fail_early,
             exit_early: args.exit_early,
             compare: common::parse_compare_settings(&args.metadata_compare)?,
@@ -167,9 +167,9 @@ fn main() -> Result<()> {
             false => {
                 // if there are any differences, return error code 1
                 for (_, cmp_result) in &summary.mismatch {
-                    let different = cmp_result[common::CmpResult::Different] > 0
-                        || cmp_result[common::CmpResult::SrcMissing] > 0
-                        || cmp_result[common::CmpResult::DstMissing] > 0;
+                    let different = cmp_result[common::cmp::CompareResult::Different] > 0
+                        || cmp_result[common::cmp::CompareResult::SrcMissing] > 0
+                        || cmp_result[common::cmp::CompareResult::DstMissing] > 0;
                     if different {
                         std::process::exit(1);
                     }

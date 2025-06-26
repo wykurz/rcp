@@ -8,25 +8,24 @@ use crate::filecmp;
 use crate::preserve;
 use crate::progress;
 use crate::rm;
-use crate::RmSettings;
-use crate::RmSummary;
+use crate::rm::{Settings as RmSettings, Summary as RmSummary};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
-pub struct CopyError {
+pub struct Error {
     #[source]
     pub source: anyhow::Error,
-    pub summary: CopySummary,
+    pub summary: Summary,
 }
 
-impl CopyError {
-    pub fn new(source: anyhow::Error, summary: CopySummary) -> Self {
-        CopyError { source, summary }
+impl Error {
+    pub fn new(source: anyhow::Error, summary: Summary) -> Self {
+        Error { source, summary }
     }
 }
 
 #[derive(Debug, Copy, Clone)]
-pub struct CopySettings {
+pub struct Settings {
     pub dereference: bool,
     pub fail_early: bool,
     pub overwrite: bool,
@@ -48,10 +47,10 @@ pub async fn copy_file(
     prog_track: &'static progress::Progress,
     src: &std::path::Path,
     dst: &std::path::Path,
-    settings: &CopySettings,
-    preserve: &preserve::PreserveSettings,
+    settings: &Settings,
+    preserve: &preserve::Settings,
     is_fresh: bool,
-) -> Result<CopySummary, CopyError> {
+) -> Result<Summary, Error> {
     let _open_file_guard = throttle::open_file_permit().await;
     event!(
         Level::DEBUG,
@@ -60,7 +59,7 @@ pub async fn copy_file(
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))
-        .map_err(|err| CopyError::new(err, Default::default()))?;
+        .map_err(|err| Error::new(err, Default::default()))?;
     if settings.chunk_size > 0 {
         let tokens = 1 + (std::cmp::max(1, src_metadata.size()) - 1) / settings.chunk_size;
         if tokens > u32::MAX as u64 {
@@ -80,7 +79,7 @@ pub async fn copy_file(
             let dst_metadata = tokio::fs::symlink_metadata(dst)
                 .await
                 .with_context(|| format!("failed reading metadata from {:?}", &dst))
-                .map_err(|err| CopyError::new(err, Default::default()))?;
+                .map_err(|err| Error::new(err, Default::default()))?;
             if is_file_type_same(&src_metadata, &dst_metadata)
                 && filecmp::metadata_equal(
                     &settings.overwrite_compare,
@@ -90,7 +89,7 @@ pub async fn copy_file(
             {
                 event!(Level::DEBUG, "file is identical, skipping");
                 prog_track.files_unchanged.inc();
-                return Ok(CopySummary {
+                return Ok(Summary {
                     files_unchanged: 1,
                     ..Default::default()
                 });
@@ -107,14 +106,14 @@ pub async fn copy_file(
             .await
             .map_err(|err| {
                 let rm_summary = err.summary;
-                let copy_summary = CopySummary {
+                let copy_summary = Summary {
                     rm_summary,
                     ..Default::default()
                 };
-                CopyError::new(anyhow::Error::msg(err), copy_summary)
+                Error::new(anyhow::Error::msg(err), copy_summary)
             })?;
         } else {
-            return Err(CopyError::new(
+            return Err(Error::new(
                 anyhow!(
                     "destination {:?} already exists, did you intend to specify --overwrite?",
                     dst
@@ -124,20 +123,20 @@ pub async fn copy_file(
         }
     }
     event!(Level::DEBUG, "copying data");
-    let mut copy_summary = CopySummary {
+    let mut copy_summary = Summary {
         rm_summary,
         ..Default::default()
     };
     tokio::fs::copy(src, dst)
         .await
         .with_context(|| format!("failed copying {:?} to {:?}", &src, &dst))
-        .map_err(|err| CopyError::new(err, copy_summary))?;
+        .map_err(|err| Error::new(err, copy_summary))?;
     prog_track.files_copied.inc();
     prog_track.bytes_copied.add(src_metadata.len());
     event!(Level::DEBUG, "setting permissions");
     preserve::set_file_metadata(preserve, &src_metadata, dst)
         .await
-        .map_err(|err| CopyError::new(err, copy_summary))?;
+        .map_err(|err| Error::new(err, copy_summary))?;
     // we mark files as "copied" only after all metadata is set as well
     copy_summary.bytes_copied += src_metadata.len();
     copy_summary.files_copied += 1;
@@ -145,7 +144,7 @@ pub async fn copy_file(
 }
 
 #[derive(Copy, Clone, Debug, Default)]
-pub struct CopySummary {
+pub struct Summary {
     pub bytes_copied: u64,
     pub files_copied: usize,
     pub symlinks_created: usize,
@@ -156,7 +155,7 @@ pub struct CopySummary {
     pub rm_summary: RmSummary,
 }
 
-impl std::ops::Add for CopySummary {
+impl std::ops::Add for Summary {
     type Output = Self;
     fn add(self, other: Self) -> Self {
         Self {
@@ -172,7 +171,7 @@ impl std::ops::Add for CopySummary {
     }
 }
 
-impl std::fmt::Display for CopySummary {
+impl std::fmt::Display for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
@@ -203,22 +202,22 @@ pub async fn copy(
     cwd: &std::path::Path,
     src: &std::path::Path,
     dst: &std::path::Path,
-    settings: &CopySettings,
-    preserve: &preserve::PreserveSettings,
+    settings: &Settings,
+    preserve: &preserve::Settings,
     mut is_fresh: bool,
-) -> Result<CopySummary, CopyError> {
+) -> Result<Summary, Error> {
     throttle::get_ops_token().await;
     let _ops_guard = prog_track.ops.guard();
     event!(Level::DEBUG, "reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from src: {:?}", &src))
-        .map_err(|err| CopyError::new(err, Default::default()))?;
+        .map_err(|err| Error::new(err, Default::default()))?;
     if settings.dereference && src_metadata.is_symlink() {
         let link = tokio::fs::read_link(&src)
             .await
             .with_context(|| format!("failed reading src symlink {:?}", &src))
-            .map_err(|err| CopyError::new(err, Default::default()))?;
+            .map_err(|err| Error::new(err, Default::default()))?;
         let abs_link = if link.is_relative() {
             cwd.join(link)
         } else {
@@ -246,19 +245,19 @@ pub async fn copy(
         let link = tokio::fs::read_link(src)
             .await
             .with_context(|| format!("failed reading symlink {:?}", &src))
-            .map_err(|err| CopyError::new(err, Default::default()))?;
+            .map_err(|err| Error::new(err, Default::default()))?;
         // try creating a symlink, if dst path exists and overwrite is set - remove and try again
         if let Err(error) = tokio::fs::symlink(&link, dst).await {
             if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
                 let dst_metadata = tokio::fs::symlink_metadata(dst)
                     .await
                     .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))
-                    .map_err(|err| CopyError::new(err, Default::default()))?;
+                    .map_err(|err| Error::new(err, Default::default()))?;
                 if is_file_type_same(&src_metadata, &dst_metadata) {
                     let dst_link = tokio::fs::read_link(dst)
                         .await
                         .with_context(|| format!("failed reading dst symlink: {:?}", &dst))
-                        .map_err(|err| CopyError::new(err, Default::default()))?;
+                        .map_err(|err| Error::new(err, Default::default()))?;
                     if link == dst_link {
                         event!(
                             Level::DEBUG,
@@ -271,7 +270,7 @@ pub async fn copy(
                                 .with_context(|| {
                                     format!("failed reading metadata from dst: {:?}", &dst)
                                 })
-                                .map_err(|err| CopyError::new(err, Default::default()))?;
+                                .map_err(|err| Error::new(err, Default::default()))?;
                             if !filecmp::metadata_equal(
                                 &settings.overwrite_compare,
                                 &src_metadata,
@@ -280,10 +279,10 @@ pub async fn copy(
                                 event!(Level::DEBUG, "'dst' metadata is different, updating");
                                 preserve::set_symlink_metadata(preserve, &src_metadata, dst)
                                     .await
-                                    .map_err(|err| CopyError::new(err, Default::default()))?;
+                                    .map_err(|err| Error::new(err, Default::default()))?;
                                 prog_track.symlinks_removed.inc();
                                 prog_track.symlinks_created.inc();
-                                return Ok(CopySummary {
+                                return Ok(Summary {
                                     rm_summary: RmSummary {
                                         symlinks_removed: 1,
                                         ..Default::default()
@@ -295,7 +294,7 @@ pub async fn copy(
                         }
                         event!(Level::DEBUG, "symlink already exists, skipping");
                         prog_track.symlinks_unchanged.inc();
-                        return Ok(CopySummary {
+                        return Ok(Summary {
                             symlinks_unchanged: 1,
                             ..Default::default()
                         });
@@ -317,24 +316,24 @@ pub async fn copy(
                 .await
                 .map_err(|err| {
                     let rm_summary = err.summary;
-                    let copy_summary = CopySummary {
+                    let copy_summary = Summary {
                         rm_summary,
                         ..Default::default()
                     };
-                    CopyError::new(err.source, copy_summary)
+                    Error::new(err.source, copy_summary)
                 })?;
                 tokio::fs::symlink(&link, dst)
                     .await
                     .with_context(|| format!("failed creating symlink {:?}", &dst))
                     .map_err(|err| {
-                        let copy_summary = CopySummary {
+                        let copy_summary = Summary {
                             rm_summary,
                             ..Default::default()
                         };
-                        CopyError::new(err, copy_summary)
+                        Error::new(err, copy_summary)
                     })?;
             } else {
-                return Err(CopyError::new(
+                return Err(Error::new(
                     anyhow!("failed creating symlink {:?}", &dst),
                     Default::default(),
                 ));
@@ -343,21 +342,21 @@ pub async fn copy(
         preserve::set_symlink_metadata(preserve, &src_metadata, dst)
             .await
             .map_err(|err| {
-                let copy_summary = CopySummary {
+                let copy_summary = Summary {
                     rm_summary,
                     ..Default::default()
                 };
-                CopyError::new(err, copy_summary)
+                Error::new(err, copy_summary)
             })?;
         prog_track.symlinks_created.inc();
-        return Ok(CopySummary {
+        return Ok(Summary {
             rm_summary,
             symlinks_created: 1,
             ..Default::default()
         });
     }
     if !src_metadata.is_dir() {
-        return Err(CopyError::new(
+        return Err(Error::new(
             anyhow!(
                 "copy: {:?} -> {:?} failed, unsupported src file type: {:?}",
                 src,
@@ -371,7 +370,7 @@ pub async fn copy(
     let mut entries = tokio::fs::read_dir(src)
         .await
         .with_context(|| format!("cannot open directory {:?} for reading", src))
-        .map_err(|err| CopyError::new(err, Default::default()))?;
+        .map_err(|err| Error::new(err, Default::default()))?;
     let mut copy_summary = {
         if let Err(error) = tokio::fs::create_dir(dst).await {
             assert!(!is_fresh, "unexpected error creating directory: {:?}", &dst);
@@ -383,11 +382,11 @@ pub async fn copy(
                 let dst_metadata = tokio::fs::metadata(dst)
                     .await
                     .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))
-                    .map_err(|err| CopyError::new(err, Default::default()))?;
+                    .map_err(|err| Error::new(err, Default::default()))?;
                 if dst_metadata.is_dir() {
                     event!(Level::DEBUG, "'dst' is a directory, leaving it as is");
                     prog_track.directories_unchanged.inc();
-                    CopySummary {
+                    Summary {
                         directories_unchanged: 1,
                         ..Default::default()
                     }
@@ -406,26 +405,26 @@ pub async fn copy(
                     .await
                     .map_err(|err| {
                         let rm_summary = err.summary;
-                        let copy_summary = CopySummary {
+                        let copy_summary = Summary {
                             rm_summary,
                             ..Default::default()
                         };
-                        CopyError::new(err.source, copy_summary)
+                        Error::new(err.source, copy_summary)
                     })?;
                     tokio::fs::create_dir(dst)
                         .await
                         .with_context(|| format!("cannot create directory {:?}", dst))
                         .map_err(|err| {
-                            let copy_summary = CopySummary {
+                            let copy_summary = Summary {
                                 rm_summary,
                                 ..Default::default()
                             };
-                            CopyError::new(anyhow::Error::msg(err), copy_summary)
+                            Error::new(anyhow::Error::msg(err), copy_summary)
                         })?;
                     // anything copied into dst may assume they don't need to check for conflicts
                     is_fresh = true;
                     prog_track.directories_created.inc();
-                    CopySummary {
+                    Summary {
                         rm_summary,
                         directories_created: 1,
                         ..Default::default()
@@ -433,7 +432,7 @@ pub async fn copy(
                 }
             } else {
                 event!(Level::ERROR, "{:?}", &error);
-                return Err(CopyError::new(
+                return Err(Error::new(
                     anyhow!("cannot create directory {:?}", dst),
                     Default::default(),
                 ));
@@ -442,7 +441,7 @@ pub async fn copy(
             // new directory created, anything copied into dst may assume they don't need to check for conflicts
             is_fresh = true;
             prog_track.directories_created.inc();
-            CopySummary {
+            Summary {
                 directories_created: 1,
                 ..Default::default()
             }
@@ -454,7 +453,7 @@ pub async fn copy(
         .next_entry()
         .await
         .with_context(|| format!("failed traversing src directory {:?}", &src))
-        .map_err(|err| CopyError::new(err, copy_summary))?
+        .map_err(|err| Error::new(err, copy_summary))?
     {
         let cwd_path = src.to_owned();
         let entry_path = entry.path();
@@ -493,20 +492,20 @@ pub async fn copy(
                     );
                     copy_summary = copy_summary + error.summary;
                     if settings.fail_early {
-                        return Err(CopyError::new(error.source, copy_summary));
+                        return Err(Error::new(error.source, copy_summary));
                     }
                     success = false;
                 }
             },
             Err(error) => {
                 if settings.fail_early {
-                    return Err(CopyError::new(anyhow::Error::msg(error), copy_summary));
+                    return Err(Error::new(anyhow::Error::msg(error), copy_summary));
                 }
             }
         }
     }
     if !success {
-        return Err(CopyError::new(
+        return Err(Error::new(
             anyhow!("copy: {:?} -> {:?} failed!", src, dst),
             copy_summary,
         ))?;
@@ -514,7 +513,7 @@ pub async fn copy(
     event!(Level::DEBUG, "set 'dst' directory metadata");
     preserve::set_dir_metadata(preserve, &src_metadata, dst)
         .await
-        .map_err(|err| CopyError::new(err, copy_summary))?;
+        .map_err(|err| Error::new(err, copy_summary))?;
     Ok(copy_summary)
 }
 
@@ -529,8 +528,8 @@ mod copy_tests {
 
     lazy_static! {
         static ref PROGRESS: progress::Progress = progress::Progress::new();
-        static ref NO_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_default();
-        static ref DO_PRESERVE_SETTINGS: preserve::PreserveSettings = preserve::preserve_all();
+        static ref NO_PRESERVE_SETTINGS: preserve::Settings = preserve::preserve_default();
+        static ref DO_PRESERVE_SETTINGS: preserve::Settings = preserve::preserve_all();
     }
 
     #[tokio::test]
@@ -543,7 +542,7 @@ mod copy_tests {
             &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            &CopySettings {
+            &Settings {
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -588,7 +587,7 @@ mod copy_tests {
             &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            &CopySettings {
+            &Settings {
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -660,7 +659,7 @@ mod copy_tests {
             &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            &CopySettings {
+            &Settings {
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -724,7 +723,7 @@ mod copy_tests {
             &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            &CopySettings {
+            &Settings {
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -768,7 +767,7 @@ mod copy_tests {
             &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            &CopySettings {
+            &Settings {
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
@@ -806,7 +805,7 @@ mod copy_tests {
 
     async fn cp_compare(
         cp_args: &[&str],
-        rcp_settings: &CopySettings,
+        rcp_settings: &Settings,
         preserve: bool,
     ) -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
@@ -860,7 +859,7 @@ mod copy_tests {
     async fn test_cp_compat() -> Result<(), anyhow::Error> {
         cp_compare(
             &["-r"],
-            &CopySettings {
+            &Settings {
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -882,7 +881,7 @@ mod copy_tests {
     async fn test_cp_compat_preserve() -> Result<(), anyhow::Error> {
         cp_compare(
             &["-r", "-p"],
-            &CopySettings {
+            &Settings {
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -904,7 +903,7 @@ mod copy_tests {
     async fn test_cp_compat_dereference() -> Result<(), anyhow::Error> {
         cp_compare(
             &["-r", "-L"],
-            &CopySettings {
+            &Settings {
                 dereference: true,
                 fail_early: false,
                 overwrite: false,
@@ -926,7 +925,7 @@ mod copy_tests {
     async fn test_cp_compat_preserve_and_dereference() -> Result<(), anyhow::Error> {
         cp_compare(
             &["-r", "-p", "-L"],
-            &CopySettings {
+            &Settings {
                 dereference: true,
                 fail_early: false,
                 overwrite: false,
@@ -951,7 +950,7 @@ mod copy_tests {
             &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            &CopySettings {
+            &Settings {
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -1009,7 +1008,7 @@ mod copy_tests {
             &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
-            &CopySettings {
+            &Settings {
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -1079,7 +1078,7 @@ mod copy_tests {
             &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
-            &CopySettings {
+            &Settings {
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -1148,7 +1147,7 @@ mod copy_tests {
             &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
-            &CopySettings {
+            &Settings {
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -1220,7 +1219,7 @@ mod copy_tests {
             &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
-            &CopySettings {
+            &Settings {
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -1263,7 +1262,7 @@ mod copy_tests {
             &test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
-            &CopySettings {
+            &Settings {
                 dereference: false,
                 fail_early: false,
                 overwrite: false,
@@ -1306,7 +1305,7 @@ mod copy_tests {
             &tmp_dir,
             &tmp_dir.join("foo"),
             &output_path,
-            &CopySettings {
+            &Settings {
                 dereference: false,
                 fail_early: false,
                 overwrite: true, // <- important!
@@ -1349,7 +1348,7 @@ mod copy_tests {
             &tmp_dir,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &CopySettings {
+            &Settings {
                 dereference: true, // <- important!
                 fail_early: false,
                 overwrite: false,
