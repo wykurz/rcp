@@ -4,33 +4,30 @@ use tracing::{instrument, Level};
 pub async fn run_destination(
     src_endpoint: &std::net::SocketAddr,
     src_server_name: &str,
-    dst: &std::path::Path,
     _destination_config: &remote::protocol::DestinationConfig,
     _rcpd_config: &remote::protocol::RcpdConfig,
 ) -> anyhow::Result<String> {
-    if !dst.is_absolute() {
-        return Err(anyhow::anyhow!(
-            "Destination path must be absolute: {}",
-            dst.display()
-        ));
-    }
     let client = remote::get_client()?;
     let connection = client.connect(*src_endpoint, src_server_name)?.await?;
     tracing::event!(Level::INFO, "Connected to Source");
     while let Ok(mut recv_stream) = connection.accept_uni().await {
         tracing::event!(Level::INFO, "Received new unidirectional stream");
-        let mut buf = Vec::new();
-        match recv_stream.read_to_end(1024).await {
-            Ok(data) => {
-                buf.extend_from_slice(&data);
-                tracing::event!(
-                    Level::INFO,
-                    "Received data: {}",
-                    String::from_utf8_lossy(&buf)
-                );
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!("Failed to read from stream: {}", e));
+        while let Some(chunk) = recv_stream.read_chunk(usize::MAX, true).await? {
+            match bincode::deserialize::<remote::protocol::FsObject>(&chunk.bytes)? {
+                ref fs_object @ remote::protocol::FsObject::Directory {
+                    ref src, ref dst, ..
+                } => {
+                    tracing::event!(Level::INFO, "Received directory: {:?} -> {:?}", src, dst);
+                    tokio::fs::create_dir(&dst).await?;
+                    let settings = common::preserve::preserve_all();
+                    common::preserve::set_dir_metadata(&settings, fs_object, dst).await?;
+                }
+                whatever => {
+                    return Err(anyhow::anyhow!(
+                        "Received unsupported FsObject type {:?}",
+                        whatever
+                    ));
+                }
             }
         }
     }

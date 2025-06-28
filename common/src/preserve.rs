@@ -3,6 +3,40 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
 use tracing::{event, instrument, Level};
 
+pub trait Metadata {
+    fn uid(&self) -> u32;
+    fn gid(&self) -> u32;
+    fn atime(&self) -> i64;
+    fn atime_nsec(&self) -> i64;
+    fn mtime(&self) -> i64;
+    fn mtime_nsec(&self) -> i64;
+    fn permissions(&self) -> std::fs::Permissions;
+}
+
+impl Metadata for std::fs::Metadata {
+    fn uid(&self) -> u32 {
+        MetadataExt::uid(self)
+    }
+    fn gid(&self) -> u32 {
+        MetadataExt::gid(self)
+    }
+    fn atime(&self) -> i64 {
+        MetadataExt::atime(self)
+    }
+    fn atime_nsec(&self) -> i64 {
+        MetadataExt::atime_nsec(self)
+    }
+    fn mtime(&self) -> i64 {
+        MetadataExt::mtime(self)
+    }
+    fn mtime_nsec(&self) -> i64 {
+        MetadataExt::mtime_nsec(self)
+    }
+    fn permissions(&self) -> std::fs::Permissions {
+        self.permissions()
+    }
+}
+
 #[derive(Copy, Clone, Debug, Default)]
 pub struct UserAndTimeSettings {
     pub uid: bool,
@@ -67,52 +101,49 @@ pub struct Settings {
 }
 
 #[instrument]
-async fn set_owner_and_time(
+async fn set_owner_and_time<Meta: Metadata + std::fmt::Debug>(
     settings: &UserAndTimeSettings,
     path: &std::path::Path,
-    metadata: &std::fs::Metadata,
+    metadata: &Meta,
 ) -> Result<()> {
     let settings = settings.to_owned();
     let dst = path.to_owned();
-    let metadata = metadata.to_owned();
+    let uid = metadata.uid();
+    let gid = metadata.gid();
+    let atime = metadata.atime();
+    let atime_nsec = metadata.atime_nsec();
+    let mtime = metadata.mtime();
+    let mtime_nsec = metadata.mtime_nsec();
     tokio::task::spawn_blocking(move || -> Result<()> {
         if settings.uid || settings.gid {
             // set user and group
             event!(Level::DEBUG, "setting uid ang gid");
-            let uid = if settings.uid {
-                Some(metadata.uid().into())
-            } else {
-                None
-            };
-            let gid = if settings.gid {
-                Some(metadata.gid().into())
-            } else {
-                None
-            };
+            let uid_val = if settings.uid { Some(uid.into()) } else { None };
+            let gid_val = if settings.gid { Some(gid.into()) } else { None };
             nix::unistd::fchownat(
                 None,
                 &dst,
-                uid,
-                gid,
+                uid_val,
+                gid_val,
                 nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
             )
             .with_context(|| {
                 format!(
                     "cannot set {:?} owner to {:?} and/or group id to {:?}",
-                    &dst, &uid, &gid
+                    &dst, &uid_val, &gid_val
                 )
             })?;
         }
         // set timestamps last - modifying other file metadata can change them
         if settings.time {
             event!(Level::DEBUG, "setting timestamps");
-            let atime = nix::sys::time::TimeSpec::new(metadata.atime(), metadata.atime_nsec());
-            let mtime = nix::sys::time::TimeSpec::new(metadata.mtime(), metadata.mtime_nsec());
+            let atime_spec = nix::sys::time::TimeSpec::new(atime, atime_nsec);
+            let mtime_spec = nix::sys::time::TimeSpec::new(mtime, mtime_nsec);
             nix::sys::stat::utimensat(
                 None,
                 &dst,
-                &atime,
-                &mtime,
+                &atime_spec,
+                &mtime_spec,
                 nix::sys::stat::UtimensatFlags::NoFollowSymlink,
             )
             .with_context(|| format!("failed setting timestamps for {:?}", &dst))?;
@@ -122,9 +153,9 @@ async fn set_owner_and_time(
     .await?
 }
 
-pub async fn set_file_metadata(
+pub async fn set_file_metadata<Meta: Metadata + std::fmt::Debug>(
     settings: &Settings,
-    metadata: &std::fs::Metadata,
+    metadata: &Meta,
     path: &std::path::Path,
 ) -> Result<()> {
     let permissions = if settings.file.mode_mask == 0o7777 {
@@ -143,9 +174,9 @@ pub async fn set_file_metadata(
     Ok(())
 }
 
-pub async fn set_dir_metadata(
+pub async fn set_dir_metadata<Meta: Metadata + std::fmt::Debug>(
     settings: &Settings,
-    metadata: &std::fs::Metadata,
+    metadata: &Meta,
     path: &std::path::Path,
 ) -> Result<()> {
     let permissions = if settings.dir.mode_mask == 0o7777 {
@@ -161,9 +192,9 @@ pub async fn set_dir_metadata(
     Ok(())
 }
 
-pub async fn set_symlink_metadata(
+pub async fn set_symlink_metadata<Meta: Metadata + std::fmt::Debug>(
     settings: &Settings,
-    metadata: &std::fs::Metadata,
+    metadata: &Meta,
     path: &std::path::Path,
 ) -> Result<()> {
     // we don't set permissions for symlinks, only owner and time

@@ -6,7 +6,6 @@ use tracing::{event, instrument, Level};
 #[instrument]
 #[async_recursion]
 async fn send_directory_structure(
-    cwd: &std::path::Path,
     src: &std::path::Path,
     dst: &std::path::Path,
     send_stream: std::sync::Arc<tokio::sync::Mutex<quinn::SendStream>>,
@@ -39,13 +38,12 @@ async fn send_directory_structure(
             .await
             .with_context(|| format!("failed traversing src directory {:?}", &src))?
         {
-            let cwd_path = src.to_owned();
             let entry_path = entry.path();
             let entry_name = entry_path.file_name().unwrap();
             let dst_path = dst.join(entry_name);
             let send_stream = send_stream.clone();
             let rec = || async move {
-                send_directory_structure(&cwd_path, &entry_path, &dst_path, send_stream).await
+                send_directory_structure(&entry_path, &dst_path, send_stream).await
             };
             join_set.spawn(rec());
         }
@@ -61,25 +59,18 @@ async fn send_directory_structure(
     Ok(())
 }
 
-async fn handle_connection(conn: quinn::Connecting) -> anyhow::Result<()> {
+async fn handle_connection(
+    conn: quinn::Connecting,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> anyhow::Result<()> {
     let connection = conn.await?;
     event!(Level::INFO, "Destination connection established");
-    let mut send_stream = connection.open_uni().await?;
+    let send_stream = std::sync::Arc::new(tokio::sync::Mutex::new(connection.open_uni().await?));
     event!(Level::INFO, "Opened unidirectional stream");
-    // TODO: run send_directory_structure
-    match send_stream.write_all(b"Hello from QUIC server!\n").await {
-        Ok(()) => {
-            event!(Level::INFO, "Data sent successfully");
-            // Properly finish the stream
-            send_stream.finish().await?;
-        }
-        Err(quinn::WriteError::ConnectionLost(e)) => {
-            return Err(anyhow::anyhow!("Connection lost: {}", e));
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!("Failed to send data: {}", e));
-        }
-    }
+    send_directory_structure(src, dst, send_stream.clone()).await?;
+    event!(Level::INFO, "Data sent successfully");
+    send_stream.lock().await.finish().await?;
     Ok(())
 }
 
@@ -88,6 +79,7 @@ pub async fn run_source(
     master_connection: &quinn::Connection,
     max_concurrent_streams: u32,
     src: &std::path::Path,
+    dst: &std::path::Path,
     _source_config: &remote::protocol::SourceConfig,
     _rcpd_config: &remote::protocol::RcpdConfig,
 ) -> anyhow::Result<String> {
@@ -111,7 +103,7 @@ pub async fn run_source(
     event!(Level::INFO, "Waiting for connection from destination");
     if let Some(conn) = server_endpoint.accept().await {
         event!(Level::INFO, "New destination connection incoming");
-        handle_connection(conn).await?;
+        handle_connection(conn, src, dst).await?;
     } else {
         event!(Level::ERROR, "Timed out waiting for destination to connect");
         return Err(anyhow::anyhow!(
