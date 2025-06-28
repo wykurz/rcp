@@ -1,33 +1,88 @@
 use serde::{Deserialize, Serialize};
+use std::os::unix::prelude::PermissionsExt;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Metadata {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub atime: i64,
+    pub mtime: i64,
+    pub atime_nsec: i64,
+    pub mtime_nsec: i64,
+}
+
+impl common::preserve::Metadata for Metadata {
+    fn uid(&self) -> u32 {
+        self.uid
+    }
+    fn gid(&self) -> u32 {
+        self.gid
+    }
+    fn atime(&self) -> i64 {
+        self.atime
+    }
+    fn atime_nsec(&self) -> i64 {
+        self.atime_nsec
+    }
+    fn mtime(&self) -> i64 {
+        self.mtime
+    }
+    fn mtime_nsec(&self) -> i64 {
+        self.mtime_nsec
+    }
+    fn permissions(&self) -> std::fs::Permissions {
+        std::fs::Permissions::from_mode(self.mode)
+    }
+}
+
+impl common::preserve::Metadata for &Metadata {
+    fn uid(&self) -> u32 {
+        (*self).uid()
+    }
+    fn gid(&self) -> u32 {
+        (*self).gid()
+    }
+    fn atime(&self) -> i64 {
+        (*self).atime()
+    }
+    fn atime_nsec(&self) -> i64 {
+        (*self).atime_nsec()
+    }
+    fn mtime(&self) -> i64 {
+        (*self).mtime()
+    }
+    fn mtime_nsec(&self) -> i64 {
+        (*self).mtime_nsec()
+    }
+    fn permissions(&self) -> std::fs::Permissions {
+        (*self).permissions()
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum FsObject {
+    DirStub {
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+    },
     Directory {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-        mtime_nsec: i64,
-        ctime_nsec: i64,
+        metadata: Metadata,
     },
     // Implies files contents will be sent immediately after receiving this object
     File {
-        path: std::path::PathBuf,
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
         size: u64,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-        mtime_nsec: i64,
-        ctime_nsec: i64,
+        metadata: Metadata,
     },
     Symlink {
-        path: std::path::PathBuf,
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
         target: std::path::PathBuf,
-        uid: u32,
-        gid: u32,
-        mtime_nsec: i64,
-        ctime_nsec: i64,
+        metadata: Metadata,
     },
 }
 
@@ -60,13 +115,13 @@ pub struct DestinationConfig {
 pub enum MasterHello {
     Source {
         src: std::path::PathBuf,
+        dst: std::path::PathBuf,
         source_config: SourceConfig,
         rcpd_config: RcpdConfig,
     },
     Destination {
         source_addr: std::net::SocketAddr,
         server_name: String,
-        dst: std::path::PathBuf,
         destination_config: DestinationConfig,
         rcpd_config: RcpdConfig,
     },
