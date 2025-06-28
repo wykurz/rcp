@@ -168,6 +168,7 @@ async fn run_rcpd_master(
     source_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
         &remote::protocol::MasterHello::Source {
             src: src.path().to_path_buf(),
+            dst: dst.path().to_path_buf(),
             source_config: remote::protocol::SourceConfig {
                 dereference: args.dereference,
             },
@@ -193,7 +194,6 @@ async fn run_rcpd_master(
         &remote::protocol::MasterHello::Destination {
             source_addr: source_hello.source_addr,
             server_name: source_hello.server_name.clone(),
-            dst: dst.path().to_path_buf(),
             destination_config: remote::protocol::DestinationConfig {
                 overwrite: args.overwrite,
                 overwrite_compare: args.overwrite_compare.clone(),
