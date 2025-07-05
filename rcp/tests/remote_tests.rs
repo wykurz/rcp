@@ -28,7 +28,6 @@ fn test_remote_copy_basic() {
 }
 
 #[test]
-#[ignore = "functionality not working yet"]
 fn test_remote_copy_localhost() {
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("test.txt");

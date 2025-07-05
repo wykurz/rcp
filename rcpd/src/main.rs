@@ -74,6 +74,7 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
     match master_hello {
         remote::protocol::MasterHello::Source {
             src,
+            dst,
             source_config,
             rcpd_config,
         } => {
@@ -82,6 +83,7 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
                 &connection,
                 args.max_workers as u32,
                 &src,
+                &dst,
                 &source_config,
                 &rcpd_config,
             )
@@ -90,7 +92,6 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
         remote::protocol::MasterHello::Destination {
             source_addr,
             server_name,
-            dst,
             destination_config,
             rcpd_config,
         } => {
@@ -98,7 +99,6 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
             destination::run_destination(
                 &source_addr,
                 &server_name,
-                &dst,
                 &destination_config,
                 &rcpd_config,
             )

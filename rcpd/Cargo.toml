@@ -15,12 +15,14 @@ bincode = "1.3"
 bytes = "1.10"
 bytesize = "1.3"
 common = { path = "../common" }
+futures = "0.3"
 quinn = "0.10"
 structopt = "0.3"
 rand = "0.8"
 remote = { path = "../remote" }
 thiserror = "1.0"
 tokio = { version = "1.38", features = ["full", "parking_lot", "tracing"] }
+tokio-util = "0.7"
 tracing = "0.1"
 
 [package.metadata.deb]
