@@ -204,11 +204,9 @@ pub fn parse_preserve_settings(settings: &str) -> Result<preserve::Settings, any
     let mut preserve_settings = preserve::Settings::default();
     for type_settings in settings.split(' ') {
         if let Some((obj_type, obj_settings)) = type_settings.split_once(':') {
-            let (user_and_time_settings, mode_opt) =
-                parse_type_settings(obj_settings).context(format!(
-                    "parsing preserve settings: {}, type: {}",
-                    obj_settings, obj_type
-                ))?;
+            let (user_and_time_settings, mode_opt) = parse_type_settings(obj_settings).context(
+                format!("parsing preserve settings: {obj_settings}, type: {obj_type}"),
+            )?;
             match obj_type {
                 "f" | "file" => {
                     preserve_settings.file = preserve::FileSettings::default();
@@ -244,8 +242,7 @@ pub fn parse_compare_settings(settings: &str) -> Result<cmp::ObjSettings, anyhow
     for type_settings in settings.split(' ') {
         if let Some((obj_type, obj_settings)) = type_settings.split_once(':') {
             let obj_cmp_settings = parse_metadata_cmp_settings(obj_settings).context(format!(
-                "parsing preserve settings: {}, type: {}",
-                obj_settings, obj_type
+                "parsing preserve settings: {obj_settings}, type: {obj_type}"
             ))?;
             let obj_type = match obj_type {
                 "f" | "file" => ObjType::File,
@@ -509,13 +506,13 @@ where
         }
         Err(err) => {
             if !quiet {
-                println!("{:?}", err);
+                println!("{err:?}");
             }
         }
     }
     if print_summary || verbose > 0 {
         if let Err(err) = print_runtime_stats() {
-            println!("Failed to print runtime stats: {:?}", err);
+            println!("Failed to print runtime stats: {err:?}");
         }
     }
     res.ok()

@@ -184,7 +184,7 @@ async fn filegen(
     let mut join_set = tokio::task::JoinSet::new();
     // generate directories and recurse into them
     for i in 0..numdirs {
-        let path = root.join(format!("dir{}", i));
+        let path = root.join(format!("dir{i}"));
         let dirwidth = dirwidth[1..].to_owned();
         let recurse = || async move {
             tokio::fs::create_dir(&path)
@@ -196,7 +196,7 @@ async fn filegen(
     }
     // generate files
     for i in 0..numfiles {
-        let path = root.join(format!("file{}", i));
+        let path = root.join(format!("file{i}"));
         join_set.spawn(write_file(path.clone(), filesize, writebuf, chunk_size));
     }
     while let Some(res) = join_set.join_next().await {

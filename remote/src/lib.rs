@@ -26,10 +26,10 @@ async fn setup_ssh_session(
 ) -> anyhow::Result<std::sync::Arc<openssh::Session>> {
     let host = session.host.as_str();
     let destination = match (session.user.as_deref(), session.port) {
-        (Some(user), Some(port)) => format!("ssh://{}@{}:{}", user, host, port),
+        (Some(user), Some(port)) => format!("ssh://{user}@{host}:{port}"),
         (None, Some(port)) => format!("ssh://{}:{}", session.host, port),
-        (Some(user), None) => format!("ssh://{}@{}", user, host),
-        (None, None) => format!("ssh://{}", host),
+        (Some(user), None) => format!("ssh://{user}@{host}"),
+        (None, None) => format!("ssh://{host}"),
     };
     event!(
         Level::DEBUG,

@@ -369,7 +369,7 @@ pub async fn copy(
     event!(Level::DEBUG, "process contents of 'src' directory");
     let mut entries = tokio::fs::read_dir(src)
         .await
-        .with_context(|| format!("cannot open directory {:?} for reading", src))
+        .with_context(|| format!("cannot open directory {src:?} for reading"))
         .map_err(|err| Error::new(err, Default::default()))?;
     let mut copy_summary = {
         if let Err(error) = tokio::fs::create_dir(dst).await {
@@ -413,7 +413,7 @@ pub async fn copy(
                     })?;
                     tokio::fs::create_dir(dst)
                         .await
-                        .with_context(|| format!("cannot create directory {:?}", dst))
+                        .with_context(|| format!("cannot create directory {dst:?}"))
                         .map_err(|err| {
                             let copy_summary = Summary {
                                 rm_summary,

@@ -109,9 +109,7 @@ pub async fn check_dirs_identical(
         assert_eq!(
             src_md.mtime_nsec(),
             dst_md.mtime_nsec(),
-            "mtime doesn't match for {:?} {:?}",
-            src_entry_path,
-            dst_entry_path
+            "mtime doesn't match for {src_entry_path:?} {dst_entry_path:?}"
         );
     }
     Ok(())

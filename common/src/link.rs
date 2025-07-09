@@ -86,7 +86,7 @@ async fn hard_link_helper(
             );
             let dst_metadata = tokio::fs::symlink_metadata(dst)
                 .await
-                .with_context(|| format!("cannot read {:?} metadata", dst))
+                .with_context(|| format!("cannot read {dst:?} metadata"))
                 .map_err(|err| Error::new(err, Default::default()))?;
             if is_hard_link(src_metadata, &dst_metadata) {
                 event!(Level::DEBUG, "no change, leaving file as is");
@@ -309,7 +309,7 @@ pub async fn link(
     event!(Level::DEBUG, "process contents of 'src' directory");
     let mut src_entries = tokio::fs::read_dir(src)
         .await
-        .with_context(|| format!("cannot open directory {:?} for reading", src))
+        .with_context(|| format!("cannot open directory {src:?} for reading"))
         .map_err(|err| Error::new(err, Default::default()))?;
     let copy_summary = {
         if let Err(error) = tokio::fs::create_dir(dst).await {
@@ -357,7 +357,7 @@ pub async fn link(
                     })?;
                     tokio::fs::create_dir(dst)
                         .await
-                        .with_context(|| format!("cannot create directory {:?}", dst))
+                        .with_context(|| format!("cannot create directory {dst:?}"))
                         .map_err(|err| {
                             copy_summary.rm_summary = rm_summary;
                             Error::new(
@@ -378,7 +378,7 @@ pub async fn link(
                 }
             } else {
                 return Err(error)
-                    .with_context(|| format!("cannot create directory {:?}", dst))
+                    .with_context(|| format!("cannot create directory {dst:?}"))
                     .map_err(|err| Error::new(err, Default::default()))?;
             }
         } else {

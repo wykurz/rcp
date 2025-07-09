@@ -56,7 +56,7 @@ impl std::fmt::Display for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         for (obj_type, &cmp_res_map) in &self.mismatch {
             for (cmp_res, &count) in &cmp_res_map {
-                writeln!(f, "{:?} {:?}: {}", obj_type, cmp_res, count)?;
+                writeln!(f, "{obj_type:?} {cmp_res:?}: {count}")?;
             }
         }
         Ok(())
@@ -76,7 +76,7 @@ impl LogWriter {
                 .create_new(true)
                 .open(log_path)
                 .await
-                .with_context(|| format!("Failed to open log file: {:?}", log_path))?;
+                .with_context(|| format!("Failed to open log file: {log_path:?}"))?;
             let log =
                 std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::BufWriter::new(log_file)));
             Ok(Self { log_opt: Some(log) })
@@ -94,8 +94,7 @@ impl LogWriter {
         dst: &std::path::Path,
     ) -> Result<()> {
         self.write(&format!(
-            "[{:?}]\n\t[{:?}]\t{:?}\n\t[{:?}]\t{:?}\n",
-            cmp_result, src_obj_type, src, dst_obj_type, dst
+            "[{cmp_result:?}]\n\t[{src_obj_type:?}]\t{src:?}\n\t[{dst_obj_type:?}]\t{dst:?}\n"
         ))
         .await
     }
@@ -200,7 +199,7 @@ pub async fn cmp(
     event!(Level::DEBUG, "process contents of 'src' directory");
     let mut src_entries = tokio::fs::read_dir(src)
         .await
-        .with_context(|| format!("cannot open directory {:?} for reading", src))?;
+        .with_context(|| format!("cannot open directory {src:?} for reading"))?;
     let mut join_set = tokio::task::JoinSet::new();
     let mut success = true;
     // create a set of all the files we already processed

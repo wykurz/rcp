@@ -30,7 +30,7 @@ async fn send_directory_structure(
         .with_context(|| format!("failed sending directory: {:?}", &src))?;
     let mut entries = tokio::fs::read_dir(src)
         .await
-        .with_context(|| format!("cannot open directory {:?} for reading", src))?;
+        .with_context(|| format!("cannot open directory {src:?} for reading"))?;
     let mut join_set = tokio::task::JoinSet::new();
     while let Some(entry) = entries
         .next_entry()
@@ -49,7 +49,7 @@ async fn send_directory_structure(
     // one thing we CAN do however is to drop it as soon as we're done with it
     drop(entries);
     while let Some(res) = join_set.join_next().await {
-        res.with_context(|| format!("send_directory_structure: {:?} -> {:?} failed", src, dst))??;
+        res.with_context(|| format!("send_directory_structure: {src:?} -> {dst:?} failed"))??;
     }
     Ok(())
 }
@@ -86,8 +86,7 @@ async fn send_file_or_symlink(
     } else {
         assert!(
             src_metadata.is_symlink(),
-            "Expected src to be a file or symlink, got {:?}",
-            src
+            "Expected src to be a file or symlink, got {src:?}"
         );
         remote::protocol::FsObject::Symlink {
             src: src.to_path_buf(),
