@@ -132,3 +132,9 @@ pub struct SourceMasterHello {
     pub source_addr: std::net::SocketAddr,
     pub server_name: String,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DirectoryCreated {
+    pub src: std::path::PathBuf,
+    pub dst: std::path::PathBuf,
+}
