@@ -41,7 +41,6 @@ fn test_remote_copy_localhost() {
 }
 
 #[test]
-#[ignore = "functionality not working yet"]
 fn test_remote_copy_localhost_to_local() {
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("source.txt");
@@ -71,7 +70,6 @@ fn test_remote_copy_local_to_localhost() {
 }
 
 #[test]
-#[ignore = "functionality not working yet"]
 fn test_remote_copy_with_preserve() {
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("preserve_test.txt");
@@ -89,7 +87,6 @@ fn test_remote_copy_with_preserve() {
 }
 
 #[test]
-#[ignore = "functionality not working yet"]
 fn test_remote_copy_directory() {
     let (src_dir, dst_dir) = setup_test_env();
     let src_subdir = src_dir.path().join("remote_subdir");
