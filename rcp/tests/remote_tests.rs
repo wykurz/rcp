@@ -192,7 +192,7 @@ fn test_remote_copy_without_overwrite_fails() {
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([&src_remote, &dst_remote]).assert().failure(); // should fail without --overwrite
-    // verify content was not overwritten
+                                                             // verify content was not overwritten
     assert_eq!(get_file_content(&dst_file), "old content");
 }
 
