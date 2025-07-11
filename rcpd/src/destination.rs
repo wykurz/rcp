@@ -1,8 +1,13 @@
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::{instrument, Level};
+use crate::directory_tracker::DirectoryTracker;
 
 #[instrument]
-async fn handle_file_stream(mut recv_stream: quinn::RecvStream) -> anyhow::Result<()> {
+async fn handle_file_stream(
+    mut recv_stream: quinn::RecvStream,
+    directory_tracker: Arc<DirectoryTracker>,
+) -> anyhow::Result<()> {
     tracing::event!(Level::INFO, "Processing file stream");
     let mut framed = tokio_util::codec::FramedRead::new(
         &mut recv_stream,
@@ -39,6 +44,9 @@ async fn handle_file_stream(mut recv_stream: quinn::RecvStream) -> anyhow::Resul
                 }
                 let settings = common::preserve::preserve_all();
                 common::preserve::set_file_metadata(&settings, &metadata, dst).await?;
+                
+                // Decrement directory entry count
+                directory_tracker.decrement_entry(src, dst).await?;
             }
             remote::protocol::FsObject::Symlink {
                 ref src,
@@ -56,6 +64,9 @@ async fn handle_file_stream(mut recv_stream: quinn::RecvStream) -> anyhow::Resul
                 tokio::fs::symlink(target, dst).await?;
                 let settings = common::preserve::preserve_all();
                 common::preserve::set_symlink_metadata(&settings, metadata, dst).await?;
+                
+                // Decrement directory entry count
+                directory_tracker.decrement_entry(src, dst).await?;
             }
             _ => {
                 return Err(anyhow::anyhow!(
@@ -77,84 +88,104 @@ pub async fn run_destination(
     let client = remote::get_client()?;
     let connection = client.connect(*src_endpoint, src_server_name)?.await?;
     tracing::event!(Level::INFO, "Connected to Source");
-    // Spawn task to handle unidirectional file streams
-    let connection_clone = connection.clone();
-    let file_handler_task = tokio::spawn(async move {
-        let mut join_set = tokio::task::JoinSet::new();
-        while let Ok(recv_stream) = connection_clone.accept_uni().await {
-            tracing::event!(Level::INFO, "Received new unidirectional stream for file");
-            join_set.spawn(handle_file_stream(recv_stream));
-        }
-        // Wait for all file tasks to complete
-        while let Some(res) = join_set.join_next().await {
-            if let Err(e) = res {
-                tracing::event!(Level::ERROR, "File handler task failed: {:?}", e);
-            }
-        }
-        tracing::event!(Level::INFO, "File handler task completed");
-    });
+    
     // Handle bidirectional stream for directory structure
-    while let Ok((mut send_stream, mut recv_stream)) = connection.accept_bi().await {
+    if let Ok((send_stream, mut recv_stream)) = connection.accept_bi().await {
         tracing::event!(Level::INFO, "Received new bidirectional stream");
-        let mut framed = tokio_util::codec::FramedRead::new(
+        let mut framed_recv = tokio_util::codec::FramedRead::new(
             &mut recv_stream,
             tokio_util::codec::LengthDelimitedCodec::new(),
         );
-        while let Some(frame) = futures::StreamExt::next(&mut framed).await {
-            let chunk = frame?;
-            // throttle::get_ops_token().await;
-            match bincode::deserialize::<remote::protocol::FsObject>(&chunk)? {
-                remote::protocol::FsObject::DirStub { ref src, ref dst } => {
-                    tracing::event!(
-                        Level::INFO,
-                        "Received directory stub: {:?} -> {:?}",
-                        src,
-                        dst
-                    );
-                    tokio::fs::create_dir_all(&dst).await?;
+
+        // Create directory tracker with the send stream for completions
+        let directory_tracker = Arc::new(DirectoryTracker::new(send_stream));
+        
+        // Spawn task to handle unidirectional file streams
+        let connection_clone = connection.clone();
+        let directory_tracker_clone = directory_tracker.clone();
+        let file_handler_task = tokio::spawn(async move {
+            let mut join_set = tokio::task::JoinSet::new();
+            while let Ok(recv_stream) = connection_clone.accept_uni().await {
+                tracing::event!(Level::INFO, "Received new unidirectional stream for file");
+                join_set.spawn(handle_file_stream(
+                    recv_stream,
+                    directory_tracker_clone.clone(),
+                ));
+            }
+            // Wait for all file tasks to complete
+            while let Some(res) = join_set.join_next().await {
+                if let Err(e) = res {
+                    tracing::event!(Level::ERROR, "File handler task failed: {:?}", e);
                 }
-                remote::protocol::FsObject::Directory {
-                    ref src,
-                    ref dst,
-                    ref metadata,
-                } => {
-                    tracing::event!(Level::INFO, "Received directory: {:?} -> {:?}", src, dst);
-                    tokio::fs::create_dir_all(&dst).await?;
-                    let settings = common::preserve::preserve_all();
-                    common::preserve::set_dir_metadata(&settings, metadata, dst).await?;
-                    // Send directory creation confirmation
-                    let confirmation = remote::protocol::DirectoryCreated {
-                        src: src.clone(),
-                        dst: dst.clone(),
-                    };
-                    let confirmation_bytes = bincode::serialize(&confirmation)?;
-                    let mut framed_confirmation = tokio_util::codec::FramedWrite::new(
-                        &mut send_stream,
-                        tokio_util::codec::LengthDelimitedCodec::new(),
-                    );
-                    futures::SinkExt::send(
-                        &mut framed_confirmation,
-                        bytes::Bytes::from(confirmation_bytes),
-                    )
-                    .await?;
-                    tracing::event!(
-                        Level::INFO,
-                        "Sent directory creation confirmation for: {:?}",
-                        dst
-                    );
-                }
-                remote::protocol::FsObject::File { .. }
-                | remote::protocol::FsObject::Symlink { .. } => {
-                    tracing::event!(
-                        Level::WARN,
-                        "Received file/symlink on bidirectional stream, ignoring"
-                    );
+            }
+            tracing::event!(Level::INFO, "File handler task completed");
+        });
+
+        loop {
+            tokio::select! {
+                frame = futures::StreamExt::next(&mut framed_recv) => {
+                    if let Some(frame) = frame {
+                        let chunk = frame?;
+                        // throttle::get_ops_token().await;
+                        match bincode::deserialize::<remote::protocol::FsObject>(&chunk)? {
+                            remote::protocol::FsObject::DirStub { ref src, ref dst, num_entries } => {
+                                tracing::event!(
+                                    Level::INFO,
+                                    "Received directory stub: {:?} -> {:?} (entries: {})",
+                                    src,
+                                    dst,
+                                    num_entries
+                                );
+                                tokio::fs::create_dir_all(&dst).await?;
+
+                                // Track directory entries
+                                directory_tracker.add_directory(dst.clone(), num_entries).await?;
+
+                                // Send directory creation confirmation
+                                let confirmation = remote::protocol::DirectoryCreated {
+                                    src: src.clone(),
+                                    dst: dst.clone(),
+                                };
+                                directory_tracker.send_directory_created(confirmation).await?;
+                                tracing::event!(
+                                    Level::INFO,
+                                    "Sent directory creation confirmation for: {:?}",
+                                    dst
+                                );
+                            }
+                            remote::protocol::FsObject::Directory {
+                                ref src,
+                                ref dst,
+                                ref metadata,
+                            } => {
+                                tracing::event!(Level::INFO, "Received directory metadata: {:?} -> {:?}", src, dst);
+                                // Apply metadata changes now that directory is complete
+                                let settings = common::preserve::preserve_all();
+                                common::preserve::set_dir_metadata(&settings, metadata, dst).await?;
+                                tracing::event!(Level::INFO, "Applied metadata for completed directory: {:?}", dst);
+                            }
+                            remote::protocol::FsObject::File { .. }
+                            | remote::protocol::FsObject::Symlink { .. } => {
+                                tracing::event!(
+                                    Level::WARN,
+                                    "Received file/symlink on bidirectional stream, ignoring"
+                                );
+                            }
+                        }
+                    } else {
+                        break;
+                    }
                 }
             }
         }
+        
+        // Finish the directory tracker
+        directory_tracker.finish().await?;
+        
+        // Wait for file handler task to complete
+        let _ = file_handler_task.await;
     }
-    // Wait for file handler task to complete
-    let _ = file_handler_task.await;
+    
     tracing::event!(Level::INFO, "Destination is done");
     Ok("destination OK".to_string())
 }

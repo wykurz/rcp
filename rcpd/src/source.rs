@@ -16,19 +16,17 @@ async fn send_directory_structure(
     if !src_metadata.is_dir() {
         return Ok(());
     }
-    let metadata = remote::protocol::Metadata {
-        mode: src_metadata.mode(),
-        uid: src_metadata.uid(),
-        gid: src_metadata.gid(),
-        atime: src_metadata.atime(),
-        mtime: src_metadata.mtime(),
-        atime_nsec: src_metadata.atime_nsec(),
-        mtime_nsec: src_metadata.mtime_nsec(),
-    };
-    let dir = remote::protocol::FsObject::Directory {
+    // Count the number of entries in the directory
+    let mut entry_count = 0;
+    let mut entries = tokio::fs::read_dir(src).await?;
+    while let Some(_entry) = entries.next_entry().await? {
+        entry_count += 1;
+    }
+    
+    let dir = remote::protocol::FsObject::DirStub {
         src: src.to_path_buf(),
         dst: dst.to_path_buf(),
-        metadata,
+        num_entries: entry_count,
     };
     let mut locked_stream = send_stream.lock().await;
     let mut framed = tokio_util::codec::FramedWrite::new(
@@ -156,24 +154,64 @@ async fn send_files_in_directory(
 #[instrument]
 async fn wait_for_directory_creation_and_send_files(
     mut recv_stream: quinn::RecvStream,
+    mut send_stream: quinn::SendStream,
     connection: &quinn::Connection,
 ) -> anyhow::Result<()> {
-    let mut framed = tokio_util::codec::FramedRead::new(
+    let mut framed_recv = tokio_util::codec::FramedRead::new(
         &mut recv_stream,
         tokio_util::codec::LengthDelimitedCodec::new(),
     );
-    // Wait for directory creation confirmations and send files for each
-    while let Some(frame) = futures::StreamExt::next(&mut framed).await {
+    let mut framed_send = tokio_util::codec::FramedWrite::new(
+        &mut send_stream,
+        tokio_util::codec::LengthDelimitedCodec::new(),
+    );
+    
+    // Wait for directory creation confirmations and completions
+    while let Some(frame) = futures::StreamExt::next(&mut framed_recv).await {
         let chunk = frame?;
-        let confirmation: remote::protocol::DirectoryCreated = bincode::deserialize(&chunk)?;
-        event!(
-            Level::INFO,
-            "Received directory creation confirmation for: {:?} -> {:?}",
-            confirmation.src,
-            confirmation.dst
-        );
-        // Send files in this directory
-        send_files_in_directory(&confirmation.src, &confirmation.dst, connection).await?;
+        
+        // Try to deserialize as DirectoryCreated first
+        if let Ok(confirmation) = bincode::deserialize::<remote::protocol::DirectoryCreated>(&chunk) {
+            event!(
+                Level::INFO,
+                "Received directory creation confirmation for: {:?} -> {:?}",
+                confirmation.src,
+                confirmation.dst
+            );
+            // Send files in this directory
+            send_files_in_directory(&confirmation.src, &confirmation.dst, connection).await?;
+        }
+        // Try to deserialize as DirectoryComplete
+        else if let Ok(completion) = bincode::deserialize::<remote::protocol::DirectoryComplete>(&chunk) {
+            event!(
+                Level::INFO,
+                "Received directory completion for: {:?} -> {:?}",
+                completion.src,
+                completion.dst
+            );
+            // Send directory metadata
+            let src_metadata = tokio::fs::symlink_metadata(&completion.src)
+                .await
+                .with_context(|| format!("failed reading metadata from src: {:?}", &completion.src))?;
+            let metadata = remote::protocol::Metadata {
+                mode: src_metadata.mode(),
+                uid: src_metadata.uid(),
+                gid: src_metadata.gid(),
+                atime: src_metadata.atime(),
+                mtime: src_metadata.mtime(),
+                atime_nsec: src_metadata.atime_nsec(),
+                mtime_nsec: src_metadata.mtime_nsec(),
+            };
+            let dir_metadata = remote::protocol::FsObject::Directory {
+                src: completion.src,
+                dst: completion.dst,
+                metadata,
+            };
+            futures::SinkExt::send(
+                &mut framed_send,
+                bytes::Bytes::from(bincode::serialize(&dir_metadata)?),
+            ).await?;
+        }
     }
     Ok(())
 }
@@ -188,18 +226,19 @@ async fn handle_connection(
     // Set up bidirectional stream for directory creation confirmations
     let (send_stream, recv_stream) = connection.open_bi().await?;
     if src.is_dir() {
-        let send_stream = std::sync::Arc::new(tokio::sync::Mutex::new(send_stream));
+        let dir_send_stream = connection.open_uni().await?;
+        let dir_send_stream = std::sync::Arc::new(tokio::sync::Mutex::new(dir_send_stream));
         event!(
             Level::INFO,
             "Opened unidirectional stream for directory structure"
         );
         // Send directory structure first
-        send_directory_structure(src, dst, send_stream.clone()).await?;
-        send_stream.lock().await.finish().await?;
+        send_directory_structure(src, dst, dir_send_stream.clone()).await?;
+        dir_send_stream.lock().await.finish().await?;
         // Start directory confirmation receiver task
         let connection_clone = connection.clone();
         let confirmation_task = tokio::spawn(async move {
-            wait_for_directory_creation_and_send_files(recv_stream, &connection_clone).await
+            wait_for_directory_creation_and_send_files(recv_stream, send_stream, &connection_clone).await
         });
         // Wait for the confirmation task to complete
         confirmation_task.await??;
