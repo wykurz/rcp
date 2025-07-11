@@ -89,25 +89,21 @@ pub async fn start_rcpd(
         .context("Failed to spawn rcpd command")
 }
 
-fn configure_server(max_concurrent_streams: u32) -> anyhow::Result<quinn::ServerConfig> {
+fn configure_server() -> anyhow::Result<quinn::ServerConfig> {
     event!(Level::INFO, "Configuring QUIC server");
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let key_der = cert.serialize_private_key_der();
     let cert_der = cert.serialize_der()?;
     let key = rustls::PrivateKey(key_der);
     let cert = rustls::Certificate(cert_der);
-    let mut server_config = quinn::ServerConfig::with_single_cert(vec![cert], key)
+    let server_config = quinn::ServerConfig::with_single_cert(vec![cert], key)
         .context("Failed to create server config")?;
-    std::sync::Arc::get_mut(&mut server_config.transport)
-        .expect("Failed to get transport config")
-        .max_concurrent_uni_streams(max_concurrent_streams.into())
-        .max_idle_timeout(Some(tokio::time::Duration::from_secs(30).try_into()?));
     Ok(server_config)
 }
 
 #[instrument]
-pub fn get_server(max_concurrent_streams: u32) -> anyhow::Result<quinn::Endpoint> {
-    let server_config = configure_server(max_concurrent_streams)?;
+pub fn get_server() -> anyhow::Result<quinn::Endpoint> {
+    let server_config = configure_server()?;
     let addr = "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap();
     quinn::Endpoint::server(server_config, addr).context("Failed to create QUIC endpoint")
 }

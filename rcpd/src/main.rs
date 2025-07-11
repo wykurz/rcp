@@ -2,6 +2,7 @@ use structopt::StructOpt;
 use tracing::instrument;
 
 mod destination;
+mod directory_tracker;
 mod source;
 
 #[derive(structopt::StructOpt, std::fmt::Debug, std::clone::Clone)]
@@ -79,15 +80,7 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
             rcpd_config,
         } => {
             tracing::event!(tracing::Level::INFO, "Starting source");
-            source::run_source(
-                &connection,
-                args.max_workers as u32,
-                &src,
-                &dst,
-                &source_config,
-                &rcpd_config,
-            )
-            .await?;
+            source::run_source(&connection, &src, &dst, &source_config, &rcpd_config).await?;
         }
         remote::protocol::MasterHello::Destination {
             source_addr,
