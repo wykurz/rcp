@@ -135,8 +135,7 @@ async fn run_rcpd_master(
 ) -> Result<common::copy::Summary> {
     event!(Level::DEBUG, "running rcpd src/dst");
     // open a port and wait from server & client hello, respond to client with server port
-    let max_concurrent_streams = 30;
-    let server_endpoint = remote::get_server(max_concurrent_streams)?;
+    let server_endpoint = remote::get_server()?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
     let server_name = remote::get_random_server_name();
     let mut rcpds = vec![];

@@ -65,6 +65,7 @@ pub enum FsObject {
     DirStub {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
+        num_entries: usize,
     },
     Directory {
         src: std::path::PathBuf,
@@ -135,6 +136,12 @@ pub struct SourceMasterHello {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DirectoryCreated {
+    pub src: std::path::PathBuf,
+    pub dst: std::path::PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DirectoryComplete {
     pub src: std::path::PathBuf,
     pub dst: std::path::PathBuf,
 }
