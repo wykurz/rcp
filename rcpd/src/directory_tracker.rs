@@ -112,7 +112,15 @@ impl DirectoryTracker {
         Ok(())
     }
 
-    pub async fn finish(&self) -> anyhow::Result<()> {
+    pub async fn done_creating_directories(&self) -> anyhow::Result<()> {
+        // TODO: call this after create_directory_structure completes
+        // if there are no more tracked directories we are done (call finish)
+        // if not -- any call that removes a directory should check if it's the last one and call finish
+        event!(Level::INFO, "All directories created");
+        Ok(())
+    }
+
+    async fn finish(&self) -> anyhow::Result<()> {
         let mut send_stream_opt = self.dir_created_send_stream.lock().await;
         send_stream_opt
             .take()
