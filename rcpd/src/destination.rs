@@ -7,7 +7,7 @@ use crate::streams;
 #[instrument]
 async fn handle_file_stream(
     mut file_recv_stream: streams::RecvStream,
-    directory_tracker: std::sync::Arc<directory_tracker::DirectoryTracker>,
+    directory_tracker: &directory_tracker::DirectoryTracker,
 ) -> anyhow::Result<()> {
     tracing::event!(Level::INFO, "Processing file stream");
     if let Some(fs_obj) = file_recv_stream
@@ -80,14 +80,14 @@ async fn handle_file_stream(
 #[instrument]
 async fn spawn_file_handler_task(
     connection: quinn::Connection,
-    directory_tracker: std::sync::Arc<directory_tracker::DirectoryTracker>,
+    directory_tracker: &directory_tracker::DirectoryTracker,
 ) -> anyhow::Result<()> {
     let connection = streams::Connection::new(connection);
     while let Ok(file_recv_stream) = connection.accept_uni().await {
         tracing::event!(Level::INFO, "Received new unidirectional stream for file");
         tokio::spawn(handle_file_stream(
             file_recv_stream,
-            directory_tracker.clone(),
+            directory_tracker,
         ));
     }
     tracing::event!(Level::INFO, "File handler task completed");
@@ -99,7 +99,7 @@ async fn spawn_file_handler_task(
 #[instrument]
 async fn create_directory_structure(
     mut dir_stub_recv_stream: streams::RecvStream,
-    directory_tracker: std::sync::Arc<directory_tracker::DirectoryTracker>,
+    directory_tracker: &directory_tracker::DirectoryTracker,
 ) -> anyhow::Result<()> {
     while let Some(fs_obj) = dir_stub_recv_stream
         .recv_object::<remote::protocol::FsObject>()
@@ -187,15 +187,15 @@ pub async fn run_destination(
     let (dir_created_send_stream, dir_stub_recv_stream) = connection.accept_bi().await?;
     let dir_metadata_recv_stream = connection.accept_uni().await?;
     tracing::event!(Level::INFO, "Received directory creation streams");
-    let directory_tracker = std::sync::Arc::new(directory_tracker::DirectoryTracker::new(
+    let directory_tracker = directory_tracker::DirectoryTracker::new(
         dir_created_send_stream,
-    ));
+    );
     let file_handler_task = tokio::spawn(spawn_file_handler_task(
         connection.inner().clone(),
-        directory_tracker.clone(),
+        &directory_tracker,
     ));
     let update_metadata_task = tokio::spawn(update_directory_metadata(dir_metadata_recv_stream));
-    create_directory_structure(dir_stub_recv_stream, directory_tracker.clone()).await?;
+    create_directory_structure(dir_stub_recv_stream, &directory_tracker).await?;
     file_handler_task.await??;
     directory_tracker.finish().await?;
     update_metadata_task.await??;
