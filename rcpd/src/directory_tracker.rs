@@ -1,21 +1,14 @@
-use futures::SinkExt;
+use crate::streams::SendStream;
 use tracing::{event, Level};
 
 #[derive(Debug)]
 pub struct DirectoryTracker {
     remaining_dir_entries: tokio::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>,
-    dir_created_send_stream: tokio::sync::Mutex<
-        tokio_util::codec::FramedWrite<quinn::SendStream, tokio_util::codec::LengthDelimitedCodec>,
-    >,
+    dir_created_send_stream: tokio::sync::Mutex<SendStream>,
 }
 
 impl DirectoryTracker {
-    pub fn new(
-        dir_created_send_stream: tokio_util::codec::FramedWrite<
-            quinn::SendStream,
-            tokio_util::codec::LengthDelimitedCodec,
-        >,
-    ) -> Self {
+    pub fn new(dir_created_send_stream: SendStream) -> Self {
         Self {
             remaining_dir_entries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             dir_created_send_stream: tokio::sync::Mutex::new(dir_created_send_stream),
@@ -44,14 +37,14 @@ impl DirectoryTracker {
             src: src.to_path_buf(),
             dst: dst.to_path_buf(),
         };
-        let confirmation_bytes = bincode::serialize(&confirmation)?;
+        let message = remote::protocol::DirectoryMessage::Created(confirmation);
         let mut sender = self.dir_created_send_stream.lock().await;
-        futures::SinkExt::send(&mut *sender, bytes::Bytes::from(confirmation_bytes)).await?;
+        sender.send_object(&message).await?;
         event!(
             Level::INFO,
             "Sent directory creation confirmation: {:?} -> {:?}",
-            confirmation.src,
-            confirmation.dst
+            src,
+            dst
         );
         Ok(())
     }
@@ -65,14 +58,14 @@ impl DirectoryTracker {
             src: src.to_path_buf(),
             dst: dst.to_path_buf(),
         };
-        let completion_bytes = bincode::serialize(&completion)?;
+        let message = remote::protocol::DirectoryMessage::Complete(completion);
         let mut sender = self.dir_created_send_stream.lock().await;
-        futures::SinkExt::send(&mut *sender, bytes::Bytes::from(completion_bytes)).await?;
+        sender.send_object(&message).await?;
         event!(
             Level::INFO,
             "Sent directory completion notification: {:?} -> {:?}",
-            completion.src,
-            completion.dst
+            src,
+            dst
         );
         Ok(())
     }
@@ -105,8 +98,7 @@ impl DirectoryTracker {
     }
 
     pub async fn finish(&self) -> anyhow::Result<()> {
-        let mut sender = self.dir_created_send_stream.lock().await;
-        sender.close().await?;
+        // Stream will be closed automatically when dropped
         assert!(
             self.remaining_dir_entries.lock().await.is_empty(),
             "Not all directories were processed before finishing"

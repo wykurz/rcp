@@ -1526,6 +1526,7 @@ dependencies = [
  "quinn",
  "rand",
  "remote",
+ "serde",
  "structopt",
  "thiserror 1.0.55",
  "tokio",

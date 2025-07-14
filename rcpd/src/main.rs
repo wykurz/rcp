@@ -4,6 +4,7 @@ use tracing::instrument;
 mod destination;
 mod directory_tracker;
 mod source;
+mod streams;
 
 #[derive(structopt::StructOpt, std::fmt::Debug, std::clone::Clone)]
 #[structopt(

@@ -1,21 +1,20 @@
-use crate::directory_tracker::DirectoryTracker;
-use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::{instrument, Level};
 
+use crate::directory_tracker;
+use crate::streams;
+
 #[instrument]
 async fn handle_file_stream(
-    mut file_recv_stream: quinn::RecvStream,
-    directory_tracker: Arc<DirectoryTracker>,
+    mut file_recv_stream: streams::RecvStream,
+    directory_tracker: std::sync::Arc<directory_tracker::DirectoryTracker>,
 ) -> anyhow::Result<()> {
     tracing::event!(Level::INFO, "Processing file stream");
-    let mut file_recv_stream = tokio_util::codec::FramedRead::new(
-        &mut file_recv_stream,
-        tokio_util::codec::LengthDelimitedCodec::new(),
-    );
-    if let Some(frame) = futures::StreamExt::next(&mut file_recv_stream).await {
-        let chunk = frame?;
-        match bincode::deserialize::<remote::protocol::FsObject>(&chunk)? {
+    if let Some(fs_obj) = file_recv_stream
+        .recv_object::<remote::protocol::FsObject>()
+        .await?
+    {
+        match fs_obj {
             remote::protocol::FsObject::File {
                 ref src,
                 ref dst,
@@ -81,8 +80,9 @@ async fn handle_file_stream(
 #[instrument]
 async fn spawn_file_handler_task(
     connection: quinn::Connection,
-    directory_tracker: Arc<DirectoryTracker>,
+    directory_tracker: std::sync::Arc<directory_tracker::DirectoryTracker>,
 ) -> anyhow::Result<()> {
+    let connection = streams::Connection::new(connection);
     while let Ok(file_recv_stream) = connection.accept_uni().await {
         tracing::event!(Level::INFO, "Received new unidirectional stream for file");
         tokio::spawn(handle_file_stream(
@@ -98,16 +98,15 @@ async fn spawn_file_handler_task(
 /// Fails hard on receiving any unexpected message type.
 #[instrument]
 async fn create_directory_structure(
-    mut dir_stub_recv_stream: tokio_util::codec::FramedRead<
-        quinn::RecvStream,
-        tokio_util::codec::LengthDelimitedCodec,
-    >,
-    directory_tracker: Arc<DirectoryTracker>,
+    mut dir_stub_recv_stream: streams::RecvStream,
+    directory_tracker: std::sync::Arc<directory_tracker::DirectoryTracker>,
 ) -> anyhow::Result<()> {
-    while let Some(frame) = futures::StreamExt::next(&mut dir_stub_recv_stream).await {
-        let chunk = frame?;
+    while let Some(fs_obj) = dir_stub_recv_stream
+        .recv_object::<remote::protocol::FsObject>()
+        .await?
+    {
         // throttle::get_ops_token().await;
-        match bincode::deserialize::<remote::protocol::FsObject>(&chunk)? {
+        match fs_obj {
             remote::protocol::FsObject::DirStub {
                 ref src,
                 ref dst,
@@ -126,7 +125,7 @@ async fn create_directory_structure(
                     .await?;
             }
             _ => {
-                return Err(anyhow::anyhow!("Expected DirStub, got: {:?}", chunk));
+                return Err(anyhow::anyhow!("Expected DirStub, got: {:?}", fs_obj));
             }
         }
     }
@@ -136,15 +135,14 @@ async fn create_directory_structure(
 
 #[instrument]
 async fn update_directory_metadata(
-    mut dir_metadata_recv_stream: tokio_util::codec::FramedRead<
-        quinn::RecvStream,
-        tokio_util::codec::LengthDelimitedCodec,
-    >,
+    mut dir_metadata_recv_stream: streams::RecvStream,
 ) -> anyhow::Result<()> {
-    while let Some(frame) = futures::StreamExt::next(&mut dir_metadata_recv_stream).await {
-        let chunk = frame?;
+    while let Some(fs_obj) = dir_metadata_recv_stream
+        .recv_object::<remote::protocol::FsObject>()
+        .await?
+    {
         // throttle::get_ops_token().await;
-        match bincode::deserialize::<remote::protocol::FsObject>(&chunk)? {
+        match fs_obj {
             remote::protocol::FsObject::Directory {
                 ref src,
                 ref dst,
@@ -166,7 +164,7 @@ async fn update_directory_metadata(
                 );
             }
             _ => {
-                return Err(anyhow::anyhow!("Expected Directory, got: {:?}", chunk));
+                return Err(anyhow::anyhow!("Expected Directory, got: {:?}", fs_obj));
             }
         }
     }
@@ -184,25 +182,16 @@ pub async fn run_destination(
     let client = remote::get_client()?;
     let connection = client.connect(*src_endpoint, src_server_name)?.await?;
     tracing::event!(Level::INFO, "Connected to Source");
-    // Handle bidirectional stream for directory structure
+    let connection = streams::Connection::new(connection);
+    // Always accept the directory streams first (even for single files)
     let (dir_created_send_stream, dir_stub_recv_stream) = connection.accept_bi().await?;
-    let dir_created_send_stream = tokio_util::codec::FramedWrite::new(
-        dir_created_send_stream,
-        tokio_util::codec::LengthDelimitedCodec::new(),
-    );
-    let dir_stub_recv_stream = tokio_util::codec::FramedRead::new(
-        dir_stub_recv_stream,
-        tokio_util::codec::LengthDelimitedCodec::new(),
-    );
     let dir_metadata_recv_stream = connection.accept_uni().await?;
-    let dir_metadata_recv_stream = tokio_util::codec::FramedRead::new(
-        dir_metadata_recv_stream,
-        tokio_util::codec::LengthDelimitedCodec::new(),
-    );
     tracing::event!(Level::INFO, "Received directory creation streams");
-    let directory_tracker = Arc::new(DirectoryTracker::new(dir_created_send_stream));
+    let directory_tracker = std::sync::Arc::new(directory_tracker::DirectoryTracker::new(
+        dir_created_send_stream,
+    ));
     let file_handler_task = tokio::spawn(spawn_file_handler_task(
-        connection,
+        connection.inner().clone(),
         directory_tracker.clone(),
     ));
     let update_metadata_task = tokio::spawn(update_directory_metadata(dir_metadata_recv_stream));

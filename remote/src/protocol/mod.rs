@@ -145,3 +145,14 @@ pub struct DirectoryComplete {
     pub src: std::path::PathBuf,
     pub dst: std::path::PathBuf,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamHello {
+    pub stream_type: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum DirectoryMessage {
+    Created(DirectoryCreated),
+    Complete(DirectoryComplete),
+}
