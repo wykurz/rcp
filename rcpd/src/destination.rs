@@ -168,7 +168,7 @@ async fn update_directory_metadata(
             }
         }
     }
-    tracing::event!(Level::INFO, "Directory structure creation completed");
+    tracing::event!(Level::INFO, "Directory metadata update completed");
     Ok(())
 }
 
@@ -196,8 +196,8 @@ pub async fn run_destination(
     ));
     let update_metadata_task = tokio::spawn(update_directory_metadata(dir_metadata_recv_stream));
     create_directory_structure(dir_stub_recv_stream, directory_tracker.clone()).await?;
-    directory_tracker.finish().await?;
     file_handler_task.await??;
+    directory_tracker.finish().await?;
     update_metadata_task.await??;
     tracing::event!(Level::INFO, "Destination is done");
     Ok("destination OK".to_string())
