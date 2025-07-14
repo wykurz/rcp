@@ -22,7 +22,7 @@ impl DirectoryTracker {
         num_entries: usize,
     ) -> anyhow::Result<()> {
         // First, add directory to tracking (acquire and release entries lock)
-        {
+        if num_entries > 0 {
             let mut entries = self.remaining_dir_entries.lock().await;
             entries.insert(dst.to_path_buf(), num_entries);
             event!(
@@ -32,20 +32,25 @@ impl DirectoryTracker {
                 num_entries
             );
         }
-        // Now send confirmation (acquire sender lock)
         let confirmation = remote::protocol::DirectoryCreated {
             src: src.to_path_buf(),
             dst: dst.to_path_buf(),
         };
         let message = remote::protocol::DirectoryMessage::Created(confirmation);
-        let mut sender = self.dir_created_send_stream.lock().await;
-        sender.send_object(&message).await?;
-        event!(
-            Level::INFO,
-            "Sent directory creation confirmation: {:?} -> {:?}",
-            src,
-            dst
-        );
+        {
+            let mut sender = self.dir_created_send_stream.lock().await;
+            sender.send_object(&message).await?;
+            event!(
+                Level::INFO,
+                "Sent directory creation confirmation: {:?} -> {:?}",
+                src,
+                dst
+            );
+        } // release the stream lock
+        if num_entries == 0 {
+            event!(Level::INFO, "Directory completed: {:?}", dst);
+            self.send_completion(src, dst).await?;
+        }
         Ok(())
     }
 
@@ -75,23 +80,27 @@ impl DirectoryTracker {
         src: &std::path::Path,
         dst: &std::path::Path,
     ) -> anyhow::Result<()> {
-        let parent_dir = dst.parent().unwrap();
+        let dst_parent_dir = dst.parent().unwrap();
         let mut entries = self.remaining_dir_entries.lock().await;
         let remaining = entries
-            .get_mut(parent_dir)
-            .ok_or_else(|| anyhow::anyhow!("Directory {:?} not being tracked", parent_dir))?;
+            .get_mut(dst_parent_dir)
+            .ok_or_else(|| anyhow::anyhow!("Directory {:?} not being tracked", dst_parent_dir))?;
+        assert!(
+            *remaining > 0,
+            "Entry count for {dst_parent_dir:?} is already zero"
+        );
         *remaining -= 1;
         event!(
             Level::DEBUG,
             "Decremented entry count for {:?}, remaining: {}",
-            parent_dir,
+            dst_parent_dir,
             *remaining
         );
         if *remaining == 0 {
-            entries.remove(parent_dir);
+            entries.remove(dst_parent_dir);
             drop(entries); // Release lock before sending completion
-            event!(Level::INFO, "Directory completed: {:?}", parent_dir);
-            self.send_completion(src.parent().unwrap(), parent_dir)
+            event!(Level::INFO, "Directory completed: {:?}", dst_parent_dir);
+            self.send_completion(src.parent().unwrap(), dst_parent_dir)
                 .await?;
         }
         Ok(())
