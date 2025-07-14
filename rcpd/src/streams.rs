@@ -93,6 +93,7 @@ impl RecvStream {
 }
 
 /// Connection wrapper that provides framed stream creation
+#[derive(Clone, Debug)]
 pub struct Connection {
     inner: quinn::Connection,
 }

@@ -106,7 +106,7 @@ impl DirectoryTracker {
         Ok(())
     }
 
-    pub async fn finish(self) -> anyhow::Result<()> {
+    pub async fn finish(&self) -> anyhow::Result<()> {
         // Stream will be closed automatically when dropped
         assert!(
             self.remaining_dir_entries.lock().await.is_empty(),
