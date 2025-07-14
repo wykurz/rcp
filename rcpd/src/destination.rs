@@ -7,7 +7,7 @@ use crate::streams;
 #[instrument]
 async fn handle_file_stream(
     mut file_recv_stream: streams::RecvStream,
-    directory_tracker: &directory_tracker::DirectoryTracker,
+    directory_tracker: std::sync::Arc<directory_tracker::DirectoryTracker>,
 ) -> anyhow::Result<()> {
     tracing::event!(Level::INFO, "Processing file stream");
     if let Some(fs_obj) = file_recv_stream
@@ -79,10 +79,9 @@ async fn handle_file_stream(
 /// Processes new streams and completes existing ones concurrently for maximum parallelism.
 #[instrument]
 async fn process_incoming_file_streams(
-    connection: quinn::Connection,
-    directory_tracker: &directory_tracker::DirectoryTracker,
+    connection: streams::Connection,
+    directory_tracker: std::sync::Arc<directory_tracker::DirectoryTracker>,
 ) -> anyhow::Result<()> {
-    let connection = streams::Connection::new(connection);
     let mut join_set = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
@@ -92,9 +91,9 @@ async fn process_incoming_file_streams(
                     Ok(file_recv_stream) => {
                         tracing::event!(Level::INFO, "Received new unidirectional stream for file");
                         let tracker = directory_tracker.clone();
-                        join_set.spawn(async move {
-                            handle_file_stream(file_recv_stream, &tracker).await
-                        });
+                        join_set.spawn(
+                            handle_file_stream(file_recv_stream, tracker.clone())
+                        );
                     }
                     Err(_) => {
                         tracing::event!(Level::INFO, "No more file streams to accept");
@@ -218,18 +217,20 @@ pub async fn run_destination(
     let (dir_created_send_stream, dir_stub_recv_stream) = connection.accept_bi().await?;
     let dir_metadata_recv_stream = connection.accept_uni().await?;
     tracing::event!(Level::INFO, "Received directory creation streams");
-    let directory_tracker = directory_tracker::DirectoryTracker::new(
+    let directory_tracker = std::sync::Arc::new(directory_tracker::DirectoryTracker::new(
         dir_created_send_stream,
-    );
+    ));
     let file_handler_task = tokio::spawn(process_incoming_file_streams(
-        connection.inner().clone(),
-        &directory_tracker,
+        connection.clone(),
+        directory_tracker.clone(),
     ));
     // Run all tasks concurrently using structured concurrency
     let update_metadata_task = tokio::spawn(update_directory_metadata(dir_metadata_recv_stream));
     create_directory_structure(dir_stub_recv_stream, &directory_tracker).await?;
     file_handler_task.await??;
+    // TODO: this is a hack to ensure all directories are processed before finishing
     directory_tracker.finish().await?;
+    drop(directory_tracker); // Ensure directory tracker is dropped to close the stream
     update_metadata_task.await??;
     tracing::event!(Level::INFO, "Destination is done");
     Ok("destination OK".to_string())
