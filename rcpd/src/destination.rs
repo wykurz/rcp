@@ -75,22 +75,53 @@ async fn handle_file_stream(
     Ok(())
 }
 
-/// Spawns a task that continuously accepts unidirectional streams for file/symlink transfers.
-/// Each stream is handled in its own task for maximum parallelism.
+/// Handles unidirectional streams for file/symlink transfers with proper task tracking.
+/// Processes new streams and completes existing ones concurrently for maximum parallelism.
 #[instrument]
-async fn spawn_file_handler_task(
+async fn process_incoming_file_streams(
     connection: quinn::Connection,
     directory_tracker: &directory_tracker::DirectoryTracker,
 ) -> anyhow::Result<()> {
     let connection = streams::Connection::new(connection);
-    while let Ok(file_recv_stream) = connection.accept_uni().await {
-        tracing::event!(Level::INFO, "Received new unidirectional stream for file");
-        tokio::spawn(handle_file_stream(
-            file_recv_stream,
-            directory_tracker,
-        ));
+    let mut join_set = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            // Accept new file streams
+            stream_result = connection.accept_uni() => {
+                match stream_result {
+                    Ok(file_recv_stream) => {
+                        tracing::event!(Level::INFO, "Received new unidirectional stream for file");
+                        let tracker = directory_tracker.clone();
+                        join_set.spawn(async move {
+                            handle_file_stream(file_recv_stream, &tracker).await
+                        });
+                    }
+                    Err(_) => {
+                        tracing::event!(Level::INFO, "No more file streams to accept");
+                        break;
+                    }
+                }
+            }
+            // Handle completion of existing file streams
+            Some(result) = join_set.join_next() => {
+                match result {
+                    Ok(Ok(())) => {
+                        tracing::event!(Level::DEBUG, "File stream handled successfully");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::event!(Level::ERROR, "File stream handling failed: {}", e);
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        tracing::event!(Level::ERROR, "File stream task panicked: {}", e);
+                        return Err(anyhow::anyhow!("File stream task panicked: {}", e));
+                    }
+                }
+            }
+        }
     }
-    tracing::event!(Level::INFO, "File handler task completed");
+    join_set.shutdown().await;
+    tracing::event!(Level::INFO, "All file streams completed");
     Ok(())
 }
 
@@ -190,10 +221,11 @@ pub async fn run_destination(
     let directory_tracker = directory_tracker::DirectoryTracker::new(
         dir_created_send_stream,
     );
-    let file_handler_task = tokio::spawn(spawn_file_handler_task(
+    let file_handler_task = tokio::spawn(process_incoming_file_streams(
         connection.inner().clone(),
         &directory_tracker,
     ));
+    // Run all tasks concurrently using structured concurrency
     let update_metadata_task = tokio::spawn(update_directory_metadata(dir_metadata_recv_stream));
     create_directory_structure(dir_stub_recv_stream, &directory_tracker).await?;
     file_handler_task.await??;
