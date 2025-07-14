@@ -160,6 +160,7 @@ async fn create_directory_structure(
         }
     }
     tracing::event!(Level::INFO, "Directory structure creation completed");
+    directory_tracker.done_creating_directories().await?;
     Ok(())
 }
 
@@ -224,13 +225,9 @@ pub async fn run_destination(
         connection.clone(),
         directory_tracker.clone(),
     ));
-    // Run all tasks concurrently using structured concurrency
     let update_metadata_task = tokio::spawn(update_directory_metadata(dir_metadata_recv_stream));
     create_directory_structure(dir_stub_recv_stream, &directory_tracker).await?;
     file_handler_task.await??;
-    // TODO: this is a hack to ensure all directories are processed before finishing
-    directory_tracker.finish().await?;
-    drop(directory_tracker); // Ensure directory tracker is dropped to close the stream
     update_metadata_task.await??;
     tracing::event!(Level::INFO, "Destination is done");
     Ok("destination OK".to_string())
