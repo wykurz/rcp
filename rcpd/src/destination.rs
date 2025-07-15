@@ -7,7 +7,7 @@ use crate::streams;
 #[instrument]
 async fn handle_file_stream(
     mut file_recv_stream: streams::RecvStream,
-    directory_tracker: std::sync::Arc<directory_tracker::DirectoryTracker>,
+    directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
     tracing::event!(Level::INFO, "Processing file stream");
     if let Some(fs_obj) = file_recv_stream
@@ -44,7 +44,11 @@ async fn handle_file_stream(
                 let settings = common::preserve::preserve_all();
                 common::preserve::set_file_metadata(&settings, &metadata, dst).await?;
                 // Decrement directory entry count
-                directory_tracker.decrement_entry(src, dst).await?;
+                directory_tracker
+                    .lock()
+                    .await
+                    .decrement_entry(src, dst)
+                    .await?;
             }
             remote::protocol::FsObject::Symlink {
                 ref src,
@@ -63,7 +67,11 @@ async fn handle_file_stream(
                 let settings = common::preserve::preserve_all();
                 common::preserve::set_symlink_metadata(&settings, metadata, dst).await?;
                 // Decrement directory entry count
-                directory_tracker.decrement_entry(src, dst).await?;
+                directory_tracker
+                    .lock()
+                    .await
+                    .decrement_entry(src, dst)
+                    .await?;
             }
             _ => {
                 return Err(anyhow::anyhow!(
@@ -80,7 +88,7 @@ async fn handle_file_stream(
 #[instrument]
 async fn process_incoming_file_streams(
     connection: streams::Connection,
-    directory_tracker: std::sync::Arc<directory_tracker::DirectoryTracker>,
+    directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
     let mut join_set = tokio::task::JoinSet::new();
     loop {
@@ -129,7 +137,7 @@ async fn process_incoming_file_streams(
 #[instrument]
 async fn create_directory_structure(
     mut dir_stub_recv_stream: streams::RecvStream,
-    directory_tracker: &directory_tracker::DirectoryTracker,
+    directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
     while let Some(fs_obj) = dir_stub_recv_stream
         .recv_object::<remote::protocol::FsObject>()
@@ -151,6 +159,8 @@ async fn create_directory_structure(
                 );
                 tokio::fs::create_dir_all(&dst).await?;
                 directory_tracker
+                    .lock()
+                    .await
                     .add_directory(src, dst, num_entries)
                     .await?;
             }
@@ -160,7 +170,11 @@ async fn create_directory_structure(
         }
     }
     tracing::event!(Level::INFO, "Directory structure creation completed");
-    directory_tracker.done_creating_directories().await?;
+    directory_tracker
+        .lock()
+        .await
+        .done_creating_directories()
+        .await?;
     Ok(())
 }
 
@@ -218,15 +232,13 @@ pub async fn run_destination(
     let (dir_created_send_stream, dir_stub_recv_stream) = connection.accept_bi().await?;
     let dir_metadata_recv_stream = connection.accept_uni().await?;
     tracing::event!(Level::INFO, "Received directory creation streams");
-    let directory_tracker = std::sync::Arc::new(directory_tracker::DirectoryTracker::new(
-        dir_created_send_stream,
-    ));
+    let directory_tracker = directory_tracker::make_shared(dir_created_send_stream);
     let file_handler_task = tokio::spawn(process_incoming_file_streams(
         connection.clone(),
         directory_tracker.clone(),
     ));
     let update_metadata_task = tokio::spawn(update_directory_metadata(dir_metadata_recv_stream));
-    create_directory_structure(dir_stub_recv_stream, &directory_tracker).await?;
+    create_directory_structure(dir_stub_recv_stream, directory_tracker).await?;
     file_handler_task.await??;
     update_metadata_task.await??;
     tracing::event!(Level::INFO, "Destination is done");
