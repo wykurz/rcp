@@ -1,5 +1,5 @@
 use tokio::io::AsyncWriteExt;
-use tracing::{instrument, Level};
+use tracing::{event, instrument, Level};
 
 use crate::directory_tracker;
 use crate::streams;
@@ -9,7 +9,7 @@ async fn handle_file_stream(
     mut file_recv_stream: streams::RecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
-    tracing::event!(Level::INFO, "Processing file stream");
+    event!(Level::INFO, "Processing file stream");
     if let Some(fs_obj) = file_recv_stream
         .recv_object::<remote::protocol::FsObject>()
         .await?
@@ -22,7 +22,7 @@ async fn handle_file_stream(
                 ref metadata,
                 is_root,
             } => {
-                tracing::event!(Level::INFO, "Received file: {:?} -> {:?}", src, dst);
+                event!(Level::INFO, "Received file: {:?} -> {:?}", src, dst);
                 // TODO:
                 // let _open_file_guard = throttle::open_file_permit().await;
                 // throttle::get_iops_tokens(tokens as u32).await;
@@ -43,6 +43,13 @@ async fn handle_file_stream(
                     ));
                 }
                 drop(file); // Ensure file is closed before setting metadata
+                event!(
+                    Level::INFO,
+                    "File {} -> {} created, size: {} bytes, setting metadata...",
+                    src.display(),
+                    dst.display(),
+                    size
+                );
                 let settings = common::preserve::preserve_all();
                 common::preserve::set_file_metadata(&settings, &metadata, dst).await?;
                 if !is_root {
@@ -52,7 +59,7 @@ async fn handle_file_stream(
                         .decrement_entry(src, dst)
                         .await?;
                 } else {
-                    tracing::event!(
+                    event!(
                         Level::INFO,
                         "Root file {} -> {} processed",
                         src.display(),
@@ -67,7 +74,7 @@ async fn handle_file_stream(
                 ref metadata,
                 is_root,
             } => {
-                tracing::event!(
+                event!(
                     Level::INFO,
                     "Received symlink: {:?} -> {:?} (target: {:?})",
                     src,
@@ -84,7 +91,7 @@ async fn handle_file_stream(
                         .decrement_entry(src, dst)
                         .await?;
                 } else {
-                    tracing::event!(
+                    event!(
                         Level::INFO,
                         "Root symlink {} -> {} processed",
                         src.display(),
@@ -112,7 +119,7 @@ async fn process_incoming_file_streams(
     let mut join_set = tokio::task::JoinSet::new();
     // TODO: we're accumulating unbounded number of spawned tasks here
     while let Ok(file_recv_stream) = connection.accept_uni().await {
-        tracing::event!(Level::INFO, "Received new unidirectional stream for file");
+        event!(Level::INFO, "Received new unidirectional stream for file");
         let tracker = directory_tracker.clone();
         join_set.spawn(handle_file_stream(file_recv_stream, tracker.clone()));
     }
@@ -121,7 +128,7 @@ async fn process_incoming_file_streams(
         result??;
     }
     join_set.shutdown().await;
-    tracing::event!(Level::INFO, "All file streams completed");
+    event!(Level::INFO, "All file streams completed");
     Ok(())
 }
 
@@ -143,7 +150,7 @@ async fn create_directory_structure(
                 ref dst,
                 num_entries,
             } => {
-                tracing::event!(
+                event!(
                     Level::INFO,
                     "Received directory stub: {:?} -> {:?} (entries: {})",
                     src,
@@ -162,7 +169,7 @@ async fn create_directory_structure(
             }
         }
     }
-    tracing::event!(Level::INFO, "Directory structure creation completed");
+    event!(Level::INFO, "Directory structure creation completed");
     directory_tracker
         .lock()
         .await
@@ -188,7 +195,7 @@ async fn update_directory_metadata(
                 ref metadata,
                 is_root,
             } => {
-                tracing::event!(
+                event!(
                     Level::INFO,
                     "Received directory metadata: {:?} -> {:?}",
                     src,
@@ -197,7 +204,7 @@ async fn update_directory_metadata(
                 // Apply metadata changes now that directory is complete
                 let settings = common::preserve::preserve_all();
                 common::preserve::set_dir_metadata(&settings, metadata, dst).await?;
-                tracing::event!(
+                event!(
                     Level::INFO,
                     "Applied metadata for completed directory: {:?}",
                     dst
@@ -209,7 +216,7 @@ async fn update_directory_metadata(
                         .decrement_entry(src, dst)
                         .await?;
                 } else {
-                    tracing::event!(
+                    event!(
                         Level::INFO,
                         "Root directory {} -> {} processed",
                         src.display(),
@@ -222,7 +229,7 @@ async fn update_directory_metadata(
             }
         }
     }
-    tracing::event!(Level::INFO, "Directory metadata update completed");
+    event!(Level::INFO, "Directory metadata update completed");
     Ok(())
 }
 
@@ -235,12 +242,12 @@ pub async fn run_destination(
 ) -> anyhow::Result<String> {
     let client = remote::get_client()?;
     let connection = client.connect(*src_endpoint, src_server_name)?.await?;
-    tracing::event!(Level::INFO, "Connected to Source");
+    event!(Level::INFO, "Connected to Source");
     let connection = streams::Connection::new(connection);
     // Always accept the directory streams first (even for single files)
     let (dir_created_send_stream, dir_stub_recv_stream) = connection.accept_bi().await?;
     let dir_metadata_recv_stream = connection.accept_uni().await?;
-    tracing::event!(Level::INFO, "Received directory creation streams");
+    event!(Level::INFO, "Received directory creation streams");
     let directory_tracker = directory_tracker::make_shared(dir_created_send_stream);
     let file_handler_task = tokio::spawn(process_incoming_file_streams(
         connection.clone(),
@@ -253,6 +260,6 @@ pub async fn run_destination(
     create_directory_structure(dir_stub_recv_stream, directory_tracker).await?;
     file_handler_task.await??;
     update_metadata_task.await??;
-    tracing::event!(Level::INFO, "Destination is done");
+    event!(Level::INFO, "Destination is done");
     Ok("destination OK".to_string())
 }
