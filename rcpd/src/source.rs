@@ -79,6 +79,7 @@ async fn send_directory_structure(
 async fn send_file_or_symlink(
     src: &std::path::Path,
     dst: &std::path::Path,
+    is_root: bool,
     connection: &quinn::Connection,
 ) -> anyhow::Result<()> {
     let src_metadata = tokio::fs::symlink_metadata(src)
@@ -102,6 +103,7 @@ async fn send_file_or_symlink(
             dst: dst.to_path_buf(),
             size: src_metadata.len(),
             metadata,
+            is_root,
         }
     } else {
         assert!(
@@ -113,6 +115,7 @@ async fn send_file_or_symlink(
             dst: dst.to_path_buf(),
             target: tokio::fs::read_link(src).await?.to_path_buf(),
             metadata,
+            is_root,
         }
     };
     let connection = streams::Connection::new(connection.clone());
@@ -150,8 +153,9 @@ async fn send_files_in_directory(
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
         let connection = connection.clone();
-        join_set
-            .spawn(async move { send_file_or_symlink(&entry_path, &dst_path, &connection).await });
+        join_set.spawn(async move {
+            send_file_or_symlink(&entry_path, &dst_path, false, &connection).await
+        });
     }
     drop(entries);
     while let Some(res) = join_set.join_next().await {
@@ -165,6 +169,7 @@ async fn wait_for_directory_creation_and_send_files(
     mut dir_created_recv_stream: streams::RecvStream,
     mut dir_metadata_send_stream: streams::SendStream,
     connection: &quinn::Connection,
+    src_root: &std::path::Path,
 ) -> anyhow::Result<()> {
     // Wait for directory creation confirmations and completions
     while let Some(message) = dir_created_recv_stream
@@ -204,10 +209,12 @@ async fn wait_for_directory_creation_and_send_files(
                     atime_nsec: src_metadata.atime_nsec(),
                     mtime_nsec: src_metadata.mtime_nsec(),
                 };
+                let is_root = completion.src == src_root;
                 let dir_metadata = remote::protocol::FsObject::Directory {
                     src: completion.src,
                     dst: completion.dst,
                     metadata,
+                    is_root,
                 };
                 dir_metadata_send_stream.send_object(&dir_metadata).await?;
             }
@@ -235,11 +242,13 @@ async fn handle_connection(
     event!(Level::INFO, "Opened streams for directory transfer");
     if src.is_dir() {
         // Start directory confirmation receiver task
+        let src_root = src.to_path_buf();
         let confirmation_task = tokio::spawn(async move {
             wait_for_directory_creation_and_send_files(
                 dir_created_recv_stream,
                 dir_metadata_send_stream,
                 connection.inner(),
+                &src_root,
             )
             .await
         });
@@ -250,7 +259,7 @@ async fn handle_connection(
         drop(dir_stub_send_stream);
         drop(dir_metadata_send_stream);
         drop(dir_created_recv_stream);
-        send_file_or_symlink(src, dst, connection.inner()).await?;
+        send_file_or_symlink(src, dst, true, connection.inner()).await?;
     }
     event!(Level::INFO, "Data sent successfully");
     Ok(())
