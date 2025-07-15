@@ -80,7 +80,7 @@ async fn send_file_or_symlink(
     src: &std::path::Path,
     dst: &std::path::Path,
     is_root: bool,
-    connection: &quinn::Connection,
+    connection: &streams::Connection,
 ) -> anyhow::Result<()> {
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
@@ -118,7 +118,6 @@ async fn send_file_or_symlink(
             is_root,
         }
     };
-    let connection = streams::Connection::new(connection.clone());
     let mut file_send_stream = connection.open_uni().await?;
     file_send_stream
         .send_object(&fs_obj)
@@ -138,7 +137,7 @@ async fn send_file_or_symlink(
 async fn send_files_in_directory(
     src: &std::path::Path,
     dst: &std::path::Path,
-    connection: &quinn::Connection,
+    connection: &streams::Connection,
 ) -> anyhow::Result<()> {
     let mut entries = tokio::fs::read_dir(src)
         .await
@@ -168,7 +167,7 @@ async fn send_files_in_directory(
 async fn wait_for_directory_creation_and_send_files(
     mut dir_created_recv_stream: streams::RecvStream,
     mut dir_metadata_send_stream: streams::SendStream,
-    connection: &quinn::Connection,
+    connection: &streams::Connection,
     src_root: &std::path::Path,
 ) -> anyhow::Result<()> {
     // Wait for directory creation confirmations and completions
@@ -247,7 +246,7 @@ async fn handle_connection(
             wait_for_directory_creation_and_send_files(
                 dir_created_recv_stream,
                 dir_metadata_send_stream,
-                connection.inner(),
+                &connection,
                 &src_root,
             )
             .await
@@ -259,7 +258,7 @@ async fn handle_connection(
         drop(dir_stub_send_stream);
         drop(dir_metadata_send_stream);
         drop(dir_created_recv_stream);
-        send_file_or_symlink(src, dst, true, connection.inner()).await?;
+        send_file_or_symlink(src, dst, true, &connection).await?;
     }
     event!(Level::INFO, "Data sent successfully");
     Ok(())

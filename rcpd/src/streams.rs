@@ -131,11 +131,6 @@ impl Connection {
         let recv_stream = self.inner.accept_uni().await?;
         RecvStream::new(recv_stream).await
     }
-
-    /// Get access to the underlying quinn::Connection
-    pub fn inner(&self) -> &quinn::Connection {
-        &self.inner
-    }
 }
 
 impl std::ops::Deref for Connection {
