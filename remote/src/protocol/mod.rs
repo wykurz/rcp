@@ -71,6 +71,7 @@ pub enum FsObject {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
         metadata: Metadata,
+        is_root: bool,
     },
     // Implies files contents will be sent immediately after receiving this object
     File {
@@ -78,12 +79,14 @@ pub enum FsObject {
         dst: std::path::PathBuf,
         size: u64,
         metadata: Metadata,
+        is_root: bool,
     },
     Symlink {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
         target: std::path::PathBuf,
         metadata: Metadata,
+        is_root: bool,
     },
 }
 
