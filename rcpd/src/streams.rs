@@ -39,7 +39,7 @@ impl SendStream {
 impl Drop for SendStream {
     fn drop(&mut self) {
         // Close the underlying stream when SendStream is dropped
-        std::mem::drop(self.framed.get_mut().finish());
+        std::mem::drop(self.framed.close());
     }
 }
 
