@@ -41,6 +41,7 @@ async fn handle_file_stream(
                         buffer_size + stream_bytes,
                     ));
                 }
+                drop(file); // Ensure file is closed before setting metadata
                 let settings = common::preserve::preserve_all();
                 common::preserve::set_file_metadata(&settings, &metadata, dst).await?;
                 // Decrement directory entry count
