@@ -1,6 +1,5 @@
 use anyhow::Context;
 use async_recursion::async_recursion;
-use std::os::unix::fs::MetadataExt;
 use tracing::{event, instrument, Level};
 
 use crate::streams;
@@ -208,15 +207,7 @@ async fn dispatch_control_messages(
                     .with_context(|| {
                         format!("failed reading metadata from src: {:?}", &completion.src)
                     })?;
-                let metadata = remote::protocol::Metadata {
-                    mode: src_metadata.mode(),
-                    uid: src_metadata.uid(),
-                    gid: src_metadata.gid(),
-                    atime: src_metadata.atime(),
-                    mtime: src_metadata.mtime(),
-                    atime_nsec: src_metadata.atime_nsec(),
-                    mtime_nsec: src_metadata.mtime_nsec(),
-                };
+                let metadata = remote::protocol::Metadata::from(&src_metadata);
                 let is_root = completion.src == src_root;
                 let dir_metadata = remote::protocol::FsObjectMessage::Directory {
                     src: completion.src,
