@@ -236,3 +236,5 @@ fn test_remote_copy_comprehensive() {
     let dst_target = dst_subdir.join("target.txt");
     assert_eq!(get_file_content(&dst_target), "target content");
 }
+
+// TODO: add coverage for root object being a symlink to file or directory with and without dereferencing

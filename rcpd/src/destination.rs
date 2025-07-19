@@ -20,83 +20,51 @@ async fn handle_file_stream(
     directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
     event!(Level::INFO, "Processing file stream");
-    let (src, dst, is_root) = match file_recv_stream
-        .recv_object::<remote::protocol::FsObject>()
+    let file_header = file_recv_stream
+        .recv_object::<remote::protocol::File>()
         .await?
-        .expect("No file data sent over uni-stream?!")
-    {
-        // TODO: separate out from Symlink
-        remote::protocol::FsObject::File {
-            ref src,
-            ref dst,
-            size,
-            ref metadata,
-            is_root,
-        } => {
-            event!(Level::INFO, "Received file: {:?} -> {:?}", src, dst);
-            // TODO:
-            // let _open_file_guard = throttle::open_file_permit().await;
-            // throttle::get_iops_tokens(tokens as u32).await;
-            let mut file = tokio::fs::File::create(&dst).await?;
-            let copied = file_recv_stream.copy_to(&mut file).await?;
-            if copied != size {
-                return Err(anyhow::anyhow!(
-                    "File size mismatch: expected {} bytes, copied {} bytes",
-                    size,
-                    copied
-                ));
-            }
-            drop(file); // Ensure file is closed before setting metadata
-            event!(
-                Level::INFO,
-                "File {} -> {} created, size: {} bytes, setting metadata...",
-                src.display(),
-                dst.display(),
-                size
-            );
-            let settings = common::preserve::preserve_all();
-            common::preserve::set_file_metadata(&settings, &metadata, dst).await?;
-            (src.to_owned(), dst.to_owned(), is_root)
-        }
-        // TODO: move to handling with Directory
-        remote::protocol::FsObject::Symlink {
-            ref src,
-            ref dst,
-            ref target,
-            ref metadata,
-            is_root,
-        } => {
-            event!(
-                Level::INFO,
-                "Received symlink: {:?} -> {:?} (target: {:?})",
-                src,
-                dst,
-                target
-            );
-            tokio::fs::symlink(target, dst).await?;
-            let settings = common::preserve::preserve_all();
-            common::preserve::set_symlink_metadata(&settings, metadata, dst).await?;
-            (src.to_owned(), dst.to_owned(), is_root)
-        }
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Expected file or symlink on unidirectional stream"
-            ));
-        }
-    };
-    if is_root {
+        .expect("No file data sent over uni-stream?!");
+    event!(
+        Level::INFO,
+        "Received file: {:?} -> {:?}",
+        file_header.src,
+        file_header.dst
+    );
+    // TODO:
+    // let _open_file_guard = throttle::open_file_permit().await;
+    // throttle::get_iops_tokens(tokens as u32).await;
+    let mut file = tokio::fs::File::create(&file_header.dst).await?;
+    let copied = file_recv_stream.copy_to(&mut file).await?;
+    if copied != file_header.size {
+        return Err(anyhow::anyhow!(
+            "File size mismatch: expected {} bytes, copied {} bytes",
+            file_header.size,
+            copied
+        ));
+    }
+    drop(file); // Ensure file is closed before setting metadata
+    event!(
+        Level::INFO,
+        "File {} -> {} created, size: {} bytes, setting metadata...",
+        file_header.src.display(),
+        file_header.dst.display(),
+        file_header.size
+    );
+    let settings = common::preserve::preserve_all();
+    common::preserve::set_file_metadata(&settings, &file_header.metadata, &file_header.dst).await?;
+    if file_header.is_root {
         event!(
             Level::INFO,
-            "Root symlink {} -> {} processed",
-            src.display(),
-            dst.display()
+            "Root symlink {:?} -> {:?} processed",
+            file_header.src,
+            file_header.dst,
         );
         send_root_done(control_send_stream).await?;
     } else {
         directory_tracker
             .lock()
             .await
-            .decrement_entry(&src, &dst)
+            .decrement_entry(&file_header.src, &file_header.dst)
             .await?;
     }
     Ok(())
@@ -135,12 +103,12 @@ async fn create_directory_structure(
     directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
     while let Some(fs_obj) = dir_stub_recv_stream
-        .recv_object::<remote::protocol::FsObject>()
+        .recv_object::<remote::protocol::FsObjectMessage>()
         .await?
     {
         // throttle::get_ops_token().await;
         match fs_obj {
-            remote::protocol::FsObject::DirStub {
+            remote::protocol::FsObjectMessage::DirStub {
                 ref src,
                 ref dst,
                 num_entries,
@@ -159,7 +127,7 @@ async fn create_directory_structure(
                     .add_directory(src, dst, num_entries)
                     .await?;
             }
-            remote::protocol::FsObject::Directory {
+            remote::protocol::FsObjectMessage::Directory {
                 ref src,
                 ref dst,
                 ref metadata,
@@ -196,12 +164,26 @@ async fn create_directory_structure(
                         .await?;
                 }
             }
-            remote::protocol::FsObject::AllDirectoriesComplete => {
+            remote::protocol::FsObjectMessage::Symlink {
+                ref src,
+                ref dst,
+                ref target,
+                ref metadata,
+            } => {
+                event!(
+                    Level::INFO,
+                    "Received symlink: {:?} -> {:?} (target: {:?})",
+                    src,
+                    dst,
+                    target
+                );
+                tokio::fs::symlink(target, dst).await?;
+                let settings = common::preserve::preserve_all();
+                common::preserve::set_symlink_metadata(&settings, metadata, dst).await?;
+            }
+            remote::protocol::FsObjectMessage::DirsAndSymlinksComplete => {
                 event!(Level::INFO, "All directories creation completed");
                 break;
-            }
-            _ => {
-                return Err(anyhow::anyhow!("Expected DirStub, got: {:?}", fs_obj));
             }
         }
     }

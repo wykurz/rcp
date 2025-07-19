@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,8 +61,31 @@ impl common::preserve::Metadata for &Metadata {
     }
 }
 
+impl From<&std::fs::Metadata> for Metadata {
+    fn from(metadata: &std::fs::Metadata) -> Self {
+        Metadata {
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            atime: metadata.atime(),
+            mtime: metadata.mtime(),
+            atime_nsec: metadata.atime_nsec(),
+            mtime_nsec: metadata.mtime_nsec(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
-pub enum FsObject {
+pub struct File {
+    pub src: std::path::PathBuf,
+    pub dst: std::path::PathBuf,
+    pub size: u64,
+    pub metadata: Metadata,
+    pub is_root: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum FsObjectMessage {
     DirStub {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
@@ -73,21 +97,13 @@ pub enum FsObject {
         metadata: Metadata,
         is_root: bool,
     },
-    AllDirectoriesComplete,
+    DirsAndSymlinksComplete,
     // implies files contents will be sent immediately after receiving this object
-    File {
-        src: std::path::PathBuf,
-        dst: std::path::PathBuf,
-        size: u64,
-        metadata: Metadata,
-        is_root: bool,
-    },
     Symlink {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
         target: std::path::PathBuf,
         metadata: Metadata,
-        is_root: bool,
     },
 }
 
