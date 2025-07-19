@@ -7,7 +7,7 @@ use crate::streams;
 
 #[instrument]
 #[async_recursion]
-async fn send_directories(
+async fn send_directories_and_symlinks(
     src: &std::path::Path,
     dst: &std::path::Path,
     control_send_stream: &streams::SharedSendStream,
@@ -17,8 +17,22 @@ async fn send_directories(
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from src: {:?}", &src))?;
-    if !src_metadata.is_dir() {
+    if src_metadata.is_symlink() {
         // TODO: handle dereferencing symlinks
+        let symlink = remote::protocol::FsObjectMessage::Symlink {
+            src: src.to_path_buf(),
+            dst: dst.to_path_buf(),
+            target: tokio::fs::read_link(src).await?.to_path_buf(),
+            metadata: remote::protocol::Metadata::from(&src_metadata),
+        };
+        return control_send_stream.lock().await.send_object(&symlink).await;
+    }
+    if !src_metadata.is_dir() {
+        assert!(
+            src_metadata.is_file(),
+            "Encountered fs object that's not a directory, symlink or a file? {src:?}"
+        );
+        // handle files separately
         return Ok(());
     }
     // we do one more read_dir to count entries; this could be avoided by e.g. modifying
@@ -28,7 +42,7 @@ async fn send_directories(
     while let Some(_entry) = entries.next_entry().await? {
         entry_count += 1;
     }
-    let dir = remote::protocol::FsObject::DirStub {
+    let dir = remote::protocol::FsObjectMessage::DirStub {
         src: src.to_path_buf(),
         dst: dst.to_path_buf(),
         num_entries: entry_count,
@@ -52,7 +66,8 @@ async fn send_directories(
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
-        send_directories(&entry_path, &dst_path, control_send_stream, connection).await?;
+        send_directories_and_symlinks(&entry_path, &dst_path, control_send_stream, connection)
+            .await?;
     }
     Ok(())
 }
@@ -69,23 +84,23 @@ async fn send_fs_objects(
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from src: {:?}", &src))?;
-    if src_metadata.is_dir() {
-        send_directories(src, dst, &control_send_stream, &connection).await?;
+    if !src_metadata.is_file() {
+        send_directories_and_symlinks(src, dst, &control_send_stream, &connection).await?;
     }
     let mut stream = control_send_stream.lock().await;
     stream
-        .send_object(&remote::protocol::FsObject::AllDirectoriesComplete)
+        .send_object(&remote::protocol::FsObjectMessage::DirsAndSymlinksComplete)
         .await?;
     stream.flush().await?;
-    if !src_metadata.is_dir() {
-        send_file_or_symlink(src, dst, true, connection).await?;
+    if src_metadata.is_file() {
+        send_file(src, dst, true, connection).await?;
     }
     return Ok(());
 }
 
 #[instrument]
 #[async_recursion]
-async fn send_file_or_symlink(
+async fn send_file(
     src: &std::path::Path,
     dst: &std::path::Path,
     is_root: bool,
@@ -94,51 +109,28 @@ async fn send_file_or_symlink(
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from src: {:?}", &src))?;
-    if src_metadata.is_dir() {
-        return Ok(());
-    }
-    let metadata = remote::protocol::Metadata {
-        mode: src_metadata.mode(),
-        uid: src_metadata.uid(),
-        gid: src_metadata.gid(),
-        atime: src_metadata.atime(),
-        mtime: src_metadata.mtime(),
-        atime_nsec: src_metadata.atime_nsec(),
-        mtime_nsec: src_metadata.mtime_nsec(),
-    };
-    let fs_obj = if src_metadata.is_file() {
-        remote::protocol::FsObject::File {
-            src: src.to_path_buf(),
-            dst: dst.to_path_buf(),
-            size: src_metadata.len(),
-            metadata,
-            is_root,
-        }
-    } else {
-        assert!(
-            src_metadata.is_symlink(),
-            "Expected src to be a file or symlink, got {src:?}"
-        );
-        remote::protocol::FsObject::Symlink {
-            src: src.to_path_buf(),
-            dst: dst.to_path_buf(),
-            target: tokio::fs::read_link(src).await?.to_path_buf(),
-            metadata,
-            is_root,
-        }
+    assert!(
+        src_metadata.is_file(),
+        "Expected src to be a file, got {src:?}"
+    );
+    let metadata = remote::protocol::Metadata::from(&src_metadata);
+    let file_header = remote::protocol::File {
+        src: src.to_path_buf(),
+        dst: dst.to_path_buf(),
+        size: src_metadata.len(),
+        metadata,
+        is_root,
     };
     let mut file_send_stream = connection.open_uni().await?;
     file_send_stream
-        .send_object(&fs_obj)
+        .send_object(&file_header)
         .await
         .with_context(|| format!("failed sending file metadata: {:?}", &src))?;
-    if src_metadata.is_file() {
-        event!(Level::INFO, "Sending file content for {:?}", src);
-        file_send_stream
-            .copy_from(&mut tokio::fs::File::open(src).await?)
-            .await
-            .with_context(|| format!("failed sending file content: {:?}", &src))?;
-    }
+    event!(Level::INFO, "Sending file content for {:?}", src);
+    file_send_stream
+        .copy_from(&mut tokio::fs::File::open(src).await?)
+        .await
+        .with_context(|| format!("failed sending file content: {:?}", &src))?;
     file_send_stream.close().await?;
     // Stream will be closed automatically when dropped
     event!(Level::INFO, "Sent file/symlink: {:?} -> {:?}", src, dst);
@@ -164,9 +156,7 @@ async fn send_files_in_directory(
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
         let connection = connection.clone();
-        join_set.spawn(async move {
-            send_file_or_symlink(&entry_path, &dst_path, false, connection).await
-        });
+        join_set.spawn(async move { send_file(&entry_path, &dst_path, false, connection).await });
     }
     drop(entries);
     while let Some(res) = join_set.join_next().await {
@@ -220,7 +210,7 @@ async fn dispatch_control_messages(
                     mtime_nsec: src_metadata.mtime_nsec(),
                 };
                 let is_root = completion.src == src_root;
-                let dir_metadata = remote::protocol::FsObject::Directory {
+                let dir_metadata = remote::protocol::FsObjectMessage::Directory {
                     src: completion.src,
                     dst: completion.dst,
                     metadata,
