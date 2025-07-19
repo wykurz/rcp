@@ -73,7 +73,8 @@ pub enum FsObject {
         metadata: Metadata,
         is_root: bool,
     },
-    // Implies files contents will be sent immediately after receiving this object
+    AllDirectoriesComplete,
+    // implies files contents will be sent immediately after receiving this object
     File {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
@@ -88,6 +89,19 @@ pub enum FsObject {
         metadata: Metadata,
         is_root: bool,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SrcDst {
+    pub src: std::path::PathBuf,
+    pub dst: std::path::PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum DestinationMessage {
+    DirectoryCreated(SrcDst),
+    DirectoryComplete(SrcDst),
+    RootDone,
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
@@ -135,27 +149,4 @@ pub enum MasterHello {
 pub struct SourceMasterHello {
     pub source_addr: std::net::SocketAddr,
     pub server_name: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DirectoryCreated {
-    pub src: std::path::PathBuf,
-    pub dst: std::path::PathBuf,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DirectoryComplete {
-    pub src: std::path::PathBuf,
-    pub dst: std::path::PathBuf,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StreamHello {
-    pub stream_type: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum DirectoryMessage {
-    Created(DirectoryCreated),
-    Complete(DirectoryComplete),
 }

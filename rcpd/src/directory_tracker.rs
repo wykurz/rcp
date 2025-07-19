@@ -1,20 +1,17 @@
-use crate::streams::SendStream;
+use crate::streams;
 use tracing::{event, Level};
 
 #[derive(Debug)]
 pub struct DirectoryTracker {
     remaining_dir_entries: std::collections::HashMap<std::path::PathBuf, usize>,
-    // Use Option to allow dropping the stream when done, separately from releasing the tracker
-    dir_created_send_stream: Option<SendStream>,
-    done_creating_directories: bool,
+    control_send_stream: streams::SharedSendStream,
 }
 
 impl DirectoryTracker {
-    pub fn new(dir_created_send_stream: SendStream) -> Self {
+    pub fn new(control_send_stream: streams::SharedSendStream) -> Self {
         Self {
             remaining_dir_entries: std::collections::HashMap::new(),
-            dir_created_send_stream: Some(dir_created_send_stream),
-            done_creating_directories: false,
+            control_send_stream,
         }
     }
 
@@ -34,16 +31,16 @@ impl DirectoryTracker {
                 num_entries
             );
         }
-        let confirmation = remote::protocol::DirectoryCreated {
+        let confirmation = remote::protocol::SrcDst {
             src: src.to_path_buf(),
             dst: dst.to_path_buf(),
         };
-        let message = remote::protocol::DirectoryMessage::Created(confirmation);
-        self.dir_created_send_stream
-            .as_mut()
-            .expect("Send stream should be initialized")
-            .send_object(&message)
-            .await?;
+        let message = remote::protocol::DestinationMessage::DirectoryCreated(confirmation);
+        {
+            let mut stream = self.control_send_stream.lock().await;
+            stream.send_object(&message).await?;
+            stream.flush().await?;
+        }
         event!(
             Level::INFO,
             "Sent directory creation confirmation: {:?} -> {:?}",
@@ -54,9 +51,6 @@ impl DirectoryTracker {
         if num_entries == 0 {
             event!(Level::INFO, "Directory completed: {:?}", dst);
             self.send_completion(src, dst).await?;
-            if self.done_creating_directories && self.remaining_dir_entries.is_empty() {
-                self.finish().await?;
-            }
         }
         Ok(())
     }
@@ -66,16 +60,14 @@ impl DirectoryTracker {
         src: &std::path::Path,
         dst: &std::path::Path,
     ) -> anyhow::Result<()> {
-        let completion = remote::protocol::DirectoryComplete {
+        let completion = remote::protocol::SrcDst {
             src: src.to_path_buf(),
             dst: dst.to_path_buf(),
         };
-        let message = remote::protocol::DirectoryMessage::Complete(completion);
-        self.dir_created_send_stream
-            .as_mut()
-            .expect("Send stream should be initialized")
-            .send_object(&message)
-            .await?;
+        let message = remote::protocol::DestinationMessage::DirectoryComplete(completion);
+        let mut stream = self.control_send_stream.lock().await;
+        stream.send_object(&message).await?;
+        stream.flush().await?;
         event!(
             Level::INFO,
             "Sent directory completion notification: {:?} -> {:?}",
@@ -111,45 +103,15 @@ impl DirectoryTracker {
             event!(Level::INFO, "Directory completed: {:?}", dst_parent_dir);
             self.send_completion(src.parent().unwrap(), dst_parent_dir)
                 .await?;
-            if self.done_creating_directories && self.remaining_dir_entries.is_empty() {
-                self.finish().await?;
-            }
         }
-        Ok(())
-    }
-
-    pub async fn done_creating_directories(&mut self) -> anyhow::Result<()> {
-        event!(Level::INFO, "All directories created");
-        self.done_creating_directories = true;
-        if self.remaining_dir_entries.is_empty() {
-            self.finish().await?;
-        } else {
-            event!(
-                Level::DEBUG,
-                "Not all directories were processed, remaining: {}",
-                self.remaining_dir_entries.len()
-            );
-        }
-        Ok(())
-    }
-
-    async fn finish(&mut self) -> anyhow::Result<()> {
-        event!(Level::INFO, "No more directories to process, finishing");
-        self.dir_created_send_stream
-            .take()
-            .expect("Send stream should be initialized");
-        assert!(
-            self.remaining_dir_entries.is_empty(),
-            "Not all directories were processed before finishing"
-        );
         Ok(())
     }
 }
 
 pub type SharedDirectoryTracker = std::sync::Arc<tokio::sync::Mutex<DirectoryTracker>>;
 
-pub fn make_shared(dir_created_send_stream: SendStream) -> SharedDirectoryTracker {
+pub fn make_shared(control_send_stream: streams::SharedSendStream) -> SharedDirectoryTracker {
     std::sync::Arc::new(tokio::sync::Mutex::new(DirectoryTracker::new(
-        dir_created_send_stream,
+        control_send_stream,
     )))
 }
