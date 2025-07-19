@@ -12,6 +12,7 @@ async fn send_directories_and_symlinks(
     dst: &std::path::Path,
     control_send_stream: &streams::SharedSendStream,
     connection: &streams::Connection,
+    is_root: bool,
 ) -> anyhow::Result<()> {
     event!(Level::INFO, "Sending data from {:?} to {:?}", src, dst);
     let src_metadata = tokio::fs::symlink_metadata(src)
@@ -24,6 +25,7 @@ async fn send_directories_and_symlinks(
             dst: dst.to_path_buf(),
             target: tokio::fs::read_link(src).await?.to_path_buf(),
             metadata: remote::protocol::Metadata::from(&src_metadata),
+            is_root,
         };
         return control_send_stream.lock().await.send_object(&symlink).await;
     }
@@ -66,8 +68,14 @@ async fn send_directories_and_symlinks(
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
-        send_directories_and_symlinks(&entry_path, &dst_path, control_send_stream, connection)
-            .await?;
+        send_directories_and_symlinks(
+            &entry_path,
+            &dst_path,
+            control_send_stream,
+            connection,
+            false,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -85,7 +93,7 @@ async fn send_fs_objects(
         .await
         .with_context(|| format!("failed reading metadata from src: {:?}", &src))?;
     if !src_metadata.is_file() {
-        send_directories_and_symlinks(src, dst, &control_send_stream, &connection).await?;
+        send_directories_and_symlinks(src, dst, &control_send_stream, &connection, true).await?;
     }
     let mut stream = control_send_stream.lock().await;
     stream
