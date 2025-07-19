@@ -9,9 +9,9 @@ use crate::streams;
 async fn send_directories_and_symlinks(
     src: &std::path::Path,
     dst: &std::path::Path,
+    is_root: bool,
     control_send_stream: &streams::SharedSendStream,
     connection: &streams::Connection,
-    is_root: bool,
 ) -> anyhow::Result<()> {
     event!(Level::INFO, "Sending data from {:?} to {:?}", src, dst);
     let src_metadata = tokio::fs::symlink_metadata(src)
@@ -70,9 +70,9 @@ async fn send_directories_and_symlinks(
         send_directories_and_symlinks(
             &entry_path,
             &dst_path,
+            false,
             control_send_stream,
             connection,
-            false,
         )
         .await?;
     }
@@ -92,7 +92,7 @@ async fn send_fs_objects(
         .await
         .with_context(|| format!("failed reading metadata from src: {:?}", &src))?;
     if !src_metadata.is_file() {
-        send_directories_and_symlinks(src, dst, &control_send_stream, &connection, true).await?;
+        send_directories_and_symlinks(src, dst, true, &control_send_stream, &connection).await?;
     }
     let mut stream = control_send_stream.lock().await;
     stream
@@ -139,7 +139,6 @@ async fn send_file(
         .await
         .with_context(|| format!("failed sending file content: {:?}", &src))?;
     file_send_stream.close().await?;
-    // Stream will be closed automatically when dropped
     event!(Level::INFO, "Sent file/symlink: {:?} -> {:?}", src, dst);
     Ok(())
 }
@@ -215,9 +214,13 @@ async fn dispatch_control_messages(
                     metadata,
                     is_root,
                 };
-                let mut stream = control_send_stream.lock().await;
-                stream.send_object(&dir_metadata).await?;
-                stream.flush().await?;
+                event!(Level::DEBUG, "Before sending directory metadata");
+                {
+                    let mut stream = control_send_stream.lock().await;
+                    stream.send_object(&dir_metadata).await?;
+                    stream.flush().await?;
+                }
+                event!(Level::DEBUG, "Sent directory metadata");
             }
             remote::protocol::DestinationMessage::RootDone => {
                 event!(Level::INFO, "Received root completion message");
