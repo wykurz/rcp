@@ -55,7 +55,7 @@ async fn handle_file_stream(
     if file_header.is_root {
         event!(
             Level::INFO,
-            "Root symlink {:?} -> {:?} processed",
+            "Root file {:?} -> {:?} processed",
             file_header.src,
             file_header.dst,
         );
@@ -169,6 +169,7 @@ async fn create_directory_structure(
                 ref dst,
                 ref target,
                 ref metadata,
+                is_root,
             } => {
                 event!(
                     Level::INFO,
@@ -180,6 +181,23 @@ async fn create_directory_structure(
                 tokio::fs::symlink(target, dst).await?;
                 let settings = common::preserve::preserve_all();
                 common::preserve::set_symlink_metadata(&settings, metadata, dst).await?;
+                // TODO: deduplicate
+                if is_root {
+                    event!(
+                        Level::INFO,
+                        "Root symlink {} -> {} processed",
+                        src.display(),
+                        dst.display()
+                    );
+                    send_root_done(control_send_stream).await?;
+                    break;
+                } else {
+                    directory_tracker
+                        .lock()
+                        .await
+                        .decrement_entry(src, dst)
+                        .await?;
+                }
             }
             remote::protocol::FsObjectMessage::DirsAndSymlinksComplete => {
                 event!(Level::INFO, "All directories creation completed");

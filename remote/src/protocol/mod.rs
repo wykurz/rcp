@@ -104,6 +104,7 @@ pub enum FsObjectMessage {
         dst: std::path::PathBuf,
         target: std::path::PathBuf,
         metadata: Metadata,
+        is_root: bool,
     },
 }
 
