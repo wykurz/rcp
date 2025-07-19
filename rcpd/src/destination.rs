@@ -99,10 +99,10 @@ async fn process_incoming_file_streams(
 #[instrument]
 async fn create_directory_structure(
     control_send_stream: streams::SharedSendStream,
-    mut dir_stub_recv_stream: streams::RecvStream,
+    mut control_recv_stream: streams::RecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
-    while let Some(fs_obj) = dir_stub_recv_stream
+    while let Some(fs_obj) = control_recv_stream
         .recv_object::<remote::protocol::FsObjectMessage>()
         .await?
     {
@@ -221,7 +221,7 @@ pub async fn run_destination(
     event!(Level::INFO, "Connected to Source");
     let connection = streams::Connection::new(connection);
     // Always accept the directory streams first (even for single files)
-    let (control_send_stream, dir_stub_recv_stream) = connection.accept_bi().await?;
+    let (control_send_stream, control_recv_stream) = connection.accept_bi().await?;
     event!(Level::INFO, "Received directory creation streams");
     let directory_tracker = directory_tracker::make_shared(control_send_stream.clone());
     let file_handler_task = tokio::spawn(process_incoming_file_streams(
@@ -229,7 +229,7 @@ pub async fn run_destination(
         connection.clone(),
         directory_tracker.clone(),
     ));
-    create_directory_structure(control_send_stream, dir_stub_recv_stream, directory_tracker)
+    create_directory_structure(control_send_stream, control_recv_stream, directory_tracker)
         .await?;
     file_handler_task.await??;
     event!(Level::INFO, "Destination is done");
