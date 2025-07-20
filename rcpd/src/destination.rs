@@ -54,12 +54,7 @@ async fn handle_file_stream(
     let settings = common::preserve::preserve_all();
     common::preserve::set_file_metadata(&settings, &file_header.metadata, &file_header.dst).await?;
     if file_header.is_root {
-        event!(
-            Level::INFO,
-            "Root file {:?} -> {:?} processed",
-            file_header.src,
-            file_header.dst,
-        );
+        event!(Level::INFO, "Root file processed");
         send_root_done(control_send_stream).await?;
     } else {
         directory_tracker
@@ -104,29 +99,26 @@ async fn create_directory_structure(
     mut control_recv_stream: streams::RecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
-    while let Some(fs_obj) = control_recv_stream
+    while let Some(source_message) = control_recv_stream
         .recv_object::<remote::protocol::SourceMessage>()
         .await
         .context("Failed to receive FS object message")?
     {
         // throttle::get_ops_token().await;
-        match fs_obj {
+        event!(
+            Level::DEBUG,
+            "Received source message: {:?}",
+            source_message
+        );
+        let mut directory_tracker = directory_tracker.lock().await;
+        match source_message {
             remote::protocol::SourceMessage::DirStub {
                 ref src,
                 ref dst,
                 num_entries,
             } => {
-                event!(
-                    Level::INFO,
-                    "Received directory stub: {:?} -> {:?} (entries: {})",
-                    src,
-                    dst,
-                    num_entries
-                );
                 tokio::fs::create_dir_all(&dst).await?;
                 directory_tracker
-                    .lock()
-                    .await
                     .add_directory(src, dst, num_entries)
                     .await
                     .context("Failed to add directory to tracker")?;
@@ -137,12 +129,6 @@ async fn create_directory_structure(
                 ref metadata,
                 is_root,
             } => {
-                event!(
-                    Level::INFO,
-                    "Received directory metadata: {:?} -> {:?}",
-                    src,
-                    dst
-                );
                 // apply metadata changes now that directory is complete
                 let settings = common::preserve::preserve_all();
                 common::preserve::set_dir_metadata(&settings, metadata, dst).await?;
@@ -152,18 +138,11 @@ async fn create_directory_structure(
                     dst
                 );
                 if is_root {
-                    event!(
-                        Level::INFO,
-                        "Root directory {} -> {} processed",
-                        src.display(),
-                        dst.display()
-                    );
+                    event!(Level::INFO, "Root directory processed");
                     send_root_done(control_send_stream).await?;
                     break;
                 } else {
                     directory_tracker
-                        .lock()
-                        .await
                         .decrement_entry(src, dst)
                         .await
                         .context("Failed to decrement directory entry count after receiving directory metadata")?;
@@ -176,35 +155,18 @@ async fn create_directory_structure(
                 ref metadata,
                 is_root,
             } => {
-                event!(
-                    Level::INFO,
-                    "Received symlink: {:?} -> {:?} (target: {:?})",
-                    src,
-                    dst,
-                    target
-                );
                 tokio::fs::symlink(target, dst).await?;
                 let settings = common::preserve::preserve_all();
                 common::preserve::set_symlink_metadata(&settings, metadata, dst).await?;
                 // TODO: deduplicate
                 if is_root {
-                    event!(
-                        Level::INFO,
-                        "Root symlink {} -> {} processed",
-                        src.display(),
-                        dst.display()
-                    );
+                    event!(Level::INFO, "Root symlink processed");
                     send_root_done(control_send_stream).await?;
                     break;
                 } else {
-                    directory_tracker
-                        .lock()
-                        .await
-                        .decrement_entry(src, dst)
-                        .await
-                        .context(
-                            "Failed to decrement directory entry count after receiving a symlink",
-                        )?;
+                    directory_tracker.decrement_entry(src, dst).await.context(
+                        "Failed to decrement directory entry count after receiving a symlink",
+                    )?;
                 }
             }
             remote::protocol::SourceMessage::DirStructureComplete => {
