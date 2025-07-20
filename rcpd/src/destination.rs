@@ -1,3 +1,4 @@
+use anyhow::Context;
 use tracing::{event, instrument, Level};
 
 use crate::directory_tracker;
@@ -201,7 +202,6 @@ async fn create_directory_structure(
             }
             remote::protocol::FsObjectMessage::DirsAndSymlinksComplete => {
                 event!(Level::INFO, "All directories creation completed");
-                break;
             }
         }
     }
@@ -229,8 +229,12 @@ pub async fn run_destination(
         connection.clone(),
         directory_tracker.clone(),
     ));
-    create_directory_structure(control_send_stream, control_recv_stream, directory_tracker).await?;
-    file_handler_task.await??;
+    create_directory_structure(control_send_stream, control_recv_stream, directory_tracker)
+        .await
+        .context("Failed to create directory structure")?;
+    file_handler_task
+        .await
+        .context("Failed to process incoming file streams")??;
     event!(Level::INFO, "Destination is done");
     connection.close();
     client.wait_idle().await;
