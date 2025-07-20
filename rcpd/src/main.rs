@@ -68,9 +68,9 @@ struct Args {
 async fn async_main(args: Args) -> anyhow::Result<String> {
     // master_endpoint
     let client = remote::get_client()?;
-    let connection = client.connect(args.master_addr, &args.server_name)?.await?;
+    let master_connection = client.connect(args.master_addr, &args.server_name)?.await?;
     event!(Level::INFO, "Connected to master");
-    let hello_message = connection.read_datagram().await?;
+    let hello_message = master_connection.read_datagram().await?;
     let master_hello = bincode::deserialize::<remote::protocol::MasterHello>(&hello_message)?;
     event!(Level::INFO, "Received side: {:?}", master_hello);
     match master_hello {
@@ -81,7 +81,8 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
             rcpd_config,
         } => {
             event!(Level::INFO, "Starting source");
-            source::run_source(&connection, &src, &dst, &source_config, &rcpd_config).await?;
+            source::run_source(&master_connection, &src, &dst, &source_config, &rcpd_config)
+                .await?;
         }
         remote::protocol::MasterHello::Destination {
             source_addr,
@@ -99,6 +100,8 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
             .await?;
         }
     }
+    master_connection.close(0u32.into(), b"done");
+    client.wait_idle().await;
     Ok("whee".to_string())
 }
 
