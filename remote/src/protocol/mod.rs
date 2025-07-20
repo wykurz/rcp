@@ -86,7 +86,7 @@ pub struct File {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum FsObjectMessage {
+pub enum SourceMessage {
     DirStub {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
@@ -98,6 +98,7 @@ pub enum FsObjectMessage {
         metadata: Metadata,
         is_root: bool,
     },
+    // this message is useful to open the control stream when there are no directories
     DirStructureComplete,
     Symlink {
         src: std::path::PathBuf,

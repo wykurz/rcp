@@ -16,25 +16,30 @@ impl SendStream {
         Ok(Self { framed })
     }
 
-    pub async fn send_object<T: serde::Serialize>(&mut self, obj: &T) -> anyhow::Result<()> {
+    pub async fn send_batch_message<T: serde::Serialize>(&mut self, obj: &T) -> anyhow::Result<()> {
         let bytes = bincode::serialize(obj)?;
         self.framed.send(bytes::Bytes::from(bytes)).await?;
         Ok(())
     }
 
-    pub async fn copy_from<R: tokio::io::AsyncRead + Unpin>(
+    pub async fn send_control_message<T: serde::Serialize>(
         &mut self,
+        obj: &T,
+    ) -> anyhow::Result<()> {
+        self.send_batch_message(obj).await?;
+        self.framed.flush().await?;
+        Ok(())
+    }
+
+    pub async fn send_message_with_data<T: serde::Serialize, R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        obj: &T,
         reader: &mut R,
     ) -> anyhow::Result<u64> {
-        self.framed.flush().await?;
+        self.send_control_message(obj).await?;
         let mut data_stream = self.framed.get_mut();
         let bytes_copied = tokio::io::copy(reader, &mut data_stream).await?;
         Ok(bytes_copied)
-    }
-
-    pub async fn flush(&mut self) -> anyhow::Result<()> {
-        self.framed.flush().await?;
-        Ok(())
     }
 
     pub async fn close(&mut self) -> anyhow::Result<()> {

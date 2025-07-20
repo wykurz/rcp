@@ -7,7 +7,7 @@ use crate::streams;
 async fn send_root_done(control_send_stream: streams::SharedSendStream) -> anyhow::Result<()> {
     let mut stream = control_send_stream.lock().await;
     stream
-        .send_object(&remote::protocol::DestinationMessage::DestinationDone)
+        .send_control_message(&remote::protocol::DestinationMessage::DestinationDone)
         .await?;
     stream.close().await?;
     event!(Level::INFO, "Sent destination done message");
@@ -104,13 +104,13 @@ async fn create_directory_structure(
     directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
     while let Some(fs_obj) = control_recv_stream
-        .recv_object::<remote::protocol::FsObjectMessage>()
+        .recv_object::<remote::protocol::SourceMessage>()
         .await
         .context("Failed to receive FS object message")?
     {
         // throttle::get_ops_token().await;
         match fs_obj {
-            remote::protocol::FsObjectMessage::DirStub {
+            remote::protocol::SourceMessage::DirStub {
                 ref src,
                 ref dst,
                 num_entries,
@@ -129,7 +129,7 @@ async fn create_directory_structure(
                     .add_directory(src, dst, num_entries)
                     .await?;
             }
-            remote::protocol::FsObjectMessage::Directory {
+            remote::protocol::SourceMessage::Directory {
                 ref src,
                 ref dst,
                 ref metadata,
@@ -166,7 +166,7 @@ async fn create_directory_structure(
                         .await?;
                 }
             }
-            remote::protocol::FsObjectMessage::Symlink {
+            remote::protocol::SourceMessage::Symlink {
                 ref src,
                 ref dst,
                 ref target,
@@ -201,10 +201,10 @@ async fn create_directory_structure(
                         .await?;
                 }
             }
-            remote::protocol::FsObjectMessage::DirStructureComplete => {
+            remote::protocol::SourceMessage::DirStructureComplete => {
                 event!(Level::INFO, "All directories creation completed");
             }
-            remote::protocol::FsObjectMessage::SourceDone => {
+            remote::protocol::SourceMessage::SourceDone => {
                 event!(Level::INFO, "Received source done message received");
                 break;
             }

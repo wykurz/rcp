@@ -19,14 +19,18 @@ async fn send_directories_and_symlinks(
         .with_context(|| format!("failed reading metadata from src: {:?}", &src))?;
     if src_metadata.is_symlink() {
         // TODO: handle dereferencing symlinks
-        let symlink = remote::protocol::FsObjectMessage::Symlink {
+        let symlink = remote::protocol::SourceMessage::Symlink {
             src: src.to_path_buf(),
             dst: dst.to_path_buf(),
             target: tokio::fs::read_link(src).await?.to_path_buf(),
             metadata: remote::protocol::Metadata::from(&src_metadata),
             is_root,
         };
-        return control_send_stream.lock().await.send_object(&symlink).await;
+        return control_send_stream
+            .lock()
+            .await
+            .send_batch_message(&symlink)
+            .await;
     }
     if !src_metadata.is_dir() {
         assert!(
@@ -43,7 +47,7 @@ async fn send_directories_and_symlinks(
     while let Some(_entry) = entries.next_entry().await? {
         entry_count += 1;
     }
-    let dir = remote::protocol::FsObjectMessage::DirStub {
+    let dir = remote::protocol::SourceMessage::DirStub {
         src: src.to_path_buf(),
         dst: dst.to_path_buf(),
         num_entries: entry_count,
@@ -55,7 +59,11 @@ async fn send_directories_and_symlinks(
         dst,
         entry_count
     );
-    control_send_stream.lock().await.send_object(&dir).await?;
+    control_send_stream
+        .lock()
+        .await
+        .send_batch_message(&dir)
+        .await?;
     let mut entries = tokio::fs::read_dir(src)
         .await
         .with_context(|| format!("cannot open directory {src:?} for reading"))?;
@@ -96,9 +104,8 @@ async fn send_fs_objects(
     }
     let mut stream = control_send_stream.lock().await;
     stream
-        .send_object(&remote::protocol::FsObjectMessage::DirStructureComplete)
+        .send_control_message(&remote::protocol::SourceMessage::DirStructureComplete)
         .await?;
-    stream.flush().await?;
     if src_metadata.is_file() {
         send_file(src, dst, true, connection).await?;
     }
@@ -129,13 +136,9 @@ async fn send_file(
         is_root,
     };
     let mut file_send_stream = connection.open_uni().await?;
-    file_send_stream
-        .send_object(&file_header)
-        .await
-        .with_context(|| format!("failed sending file metadata: {:?}", &src))?;
     event!(Level::DEBUG, "Sending file content for {:?}", src);
     file_send_stream
-        .copy_from(&mut tokio::fs::File::open(src).await?)
+        .send_message_with_data(&file_header, &mut tokio::fs::File::open(src).await?)
         .await
         .with_context(|| format!("failed sending file content: {:?}", &src))?;
     file_send_stream.close().await?;
@@ -208,7 +211,7 @@ async fn dispatch_control_messages(
                     })?;
                 let metadata = remote::protocol::Metadata::from(&src_metadata);
                 let is_root = completion.src == src_root;
-                let dir_metadata = remote::protocol::FsObjectMessage::Directory {
+                let dir_metadata = remote::protocol::SourceMessage::Directory {
                     src: completion.src,
                     dst: completion.dst,
                     metadata,
@@ -217,8 +220,7 @@ async fn dispatch_control_messages(
                 event!(Level::DEBUG, "Before sending directory metadata");
                 {
                     let mut stream = control_send_stream.lock().await;
-                    stream.send_object(&dir_metadata).await?;
-                    stream.flush().await?;
+                    stream.send_control_message(&dir_metadata).await?;
                 }
                 event!(Level::DEBUG, "Sent directory metadata");
             }
@@ -226,7 +228,7 @@ async fn dispatch_control_messages(
                 event!(Level::INFO, "Received destination done message");
                 let mut stream = control_send_stream.lock().await;
                 stream
-                    .send_object(&remote::protocol::FsObjectMessage::SourceDone)
+                    .send_control_message(&remote::protocol::SourceMessage::SourceDone)
                     .await?;
                 stream.close().await?;
                 event!(Level::INFO, "Sent source done message");
