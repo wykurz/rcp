@@ -55,7 +55,8 @@ pub async fn wait_for_rcpd_process(
         .context("Failed to wait for rcpd server (source) completion")?;
     if !output.status.success() {
         return Err(anyhow!(
-            "rcpd command failed on remote host, stdout:\n{:?}\nstderr:\n{:?}",
+            "rcpd command failed on remote host, status code: {:?}\nstdout:\n{:?}\nstderr:\n{:?}",
+            output.status.code(),
             output.stdout,
             output.stderr,
         ));
