@@ -38,8 +38,7 @@ impl DirectoryTracker {
         let message = remote::protocol::DestinationMessage::DirectoryCreated(confirmation);
         {
             let mut stream = self.control_send_stream.lock().await;
-            stream.send_object(&message).await?;
-            stream.flush().await?;
+            stream.send_control_message(&message).await?;
         }
         event!(
             Level::INFO,
@@ -66,8 +65,7 @@ impl DirectoryTracker {
         };
         let message = remote::protocol::DestinationMessage::DirectoryComplete(completion);
         let mut stream = self.control_send_stream.lock().await;
-        stream.send_object(&message).await?;
-        stream.flush().await?;
+        stream.send_control_message(&message).await?;
         event!(
             Level::INFO,
             "Sent directory completion notification: {:?} -> {:?}",
