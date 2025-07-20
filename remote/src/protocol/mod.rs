@@ -75,6 +75,7 @@ impl From<&std::fs::Metadata> for Metadata {
     }
 }
 
+// implies files contents will be sent immediately after receiving this object
 #[derive(Debug, Serialize, Deserialize)]
 pub struct File {
     pub src: std::path::PathBuf,
@@ -97,8 +98,7 @@ pub enum FsObjectMessage {
         metadata: Metadata,
         is_root: bool,
     },
-    DirsAndSymlinksComplete,
-    // implies files contents will be sent immediately after receiving this object
+    DirStructureComplete,
     Symlink {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
@@ -106,6 +106,7 @@ pub enum FsObjectMessage {
         metadata: Metadata,
         is_root: bool,
     },
+    SourceDone, // must be the last message sent by the source
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -118,7 +119,7 @@ pub struct SrcDst {
 pub enum DestinationMessage {
     DirectoryCreated(SrcDst),
     DirectoryComplete(SrcDst),
-    RootDone,
+    DestinationDone, // must be the last message sent by the destination
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
