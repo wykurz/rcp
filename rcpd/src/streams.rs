@@ -125,4 +125,8 @@ impl Connection {
         let recv_stream = self.inner.accept_uni().await?;
         RecvStream::new(recv_stream).await
     }
+
+    pub fn close(&self) {
+        self.inner.close(0u32.into(), b"done");
+    }
 }

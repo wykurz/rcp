@@ -133,13 +133,13 @@ async fn send_file(
         .send_object(&file_header)
         .await
         .with_context(|| format!("failed sending file metadata: {:?}", &src))?;
-    event!(Level::INFO, "Sending file content for {:?}", src);
+    event!(Level::DEBUG, "Sending file content for {:?}", src);
     file_send_stream
         .copy_from(&mut tokio::fs::File::open(src).await?)
         .await
         .with_context(|| format!("failed sending file content: {:?}", &src))?;
     file_send_stream.close().await?;
-    event!(Level::INFO, "Sent file/symlink: {:?} -> {:?}", src, dst);
+    event!(Level::INFO, "Sent file: {:?} -> {:?}", src, dst);
     Ok(())
 }
 
@@ -285,5 +285,7 @@ pub async fn run_source(
         ));
     }
     event!(Level::INFO, "Source is done",);
+    master_connection.close(0u32.into(), b"done");
+    server_endpoint.wait_idle().await;
     Ok("source OK".to_string())
 }

@@ -229,9 +229,10 @@ pub async fn run_destination(
         connection.clone(),
         directory_tracker.clone(),
     ));
-    create_directory_structure(control_send_stream, control_recv_stream, directory_tracker)
-        .await?;
+    create_directory_structure(control_send_stream, control_recv_stream, directory_tracker).await?;
     file_handler_task.await??;
     event!(Level::INFO, "Destination is done");
+    connection.close();
+    client.wait_idle().await;
     Ok("destination OK".to_string())
 }
