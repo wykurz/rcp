@@ -501,7 +501,7 @@ where
     match &res {
         Ok(summary) => {
             if print_summary || verbose > 0 {
-                println!("{}", &summary);
+                println!("{summary}");
             }
         }
         Err(err) => {
