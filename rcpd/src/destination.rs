@@ -7,10 +7,10 @@ use crate::streams;
 async fn send_root_done(control_send_stream: streams::SharedSendStream) -> anyhow::Result<()> {
     let mut stream = control_send_stream.lock().await;
     stream
-        .send_object(&remote::protocol::DestinationMessage::RootDone)
+        .send_object(&remote::protocol::DestinationMessage::DestinationDone)
         .await?;
-    stream.flush().await?;
-    event!(Level::INFO, "Sent root done message");
+    stream.close().await?;
+    event!(Level::INFO, "Sent destination done message");
     Ok(())
 }
 
@@ -105,7 +105,8 @@ async fn create_directory_structure(
 ) -> anyhow::Result<()> {
     while let Some(fs_obj) = control_recv_stream
         .recv_object::<remote::protocol::FsObjectMessage>()
-        .await?
+        .await
+        .context("Failed to receive FS object message")?
     {
         // throttle::get_ops_token().await;
         match fs_obj {
@@ -200,8 +201,12 @@ async fn create_directory_structure(
                         .await?;
                 }
             }
-            remote::protocol::FsObjectMessage::DirsAndSymlinksComplete => {
+            remote::protocol::FsObjectMessage::DirStructureComplete => {
                 event!(Level::INFO, "All directories creation completed");
+            }
+            remote::protocol::FsObjectMessage::SourceDone => {
+                event!(Level::INFO, "Received source done message received");
+                break;
             }
         }
     }

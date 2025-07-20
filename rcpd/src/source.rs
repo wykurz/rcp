@@ -96,7 +96,7 @@ async fn send_fs_objects(
     }
     let mut stream = control_send_stream.lock().await;
     stream
-        .send_object(&remote::protocol::FsObjectMessage::DirsAndSymlinksComplete)
+        .send_object(&remote::protocol::FsObjectMessage::DirStructureComplete)
         .await?;
     stream.flush().await?;
     if src_metadata.is_file() {
@@ -222,8 +222,14 @@ async fn dispatch_control_messages(
                 }
                 event!(Level::DEBUG, "Sent directory metadata");
             }
-            remote::protocol::DestinationMessage::RootDone => {
-                event!(Level::INFO, "Received root completion message");
+            remote::protocol::DestinationMessage::DestinationDone => {
+                event!(Level::INFO, "Received destination done message");
+                let mut stream = control_send_stream.lock().await;
+                stream
+                    .send_object(&remote::protocol::FsObjectMessage::SourceDone)
+                    .await?;
+                stream.close().await?;
+                event!(Level::INFO, "Sent source done message");
                 break;
             }
         }
