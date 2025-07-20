@@ -55,7 +55,6 @@ fn test_remote_copy_localhost_to_local() {
 }
 
 #[test]
-#[ignore = "functionality not working yet"]
 fn test_remote_copy_local_to_localhost() {
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("local_source.txt");

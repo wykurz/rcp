@@ -66,7 +66,8 @@ async fn handle_file_stream(
             .lock()
             .await
             .decrement_entry(&file_header.src, &file_header.dst)
-            .await?;
+            .await
+            .context("Failed to decrement directory entry count after receiving a file")?;
     }
     Ok(())
 }
@@ -127,7 +128,8 @@ async fn create_directory_structure(
                     .lock()
                     .await
                     .add_directory(src, dst, num_entries)
-                    .await?;
+                    .await
+                    .context("Failed to add directory to tracker")?;
             }
             remote::protocol::SourceMessage::Directory {
                 ref src,
@@ -163,7 +165,8 @@ async fn create_directory_structure(
                         .lock()
                         .await
                         .decrement_entry(src, dst)
-                        .await?;
+                        .await
+                        .context("Failed to decrement directory entry count after receiving directory metadata")?;
                 }
             }
             remote::protocol::SourceMessage::Symlink {
@@ -198,7 +201,10 @@ async fn create_directory_structure(
                         .lock()
                         .await
                         .decrement_entry(src, dst)
-                        .await?;
+                        .await
+                        .context(
+                            "Failed to decrement directory entry count after receiving a symlink",
+                        )?;
                 }
             }
             remote::protocol::SourceMessage::DirStructureComplete => {

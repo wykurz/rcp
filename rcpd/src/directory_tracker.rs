@@ -1,4 +1,5 @@
 use crate::streams;
+use anyhow::Context;
 use tracing::{event, Level};
 
 #[derive(Debug)]
@@ -46,7 +47,7 @@ impl DirectoryTracker {
             src,
             dst
         );
-        // If there are no entries, we can immediately send completion
+        // if there are no entries, we can immediately send completion
         if num_entries == 0 {
             event!(Level::INFO, "Directory completed: {:?}", dst);
             self.send_completion(src, dst).await?;
@@ -65,7 +66,10 @@ impl DirectoryTracker {
         };
         let message = remote::protocol::DestinationMessage::DirectoryComplete(completion);
         let mut stream = self.control_send_stream.lock().await;
-        stream.send_control_message(&message).await?;
+        stream
+            .send_control_message(&message)
+            .await
+            .context("Failed to send directory completion notification")?;
         event!(
             Level::INFO,
             "Sent directory completion notification: {:?} -> {:?}",
