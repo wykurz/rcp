@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
-use tracing::{event, instrument, Level};
+use tracing::instrument;
 
 pub trait Metadata {
     fn uid(&self) -> u32;
@@ -117,7 +117,7 @@ async fn set_owner_and_time<Meta: Metadata + std::fmt::Debug>(
     tokio::task::spawn_blocking(move || -> Result<()> {
         if settings.uid || settings.gid {
             // set user and group
-            event!(Level::DEBUG, "setting uid ang gid");
+            tracing::debug!("setting uid ang gid");
             let uid_val = if settings.uid { Some(uid.into()) } else { None };
             let gid_val = if settings.gid { Some(gid.into()) } else { None };
             nix::unistd::fchownat(
@@ -136,7 +136,7 @@ async fn set_owner_and_time<Meta: Metadata + std::fmt::Debug>(
         }
         // set timestamps last - modifying other file metadata can change them
         if settings.time {
-            event!(Level::DEBUG, "setting timestamps");
+            tracing::debug!("setting timestamps");
             let atime_spec = nix::sys::time::TimeSpec::new(atime, atime_nsec);
             let mtime_spec = nix::sys::time::TimeSpec::new(mtime, mtime_nsec);
             nix::sys::stat::utimensat(

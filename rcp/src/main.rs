@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use common::ProgressType;
 use structopt::StructOpt;
-use tracing::{event, instrument, Level};
+use tracing::instrument;
 
 mod path;
 
@@ -133,7 +133,7 @@ async fn run_rcpd_master(
     src: &path::RemotePath,
     dst: &path::RemotePath,
 ) -> Result<common::copy::Summary> {
-    event!(Level::DEBUG, "running rcpd src/dst");
+    tracing::debug!("running rcpd src/dst");
     // open a port and wait from server & client hello, respond to client with server port
     let server_endpoint = remote::get_server()?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
@@ -143,17 +143,14 @@ async fn run_rcpd_master(
         let rcpd = remote::start_rcpd(src.session(), &server_addr, &server_name).await?;
         rcpds.push(rcpd);
     }
-    event!(
-        Level::INFO,
-        "Waiting for connections from rcpd processes..."
-    );
+    tracing::info!("Waiting for connections from rcpd processes...");
     // accept connection from source
     let source_connecting = match server_endpoint.accept().await {
         Some(conn) => conn,
         None => return Err(anyhow!("Server endpoint closed before source connected")),
     };
     let source_connection = source_connecting.await?;
-    event!(Level::INFO, "Source rcpd connected");
+    tracing::info!("Source rcpd connected");
     let rcpd_config = remote::protocol::RcpdConfig {
         fail_early: args.fail_early,
         max_workers: args.max_workers,
@@ -187,8 +184,8 @@ async fn run_rcpd_master(
         }
     };
     let dest_connection = dest_connecting.await?;
-    event!(Level::INFO, "Destination rcpd connected");
-    event!(Level::INFO, "Source rcpd connected");
+    tracing::info!("Destination rcpd connected");
+    tracing::info!("Source rcpd connected");
     dest_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
         &remote::protocol::MasterHello::Destination {
             source_addr: source_hello.source_addr,
@@ -202,16 +199,9 @@ async fn run_rcpd_master(
             rcpd_config,
         },
     )?))?;
-    event!(
-        Level::INFO,
-        "Forwarded source connection info to destination"
-    );
+    tracing::info!("Forwarded source connection info to destination");
     for rcpd in rcpds {
-        event!(
-            Level::INFO,
-            "Waiting for rcpd process to finish: {:?}",
-            rcpd
-        );
+        tracing::info!("Waiting for rcpd process to finish: {:?}", rcpd);
         remote::wait_for_rcpd_process(rcpd).await?;
     }
     Ok(common::copy::Summary::default())
@@ -312,12 +302,9 @@ async fn async_main(args: Args) -> Result<common::copy::Summary> {
             .map_err(|err| common::copy::Error::new(err, Default::default()))?,
         chunk_size: args.chunk_size.0,
     };
-    event!(Level::DEBUG, "copy settings: {:?}", &settings);
+    tracing::debug!("copy settings: {:?}", &settings);
     if args.preserve_settings.is_some() && args.preserve {
-        event!(
-            Level::WARN,
-            "The --preserve flag is ignored when --preserve-settings is specified!"
-        );
+        tracing::warn!("The --preserve flag is ignored when --preserve-settings is specified!");
     }
     let preserve = if let Some(preserve_settings) = args.preserve_settings {
         common::parse_preserve_settings(&preserve_settings)
@@ -327,7 +314,7 @@ async fn async_main(args: Args) -> Result<common::copy::Summary> {
     } else {
         common::preserve::preserve_default()
     };
-    event!(Level::DEBUG, "preserve settings: {:?}", &preserve);
+    tracing::debug!("preserve settings: {:?}", &preserve);
     let mut join_set = tokio::task::JoinSet::new();
     for (src_path, dst_path) in src_dst {
         let do_copy =
@@ -341,7 +328,7 @@ async fn async_main(args: Args) -> Result<common::copy::Summary> {
             Ok(result) => match result {
                 Ok(summary) => copy_summary = copy_summary + summary,
                 Err(error) => {
-                    event!(Level::ERROR, "{:?}", &error);
+                    tracing::error!("{:?}", &error);
                     copy_summary = copy_summary + error.summary;
                     if args.fail_early {
                         if args.summary {

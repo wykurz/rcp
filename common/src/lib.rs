@@ -6,7 +6,7 @@ use anyhow::anyhow;
 use anyhow::Context;
 use std::fmt;
 use std::io::IsTerminal;
-use tracing::{event, instrument, Level};
+use tracing::instrument;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::prelude::*;
 
@@ -427,10 +427,7 @@ where
         builder.max_blocking_threads(max_blocking_threads);
     }
     if !sysinfo::set_open_files_limit(isize::MAX) {
-        event!(
-            Level::INFO,
-            "Failed to update the open files limit (expected on non-linux targets)"
-        );
+        tracing::info!("Failed to update the open files limit (expected on non-linux targets)");
     }
     let set_max_open_files = max_open_files.unwrap_or_else(|| {
         let limit = get_max_open_files().expect(
@@ -439,14 +436,10 @@ where
         80 * limit / 100 // ~80% of the max open files limit
     });
     if set_max_open_files > 0 {
-        event!(
-            Level::INFO,
-            "Setting max open files to: {}",
-            set_max_open_files
-        );
+        tracing::info!("Setting max open files to: {}", set_max_open_files);
         throttle::set_max_open_files(set_max_open_files);
     } else {
-        event!(Level::INFO, "Not applying any limit to max open files!",);
+        tracing::info!("Not applying any limit to max open files!");
     }
     let runtime = builder.build().expect("Failed to create runtime");
     fn get_replenish_interval(replenish: usize) -> (usize, std::time::Duration) {
@@ -465,25 +458,20 @@ where
     }
     if iops_throttle > 0 {
         if chunk_size == 0 {
-            event!(
-                Level::ERROR,
-                "Chunk size must be specified when using --iops-throttle"
-            );
+            tracing::error!("Chunk size must be specified when using --iops-throttle");
             return None;
         }
         let (replenish, interval) = get_replenish_interval(iops_throttle);
         throttle::init_iops_tokens(replenish);
         runtime.spawn(throttle::run_iops_replenish_thread(replenish, interval));
     } else if chunk_size > 0 {
-        event!(
-            Level::ERROR,
+        tracing::error!(
             "--chunk-size > 0 but --iops-throttle is 0 -- did you intend to use --iops-throttle?"
         );
         return None;
     }
     if tput_throttle > 0 {
-        event!(
-            Level::ERROR,
+        tracing::error!(
             "Throughput throttling is not supported yet, please use --iops-throttle instead"
         );
         return None;

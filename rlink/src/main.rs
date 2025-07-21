@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use common::ProgressType;
 use structopt::StructOpt;
-use tracing::{event, Level};
+// No tracing imports needed anymore
 
 #[derive(StructOpt, Debug, Clone)]
 #[structopt(
@@ -166,7 +166,7 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
     match result {
         Ok(summary) => Ok(summary),
         Err(error) => {
-            event!(Level::ERROR, "{:?}", &error);
+            tracing::error!("{:?}", &error);
             if args.summary {
                 return Err(anyhow!("rlink encountered errors\n\n{}", &error.summary));
             }
