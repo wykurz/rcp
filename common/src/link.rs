@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context};
 use async_recursion::async_recursion;
 use std::os::linux::fs::MetadataExt as LinuxMetadataExt;
-use tracing::{event, instrument, Level};
+use tracing::instrument;
 
 use crate::copy;
 use crate::copy::{Settings as CopySettings, Summary as CopySummary};
@@ -80,26 +80,20 @@ async fn hard_link_helper(
     let mut link_summary = Summary::default();
     if let Err(error) = tokio::fs::hard_link(src, dst).await {
         if settings.copy_settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
-            event!(
-                Level::DEBUG,
-                "'dst' already exists, check if we need to update"
-            );
+            tracing::debug!("'dst' already exists, check if we need to update");
             let dst_metadata = tokio::fs::symlink_metadata(dst)
                 .await
                 .with_context(|| format!("cannot read {dst:?} metadata"))
                 .map_err(|err| Error::new(err, Default::default()))?;
             if is_hard_link(src_metadata, &dst_metadata) {
-                event!(Level::DEBUG, "no change, leaving file as is");
+                tracing::debug!("no change, leaving file as is");
                 prog_track.hard_links_unchanged.inc();
                 return Ok(Summary {
                     hard_links_unchanged: 1,
                     ..Default::default()
                 });
             }
-            event!(
-                Level::INFO,
-                "'dst' file type changed, removing and hard-linking"
-            );
+            tracing::info!("'dst' file type changed, removing and hard-linking");
             let rm_summary = rm::rm(
                 prog_track,
                 dst,
@@ -137,14 +131,14 @@ pub async fn link(
 ) -> Result<Summary, Error> {
     throttle::get_ops_token().await;
     let _prog_guard = prog_track.ops.guard();
-    event!(Level::DEBUG, "reading source metadata");
+    tracing::debug!("reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))
         .map_err(|err| Error::new(err, Default::default()))?;
     let update_metadata_opt = match update {
         Some(update) => {
-            event!(Level::DEBUG, "reading 'update' metadata");
+            tracing::debug!("reading 'update' metadata");
             let update_metadata_res = tokio::fs::symlink_metadata(update).await;
             match update_metadata_res {
                 Ok(update_metadata) => Some(update_metadata),
@@ -170,8 +164,7 @@ pub async fn link(
         let update = update.as_ref().unwrap();
         if !copy::is_file_type_same(&src_metadata, update_metadata) {
             // file type changed, just copy the updated one
-            event!(
-                Level::DEBUG,
+            tracing::debug!(
                 "link: file type of {:?} ({:?}) and {:?} ({:?}) differs - copying from update",
                 src,
                 src_metadata.file_type(),
@@ -204,11 +197,10 @@ pub async fn link(
         if update_metadata.is_file() {
             // check if the file is unchanged and if so hard-link, otherwise copy from the updated one
             if filecmp::metadata_equal(&settings.update_compare, &src_metadata, update_metadata) {
-                event!(Level::DEBUG, "no change, hard link 'src'");
+                tracing::debug!("no change, hard link 'src'");
                 return hard_link_helper(prog_track, src, &src_metadata, dst, settings).await;
             } else {
-                event!(
-                    Level::DEBUG,
+                tracing::debug!(
                     "link: {:?} metadata has changed, copying from {:?}",
                     src,
                     update
@@ -236,7 +228,7 @@ pub async fn link(
             }
         }
         if update_metadata.is_symlink() {
-            event!(Level::DEBUG, "'update' is a symlink so just symlink that");
+            tracing::debug!("'update' is a symlink so just symlink that");
             // use "copy" function to handle the overwrite logic
             let copy_summary = copy::copy(
                 prog_track,
@@ -263,12 +255,12 @@ pub async fn link(
         }
     } else {
         // update hasn't been specified, if this is a file just hard-link the source or symlink if it's a symlink
-        event!(Level::DEBUG, "no 'update' specified");
+        tracing::debug!("no 'update' specified");
         if src_metadata.is_file() {
             return hard_link_helper(prog_track, src, &src_metadata, dst, settings).await;
         }
         if src_metadata.is_symlink() {
-            event!(Level::DEBUG, "'src' is a symlink so just symlink that");
+            tracing::debug!("'src' is a symlink so just symlink that");
             // use "copy" function to handle the overwrite logic
             let copy_summary = copy::copy(
                 prog_track,
@@ -306,7 +298,7 @@ pub async fn link(
         ));
     }
     assert!(update_metadata_opt.is_none() || update_metadata_opt.as_ref().unwrap().is_dir());
-    event!(Level::DEBUG, "process contents of 'src' directory");
+    tracing::debug!("process contents of 'src' directory");
     let mut src_entries = tokio::fs::read_dir(src)
         .await
         .with_context(|| format!("cannot open directory {src:?} for reading"))
@@ -325,16 +317,13 @@ pub async fn link(
                     .with_context(|| format!("failed reading metadata from {:?}", &dst))
                     .map_err(|err| Error::new(err, Default::default()))?;
                 if dst_metadata.is_dir() {
-                    event!(Level::DEBUG, "'dst' is a directory, leaving it as is");
+                    tracing::debug!("'dst' is a directory, leaving it as is");
                     CopySummary {
                         directories_unchanged: 1,
                         ..Default::default()
                     }
                 } else {
-                    event!(
-                        Level::INFO,
-                        "'dst' is not a directory, removing and creating a new one"
-                    );
+                    tracing::info!("'dst' is not a directory, removing and creating a new one");
                     let mut copy_summary = CopySummary::default();
                     let rm_summary = rm::rm(
                         prog_track,
@@ -432,7 +421,7 @@ pub async fn link(
     // only process update if the path was provided and the directory is present
     if update_metadata_opt.is_some() {
         let update = update.as_ref().unwrap();
-        event!(Level::DEBUG, "process contents of 'update' directory");
+        tracing::debug!("process contents of 'update' directory");
         let mut update_entries = tokio::fs::read_dir(update)
             .await
             .with_context(|| format!("cannot open directory {:?} for reading", &update))
@@ -451,7 +440,7 @@ pub async fn link(
                 // we already must have considered this file, skip it
                 continue;
             }
-            event!(Level::DEBUG, "found a new entry in the 'update' directory");
+            tracing::debug!("found a new entry in the 'update' directory");
             let dst_path = dst.join(entry_name);
             let update_path = update.join(entry_name);
             let settings = *settings;
@@ -486,8 +475,7 @@ pub async fn link(
             Ok(result) => match result {
                 Ok(summary) => link_summary = link_summary + summary,
                 Err(error) => {
-                    event!(
-                        Level::ERROR,
+                    tracing::error!(
                         "link: {:?} {:?} -> {:?} failed with: {}",
                         src,
                         update,
@@ -513,7 +501,7 @@ pub async fn link(
             link_summary,
         ))?;
     }
-    event!(Level::DEBUG, "set 'dst' directory metadata");
+    tracing::debug!("set 'dst' directory metadata");
     let preserve_metadata = if let Some(update_metadata) = update_metadata_opt.as_ref() {
         update_metadata
     } else {
@@ -1041,7 +1029,7 @@ mod link_tests {
         {
             Ok(_) => panic!("Expected the link to error!"),
             Err(error) => {
-                event!(Level::INFO, "{}", &error);
+                tracing::info!("{}", &error);
                 assert_eq!(error.summary.hard_links_created, 3);
                 assert_eq!(error.summary.copy_summary.files_copied, 0);
                 assert_eq!(error.summary.copy_summary.symlinks_created, 0);

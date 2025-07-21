@@ -1,4 +1,4 @@
-use tracing::{event, instrument, Level};
+use tracing::instrument;
 
 #[derive(Debug)]
 pub struct TlsCounter {
@@ -87,8 +87,7 @@ impl ProgressCounter {
             finished: self.finished.get(),
         };
         if status.finished > status.started {
-            event!(
-                Level::DEBUG,
+            tracing::debug!(
                 "Progress inversion - started: {}, finished {}",
                 status.started,
                 status.finished

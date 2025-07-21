@@ -2,7 +2,7 @@ use std::os::unix::fs::MetadataExt;
 
 use anyhow::{anyhow, Context};
 use async_recursion::async_recursion;
-use tracing::{event, instrument, Level};
+use tracing::instrument;
 
 use crate::filecmp;
 use crate::preserve;
@@ -52,10 +52,7 @@ pub async fn copy_file(
     is_fresh: bool,
 ) -> Result<Summary, Error> {
     let _open_file_guard = throttle::open_file_permit().await;
-    event!(
-        Level::DEBUG,
-        "opening 'src' for reading and 'dst' for writing"
-    );
+    tracing::debug!("opening 'src' for reading and 'dst' for writing");
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))
@@ -63,8 +60,7 @@ pub async fn copy_file(
     if settings.chunk_size > 0 {
         let tokens = 1 + (std::cmp::max(1, src_metadata.size()) - 1) / settings.chunk_size;
         if tokens > u32::MAX as u64 {
-            event!(
-                Level::ERROR,
+            tracing::error!(
                 "chunk size: {} is too small to limit throughput for files this big, file: {:?}, size: {}",
                 settings.chunk_size, &src, src_metadata.size(),
             );
@@ -75,7 +71,7 @@ pub async fn copy_file(
     let mut rm_summary = RmSummary::default();
     if !is_fresh && dst.exists() {
         if settings.overwrite {
-            event!(Level::DEBUG, "file exists, check if it's identical");
+            tracing::debug!("file exists, check if it's identical");
             let dst_metadata = tokio::fs::symlink_metadata(dst)
                 .await
                 .with_context(|| format!("failed reading metadata from {:?}", &dst))
@@ -87,14 +83,14 @@ pub async fn copy_file(
                     &dst_metadata,
                 )
             {
-                event!(Level::DEBUG, "file is identical, skipping");
+                tracing::debug!("file is identical, skipping");
                 prog_track.files_unchanged.inc();
                 return Ok(Summary {
                     files_unchanged: 1,
                     ..Default::default()
                 });
             }
-            event!(Level::INFO, "file is different, removing existing file");
+            tracing::info!("file is different, removing existing file");
             // note tokio::fs::overwrite cannot handle this path being e.g. a directory
             rm_summary = rm::rm(
                 prog_track,
@@ -122,7 +118,7 @@ pub async fn copy_file(
             ));
         }
     }
-    event!(Level::DEBUG, "copying data");
+    tracing::debug!("copying data");
     let mut copy_summary = Summary {
         rm_summary,
         ..Default::default()
@@ -133,7 +129,7 @@ pub async fn copy_file(
         .map_err(|err| Error::new(err, copy_summary))?;
     prog_track.files_copied.inc();
     prog_track.bytes_copied.add(src_metadata.len());
-    event!(Level::DEBUG, "setting permissions");
+    tracing::debug!("setting permissions");
     preserve::set_file_metadata(preserve, &src_metadata, dst)
         .await
         .map_err(|err| Error::new(err, copy_summary))?;
@@ -208,7 +204,7 @@ pub async fn copy(
 ) -> Result<Summary, Error> {
     throttle::get_ops_token().await;
     let _ops_guard = prog_track.ops.guard();
-    event!(Level::DEBUG, "reading source metadata");
+    tracing::debug!("reading source metadata");
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from src: {:?}", &src))
@@ -259,8 +255,7 @@ pub async fn copy(
                         .with_context(|| format!("failed reading dst symlink: {:?}", &dst))
                         .map_err(|err| Error::new(err, Default::default()))?;
                     if link == dst_link {
-                        event!(
-                            Level::DEBUG,
+                        tracing::debug!(
                             "'dst' is a symlink and points to the same location as 'src'"
                         );
                         if preserve.symlink.any() {
@@ -276,7 +271,7 @@ pub async fn copy(
                                 &src_metadata,
                                 &dst_metadata,
                             ) {
-                                event!(Level::DEBUG, "'dst' metadata is different, updating");
+                                tracing::debug!("'dst' metadata is different, updating");
                                 preserve::set_symlink_metadata(preserve, &src_metadata, dst)
                                     .await
                                     .map_err(|err| Error::new(err, Default::default()))?;
@@ -292,19 +287,16 @@ pub async fn copy(
                                 });
                             }
                         }
-                        event!(Level::DEBUG, "symlink already exists, skipping");
+                        tracing::debug!("symlink already exists, skipping");
                         prog_track.symlinks_unchanged.inc();
                         return Ok(Summary {
                             symlinks_unchanged: 1,
                             ..Default::default()
                         });
                     }
-                    event!(
-                        Level::DEBUG,
-                        "'dst' is a symlink but points to a different path, updating"
-                    );
+                    tracing::debug!("'dst' is a symlink but points to a different path, updating");
                 } else {
-                    event!(Level::INFO, "'dst' is not a symlink, updating");
+                    tracing::info!("'dst' is not a symlink, updating");
                 }
                 rm_summary = rm::rm(
                     prog_track,
@@ -366,7 +358,7 @@ pub async fn copy(
             Default::default(),
         ));
     }
-    event!(Level::DEBUG, "process contents of 'src' directory");
+    tracing::debug!("process contents of 'src' directory");
     let mut entries = tokio::fs::read_dir(src)
         .await
         .with_context(|| format!("cannot open directory {src:?} for reading"))
@@ -384,17 +376,14 @@ pub async fn copy(
                     .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))
                     .map_err(|err| Error::new(err, Default::default()))?;
                 if dst_metadata.is_dir() {
-                    event!(Level::DEBUG, "'dst' is a directory, leaving it as is");
+                    tracing::debug!("'dst' is a directory, leaving it as is");
                     prog_track.directories_unchanged.inc();
                     Summary {
                         directories_unchanged: 1,
                         ..Default::default()
                     }
                 } else {
-                    event!(
-                        Level::INFO,
-                        "'dst' is not a directory, removing and creating a new one"
-                    );
+                    tracing::info!("'dst' is not a directory, removing and creating a new one");
                     let rm_summary = rm::rm(
                         prog_track,
                         dst,
@@ -431,7 +420,7 @@ pub async fn copy(
                     }
                 }
             } else {
-                event!(Level::ERROR, "{:?}", &error);
+                tracing::error!("{:?}", &error);
                 return Err(Error::new(
                     anyhow!("cannot create directory {:?}", dst),
                     Default::default(),
@@ -483,13 +472,7 @@ pub async fn copy(
             Ok(result) => match result {
                 Ok(summary) => copy_summary = copy_summary + summary,
                 Err(error) => {
-                    event!(
-                        Level::ERROR,
-                        "copy: {:?} -> {:?} failed with: {}",
-                        src,
-                        dst,
-                        &error
-                    );
+                    tracing::error!("copy: {:?} -> {:?} failed with: {}", src, dst, &error);
                     copy_summary = copy_summary + error.summary;
                     if settings.fail_early {
                         return Err(Error::new(error.source, copy_summary));
@@ -510,7 +493,7 @@ pub async fn copy(
             copy_summary,
         ))?;
     }
-    event!(Level::DEBUG, "set 'dst' directory metadata");
+    tracing::debug!("set 'dst' directory metadata");
     preserve::set_dir_metadata(preserve, &src_metadata, dst)
         .await
         .map_err(|err| Error::new(err, copy_summary))?;
@@ -605,7 +588,7 @@ mod copy_tests {
         {
             Ok(_) => panic!("Expected the copy to error!"),
             Err(error) => {
-                event!(Level::INFO, "{}", &error);
+                tracing::info!("{}", &error);
                 // foo
                 // |- 0.txt  // <- no read permission
                 // |- bar
@@ -1323,7 +1306,7 @@ mod copy_tests {
         {
             Ok(_) => panic!("Expected the copy to error!"),
             Err(error) => {
-                event!(Level::INFO, "{}", &error);
+                tracing::info!("{}", &error);
                 assert_eq!(error.summary.files_copied, 1);
                 assert_eq!(error.summary.symlinks_created, 2);
                 assert_eq!(error.summary.directories_created, 0);

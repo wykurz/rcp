@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use async_recursion::async_recursion;
 use enum_map::{Enum, EnumMap};
 use tokio::io::AsyncWriteExt;
-use tracing::{event, instrument, Level};
+use tracing::instrument;
 
 use crate::copy::is_file_type_same;
 use crate::filecmp;
@@ -141,7 +141,7 @@ pub async fn cmp(
 ) -> Result<Summary> {
     throttle::get_ops_token().await;
     let _prog_guard = prog_track.ops.guard();
-    event!(Level::DEBUG, "reading source metadata");
+    tracing::debug!("reading source metadata");
     // it is impossible for src not exist other than user passing invalid path (which is an error)
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
@@ -196,7 +196,7 @@ pub async fn cmp(
         // nothing more to do
         return Ok(cmp_summary);
     }
-    event!(Level::DEBUG, "process contents of 'src' directory");
+    tracing::debug!("process contents of 'src' directory");
     let mut src_entries = tokio::fs::read_dir(src)
         .await
         .with_context(|| format!("cannot open directory {src:?} for reading"))?;
@@ -223,7 +223,7 @@ pub async fn cmp(
     // unfortunately ReadDir is opening file-descriptors and there's not a good way to limit this,
     // one thing we CAN do however is to drop it as soon as we're done with it
     drop(src_entries);
-    event!(Level::DEBUG, "process contents of 'dst' directory");
+    tracing::debug!("process contents of 'dst' directory");
     let mut dst_entries = tokio::fs::read_dir(dst)
         .await
         .with_context(|| format!("cannot open directory {:?} for reading", &dst))?;
@@ -239,7 +239,7 @@ pub async fn cmp(
             // we already must have considered this file, skip it
             continue;
         }
-        event!(Level::DEBUG, "found a new entry in the 'dst' directory");
+        tracing::debug!("found a new entry in the 'dst' directory");
         let dst_path = dst.join(entry_name);
         let dst_entry_metadata = tokio::fs::symlink_metadata(&dst_path)
             .await
@@ -262,13 +262,7 @@ pub async fn cmp(
         match res? {
             Ok(summary) => cmp_summary = cmp_summary + summary,
             Err(error) => {
-                event!(
-                    Level::ERROR,
-                    "cmp: {:?} vs {:?} failed with: {}",
-                    src,
-                    dst,
-                    &error
-                );
+                tracing::error!("cmp: {:?} vs {:?} failed with: {}", src, dst, &error);
                 if settings.fail_early {
                     return Err(error);
                 }

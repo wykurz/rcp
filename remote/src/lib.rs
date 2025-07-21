@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context};
 use rand::Rng;
-use tracing::{event, instrument, Level};
+use tracing::instrument;
 
 pub mod protocol;
 
@@ -31,11 +31,7 @@ async fn setup_ssh_session(
         (Some(user), None) => format!("ssh://{user}@{host}"),
         (None, None) => format!("ssh://{host}"),
     };
-    event!(
-        Level::DEBUG,
-        "Connecting to SSH destination: {}",
-        destination
-    );
+    tracing::debug!("Connecting to SSH destination: {}", destination);
     let session = std::sync::Arc::new(
         openssh::Session::connect(destination, openssh::KnownHosts::Accept)
             .await
@@ -48,7 +44,7 @@ async fn setup_ssh_session(
 pub async fn wait_for_rcpd_process(
     process: openssh::Child<std::sync::Arc<openssh::Session>>,
 ) -> anyhow::Result<()> {
-    event!(Level::INFO, "Waiting on rcpd server on: {:?}", process);
+    tracing::info!("Waiting on rcpd server on: {:?}", process);
     let output = process
         .wait_with_output()
         .await
@@ -70,14 +66,14 @@ pub async fn start_rcpd(
     master_addr: &std::net::SocketAddr,
     master_server_name: &str,
 ) -> anyhow::Result<openssh::Child<std::sync::Arc<openssh::Session>>> {
-    event!(Level::INFO, "Starting rcpd server on: {:?}", session);
+    tracing::info!("Starting rcpd server on: {:?}", session);
     let session = setup_ssh_session(session).await?;
     // Run rcpd command remotely
     let current_exe = std::env::current_exe().context("Failed to get current executable path")?;
     let bin_dir = current_exe
         .parent()
         .context("Failed to get parent directory of current executable")?;
-    event!(Level::DEBUG, "Running rcpd from: {:?}", bin_dir,);
+    tracing::debug!("Running rcpd from: {:?}", bin_dir,);
     // TODO: if that doesn't work, try an alternative path
     let mut cmd = session.arc_command(format!("{}/rcpd", bin_dir.display()));
     cmd.arg("--master-addr")
@@ -91,7 +87,7 @@ pub async fn start_rcpd(
 }
 
 fn configure_server() -> anyhow::Result<quinn::ServerConfig> {
-    event!(Level::INFO, "Configuring QUIC server");
+    tracing::info!("Configuring QUIC server");
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let key_der = cert.serialize_private_key_der();
     let cert_der = cert.serialize_der()?;

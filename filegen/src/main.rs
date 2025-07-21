@@ -4,7 +4,7 @@ use common::ProgressType;
 use rand::Rng;
 use structopt::StructOpt;
 use tokio::io::AsyncWriteExt;
-use tracing::{event, instrument, Level};
+use tracing::instrument;
 
 #[derive(Clone, Debug)]
 struct Dirwidth {
@@ -137,8 +137,7 @@ async fn write_file(
     if chunk_size > 0 {
         let tokens = 1 + (std::cmp::max(1, filesize) - 1) as u64 / chunk_size;
         if tokens > u32::MAX as u64 {
-            event!(
-                Level::ERROR,
+            tracing::error!(
                 "chunk size: {} is too small to limit throughput for files this size: {}",
                 chunk_size,
                 filesize,

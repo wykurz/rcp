@@ -1,5 +1,5 @@
 use structopt::StructOpt;
-use tracing::{event, instrument, Level};
+use tracing::instrument;
 
 mod destination;
 mod directory_tracker;
@@ -69,10 +69,10 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
     // master_endpoint
     let client = remote::get_client()?;
     let master_connection = client.connect(args.master_addr, &args.server_name)?.await?;
-    event!(Level::INFO, "Connected to master");
+    tracing::info!("Connected to master");
     let hello_message = master_connection.read_datagram().await?;
     let master_hello = bincode::deserialize::<remote::protocol::MasterHello>(&hello_message)?;
-    event!(Level::INFO, "Received side: {:?}", master_hello);
+    tracing::info!("Received side: {:?}", master_hello);
     let result = match master_hello {
         remote::protocol::MasterHello::Source {
             src,
@@ -80,7 +80,7 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
             source_config,
             rcpd_config,
         } => {
-            event!(Level::INFO, "Starting source");
+            tracing::info!("Starting source");
             source::run_source(&master_connection, &src, &dst, &source_config, &rcpd_config).await?
         }
         remote::protocol::MasterHello::Destination {
@@ -89,7 +89,7 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
             destination_config,
             rcpd_config,
         } => {
-            event!(Level::INFO, "Starting destination");
+            tracing::info!("Starting destination");
             destination::run_destination(
                 &source_addr,
                 &server_name,

@@ -1,6 +1,5 @@
 use crate::streams;
 use anyhow::Context;
-use tracing::{event, Level};
 
 #[derive(Debug)]
 pub struct DirectoryTracker {
@@ -25,8 +24,7 @@ impl DirectoryTracker {
         if num_entries > 0 {
             self.remaining_dir_entries
                 .insert(dst.to_path_buf(), num_entries);
-            event!(
-                Level::DEBUG,
+            tracing::debug!(
                 "Added directory tracking: {:?} with {} entries",
                 dst,
                 num_entries
@@ -41,15 +39,14 @@ impl DirectoryTracker {
             let mut stream = self.control_send_stream.lock().await;
             stream.send_control_message(&message).await?;
         }
-        event!(
-            Level::INFO,
+        tracing::info!(
             "Sent directory creation confirmation: {:?} -> {:?}",
             src,
             dst
         );
         // if there are no entries, we can immediately send completion
         if num_entries == 0 {
-            event!(Level::INFO, "Directory completed: {:?}", dst);
+            tracing::info!("Directory completed: {:?}", dst);
             self.send_completion(src, dst).await?;
         }
         Ok(())
@@ -70,8 +67,7 @@ impl DirectoryTracker {
             .send_control_message(&message)
             .await
             .context("Failed to send directory completion notification")?;
-        event!(
-            Level::INFO,
+        tracing::info!(
             "Sent directory completion notification: {:?} -> {:?}",
             src,
             dst
@@ -94,15 +90,14 @@ impl DirectoryTracker {
             "Entry count for {dst_parent_dir:?} is already zero"
         );
         *remaining -= 1;
-        event!(
-            Level::DEBUG,
+        tracing::debug!(
             "Decremented entry count for {:?}, remaining: {}",
             dst_parent_dir,
             *remaining
         );
         if *remaining == 0 {
             self.remaining_dir_entries.remove(dst_parent_dir);
-            event!(Level::INFO, "Directory completed: {:?}", dst_parent_dir);
+            tracing::info!("Directory completed: {:?}", dst_parent_dir);
             self.send_completion(src.parent().unwrap(), dst_parent_dir)
                 .await?;
         }

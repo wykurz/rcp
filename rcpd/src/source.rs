@@ -1,6 +1,6 @@
 use anyhow::Context;
 use async_recursion::async_recursion;
-use tracing::{event, instrument, Level};
+use tracing::instrument;
 
 use crate::streams;
 
@@ -13,7 +13,7 @@ async fn send_directories_and_symlinks(
     control_send_stream: &streams::SharedSendStream,
     connection: &streams::Connection,
 ) -> anyhow::Result<()> {
-    event!(Level::INFO, "Sending data from {:?} to {:?}", src, dst);
+    tracing::info!("Sending data from {:?} to {:?}", src, dst);
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from src: {:?}", &src))?;
@@ -52,8 +52,7 @@ async fn send_directories_and_symlinks(
         dst: dst.to_path_buf(),
         num_entries: entry_count,
     };
-    event!(
-        Level::DEBUG,
+    tracing::debug!(
         "Sending directory stub: {:?} -> {:?}, with {} entries",
         src,
         dst,
@@ -95,7 +94,7 @@ async fn send_fs_objects(
     control_send_stream: streams::SharedSendStream,
     connection: streams::Connection,
 ) -> anyhow::Result<()> {
-    event!(Level::INFO, "Sending data from {:?} to {:?}", src, dst);
+    tracing::info!("Sending data from {:?} to {:?}", src, dst);
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from src: {:?}", &src))?;
@@ -136,13 +135,13 @@ async fn send_file(
         is_root,
     };
     let mut file_send_stream = connection.open_uni().await?;
-    event!(Level::DEBUG, "Sending file content for {:?}", src);
+    tracing::debug!("Sending file content for {:?}", src);
     file_send_stream
         .send_message_with_data(&file_header, &mut tokio::fs::File::open(src).await?)
         .await
         .with_context(|| format!("failed sending file content: {:?}", &src))?;
     file_send_stream.close().await?;
-    event!(Level::INFO, "Sent file: {:?} -> {:?}", src, dst);
+    tracing::info!("Sent file: {:?} -> {:?}", src, dst);
     Ok(())
 }
 
@@ -187,8 +186,7 @@ async fn dispatch_control_messages(
     {
         match message {
             remote::protocol::DestinationMessage::DirectoryCreated(confirmation) => {
-                event!(
-                    Level::INFO,
+                tracing::info!(
                     "Received directory creation confirmation for: {:?} -> {:?}",
                     confirmation.src,
                     confirmation.dst
@@ -197,8 +195,7 @@ async fn dispatch_control_messages(
                     .await?;
             }
             remote::protocol::DestinationMessage::DirectoryComplete(completion) => {
-                event!(
-                    Level::INFO,
+                tracing::info!(
                     "Received directory completion for: {:?} -> {:?}",
                     completion.src,
                     completion.dst
@@ -217,26 +214,26 @@ async fn dispatch_control_messages(
                     metadata,
                     is_root,
                 };
-                event!(Level::DEBUG, "Before sending directory metadata");
+                tracing::debug!("Before sending directory metadata");
                 {
                     let mut stream = control_send_stream.lock().await;
                     stream.send_control_message(&dir_metadata).await?;
                 }
-                event!(Level::DEBUG, "Sent directory metadata");
+                tracing::debug!("Sent directory metadata");
             }
             remote::protocol::DestinationMessage::DestinationDone => {
-                event!(Level::INFO, "Received destination done message");
+                tracing::info!("Received destination done message");
                 let mut stream = control_send_stream.lock().await;
                 stream
                     .send_control_message(&remote::protocol::SourceMessage::SourceDone)
                     .await?;
                 stream.close().await?;
-                event!(Level::INFO, "Sent source done message");
+                tracing::info!("Sent source done message");
                 break;
             }
         }
     }
-    event!(Level::INFO, "Finished dispatching control messages");
+    tracing::info!("Finished dispatching control messages");
     Ok(())
 }
 
@@ -246,10 +243,10 @@ async fn handle_connection(
     dst: &std::path::Path,
 ) -> anyhow::Result<()> {
     let connection = conn.await?;
-    event!(Level::INFO, "Destination connection established");
+    tracing::info!("Destination connection established");
     let connection = streams::Connection::new(connection);
     let (control_send_stream, control_recv_stream) = connection.open_bi().await?;
-    event!(Level::INFO, "Opened streams for directory transfer");
+    tracing::info!("Opened streams for directory transfer");
     let src_root = src.to_path_buf();
     let dispatch_task = tokio::spawn(dispatch_control_messages(
         control_recv_stream,
@@ -259,7 +256,7 @@ async fn handle_connection(
     ));
     send_fs_objects(src, dst, control_send_stream, connection).await?;
     dispatch_task.await??;
-    event!(Level::INFO, "Data sent successfully");
+    tracing::info!("Data sent successfully");
     Ok(())
 }
 
@@ -273,26 +270,26 @@ pub async fn run_source(
 ) -> anyhow::Result<String> {
     let server_endpoint = remote::get_server()?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
-    event!(Level::INFO, "Source server listening on {}", server_addr);
+    tracing::info!("Source server listening on {}", server_addr);
     let master_hello = remote::protocol::SourceMasterHello {
         source_addr: server_addr,
         server_name: remote::get_random_server_name(),
     };
-    event!(Level::INFO, "Sending master hello: {:?}", master_hello);
+    tracing::info!("Sending master hello: {:?}", master_hello);
     let master_hello = bincode::serialize(&master_hello)?;
     // TODO: replace send_datagram with setting up a bi-directional stream
     master_connection.send_datagram(bytes::Bytes::from(master_hello))?;
-    event!(Level::INFO, "Waiting for connection from destination");
+    tracing::info!("Waiting for connection from destination");
     if let Some(conn) = server_endpoint.accept().await {
-        event!(Level::INFO, "New destination connection incoming");
+        tracing::info!("New destination connection incoming");
         handle_connection(conn, src, dst).await?;
     } else {
-        event!(Level::ERROR, "Timed out waiting for destination to connect");
+        tracing::error!("Timed out waiting for destination to connect");
         return Err(anyhow::anyhow!(
             "Timed out waiting for destination to connect"
         ));
     }
-    event!(Level::INFO, "Source is done",);
+    tracing::info!("Source is done");
     master_connection.close(0u32.into(), b"done");
     server_endpoint.wait_idle().await;
     Ok("source OK".to_string())

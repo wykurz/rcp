@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context};
 use async_recursion::async_recursion;
 use std::os::unix::fs::PermissionsExt;
-use tracing::{event, instrument, Level};
+use tracing::instrument;
 
 use crate::progress;
 
@@ -63,13 +63,13 @@ pub async fn rm(
 ) -> Result<Summary, Error> {
     throttle::get_ops_token().await;
     let _ops_guard = prog_track.ops.guard();
-    event!(Level::DEBUG, "read path metadata");
+    tracing::debug!("read path metadata");
     let src_metadata = tokio::fs::symlink_metadata(path)
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &path))
         .map_err(|err| Error::new(anyhow::Error::msg(err), Default::default()))?;
     if !src_metadata.is_dir() {
-        event!(Level::DEBUG, "not a directory, just remove");
+        tracing::debug!("not a directory, just remove");
         tokio::fs::remove_file(path)
             .await
             .with_context(|| format!("failed removing {:?}", &path))
@@ -87,12 +87,9 @@ pub async fn rm(
             ..Default::default()
         });
     }
-    event!(Level::DEBUG, "remove contents of the directory first");
+    tracing::debug!("remove contents of the directory first");
     if src_metadata.permissions().readonly() {
-        event!(
-            Level::DEBUG,
-            "directory is read-only - change the permissions"
-        );
+        tracing::debug!("directory is read-only - change the permissions");
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
             .await
             .with_context(|| {
@@ -130,7 +127,7 @@ pub async fn rm(
         match res.map_err(|err| Error::new(anyhow::Error::msg(err), Default::default()))? {
             Ok(summary) => rm_summary = rm_summary + summary,
             Err(error) => {
-                event!(Level::ERROR, "remove: {:?} failed with: {:?}", path, &error);
+                tracing::error!("remove: {:?} failed with: {:?}", path, &error);
                 rm_summary = rm_summary + error.summary;
                 if settings.fail_early {
                     return Err(Error::new(error.source, rm_summary));
@@ -142,7 +139,7 @@ pub async fn rm(
     if !success {
         return Err(Error::new(anyhow!("rm: {:?} failed!", &path), rm_summary));
     }
-    event!(Level::DEBUG, "finally remove the empty directory");
+    tracing::debug!("finally remove the empty directory");
     tokio::fs::remove_dir(path)
         .await
         .with_context(|| format!("failed removing directory {:?}", &path))
