@@ -2,16 +2,14 @@ use anyhow::Context;
 use async_recursion::async_recursion;
 use tracing::instrument;
 
-use crate::streams;
-
 #[instrument]
 #[async_recursion]
 async fn send_directories_and_symlinks(
     src: &std::path::Path,
     dst: &std::path::Path,
     is_root: bool,
-    control_send_stream: &streams::SharedSendStream,
-    connection: &streams::Connection,
+    control_send_stream: &remote::streams::SharedSendStream,
+    connection: &remote::streams::Connection,
 ) -> anyhow::Result<()> {
     tracing::info!("Sending data from {:?} to {:?}", src, dst);
     let src_metadata = tokio::fs::symlink_metadata(src)
@@ -91,8 +89,8 @@ async fn send_directories_and_symlinks(
 async fn send_fs_objects(
     src: &std::path::Path,
     dst: &std::path::Path,
-    control_send_stream: streams::SharedSendStream,
-    connection: streams::Connection,
+    control_send_stream: remote::streams::SharedSendStream,
+    connection: remote::streams::Connection,
 ) -> anyhow::Result<()> {
     tracing::info!("Sending data from {:?} to {:?}", src, dst);
     let src_metadata = tokio::fs::symlink_metadata(src)
@@ -117,7 +115,7 @@ async fn send_file(
     src: &std::path::Path,
     dst: &std::path::Path,
     is_root: bool,
-    connection: streams::Connection,
+    connection: remote::streams::Connection,
 ) -> anyhow::Result<()> {
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
@@ -149,7 +147,7 @@ async fn send_file(
 async fn send_files_in_directory(
     src: &std::path::Path,
     dst: &std::path::Path,
-    connection: streams::Connection,
+    connection: remote::streams::Connection,
 ) -> anyhow::Result<()> {
     let mut entries = tokio::fs::read_dir(src)
         .await
@@ -175,9 +173,9 @@ async fn send_files_in_directory(
 
 #[instrument]
 async fn dispatch_control_messages(
-    mut control_recv_stream: streams::RecvStream,
-    control_send_stream: streams::SharedSendStream,
-    connection: streams::Connection,
+    mut control_recv_stream: remote::streams::RecvStream,
+    control_send_stream: remote::streams::SharedSendStream,
+    connection: remote::streams::Connection,
     src_root: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     while let Some(message) = control_recv_stream
@@ -244,7 +242,7 @@ async fn handle_connection(
 ) -> anyhow::Result<()> {
     let connection = conn.await?;
     tracing::info!("Destination connection established");
-    let connection = streams::Connection::new(connection);
+    let connection = remote::streams::Connection::new(connection);
     let (control_send_stream, control_recv_stream) = connection.open_bi().await?;
     tracing::info!("Opened streams for directory transfer");
     let src_root = src.to_path_buf();
@@ -262,7 +260,7 @@ async fn handle_connection(
 
 #[instrument]
 pub async fn run_source(
-    master_connection: &quinn::Connection,
+    master_send_stream: remote::streams::SharedSendStream,
     src: &std::path::Path,
     dst: &std::path::Path,
     _source_config: &remote::protocol::SourceConfig,
@@ -276,9 +274,11 @@ pub async fn run_source(
         server_name: remote::get_random_server_name(),
     };
     tracing::info!("Sending master hello: {:?}", master_hello);
-    let master_hello = bincode::serialize(&master_hello)?;
-    // TODO: replace send_datagram with setting up a bi-directional stream
-    master_connection.send_datagram(bytes::Bytes::from(master_hello))?;
+    master_send_stream
+        .lock()
+        .await
+        .send_control_message(&master_hello)
+        .await?;
     tracing::info!("Waiting for connection from destination");
     if let Some(conn) = server_endpoint.accept().await {
         tracing::info!("New destination connection incoming");
@@ -290,7 +290,6 @@ pub async fn run_source(
         ));
     }
     tracing::info!("Source is done");
-    master_connection.close(0u32.into(), b"done");
     server_endpoint.wait_idle().await;
     Ok("source OK".to_string())
 }

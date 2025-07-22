@@ -14,6 +14,7 @@ pub mod cmp;
 pub mod copy;
 pub mod link;
 pub mod preserve;
+pub mod remote_tracing;
 pub mod rm;
 
 mod filecmp;
@@ -366,52 +367,68 @@ pub fn run<Fut, Summary, Error>(
     iops_throttle: usize,
     chunk_size: u64,
     tput_throttle: usize,
+    remote_tracing_layer: Option<remote_tracing::RemoteTracingLayer>,
     func: impl FnOnce() -> Fut,
 ) -> Option<Summary>
-// we return an Option rather than a Result to indicate that callers of this function will NOT print the error
+// we return an Option rather than a Result to indicate that callers of this function should NOT print the error
 where
     Summary: std::fmt::Display,
     Error: std::fmt::Display + std::fmt::Debug,
     Fut: std::future::Future<Output = Result<Summary, Error>>,
 {
     if !quiet {
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_target(true)
-            .with_line_number(true)
-            .with_span_events(if verbose > 2 {
-                FmtSpan::NEW | FmtSpan::CLOSE
-            } else {
-                FmtSpan::NONE
-            })
-            .pretty()
-            .with_writer(ProgWriter::new)
-            .with_filter(
-                tracing_subscriber::EnvFilter::try_new(match verbose {
-                    0 => "error",
-                    1 => "info",
-                    2 => "debug",
-                    _ => "trace",
-                })
-                .unwrap(),
-            );
-        let is_console_enabled = match std::env::var("RCP_TOKIO_TRACING_CONSOLE_ENABLED") {
-            Ok(val) => matches!(val.to_lowercase().as_str(), "true" | "1"),
-            Err(_) => false,
-        };
-        let subscriber = tracing_subscriber::registry().with(fmt_layer);
-        if is_console_enabled {
-            let console_port: u16 =
-                read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_SERVER_PORT", 6669);
-            let retention_seconds: u64 =
-                read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS", 60);
-            let console_layer = console_subscriber::ConsoleLayer::builder()
-                .retention(std::time::Duration::from_secs(retention_seconds))
-                .server_addr(([127, 0, 0, 1], console_port))
-                .spawn();
-            subscriber.with(console_layer).init();
-        } else {
+        if let Some(remote_tracing_layer) = remote_tracing_layer {
+            let subscriber = tracing_subscriber::registry()
+                .with(remote_tracing_layer)
+                .with(
+                    tracing_subscriber::EnvFilter::try_new(match verbose {
+                        0 => "error",
+                        1 => "info",
+                        2 => "debug",
+                        _ => "trace",
+                    })
+                    .unwrap(),
+                );
             subscriber.init();
-        };
+        } else {
+            let fmt_layer = tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_line_number(true)
+                .with_span_events(if verbose > 2 {
+                    FmtSpan::NEW | FmtSpan::CLOSE
+                } else {
+                    FmtSpan::NONE
+                })
+                .pretty()
+                .with_writer(ProgWriter::new)
+                .with_filter(
+                    tracing_subscriber::EnvFilter::try_new(match verbose {
+                        0 => "error",
+                        1 => "info",
+                        2 => "debug",
+                        _ => "trace",
+                    })
+                    .unwrap(),
+                );
+            let is_console_enabled = match std::env::var("RCP_TOKIO_TRACING_CONSOLE_ENABLED") {
+                Ok(val) => matches!(val.to_lowercase().as_str(), "true" | "1"),
+                Err(_) => false,
+            };
+            let subscriber = tracing_subscriber::registry().with(fmt_layer);
+            if is_console_enabled {
+                let console_port: u16 =
+                    read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_SERVER_PORT", 6669);
+                let retention_seconds: u64 =
+                    read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS", 60);
+                let console_layer = console_subscriber::ConsoleLayer::builder()
+                    .retention(std::time::Duration::from_secs(retention_seconds))
+                    .server_addr(([127, 0, 0, 1], console_port))
+                    .spawn();
+                subscriber.with(console_layer).init();
+            } else {
+                subscriber.init();
+            }
+        }
     } else {
         assert!(
             verbose == 0,

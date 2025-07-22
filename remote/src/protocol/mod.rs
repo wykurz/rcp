@@ -149,6 +149,9 @@ pub struct DestinationConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TracingHello {}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MasterHello {
     Source {
         src: std::path::PathBuf,
@@ -169,3 +172,6 @@ pub struct SourceMasterHello {
     pub source_addr: std::net::SocketAddr,
     pub server_name: String,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RcpdGoodBye {}
