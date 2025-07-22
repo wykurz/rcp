@@ -47,7 +47,7 @@ impl FieldVisitor {
 
 impl Visit for FieldVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        let value_str = format!("{:?}", value);
+        let value_str = format!("{value:?}");
         if field.name() == "message" {
             self.message = Some(value_str);
         } else {

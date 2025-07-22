@@ -106,57 +106,11 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
 
 fn main() -> Result<(), anyhow::Error> {
     let args = Args::from_args();
-    
-    // Set up remote tracing
-    let (remote_layer, receiver) = common::remote_tracing::RemoteTracingLayer::new();
-    let sender = Some(remote_layer.sender.clone());
-    
-    // Clone the args for the background task
-    let master_addr = args.master_addr;
-    let server_name = args.server_name.clone();
-    
-    // Start a background task to send remote tracing messages
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            // Connect to master for remote tracing
-            let client = match remote::get_client() {
-                Ok(client) => client,
-                Err(e) => {
-                    eprintln!("Failed to create QUIC client for tracing: {}", e);
-                    return;
-                }
-            };
-            
-            let master_connection = match client.connect(master_addr, &server_name) {
-                Ok(connecting) => {
-                    match connecting.await {
-                        Ok(conn) => std::sync::Arc::new(conn),
-                        Err(e) => {
-                            eprintln!("Failed to establish connection to master for tracing: {}", e);
-                            return;
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to connect to master for tracing: {}", e);
-                    return;
-                }
-            };
-            
-            // Run the remote tracing sender
-            if let Err(e) = remote::run_remote_tracing_sender(receiver, master_connection).await {
-                eprintln!("Remote tracing sender failed: {}", e);
-            }
-        });
-    });
-    
     let func = {
         let args = args.clone();
         || async_main(args)
     };
-    
-    let res = common::run_with_remote_tracing(
+    let res = common::run(
         None,
         args.quiet,
         args.verbose,
@@ -168,10 +122,8 @@ fn main() -> Result<(), anyhow::Error> {
         args.iops_throttle,
         args.chunk_size,
         args.tput_throttle,
-        sender,
         func,
     );
-    
     if res.is_none() {
         std::process::exit(1);
     }
