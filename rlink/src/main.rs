@@ -200,6 +200,7 @@ fn main() -> Result<()> {
         args.iops_throttle,
         args.chunk_size,
         args.tput_throttle,
+        None,
         func,
     );
     if res.is_none() {

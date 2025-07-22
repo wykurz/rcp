@@ -297,7 +297,7 @@ mod cmp_tests {
         let test_path = tmp_dir.as_path();
         copy::copy(
             &PROGRESS,
-            &test_path,
+            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &copy::Settings {
@@ -338,7 +338,7 @@ mod cmp_tests {
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         // modify 1 file in dst
         truncate_file(
-            &tmp_dir
+            tmp_dir
                 .join("bar")
                 .join("baz")
                 .join("4.txt")
@@ -373,7 +373,7 @@ mod cmp_tests {
             &PROGRESS,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &LogWriter::new(Some(&tmp_dir.join("cmp.log").as_path())).await?,
+            &LogWriter::new(Some(tmp_dir.join("cmp.log").as_path())).await?,
             &compare_settings,
         )
         .await?;

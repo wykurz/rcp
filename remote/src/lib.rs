@@ -1,8 +1,80 @@
 use anyhow::{anyhow, Context};
 use rand::Rng;
+use std::sync::Arc;
 use tracing::instrument;
 
 pub mod protocol;
+
+/// Send tracing messages over a QUIC connection
+pub async fn run_remote_tracing_sender(
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<common::remote_tracing::TracingMessage>,
+    connection: Arc<quinn::Connection>,
+) -> anyhow::Result<()> {
+    while let Some(msg) = receiver.recv().await {
+        // Send each tracing message as a separate datagram
+        let serialized = bincode::serialize(&msg)?;
+        if let Err(e) = connection.send_datagram(serialized.into()) {
+            tracing::warn!("Failed to send tracing message: {}", e);
+            // Continue processing other messages even if one fails
+        }
+    }
+    Ok(())
+}
+
+/// Receive tracing messages from remote rcpd processes and log them locally
+pub async fn run_remote_tracing_receiver(connection: Arc<quinn::Connection>) -> anyhow::Result<()> {
+    while let Ok(datagram) = connection.read_datagram().await {
+        match bincode::deserialize::<common::remote_tracing::TracingMessage>(&datagram) {
+            Ok(msg) => {
+                let level = match msg.level.as_str() {
+                    "ERROR" => tracing::Level::ERROR,
+                    "WARN" => tracing::Level::WARN,
+                    "INFO" => tracing::Level::INFO,
+                    "DEBUG" => tracing::Level::DEBUG,
+                    "TRACE" => tracing::Level::TRACE,
+                    _ => tracing::Level::INFO,
+                };
+
+                // Log the remote message locally with timestamp
+                let remote_target = format!("remote::{}", msg.target);
+                let timestamp_str = match msg.timestamp.duration_since(std::time::UNIX_EPOCH) {
+                    Ok(duration) => {
+                        let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                            duration.as_secs() as i64,
+                            duration.subsec_nanos(),
+                        );
+                        match datetime {
+                            Some(dt) => dt.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string(),
+                            None => format!("{:?}", msg.timestamp),
+                        }
+                    }
+                    Err(_) => format!("{:?}", msg.timestamp),
+                };
+                match level {
+                    tracing::Level::ERROR => {
+                        tracing::error!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, msg.message)
+                    }
+                    tracing::Level::WARN => {
+                        tracing::warn!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, msg.message)
+                    }
+                    tracing::Level::INFO => {
+                        tracing::info!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, msg.message)
+                    }
+                    tracing::Level::DEBUG => {
+                        tracing::debug!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, msg.message)
+                    }
+                    tracing::Level::TRACE => {
+                        tracing::trace!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, msg.message)
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to deserialize remote tracing message: {}", e);
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, PartialEq)]
 pub struct SshSession {

@@ -522,7 +522,7 @@ mod copy_tests {
         let test_path = tmp_dir.as_path();
         let summary = copy(
             &PROGRESS,
-            &test_path,
+            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -567,7 +567,7 @@ mod copy_tests {
         }
         match copy(
             &PROGRESS,
-            &test_path,
+            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -639,7 +639,7 @@ mod copy_tests {
         let test_path = tmp_dir.as_path();
         let summary = copy(
             &PROGRESS,
-            &test_path,
+            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -703,7 +703,7 @@ mod copy_tests {
         .await?;
         let summary = copy(
             &PROGRESS,
-            &test_path,
+            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -742,12 +742,12 @@ mod copy_tests {
         let src1 = &test_path.join("foo").join("bar").join("2.txt");
         let src2 = &test_path.join("foo").join("bar").join("3.txt");
         let test_mode = 0o440;
-        for f in vec![src1, src2] {
+        for f in [src1, src2] {
             tokio::fs::set_permissions(f, std::fs::Permissions::from_mode(test_mode)).await?;
         }
         let summary = copy(
             &PROGRESS,
-            &test_path,
+            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -775,7 +775,7 @@ mod copy_tests {
         //    |- 6.txt -> (absolute path) .../foo/bar/3.txt
         let dst1 = &test_path.join("bar").join("baz").join("5.txt");
         let dst2 = &test_path.join("bar").join("baz").join("6.txt");
-        for f in vec![dst1, dst2] {
+        for f in [dst1, dst2] {
             let metadata = tokio::fs::symlink_metadata(f)
                 .await
                 .with_context(|| format!("failed reading metadata from {:?}", &f))?;
@@ -804,7 +804,7 @@ mod copy_tests {
         // now run rcp
         let summary = copy(
             &PROGRESS,
-            &test_path,
+            test_path,
             &test_path.join("foo"),
             &test_path.join("baz"),
             rcp_settings,
@@ -930,7 +930,7 @@ mod copy_tests {
         let test_path = tmp_dir.as_path();
         let summary = copy(
             &PROGRESS,
-            &test_path,
+            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -990,7 +990,7 @@ mod copy_tests {
             &PROGRESS,
             &tmp_dir,
             &tmp_dir.join("foo"),
-            &output_path,
+            output_path,
             &Settings {
                 dereference: false,
                 fail_early: false,
@@ -1011,7 +1011,7 @@ mod copy_tests {
         assert_eq!(summary.directories_created, 1);
         testutils::check_dirs_identical(
             &tmp_dir.join("foo"),
-            &output_path,
+            output_path,
             testutils::FileEqualityCheck::Timestamp,
         )
         .await?;
@@ -1060,7 +1060,7 @@ mod copy_tests {
             &PROGRESS,
             &tmp_dir,
             &tmp_dir.join("foo"),
-            &output_path,
+            output_path,
             &Settings {
                 dereference: false,
                 fail_early: false,
@@ -1084,7 +1084,7 @@ mod copy_tests {
         assert_eq!(summary.directories_created, 1);
         testutils::check_dirs_identical(
             &tmp_dir.join("foo"),
-            &output_path,
+            output_path,
             testutils::FileEqualityCheck::Timestamp,
         )
         .await?;
@@ -1129,7 +1129,7 @@ mod copy_tests {
             &PROGRESS,
             &tmp_dir,
             &tmp_dir.join("foo"),
-            &output_path,
+            output_path,
             &Settings {
                 dereference: false,
                 fail_early: false,
@@ -1153,7 +1153,7 @@ mod copy_tests {
         assert_eq!(summary.directories_created, 0);
         testutils::check_dirs_identical(
             &tmp_dir.join("foo"),
-            &output_path,
+            output_path,
             testutils::FileEqualityCheck::Timestamp,
         )
         .await?;
@@ -1201,7 +1201,7 @@ mod copy_tests {
             &PROGRESS,
             &tmp_dir,
             &tmp_dir.join("foo"),
-            &output_path,
+            output_path,
             &Settings {
                 dereference: false,
                 fail_early: false,
@@ -1228,7 +1228,7 @@ mod copy_tests {
         assert_eq!(summary.directories_unchanged, 2);
         testutils::check_dirs_identical(
             &tmp_dir.join("foo"),
-            &output_path,
+            output_path,
             testutils::FileEqualityCheck::Timestamp,
         )
         .await?;
@@ -1242,7 +1242,7 @@ mod copy_tests {
         let test_path = tmp_dir.as_path();
         let summary = copy(
             &PROGRESS,
-            &test_path,
+            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -1287,7 +1287,7 @@ mod copy_tests {
             &PROGRESS,
             &tmp_dir,
             &tmp_dir.join("foo"),
-            &output_path,
+            output_path,
             &Settings {
                 dereference: false,
                 fail_early: false,
@@ -1351,7 +1351,7 @@ mod copy_tests {
         assert_eq!(summary.directories_created, 5);
         // check_dirs_identical doesn't handle dereference so let's do it manually
         tokio::process::Command::new("cp")
-            .args(&["-r", "-L"])
+            .args(["-r", "-L"])
             .arg(tmp_dir.join("foo"))
             .arg(tmp_dir.join("bar-cp"))
             .output()
