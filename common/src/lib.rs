@@ -14,6 +14,7 @@ pub mod cmp;
 pub mod copy;
 pub mod link;
 pub mod preserve;
+pub mod remote_tracing;
 pub mod rm;
 
 mod filecmp;
@@ -486,6 +487,188 @@ where
         });
         runtime.block_on(func())
     };
+    match &res {
+        Ok(summary) => {
+            if print_summary || verbose > 0 {
+                println!("{summary}");
+            }
+        }
+        Err(err) => {
+            if !quiet {
+                println!("{err:?}");
+            }
+        }
+    }
+    if print_summary || verbose > 0 {
+        if let Err(err) = print_runtime_stats() {
+            println!("Failed to print runtime stats: {err:?}");
+        }
+    }
+    res.ok()
+}
+
+#[instrument(skip(func, remote_tracing_sender))] // "func" is not Debug printable
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_remote_tracing<Fut, Summary, Error>(
+    progress: Option<ProgressSettings>,
+    quiet: bool,
+    verbose: u8,
+    print_summary: bool,
+    max_workers: usize,
+    max_blocking_threads: usize,
+    max_open_files: Option<usize>,
+    ops_throttle: usize,
+    iops_throttle: usize,
+    chunk_size: u64,
+    tput_throttle: usize,
+    remote_tracing_sender: Option<tokio::sync::mpsc::UnboundedSender<crate::remote_tracing::TracingMessage>>,
+    func: impl FnOnce() -> Fut,
+) -> Option<Summary>
+// we return an Option rather than a Result to indicate that callers of this function will NOT print the error
+where
+    Summary: std::fmt::Display,
+    Error: std::fmt::Display + std::fmt::Debug,
+    Fut: std::future::Future<Output = Result<Summary, Error>>,
+{
+    if !quiet {
+        if let Some(sender) = remote_tracing_sender {
+            // Set up remote tracing layer
+            let remote_layer = crate::remote_tracing::RemoteTracingLayer {
+                sender,
+            };
+            
+            let subscriber = tracing_subscriber::registry()
+                .with(remote_layer)
+                .with(
+                    tracing_subscriber::EnvFilter::try_new(match verbose {
+                        0 => "error",
+                        1 => "info",
+                        2 => "debug",
+                        _ => "trace",
+                    })
+                    .unwrap(),
+                );
+            subscriber.init();
+        } else {
+            // Set up local tracing (same as the regular run function)
+            let fmt_layer = tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_line_number(true)
+                .with_span_events(if verbose > 2 {
+                    FmtSpan::NEW | FmtSpan::CLOSE
+                } else {
+                    FmtSpan::NONE
+                })
+                .pretty()
+                .with_writer(ProgWriter::new)
+                .with_filter(
+                    tracing_subscriber::EnvFilter::try_new(match verbose {
+                        0 => "error",
+                        1 => "info",
+                        2 => "debug",
+                        _ => "trace",
+                    })
+                    .unwrap(),
+                );
+            let is_console_enabled = match std::env::var("RCP_TOKIO_TRACING_CONSOLE_ENABLED") {
+                Ok(val) => matches!(val.to_lowercase().as_str(), "true" | "1"),
+                Err(_) => false,
+            };
+            let subscriber = tracing_subscriber::registry().with(fmt_layer);
+            if is_console_enabled {
+                let console_port: u16 =
+                    read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_SERVER_PORT", 6669);
+                let retention_seconds: u64 =
+                    read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS", 60);
+                let console_layer = console_subscriber::ConsoleLayer::builder()
+                    .retention(std::time::Duration::from_secs(retention_seconds))
+                    .server_addr(([127, 0, 0, 1], console_port))
+                    .spawn();
+                subscriber.with(console_layer).init();
+            } else {
+                subscriber.init();
+            }
+        }
+    } else {
+        assert!(
+            verbose == 0,
+            "Quiet mode and verbose mode are mutually exclusive"
+        );
+    }
+    
+    // Set up runtime and run the same way as the regular run function
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if max_workers > 0 {
+        builder.worker_threads(max_workers);
+    }
+    if max_blocking_threads > 0 {
+        builder.max_blocking_threads(max_blocking_threads);
+    }
+    if !sysinfo::set_open_files_limit(isize::MAX) {
+        tracing::info!("Failed to update the open files limit (expected on non-linux targets)");
+    }
+    let set_max_open_files = max_open_files.unwrap_or_else(|| {
+        let limit = get_max_open_files().expect(
+            "We failed to query rlimit, if this is expected try specifying --max-open-files",
+        ) as usize;
+        80 * limit / 100 // ~80% of the max open files limit
+    });
+    if set_max_open_files > 0 {
+        tracing::info!("Setting max open files to: {}", set_max_open_files);
+        throttle::set_max_open_files(set_max_open_files);
+    } else {
+        tracing::info!("Not applying any limit to max open files!");
+    }
+    let runtime = builder.build().expect("Failed to create runtime");
+    
+    fn get_replenish_interval(replenish: usize) -> (usize, std::time::Duration) {
+        let mut replenish = replenish;
+        let mut interval = std::time::Duration::from_secs(1);
+        while replenish > 100 && interval > std::time::Duration::from_millis(1) {
+            replenish /= 10;
+            interval /= 10;
+        }
+        (replenish, interval)
+    }
+    
+    if ops_throttle > 0 {
+        let (replenish, interval) = get_replenish_interval(ops_throttle);
+        throttle::init_ops_tokens(replenish);
+        runtime.spawn(throttle::run_ops_replenish_thread(replenish, interval));
+    }
+    if iops_throttle > 0 {
+        if chunk_size == 0 {
+            tracing::error!("Chunk size must be specified when using --iops-throttle");
+            return None;
+        }
+        let (replenish, interval) = get_replenish_interval(iops_throttle);
+        throttle::init_iops_tokens(replenish);
+        runtime.spawn(throttle::run_iops_replenish_thread(replenish, interval));
+    } else if chunk_size > 0 {
+        tracing::error!(
+            "--chunk-size > 0 but --iops-throttle is 0 -- did you intend to use --iops-throttle?"
+        );
+        return None;
+    }
+    if tput_throttle > 0 {
+        tracing::error!(
+            "Throughput throttling is not supported yet, please use --iops-throttle instead"
+        );
+        return None;
+    }
+    
+    let res = {
+        let _progress = progress.map(|settings| {
+            let delay = settings.progress_delay.map(|delay_str| {
+                humantime::parse_duration(&delay_str)
+                    .expect("Couldn't parse duration out of --progress-delay")
+            });
+            ProgressTracker::new(settings.progress_type, delay)
+        });
+        runtime.block_on(func())
+    };
+    
     match &res {
         Ok(summary) => {
             if print_summary || verbose > 0 {

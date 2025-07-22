@@ -200,10 +200,37 @@ async fn run_rcpd_master(
         },
     )?))?;
     tracing::info!("Forwarded source connection info to destination");
+    
+    // Set up remote tracing receivers for both connections
+    let source_conn_for_tracing = std::sync::Arc::new(source_connection);
+    let dest_conn_for_tracing = std::sync::Arc::new(dest_connection);
+    
+    let source_tracing_task = {
+        let conn = source_conn_for_tracing.clone();
+        tokio::spawn(async move {
+            if let Err(e) = remote::run_remote_tracing_receiver(conn).await {
+                tracing::warn!("Source remote tracing receiver failed: {}", e);
+            }
+        })
+    };
+    
+    let dest_tracing_task = {
+        let conn = dest_conn_for_tracing.clone();
+        tokio::spawn(async move {
+            if let Err(e) = remote::run_remote_tracing_receiver(conn).await {
+                tracing::warn!("Destination remote tracing receiver failed: {}", e);
+            }
+        })
+    };
+    
     for rcpd in rcpds {
         tracing::info!("Waiting for rcpd process to finish: {:?}", rcpd);
         remote::wait_for_rcpd_process(rcpd).await?;
     }
+    
+    // Cancel the tracing tasks when done
+    source_tracing_task.abort();
+    dest_tracing_task.abort();
     Ok(common::copy::Summary::default())
 }
 
