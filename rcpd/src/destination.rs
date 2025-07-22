@@ -2,9 +2,10 @@ use anyhow::Context;
 use tracing::instrument;
 
 use crate::directory_tracker;
-use crate::streams;
 
-async fn send_root_done(control_send_stream: streams::SharedSendStream) -> anyhow::Result<()> {
+async fn send_root_done(
+    control_send_stream: remote::streams::SharedSendStream,
+) -> anyhow::Result<()> {
     let mut stream = control_send_stream.lock().await;
     stream
         .send_control_message(&remote::protocol::DestinationMessage::DestinationDone)
@@ -16,8 +17,8 @@ async fn send_root_done(control_send_stream: streams::SharedSendStream) -> anyho
 
 #[instrument]
 async fn handle_file_stream(
-    control_send_stream: streams::SharedSendStream,
-    mut file_recv_stream: streams::RecvStream,
+    control_send_stream: remote::streams::SharedSendStream,
+    mut file_recv_stream: remote::streams::RecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
     tracing::info!("Processing file stream");
@@ -67,8 +68,8 @@ async fn handle_file_stream(
 
 #[instrument]
 async fn process_incoming_file_streams(
-    control_send_stream: streams::SharedSendStream,
-    connection: streams::Connection,
+    control_send_stream: remote::streams::SharedSendStream,
+    connection: remote::streams::Connection,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
     let mut join_set = tokio::task::JoinSet::new();
@@ -93,8 +94,8 @@ async fn process_incoming_file_streams(
 
 #[instrument]
 async fn create_directory_structure(
-    control_send_stream: streams::SharedSendStream,
-    mut control_recv_stream: streams::RecvStream,
+    control_send_stream: remote::streams::SharedSendStream,
+    mut control_recv_stream: remote::streams::RecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
     while let Some(source_message) = control_recv_stream
@@ -182,7 +183,7 @@ pub async fn run_destination(
     let client = remote::get_client()?;
     let connection = client.connect(*src_endpoint, src_server_name)?.await?;
     tracing::info!("Connected to Source");
-    let connection = streams::Connection::new(connection);
+    let connection = remote::streams::Connection::new(connection);
     // Always accept the directory streams first (even for single files)
     let (control_send_stream, control_recv_stream) = connection.accept_bi().await?;
     tracing::info!("Received directory creation streams");

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Context};
 use common::ProgressType;
 use structopt::StructOpt;
 use tracing::instrument;
@@ -132,7 +132,7 @@ async fn run_rcpd_master(
     args: &Args,
     src: &path::RemotePath,
     dst: &path::RemotePath,
-) -> Result<common::copy::Summary> {
+) -> anyhow::Result<common::copy::Summary> {
     tracing::debug!("running rcpd src/dst");
     // open a port and wait from server & client hello, respond to client with server port
     let server_endpoint = remote::get_server()?;
@@ -145,12 +145,35 @@ async fn run_rcpd_master(
     }
     tracing::info!("Waiting for connections from rcpd processes...");
     // accept connection from source
-    let source_connecting = match server_endpoint.accept().await {
-        Some(conn) => conn,
-        None => return Err(anyhow!("Server endpoint closed before source connected")),
+    tracing::info!("Waiting for connection from source rcpd...");
+    let source_connection = {
+        let source_connecting = match server_endpoint.accept().await {
+            Some(conn) => conn,
+            None => return Err(anyhow!("Server endpoint closed before source connected")),
+        };
+        tracing::info!("Source rcpd connected");
+        remote::streams::Connection::new(source_connecting.await?)
     };
-    let source_connection = source_connecting.await?;
-    tracing::info!("Source rcpd connected");
+    let mut source_tracing_stream = source_connection
+        .accept_uni()
+        .await
+        .context("Failed to open unidirectional stream with source rcpd")?;
+    // receiving some data guarantees that the stream is established in the right order
+    source_tracing_stream
+        .recv_object::<remote::protocol::TracingHello>()
+        .await
+        .context("Failed to receive tracing hello from source rcpd")?;
+    let source_tracing_task = {
+        tokio::spawn(async move {
+            if let Err(e) = remote::run_remote_tracing_receiver(source_tracing_stream).await {
+                tracing::warn!("Source remote tracing receiver failed: {}", e);
+            }
+        })
+    };
+    let (source_send_stream, mut source_recv_stream) = source_connection
+        .open_bi()
+        .await
+        .context("Failed to open bidirectional stream with source rcpd")?;
     let rcpd_config = remote::protocol::RcpdConfig {
         fail_early: args.fail_early,
         max_workers: args.max_workers,
@@ -161,54 +184,103 @@ async fn run_rcpd_master(
         chunk_size: args.chunk_size.0 as usize,
         tput_throttle: args.tput_throttle,
     };
-    source_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
-        &remote::protocol::MasterHello::Source {
-            src: src.path().to_path_buf(),
-            dst: dst.path().to_path_buf(),
-            source_config: remote::protocol::SourceConfig {
-                dereference: args.dereference,
-            },
-            rcpd_config,
-        },
-    )?))?;
-    let source_message = source_connection.read_datagram().await?;
-    let source_hello =
-        bincode::deserialize::<remote::protocol::SourceMasterHello>(&source_message)?;
+    {
+        let mut source_send_stream = source_send_stream.lock().await;
+        source_send_stream
+            .send_control_message(&remote::protocol::MasterHello::Source {
+                src: src.path().to_path_buf(),
+                dst: dst.path().to_path_buf(),
+                source_config: remote::protocol::SourceConfig {
+                    dereference: args.dereference,
+                },
+                rcpd_config,
+            })
+            .await?;
+        source_send_stream.close().await?;
+    }
+    tracing::debug!("Waiting for source rcpd to send hello");
+    let source_hello = source_recv_stream
+        .recv_object::<remote::protocol::SourceMasterHello>()
+        .await?
+        .expect("Failed to receive source hello from source rcpd");
     // accept connection from destination
-    let dest_connecting = match server_endpoint.accept().await {
-        Some(conn) => conn,
-        None => {
-            return Err(anyhow!(
-                "Server endpoint closed before destination connected"
-            ))
-        }
+    tracing::info!("Waiting for connection from destination rcpd...");
+    let dest_connection = {
+        let dest_connecting = match server_endpoint.accept().await {
+            Some(conn) => conn,
+            None => {
+                return Err(anyhow!(
+                    "Server endpoint closed before destination connected"
+                ))
+            }
+        };
+        tracing::info!("Destination rcpd connected");
+        remote::streams::Connection::new(dest_connecting.await?)
     };
-    let dest_connection = dest_connecting.await?;
-    tracing::info!("Destination rcpd connected");
-    tracing::info!("Source rcpd connected");
-    dest_connection.send_datagram(bytes::Bytes::from(bincode::serialize(
-        &remote::protocol::MasterHello::Destination {
-            source_addr: source_hello.source_addr,
-            server_name: source_hello.server_name.clone(),
-            destination_config: remote::protocol::DestinationConfig {
-                overwrite: args.overwrite,
-                overwrite_compare: args.overwrite_compare.clone(),
-                preserve: args.preserve,
-                preserve_settings: args.preserve_settings.clone(),
-            },
-            rcpd_config,
-        },
-    )?))?;
+    let mut dest_tracing_stream = dest_connection
+        .accept_uni()
+        .await
+        .context("Failed to open unidirectional stream with destination rcpd")?;
+    // receiving some data guarantees that the stream is established in the right order
+    dest_tracing_stream
+        .recv_object::<remote::protocol::TracingHello>()
+        .await
+        .context("Failed to receive tracing hello from destination rcpd")?;
+    let dest_tracing_task = {
+        tokio::spawn(async move {
+            if let Err(e) = remote::run_remote_tracing_receiver(dest_tracing_stream).await {
+                tracing::warn!("Destination remote tracing receiver failed: {}", e);
+            }
+        })
+    };
+    // rcpd doesn't know if it's source or destination so we need to match the stream type to source (bidirectional)
+    // although a unidirectional stream would be enough here
+    let (dest_send_stream, mut dest_recv_stream) = dest_connection
+        .open_bi()
+        .await
+        .context("Failed to open bidirectional stream with destination rcpd")?;
+    {
+        let mut dest_send_stream = dest_send_stream.lock().await;
+        dest_send_stream
+            .send_control_message(&remote::protocol::MasterHello::Destination {
+                source_addr: source_hello.source_addr,
+                server_name: source_hello.server_name.clone(),
+                destination_config: remote::protocol::DestinationConfig {
+                    overwrite: args.overwrite,
+                    overwrite_compare: args.overwrite_compare.clone(),
+                    preserve: args.preserve,
+                    preserve_settings: args.preserve_settings.clone(),
+                },
+                rcpd_config,
+            })
+            .await?;
+        dest_send_stream.close().await?;
+    }
     tracing::info!("Forwarded source connection info to destination");
+    source_recv_stream
+        .recv_object::<remote::protocol::RcpdGoodBye>()
+        .await?
+        .expect("Failed to receive RcpdGoodBye from source rcpd");
+    dest_recv_stream
+        .recv_object::<remote::protocol::RcpdGoodBye>()
+        .await?
+        .expect("Failed to receive RcpdGoodBye from destination rcpd");
+    tracing::debug!("Received RcpdGoodBye from both source and destination rcpds");
     for rcpd in rcpds {
         tracing::info!("Waiting for rcpd process to finish: {:?}", rcpd);
         remote::wait_for_rcpd_process(rcpd).await?;
     }
+    source_tracing_task.await?;
+    dest_tracing_task.await?;
+    source_connection.close();
+    dest_connection.close();
+    server_endpoint.wait_idle().await;
+    tracing::info!("All rcpd processes finished");
     Ok(common::copy::Summary::default())
 }
 
 #[instrument]
-async fn async_main(args: Args) -> Result<common::copy::Summary> {
+async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
     if args.paths.len() < 2 {
         return Err(anyhow!(
             "You must specify at least one source path and one destination path!"
@@ -383,6 +455,7 @@ fn main() -> Result<(), anyhow::Error> {
         args.iops_throttle,
         args.chunk_size.0,
         args.tput_throttle,
+        None,
         func,
     );
     if res.is_none() {

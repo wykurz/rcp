@@ -1,10 +1,10 @@
+use anyhow::Context;
 use structopt::StructOpt;
 use tracing::instrument;
 
 mod destination;
 mod directory_tracker;
 mod source;
-mod streams;
 
 #[derive(structopt::StructOpt, std::fmt::Debug, std::clone::Clone)]
 #[structopt(
@@ -65,13 +65,34 @@ struct Args {
 }
 
 #[instrument]
-async fn async_main(args: Args) -> anyhow::Result<String> {
-    // master_endpoint
+async fn async_main(
+    args: Args,
+    tracing_receiver: tokio::sync::mpsc::UnboundedReceiver<common::remote_tracing::TracingMessage>,
+) -> anyhow::Result<String> {
     let client = remote::get_client()?;
-    let master_connection = client.connect(args.master_addr, &args.server_name)?.await?;
+    let master_connection = {
+        let master_connection = client.connect(args.master_addr, &args.server_name)?.await?;
+        remote::streams::Connection::new(master_connection)
+    };
     tracing::info!("Connected to master");
-    let hello_message = master_connection.read_datagram().await?;
-    let master_hello = bincode::deserialize::<remote::protocol::MasterHello>(&hello_message)?;
+    let mut tracing_stream = master_connection.open_uni().await?;
+    tracing_stream
+        .send_control_message(&remote::protocol::TracingHello {})
+        .await?;
+    // setup tracing
+    let cancellation_token = tokio_util::sync::CancellationToken::new();
+    let tracing_sender_task = tokio::spawn(remote::run_remote_tracing_sender(
+        tracing_receiver,
+        tracing_stream,
+        cancellation_token.clone(),
+    ));
+    // run source or destination
+    let (master_send_stream, mut master_recv_stream) = master_connection.accept_bi().await?;
+    let master_hello = master_recv_stream
+        .recv_object::<remote::protocol::MasterHello>()
+        .await
+        .context("Failed to receive hello message from master")?
+        .unwrap();
     tracing::info!("Received side: {:?}", master_hello);
     let result = match master_hello {
         remote::protocol::MasterHello::Source {
@@ -81,7 +102,14 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
             rcpd_config,
         } => {
             tracing::info!("Starting source");
-            source::run_source(&master_connection, &src, &dst, &source_config, &rcpd_config).await?
+            source::run_source(
+                master_send_stream.clone(),
+                &src,
+                &dst,
+                &source_config,
+                &rcpd_config,
+            )
+            .await?
         }
         remote::protocol::MasterHello::Destination {
             source_addr,
@@ -99,16 +127,31 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
             .await?
         }
     };
-    master_connection.close(0u32.into(), b"done");
+    tracing::debug!("Closing master send stream");
+    {
+        let mut master_send_stream = master_send_stream.lock().await;
+        master_send_stream
+            .send_control_message(&remote::protocol::RcpdGoodBye {})
+            .await?;
+        master_send_stream.close().await?;
+    }
+    // shutdown tracing sender
+    cancellation_token.cancel();
+    tracing::debug!("Cancelling tracing sender");
+    tracing_sender_task.await??;
+    master_connection.close();
     client.wait_idle().await;
     Ok(result)
 }
 
 fn main() -> Result<(), anyhow::Error> {
     let args = Args::from_args();
+    // let master_connection = client.connect(args.master_addr, &args.server_name)?.await?;
+    let (tracing_layer, tracing_receiver) = common::remote_tracing::RemoteTracingLayer::new();
+    // TODO: signal cancellation_token when the process is about to exit
     let func = {
         let args = args.clone();
-        || async_main(args)
+        || async_main(args, tracing_receiver)
     };
     let res = common::run(
         None,
@@ -122,6 +165,7 @@ fn main() -> Result<(), anyhow::Error> {
         args.iops_throttle,
         args.chunk_size,
         args.tput_throttle,
+        Some(tracing_layer),
         func,
     );
     if res.is_none() {

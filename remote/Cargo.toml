@@ -7,7 +7,10 @@ edition = "2021"
 anyhow = "1.0"
 async-recursion = "1.1"
 bincode = "1.3"
+bytes = "1.10"
+chrono = "0.4"
 common = { path = "../common" }
+futures = "0.3"
 openssh = "0.11"
 quinn = "0.10"
 rand = "0.8"
@@ -17,4 +20,5 @@ rustls-pemfile = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 strum = { version = "0.27", features = ["derive"] }
 tokio = { version = "1.38", features = ["full", "parking_lot", "tracing"] }
+tokio-util = "0.7"
 tracing = "0.1"

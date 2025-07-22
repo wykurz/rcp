@@ -1,14 +1,13 @@
-use crate::streams;
 use anyhow::Context;
 
 #[derive(Debug)]
 pub struct DirectoryTracker {
     remaining_dir_entries: std::collections::HashMap<std::path::PathBuf, usize>,
-    control_send_stream: streams::SharedSendStream,
+    control_send_stream: remote::streams::SharedSendStream,
 }
 
 impl DirectoryTracker {
-    pub fn new(control_send_stream: streams::SharedSendStream) -> Self {
+    pub fn new(control_send_stream: remote::streams::SharedSendStream) -> Self {
         Self {
             remaining_dir_entries: std::collections::HashMap::new(),
             control_send_stream,
@@ -107,7 +106,9 @@ impl DirectoryTracker {
 
 pub type SharedDirectoryTracker = std::sync::Arc<tokio::sync::Mutex<DirectoryTracker>>;
 
-pub fn make_shared(control_send_stream: streams::SharedSendStream) -> SharedDirectoryTracker {
+pub fn make_shared(
+    control_send_stream: remote::streams::SharedSendStream,
+) -> SharedDirectoryTracker {
     std::sync::Arc::new(tokio::sync::Mutex::new(DirectoryTracker::new(
         control_send_stream,
     )))

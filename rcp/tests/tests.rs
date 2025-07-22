@@ -170,8 +170,8 @@ fn test_weird_permissions() {
     ];
 
     for (mode, description) in readable_test_cases {
-        let src_file = src_dir.path().join(format!("test_{:o}.txt", mode));
-        let dst_file = dst_dir.path().join(format!("test_{:o}.txt", mode));
+        let src_file = src_dir.path().join(format!("test_{mode:o}.txt"));
+        let dst_file = dst_dir.path().join(format!("test_{mode:o}.txt"));
 
         create_test_file(&src_file, description, mode);
 
@@ -193,8 +193,7 @@ fn test_weird_permissions() {
 
         if actual_mode != expected_mode {
             eprintln!(
-                "WARNING: Permission mode changed for {:o} -> {:o} ({})",
-                expected_mode, actual_mode, description
+                "WARNING: Permission mode changed for {expected_mode:o} -> {actual_mode:o} ({description})"
             );
             eprintln!("This might be expected behavior for special permission bits");
         }
@@ -215,8 +214,8 @@ fn test_unreadable_permissions_fail() {
     ];
 
     for (mode, description) in unreadable_test_cases {
-        let src_file = src_dir.path().join(format!("test_{:o}.txt", mode));
-        let dst_file = dst_dir.path().join(format!("test_{:o}.txt", mode));
+        let src_file = src_dir.path().join(format!("test_{mode:o}.txt"));
+        let dst_file = dst_dir.path().join(format!("test_{mode:o}.txt"));
 
         create_test_file(&src_file, description, mode);
 
@@ -233,8 +232,7 @@ fn test_unreadable_permissions_fail() {
         // Verify the destination file was not created
         assert!(
             !dst_file.exists(),
-            "Destination file should not exist for unreadable source with mode {:o}",
-            mode
+            "Destination file should not exist for unreadable source with mode {mode:o}"
         );
     }
 }
@@ -435,7 +433,7 @@ fn test_relative_symlink() {
 
     let original_dir = std::env::current_dir().unwrap();
     std::env::set_current_dir(src_dir.path()).unwrap();
-    create_symlink(&std::path::Path::new("target.txt"), &src_symlink);
+    create_symlink(std::path::Path::new("target.txt"), &src_symlink);
     std::env::set_current_dir(original_dir).unwrap();
 
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
@@ -563,14 +561,14 @@ fn test_edge_case_special_chars_filename() {
         let src_file = src_dir.path().join(name);
         let dst_file = dst_dir.path().join(name);
 
-        create_test_file(&src_file, &format!("content for {}", name), 0o644);
+        create_test_file(&src_file, &format!("content for {name}"), 0o644);
 
         let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
         cmd.args([src_file.to_str().unwrap(), dst_file.to_str().unwrap()])
             .assert()
             .success();
 
-        assert_eq!(get_file_content(&dst_file), format!("content for {}", name));
+        assert_eq!(get_file_content(&dst_file), format!("content for {name}"));
     }
 }
 

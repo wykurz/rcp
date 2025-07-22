@@ -148,12 +148,12 @@ fn test_update_exclusive_mode() {
 
     let src_subdir = src_dir.path().join("subdir");
     std::fs::create_dir(&src_subdir).unwrap();
-    std::fs::write(&src_subdir.join("file1.txt"), "content1").unwrap();
-    std::fs::write(&src_subdir.join("file2.txt"), "content2").unwrap();
+    std::fs::write(src_subdir.join("file1.txt"), "content1").unwrap();
+    std::fs::write(src_subdir.join("file2.txt"), "content2").unwrap();
 
     let update_subdir = update_dir.path().join("subdir");
     std::fs::create_dir(&update_subdir).unwrap();
-    std::fs::write(&update_subdir.join("file1.txt"), "updated content1").unwrap();
+    std::fs::write(update_subdir.join("file1.txt"), "updated content1").unwrap();
 
     let dst_subdir = dst_dir.path().join("subdir");
 
@@ -393,8 +393,8 @@ fn test_edge_case_special_permissions() {
     ];
 
     for (mode, description) in test_cases {
-        let src_file = src_dir.path().join(format!("test_{:o}.txt", mode));
-        let dst_file = dst_dir.path().join(format!("test_{:o}.txt", mode));
+        let src_file = src_dir.path().join(format!("test_{mode:o}.txt"));
+        let dst_file = dst_dir.path().join(format!("test_{mode:o}.txt"));
 
         create_test_file(&src_file, description, mode);
 
@@ -407,9 +407,7 @@ fn test_edge_case_special_permissions() {
         assert_eq!(
             get_file_mode(&dst_file),
             mode,
-            "Failed for mode {:o} ({})",
-            mode,
-            description
+            "Failed for mode {mode:o} ({description})"
         );
         assert_eq!(get_file_content(&dst_file), description);
     }

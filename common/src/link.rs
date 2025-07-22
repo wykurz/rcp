@@ -554,7 +554,7 @@ mod link_tests {
         let test_path = tmp_dir.as_path();
         let summary = link(
             &PROGRESS,
-            &test_path,
+            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &None,
@@ -582,7 +582,7 @@ mod link_tests {
         let test_path = tmp_dir.as_path();
         let summary = link(
             &PROGRESS,
-            &test_path,
+            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Some(test_path.join("foo")),
@@ -611,7 +611,7 @@ mod link_tests {
         let test_path = tmp_dir.as_path();
         let summary = link(
             &PROGRESS,
-            &test_path,
+            test_path,
             &test_path.join("baz"), // empty source
             &test_path.join("bar"),
             &Some(test_path.join("foo")),
@@ -663,7 +663,7 @@ mod link_tests {
         let test_path = tmp_dir.as_path();
         let summary = link(
             &PROGRESS,
-            &test_path,
+            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Some(test_path.join("update")),
@@ -702,7 +702,7 @@ mod link_tests {
         settings.update_exclusive = true;
         let summary = link(
             &PROGRESS,
-            &test_path,
+            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Some(test_path.join("update")),
@@ -734,7 +734,7 @@ mod link_tests {
         let test_path = tmp_dir.as_path();
         let summary = link(
             &PROGRESS,
-            &test_path,
+            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &None,
@@ -784,7 +784,7 @@ mod link_tests {
             &PROGRESS,
             &tmp_dir,
             &tmp_dir.join("foo"),
-            &output_path,
+            output_path,
             &None,
             &common_settings(false, true), // overwrite!
             false,
@@ -795,7 +795,7 @@ mod link_tests {
         assert_eq!(summary.copy_summary.directories_created, 1);
         testutils::check_dirs_identical(
             &tmp_dir.join("foo"),
-            &output_path,
+            output_path,
             testutils::FileEqualityCheck::Timestamp,
         )
         .await?;
@@ -844,7 +844,7 @@ mod link_tests {
             &PROGRESS,
             &tmp_dir,
             &tmp_dir.join("foo"),
-            &output_path,
+            output_path,
             &Some(tmp_dir.join("update")),
             &common_settings(false, true), // overwrite!
             false,
@@ -931,7 +931,7 @@ mod link_tests {
             &PROGRESS,
             &tmp_dir,
             &tmp_dir.join("foo"),
-            &output_path,
+            output_path,
             &None,
             &common_settings(false, true), // overwrite!
             false,
@@ -1020,7 +1020,7 @@ mod link_tests {
             &PROGRESS,
             &tmp_dir,
             &tmp_dir.join("foo"),
-            &output_path,
+            output_path,
             &None,
             &common_settings(false, true), // overwrite!
             false,
