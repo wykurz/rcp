@@ -1,8 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use tokio::sync::mpsc;
-use tracing::{Event, Subscriber};
-use tracing_subscriber::{field::Visit, layer::Context, registry::LookupSpan, Layer};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TracingMessage {
@@ -16,31 +12,31 @@ pub struct TracingMessage {
 
 /// A tracing layer that sends logs to a remote destination
 pub struct RemoteTracingLayer {
-    pub sender: mpsc::UnboundedSender<TracingMessage>,
+    pub sender: tokio::sync::mpsc::UnboundedSender<TracingMessage>,
 }
 
 impl RemoteTracingLayer {
-    pub fn new() -> (Self, mpsc::UnboundedReceiver<TracingMessage>) {
-        let (sender, receiver) = mpsc::unbounded_channel();
+    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<TracingMessage>) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         (Self { sender }, receiver)
     }
 }
 
 struct FieldVisitor {
-    fields: HashMap<String, String>,
+    fields: std::collections::HashMap<String, String>,
     message: Option<String>,
 }
 
 impl FieldVisitor {
     fn new() -> Self {
         Self {
-            fields: HashMap::new(),
+            fields: std::collections::HashMap::new(),
             message: None,
         }
     }
 }
 
-impl Visit for FieldVisitor {
+impl tracing_subscriber::field::Visit for FieldVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         let value_str = format!("{value:?}");
         if field.name() == "message" {
@@ -80,11 +76,15 @@ impl Visit for FieldVisitor {
     }
 }
 
-impl<S> Layer<S> for RemoteTracingLayer
+impl<S> tracing_subscriber::Layer<S> for RemoteTracingLayer
 where
-    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
 {
-    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         let mut visitor = FieldVisitor::new();
         event.record(&mut visitor);
 
