@@ -6,8 +6,6 @@ pub struct TracingMessage {
     pub level: String,
     pub target: String,
     pub message: String,
-    pub fields: std::collections::HashMap<String, String>,
-    pub span: Option<String>,
 }
 
 /// A tracing layer that sends logs to a remote destination
@@ -87,7 +85,6 @@ where
     ) {
         let mut visitor = FieldVisitor::new();
         event.record(&mut visitor);
-
         let message = visitor.message.unwrap_or_else(|| {
             if visitor.fields.is_empty() {
                 "".to_string()
@@ -95,14 +92,11 @@ where
                 format!("{:?}", visitor.fields)
             }
         });
-
         let tracing_message = TracingMessage {
             timestamp: std::time::SystemTime::now(),
             level: event.metadata().level().to_string(),
             target: event.metadata().target().to_string(),
             message,
-            fields: visitor.fields,
-            span: None, // TODO: Add span information if needed
         };
 
         if self.sender.send(tracing_message).is_err() {

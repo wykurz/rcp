@@ -35,23 +35,36 @@ pub async fn run_remote_tracing_receiver(connection: Arc<quinn::Connection>) -> 
                     _ => tracing::Level::INFO,
                 };
 
-                // Log the remote message locally
+                // Log the remote message locally with timestamp
                 let remote_target = format!("remote::{}", msg.target);
+                let timestamp_str = match msg.timestamp.duration_since(std::time::UNIX_EPOCH) {
+                    Ok(duration) => {
+                        let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                            duration.as_secs() as i64,
+                            duration.subsec_nanos(),
+                        );
+                        match datetime {
+                            Some(dt) => dt.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string(),
+                            None => format!("{:?}", msg.timestamp),
+                        }
+                    }
+                    Err(_) => format!("{:?}", msg.timestamp),
+                };
                 match level {
                     tracing::Level::ERROR => {
-                        tracing::error!(target: "remote", "{}: {}", remote_target, msg.message)
+                        tracing::error!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, msg.message)
                     }
                     tracing::Level::WARN => {
-                        tracing::warn!(target: "remote", "{}: {}", remote_target, msg.message)
+                        tracing::warn!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, msg.message)
                     }
                     tracing::Level::INFO => {
-                        tracing::info!(target: "remote", "{}: {}", remote_target, msg.message)
+                        tracing::info!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, msg.message)
                     }
                     tracing::Level::DEBUG => {
-                        tracing::debug!(target: "remote", "{}: {}", remote_target, msg.message)
+                        tracing::debug!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, msg.message)
                     }
                     tracing::Level::TRACE => {
-                        tracing::trace!(target: "remote", "{}: {}", remote_target, msg.message)
+                        tracing::trace!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, msg.message)
                     }
                 }
             }
