@@ -122,6 +122,7 @@ fn main() -> Result<(), anyhow::Error> {
         args.iops_throttle,
         args.chunk_size,
         args.tput_throttle,
+        None,
         func,
     );
     if res.is_none() {
