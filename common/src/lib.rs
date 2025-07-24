@@ -521,7 +521,9 @@ pub fn run_with_remote_tracing<Fut, Summary, Error>(
     iops_throttle: usize,
     chunk_size: u64,
     tput_throttle: usize,
-    remote_tracing_sender: Option<tokio::sync::mpsc::UnboundedSender<crate::remote_tracing::TracingMessage>>,
+    remote_tracing_sender: Option<
+        tokio::sync::mpsc::UnboundedSender<crate::remote_tracing::TracingMessage>,
+    >,
     func: impl FnOnce() -> Fut,
 ) -> Option<Summary>
 // we return an Option rather than a Result to indicate that callers of this function will NOT print the error
@@ -533,21 +535,17 @@ where
     if !quiet {
         if let Some(sender) = remote_tracing_sender {
             // Set up remote tracing layer
-            let remote_layer = crate::remote_tracing::RemoteTracingLayer {
-                sender,
-            };
-            
-            let subscriber = tracing_subscriber::registry()
-                .with(remote_layer)
-                .with(
-                    tracing_subscriber::EnvFilter::try_new(match verbose {
-                        0 => "error",
-                        1 => "info",
-                        2 => "debug",
-                        _ => "trace",
-                    })
-                    .unwrap(),
-                );
+            let remote_layer = crate::remote_tracing::RemoteTracingLayer { sender };
+
+            let subscriber = tracing_subscriber::registry().with(remote_layer).with(
+                tracing_subscriber::EnvFilter::try_new(match verbose {
+                    0 => "error",
+                    1 => "info",
+                    2 => "debug",
+                    _ => "trace",
+                })
+                .unwrap(),
+            );
             subscriber.init();
         } else {
             // Set up local tracing (same as the regular run function)
@@ -595,7 +593,7 @@ where
             "Quiet mode and verbose mode are mutually exclusive"
         );
     }
-    
+
     // Set up runtime and run the same way as the regular run function
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
@@ -621,7 +619,7 @@ where
         tracing::info!("Not applying any limit to max open files!");
     }
     let runtime = builder.build().expect("Failed to create runtime");
-    
+
     fn get_replenish_interval(replenish: usize) -> (usize, std::time::Duration) {
         let mut replenish = replenish;
         let mut interval = std::time::Duration::from_secs(1);
@@ -631,7 +629,7 @@ where
         }
         (replenish, interval)
     }
-    
+
     if ops_throttle > 0 {
         let (replenish, interval) = get_replenish_interval(ops_throttle);
         throttle::init_ops_tokens(replenish);
@@ -657,7 +655,7 @@ where
         );
         return None;
     }
-    
+
     let res = {
         let _progress = progress.map(|settings| {
             let delay = settings.progress_delay.map(|delay_str| {
@@ -668,7 +666,7 @@ where
         });
         runtime.block_on(func())
     };
-    
+
     match &res {
         Ok(summary) => {
             if print_summary || verbose > 0 {

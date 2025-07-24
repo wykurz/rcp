@@ -1,13 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tracing::{Event, Subscriber};
-use tracing_subscriber::{
-    field::Visit,
-    layer::Context,
-    registry::LookupSpan,
-    Layer,
-};
-use serde::{Deserialize, Serialize};
+use tracing_subscriber::{field::Visit, layer::Context, registry::LookupSpan, Layer};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TracingMessage {
@@ -59,24 +54,29 @@ impl Visit for FieldVisitor {
         if field.name() == "message" {
             self.message = Some(value.to_string());
         } else {
-            self.fields.insert(field.name().to_string(), value.to_string());
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
         }
     }
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
 
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
 }
 

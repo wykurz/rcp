@@ -22,9 +22,7 @@ pub async fn run_remote_tracing_sender(
 }
 
 /// Receive tracing messages from remote rcpd processes and log them locally
-pub async fn run_remote_tracing_receiver(
-    connection: Arc<quinn::Connection>,
-) -> anyhow::Result<()> {
+pub async fn run_remote_tracing_receiver(connection: Arc<quinn::Connection>) -> anyhow::Result<()> {
     while let Ok(datagram) = connection.read_datagram().await {
         match bincode::deserialize::<common::remote_tracing::TracingMessage>(&datagram) {
             Ok(msg) => {
@@ -40,11 +38,21 @@ pub async fn run_remote_tracing_receiver(
                 // Log the remote message locally
                 let remote_target = format!("remote::{}", msg.target);
                 match level {
-                    tracing::Level::ERROR => tracing::error!(target: "remote", "{}: {}", remote_target, msg.message),
-                    tracing::Level::WARN => tracing::warn!(target: "remote", "{}: {}", remote_target, msg.message),
-                    tracing::Level::INFO => tracing::info!(target: "remote", "{}: {}", remote_target, msg.message),
-                    tracing::Level::DEBUG => tracing::debug!(target: "remote", "{}: {}", remote_target, msg.message),
-                    tracing::Level::TRACE => tracing::trace!(target: "remote", "{}: {}", remote_target, msg.message),
+                    tracing::Level::ERROR => {
+                        tracing::error!(target: "remote", "{}: {}", remote_target, msg.message)
+                    }
+                    tracing::Level::WARN => {
+                        tracing::warn!(target: "remote", "{}: {}", remote_target, msg.message)
+                    }
+                    tracing::Level::INFO => {
+                        tracing::info!(target: "remote", "{}: {}", remote_target, msg.message)
+                    }
+                    tracing::Level::DEBUG => {
+                        tracing::debug!(target: "remote", "{}: {}", remote_target, msg.message)
+                    }
+                    tracing::Level::TRACE => {
+                        tracing::trace!(target: "remote", "{}: {}", remote_target, msg.message)
+                    }
                 }
             }
             Err(e) => {
