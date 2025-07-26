@@ -65,10 +65,11 @@ struct Args {
 }
 
 #[instrument]
-async fn async_main(args: Args) -> anyhow::Result<String> {
-    // master_endpoint
-    let client = remote::get_client()?;
-    let master_connection = client.connect(args.master_addr, &args.server_name)?.await?;
+async fn async_main(
+    args: Args,
+    master_connection: quinn::Connection,
+    tracing_sender_task: tokio::task::JoinHandle<()>,
+) -> anyhow::Result<String> {
     tracing::info!("Connected to master");
     let hello_message = master_connection.read_datagram().await?;
     let master_hello = bincode::deserialize::<remote::protocol::MasterHello>(&hello_message)?;
@@ -106,9 +107,19 @@ async fn async_main(args: Args) -> anyhow::Result<String> {
 
 fn main() -> Result<(), anyhow::Error> {
     let args = Args::from_args();
+    let client = remote::get_client()?;
+    let master_connection = client.connect(args.master_addr, &args.server_name)?.await?;
+    let (tracing_layer, tracing_receiver) = common::remote_tracing::RemoteTracingLayer::new();
+    let cancellation_token = tokio_util::sync::CancellationToken::new();
+    let tracing_sender_task = tokio::spawn(remote::run_remote_tracing_sender(
+        tracing_receiver,
+        master_connection.clone(),
+        cancellation_token.clone(),
+    ));
+    // TODO: signal cancellation_token when the process is about to exit
     let func = {
         let args = args.clone();
-        || async_main(args)
+        || async_main(args, master_connection.clone(), tracing_sender_task)
     };
     let res = common::run(
         None,
@@ -122,7 +133,7 @@ fn main() -> Result<(), anyhow::Error> {
         args.iops_throttle,
         args.chunk_size,
         args.tput_throttle,
-        None,
+        Some(tracing_layer),
         func,
     );
     if res.is_none() {

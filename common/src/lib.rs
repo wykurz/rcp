@@ -353,7 +353,7 @@ impl std::io::Write for ProgWriter {
     }
 }
 
-#[instrument(skip(func, remote_tracing_sender))] // "func" is not Debug printable
+#[instrument(skip(func))] // "func" is not Debug printable
 #[allow(clippy::too_many_arguments)]
 pub fn run<Fut, Summary, Error>(
     progress: Option<ProgressSettings>,
@@ -367,9 +367,7 @@ pub fn run<Fut, Summary, Error>(
     iops_throttle: usize,
     chunk_size: u64,
     tput_throttle: usize,
-    remote_tracing_sender: Option<
-        tokio::sync::mpsc::UnboundedSender<crate::remote_tracing::TracingMessage>,
-    >,
+    remote_tracing_layer: Option<remote_tracing::RemoteTracingLayer>,
     func: impl FnOnce() -> Fut,
 ) -> Option<Summary>
 // we return an Option rather than a Result to indicate that callers of this function will NOT print the error
@@ -379,22 +377,20 @@ where
     Fut: std::future::Future<Output = Result<Summary, Error>>,
 {
     if !quiet {
-        if let Some(sender) = remote_tracing_sender {
-            // Set up remote tracing layer
-            let remote_layer = crate::remote_tracing::RemoteTracingLayer { sender };
-
-            let subscriber = tracing_subscriber::registry().with(remote_layer).with(
-                tracing_subscriber::EnvFilter::try_new(match verbose {
-                    0 => "error",
-                    1 => "info",
-                    2 => "debug",
-                    _ => "trace",
-                })
-                .unwrap(),
-            );
+        if let Some(remote_tracing_layer) = remote_tracing_layer {
+            let subscriber = tracing_subscriber::registry()
+                .with(remote_tracing_layer)
+                .with(
+                    tracing_subscriber::EnvFilter::try_new(match verbose {
+                        0 => "error",
+                        1 => "info",
+                        2 => "debug",
+                        _ => "trace",
+                    })
+                    .unwrap(),
+                );
             subscriber.init();
         } else {
-            // Set up local tracing (same as the regular run function)
             let fmt_layer = tracing_subscriber::fmt::layer()
                 .with_target(true)
                 .with_line_number(true)

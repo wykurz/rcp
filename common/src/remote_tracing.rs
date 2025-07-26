@@ -8,7 +8,7 @@ pub struct TracingMessage {
     pub message: String,
 }
 
-/// A tracing layer that sends logs to a remote destination
+#[derive(Debug)]
 pub struct RemoteTracingLayer {
     pub sender: tokio::sync::mpsc::UnboundedSender<TracingMessage>,
 }
@@ -98,13 +98,9 @@ where
             target: event.metadata().target().to_string(),
             message,
         };
-
         if self.sender.send(tracing_message).is_err() {
             // If we can't send the tracing message, there's not much we can do
             // The receiver has probably been dropped
         }
     }
 }
-
-// Note: These functions will be implemented in the remote crate where quinn is available
-// They are just placeholders here to make the common crate compile

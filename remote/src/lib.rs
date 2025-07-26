@@ -5,23 +5,28 @@ use tracing::instrument;
 
 pub mod protocol;
 
-/// Send tracing messages over a QUIC connection
 pub async fn run_remote_tracing_sender(
     mut receiver: tokio::sync::mpsc::UnboundedReceiver<common::remote_tracing::TracingMessage>,
-    connection: Arc<quinn::Connection>,
+    connection: quinn::Connection,
+    cancellation_token: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
-    while let Some(msg) = receiver.recv().await {
-        // Send each tracing message as a separate datagram
+    while let Some(msg) = tokio::select! {
+        msg = receiver.recv() => msg,
+        _ = cancellation_token.cancelled() => {
+            println!("Remote tracing sender done, receiver shutdown signal");
+            return Ok(());
+        }
+    } {
+        // let msg = msg.ok_or_else(|| anyhow!("Remote tracing sender channel closed"))?;
         let serialized = bincode::serialize(&msg)?;
         if let Err(e) = connection.send_datagram(serialized.into()) {
-            tracing::warn!("Failed to send tracing message: {}", e);
-            // Continue processing other messages even if one fails
+            eprintln!("Failed to send tracing message: {}", e);
         }
     }
+    println!("Remote tracing sender done, no more messages to send");
     Ok(())
 }
 
-/// Receive tracing messages from remote rcpd processes and log them locally
 pub async fn run_remote_tracing_receiver(connection: Arc<quinn::Connection>) -> anyhow::Result<()> {
     while let Ok(datagram) = connection.read_datagram().await {
         match bincode::deserialize::<common::remote_tracing::TracingMessage>(&datagram) {
@@ -34,8 +39,6 @@ pub async fn run_remote_tracing_receiver(connection: Arc<quinn::Connection>) -> 
                     "TRACE" => tracing::Level::TRACE,
                     _ => tracing::Level::INFO,
                 };
-
-                // Log the remote message locally with timestamp
                 let remote_target = format!("remote::{}", msg.target);
                 let timestamp_str = match msg.timestamp.duration_since(std::time::UNIX_EPOCH) {
                     Ok(duration) => {
