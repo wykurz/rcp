@@ -133,7 +133,6 @@ async fn write_file(
     chunk_size: u64,
 ) -> Result<()> {
     let _permit = throttle::open_file_permit().await;
-    throttle::get_ops_token().await;
     if chunk_size > 0 {
         let tokens = 1 + (std::cmp::max(1, filesize) - 1) as u64 / chunk_size;
         if tokens > u32::MAX as u64 {
@@ -195,6 +194,10 @@ async fn filegen(
     }
     // generate files
     for i in 0..numfiles {
+        // it's better to await the token here so that we throttle how many tasks we spawn. the
+        // ops-throttle will never cause a deadlock (unlike max-open-files limit) so it's safe to
+        // do here.
+        throttle::get_ops_token().await;
         let path = root.join(format!("file{i}"));
         join_set.spawn(write_file(path.clone(), filesize, writebuf, chunk_size));
     }
