@@ -1,6 +1,6 @@
 [package]
 name = "filegen"
-version = "0.18.0"
+version = "0.19.0"
 description = "Tool for generating filesets typically used for testing."
 license = "MIT"
 edition = "2021"
