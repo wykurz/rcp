@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Metadata {
     pub mode: u32,
     pub uid: u32,
@@ -76,7 +76,7 @@ impl From<&std::fs::Metadata> for Metadata {
 }
 
 // implies files contents will be sent immediately after receiving this object
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct File {
     pub src: std::path::PathBuf,
     pub dst: std::path::PathBuf,
@@ -85,7 +85,7 @@ pub struct File {
     pub is_root: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub enum SourceMessage {
     DirStub {
         src: std::path::PathBuf,
@@ -110,20 +110,20 @@ pub enum SourceMessage {
     SourceDone, // must be the last message sent by the source
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SrcDst {
     pub src: std::path::PathBuf,
     pub dst: std::path::PathBuf,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum DestinationMessage {
     DirectoryCreated(SrcDst),
     DirectoryComplete(SrcDst),
     DestinationDone, // must be the last message sent by the destination
 }
 
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Deserialize, Serialize)]
 pub struct RcpdConfig {
     pub fail_early: bool,
     pub max_workers: usize,
@@ -135,23 +135,22 @@ pub struct RcpdConfig {
     pub tput_throttle: usize,
 }
 
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Deserialize, Serialize)]
 pub struct SourceConfig {
     pub dereference: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DestinationConfig {
     pub overwrite: bool,
     pub overwrite_compare: String,
-    pub preserve: bool,
-    pub preserve_settings: Option<String>,
+    pub preserve: common::preserve::Settings,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TracingHello {}
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum MasterHello {
     Source {
         src: std::path::PathBuf,
@@ -167,11 +166,11 @@ pub enum MasterHello {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SourceMasterHello {
     pub source_addr: std::net::SocketAddr,
     pub server_name: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RcpdGoodBye {}

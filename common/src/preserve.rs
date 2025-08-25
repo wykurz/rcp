@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
 use tracing::instrument;
@@ -37,7 +38,7 @@ impl Metadata for std::fs::Metadata {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize)]
 pub struct UserAndTimeSettings {
     pub uid: bool,
     pub gid: bool,
@@ -52,7 +53,7 @@ impl UserAndTimeSettings {
 
 pub type ModeMask = u32;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Deserialize, Serialize)]
 pub struct FileSettings {
     pub user_and_time: UserAndTimeSettings,
     pub mode_mask: ModeMask,
@@ -67,7 +68,7 @@ impl Default for FileSettings {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Deserialize, Serialize)]
 pub struct DirSettings {
     pub user_and_time: UserAndTimeSettings,
     pub mode_mask: ModeMask,
@@ -82,7 +83,7 @@ impl Default for DirSettings {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize)]
 pub struct SymlinkSettings {
     pub user_and_time: UserAndTimeSettings,
 }
@@ -93,7 +94,7 @@ impl SymlinkSettings {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Settings {
     pub file: FileSettings,
     pub dir: DirSettings,

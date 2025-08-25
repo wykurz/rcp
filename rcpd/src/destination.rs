@@ -17,6 +17,7 @@ async fn send_root_done(
 
 #[instrument]
 async fn handle_file_stream(
+    destination_config: remote::protocol::DestinationConfig,
     control_send_stream: remote::streams::SharedSendStream,
     mut file_recv_stream: remote::streams::RecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
@@ -50,8 +51,12 @@ async fn handle_file_stream(
         file_header.dst.display(),
         file_header.size
     );
-    let settings = common::preserve::preserve_all();
-    common::preserve::set_file_metadata(&settings, &file_header.metadata, &file_header.dst).await?;
+    common::preserve::set_file_metadata(
+        &destination_config.preserve,
+        &file_header.metadata,
+        &file_header.dst,
+    )
+    .await?;
     if file_header.is_root {
         tracing::info!("Root file processed");
         send_root_done(control_send_stream).await?;
@@ -68,6 +73,7 @@ async fn handle_file_stream(
 
 #[instrument]
 async fn process_incoming_file_streams(
+    destination_config: remote::protocol::DestinationConfig,
     control_send_stream: remote::streams::SharedSendStream,
     connection: remote::streams::Connection,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
@@ -78,6 +84,7 @@ async fn process_incoming_file_streams(
         tracing::info!("Received new unidirectional stream for file");
         let tracker = directory_tracker.clone();
         join_set.spawn(handle_file_stream(
+            destination_config.clone(),
             control_send_stream.clone(),
             file_recv_stream,
             tracker.clone(),
@@ -94,6 +101,7 @@ async fn process_incoming_file_streams(
 
 #[instrument]
 async fn create_directory_structure(
+    destination_config: &remote::protocol::DestinationConfig,
     control_send_stream: remote::streams::SharedSendStream,
     mut control_recv_stream: remote::streams::RecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
@@ -112,7 +120,7 @@ async fn create_directory_structure(
                 ref dst,
                 num_entries,
             } => {
-                tokio::fs::create_dir_all(&dst).await?;
+                tokio::fs::create_dir(&dst).await?;
                 directory_tracker
                     .add_directory(src, dst, num_entries)
                     .await
@@ -125,9 +133,8 @@ async fn create_directory_structure(
                 is_root,
             } => {
                 // apply metadata changes now that directory is complete
-                let settings = common::preserve::preserve_all();
-                common::preserve::set_dir_metadata(&settings, metadata, dst).await?;
-                tracing::info!("Applied metadata for completed directory: {:?}", dst);
+                common::preserve::set_dir_metadata(&destination_config.preserve, metadata, dst)
+                    .await?;
                 if is_root {
                     tracing::info!("Root directory processed");
                     send_root_done(control_send_stream).await?;
@@ -147,9 +154,8 @@ async fn create_directory_structure(
                 is_root,
             } => {
                 tokio::fs::symlink(target, dst).await?;
-                let settings = common::preserve::preserve_all();
-                common::preserve::set_symlink_metadata(&settings, metadata, dst).await?;
-                // TODO: deduplicate
+                common::preserve::set_symlink_metadata(&destination_config.preserve, metadata, dst)
+                    .await?;
                 if is_root {
                     tracing::info!("Root symlink processed");
                     send_root_done(control_send_stream).await?;
@@ -177,7 +183,7 @@ async fn create_directory_structure(
 pub async fn run_destination(
     src_endpoint: &std::net::SocketAddr,
     src_server_name: &str,
-    _destination_config: &remote::protocol::DestinationConfig,
+    destination_config: &remote::protocol::DestinationConfig,
     _rcpd_config: &remote::protocol::RcpdConfig,
 ) -> anyhow::Result<String> {
     let client = remote::get_client()?;
@@ -189,13 +195,19 @@ pub async fn run_destination(
     tracing::info!("Received directory creation streams");
     let directory_tracker = directory_tracker::make_shared(control_send_stream.clone());
     let file_handler_task = tokio::spawn(process_incoming_file_streams(
+        destination_config.clone(),
         control_send_stream.clone(),
         connection.clone(),
         directory_tracker.clone(),
     ));
-    create_directory_structure(control_send_stream, control_recv_stream, directory_tracker)
-        .await
-        .context("Failed to create directory structure")?;
+    create_directory_structure(
+        destination_config,
+        control_send_stream,
+        control_recv_stream,
+        directory_tracker,
+    )
+    .await
+    .context("Failed to create directory structure")?;
     file_handler_task
         .await
         .context("Failed to process incoming file streams")??;
