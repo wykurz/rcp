@@ -130,6 +130,7 @@ struct Args {
 #[instrument]
 async fn run_rcpd_master(
     args: &Args,
+    preserve: &common::preserve::Settings,
     src: &path::RemotePath,
     dst: &path::RemotePath,
 ) -> anyhow::Result<common::copy::Summary> {
@@ -248,8 +249,7 @@ async fn run_rcpd_master(
                 destination_config: remote::protocol::DestinationConfig {
                     overwrite: args.overwrite,
                     overwrite_compare: args.overwrite_compare.clone(),
-                    preserve: args.preserve,
-                    preserve_settings: args.preserve_settings.clone(),
+                    preserve: *preserve,
                 },
                 rcpd_config,
             })
@@ -323,13 +323,26 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         }
         (path::PathType::Local(_), path::PathType::Local(_)) => None,
     };
+    if args.preserve_settings.is_some() && args.preserve {
+        tracing::warn!("The --preserve flag is ignored when --preserve-settings is specified!");
+    }
+    let preserve = if let Some(preserve_settings) = &args.preserve_settings {
+        common::parse_preserve_settings(preserve_settings)
+            .map_err(|err| common::copy::Error::new(err, Default::default()))?
+    } else if args.preserve {
+        common::preserve::preserve_all()
+    } else {
+        common::preserve::preserve_default()
+    };
+    tracing::debug!("preserve settings: {:?}", &preserve);
     if let Some((remote_src, remote_dst)) = remote_src_dst {
         if src_strings.len() > 1 {
             return Err(anyhow!(
                 "Multiple sources are currently not supported when using remote paths!"
             ));
         }
-        return run_rcpd_master(&args, &remote_src, &remote_dst).await;
+        return run_rcpd_master(&args, &preserve, &remote_src, &remote_dst).await;
+        // HERE
     }
     let src_dst: Vec<(std::path::PathBuf, std::path::PathBuf)> = if dst_string.ends_with('/') {
         // rcp foo bar baz/ -> copy foo to baz/foo and bar to baz/bar
@@ -375,18 +388,6 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         chunk_size: args.chunk_size.0,
     };
     tracing::debug!("copy settings: {:?}", &settings);
-    if args.preserve_settings.is_some() && args.preserve {
-        tracing::warn!("The --preserve flag is ignored when --preserve-settings is specified!");
-    }
-    let preserve = if let Some(preserve_settings) = args.preserve_settings {
-        common::parse_preserve_settings(&preserve_settings)
-            .map_err(|err| common::copy::Error::new(err, Default::default()))?
-    } else if args.preserve {
-        common::preserve::preserve_all()
-    } else {
-        common::preserve::preserve_default()
-    };
-    tracing::debug!("preserve settings: {:?}", &preserve);
     let mut join_set = tokio::task::JoinSet::new();
     for (src_path, dst_path) in src_dst {
         let do_copy =
