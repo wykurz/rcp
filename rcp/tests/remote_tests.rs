@@ -112,7 +112,6 @@ fn test_remote_copy_directory() {
 }
 
 #[test]
-#[ignore = "functionality not working yet"]
 fn test_remote_copy_symlink_no_dereference() {
     let (src_dir, dst_dir) = setup_test_env();
     let target_file = src_dir.path().join("target.txt");
@@ -131,7 +130,6 @@ fn test_remote_copy_symlink_no_dereference() {
 }
 
 #[test]
-#[ignore = "functionality not working yet"]
 fn test_remote_copy_symlink_with_dereference() {
     let (src_dir, dst_dir) = setup_test_env();
     let target_file = src_dir.path().join("target.txt");

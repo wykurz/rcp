@@ -5,18 +5,33 @@ use tracing::instrument;
 #[instrument]
 #[async_recursion]
 async fn send_directories_and_symlinks(
+    source_config: &remote::protocol::SourceConfig,
     src: &std::path::Path,
     dst: &std::path::Path,
     is_root: bool,
     control_send_stream: &remote::streams::SharedSendStream,
     connection: &remote::streams::Connection,
 ) -> anyhow::Result<()> {
-    tracing::info!("Sending data from {:?} to {:?}", src, dst);
+    tracing::debug!("Sending data from {:?} to {:?}", src, dst);
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from src: {:?}", &src))?;
+    if src_metadata.is_file() {
+        return Ok(());
+    }
+    if src_metadata.is_symlink() && source_config.dereference {
+        let target = tokio::fs::canonicalize(src).await?;
+        return send_directories_and_symlinks(
+            source_config,
+            &target,
+            dst,
+            is_root,
+            control_send_stream,
+            connection,
+        )
+        .await;
+    }
     if src_metadata.is_symlink() {
-        // TODO: handle dereferencing symlinks
         let symlink = remote::protocol::SourceMessage::Symlink {
             src: src.to_path_buf(),
             dst: dst.to_path_buf(),
@@ -35,7 +50,6 @@ async fn send_directories_and_symlinks(
             src_metadata.is_file(),
             "Encountered fs object that's not a directory, symlink or a file? {src:?}"
         );
-        // handle files separately
         return Ok(());
     }
     // we do one more read_dir to count entries; this could be avoided by e.g. modifying
@@ -69,10 +83,16 @@ async fn send_directories_and_symlinks(
         .await
         .with_context(|| format!("failed traversing src directory {:?}", &src))?
     {
+        assert!(
+            entry_count > 0,
+            "Entry count for {src:?} is out of sync, was it modified during the copy?"
+        );
+        entry_count -= 1;
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
         send_directories_and_symlinks(
+            source_config,
             &entry_path,
             &dst_path,
             false,
@@ -81,30 +101,48 @@ async fn send_directories_and_symlinks(
         )
         .await?;
     }
+    assert!(
+        entry_count == 0,
+        "Entry count for {src:?} is out of sync, was it modified during the copy?"
+    );
     Ok(())
 }
 
 #[instrument]
 #[async_recursion]
 async fn send_fs_objects(
+    source_config: &remote::protocol::SourceConfig,
     src: &std::path::Path,
     dst: &std::path::Path,
     control_send_stream: remote::streams::SharedSendStream,
     connection: remote::streams::Connection,
 ) -> anyhow::Result<()> {
     tracing::info!("Sending data from {:?} to {:?}", src, dst);
-    let src_metadata = tokio::fs::symlink_metadata(src)
+    let target = if source_config.dereference {
+        tokio::fs::canonicalize(src).await?
+    } else {
+        src.to_path_buf()
+    };
+    let target_metadata = tokio::fs::symlink_metadata(&target)
         .await
-        .with_context(|| format!("failed reading metadata from src: {:?}", &src))?;
-    if !src_metadata.is_file() {
-        send_directories_and_symlinks(src, dst, true, &control_send_stream, &connection).await?;
+        .with_context(|| format!("failed reading metadata from src: {:?}", &target))?;
+    if !target_metadata.is_file() {
+        send_directories_and_symlinks(
+            source_config,
+            &target,
+            dst,
+            true,
+            &control_send_stream,
+            &connection,
+        )
+        .await?;
     }
     let mut stream = control_send_stream.lock().await;
     stream
         .send_control_message(&remote::protocol::SourceMessage::DirStructureComplete)
         .await?;
-    if src_metadata.is_file() {
-        send_file(src, dst, true, connection).await?;
+    if target_metadata.is_file() {
+        send_file(&target, dst, true, connection).await?;
     }
     return Ok(());
 }
@@ -145,10 +183,12 @@ async fn send_file(
 
 #[instrument]
 async fn send_files_in_directory(
+    source_config: &remote::protocol::SourceConfig,
     src: &std::path::Path,
     dst: &std::path::Path,
     connection: remote::streams::Connection,
 ) -> anyhow::Result<()> {
+    tracing::info!("Sending files from {src:?}");
     let mut entries = tokio::fs::read_dir(src)
         .await
         .with_context(|| format!("cannot open directory {src:?} for reading"))?;
@@ -161,8 +201,19 @@ async fn send_files_in_directory(
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
+        let target = if source_config.dereference {
+            tokio::fs::canonicalize(&entry_path).await?
+        } else {
+            entry_path.to_path_buf()
+        };
+        let target_metadata = tokio::fs::symlink_metadata(&target)
+            .await
+            .with_context(|| format!("failed reading metadata from src: {:?}", &target))?;
+        if !target_metadata.is_file() {
+            continue;
+        }
         let connection = connection.clone();
-        join_set.spawn(async move { send_file(&entry_path, &dst_path, false, connection).await });
+        join_set.spawn(async move { send_file(&target, &dst_path, false, connection).await });
     }
     drop(entries);
     while let Some(res) = join_set.join_next().await {
@@ -173,6 +224,7 @@ async fn send_files_in_directory(
 
 #[instrument]
 async fn dispatch_control_messages(
+    source_config: remote::protocol::SourceConfig,
     mut control_recv_stream: remote::streams::RecvStream,
     control_send_stream: remote::streams::SharedSendStream,
     connection: remote::streams::Connection,
@@ -189,8 +241,13 @@ async fn dispatch_control_messages(
                     confirmation.src,
                     confirmation.dst
                 );
-                send_files_in_directory(&confirmation.src, &confirmation.dst, connection.clone())
-                    .await?;
+                send_files_in_directory(
+                    &source_config,
+                    &confirmation.src,
+                    &confirmation.dst,
+                    connection.clone(),
+                )
+                .await?;
             }
             remote::protocol::DestinationMessage::DirectoryComplete(completion) => {
                 tracing::info!(
@@ -237,6 +294,7 @@ async fn dispatch_control_messages(
 
 async fn handle_connection(
     conn: quinn::Connecting,
+    source_config: &remote::protocol::SourceConfig,
     src: &std::path::Path,
     dst: &std::path::Path,
 ) -> anyhow::Result<()> {
@@ -247,12 +305,13 @@ async fn handle_connection(
     tracing::info!("Opened streams for directory transfer");
     let src_root = src.to_path_buf();
     let dispatch_task = tokio::spawn(dispatch_control_messages(
+        *source_config,
         control_recv_stream,
         control_send_stream.clone(),
         connection.clone(),
         src_root.clone(),
     ));
-    send_fs_objects(src, dst, control_send_stream, connection).await?;
+    send_fs_objects(source_config, src, dst, control_send_stream, connection).await?;
     dispatch_task.await??;
     tracing::info!("Data sent successfully");
     Ok(())
@@ -263,8 +322,8 @@ pub async fn run_source(
     master_send_stream: remote::streams::SharedSendStream,
     src: &std::path::Path,
     dst: &std::path::Path,
-    _source_config: &remote::protocol::SourceConfig,
-    _rcpd_config: &remote::protocol::RcpdConfig,
+    source_config: &remote::protocol::SourceConfig,
+    _rcpd_config: &remote::protocol::RcpdConfig, // TODO: use
 ) -> anyhow::Result<String> {
     let server_endpoint = remote::get_server()?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
@@ -282,7 +341,7 @@ pub async fn run_source(
     tracing::info!("Waiting for connection from destination");
     if let Some(conn) = server_endpoint.accept().await {
         tracing::info!("New destination connection incoming");
-        handle_connection(conn, src, dst).await?;
+        handle_connection(conn, source_config, src, dst).await?;
     } else {
         tracing::error!("Timed out waiting for destination to connect");
         return Err(anyhow::anyhow!(
