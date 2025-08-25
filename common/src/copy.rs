@@ -209,6 +209,7 @@ pub async fn copy(
         .with_context(|| format!("failed reading metadata from src: {:?}", &src))
         .map_err(|err| Error::new(err, Default::default()))?;
     if settings.dereference && src_metadata.is_symlink() {
+        // TODO: use tokio::fs::canonicalize instead
         let link = tokio::fs::read_link(&src)
             .await
             .with_context(|| format!("failed reading src symlink {:?}", &src))
