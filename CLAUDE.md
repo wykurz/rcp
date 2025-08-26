@@ -7,8 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Build all packages**: `cargo build`
 - **Build specific package**: `cargo build -p <package_name>` (e.g., `cargo build -p rcp`)
 - **Build for release**: `cargo build --release`
-- **Test all packages**: `cargo test --verbose`
-- **Test specific package**: `cargo test -p <package_name>`
+- **Test all packages**: `cargo nextest run` (recommended) or `cargo test --verbose`
+- **Test with full output**: `cargo nextest run --no-capture`
+- **Test specific package**: `cargo nextest run -p <package_name>` or `cargo test -p <package_name>`
+- **Test specific test**: `cargo nextest run --no-capture <test_name>`
 - **Format code**: `cargo fmt`
 - **Check formatting**: `cargo fmt --check`
 - **Lint code**: `cargo clippy`

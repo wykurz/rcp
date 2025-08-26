@@ -105,6 +105,7 @@
             cargo-expand
             cargo-flamegraph
             cargo-generate
+            cargo-nextest
             cargo-outdated
             cargo-udeps
             gdb
@@ -123,6 +124,7 @@
             echo "Available commands:"
             echo "  cargo build          - Build all packages"
             echo "  cargo test           - Test all packages"
+            echo "  cargo nextest run    - Test with better output (recommended)"
             echo "  cargo fmt            - Format code"
             echo "  cargo clippy         - Lint code"
             echo ""
