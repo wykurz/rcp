@@ -20,6 +20,7 @@ in
       cargo-expand
       cargo-flamegraph
       cargo-generate
+      cargo-nextest
       cargo-outdated
       cargo-udeps
       gdb

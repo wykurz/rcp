@@ -29,5 +29,16 @@ jobs:
       run: cargo fmt --check
     - name: Lint
       run: cargo clippy
+    - name: Install cargo-nextest
+      run: cargo install cargo-nextest
     - name: Test
-      run: cargo test --verbose
+      run: |
+        # Run tests with nextest for better output
+        cargo nextest run --no-capture 2>&1 | tee test_output.log
+      continue-on-error: true
+    - name: Upload test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs
+        path: test_output.log

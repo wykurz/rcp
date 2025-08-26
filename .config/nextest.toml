@@ -1,0 +1,12 @@
+[profile.default]
+# Allow most tests to run in parallel
+test-threads = 32
+
+[test-groups]
+# Serial execution for remote tests that use SSH to localhost
+serial = { max-threads = 1 }
+
+# But run remote tests that use localhost SSH serially
+[[profile.default.overrides]]
+filter = 'test(remote)'
+test-group = 'serial'
