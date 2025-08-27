@@ -276,9 +276,7 @@ pub async fn copy(
     settings: &copy::Settings,
     preserve: &preserve::Settings,
 ) -> Result<copy::Summary, copy::Error> {
-    let cwd = std::env::current_dir()
-        .map_err(|err| copy::Error::new(anyhow::Error::msg(err), copy::Summary::default()))?;
-    copy::copy(&PROGRESS, &cwd, src, dst, settings, preserve, false).await
+    copy::copy(&PROGRESS, src, dst, settings, preserve, false).await
 }
 
 pub async fn rm(path: &std::path::Path, settings: &rm::Settings) -> Result<rm::Summary, rm::Error> {

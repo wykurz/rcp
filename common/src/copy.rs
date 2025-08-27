@@ -195,7 +195,6 @@ impl std::fmt::Display for Summary {
 #[async_recursion]
 pub async fn copy(
     prog_track: &'static progress::Progress,
-    cwd: &std::path::Path,
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &Settings,
@@ -209,29 +208,11 @@ pub async fn copy(
         .with_context(|| format!("failed reading metadata from src: {:?}", &src))
         .map_err(|err| Error::new(err, Default::default()))?;
     if settings.dereference && src_metadata.is_symlink() {
-        // TODO: use tokio::fs::canonicalize instead
-        let link = tokio::fs::read_link(&src)
+        let link = tokio::fs::canonicalize(&src)
             .await
             .with_context(|| format!("failed reading src symlink {:?}", &src))
             .map_err(|err| Error::new(err, Default::default()))?;
-        let abs_link = if link.is_relative() {
-            cwd.join(link)
-        } else {
-            link
-        };
-        let new_cwd = abs_link
-            .parent()
-            .with_context(|| {
-                format!(
-                    "the source symlink {:?} does not have a parent directory",
-                    &src
-                )
-            })
-            .unwrap();
-        return copy(
-            prog_track, new_cwd, &abs_link, dst, settings, preserve, is_fresh,
-        )
-        .await;
+        return copy(prog_track, &link, dst, settings, preserve, is_fresh).await;
     }
     if src_metadata.is_file() {
         return copy_file(prog_track, src, dst, settings, preserve, is_fresh).await;
@@ -448,7 +429,6 @@ pub async fn copy(
         // DirEntry call. the ops-throttle will never cause a deadlock (unlike max-open-files limit)
         // so it's safe to do here.
         throttle::get_ops_token().await;
-        let cwd_path = src.to_owned();
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
@@ -457,7 +437,6 @@ pub async fn copy(
         let do_copy = || async move {
             copy(
                 prog_track,
-                &cwd_path,
                 &entry_path,
                 &dst_path,
                 &settings,
@@ -526,7 +505,6 @@ mod copy_tests {
         let test_path = tmp_dir.as_path();
         let summary = copy(
             &PROGRESS,
-            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -571,7 +549,6 @@ mod copy_tests {
         }
         match copy(
             &PROGRESS,
-            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -643,7 +620,6 @@ mod copy_tests {
         let test_path = tmp_dir.as_path();
         let summary = copy(
             &PROGRESS,
-            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -707,7 +683,6 @@ mod copy_tests {
         .await?;
         let summary = copy(
             &PROGRESS,
-            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -751,7 +726,6 @@ mod copy_tests {
         }
         let summary = copy(
             &PROGRESS,
-            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -808,7 +782,6 @@ mod copy_tests {
         // now run rcp
         let summary = copy(
             &PROGRESS,
-            test_path,
             &test_path.join("foo"),
             &test_path.join("baz"),
             rcp_settings,
@@ -934,7 +907,6 @@ mod copy_tests {
         let test_path = tmp_dir.as_path();
         let summary = copy(
             &PROGRESS,
-            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -992,7 +964,6 @@ mod copy_tests {
         }
         let summary = copy(
             &PROGRESS,
-            &tmp_dir,
             &tmp_dir.join("foo"),
             output_path,
             &Settings {
@@ -1062,7 +1033,6 @@ mod copy_tests {
         }
         let summary = copy(
             &PROGRESS,
-            &tmp_dir,
             &tmp_dir.join("foo"),
             output_path,
             &Settings {
@@ -1131,7 +1101,6 @@ mod copy_tests {
         }
         let summary = copy(
             &PROGRESS,
-            &tmp_dir,
             &tmp_dir.join("foo"),
             output_path,
             &Settings {
@@ -1203,7 +1172,6 @@ mod copy_tests {
         }
         let summary = copy(
             &PROGRESS,
-            &tmp_dir,
             &tmp_dir.join("foo"),
             output_path,
             &Settings {
@@ -1246,7 +1214,6 @@ mod copy_tests {
         let test_path = tmp_dir.as_path();
         let summary = copy(
             &PROGRESS,
-            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &Settings {
@@ -1289,7 +1256,6 @@ mod copy_tests {
         //    |- 6.txt -> (absolute path) .../foo/bar/3.txt
         match copy(
             &PROGRESS,
-            &tmp_dir,
             &tmp_dir.join("foo"),
             output_path,
             &Settings {
@@ -1332,7 +1298,6 @@ mod copy_tests {
         tokio::fs::symlink("bar-link", &tmp_dir.join("foo").join("bar-link-link")).await?;
         let summary = copy(
             &PROGRESS,
-            &tmp_dir,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
             &Settings {

@@ -172,7 +172,6 @@ pub async fn link(
             );
             let copy_summary = copy::copy(
                 prog_track,
-                cwd,
                 update,
                 dst,
                 &settings.copy_settings,
@@ -231,7 +230,6 @@ pub async fn link(
             // use "copy" function to handle the overwrite logic
             let copy_summary = copy::copy(
                 prog_track,
-                cwd,
                 update,
                 dst,
                 &settings.copy_settings,
@@ -263,7 +261,6 @@ pub async fn link(
             // use "copy" function to handle the overwrite logic
             let copy_summary = copy::copy(
                 prog_track,
-                cwd,
                 src,
                 dst,
                 &settings.copy_settings,
@@ -436,7 +433,6 @@ pub async fn link(
             .with_context(|| format!("failed traversing directory {:?}", &update))
             .map_err(|err| Error::new(err, link_summary))?
         {
-            let cwd_path = cwd.to_owned();
             let entry_path = update_entry.path();
             let entry_name = entry_path.file_name().unwrap();
             if processed_files.contains(entry_name) {
@@ -450,7 +446,6 @@ pub async fn link(
             let do_copy = || async move {
                 let copy_summary = copy::copy(
                     prog_track,
-                    &cwd_path,
                     &update_path,
                     &dst_path,
                     &settings.copy_settings,
