@@ -303,7 +303,11 @@ async fn handle_connection(
     let connection = remote::streams::Connection::new(connection);
     let (control_send_stream, control_recv_stream) = connection.open_bi().await?;
     tracing::info!("Opened streams for directory transfer");
-    let src_root = src.to_path_buf();
+    let src_root = if source_config.dereference {
+        tokio::fs::canonicalize(src).await?
+    } else {
+        src.to_path_buf()
+    };
     let dispatch_task = tokio::spawn(dispatch_control_messages(
         *source_config,
         control_recv_stream,
