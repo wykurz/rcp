@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use async_recursion::async_recursion;
 use std::os::unix::fs::MetadataExt;
 
-async fn create_temp_dir() -> Result<std::path::PathBuf> {
+pub async fn create_temp_dir() -> Result<std::path::PathBuf> {
     let mut idx = 0;
     loop {
         let tmp_dir = std::env::temp_dir().join(format!("rcp_test{}", &idx));
@@ -66,7 +66,7 @@ pub enum FileEqualityCheck {
 pub async fn check_dirs_identical(
     src: &std::path::Path,
     dst: &std::path::Path,
-    file_eqality_check: FileEqualityCheck,
+    file_equality_check: FileEqualityCheck,
 ) -> Result<()> {
     let mut src_entries = tokio::fs::read_dir(src).await?;
     while let Some(src_entry) = src_entries.next_entry().await? {
@@ -85,7 +85,7 @@ pub async fn check_dirs_identical(
         // compare file type and content
         assert_eq!(src_md.file_type(), dst_md.file_type());
         if src_md.is_file() {
-            if file_eqality_check == FileEqualityCheck::HardLink {
+            if file_equality_check == FileEqualityCheck::HardLink {
                 assert_eq!(src_md.ino(), dst_md.ino());
             } else {
                 let src_contents = tokio::fs::read_to_string(&src_entry_path).await?;
@@ -97,11 +97,11 @@ pub async fn check_dirs_identical(
             let dst_link = tokio::fs::read_link(&dst_entry_path).await?;
             assert_eq!(src_link, dst_link);
         } else {
-            check_dirs_identical(&src_entry_path, &dst_entry_path, file_eqality_check).await?;
+            check_dirs_identical(&src_entry_path, &dst_entry_path, file_equality_check).await?;
         }
         // compare permissions
         assert_eq!(src_md.permissions(), dst_md.permissions());
-        if file_eqality_check != FileEqualityCheck::Timestamp {
+        if file_equality_check != FileEqualityCheck::Timestamp {
             continue;
         }
         // compare timestamps

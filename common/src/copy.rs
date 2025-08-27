@@ -1290,6 +1290,68 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
+    async fn test_cp_dereference_symlink_chain() -> Result<(), anyhow::Error> {
+        // Create a fresh temporary directory to avoid conflicts
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let test_path = tmp_dir.as_path();
+        // Create a chain of symlinks: foo -> bar -> baz (actual file)
+        let baz_file = test_path.join("baz_file.txt");
+        tokio::fs::write(&baz_file, "final content").await?;
+        let bar_link = test_path.join("bar_link");
+        let foo_link = test_path.join("foo_link");
+        // Create chain: foo_link -> bar_link -> baz_file.txt
+        tokio::fs::symlink(&baz_file, &bar_link).await?;
+        tokio::fs::symlink(&bar_link, &foo_link).await?;
+        // Create source directory with the symlink chain
+        let src_dir = test_path.join("src_chain");
+        tokio::fs::create_dir(&src_dir).await?;
+        // Copy the chain into the source directory
+        tokio::fs::symlink("../foo_link", &src_dir.join("foo")).await?;
+        tokio::fs::symlink("../bar_link", &src_dir.join("bar")).await?;
+        tokio::fs::symlink("../baz_file.txt", &src_dir.join("baz")).await?;
+        // Test with dereference - should copy 3 files with same content
+        let summary = copy(
+            &PROGRESS,
+            &src_dir,
+            &test_path.join("dst_with_deref"),
+            &Settings {
+                dereference: true, // <- important!
+                fail_early: false,
+                overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
+                chunk_size: 0,
+            },
+            &NO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        assert_eq!(summary.files_copied, 3); // foo, bar, baz all copied as files
+        assert_eq!(summary.symlinks_created, 0); // dereference is set
+        assert_eq!(summary.directories_created, 1);
+        let dst_dir = test_path.join("dst_with_deref");
+        // Verify all three are now regular files with the same content
+        let foo_content = tokio::fs::read_to_string(dst_dir.join("foo")).await?;
+        let bar_content = tokio::fs::read_to_string(dst_dir.join("bar")).await?;
+        let baz_content = tokio::fs::read_to_string(dst_dir.join("baz")).await?;
+        assert_eq!(foo_content, "final content");
+        assert_eq!(bar_content, "final content");
+        assert_eq!(baz_content, "final content");
+        // Verify they are all regular files, not symlinks
+        assert!(dst_dir.join("foo").is_file());
+        assert!(dst_dir.join("bar").is_file());
+        assert!(dst_dir.join("baz").is_file());
+        assert!(!dst_dir.join("foo").is_symlink());
+        assert!(!dst_dir.join("bar").is_symlink());
+        assert!(!dst_dir.join("baz").is_symlink());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
     async fn test_cp_dereference_dir() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         // symlink bar to bar-link
