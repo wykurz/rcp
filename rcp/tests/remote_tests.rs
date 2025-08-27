@@ -233,4 +233,88 @@ fn test_remote_copy_comprehensive() {
     assert_eq!(get_file_content(&dst_target), "target content");
 }
 
-// TODO: add coverage for root object being a symlink to file or directory with and without dereferencing
+#[test]
+#[ignore = "functionality not working yet"]
+fn test_remote_symlink_chain_dereference() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // Create a chain of symlinks: foo -> bar -> baz (actual file)
+    let baz_file = src_dir.path().join("baz_file.txt");
+    create_test_file(&baz_file, "final content", 0o644);
+    let bar_link = src_dir.path().join("bar");
+    let foo_link = src_dir.path().join("foo");
+    // Create chain: foo -> bar -> baz_file.txt
+    std::os::unix::fs::symlink(&baz_file, &bar_link).unwrap();
+    std::os::unix::fs::symlink(&bar_link, &foo_link).unwrap();
+    // Create a source directory with the symlink chain
+    let src_subdir = src_dir.path().join("chain_test");
+    std::fs::create_dir(&src_subdir).unwrap();
+    // Create symlinks in the test directory that represent the chain
+    std::os::unix::fs::symlink(&foo_link, &src_subdir.join("foo")).unwrap();
+    std::os::unix::fs::symlink(&bar_link, &src_subdir.join("bar")).unwrap();
+    std::os::unix::fs::symlink(&baz_file, &src_subdir.join("baz")).unwrap();
+    let dst_subdir = dst_dir.path().join("chain_test");
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    // Test with dereference - should copy 3 files with same content
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args(["-L", &src_remote, &dst_remote])
+        .assert()
+        .success();
+    // Verify all three are now regular files with the same content
+    let foo_content = get_file_content(&dst_subdir.join("foo"));
+    let bar_content = get_file_content(&dst_subdir.join("bar"));
+    let baz_content = get_file_content(&dst_subdir.join("baz"));
+    assert_eq!(foo_content, "final content");
+    assert_eq!(bar_content, "final content");
+    assert_eq!(baz_content, "final content");
+    // Verify they are all regular files, not symlinks
+    assert!(dst_subdir.join("foo").is_file());
+    assert!(dst_subdir.join("bar").is_file());
+    assert!(dst_subdir.join("baz").is_file());
+    assert!(!dst_subdir.join("foo").is_symlink());
+    assert!(!dst_subdir.join("bar").is_symlink());
+    assert!(!dst_subdir.join("baz").is_symlink());
+}
+
+#[test]
+fn test_remote_symlink_chain_no_dereference() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // Create a chain of symlinks: foo -> bar -> baz (actual file)
+    let baz_file = src_dir.path().join("baz_file.txt");
+    create_test_file(&baz_file, "final content", 0o644);
+    let bar_link = src_dir.path().join("bar");
+    let foo_link = src_dir.path().join("foo");
+    // Create chain: foo -> bar -> baz_file.txt
+    std::os::unix::fs::symlink(&baz_file, &bar_link).unwrap();
+    std::os::unix::fs::symlink(&bar_link, &foo_link).unwrap();
+    // Create a source directory with the symlink chain
+    let src_subdir = src_dir.path().join("chain_test");
+    std::fs::create_dir(&src_subdir).unwrap();
+    // Create symlinks in the test directory that represent the chain
+    std::os::unix::fs::symlink(&foo_link, &src_subdir.join("foo")).unwrap();
+    std::os::unix::fs::symlink(&bar_link, &src_subdir.join("bar")).unwrap();
+    std::os::unix::fs::symlink(&baz_file, &src_subdir.join("baz")).unwrap();
+    let dst_subdir = dst_dir.path().join("chain_test");
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    // Test without dereference - should preserve symlinks
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args([&src_remote, &dst_remote]).assert().success();
+    // Verify all three remain as symlinks
+    assert!(dst_subdir.join("foo").is_symlink());
+    assert!(dst_subdir.join("bar").is_symlink());
+    assert!(dst_subdir.join("baz").is_symlink());
+    // Verify symlink targets are preserved
+    assert_eq!(
+        std::fs::read_link(&dst_subdir.join("foo")).unwrap(),
+        foo_link
+    );
+    assert_eq!(
+        std::fs::read_link(&dst_subdir.join("bar")).unwrap(),
+        bar_link
+    );
+    assert_eq!(
+        std::fs::read_link(&dst_subdir.join("baz")).unwrap(),
+        baz_file
+    );
+}

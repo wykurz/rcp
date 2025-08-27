@@ -32,12 +32,9 @@ fn get_file_content(path: &std::path::Path) -> String {
 #[test]
 fn test_preserve_permissions_basic() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let src_file = src_dir.path().join("test.txt");
     let dst_file = dst_dir.path().join("test.txt");
-
     create_test_file(&src_file, "test content", 0o755);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([
         "--preserve",
@@ -46,7 +43,6 @@ fn test_preserve_permissions_basic() {
     ])
     .assert()
     .success();
-
     assert_eq!(get_file_mode(&dst_file), 0o755);
     assert_eq!(get_file_content(&dst_file), "test content");
 }
@@ -54,12 +50,9 @@ fn test_preserve_permissions_basic() {
 #[test]
 fn test_preserve_permissions_complex() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let src_file = src_dir.path().join("special.txt");
     let dst_file = dst_dir.path().join("special.txt");
-
     create_test_file(&src_file, "special content", 0o644);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([
         "--preserve",
@@ -68,19 +61,15 @@ fn test_preserve_permissions_complex() {
     ])
     .assert()
     .success();
-
     assert_eq!(get_file_mode(&dst_file), 0o644);
 }
 
 #[test]
 fn test_preserve_settings_file_specific() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let src_file = src_dir.path().join("file.txt");
     let dst_file = dst_dir.path().join("file.txt");
-
     create_test_file(&src_file, "content", 0o777);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([
         "--preserve-settings",
@@ -90,41 +79,32 @@ fn test_preserve_settings_file_specific() {
     ])
     .assert()
     .success();
-
     assert_eq!(get_file_mode(&dst_file), 0o644);
 }
 
 #[test]
 fn test_no_preserve_permissions() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let src_file = src_dir.path().join("test.txt");
     let dst_file = dst_dir.path().join("test.txt");
-
     create_test_file(&src_file, "test content", 0o755);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([src_file.to_str().unwrap(), dst_file.to_str().unwrap()])
         .assert()
         .success();
-
     assert_eq!(get_file_content(&dst_file), "test content");
 }
 
 #[test]
 fn test_overwrite_behavior() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let src_file = src_dir.path().join("test.txt");
     let dst_file = dst_dir.path().join("test.txt");
-
     create_test_file(&src_file, "new content", 0o644);
     create_test_file(&dst_file, "old content", 0o644);
-
     // Add delay to ensure different timestamps
     std::thread::sleep(std::time::Duration::from_millis(10));
     std::fs::write(&src_file, "new content").unwrap();
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([
         "--overwrite",
@@ -133,20 +113,16 @@ fn test_overwrite_behavior() {
     ])
     .assert()
     .success();
-
     assert_eq!(get_file_content(&dst_file), "new content");
 }
 
 #[test]
 fn test_overwrite_fail_without_flag() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let src_file = src_dir.path().join("test.txt");
     let dst_file = dst_dir.path().join("test.txt");
-
     create_test_file(&src_file, "new content", 0o644);
     create_test_file(&dst_file, "old content", 0o644);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([src_file.to_str().unwrap(), dst_file.to_str().unwrap()])
         .assert()
@@ -156,7 +132,6 @@ fn test_overwrite_fail_without_flag() {
 #[test]
 fn test_weird_permissions() {
     let (src_dir, dst_dir) = setup_test_env();
-
     // Test cases for files that can be read (owner has read permission)
     let readable_test_cases = [
         (0o400, "read only"),
@@ -168,13 +143,10 @@ fn test_weird_permissions() {
         (0o6755, "setuid+setgid + rwxr-xr-x"),
         (0o1755, "sticky + rwxr-xr-x"),
     ];
-
     for (mode, description) in readable_test_cases {
         let src_file = src_dir.path().join(format!("test_{mode:o}.txt"));
         let dst_file = dst_dir.path().join(format!("test_{mode:o}.txt"));
-
         create_test_file(&src_file, description, mode);
-
         let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
         cmd.args([
             "--preserve",
@@ -183,14 +155,11 @@ fn test_weird_permissions() {
         ])
         .assert()
         .success();
-
         // Note: Some special permission bits (setuid/setgid/sticky) might be stripped
         // during copy operations for security reasons, so we check the content first
         assert_eq!(get_file_content(&dst_file), description);
-
         let actual_mode = get_file_mode(&dst_file);
         let expected_mode = mode;
-
         if actual_mode != expected_mode {
             eprintln!(
                 "WARNING: Permission mode changed for {expected_mode:o} -> {actual_mode:o} ({description})"
@@ -203,7 +172,6 @@ fn test_weird_permissions() {
 #[test]
 fn test_unreadable_permissions_fail() {
     let (src_dir, dst_dir) = setup_test_env();
-
     // Test cases for files that cannot be read (no read permission for owner)
     let unreadable_test_cases = [
         (0o000, "no permissions"),
@@ -212,13 +180,10 @@ fn test_unreadable_permissions_fail() {
         (0o111, "execute all"),
         (0o222, "write all"),
     ];
-
     for (mode, description) in unreadable_test_cases {
         let src_file = src_dir.path().join(format!("test_{mode:o}.txt"));
         let dst_file = dst_dir.path().join(format!("test_{mode:o}.txt"));
-
         create_test_file(&src_file, description, mode);
-
         // These should fail because the file cannot be read
         let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
         cmd.args([
@@ -228,7 +193,6 @@ fn test_unreadable_permissions_fail() {
         ])
         .assert()
         .failure();
-
         // Verify the destination file was not created
         assert!(
             !dst_file.exists(),
@@ -240,16 +204,12 @@ fn test_unreadable_permissions_fail() {
 #[test]
 fn test_directory_permissions() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let src_subdir = src_dir.path().join("subdir");
     let dst_subdir = dst_dir.path().join("subdir");
-
     std::fs::create_dir(&src_subdir).unwrap();
     std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(0o750)).unwrap();
-
     let src_file = src_subdir.join("file.txt");
     create_test_file(&src_file, "content", 0o640);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([
         "--preserve",
@@ -258,7 +218,6 @@ fn test_directory_permissions() {
     ])
     .assert()
     .success();
-
     assert_eq!(get_file_mode(&dst_subdir), 0o750);
     assert_eq!(get_file_mode(&dst_subdir.join("file.txt")), 0o640);
 }
@@ -266,12 +225,9 @@ fn test_directory_permissions() {
 #[test]
 fn test_fail_early_flag() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let valid_src = src_dir.path().join("valid.txt");
     let invalid_src = src_dir.path().join("nonexistent.txt");
-
     create_test_file(&valid_src, "content", 0o644);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([
         "--fail-early",
@@ -285,19 +241,15 @@ fn test_fail_early_flag() {
 #[test]
 fn test_symlink_copy_default() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let target_file = src_dir.path().join("target.txt");
     let src_symlink = src_dir.path().join("link.txt");
     let dst_symlink = dst_dir.path().join("link.txt");
-
     create_test_file(&target_file, "target content", 0o644);
     create_symlink(&target_file, &src_symlink);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([src_symlink.to_str().unwrap(), dst_symlink.to_str().unwrap()])
         .assert()
         .success();
-
     assert!(dst_symlink.is_symlink());
     assert_eq!(std::fs::read_link(&dst_symlink).unwrap(), target_file);
 }
@@ -305,14 +257,11 @@ fn test_symlink_copy_default() {
 #[test]
 fn test_symlink_dereference() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let target_file = src_dir.path().join("target.txt");
     let src_symlink = src_dir.path().join("link.txt");
     let dst_file = dst_dir.path().join("link.txt");
-
     create_test_file(&target_file, "target content", 0o644);
     create_symlink(&target_file, &src_symlink);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([
         "--dereference",
@@ -321,7 +270,6 @@ fn test_symlink_dereference() {
     ])
     .assert()
     .success();
-
     assert!(dst_file.is_file());
     assert!(!dst_file.is_symlink());
     assert_eq!(get_file_content(&dst_file), "target content");
@@ -330,18 +278,14 @@ fn test_symlink_dereference() {
 #[test]
 fn test_broken_symlink() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let nonexistent_target = src_dir.path().join("nonexistent.txt");
     let src_symlink = src_dir.path().join("broken_link.txt");
     let dst_symlink = dst_dir.path().join("broken_link.txt");
-
     create_symlink(&nonexistent_target, &src_symlink);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([src_symlink.to_str().unwrap(), dst_symlink.to_str().unwrap()])
         .assert()
         .success();
-
     assert!(dst_symlink.is_symlink());
     assert_eq!(
         std::fs::read_link(&dst_symlink).unwrap(),
@@ -352,42 +296,34 @@ fn test_broken_symlink() {
 #[test]
 fn test_circular_symlink() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let link1 = src_dir.path().join("link1.txt");
     let link2 = src_dir.path().join("link2.txt");
     let dst_link = dst_dir.path().join("link1.txt");
-
     create_symlink(&link2, &link1);
     create_symlink(&link1, &link2);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([link1.to_str().unwrap(), dst_link.to_str().unwrap()])
         .assert()
         .success();
-
     assert!(dst_link.is_symlink());
 }
 
 #[test]
 fn test_symlink_chain() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let target = src_dir.path().join("target.txt");
     let link1 = src_dir.path().join("link1.txt");
     let link2 = src_dir.path().join("link2.txt");
     let link3 = src_dir.path().join("link3.txt");
     let dst_link = dst_dir.path().join("link3.txt");
-
     create_test_file(&target, "final target", 0o644);
     create_symlink(&target, &link1);
     create_symlink(&link1, &link2);
     create_symlink(&link2, &link3);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([link3.to_str().unwrap(), dst_link.to_str().unwrap()])
         .assert()
         .success();
-
     assert!(dst_link.is_symlink());
     assert_eq!(std::fs::read_link(&dst_link).unwrap(), link2);
 }
@@ -395,18 +331,15 @@ fn test_symlink_chain() {
 #[test]
 fn test_symlink_chain_dereference() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let target = src_dir.path().join("target.txt");
     let link1 = src_dir.path().join("link1.txt");
     let link2 = src_dir.path().join("link2.txt");
     let link3 = src_dir.path().join("link3.txt");
     let dst_file = dst_dir.path().join("link3.txt");
-
     create_test_file(&target, "final target", 0o644);
     create_symlink(&target, &link1);
     create_symlink(&link1, &link2);
     create_symlink(&link2, &link3);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([
         "--dereference",
@@ -415,7 +348,6 @@ fn test_symlink_chain_dereference() {
     ])
     .assert()
     .success();
-
     assert!(dst_file.is_file());
     assert!(!dst_file.is_symlink());
     assert_eq!(get_file_content(&dst_file), "final target");
@@ -424,23 +356,18 @@ fn test_symlink_chain_dereference() {
 #[test]
 fn test_relative_symlink() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let target = src_dir.path().join("target.txt");
     let src_symlink = src_dir.path().join("rel_link.txt");
     let dst_symlink = dst_dir.path().join("rel_link.txt");
-
     create_test_file(&target, "relative target", 0o644);
-
     let original_dir = std::env::current_dir().unwrap();
     std::env::set_current_dir(src_dir.path()).unwrap();
     create_symlink(std::path::Path::new("target.txt"), &src_symlink);
     std::env::set_current_dir(original_dir).unwrap();
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([src_symlink.to_str().unwrap(), dst_symlink.to_str().unwrap()])
         .assert()
         .success();
-
     assert!(dst_symlink.is_symlink());
     assert_eq!(
         std::fs::read_link(&dst_symlink).unwrap(),
@@ -451,19 +378,15 @@ fn test_relative_symlink() {
 #[test]
 fn test_absolute_symlink() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let target = src_dir.path().join("target.txt");
     let src_symlink = src_dir.path().join("abs_link.txt");
     let dst_symlink = dst_dir.path().join("abs_link.txt");
-
     create_test_file(&target, "absolute target", 0o644);
     create_symlink(&target, &src_symlink);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([src_symlink.to_str().unwrap(), dst_symlink.to_str().unwrap()])
         .assert()
         .success();
-
     assert!(dst_symlink.is_symlink());
     assert_eq!(std::fs::read_link(&dst_symlink).unwrap(), target);
 }
@@ -471,14 +394,11 @@ fn test_absolute_symlink() {
 #[test]
 fn test_symlink_permissions_preserve() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let target = src_dir.path().join("target.txt");
     let src_symlink = src_dir.path().join("link.txt");
     let dst_symlink = dst_dir.path().join("link.txt");
-
     create_test_file(&target, "target content", 0o755);
     create_symlink(&target, &src_symlink);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([
         "--preserve",
@@ -487,7 +407,6 @@ fn test_symlink_permissions_preserve() {
     ])
     .assert()
     .success();
-
     assert!(dst_symlink.is_symlink());
     assert_eq!(std::fs::read_link(&dst_symlink).unwrap(), target);
 }
@@ -495,59 +414,46 @@ fn test_symlink_permissions_preserve() {
 #[test]
 fn test_edge_case_empty_file() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let src_file = src_dir.path().join("empty.txt");
     let dst_file = dst_dir.path().join("empty.txt");
-
     create_test_file(&src_file, "", 0o644);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([src_file.to_str().unwrap(), dst_file.to_str().unwrap()])
         .assert()
         .success();
-
     assert_eq!(get_file_content(&dst_file), "");
 }
 
 #[test]
 fn test_edge_case_large_file() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let src_file = src_dir.path().join("large.txt");
     let dst_file = dst_dir.path().join("large.txt");
-
     let large_content = "x".repeat(1024 * 1024);
     create_test_file(&src_file, &large_content, 0o644);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([src_file.to_str().unwrap(), dst_file.to_str().unwrap()])
         .assert()
         .success();
-
     assert_eq!(get_file_content(&dst_file), large_content);
 }
 
 #[test]
 fn test_edge_case_unicode_filename() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let src_file = src_dir.path().join("файл_测试_🚀.txt");
     let dst_file = dst_dir.path().join("файл_测试_🚀.txt");
-
     create_test_file(&src_file, "unicode content", 0o644);
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([src_file.to_str().unwrap(), dst_file.to_str().unwrap()])
         .assert()
         .success();
-
     assert_eq!(get_file_content(&dst_file), "unicode content");
 }
 
 #[test]
 fn test_edge_case_special_chars_filename() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let special_names = [
         "file with spaces.txt",
         "file-with-dashes.txt",
@@ -556,18 +462,14 @@ fn test_edge_case_special_chars_filename() {
         "file@with@symbols.txt",
         "UPPERCASE.TXT",
     ];
-
     for name in special_names {
         let src_file = src_dir.path().join(name);
         let dst_file = dst_dir.path().join(name);
-
         create_test_file(&src_file, &format!("content for {name}"), 0o644);
-
         let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
         cmd.args([src_file.to_str().unwrap(), dst_file.to_str().unwrap()])
             .assert()
             .success();
-
         assert_eq!(get_file_content(&dst_file), format!("content for {name}"));
     }
 }
@@ -575,17 +477,13 @@ fn test_edge_case_special_chars_filename() {
 #[test]
 fn test_edge_case_multiple_files_to_directory() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let src1 = src_dir.path().join("file1.txt");
     let src2 = src_dir.path().join("file2.txt");
     let src3 = src_dir.path().join("file3.txt");
-
     create_test_file(&src1, "content1", 0o644);
     create_test_file(&src2, "content2", 0o755);
     create_test_file(&src3, "content3", 0o600);
-
     let dst_path = format!("{}/", dst_dir.path().to_str().unwrap());
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([
         "--preserve",
@@ -596,7 +494,6 @@ fn test_edge_case_multiple_files_to_directory() {
     ])
     .assert()
     .success();
-
     assert_eq!(
         get_file_content(&dst_dir.path().join("file1.txt")),
         "content1"
@@ -609,7 +506,6 @@ fn test_edge_case_multiple_files_to_directory() {
         get_file_content(&dst_dir.path().join("file3.txt")),
         "content3"
     );
-
     assert_eq!(get_file_mode(&dst_dir.path().join("file1.txt")), 0o644);
     assert_eq!(get_file_mode(&dst_dir.path().join("file2.txt")), 0o755);
     assert_eq!(get_file_mode(&dst_dir.path().join("file3.txt")), 0o600);
@@ -618,7 +514,6 @@ fn test_edge_case_multiple_files_to_directory() {
 #[test]
 fn test_edge_case_deep_directory_structure() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let deep_path = src_dir
         .path()
         .join("level1")
@@ -626,14 +521,11 @@ fn test_edge_case_deep_directory_structure() {
         .join("level3")
         .join("level4")
         .join("level5");
-
     std::fs::create_dir_all(&deep_path).unwrap();
     let deep_file = deep_path.join("deep_file.txt");
     create_test_file(&deep_file, "deep content", 0o755);
-
     let src_root = src_dir.path().join("level1");
     let dst_root = dst_dir.path().join("level1");
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([
         "--preserve",
@@ -642,7 +534,6 @@ fn test_edge_case_deep_directory_structure() {
     ])
     .assert()
     .success();
-
     let dst_deep_file = dst_dir
         .path()
         .join("level1")
@@ -651,7 +542,6 @@ fn test_edge_case_deep_directory_structure() {
         .join("level4")
         .join("level5")
         .join("deep_file.txt");
-
     assert_eq!(get_file_content(&dst_deep_file), "deep content");
     assert_eq!(get_file_mode(&dst_deep_file), 0o755);
 }
@@ -659,20 +549,15 @@ fn test_edge_case_deep_directory_structure() {
 #[test]
 fn test_edge_case_mixed_symlinks_and_files() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let src_subdir = src_dir.path().join("mixed");
     std::fs::create_dir(&src_subdir).unwrap();
-
     let regular_file = src_subdir.join("regular.txt");
     let target_file = src_subdir.join("target.txt");
     let symlink_file = src_subdir.join("symlink.txt");
-
     create_test_file(&regular_file, "regular content", 0o644);
     create_test_file(&target_file, "target content", 0o755);
     create_symlink(&target_file, &symlink_file);
-
     let dst_subdir = dst_dir.path().join("mixed");
-
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([
         "--preserve",
@@ -681,7 +566,6 @@ fn test_edge_case_mixed_symlinks_and_files() {
     ])
     .assert()
     .success();
-
     assert_eq!(
         get_file_content(&dst_subdir.join("regular.txt")),
         "regular content"
@@ -691,7 +575,6 @@ fn test_edge_case_mixed_symlinks_and_files() {
         "target content"
     );
     assert!(dst_subdir.join("symlink.txt").is_symlink());
-
     assert_eq!(get_file_mode(&dst_subdir.join("regular.txt")), 0o644);
     assert_eq!(get_file_mode(&dst_subdir.join("target.txt")), 0o755);
 }
@@ -699,17 +582,13 @@ fn test_edge_case_mixed_symlinks_and_files() {
 #[test]
 fn test_verbose_output_demo() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let src_file = src_dir.path().join("test.txt");
     let dst_file = dst_dir.path().join("test.txt");
-
     create_test_file(&src_file, "source content", 0o644);
     create_test_file(&dst_file, "destination content", 0o644);
-
     // Add delay and modify source to ensure overwrite happens
     std::thread::sleep(std::time::Duration::from_millis(10));
     std::fs::write(&src_file, "source content").unwrap();
-
     // This should succeed with verbose output
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([
@@ -720,23 +599,106 @@ fn test_verbose_output_demo() {
     ])
     .assert()
     .success();
-
     assert_eq!(get_file_content(&dst_file), "source content");
 }
 
 #[test]
 fn test_failure_output_demo() {
     let (src_dir, dst_dir) = setup_test_env();
-
     let src_file = src_dir.path().join("test.txt");
     let dst_file = dst_dir.path().join("test.txt");
-
     create_test_file(&src_file, "source content", 0o644);
     create_test_file(&dst_file, "destination content", 0o644);
-
     // This should fail because we don't use --overwrite
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
     cmd.args([src_file.to_str().unwrap(), dst_file.to_str().unwrap()])
         .assert()
         .failure();
+}
+
+#[test]
+fn test_symlink_chain_dereference_integration() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // Create a chain of symlinks: foo -> bar -> baz (actual file)
+    let baz_file = src_dir.path().join("baz_file.txt");
+    create_test_file(&baz_file, "final content", 0o644);
+    let bar_link = src_dir.path().join("bar");
+    let foo_link = src_dir.path().join("foo");
+    // Create chain: foo -> bar -> baz_file.txt
+    create_symlink(&baz_file, &bar_link);
+    create_symlink(&bar_link, &foo_link);
+    // Create a source directory with the symlink chain
+    let src_subdir = src_dir.path().join("chaintest");
+    std::fs::create_dir(&src_subdir).unwrap();
+    // Create symlinks in the test directory that represent the chain
+    create_symlink(&foo_link, &src_subdir.join("foo"));
+    create_symlink(&bar_link, &src_subdir.join("bar"));
+    create_symlink(&baz_file, &src_subdir.join("baz"));
+    let dst_subdir = dst_dir.path().join("chaintest");
+    // Test with dereference - should copy 3 files with same content
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args([
+        "--dereference",
+        src_subdir.to_str().unwrap(),
+        dst_subdir.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    // Verify all three are now regular files with the same content
+    let foo_content = get_file_content(&dst_subdir.join("foo"));
+    let bar_content = get_file_content(&dst_subdir.join("bar"));
+    let baz_content = get_file_content(&dst_subdir.join("baz"));
+    assert_eq!(foo_content, "final content");
+    assert_eq!(bar_content, "final content");
+    assert_eq!(baz_content, "final content");
+    // Verify they are all regular files, not symlinks
+    assert!(dst_subdir.join("foo").is_file());
+    assert!(dst_subdir.join("bar").is_file());
+    assert!(dst_subdir.join("baz").is_file());
+    assert!(!dst_subdir.join("foo").is_symlink());
+    assert!(!dst_subdir.join("bar").is_symlink());
+    assert!(!dst_subdir.join("baz").is_symlink());
+}
+
+#[test]
+fn test_symlink_chain_no_dereference_integration() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // Create a chain of symlinks: foo -> bar -> baz (actual file)
+    let baz_file = src_dir.path().join("baz_file.txt");
+    create_test_file(&baz_file, "final content", 0o644);
+    let bar_link = src_dir.path().join("bar");
+    let foo_link = src_dir.path().join("foo");
+    // Create chain: foo -> bar -> baz_file.txt
+    create_symlink(&baz_file, &bar_link);
+    create_symlink(&bar_link, &foo_link);
+    // Create a source directory with the symlink chain
+    let src_subdir = src_dir.path().join("chaintest");
+    std::fs::create_dir(&src_subdir).unwrap();
+    // Create symlinks in the test directory that represent the chain
+    create_symlink(&foo_link, &src_subdir.join("foo"));
+    create_symlink(&bar_link, &src_subdir.join("bar"));
+    create_symlink(&baz_file, &src_subdir.join("baz"));
+    let dst_subdir = dst_dir.path().join("chaintest");
+    // Test without dereference - should preserve symlinks
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args([src_subdir.to_str().unwrap(), dst_subdir.to_str().unwrap()])
+        .assert()
+        .success();
+    // Verify all three remain as symlinks
+    assert!(dst_subdir.join("foo").is_symlink());
+    assert!(dst_subdir.join("bar").is_symlink());
+    assert!(dst_subdir.join("baz").is_symlink());
+    // Verify symlink targets are preserved
+    assert_eq!(
+        std::fs::read_link(&dst_subdir.join("foo")).unwrap(),
+        foo_link
+    );
+    assert_eq!(
+        std::fs::read_link(&dst_subdir.join("bar")).unwrap(),
+        bar_link
+    );
+    assert_eq!(
+        std::fs::read_link(&dst_subdir.join("baz")).unwrap(),
+        baz_file
+    );
 }
