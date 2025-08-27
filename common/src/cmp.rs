@@ -300,7 +300,6 @@ mod cmp_tests {
         let test_path = tmp_dir.as_path();
         copy::copy(
             &PROGRESS,
-            test_path,
             &test_path.join("foo"),
             &test_path.join("bar"),
             &copy::Settings {
