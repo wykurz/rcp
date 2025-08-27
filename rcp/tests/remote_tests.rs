@@ -257,7 +257,7 @@ fn test_remote_symlink_chain_dereference() {
     let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
     // Test with dereference - should copy 3 files with same content
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.args(["-L", &src_remote, &dst_remote])
+    cmd.args(["-L", "-v", &src_remote, &dst_remote])
         .assert()
         .success();
     // Verify all three are now regular files with the same content
@@ -363,7 +363,6 @@ fn test_remote_dereference_directory_symlink() {
 }
 
 #[test]
-#[ignore = "functionality not working yet"]
 fn test_remote_dereference_file_symlink_permissions() {
     let (src_dir, dst_dir) = setup_test_env();
     // Create files with different permissions
