@@ -12,30 +12,24 @@ async fn send_directories_and_symlinks(
     control_send_stream: &remote::streams::SharedSendStream,
     connection: &remote::streams::Connection,
 ) -> anyhow::Result<()> {
-    tracing::debug!("Sending data from {:?} to {:?}", src, dst);
-    let src_metadata = tokio::fs::symlink_metadata(src)
+    let src = if source_config.dereference {
+        tokio::fs::canonicalize(src).await?
+    }
+    else {
+        src.to_path_buf()
+    };
+    tracing::debug!("Sending data from {:?} to {:?}", &src, dst);
+    let src_metadata = tokio::fs::symlink_metadata(&src)
         .await
         .with_context(|| format!("failed reading metadata from src: {:?}", &src))?;
     if src_metadata.is_file() {
         return Ok(());
     }
-    if src_metadata.is_symlink() && source_config.dereference {
-        let target = tokio::fs::canonicalize(src).await?;
-        return send_directories_and_symlinks(
-            source_config,
-            &target,
-            dst,
-            is_root,
-            control_send_stream,
-            connection,
-        )
-        .await;
-    }
     if src_metadata.is_symlink() {
         let symlink = remote::protocol::SourceMessage::Symlink {
-            src: src.to_path_buf(),
+            src: src.clone(),
             dst: dst.to_path_buf(),
-            target: tokio::fs::read_link(src).await?.to_path_buf(),
+            target: tokio::fs::read_link(&src).await?.to_path_buf(),
             metadata: remote::protocol::Metadata::from(&src_metadata),
             is_root,
         };
@@ -55,18 +49,18 @@ async fn send_directories_and_symlinks(
     // we do one more read_dir to count entries; this could be avoided by e.g. modifying
     // the protocol to send the entry count at a later time
     let mut entry_count = 0;
-    let mut entries = tokio::fs::read_dir(src).await?;
+    let mut entries = tokio::fs::read_dir(&src).await?;
     while let Some(_entry) = entries.next_entry().await? {
         entry_count += 1;
     }
     let dir = remote::protocol::SourceMessage::DirStub {
-        src: src.to_path_buf(),
+        src: src.clone(),
         dst: dst.to_path_buf(),
         num_entries: entry_count,
     };
     tracing::debug!(
         "Sending directory stub: {:?} -> {:?}, with {} entries",
-        src,
+        &src,
         dst,
         entry_count
     );
@@ -75,7 +69,7 @@ async fn send_directories_and_symlinks(
         .await
         .send_batch_message(&dir)
         .await?;
-    let mut entries = tokio::fs::read_dir(src)
+    let mut entries = tokio::fs::read_dir(&src)
         .await
         .with_context(|| format!("cannot open directory {src:?} for reading"))?;
     while let Some(entry) = entries
