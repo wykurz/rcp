@@ -318,3 +318,90 @@ fn test_remote_symlink_chain_no_dereference() {
         baz_file
     );
 }
+
+#[test]
+#[ignore = "functionality not working yet"]
+fn test_remote_dereference_directory_symlink() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // Create a directory with specific permissions and files
+    let target_dir = src_dir.path().join("target_directory");
+    std::fs::create_dir(&target_dir).unwrap();
+    std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    create_test_file(&target_dir.join("file1.txt"), "content1", 0o644);
+    create_test_file(&target_dir.join("file2.txt"), "content2", 0o600);
+    // Create a symlink pointing to the directory
+    let dir_symlink = src_dir.path().join("dir_link");
+    std::os::unix::fs::symlink(&target_dir, &dir_symlink).unwrap();
+    let dst_path = dst_dir.path().join("copied_directory");
+    let src_remote = format!("localhost:{}", dir_symlink.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_path.to_str().unwrap());
+    // Test with dereference - should copy as a directory with preserved permissions
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args(["-L", "--preserve", &src_remote, &dst_remote])
+        .assert()
+        .success();
+    // Verify the result is a directory, not a symlink
+    assert!(dst_path.is_dir());
+    assert!(!dst_path.is_symlink());
+    // Verify directory permissions preserved
+    let mode = std::fs::metadata(&dst_path).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o755);
+    // Verify files were copied with correct content and permissions
+    assert_eq!(get_file_content(&dst_path.join("file1.txt")), "content1");
+    assert_eq!(get_file_content(&dst_path.join("file2.txt")), "content2");
+    let mode1 = std::fs::metadata(&dst_path.join("file1.txt"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    let mode2 = std::fs::metadata(&dst_path.join("file2.txt"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(mode1, 0o644);
+    assert_eq!(mode2, 0o600);
+}
+
+#[test]
+#[ignore = "functionality not working yet"]
+fn test_remote_dereference_file_symlink_permissions() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // Create files with different permissions
+    let file1 = src_dir.path().join("file1.txt");
+    let file2 = src_dir.path().join("file2.txt");
+    create_test_file(&file1, "content1", 0o755);
+    create_test_file(&file2, "content2", 0o640);
+    // Create symlinks to these files
+    let symlink1 = src_dir.path().join("symlink1");
+    let symlink2 = src_dir.path().join("symlink2");
+    std::os::unix::fs::symlink(&file1, &symlink1).unwrap();
+    std::os::unix::fs::symlink(&file2, &symlink2).unwrap();
+    let dst_file1 = dst_dir.path().join("copied1.txt");
+    let dst_file2 = dst_dir.path().join("copied2.txt");
+    let src_remote1 = format!("localhost:{}", symlink1.to_str().unwrap());
+    let dst_remote1 = format!("localhost:{}", dst_file1.to_str().unwrap());
+    let src_remote2 = format!("localhost:{}", symlink2.to_str().unwrap());
+    let dst_remote2 = format!("localhost:{}", dst_file2.to_str().unwrap());
+    // Test copying with dereference and preserve
+    let mut cmd1 = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd1.args(["-L", "--preserve", &src_remote1, &dst_remote1])
+        .assert()
+        .success();
+    let mut cmd2 = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd2.args(["-L", "--preserve", &src_remote2, &dst_remote2])
+        .assert()
+        .success();
+    // Verify results are regular files, not symlinks
+    assert!(dst_file1.is_file());
+    assert!(!dst_file1.is_symlink());
+    assert!(dst_file2.is_file());
+    assert!(!dst_file2.is_symlink());
+    // Verify content and permissions of target files were preserved
+    assert_eq!(get_file_content(&dst_file1), "content1");
+    assert_eq!(get_file_content(&dst_file2), "content2");
+    let mode1 = std::fs::metadata(&dst_file1).unwrap().permissions().mode() & 0o7777;
+    let mode2 = std::fs::metadata(&dst_file2).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode1, 0o755);
+    assert_eq!(mode2, 0o640);
+}
