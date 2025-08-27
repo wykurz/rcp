@@ -320,7 +320,6 @@ fn test_remote_symlink_chain_no_dereference() {
 }
 
 #[test]
-#[ignore = "functionality not working yet"]
 fn test_remote_dereference_directory_symlink() {
     let (src_dir, dst_dir) = setup_test_env();
     // Create a directory with specific permissions and files
