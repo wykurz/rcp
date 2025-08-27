@@ -1352,6 +1352,145 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
+    async fn test_cp_dereference_symlink_to_directory() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let test_path = tmp_dir.as_path();
+        // Create a directory with specific permissions and content
+        let target_dir = test_path.join("target_dir");
+        tokio::fs::create_dir(&target_dir).await?;
+        tokio::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o755)).await?;
+        // Add some files to the directory
+        tokio::fs::write(target_dir.join("file1.txt"), "content1").await?;
+        tokio::fs::write(target_dir.join("file2.txt"), "content2").await?;
+        tokio::fs::set_permissions(
+            &target_dir.join("file1.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .await?;
+        tokio::fs::set_permissions(
+            &target_dir.join("file2.txt"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .await?;
+        // Create a symlink pointing to the directory
+        let dir_symlink = test_path.join("dir_symlink");
+        tokio::fs::symlink(&target_dir, &dir_symlink).await?;
+        // Test copying the symlink with dereference - should copy as a directory
+        let summary = copy(
+            &PROGRESS,
+            &dir_symlink,
+            &test_path.join("copied_dir"),
+            &Settings {
+                dereference: true, // <- important!
+                fail_early: false,
+                overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
+                chunk_size: 0,
+            },
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        assert_eq!(summary.files_copied, 2); // file1.txt, file2.txt
+        assert_eq!(summary.symlinks_created, 0); // dereference is set
+        assert_eq!(summary.directories_created, 1); // copied_dir
+        let copied_dir = test_path.join("copied_dir");
+        // Verify the directory and its contents were copied
+        assert!(copied_dir.is_dir());
+        assert!(!copied_dir.is_symlink()); // Should be a real directory, not a symlink
+                                           // Verify files were copied with correct content
+        let file1_content = tokio::fs::read_to_string(copied_dir.join("file1.txt")).await?;
+        let file2_content = tokio::fs::read_to_string(copied_dir.join("file2.txt")).await?;
+        assert_eq!(file1_content, "content1");
+        assert_eq!(file2_content, "content2");
+        // Verify permissions were preserved
+        let copied_dir_metadata = tokio::fs::metadata(&copied_dir).await?;
+        let file1_metadata = tokio::fs::metadata(copied_dir.join("file1.txt")).await?;
+        let file2_metadata = tokio::fs::metadata(copied_dir.join("file2.txt")).await?;
+        assert_eq!(copied_dir_metadata.permissions().mode() & 0o777, 0o755);
+        assert_eq!(file1_metadata.permissions().mode() & 0o777, 0o644);
+        assert_eq!(file2_metadata.permissions().mode() & 0o777, 0o600);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_cp_dereference_permissions_preserved() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let test_path = tmp_dir.as_path();
+        // Create files with specific permissions
+        let file1 = test_path.join("file1.txt");
+        let file2 = test_path.join("file2.txt");
+        tokio::fs::write(&file1, "content1").await?;
+        tokio::fs::write(&file2, "content2").await?;
+        tokio::fs::set_permissions(&file1, std::fs::Permissions::from_mode(0o755)).await?;
+        tokio::fs::set_permissions(&file2, std::fs::Permissions::from_mode(0o640)).await?;
+        // Create symlinks pointing to these files
+        let symlink1 = test_path.join("symlink1");
+        let symlink2 = test_path.join("symlink2");
+        tokio::fs::symlink(&file1, &symlink1).await?;
+        tokio::fs::symlink(&file2, &symlink2).await?;
+        // Test copying symlinks with dereference and preserve
+        let summary1 = copy(
+            &PROGRESS,
+            &symlink1,
+            &test_path.join("copied_file1.txt"),
+            &Settings {
+                dereference: true, // <- important!
+                fail_early: false,
+                overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings::default(),
+                chunk_size: 0,
+            },
+            &DO_PRESERVE_SETTINGS, // <- important!
+            false,
+        )
+        .await?;
+        let summary2 = copy(
+            &PROGRESS,
+            &symlink2,
+            &test_path.join("copied_file2.txt"),
+            &Settings {
+                dereference: true,
+                fail_early: false,
+                overwrite: false,
+                overwrite_compare: filecmp::MetadataCmpSettings::default(),
+                chunk_size: 0,
+            },
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        assert_eq!(summary1.files_copied, 1);
+        assert_eq!(summary1.symlinks_created, 0);
+        assert_eq!(summary2.files_copied, 1);
+        assert_eq!(summary2.symlinks_created, 0);
+        let copied1 = test_path.join("copied_file1.txt");
+        let copied2 = test_path.join("copied_file2.txt");
+        // Verify files are regular files, not symlinks
+        assert!(copied1.is_file());
+        assert!(!copied1.is_symlink());
+        assert!(copied2.is_file());
+        assert!(!copied2.is_symlink());
+        // Verify content was copied correctly
+        let content1 = tokio::fs::read_to_string(&copied1).await?;
+        let content2 = tokio::fs::read_to_string(&copied2).await?;
+        assert_eq!(content1, "content1");
+        assert_eq!(content2, "content2");
+        // Verify permissions from the target files were preserved (not symlink permissions)
+        let copied1_metadata = tokio::fs::metadata(&copied1).await?;
+        let copied2_metadata = tokio::fs::metadata(&copied2).await?;
+        assert_eq!(copied1_metadata.permissions().mode() & 0o777, 0o755);
+        assert_eq!(copied2_metadata.permissions().mode() & 0o777, 0o640);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
     async fn test_cp_dereference_dir() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         // symlink bar to bar-link
