@@ -252,7 +252,6 @@ fn test_remote_copy_comprehensive() {
 }
 
 #[test]
-#[ignore = "functionality not working yet"]
 fn test_remote_symlink_chain_dereference() {
     let (src_dir, dst_dir) = setup_test_env();
     // Create a chain of symlinks: foo -> bar -> baz (actual file)
