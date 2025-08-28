@@ -1,4 +1,5 @@
 use std::os::unix::fs::PermissionsExt;
+use std::process::{Command, Output};
 
 fn setup_test_env() -> (tempfile::TempDir, tempfile::TempDir) {
     let src_dir = tempfile::tempdir().unwrap();
@@ -15,6 +16,48 @@ fn get_file_content(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap()
 }
 
+fn run_rcp_with_args(args: &[&str]) -> Output {
+    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
+    let mut cmd = Command::new(&rcp_path);
+    cmd.arg("-vv"); // Always use maximum verbosity
+    cmd.args(args);
+    cmd.output().expect("Failed to execute rcp command")
+}
+
+fn print_command_output(output: &Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("=== RCP COMMAND OUTPUT ===");
+    eprintln!("Exit status: {}", output.status);
+    if !stdout.is_empty() {
+        eprintln!("--- STDOUT ---");
+        eprintln!("{}", stdout);
+    }
+    if !stderr.is_empty() {
+        eprintln!("--- STDERR ---");
+        eprintln!("{}", stderr);
+    }
+    eprintln!("=== END RCP OUTPUT ===");
+}
+
+fn run_rcp_and_expect_success(args: &[&str]) -> Output {
+    let output = run_rcp_with_args(args);
+    print_command_output(&output);
+    if !output.status.success() {
+        panic!("Command failed when success was expected");
+    }
+    output
+}
+
+fn run_rcp_and_expect_failure(args: &[&str]) -> Output {
+    let output = run_rcp_with_args(args);
+    print_command_output(&output);
+    if output.status.success() {
+        panic!("Command succeeded when failure was expected");
+    }
+    output
+}
+
 #[test]
 fn test_remote_copy_basic() {
     let (src_dir, dst_dir) = setup_test_env();
@@ -23,8 +66,7 @@ fn test_remote_copy_basic() {
     create_test_file(&src_file, "remote test content", 0o644);
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
-    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.args([&src_remote, &dst_remote]).assert().success();
+    run_rcp_and_expect_success(&[&src_remote, &dst_remote]);
 }
 
 #[test]
@@ -35,8 +77,7 @@ fn test_remote_copy_localhost() {
     create_test_file(&src_file, "remote test content", 0o644);
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
-    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.args([&src_remote, &dst_remote]).assert().success();
+    run_rcp_and_expect_success(&[&src_remote, &dst_remote]);
     assert_eq!(get_file_content(&dst_file), "remote test content");
 }
 
@@ -47,10 +88,7 @@ fn test_remote_copy_localhost_to_local() {
     let dst_file = dst_dir.path().join("destination.txt");
     create_test_file(&src_file, "localhost to local content", 0o644);
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
-    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.args([&src_remote, dst_file.to_str().unwrap()])
-        .assert()
-        .success();
+    run_rcp_and_expect_success(&[&src_remote, dst_file.to_str().unwrap()]);
     assert_eq!(get_file_content(&dst_file), "localhost to local content");
 }
 
@@ -61,10 +99,7 @@ fn test_remote_copy_local_to_localhost() {
     let dst_file = dst_dir.path().join("remote_destination.txt");
     create_test_file(&src_file, "local to localhost content", 0o644);
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
-    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.args([src_file.to_str().unwrap(), &dst_remote])
-        .assert()
-        .success();
+    run_rcp_and_expect_success(&[src_file.to_str().unwrap(), &dst_remote]);
     assert_eq!(get_file_content(&dst_file), "local to localhost content");
 }
 
@@ -76,10 +111,7 @@ fn test_remote_copy_with_preserve() {
     create_test_file(&src_file, "preserve permissions content", 0o755);
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
-    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.args(["--preserve", &src_remote, &dst_remote])
-        .assert()
-        .success();
+    run_rcp_and_expect_success(&["--preserve", &src_remote, &dst_remote]);
     assert_eq!(get_file_content(&dst_file), "preserve permissions content");
     let mode = std::fs::metadata(&dst_file).unwrap().permissions().mode() & 0o7777;
     assert_eq!(mode, 0o755);
@@ -97,10 +129,7 @@ fn test_remote_copy_directory() {
     create_test_file(&src_file2, "remote dir content 2", 0o755);
     let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
-    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.args(["--preserve", &src_remote, &dst_remote])
-        .assert()
-        .success();
+    run_rcp_and_expect_success(&["--preserve", &src_remote, &dst_remote]);
     let dst_file1 = dst_subdir.join("file1.txt");
     let dst_file2 = dst_subdir.join("file2.txt");
     assert_eq!(get_file_content(&dst_file1), "remote dir content 1");
@@ -121,8 +150,7 @@ fn test_remote_copy_symlink_no_dereference() {
     std::os::unix::fs::symlink(&target_file, &symlink_file).unwrap();
     let src_remote = format!("localhost:{}", symlink_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_symlink.to_str().unwrap());
-    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.args([&src_remote, &dst_remote]).assert().success();
+    run_rcp_and_expect_success(&[&src_remote, &dst_remote]);
     // verify destination is a symlink
     assert!(dst_symlink.is_symlink());
     let link_target = std::fs::read_link(&dst_symlink).unwrap();
@@ -139,10 +167,7 @@ fn test_remote_copy_symlink_with_dereference() {
     std::os::unix::fs::symlink(&target_file, &symlink_file).unwrap();
     let src_remote = format!("localhost:{}", symlink_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
-    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.args(["-L", &src_remote, &dst_remote])
-        .assert()
-        .success();
+    run_rcp_and_expect_success(&["-L", &src_remote, &dst_remote]);
     // verify destination is a regular file, not a symlink
     assert!(!dst_file.is_symlink());
     assert!(dst_file.is_file());
@@ -164,10 +189,7 @@ fn test_remote_copy_with_overwrite() {
     create_test_file(&dst_file, "old content", 0o644);
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
-    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.args(["--overwrite", &src_remote, &dst_remote])
-        .assert()
-        .success();
+    run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
     // verify content was overwritten
     assert_eq!(get_file_content(&dst_file), "new content");
 }
@@ -184,9 +206,8 @@ fn test_remote_copy_without_overwrite_fails() {
     create_test_file(&dst_file, "old content", 0o644);
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
-    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.args([&src_remote, &dst_remote]).assert().failure(); // should fail without --overwrite
-                                                             // verify content was not overwritten
+    run_rcp_and_expect_failure(&[&src_remote, &dst_remote]);
+    // verify content was not overwritten
     assert_eq!(get_file_content(&dst_file), "old content");
 }
 
@@ -210,10 +231,7 @@ fn test_remote_copy_comprehensive() {
     create_test_file(&existing_file, "old content", 0o644);
     let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
-    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.args(["--preserve", "--overwrite", "-L", &src_remote, &dst_remote])
-        .assert()
-        .success();
+    run_rcp_and_expect_success(&["--preserve", "--overwrite", "-L", &src_remote, &dst_remote]);
     // verify regular file was copied with permissions preserved and overwritten
     let dst_regular = dst_subdir.join("regular.txt");
     assert_eq!(get_file_content(&dst_regular), "regular content");
@@ -256,10 +274,7 @@ fn test_remote_symlink_chain_dereference() {
     let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
     // Test with dereference - should copy 3 files with same content
-    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.args(["-L", "-v", &src_remote, &dst_remote])
-        .assert()
-        .success();
+    run_rcp_and_expect_success(&["-L", &src_remote, &dst_remote]);
     // Verify all three are now regular files with the same content
     let foo_content = get_file_content(&dst_subdir.join("foo"));
     let bar_content = get_file_content(&dst_subdir.join("bar"));
@@ -298,8 +313,7 @@ fn test_remote_symlink_chain_no_dereference() {
     let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
     // Test without dereference - should preserve symlinks
-    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.args([&src_remote, &dst_remote]).assert().success();
+    run_rcp_and_expect_success(&[&src_remote, &dst_remote]);
     // Verify all three remain as symlinks
     assert!(dst_subdir.join("foo").is_symlink());
     assert!(dst_subdir.join("bar").is_symlink());
@@ -335,10 +349,7 @@ fn test_remote_dereference_directory_symlink() {
     let src_remote = format!("localhost:{}", dir_symlink.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_path.to_str().unwrap());
     // Test with dereference - should copy as a directory with preserved permissions
-    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.args(["-L", "--preserve", &src_remote, &dst_remote])
-        .assert()
-        .success();
+    run_rcp_and_expect_success(&["-L", "--preserve", &src_remote, &dst_remote]);
     // Verify the result is a directory, not a symlink
     assert!(dst_path.is_dir());
     assert!(!dst_path.is_symlink());
@@ -382,14 +393,8 @@ fn test_remote_dereference_file_symlink_permissions() {
     let src_remote2 = format!("localhost:{}", symlink2.to_str().unwrap());
     let dst_remote2 = format!("localhost:{}", dst_file2.to_str().unwrap());
     // Test copying with dereference and preserve
-    let mut cmd1 = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd1.args(["-L", "--preserve", &src_remote1, &dst_remote1])
-        .assert()
-        .success();
-    let mut cmd2 = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd2.args(["-L", "--preserve", &src_remote2, &dst_remote2])
-        .assert()
-        .success();
+    run_rcp_and_expect_success(&["-L", "--preserve", &src_remote1, &dst_remote1]);
+    run_rcp_and_expect_success(&["-L", "--preserve", &src_remote2, &dst_remote2]);
     // Verify results are regular files, not symlinks
     assert!(dst_file1.is_file());
     assert!(!dst_file1.is_symlink());

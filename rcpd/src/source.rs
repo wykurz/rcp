@@ -14,8 +14,7 @@ async fn send_directories_and_symlinks(
 ) -> anyhow::Result<()> {
     let src = if source_config.dereference {
         tokio::fs::canonicalize(src).await?
-    }
-    else {
+    } else {
         src.to_path_buf()
     };
     tracing::debug!("Sending data from {:?} to {:?}", &src, dst);
