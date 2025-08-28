@@ -12,21 +12,19 @@ async fn send_directories_and_symlinks(
     control_send_stream: &remote::streams::SharedSendStream,
     connection: &remote::streams::Connection,
 ) -> anyhow::Result<()> {
-    let src = if source_config.dereference {
-        tokio::fs::canonicalize(src).await?
-    } else {
-        src.to_path_buf()
-    };
     tracing::debug!("Sending data from {:?} to {:?}", &src, dst);
-    let src_metadata = tokio::fs::symlink_metadata(&src)
-        .await
-        .with_context(|| format!("failed reading metadata from src: {:?}", &src))?;
+    let src_metadata = if source_config.dereference {
+        tokio::fs::metadata(&src).await
+    } else {
+        tokio::fs::symlink_metadata(&src).await
+    }
+    .with_context(|| format!("failed reading metadata from src: {src:?}"))?;
     if src_metadata.is_file() {
         return Ok(());
     }
     if src_metadata.is_symlink() {
         let symlink = remote::protocol::SourceMessage::Symlink {
-            src: src.clone(),
+            src: src.to_path_buf(),
             dst: dst.to_path_buf(),
             target: tokio::fs::read_link(&src).await?.to_path_buf(),
             metadata: remote::protocol::Metadata::from(&src_metadata),
@@ -53,7 +51,7 @@ async fn send_directories_and_symlinks(
         entry_count += 1;
     }
     let dir = remote::protocol::SourceMessage::DirStub {
-        src: src.clone(),
+        src: src.to_path_buf(),
         dst: dst.to_path_buf(),
         num_entries: entry_count,
     };
@@ -111,18 +109,16 @@ async fn send_fs_objects(
     connection: remote::streams::Connection,
 ) -> anyhow::Result<()> {
     tracing::info!("Sending data from {:?} to {:?}", src, dst);
-    let target = if source_config.dereference {
-        tokio::fs::canonicalize(src).await?
+    let src_metadata = if source_config.dereference {
+        tokio::fs::metadata(src).await
     } else {
-        src.to_path_buf()
-    };
-    let target_metadata = tokio::fs::symlink_metadata(&target)
-        .await
-        .with_context(|| format!("failed reading metadata from src: {:?}", &target))?;
-    if !target_metadata.is_file() {
+        tokio::fs::symlink_metadata(src).await
+    }
+    .with_context(|| format!("failed reading metadata from src: {src:?}"))?;
+    if !src_metadata.is_file() {
         send_directories_and_symlinks(
             source_config,
-            &target,
+            src,
             dst,
             true,
             &control_send_stream,
@@ -134,8 +130,8 @@ async fn send_fs_objects(
     stream
         .send_control_message(&remote::protocol::SourceMessage::DirStructureComplete)
         .await?;
-    if target_metadata.is_file() {
-        send_file(&target, dst, true, connection).await?;
+    if src_metadata.is_file() {
+        send_file(src, dst, &src_metadata, true, connection).await?;
     }
     return Ok(());
 }
@@ -145,17 +141,11 @@ async fn send_fs_objects(
 async fn send_file(
     src: &std::path::Path,
     dst: &std::path::Path,
+    src_metadata: &std::fs::Metadata,
     is_root: bool,
     connection: remote::streams::Connection,
 ) -> anyhow::Result<()> {
-    let src_metadata = tokio::fs::symlink_metadata(src)
-        .await
-        .with_context(|| format!("failed reading metadata from src: {:?}", &src))?;
-    assert!(
-        src_metadata.is_file(),
-        "Expected src to be a file, got {src:?}"
-    );
-    let metadata = remote::protocol::Metadata::from(&src_metadata);
+    let metadata = remote::protocol::Metadata::from(src_metadata);
     let file_header = remote::protocol::File {
         src: src.to_path_buf(),
         dst: dst.to_path_buf(),
@@ -194,19 +184,19 @@ async fn send_files_in_directory(
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
-        let target = if source_config.dereference {
-            tokio::fs::canonicalize(&entry_path).await?
+        let entry_metadata = if source_config.dereference {
+            tokio::fs::metadata(&entry_path).await
         } else {
-            entry_path.to_path_buf()
-        };
-        let target_metadata = tokio::fs::symlink_metadata(&target)
-            .await
-            .with_context(|| format!("failed reading metadata from src: {:?}", &target))?;
-        if !target_metadata.is_file() {
+            tokio::fs::symlink_metadata(&entry_path).await
+        }
+        .with_context(|| format!("failed reading metadata from src: {src:?}"))?;
+        if !entry_metadata.is_file() {
             continue;
         }
         let connection = connection.clone();
-        join_set.spawn(async move { send_file(&target, &dst_path, false, connection).await });
+        join_set.spawn(async move {
+            send_file(&entry_path, &dst_path, &entry_metadata, false, connection).await
+        });
     }
     drop(entries);
     while let Some(res) = join_set.join_next().await {
@@ -249,11 +239,14 @@ async fn dispatch_control_messages(
                     completion.dst
                 );
                 // Send directory metadata
-                let src_metadata = tokio::fs::symlink_metadata(&completion.src)
-                    .await
-                    .with_context(|| {
-                        format!("failed reading metadata from src: {:?}", &completion.src)
-                    })?;
+                let src_metadata = if source_config.dereference {
+                    tokio::fs::metadata(&completion.src).await
+                } else {
+                    tokio::fs::symlink_metadata(&completion.src).await
+                }
+                .with_context(|| {
+                    format!("failed reading metadata from src: {:?}", &completion.src)
+                })?;
                 let metadata = remote::protocol::Metadata::from(&src_metadata);
                 let is_root = completion.src == src_root;
                 let dir_metadata = remote::protocol::SourceMessage::Directory {
@@ -296,17 +289,12 @@ async fn handle_connection(
     let connection = remote::streams::Connection::new(connection);
     let (control_send_stream, control_recv_stream) = connection.open_bi().await?;
     tracing::info!("Opened streams for directory transfer");
-    let src_root = if source_config.dereference {
-        tokio::fs::canonicalize(src).await?
-    } else {
-        src.to_path_buf()
-    };
     let dispatch_task = tokio::spawn(dispatch_control_messages(
         *source_config,
         control_recv_stream,
         control_send_stream.clone(),
         connection.clone(),
-        src_root.clone(),
+        src.to_path_buf(),
     ));
     send_fs_objects(source_config, src, dst, control_send_stream, connection).await?;
     dispatch_task.await??;
