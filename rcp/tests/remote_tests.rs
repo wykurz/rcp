@@ -1,5 +1,4 @@
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Output};
 
 fn setup_test_env() -> (tempfile::TempDir, tempfile::TempDir) {
     let src_dir = tempfile::tempdir().unwrap();
@@ -16,15 +15,15 @@ fn get_file_content(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap()
 }
 
-fn run_rcp_with_args(args: &[&str]) -> Output {
+fn run_rcp_with_args(args: &[&str]) -> std::process::Output {
     let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
-    let mut cmd = Command::new(&rcp_path);
+    let mut cmd = std::process::Command::new(&rcp_path);
     cmd.arg("-vv"); // Always use maximum verbosity
     cmd.args(args);
     cmd.output().expect("Failed to execute rcp command")
 }
 
-fn print_command_output(output: &Output) {
+fn print_command_output(output: &std::process::Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprintln!("=== RCP COMMAND OUTPUT ===");
@@ -40,7 +39,7 @@ fn print_command_output(output: &Output) {
     eprintln!("=== END RCP OUTPUT ===");
 }
 
-fn run_rcp_and_expect_success(args: &[&str]) -> Output {
+fn run_rcp_and_expect_success(args: &[&str]) -> std::process::Output {
     let output = run_rcp_with_args(args);
     print_command_output(&output);
     if !output.status.success() {
@@ -49,7 +48,7 @@ fn run_rcp_and_expect_success(args: &[&str]) -> Output {
     output
 }
 
-fn run_rcp_and_expect_failure(args: &[&str]) -> Output {
+fn run_rcp_and_expect_failure(args: &[&str]) -> std::process::Output {
     let output = run_rcp_with_args(args);
     print_command_output(&output);
     if output.status.success() {
