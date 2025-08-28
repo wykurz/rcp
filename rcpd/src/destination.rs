@@ -143,7 +143,7 @@ async fn create_directory_structure(
                     directory_tracker
                         .decrement_entry(src, dst)
                         .await
-                        .context(format!("Failed to decrement directory entry count after receiving directory metadata src: {src:?}, dst: {dst:?}"))?;
+                        .with_context(|| format!("Failed to decrement directory entry count after receiving directory metadata src: {src:?}, dst: {dst:?}"))?;
                 }
             }
             remote::protocol::SourceMessage::Symlink {
