@@ -44,6 +44,7 @@ async fn handle_file_stream(
             copied
         ));
     }
+    file_recv_stream.close().await;
     drop(file); // Ensure file is closed before setting metadata
     tracing::info!(
         "File {} -> {} created, size: {} bytes, setting metadata...",
@@ -175,6 +176,8 @@ async fn create_directory_structure(
             }
         }
     }
+    tracing::info!("Closing control recv stream");
+    control_recv_stream.close().await;
     tracing::info!("Directory structure creation completed");
     Ok(())
 }

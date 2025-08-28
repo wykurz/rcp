@@ -88,6 +88,15 @@ impl RecvStream {
         let stream_bytes = tokio::io::copy(data_stream, writer).await?;
         Ok(buffer_size + stream_bytes)
     }
+
+    pub async fn close(&mut self) {
+        let recv_stream = self.framed.get_mut();
+        // copied from QUIC documentation: https://docs.rs/quinn/0.10.2/quinn/struct.RecvStream.html
+        if recv_stream.read_to_end(0).await.is_err() {
+            // discard unexpected data and notify the peer to stop sending it
+            let _ = recv_stream.stop(0u8.into());
+        }
+    }
 }
 
 /// Connection wrapper that provides framed stream creation
