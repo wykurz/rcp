@@ -268,12 +268,15 @@ async fn dispatch_control_messages(
                 stream
                     .send_control_message(&remote::protocol::SourceMessage::SourceDone)
                     .await?;
+                tracing::info!("Closing control send stream");
                 stream.close().await?;
                 tracing::info!("Sent source done message");
                 break;
             }
         }
     }
+    tracing::info!("Closing control recv stream");
+    control_recv_stream.close().await;
     tracing::info!("Finished dispatching control messages");
     Ok(())
 }
