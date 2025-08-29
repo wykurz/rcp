@@ -146,9 +146,7 @@ async fn async_main(
 
 fn main() -> Result<(), anyhow::Error> {
     let args = Args::from_args();
-    // let master_connection = client.connect(args.master_addr, &args.server_name)?.await?;
     let (tracing_layer, tracing_receiver) = common::remote_tracing::RemoteTracingLayer::new();
-    // TODO: signal cancellation_token when the process is about to exit
     let func = {
         let args = args.clone();
         || async_main(args, tracing_receiver)
