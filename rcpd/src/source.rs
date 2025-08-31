@@ -160,13 +160,13 @@ async fn send_file(
 
 #[instrument]
 async fn send_files_in_directory(
-    settings: &common::copy::Settings,
-    src: &std::path::Path,
-    dst: &std::path::Path,
+    settings: common::copy::Settings,
+    src: std::path::PathBuf,
+    dst: std::path::PathBuf,
     connection: remote::streams::Connection,
 ) -> anyhow::Result<()> {
     tracing::info!("Sending files from {src:?}");
-    let mut entries = tokio::fs::read_dir(src)
+    let mut entries = tokio::fs::read_dir(&src)
         .await
         .with_context(|| format!("cannot open directory {src:?} for reading"))?;
     let mut join_set = tokio::task::JoinSet::new();
@@ -207,6 +207,7 @@ async fn dispatch_control_messages(
     connection: remote::streams::Connection,
     src_root: std::path::PathBuf,
 ) -> anyhow::Result<()> {
+    let mut join_set = tokio::task::JoinSet::new();
     while let Some(message) = control_recv_stream
         .recv_object::<remote::protocol::DestinationMessage>()
         .await?
@@ -218,14 +219,12 @@ async fn dispatch_control_messages(
                     confirmation.src,
                     confirmation.dst
                 );
-                // TODO: we should spawn here
-                send_files_in_directory(
-                    &settings,
-                    &confirmation.src,
-                    &confirmation.dst,
+                join_set.spawn(send_files_in_directory(
+                    settings,
+                    confirmation.src.clone(),
+                    confirmation.dst.clone(),
                     connection.clone(),
-                )
-                .await?;
+                ));
             }
             remote::protocol::DestinationMessage::DirectoryComplete(completion) => {
                 tracing::info!(
@@ -269,6 +268,13 @@ async fn dispatch_control_messages(
                 break;
             }
         }
+        // opportunistically cleanup finished tasks
+        while let Some(result) = join_set.try_join_next() {
+            result??;
+        }
+    }
+    while let Some(result) = join_set.join_next().await {
+        result??;
     }
     tracing::info!("Closing control recv stream");
     control_recv_stream.close().await;
