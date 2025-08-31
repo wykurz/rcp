@@ -141,6 +141,7 @@ async fn run_rcpd_master(
     let server_name = remote::get_random_server_name();
     let mut rcpds = vec![];
     let rcpd_config = remote::protocol::RcpdConfig {
+        verbose: args.verbose,
         fail_early: args.fail_early,
         max_workers: args.max_workers,
         max_blocking_threads: args.max_blocking_threads,
