@@ -1524,6 +1524,7 @@ dependencies = [
  "serde",
  "structopt",
  "thiserror 1.0.55",
+ "throttle",
  "tokio",
  "tokio-util",
  "tracing",
