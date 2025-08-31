@@ -192,9 +192,6 @@ async fn run_rcpd_master(
             .send_control_message(&remote::protocol::MasterHello::Source {
                 src: src.path().to_path_buf(),
                 dst: dst.path().to_path_buf(),
-                source_config: remote::protocol::SourceConfig {
-                    dereference: args.dereference,
-                },
             })
             .await?;
         source_send_stream.close().await?;
@@ -246,11 +243,7 @@ async fn run_rcpd_master(
             .send_control_message(&remote::protocol::MasterHello::Destination {
                 source_addr: source_hello.source_addr,
                 server_name: source_hello.server_name.clone(),
-                destination_config: remote::protocol::DestinationConfig {
-                    overwrite: args.overwrite,
-                    overwrite_compare: args.overwrite_compare.clone(),
-                    preserve: *preserve,
-                },
+                preserve: *preserve,
             })
             .await?;
         dest_send_stream.close().await?;
