@@ -140,8 +140,19 @@ async fn run_rcpd_master(
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
     let server_name = remote::get_random_server_name();
     let mut rcpds = vec![];
+    let rcpd_config = remote::protocol::RcpdConfig {
+        fail_early: args.fail_early,
+        max_workers: args.max_workers,
+        max_blocking_threads: args.max_blocking_threads,
+        max_open_files: args.max_open_files,
+        ops_throttle: args.ops_throttle,
+        iops_throttle: args.iops_throttle,
+        chunk_size: args.chunk_size.0 as usize,
+        tput_throttle: args.tput_throttle,
+    };
     for _ in 0..2 {
-        let rcpd = remote::start_rcpd(src.session(), &server_addr, &server_name).await?;
+        let rcpd =
+            remote::start_rcpd(&rcpd_config, src.session(), &server_addr, &server_name).await?;
         rcpds.push(rcpd);
     }
     tracing::info!("Waiting for connections from rcpd processes...");
@@ -175,16 +186,6 @@ async fn run_rcpd_master(
         .open_bi()
         .await
         .context("Failed to open bidirectional stream with source rcpd")?;
-    let rcpd_config = remote::protocol::RcpdConfig {
-        fail_early: args.fail_early,
-        max_workers: args.max_workers,
-        max_blocking_threads: args.max_blocking_threads,
-        max_open_files: args.max_open_files,
-        ops_throttle: args.ops_throttle,
-        iops_throttle: args.iops_throttle,
-        chunk_size: args.chunk_size.0 as usize,
-        tput_throttle: args.tput_throttle,
-    };
     {
         let mut source_send_stream = source_send_stream.lock().await;
         source_send_stream
@@ -194,7 +195,6 @@ async fn run_rcpd_master(
                 source_config: remote::protocol::SourceConfig {
                     dereference: args.dereference,
                 },
-                rcpd_config,
             })
             .await?;
         source_send_stream.close().await?;
@@ -251,7 +251,6 @@ async fn run_rcpd_master(
                     overwrite_compare: args.overwrite_compare.clone(),
                     preserve: *preserve,
                 },
-                rcpd_config,
             })
             .await?;
         dest_send_stream.close().await?;
@@ -342,7 +341,6 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
             ));
         }
         return run_rcpd_master(&args, &preserve, &remote_src, &remote_dst).await;
-        // HERE
     }
     let src_dst: Vec<(std::path::PathBuf, std::path::PathBuf)> = if dst_string.ends_with('/') {
         // rcp foo bar baz/ -> copy foo to baz/foo and bar to baz/bar

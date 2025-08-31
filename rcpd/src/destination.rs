@@ -80,6 +80,7 @@ async fn process_incoming_file_streams(
     directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
     let mut join_set = tokio::task::JoinSet::new();
+    join_set.len();
     // TODO: we're accumulating unbounded number of spawned tasks here
     while let Ok(file_recv_stream) = connection.accept_uni().await {
         tracing::info!("Received new unidirectional stream for file");
@@ -187,7 +188,6 @@ pub async fn run_destination(
     src_endpoint: &std::net::SocketAddr,
     src_server_name: &str,
     destination_config: &remote::protocol::DestinationConfig,
-    _rcpd_config: &remote::protocol::RcpdConfig,
 ) -> anyhow::Result<String> {
     let client = remote::get_client()?;
     let connection = client.connect(*src_endpoint, src_server_name)?.await?;

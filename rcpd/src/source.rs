@@ -224,6 +224,7 @@ async fn dispatch_control_messages(
                     confirmation.src,
                     confirmation.dst
                 );
+                // TODO: we should spawn here
                 send_files_in_directory(
                     &source_config,
                     &confirmation.src,
@@ -311,7 +312,6 @@ pub async fn run_source(
     src: &std::path::Path,
     dst: &std::path::Path,
     source_config: &remote::protocol::SourceConfig,
-    _rcpd_config: &remote::protocol::RcpdConfig, // TODO: use
 ) -> anyhow::Result<String> {
     let server_endpoint = remote::get_server()?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
