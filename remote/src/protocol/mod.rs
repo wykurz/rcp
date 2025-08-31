@@ -123,7 +123,7 @@ pub enum DestinationMessage {
     DestinationDone, // must be the last message sent by the destination
 }
 
-#[derive(Copy, Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RcpdConfig {
     pub fail_early: bool,
     pub max_workers: usize,
@@ -133,6 +133,10 @@ pub struct RcpdConfig {
     pub iops_throttle: usize,
     pub chunk_size: usize,
     pub tput_throttle: usize,
+    // common::copy::Settings
+    pub dereference: bool,
+    pub overwrite: bool,
+    pub overwrite_compare: String,
 }
 
 impl RcpdConfig {
@@ -145,6 +149,9 @@ impl RcpdConfig {
             format!("--iops-throttle={}", self.iops_throttle),
             format!("--chunk-size={}", self.chunk_size),
             format!("--tput-throttle={}", self.tput_throttle),
+            format!("--dereference={}", self.dereference),
+            format!("--overwrite={}", self.overwrite),
+            format!("--overwrite-compare={}", self.overwrite_compare),
         ];
         if let Some(v) = self.max_open_files {
             args.push(format!("--max-open-files={v}"));
