@@ -149,6 +149,9 @@ async fn run_rcpd_master(
         iops_throttle: args.iops_throttle,
         chunk_size: args.chunk_size.0 as usize,
         tput_throttle: args.tput_throttle,
+        dereference: args.dereference,
+        overwrite: args.overwrite,
+        overwrite_compare: args.overwrite_compare.clone(),
     };
     for _ in 0..2 {
         let rcpd =
