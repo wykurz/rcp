@@ -21,6 +21,24 @@ struct Args {
     #[structopt(long, required = true)]
     server_name: String,
 
+    /// Overwrite existing files/directories
+    #[structopt(short, long)]
+    overwrite: bool,
+
+    /// Comma separated list of file attributes to compare when when deciding if files are "identical", used with
+    /// --overwrite flag.
+    /// Options are: uid, gid, mode, size, mtime, ctime
+    #[structopt(long, default_value = "size,mtime")]
+    overwrite_compare: String,
+
+    /// Exit on first error
+    #[structopt(short = "-e", long = "fail-early")]
+    fail_early: bool,
+
+    /// Always follow symbolic links in source
+    #[structopt(short = "-L", long)]
+    dereference: bool,
+
     /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
     #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
     verbose: u8,
@@ -94,22 +112,25 @@ async fn async_main(
         .context("Failed to receive hello message from master")?
         .unwrap();
     tracing::info!("Received side: {:?}", master_hello);
+    let settings = common::copy::Settings {
+        dereference: args.dereference,
+        fail_early: args.fail_early,
+        overwrite: args.overwrite,
+        overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
+        chunk_size: args.chunk_size,
+    };
     let result = match master_hello {
-        remote::protocol::MasterHello::Source {
-            src,
-            dst,
-            source_config,
-        } => {
+        remote::protocol::MasterHello::Source { src, dst } => {
             tracing::info!("Starting source");
-            source::run_source(master_send_stream.clone(), &src, &dst, &source_config).await?
+            source::run_source(master_send_stream.clone(), &src, &dst, &settings).await?
         }
         remote::protocol::MasterHello::Destination {
             source_addr,
             server_name,
-            destination_config,
+            preserve,
         } => {
             tracing::info!("Starting destination");
-            destination::run_destination(&source_addr, &server_name, &destination_config).await?
+            destination::run_destination(&source_addr, &server_name, &settings, &preserve).await?
         }
     };
     tracing::debug!("Closing master send stream");

@@ -17,7 +17,8 @@ fn get_file_content(path: &std::path::Path) -> String {
 
 fn run_rcp_with_args(args: &[&str]) -> std::process::Output {
     let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
-    let mut cmd = std::process::Command::new(&rcp_path);
+    let mut cmd = std::process::Command::new("timeout");
+    cmd.args(["5", rcp_path.to_str().unwrap()]);
     cmd.arg("-vv"); // Always use maximum verbosity
     cmd.args(args);
     cmd.output().expect("Failed to execute rcp command")
@@ -43,7 +44,11 @@ fn run_rcp_and_expect_success(args: &[&str]) -> std::process::Output {
     let output = run_rcp_with_args(args);
     print_command_output(&output);
     if !output.status.success() {
-        panic!("Command failed when success was expected");
+        if let Some(124) = output.status.code() {
+            panic!("Command timed out after 5 seconds - possible hang detected");
+        } else {
+            panic!("Command failed when success was expected");
+        }
     }
     output
 }

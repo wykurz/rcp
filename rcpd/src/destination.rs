@@ -17,7 +17,8 @@ async fn send_root_done(
 
 #[instrument]
 async fn handle_file_stream(
-    destination_config: remote::protocol::DestinationConfig,
+    settings: common::copy::Settings,
+    preserve: common::preserve::Settings,
     control_send_stream: remote::streams::SharedSendStream,
     mut file_recv_stream: remote::streams::RecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
@@ -52,12 +53,7 @@ async fn handle_file_stream(
         file_header.dst.display(),
         file_header.size
     );
-    common::preserve::set_file_metadata(
-        &destination_config.preserve,
-        &file_header.metadata,
-        &file_header.dst,
-    )
-    .await?;
+    common::preserve::set_file_metadata(&preserve, &file_header.metadata, &file_header.dst).await?;
     if file_header.is_root {
         tracing::info!("Root file processed");
         send_root_done(control_send_stream).await?;
@@ -74,7 +70,8 @@ async fn handle_file_stream(
 
 #[instrument]
 async fn process_incoming_file_streams(
-    destination_config: remote::protocol::DestinationConfig,
+    settings: common::copy::Settings,
+    preserve: common::preserve::Settings,
     control_send_stream: remote::streams::SharedSendStream,
     connection: remote::streams::Connection,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
@@ -86,7 +83,8 @@ async fn process_incoming_file_streams(
         tracing::info!("Received new unidirectional stream for file");
         let tracker = directory_tracker.clone();
         join_set.spawn(handle_file_stream(
-            destination_config.clone(),
+            settings,
+            preserve,
             control_send_stream.clone(),
             file_recv_stream,
             tracker.clone(),
@@ -103,7 +101,8 @@ async fn process_incoming_file_streams(
 
 #[instrument]
 async fn create_directory_structure(
-    destination_config: &remote::protocol::DestinationConfig,
+    settings: &common::copy::Settings,
+    preserve: &common::preserve::Settings,
     control_send_stream: remote::streams::SharedSendStream,
     mut control_recv_stream: remote::streams::RecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
@@ -135,8 +134,7 @@ async fn create_directory_structure(
                 is_root,
             } => {
                 // apply metadata changes now that directory is complete
-                common::preserve::set_dir_metadata(&destination_config.preserve, metadata, dst)
-                    .await?;
+                common::preserve::set_dir_metadata(preserve, metadata, dst).await?;
                 if is_root {
                     tracing::info!("Root directory processed");
                     send_root_done(control_send_stream).await?;
@@ -156,8 +154,7 @@ async fn create_directory_structure(
                 is_root,
             } => {
                 tokio::fs::symlink(target, dst).await?;
-                common::preserve::set_symlink_metadata(&destination_config.preserve, metadata, dst)
-                    .await?;
+                common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
                 if is_root {
                     tracing::info!("Root symlink processed");
                     send_root_done(control_send_stream).await?;
@@ -187,7 +184,8 @@ async fn create_directory_structure(
 pub async fn run_destination(
     src_endpoint: &std::net::SocketAddr,
     src_server_name: &str,
-    destination_config: &remote::protocol::DestinationConfig,
+    settings: &common::copy::Settings,
+    preserve: &common::preserve::Settings,
 ) -> anyhow::Result<String> {
     let client = remote::get_client()?;
     let connection = client.connect(*src_endpoint, src_server_name)?.await?;
@@ -198,13 +196,15 @@ pub async fn run_destination(
     tracing::info!("Received directory creation streams");
     let directory_tracker = directory_tracker::make_shared(control_send_stream.clone());
     let file_handler_task = tokio::spawn(process_incoming_file_streams(
-        destination_config.clone(),
+        *settings,
+        *preserve,
         control_send_stream.clone(),
         connection.clone(),
         directory_tracker.clone(),
     ));
     create_directory_structure(
-        destination_config,
+        settings,
+        preserve,
         control_send_stream,
         control_recv_stream,
         directory_tracker,

@@ -5,7 +5,7 @@ use tracing::instrument;
 #[instrument]
 #[async_recursion]
 async fn send_directories_and_symlinks(
-    source_config: &remote::protocol::SourceConfig,
+    settings: &common::copy::Settings,
     src: &std::path::Path,
     dst: &std::path::Path,
     is_root: bool,
@@ -13,7 +13,7 @@ async fn send_directories_and_symlinks(
     connection: &remote::streams::Connection,
 ) -> anyhow::Result<()> {
     tracing::debug!("Sending data from {:?} to {:?}", &src, dst);
-    let src_metadata = if source_config.dereference {
+    let src_metadata = if settings.dereference {
         tokio::fs::metadata(&src).await
     } else {
         tokio::fs::symlink_metadata(&src).await
@@ -83,7 +83,7 @@ async fn send_directories_and_symlinks(
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
         send_directories_and_symlinks(
-            source_config,
+            settings,
             &entry_path,
             &dst_path,
             false,
@@ -102,29 +102,22 @@ async fn send_directories_and_symlinks(
 #[instrument]
 #[async_recursion]
 async fn send_fs_objects(
-    source_config: &remote::protocol::SourceConfig,
+    settings: &common::copy::Settings,
     src: &std::path::Path,
     dst: &std::path::Path,
     control_send_stream: remote::streams::SharedSendStream,
     connection: remote::streams::Connection,
 ) -> anyhow::Result<()> {
     tracing::info!("Sending data from {:?} to {:?}", src, dst);
-    let src_metadata = if source_config.dereference {
+    let src_metadata = if settings.dereference {
         tokio::fs::metadata(src).await
     } else {
         tokio::fs::symlink_metadata(src).await
     }
     .with_context(|| format!("failed reading metadata from src: {src:?}"))?;
     if !src_metadata.is_file() {
-        send_directories_and_symlinks(
-            source_config,
-            src,
-            dst,
-            true,
-            &control_send_stream,
-            &connection,
-        )
-        .await?;
+        send_directories_and_symlinks(settings, src, dst, true, &control_send_stream, &connection)
+            .await?;
     }
     let mut stream = control_send_stream.lock().await;
     stream
@@ -166,7 +159,7 @@ async fn send_file(
 
 #[instrument]
 async fn send_files_in_directory(
-    source_config: &remote::protocol::SourceConfig,
+    settings: &common::copy::Settings,
     src: &std::path::Path,
     dst: &std::path::Path,
     connection: remote::streams::Connection,
@@ -184,7 +177,7 @@ async fn send_files_in_directory(
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
-        let entry_metadata = if source_config.dereference {
+        let entry_metadata = if settings.dereference {
             tokio::fs::metadata(&entry_path).await
         } else {
             tokio::fs::symlink_metadata(&entry_path).await
@@ -207,7 +200,7 @@ async fn send_files_in_directory(
 
 #[instrument]
 async fn dispatch_control_messages(
-    source_config: remote::protocol::SourceConfig,
+    settings: common::copy::Settings,
     mut control_recv_stream: remote::streams::RecvStream,
     control_send_stream: remote::streams::SharedSendStream,
     connection: remote::streams::Connection,
@@ -226,7 +219,7 @@ async fn dispatch_control_messages(
                 );
                 // TODO: we should spawn here
                 send_files_in_directory(
-                    &source_config,
+                    &settings,
                     &confirmation.src,
                     &confirmation.dst,
                     connection.clone(),
@@ -240,7 +233,7 @@ async fn dispatch_control_messages(
                     completion.dst
                 );
                 // Send directory metadata
-                let src_metadata = if source_config.dereference {
+                let src_metadata = if settings.dereference {
                     tokio::fs::metadata(&completion.src).await
                 } else {
                     tokio::fs::symlink_metadata(&completion.src).await
@@ -284,7 +277,7 @@ async fn dispatch_control_messages(
 
 async fn handle_connection(
     conn: quinn::Connecting,
-    source_config: &remote::protocol::SourceConfig,
+    settings: &common::copy::Settings,
     src: &std::path::Path,
     dst: &std::path::Path,
 ) -> anyhow::Result<()> {
@@ -294,13 +287,13 @@ async fn handle_connection(
     let (control_send_stream, control_recv_stream) = connection.open_bi().await?;
     tracing::info!("Opened streams for directory transfer");
     let dispatch_task = tokio::spawn(dispatch_control_messages(
-        *source_config,
+        *settings,
         control_recv_stream,
         control_send_stream.clone(),
         connection.clone(),
         src.to_path_buf(),
     ));
-    send_fs_objects(source_config, src, dst, control_send_stream, connection).await?;
+    send_fs_objects(settings, src, dst, control_send_stream, connection).await?;
     dispatch_task.await??;
     tracing::info!("Data sent successfully");
     Ok(())
@@ -311,7 +304,7 @@ pub async fn run_source(
     master_send_stream: remote::streams::SharedSendStream,
     src: &std::path::Path,
     dst: &std::path::Path,
-    source_config: &remote::protocol::SourceConfig,
+    settings: &common::copy::Settings,
 ) -> anyhow::Result<String> {
     let server_endpoint = remote::get_server()?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
@@ -329,7 +322,7 @@ pub async fn run_source(
     tracing::info!("Waiting for connection from destination");
     if let Some(conn) = server_endpoint.accept().await {
         tracing::info!("New destination connection incoming");
-        handle_connection(conn, source_config, src, dst).await?;
+        handle_connection(conn, settings, src, dst).await?;
     } else {
         tracing::error!("Timed out waiting for destination to connect");
         return Err(anyhow::anyhow!(

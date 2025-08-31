@@ -153,18 +153,6 @@ impl RcpdConfig {
     }
 }
 
-#[derive(Copy, Clone, Debug, Deserialize, Serialize)]
-pub struct SourceConfig {
-    pub dereference: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct DestinationConfig {
-    pub overwrite: bool,
-    pub overwrite_compare: String,
-    pub preserve: common::preserve::Settings,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TracingHello {}
 
@@ -173,12 +161,11 @@ pub enum MasterHello {
     Source {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
-        source_config: SourceConfig,
     },
     Destination {
         source_addr: std::net::SocketAddr,
         server_name: String,
-        destination_config: DestinationConfig,
+        preserve: common::preserve::Settings,
     },
 }
 
