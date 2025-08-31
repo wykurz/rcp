@@ -187,6 +187,7 @@ async fn send_files_in_directory(
         if !entry_metadata.is_file() {
             continue;
         }
+        throttle::get_ops_token().await;
         let connection = connection.clone();
         join_set.spawn(async move {
             send_file(&entry_path, &dst_path, &entry_metadata, false, connection).await
