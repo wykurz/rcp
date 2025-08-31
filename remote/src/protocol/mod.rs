@@ -159,7 +159,7 @@ impl RcpdConfig {
         }
         if let Some(v) = self.max_open_files {
             args.push(format!("--max-open-files={v}"));
-        };
+        }
         if self.dereference {
             args.push("--dereference".to_string());
         }
