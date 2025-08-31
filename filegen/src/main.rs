@@ -207,7 +207,6 @@ async fn filegen(
     Ok(())
 }
 
-// TODO: implement a FilegenSummary
 #[instrument]
 async fn async_main(args: Args) -> Result<String> {
     let filesize = args
