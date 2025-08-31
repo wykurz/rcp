@@ -99,32 +99,17 @@ async fn async_main(
             src,
             dst,
             source_config,
-            rcpd_config,
         } => {
             tracing::info!("Starting source");
-            source::run_source(
-                master_send_stream.clone(),
-                &src,
-                &dst,
-                &source_config,
-                &rcpd_config,
-            )
-            .await?
+            source::run_source(master_send_stream.clone(), &src, &dst, &source_config).await?
         }
         remote::protocol::MasterHello::Destination {
             source_addr,
             server_name,
             destination_config,
-            rcpd_config,
         } => {
             tracing::info!("Starting destination");
-            destination::run_destination(
-                &source_addr,
-                &server_name,
-                &destination_config,
-                &rcpd_config,
-            )
-            .await?
+            destination::run_destination(&source_addr, &server_name, &destination_config).await?
         }
     };
     tracing::debug!("Closing master send stream");

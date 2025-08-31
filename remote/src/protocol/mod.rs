@@ -135,6 +135,24 @@ pub struct RcpdConfig {
     pub tput_throttle: usize,
 }
 
+impl RcpdConfig {
+    pub fn to_args(&self) -> Vec<String> {
+        let mut args = vec![
+            format!("--fail-early={}", self.fail_early),
+            format!("--max-workers={}", self.max_workers),
+            format!("--max-blocking-threads={}", self.max_blocking_threads),
+            format!("--ops-throttle={}", self.ops_throttle),
+            format!("--iops-throttle={}", self.iops_throttle),
+            format!("--chunk-size={}", self.chunk_size),
+            format!("--tput-throttle={}", self.tput_throttle),
+        ];
+        if let Some(v) = self.max_open_files {
+            args.push(format!("--max-open-files={v}"));
+        };
+        args
+    }
+}
+
 #[derive(Copy, Clone, Debug, Deserialize, Serialize)]
 pub struct SourceConfig {
     pub dereference: bool,
@@ -156,13 +174,11 @@ pub enum MasterHello {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
         source_config: SourceConfig,
-        rcpd_config: RcpdConfig,
     },
     Destination {
         source_addr: std::net::SocketAddr,
         server_name: String,
         destination_config: DestinationConfig,
-        rcpd_config: RcpdConfig,
     },
 }
 
