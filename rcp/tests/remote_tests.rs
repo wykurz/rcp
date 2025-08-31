@@ -15,6 +15,24 @@ fn get_file_content(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap()
 }
 
+fn interpret_exit_code(code: i32) -> String {
+    match code {
+        0 => "Success".to_string(),
+        1 => "General error".to_string(),
+        2 => "Misuse of shell command".to_string(),
+        124 => "Timeout (command exceeded time limit)".to_string(),
+        125 => "Command not found".to_string(),
+        126 => "Command found but not executable".to_string(),
+        127 => "Command not found (PATH issue)".to_string(),
+        128 => "Invalid exit argument".to_string(),
+        130 => "Terminated by Ctrl+C (SIGINT)".to_string(),
+        137 => "Killed by SIGKILL".to_string(),
+        143 => "Terminated by SIGTERM".to_string(),
+        code if code >= 128 => format!("Terminated by signal {}", code - 128),
+        code => format!("Exit code {}", code),
+    }
+}
+
 fn run_rcp_with_args(args: &[&str]) -> std::process::Output {
     let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
     let mut cmd = std::process::Command::new("timeout");
@@ -27,8 +45,14 @@ fn run_rcp_with_args(args: &[&str]) -> std::process::Output {
 fn print_command_output(output: &std::process::Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+
     eprintln!("=== RCP COMMAND OUTPUT ===");
-    eprintln!("Exit status: {}", output.status);
+    if let Some(code) = output.status.code() {
+        eprintln!("Exit status: {} ({})", code, interpret_exit_code(code));
+    } else {
+        eprintln!("Exit status: terminated by signal");
+    }
+
     if !stdout.is_empty() {
         eprintln!("--- STDOUT ---");
         eprintln!("{}", stdout);
@@ -44,10 +68,14 @@ fn run_rcp_and_expect_success(args: &[&str]) -> std::process::Output {
     let output = run_rcp_with_args(args);
     print_command_output(&output);
     if !output.status.success() {
-        if let Some(124) = output.status.code() {
-            panic!("Command timed out after 5 seconds - possible hang detected");
+        if let Some(code) = output.status.code() {
+            panic!(
+                "Command failed with exit code {} ({})",
+                code,
+                interpret_exit_code(code)
+            );
         } else {
-            panic!("Command failed when success was expected");
+            panic!("Command failed - terminated by signal");
         }
     }
     output
