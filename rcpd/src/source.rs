@@ -138,6 +138,7 @@ async fn send_file(
     is_root: bool,
     connection: remote::streams::Connection,
 ) -> anyhow::Result<()> {
+    let _open_file_guard = throttle::open_file_permit().await;
     let metadata = remote::protocol::Metadata::from(src_metadata);
     let file_header = remote::protocol::File {
         src: src.to_path_buf(),

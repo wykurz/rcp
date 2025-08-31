@@ -15,8 +15,9 @@ async fn send_root_done(
     Ok(())
 }
 
-#[instrument]
+#[instrument(skip(_open_file_guard))]
 async fn handle_file_stream(
+    _open_file_guard: throttle::OpenFileGuard,
     settings: common::copy::Settings,
     preserve: common::preserve::Settings,
     control_send_stream: remote::streams::SharedSendStream,
@@ -79,8 +80,10 @@ async fn process_incoming_file_streams(
     let mut join_set = tokio::task::JoinSet::new();
     while let Ok(file_recv_stream) = connection.accept_uni().await {
         tracing::info!("Received new unidirectional stream for file");
+        let open_file_guard = throttle::open_file_permit().await;
         let tracker = directory_tracker.clone();
         join_set.spawn(handle_file_stream(
+            open_file_guard,
             settings,
             preserve,
             control_send_stream.clone(),
