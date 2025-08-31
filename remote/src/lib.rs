@@ -149,7 +149,6 @@ pub async fn start_rcpd(
         .parent()
         .context("Failed to get parent directory of current executable")?;
     tracing::debug!("Running rcpd from: {:?}", bin_dir);
-    // TODO: if that doesn't work, try an alternative path
     let mut cmd = session.arc_command(format!("{}/rcpd", bin_dir.display()));
     cmd.arg("--master-addr")
         .arg(master_addr.to_string())
