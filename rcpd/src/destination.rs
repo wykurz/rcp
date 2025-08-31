@@ -77,7 +77,6 @@ async fn process_incoming_file_streams(
     directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
     let mut join_set = tokio::task::JoinSet::new();
-    // TODO: we're accumulating unbounded number of spawned tasks here
     while let Ok(file_recv_stream) = connection.accept_uni().await {
         tracing::info!("Received new unidirectional stream for file");
         let tracker = directory_tracker.clone();
@@ -88,8 +87,12 @@ async fn process_incoming_file_streams(
             file_recv_stream,
             tracker.clone(),
         ));
+        // opportunistically cleanup finished tasks
+        while let Some(result) = join_set.try_join_next() {
+            result??;
+        }
     }
-    // Handle completion of existing file streams
+    // handle completion of existing file streams
     while let Some(result) = join_set.join_next().await {
         result??;
     }
