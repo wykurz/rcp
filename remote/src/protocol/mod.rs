@@ -125,6 +125,7 @@ pub enum DestinationMessage {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RcpdConfig {
+    pub verbose: u8,
     pub fail_early: bool,
     pub max_workers: usize,
     pub max_blocking_threads: usize,
@@ -142,20 +143,29 @@ pub struct RcpdConfig {
 impl RcpdConfig {
     pub fn to_args(&self) -> Vec<String> {
         let mut args = vec![
-            format!("--fail-early={}", self.fail_early),
             format!("--max-workers={}", self.max_workers),
             format!("--max-blocking-threads={}", self.max_blocking_threads),
             format!("--ops-throttle={}", self.ops_throttle),
             format!("--iops-throttle={}", self.iops_throttle),
             format!("--chunk-size={}", self.chunk_size),
             format!("--tput-throttle={}", self.tput_throttle),
-            format!("--dereference={}", self.dereference),
-            format!("--overwrite={}", self.overwrite),
             format!("--overwrite-compare={}", self.overwrite_compare),
         ];
+        if self.verbose > 0 {
+            args.push(format!("-{}", "v".repeat(self.verbose as usize)));
+        }
+        if self.fail_early {
+            args.push("--fail-early".to_string());
+        }
         if let Some(v) = self.max_open_files {
             args.push(format!("--max-open-files={v}"));
         };
+        if self.dereference {
+            args.push("--dereference".to_string());
+        }
+        if self.overwrite {
+            args.push("--overwrite".to_string());
+        }
         args
     }
 }
