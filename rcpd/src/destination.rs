@@ -34,9 +34,6 @@ async fn handle_file_stream(
         file_header.src,
         file_header.dst
     );
-    // TODO:
-    // let _open_file_guard = throttle::open_file_permit().await;
-    // throttle::get_iops_tokens(tokens as u32).await;
     let mut file = tokio::fs::File::create(&file_header.dst).await?;
     let copied = file_recv_stream.copy_to(&mut file).await?;
     if copied != file_header.size {
@@ -81,6 +78,7 @@ async fn process_incoming_file_streams(
     while let Ok(file_recv_stream) = connection.accept_uni().await {
         tracing::info!("Received new unidirectional stream for file");
         let open_file_guard = throttle::open_file_permit().await;
+        throttle::get_ops_token().await;
         let tracker = directory_tracker.clone();
         join_set.spawn(handle_file_stream(
             open_file_guard,
