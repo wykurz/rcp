@@ -34,6 +34,7 @@ async fn handle_file_stream(
         file_header.src,
         file_header.dst
     );
+    throttle::get_file_iops_tokens(settings.chunk_size, file_header.size as u64).await;
     let mut file = tokio::fs::File::create(&file_header.dst).await?;
     let copied = file_recv_stream.copy_to(&mut file).await?;
     if copied != file_header.size {

@@ -124,7 +124,7 @@ async fn send_fs_objects(
         .send_control_message(&remote::protocol::SourceMessage::DirStructureComplete)
         .await?;
     if src_metadata.is_file() {
-        send_file(src, dst, &src_metadata, true, connection).await?;
+        send_file(settings, src, dst, &src_metadata, true, connection).await?;
     }
     return Ok(());
 }
@@ -132,6 +132,7 @@ async fn send_fs_objects(
 #[instrument]
 #[async_recursion]
 async fn send_file(
+    settings: &common::copy::Settings,
     src: &std::path::Path,
     dst: &std::path::Path,
     src_metadata: &std::fs::Metadata,
@@ -149,6 +150,7 @@ async fn send_file(
     };
     let mut file_send_stream = connection.open_uni().await?;
     tracing::debug!("Sending file content for {:?}", src);
+    throttle::get_file_iops_tokens(settings.chunk_size, src_metadata.len()).await;
     file_send_stream
         .send_message_with_data(&file_header, &mut tokio::fs::File::open(src).await?)
         .await
@@ -190,7 +192,15 @@ async fn send_files_in_directory(
         throttle::get_ops_token().await;
         let connection = connection.clone();
         join_set.spawn(async move {
-            send_file(&entry_path, &dst_path, &entry_metadata, false, connection).await
+            send_file(
+                &settings,
+                &entry_path,
+                &dst_path,
+                &entry_metadata,
+                false,
+                connection,
+            )
+            .await
         });
     }
     drop(entries);
