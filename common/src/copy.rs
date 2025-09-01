@@ -2,6 +2,7 @@ use std::os::unix::fs::MetadataExt;
 
 use anyhow::{anyhow, Context};
 use async_recursion::async_recursion;
+use throttle::get_file_iops_tokens;
 use tracing::instrument;
 
 use crate::filecmp;
@@ -57,17 +58,7 @@ pub async fn copy_file(
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))
         .map_err(|err| Error::new(err, Default::default()))?;
-    if settings.chunk_size > 0 {
-        let tokens = 1 + (std::cmp::max(1, src_metadata.size()) - 1) / settings.chunk_size;
-        if tokens > u32::MAX as u64 {
-            tracing::error!(
-                "chunk size: {} is too small to limit throughput for files this big, file: {:?}, size: {}",
-                settings.chunk_size, &src, src_metadata.size(),
-            );
-        } else {
-            throttle::get_iops_tokens(tokens as u32).await;
-        }
-    }
+    get_file_iops_tokens(settings.chunk_size, src_metadata.size()).await;
     let mut rm_summary = RmSummary::default();
     if !is_fresh && dst.exists() {
         if settings.overwrite {

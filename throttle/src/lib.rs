@@ -35,8 +35,23 @@ pub async fn get_ops_token() {
     OPS_THROTTLE.consume().await;
 }
 
-pub async fn get_iops_tokens(tokens: u32) {
+async fn get_iops_tokens(tokens: u32) {
     IOPS_THROTTLE.consume_many(tokens).await;
+}
+
+pub async fn get_file_iops_tokens(chunk_size: u64, file_size: u64) {
+    if chunk_size > 0 {
+        let tokens = 1 + (std::cmp::max(1, file_size) - 1) / chunk_size;
+        if tokens > u32::MAX as u64 {
+            tracing::error!(
+                "chunk size: {} is too small to limit throughput for files this big, size: {}",
+                chunk_size,
+                file_size,
+            );
+        } else {
+            get_iops_tokens(tokens as u32).await;
+        }
+    }
 }
 
 pub async fn run_ops_replenish_thread(replenish: usize, interval: std::time::Duration) {
