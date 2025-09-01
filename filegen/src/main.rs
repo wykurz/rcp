@@ -133,18 +133,7 @@ async fn write_file(
     chunk_size: u64,
 ) -> Result<()> {
     let _permit = throttle::open_file_permit().await;
-    if chunk_size > 0 {
-        let tokens = 1 + (std::cmp::max(1, filesize) - 1) as u64 / chunk_size;
-        if tokens > u32::MAX as u64 {
-            tracing::error!(
-                "chunk size: {} is too small to limit throughput for files this size: {}",
-                chunk_size,
-                filesize,
-            );
-        } else {
-            throttle::get_iops_tokens(tokens as u32).await;
-        }
-    }
+    throttle::get_file_iops_tokens(chunk_size, filesize as u64).await;
     let mut bytes = vec![0u8; bufsize];
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
