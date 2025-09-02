@@ -379,13 +379,14 @@ where
             let subscriber = tracing_subscriber::registry()
                 .with(remote_tracing_layer)
                 .with(
-                    tracing_subscriber::EnvFilter::try_new(match verbose {
-                        0 => "error",
-                        1 => "info",
-                        2 => "debug",
-                        _ => "trace",
-                    })
-                    .unwrap(),
+                    tracing_subscriber::EnvFilter::from_default_env().add_directive(
+                        match verbose {
+                            0 => "error".parse().unwrap(),
+                            1 => "info".parse().unwrap(),
+                            2 => "debug".parse().unwrap(),
+                            _ => "trace".parse().unwrap(),
+                        },
+                    ),
                 );
             subscriber.init();
         } else {
@@ -400,13 +401,14 @@ where
                 .pretty()
                 .with_writer(ProgWriter::new)
                 .with_filter(
-                    tracing_subscriber::EnvFilter::try_new(match verbose {
-                        0 => "error",
-                        1 => "info",
-                        2 => "debug",
-                        _ => "trace",
-                    })
-                    .unwrap(),
+                    tracing_subscriber::EnvFilter::from_default_env().add_directive(
+                        match verbose {
+                            0 => "error".parse().unwrap(),
+                            1 => "info".parse().unwrap(),
+                            2 => "debug".parse().unwrap(),
+                            _ => "trace".parse().unwrap(),
+                        },
+                    ),
                 );
             let is_console_enabled = match std::env::var("RCP_TOKIO_TRACING_CONSOLE_ENABLED") {
                 Ok(val) => matches!(val.to_lowercase().as_str(), "true" | "1"),
