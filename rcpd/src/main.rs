@@ -80,6 +80,10 @@ struct Args {
     /// Throttle the number of bytes per second, 0 means no throttle
     #[structopt(long, default_value = "0")]
     tput_throttle: usize,
+
+    /// Enable file-based debug logging with given prefix
+    #[structopt(long)]
+    debug_log_prefix: Option<String>,
 }
 
 #[instrument]
@@ -157,6 +161,11 @@ fn main() -> Result<(), anyhow::Error> {
         let args = args.clone();
         || async_main(args, tracing_receiver)
     };
+    let debug_log_file = args.debug_log_prefix.as_ref().map(|prefix| {
+        let filename = common::generate_debug_log_filename(prefix);
+        println!("rcpd: Debug logging to file: {filename}");
+        filename
+    });
     let res = common::run(
         None,
         args.quiet,
@@ -170,6 +179,7 @@ fn main() -> Result<(), anyhow::Error> {
         args.chunk_size,
         args.tput_throttle,
         Some(tracing_layer),
+        debug_log_file,
         func,
     );
     if res.is_none() {

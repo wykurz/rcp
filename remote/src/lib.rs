@@ -149,12 +149,14 @@ pub async fn start_rcpd(
         .parent()
         .context("Failed to get parent directory of current executable")?;
     tracing::debug!("Running rcpd from: {:?}", bin_dir);
+    let rcpd_args = rcpd_config.to_args();
+    tracing::debug!("rcpd arguments: {:?}", rcpd_args);
     let mut cmd = session.arc_command(format!("{}/rcpd", bin_dir.display()));
     cmd.arg("--master-addr")
         .arg(master_addr.to_string())
         .arg("--server-name")
         .arg(master_server_name)
-        .args(rcpd_config.to_args())
+        .args(rcpd_args)
         .spawn()
         .await
         .context("Failed to spawn rcpd command")
