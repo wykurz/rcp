@@ -138,6 +138,7 @@ pub struct RcpdConfig {
     pub dereference: bool,
     pub overwrite: bool,
     pub overwrite_compare: String,
+    pub debug_log_prefix: Option<String>,
 }
 
 impl RcpdConfig {
@@ -165,6 +166,9 @@ impl RcpdConfig {
         }
         if self.overwrite {
             args.push("--overwrite".to_string());
+        }
+        if let Some(ref prefix) = self.debug_log_prefix {
+            args.push(format!("--debug-log-prefix={prefix}"));
         }
         args
     }

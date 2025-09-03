@@ -439,3 +439,63 @@ fn test_remote_dereference_file_symlink_permissions() {
     assert_eq!(mode1, 0o755);
     assert_eq!(mode2, 0o640);
 }
+
+#[test]
+fn test_rcpd_debug_log_file_creation() {
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("debug_log_test.txt");
+    let dst_file = dst_dir.path().join("debug_log_test.txt");
+    create_test_file(&src_file, "debug log test content", 0o644);
+    // Use a unique prefix for this test
+    let temp_dir = std::env::temp_dir()
+        .to_str()
+        .expect("No default temp directory?")
+        .to_owned();
+    let log_prefix = format!("{temp_dir}/rcpd-test-{}", std::process::id());
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    // Run rcp with debug log prefix
+    let output = run_rcp_with_args(&[
+        "--rcpd-debug-log-prefix",
+        &log_prefix,
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output);
+    // Copy should succeed
+    assert!(output.status.success(), "rcp command should succeed");
+    assert_eq!(get_file_content(&dst_file), "debug log test content");
+    // Check that debug log files were created
+    let tmp_entries = std::fs::read_dir(temp_dir)
+        .expect("Failed to read temp directory")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map(|name| name.starts_with(&format!("rcpd-test-{}", std::process::id())))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    eprintln!(
+        "Found debug log files: {:?}",
+        tmp_entries
+            .iter()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>()
+    );
+    assert!(!tmp_entries.is_empty(), "Debug log files should be created");
+    // Verify log files contain actual log entries
+    for entry in tmp_entries {
+        let log_content =
+            std::fs::read_to_string(entry.path()).expect("Should be able to read debug log file");
+        eprintln!(
+            "Log file {} contents (first 200 chars): {}",
+            entry.file_name().to_str().unwrap(),
+            &log_content[..std::cmp::min(200, log_content.len())]
+        );
+        assert!(!log_content.is_empty(), "Log files should contain content");
+        // Clean up test log files
+        std::fs::remove_file(entry.path()).ok();
+    }
+}

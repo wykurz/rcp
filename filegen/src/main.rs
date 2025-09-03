@@ -246,6 +246,7 @@ fn main() -> Result<(), anyhow::Error> {
         args.chunk_size,
         args.tput_throttle,
         None,
+        None,
         func,
     );
     if res.is_none() {

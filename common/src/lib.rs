@@ -351,6 +351,13 @@ impl std::io::Write for ProgWriter {
     }
 }
 
+pub fn generate_debug_log_filename(prefix: &str) -> String {
+    let now = chrono::Utc::now();
+    let timestamp = now.format("%Y-%m-%dT%H:%M:%S").to_string();
+    let process_id = std::process::id();
+    format!("{prefix}-{timestamp}-{process_id}")
+}
+
 #[instrument(skip(func))] // "func" is not Debug printable
 #[allow(clippy::too_many_arguments)]
 pub fn run<Fut, Summary, Error>(
@@ -366,6 +373,7 @@ pub fn run<Fut, Summary, Error>(
     chunk_size: u64,
     tput_throttle: usize,
     remote_tracing_layer: Option<remote_tracing::RemoteTracingLayer>,
+    debug_log_file: Option<String>,
     func: impl FnOnce() -> Fut,
 ) -> Option<Summary>
 // we return an Option rather than a Result to indicate that callers of this function should NOT print the error
@@ -375,20 +383,37 @@ where
     Fut: std::future::Future<Output = Result<Summary, Error>>,
 {
     if !quiet {
-        if let Some(remote_tracing_layer) = remote_tracing_layer {
-            let subscriber = tracing_subscriber::registry()
-                .with(remote_tracing_layer)
-                .with(
-                    tracing_subscriber::EnvFilter::from_default_env().add_directive(
-                        match verbose {
-                            0 => "error".parse().unwrap(),
-                            1 => "info".parse().unwrap(),
-                            2 => "debug".parse().unwrap(),
-                            _ => "trace".parse().unwrap(),
-                        },
-                    ),
+        let env_filter =
+            tracing_subscriber::EnvFilter::from_default_env().add_directive(match verbose {
+                0 => "error".parse().unwrap(),
+                1 => "info".parse().unwrap(),
+                2 => "debug".parse().unwrap(),
+                _ => "trace".parse().unwrap(),
+            });
+        let file_layer = if let Some(ref log_file_path) = debug_log_file {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_file_path)
+                .unwrap_or_else(|e| {
+                    panic!("Failed to create debug log file at '{log_file_path}': {e}")
+                });
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_line_number(true)
+                .with_thread_ids(true)
+                .with_ansi(false)
+                .with_writer(file)
+                .with_filter(
+                    tracing_subscriber::EnvFilter::try_new("debug")
+                        .expect("Failed to parse log filter string 'debug'"),
                 );
-            subscriber.init();
+            Some(file_layer)
+        } else {
+            None
+        };
+        let fmt_layer = if remote_tracing_layer.is_some() {
+            None
         } else {
             let fmt_layer = tracing_subscriber::fmt::layer()
                 .with_target(true)
@@ -399,36 +424,33 @@ where
                     FmtSpan::NONE
                 })
                 .pretty()
-                .with_writer(ProgWriter::new)
-                .with_filter(
-                    tracing_subscriber::EnvFilter::from_default_env().add_directive(
-                        match verbose {
-                            0 => "error".parse().unwrap(),
-                            1 => "info".parse().unwrap(),
-                            2 => "debug".parse().unwrap(),
-                            _ => "trace".parse().unwrap(),
-                        },
-                    ),
-                );
-            let is_console_enabled = match std::env::var("RCP_TOKIO_TRACING_CONSOLE_ENABLED") {
-                Ok(val) => matches!(val.to_lowercase().as_str(), "true" | "1"),
-                Err(_) => false,
-            };
-            let subscriber = tracing_subscriber::registry().with(fmt_layer);
-            if is_console_enabled {
-                let console_port: u16 =
-                    read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_SERVER_PORT", 6669);
-                let retention_seconds: u64 =
-                    read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS", 60);
-                let console_layer = console_subscriber::ConsoleLayer::builder()
-                    .retention(std::time::Duration::from_secs(retention_seconds))
-                    .server_addr(([127, 0, 0, 1], console_port))
-                    .spawn();
-                subscriber.with(console_layer).init();
-            } else {
-                subscriber.init();
-            }
-        }
+                .with_writer(ProgWriter::new);
+            Some(fmt_layer)
+        };
+        let is_console_enabled = match std::env::var("RCP_TOKIO_TRACING_CONSOLE_ENABLED") {
+            Ok(val) => matches!(val.to_lowercase().as_str(), "true" | "1"),
+            Err(_) => false,
+        };
+        let console_layer = if is_console_enabled {
+            let console_port: u16 =
+                read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_SERVER_PORT", 6669);
+            let retention_seconds: u64 =
+                read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS", 60);
+            let console_layer = console_subscriber::ConsoleLayer::builder()
+                .retention(std::time::Duration::from_secs(retention_seconds))
+                .server_addr(([127, 0, 0, 1], console_port))
+                .spawn();
+            Some(console_layer)
+        } else {
+            None
+        };
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(file_layer)
+            .with(fmt_layer)
+            .with(remote_tracing_layer)
+            .with(console_layer)
+            .init();
     } else {
         assert!(
             verbose == 0,
