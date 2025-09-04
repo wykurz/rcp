@@ -630,7 +630,7 @@ mod link_tests {
         Ok(())
     }
 
-    pub async fn setup_update_dir(tmp_dir: &std::path::PathBuf) -> Result<(), anyhow::Error> {
+    pub async fn setup_update_dir(tmp_dir: &std::path::Path) -> Result<(), anyhow::Error> {
         // update
         // |- 0.txt
         // |- bar

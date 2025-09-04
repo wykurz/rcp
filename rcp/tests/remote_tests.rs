@@ -29,7 +29,7 @@ fn interpret_exit_code(code: i32) -> String {
         137 => "Killed by SIGKILL".to_string(),
         143 => "Terminated by SIGTERM".to_string(),
         code if code >= 128 => format!("Terminated by signal {}", code - 128),
-        code => format!("Exit code {}", code),
+        code => format!("Exit code {code}"),
     }
 }
 
@@ -55,11 +55,11 @@ fn print_command_output(output: &std::process::Output) {
 
     if !stdout.is_empty() {
         eprintln!("--- STDOUT ---");
-        eprintln!("{}", stdout);
+        eprintln!("{stdout}");
     }
     if !stderr.is_empty() {
         eprintln!("--- STDERR ---");
-        eprintln!("{}", stderr);
+        eprintln!("{stderr}");
     }
     eprintln!("=== END RCP OUTPUT ===");
 }
@@ -298,9 +298,9 @@ fn test_remote_symlink_chain_dereference() {
     let src_subdir = src_dir.path().join("chain_test");
     std::fs::create_dir(&src_subdir).unwrap();
     // Create symlinks in the test directory that represent the chain
-    std::os::unix::fs::symlink(&foo_link, &src_subdir.join("foo")).unwrap();
-    std::os::unix::fs::symlink(&bar_link, &src_subdir.join("bar")).unwrap();
-    std::os::unix::fs::symlink(&baz_file, &src_subdir.join("baz")).unwrap();
+    std::os::unix::fs::symlink(&foo_link, src_subdir.join("foo")).unwrap();
+    std::os::unix::fs::symlink(&bar_link, src_subdir.join("bar")).unwrap();
+    std::os::unix::fs::symlink(&baz_file, src_subdir.join("baz")).unwrap();
     let dst_subdir = dst_dir.path().join("chain_test");
     let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
@@ -337,9 +337,9 @@ fn test_remote_symlink_chain_no_dereference() {
     let src_subdir = src_dir.path().join("chain_test");
     std::fs::create_dir(&src_subdir).unwrap();
     // Create symlinks in the test directory that represent the chain
-    std::os::unix::fs::symlink(&foo_link, &src_subdir.join("foo")).unwrap();
-    std::os::unix::fs::symlink(&bar_link, &src_subdir.join("bar")).unwrap();
-    std::os::unix::fs::symlink(&baz_file, &src_subdir.join("baz")).unwrap();
+    std::os::unix::fs::symlink(&foo_link, src_subdir.join("foo")).unwrap();
+    std::os::unix::fs::symlink(&bar_link, src_subdir.join("bar")).unwrap();
+    std::os::unix::fs::symlink(&baz_file, src_subdir.join("baz")).unwrap();
     let dst_subdir = dst_dir.path().join("chain_test");
     let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
@@ -351,15 +351,15 @@ fn test_remote_symlink_chain_no_dereference() {
     assert!(dst_subdir.join("baz").is_symlink());
     // Verify symlink targets are preserved
     assert_eq!(
-        std::fs::read_link(&dst_subdir.join("foo")).unwrap(),
+        std::fs::read_link(dst_subdir.join("foo")).unwrap(),
         foo_link
     );
     assert_eq!(
-        std::fs::read_link(&dst_subdir.join("bar")).unwrap(),
+        std::fs::read_link(dst_subdir.join("bar")).unwrap(),
         bar_link
     );
     assert_eq!(
-        std::fs::read_link(&dst_subdir.join("baz")).unwrap(),
+        std::fs::read_link(dst_subdir.join("baz")).unwrap(),
         baz_file
     );
 }
@@ -390,12 +390,12 @@ fn test_remote_dereference_directory_symlink() {
     // Verify files were copied with correct content and permissions
     assert_eq!(get_file_content(&dst_path.join("file1.txt")), "content1");
     assert_eq!(get_file_content(&dst_path.join("file2.txt")), "content2");
-    let mode1 = std::fs::metadata(&dst_path.join("file1.txt"))
+    let mode1 = std::fs::metadata(dst_path.join("file1.txt"))
         .unwrap()
         .permissions()
         .mode()
         & 0o7777;
-    let mode2 = std::fs::metadata(&dst_path.join("file2.txt"))
+    let mode2 = std::fs::metadata(dst_path.join("file2.txt"))
         .unwrap()
         .permissions()
         .mode()
@@ -441,7 +441,7 @@ fn test_remote_dereference_file_symlink_permissions() {
 }
 
 #[test]
-fn test_rcpd_debug_log_file_creation() {
+fn test_remote_debug_log_file_creation() {
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("debug_log_test.txt");
     let dst_file = dst_dir.path().join("debug_log_test.txt");
@@ -498,4 +498,21 @@ fn test_rcpd_debug_log_file_creation() {
         // Clean up test log files
         std::fs::remove_file(entry.path()).ok();
     }
+}
+
+#[test]
+fn test_remote_copy_port_range() {
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("port_range_test.txt");
+    let dst_file = dst_dir.path().join("port_range_test.txt");
+    create_test_file(&src_file, "port range test content", 0o644);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    // use a port range that's unlikely to conflict with other tests
+    // we'll use a high port range to avoid conflicts with system services
+    let port_range = "25000-25999";
+    eprintln!("Testing remote copy with port range: {}", port_range);
+    run_rcp_and_expect_success(&["--quic-port-ranges", port_range, &src_remote, &dst_remote]);
+    // verify the file was copied successfully
+    assert_eq!(get_file_content(&dst_file), "port range test content");
 }

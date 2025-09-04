@@ -130,6 +130,11 @@ struct Args {
     /// (e.g., /tmp/rcpd-log will create /tmp/rcpd-log-YYYY-MM-DDTHH-MM-SS-RANDOM)
     #[structopt(long)]
     rcpd_debug_log_prefix: Option<String>,
+
+    /// Restrict QUIC binding to specific port ranges (e.g., "8000-8999,10000-10999")
+    /// If not specified, uses dynamic port allocation (default behavior)
+    #[structopt(long)]
+    quic_port_ranges: Option<String>,
 }
 
 #[instrument]
@@ -141,7 +146,7 @@ async fn run_rcpd_master(
 ) -> anyhow::Result<common::copy::Summary> {
     tracing::debug!("running rcpd src/dst");
     // open a port and wait from server & client hello, respond to client with server port
-    let server_endpoint = remote::get_server()?;
+    let server_endpoint = remote::get_server_with_port_ranges(args.quic_port_ranges.as_deref())?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
     let server_name = remote::get_random_server_name();
     let mut rcpds = vec![];
@@ -159,6 +164,7 @@ async fn run_rcpd_master(
         overwrite: args.overwrite,
         overwrite_compare: args.overwrite_compare.clone(),
         debug_log_prefix: args.rcpd_debug_log_prefix.clone(),
+        quic_port_ranges: args.quic_port_ranges.clone(),
     };
     for _ in 0..2 {
         let rcpd =

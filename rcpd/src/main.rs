@@ -84,6 +84,11 @@ struct Args {
     /// Enable file-based debug logging with given prefix
     #[structopt(long)]
     debug_log_prefix: Option<String>,
+
+    /// Restrict QUIC binding to specific port ranges (e.g., "8000-8999,10000-10999")
+    /// If not specified, uses dynamic port allocation (default behavior)
+    #[structopt(long)]
+    quic_port_ranges: Option<String>,
 }
 
 #[instrument]
@@ -96,7 +101,7 @@ async fn async_main(
         args.master_addr,
         args.server_name
     );
-    let client = remote::get_client()?;
+    let client = remote::get_client_with_port_ranges(args.quic_port_ranges.as_deref())?;
     let master_connection = {
         let master_connection = client.connect(args.master_addr, &args.server_name)?.await?;
         remote::streams::Connection::new(master_connection)
