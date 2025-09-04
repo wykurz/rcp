@@ -156,10 +156,9 @@ pub async fn start_rcpd(
         .arg(master_addr.to_string())
         .arg("--server-name")
         .arg(master_server_name)
-        .args(rcpd_args)
-        .spawn()
-        .await
-        .context("Failed to spawn rcpd command")
+        .args(rcpd_args);
+    tracing::info!("Will run remotely: {cmd:?}");
+    cmd.spawn().await.context("Failed to spawn rcpd command")
 }
 
 fn configure_server() -> anyhow::Result<quinn::ServerConfig> {
