@@ -139,6 +139,7 @@ pub struct RcpdConfig {
     pub overwrite: bool,
     pub overwrite_compare: String,
     pub debug_log_prefix: Option<String>,
+    pub quic_port_ranges: Option<String>,
 }
 
 impl RcpdConfig {
@@ -169,6 +170,9 @@ impl RcpdConfig {
         }
         if let Some(ref prefix) = self.debug_log_prefix {
             args.push(format!("--debug-log-prefix={prefix}"));
+        }
+        if let Some(ref ranges) = self.quic_port_ranges {
+            args.push(format!("--quic-port-ranges={ranges}"));
         }
         args
     }

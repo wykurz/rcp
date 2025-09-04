@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context};
 use rand::Rng;
 use tracing::instrument;
 
+pub mod port_ranges;
 pub mod protocol;
 pub mod streams;
 
@@ -175,13 +176,29 @@ fn configure_server() -> anyhow::Result<quinn::ServerConfig> {
 
 #[instrument]
 pub fn get_server() -> anyhow::Result<quinn::Endpoint> {
-    let server_config = configure_server()?;
-    let addr = "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap();
-    quinn::Endpoint::server(server_config, addr).context("Failed to create QUIC endpoint")
+    get_server_with_port_ranges(None)
 }
 
-// Certificate verifier that accepts any server certificate
-// Used for development/testing only
+#[instrument]
+pub fn get_server_with_port_ranges(port_ranges: Option<&str>) -> anyhow::Result<quinn::Endpoint> {
+    let server_config = configure_server()?;
+    let socket = if let Some(ranges_str) = port_ranges {
+        let ranges = port_ranges::PortRanges::parse(ranges_str)?;
+        ranges.bind_udp_socket(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))?
+    } else {
+        // default behavior: bind to any available port
+        std::net::UdpSocket::bind("0.0.0.0:0")?
+    };
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        std::sync::Arc::new(quinn::TokioRuntime),
+    )
+    .context("Failed to create QUIC endpoint")
+}
+
+// certificate verifier that accepts any server certificate
 struct AcceptAnyCertificate;
 
 impl rustls::client::ServerCertVerifier for AcceptAnyCertificate {
@@ -223,6 +240,11 @@ pub fn get_random_server_name() -> String {
 
 #[instrument]
 pub fn get_client() -> anyhow::Result<quinn::Endpoint> {
+    get_client_with_port_ranges(None)
+}
+
+#[instrument]
+pub fn get_client_with_port_ranges(port_ranges: Option<&str>) -> anyhow::Result<quinn::Endpoint> {
     // Create a crypto backend that accepts any server certificate (for development only)
     let crypto = rustls::ClientConfig::builder()
         .with_safe_defaults()
@@ -232,10 +254,22 @@ pub fn get_client() -> anyhow::Result<quinn::Endpoint> {
     // Create QUIC client config
     let client_config = quinn::ClientConfig::new(std::sync::Arc::new(crypto));
 
+    let socket = if let Some(ranges_str) = port_ranges {
+        let ranges = port_ranges::PortRanges::parse(ranges_str)?;
+        ranges.bind_udp_socket(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))?
+    } else {
+        // Default behavior: bind to any available port
+        std::net::UdpSocket::bind("0.0.0.0:0")?
+    };
+
     // Create and configure endpoint
-    let endpoint = "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap();
-    let mut endpoint =
-        quinn::Endpoint::client(endpoint).context("Failed to create QUIC endpoint")?;
+    let mut endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None, // No server config for client
+        socket,
+        std::sync::Arc::new(quinn::TokioRuntime),
+    )
+    .context("Failed to create QUIC endpoint")?;
     endpoint.set_default_client_config(client_config);
 
     Ok(endpoint)

@@ -690,15 +690,15 @@ fn test_symlink_chain_no_dereference_integration() {
     assert!(dst_subdir.join("baz").is_symlink());
     // Verify symlink targets are preserved
     assert_eq!(
-        std::fs::read_link(&dst_subdir.join("foo")).unwrap(),
+        std::fs::read_link(dst_subdir.join("foo")).unwrap(),
         foo_link
     );
     assert_eq!(
-        std::fs::read_link(&dst_subdir.join("bar")).unwrap(),
+        std::fs::read_link(dst_subdir.join("bar")).unwrap(),
         bar_link
     );
     assert_eq!(
-        std::fs::read_link(&dst_subdir.join("baz")).unwrap(),
+        std::fs::read_link(dst_subdir.join("baz")).unwrap(),
         baz_file
     );
 }
