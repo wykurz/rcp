@@ -91,6 +91,11 @@ async fn async_main(
     args: Args,
     tracing_receiver: tokio::sync::mpsc::UnboundedReceiver<common::remote_tracing::TracingMessage>,
 ) -> anyhow::Result<String> {
+    tracing::info!(
+        "Connecting to master {} (server name: {})",
+        args.master_addr,
+        args.server_name
+    );
     let client = remote::get_client()?;
     let master_connection = {
         let master_connection = client.connect(args.master_addr, &args.server_name)?.await?;

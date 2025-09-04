@@ -405,8 +405,14 @@ where
                 .with_ansi(false)
                 .with_writer(file)
                 .with_filter(
-                    tracing_subscriber::EnvFilter::try_new("debug")
-                        .expect("Failed to parse log filter string 'debug'"),
+                    tracing_subscriber::EnvFilter::from_default_env().add_directive(
+                        match verbose {
+                            0 => "error".parse().unwrap(),
+                            1 => "info".parse().unwrap(),
+                            2 => "debug".parse().unwrap(),
+                            _ => "trace".parse().unwrap(),
+                        },
+                    ),
                 );
             Some(file_layer)
         } else {
