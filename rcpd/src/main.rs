@@ -136,7 +136,14 @@ async fn async_main(
     let result = match master_hello {
         remote::protocol::MasterHello::Source { src, dst } => {
             tracing::info!("Starting source");
-            source::run_source(master_send_stream.clone(), &src, &dst, &settings).await?
+            source::run_source(
+                master_send_stream.clone(),
+                &src,
+                &dst,
+                &settings,
+                args.quic_port_ranges.as_deref(),
+            )
+            .await?
         }
         remote::protocol::MasterHello::Destination {
             source_addr,

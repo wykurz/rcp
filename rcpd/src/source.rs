@@ -323,8 +323,9 @@ pub async fn run_source(
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &common::copy::Settings,
+    quic_port_ranges: Option<&str>,
 ) -> anyhow::Result<String> {
-    let server_endpoint = remote::get_server()?;
+    let server_endpoint = remote::get_server_with_port_ranges(quic_port_ranges)?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
     tracing::info!("Source server listening on {}", server_addr);
     let master_hello = remote::protocol::SourceMasterHello {

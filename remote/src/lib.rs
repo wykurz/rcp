@@ -175,11 +175,6 @@ fn configure_server() -> anyhow::Result<quinn::ServerConfig> {
 }
 
 #[instrument]
-pub fn get_server() -> anyhow::Result<quinn::Endpoint> {
-    get_server_with_port_ranges(None)
-}
-
-#[instrument]
 pub fn get_server_with_port_ranges(port_ranges: Option<&str>) -> anyhow::Result<quinn::Endpoint> {
     let server_config = configure_server()?;
     let socket = if let Some(ranges_str) = port_ranges {
