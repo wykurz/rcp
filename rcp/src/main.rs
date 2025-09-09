@@ -264,15 +264,35 @@ async fn run_rcpd_master(
         dest_send_stream.close().await?;
     }
     tracing::info!("Forwarded source connection info to destination");
-    source_recv_stream
-        .recv_object::<remote::protocol::RcpdGoodBye>()
+    let source_result = source_recv_stream
+        .recv_object::<remote::protocol::RcpdResult>()
         .await?
-        .expect("Failed to receive RcpdGoodBye from source rcpd");
-    dest_recv_stream
-        .recv_object::<remote::protocol::RcpdGoodBye>()
+        .expect("Failed to receive RcpdResult from source rcpd");
+    let dest_result = dest_recv_stream
+        .recv_object::<remote::protocol::RcpdResult>()
         .await?
-        .expect("Failed to receive RcpdGoodBye from destination rcpd");
-    tracing::debug!("Received RcpdGoodBye from both source and destination rcpds");
+        .expect("Failed to receive RcpdResult from destination rcpd");
+    tracing::debug!("Received RcpdResult from both source and destination rcpds");
+    // check for failures and collect error details
+    let mut errors = Vec::new();
+    match source_result {
+        remote::protocol::RcpdResult::Success { message } => {
+            tracing::info!("Source rcpd completed successfully: {message}");
+        }
+        remote::protocol::RcpdResult::Failure { error } => {
+            tracing::error!("Source rcpd failed: {error}");
+            errors.push(format!("Source: {error}"));
+        }
+    }
+    match dest_result {
+        remote::protocol::RcpdResult::Success { message } => {
+            tracing::info!("Destination rcpd completed successfully: {message}");
+        }
+        remote::protocol::RcpdResult::Failure { error } => {
+            tracing::error!("Destination rcpd failed: {error}");
+            errors.push(format!("Destination: {error}"));
+        }
+    }
     for rcpd in rcpds {
         tracing::info!("Waiting for rcpd process to finish: {:?}", rcpd);
         remote::wait_for_rcpd_process(rcpd).await?;
@@ -283,6 +303,14 @@ async fn run_rcpd_master(
     dest_connection.close();
     server_endpoint.wait_idle().await;
     tracing::info!("All rcpd processes finished");
+    // propagate any errors from rcpd processes
+    if !errors.is_empty() {
+        let combined_error = errors.join("; ");
+        tracing::error!("rcpd operation(s) failed: {combined_error}");
+        return Err(anyhow::anyhow!(
+            "rcpd operation(s) failed: {combined_error}"
+        ));
+    }
     Ok(common::copy::Summary::default())
 }
 

@@ -133,17 +133,23 @@ async fn async_main(
         overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
         chunk_size: args.chunk_size,
     };
-    let result = match master_hello {
+    let rcpd_result = match master_hello {
         remote::protocol::MasterHello::Source { src, dst } => {
             tracing::info!("Starting source");
-            source::run_source(
+            match source::run_source(
                 master_send_stream.clone(),
                 &src,
                 &dst,
                 &settings,
                 args.quic_port_ranges.as_deref(),
             )
-            .await?
+            .await
+            {
+                Ok(message) => remote::protocol::RcpdResult::Success { message },
+                Err(error) => remote::protocol::RcpdResult::Failure {
+                    error: format!("{error:#}"),
+                },
+            }
         }
         remote::protocol::MasterHello::Destination {
             source_addr,
@@ -151,14 +157,21 @@ async fn async_main(
             preserve,
         } => {
             tracing::info!("Starting destination");
-            destination::run_destination(&source_addr, &server_name, &settings, &preserve).await?
+            match destination::run_destination(&source_addr, &server_name, &settings, &preserve)
+                .await
+            {
+                Ok(message) => remote::protocol::RcpdResult::Success { message },
+                Err(error) => remote::protocol::RcpdResult::Failure {
+                    error: format!("{error:#}"),
+                },
+            }
         }
     };
     tracing::debug!("Closing master send stream");
     {
         let mut master_send_stream = master_send_stream.lock().await;
         master_send_stream
-            .send_control_message(&remote::protocol::RcpdGoodBye {})
+            .send_control_message(&rcpd_result)
             .await?;
         master_send_stream.close().await?;
     }
@@ -168,7 +181,13 @@ async fn async_main(
     tracing_sender_task.await??;
     master_connection.close();
     client.wait_idle().await;
-    Ok(result)
+    match rcpd_result {
+        remote::protocol::RcpdResult::Success { message } => Ok(message),
+        remote::protocol::RcpdResult::Failure { error } => {
+            tracing::error!("rcpd operation failed: {error}");
+            Err(anyhow::anyhow!("rcpd operation failed: {error}"))
+        }
+    }
 }
 
 fn main() -> Result<(), anyhow::Error> {
