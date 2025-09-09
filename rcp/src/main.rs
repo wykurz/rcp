@@ -344,7 +344,28 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         }
     }
     let dst_string = args.paths.last().unwrap();
-    let dst_path_type = path::parse_path(dst_string);
+    // check if we have remote paths to determine if we need path resolution
+    let has_remote_paths = match first_src_path_type {
+        path::PathType::Remote(_) => true,
+        path::PathType::Local(_) => {
+            // Check if destination is remote
+            matches!(path::parse_path(dst_string), path::PathType::Remote(_))
+        }
+    };
+    // apply path resolution logic for remote case
+    let resolved_dst_string = if has_remote_paths {
+        // for remote paths, we only support single source
+        if src_strings.len() > 1 {
+            return Err(anyhow!(
+                "Multiple sources are currently not supported when using remote paths!"
+            ));
+        }
+        // resolve destination path with trailing slash logic
+        path::resolve_destination_path(&src_strings[0], dst_string, false)?
+    } else {
+        dst_string.to_string()
+    };
+    let dst_path_type = path::parse_path(&resolved_dst_string);
     // if any of the src/dst paths are remote, we'll be using the rcpd
     let remote_src_dst = match (first_src_path_type, dst_path_type) {
         (path::PathType::Remote(src_remote), path::PathType::Remote(dst_remote)) => {
@@ -371,27 +392,20 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
     };
     tracing::debug!("preserve settings: {:?}", &preserve);
     if let Some((remote_src, remote_dst)) = remote_src_dst {
-        if src_strings.len() > 1 {
-            return Err(anyhow!(
-                "Multiple sources are currently not supported when using remote paths!"
-            ));
-        }
         return run_rcpd_master(&args, &preserve, &remote_src, &remote_dst).await;
     }
     let src_dst: Vec<(std::path::PathBuf, std::path::PathBuf)> = if dst_string.ends_with('/') {
         // rcp foo bar baz/ -> copy foo to baz/foo and bar to baz/bar
-        let dst_dir = std::path::PathBuf::from(dst_string);
         src_strings
             .iter()
             .map(|src| {
-                let src_path = std::path::PathBuf::from(src);
-                let src_file = src_path
-                    .file_name()
-                    .context(format!("source {:?} does not have a basename", &src_path))
-                    .unwrap();
-                (src_path.to_owned(), dst_dir.join(src_file))
+                let resolved_dst = path::resolve_destination_path(src, dst_string, true)?;
+                Ok((
+                    std::path::PathBuf::from(src.clone()),
+                    std::path::PathBuf::from(resolved_dst),
+                ))
             })
-            .collect::<Vec<(std::path::PathBuf, std::path::PathBuf)>>()
+            .collect::<anyhow::Result<Vec<(std::path::PathBuf, std::path::PathBuf)>>>()?
     } else {
         if src_strings.len() > 1 {
             return Err(anyhow!(
