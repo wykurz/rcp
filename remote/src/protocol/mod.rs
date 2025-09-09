@@ -201,4 +201,7 @@ pub struct SourceMasterHello {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct RcpdGoodBye {}
+pub enum RcpdResult {
+    Success { message: String },
+    Failure { error: String },
+}
