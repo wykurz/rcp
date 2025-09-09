@@ -80,6 +80,53 @@ pub fn parse_path(path: &str) -> PathType {
     }
 }
 
+/// Resolves destination path handling trailing slash semantics for both local and remote paths.
+///
+/// This function implements the logic: "foo/bar -> baz/" becomes "foo/bar -> baz/bar"
+/// i.e., when destination ends with '/', copy source INTO the directory.
+///
+/// # Arguments
+/// * `src_path_str` - Source path as string (before parsing)
+/// * `dst_path_str` - Destination path as string (before parsing)
+/// * `allow_multiple_sources` - Whether multiple sources are allowed (false for remote)
+///
+/// # Returns
+/// * `Ok(resolved_dst_path)` - Destination path with trailing slash logic applied
+/// * `Err(...)` - If path resolution fails or invalid combination detected
+pub fn resolve_destination_path(
+    src_path_str: &str,
+    dst_path_str: &str,
+    allow_multiple_sources: bool,
+) -> anyhow::Result<String> {
+    if dst_path_str.ends_with('/') {
+        if !allow_multiple_sources {
+            // for remote case, still support "foo -> bar/" -> "foo -> bar/foo" logic
+            // but we don't support multiple sources
+        }
+        // extract source file name to append to destination directory
+        let src_path = std::path::Path::new(src_path_str);
+        // handle remote path case - extract just the path part after ':'
+        let actual_src_path = if let Some(colon_pos) = src_path_str.rfind(':') {
+            // This is a remote path like "host:/path/to/file"
+            let path_part = &src_path_str[colon_pos + 1..];
+            std::path::Path::new(path_part)
+        } else {
+            // this is a local path
+            src_path
+        };
+        let src_file_name = actual_src_path.file_name().ok_or_else(|| {
+            anyhow::anyhow!("Source path {:?} does not have a basename", actual_src_path)
+        })?;
+        // Construct destination: "baz/" + "bar" -> "baz/bar"
+        let dst_dir = std::path::Path::new(dst_path_str);
+        let resolved_dst = dst_dir.join(src_file_name);
+        Ok(resolved_dst.to_string_lossy().to_string())
+    } else {
+        // no trailing slash - use destination as-is
+        Ok(dst_path_str.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +176,42 @@ mod tests {
             }
             _ => panic!("Expected remote path"),
         }
+    }
+
+    #[test]
+    fn test_resolve_destination_path_local_with_trailing_slash() {
+        let result = resolve_destination_path("/path/to/file.txt", "/dest/", true).unwrap();
+        assert_eq!(result, "/dest/file.txt");
+    }
+
+    #[test]
+    fn test_resolve_destination_path_local_without_trailing_slash() {
+        let result =
+            resolve_destination_path("/path/to/file.txt", "/dest/newname.txt", true).unwrap();
+        assert_eq!(result, "/dest/newname.txt");
+    }
+
+    #[test]
+    fn test_resolve_destination_path_remote_with_trailing_slash() {
+        let result = resolve_destination_path("host:/path/to/file.txt", "/dest/", false).unwrap();
+        assert_eq!(result, "/dest/file.txt");
+    }
+
+    #[test]
+    fn test_resolve_destination_path_remote_without_trailing_slash() {
+        let result =
+            resolve_destination_path("host:/path/to/file.txt", "/dest/newname.txt", false).unwrap();
+        assert_eq!(result, "/dest/newname.txt");
+    }
+
+    #[test]
+    fn test_resolve_destination_path_remote_complex() {
+        let result = resolve_destination_path(
+            "user@host:22:/home/user/docs/report.pdf",
+            "host2:/backup/",
+            false,
+        )
+        .unwrap();
+        assert_eq!(result, "host2:/backup/report.pdf");
     }
 }
