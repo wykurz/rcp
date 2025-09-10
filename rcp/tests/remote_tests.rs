@@ -511,7 +511,7 @@ fn test_remote_copy_port_range() {
     // use a port range that's unlikely to conflict with other tests
     // we'll use a high port range to avoid conflicts with system services
     let port_range = "25000-25999";
-    eprintln!("Testing remote copy with port range: {}", port_range);
+    eprintln!("Testing remote copy with port range: {port_range}");
     run_rcp_and_expect_success(&["--quic-port-ranges", port_range, &src_remote, &dst_remote]);
     // verify the file was copied successfully
     assert_eq!(get_file_content(&dst_file), "port range test content");

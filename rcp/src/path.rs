@@ -47,12 +47,56 @@ impl PartialEq for PathType {
     }
 }
 
+/// Gets the compiled regex for parsing remote paths (shared with parse_path)
+fn get_remote_path_regex() -> &'static regex::Regex {
+    use std::sync::OnceLock;
+    static REGEX: OnceLock<regex::Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        regex::Regex::new(
+            r"^(?:(?P<user>[^@]+)@)?(?P<host>(?:\[[^\]]+\]|[^:\[\]]+))(?::(?P<port>\d+))?:(?P<path>.+)$"
+        ).unwrap()
+    })
+}
+
+/// Splits a remote path string into (host_prefix, path_part) using the same logic as parse_path
+/// For example: "user@host:22:/path/to/file" -> ("user@host:22:", "/path/to/file")
+/// For local paths, returns (None, original_path)
+fn split_remote_path(path_str: &str) -> (Option<String>, &str) {
+    let re = get_remote_path_regex();
+    if let Some(captures) = re.captures(path_str) {
+        let path_part = captures.name("path").unwrap().as_str();
+        // Reconstruct the host prefix part by finding where the path starts
+        let path_start = path_str.len() - path_part.len();
+        let host_prefix = &path_str[..path_start];
+        (Some(host_prefix.to_string()), path_part)
+    } else {
+        (None, path_str)
+    }
+}
+
+/// Extracts just the filesystem path part from a remote or local path string
+/// For example: "user@host:22:/path/to/file" -> "/path/to/file"
+/// For local paths, returns the original path
+fn extract_filesystem_path(path_str: &str) -> &str {
+    split_remote_path(path_str).1
+}
+
+/// Joins a filesystem path with a filename, handling both remote and local cases
+/// For example: ("user@host:22:", "/path/", "file.txt") -> "user@host:22:/path/file.txt"
+/// For local: (None, "/path/", "file.txt") -> "/path/file.txt"
+fn join_path_with_filename(host_prefix: Option<String>, dir_path: &str, filename: &str) -> String {
+    let fs_path = std::path::Path::new(dir_path);
+    let joined = fs_path.join(filename);
+    let joined_str = joined.to_string_lossy();
+    if let Some(prefix) = host_prefix {
+        format!("{prefix}{joined_str}")
+    } else {
+        joined_str.to_string()
+    }
+}
+
 pub fn parse_path(path: &str) -> PathType {
-    // Regular expression for remote paths with named groups
-    let re = regex::Regex::new(
-        r"^(?:(?P<user>[^@]+)@)?(?P<host>(?:\[[^\]]+\]|[^:\[\]]+))(?::(?P<port>\d+))?:(?P<path>.+)$",
-    )
-    .unwrap();
+    let re = get_remote_path_regex();
     if let Some(captures) = re.captures(path) {
         // It's a remote path
         let user = captures.name("user").map(|m| m.as_str().to_string());
@@ -89,12 +133,8 @@ pub fn parse_path(path: &str) -> PathType {
 /// * `Ok(())` - If path is valid
 /// * `Err(...)` - If path ends with . or .. with clear error message
 pub fn validate_destination_path(dst_path_str: &str) -> anyhow::Result<()> {
-    // Extract the path part for remote paths (after the last ':')
-    let path_part = if let Some(colon_pos) = dst_path_str.rfind(':') {
-        &dst_path_str[colon_pos + 1..]
-    } else {
-        dst_path_str
-    };
+    // Extract the filesystem path part for validation
+    let path_part = extract_filesystem_path(dst_path_str);
     // Check the raw string for problematic endings, since Path::file_name() normalizes
     if path_part.ends_with("/.") {
         return Err(anyhow::anyhow!(
@@ -141,23 +181,14 @@ pub fn resolve_destination_path(src_path_str: &str, dst_path_str: &str) -> anyho
     validate_destination_path(dst_path_str)?;
     if dst_path_str.ends_with('/') {
         // extract source file name to append to destination directory
-        let src_path = std::path::Path::new(src_path_str);
-        // handle remote path case - extract just the path part after ':'
-        let actual_src_path = if let Some(colon_pos) = src_path_str.rfind(':') {
-            // this is a remote path like "host:/path/to/file"
-            let path_part = &src_path_str[colon_pos + 1..];
-            std::path::Path::new(path_part)
-        } else {
-            // this is a local path
-            src_path
-        };
+        let actual_src_path = std::path::Path::new(extract_filesystem_path(src_path_str));
         let src_file_name = actual_src_path.file_name().ok_or_else(|| {
             anyhow::anyhow!("Source path {:?} does not have a basename", actual_src_path)
         })?;
         // construct destination: "baz/" + "bar" -> "baz/bar"
-        let dst_dir = std::path::Path::new(dst_path_str);
-        let resolved_dst = dst_dir.join(src_file_name);
-        Ok(resolved_dst.to_string_lossy().to_string())
+        let (host_prefix, dir_path) = split_remote_path(dst_path_str);
+        let filename = src_file_name.to_string_lossy();
+        Ok(join_path_with_filename(host_prefix, dir_path, &filename))
     } else {
         // no trailing slash - use destination as-is
         Ok(dst_path_str.to_string())
@@ -333,5 +364,137 @@ mod tests {
         // paths containing dots but not ending with them should work
         let result = resolve_destination_path("/path/to/file.txt", "/dest.backup/").unwrap();
         assert_eq!(result, "/dest.backup/file.txt");
+    }
+
+    #[test]
+    fn test_resolve_destination_path_remote_with_complex_host() {
+        // test with complex remote paths including ports and IPv6
+        let result =
+            resolve_destination_path("host:/path/to/file.txt", "user@host2:22:/backup/").unwrap();
+        assert_eq!(result, "user@host2:22:/backup/file.txt");
+
+        let result =
+            resolve_destination_path("[::1]:/path/file.txt", "[2001:db8::1]:8080:/dest/").unwrap();
+        assert_eq!(result, "[2001:db8::1]:8080:/dest/file.txt");
+    }
+
+    #[test]
+    fn test_split_remote_path() {
+        // test remote path splitting
+        assert_eq!(
+            split_remote_path("user@host:22:/path/file"),
+            (Some("user@host:22:".to_string()), "/path/file")
+        );
+        assert_eq!(
+            split_remote_path("host:/path/file"),
+            (Some("host:".to_string()), "/path/file")
+        );
+        assert_eq!(
+            split_remote_path("[::1]:8080:/path/file"),
+            (Some("[::1]:8080:".to_string()), "/path/file")
+        );
+
+        // test local path
+        assert_eq!(
+            split_remote_path("/local/path/file"),
+            (None, "/local/path/file")
+        );
+        assert_eq!(
+            split_remote_path("relative/path/file"),
+            (None, "relative/path/file")
+        );
+    }
+
+    #[test]
+    fn test_extract_filesystem_path() {
+        // test remote paths
+        assert_eq!(
+            extract_filesystem_path("user@host:22:/path/file"),
+            "/path/file"
+        );
+        assert_eq!(extract_filesystem_path("host:/path/file"), "/path/file");
+        assert_eq!(
+            extract_filesystem_path("[::1]:8080:/path/file"),
+            "/path/file"
+        );
+
+        // test local paths
+        assert_eq!(
+            extract_filesystem_path("/local/path/file"),
+            "/local/path/file"
+        );
+        assert_eq!(
+            extract_filesystem_path("relative/path/file"),
+            "relative/path/file"
+        );
+    }
+
+    #[test]
+    fn test_join_path_with_filename() {
+        // test remote path joining
+        assert_eq!(
+            join_path_with_filename(Some("user@host:22:".to_string()), "/backup/", "file.txt"),
+            "user@host:22:/backup/file.txt"
+        );
+        assert_eq!(
+            join_path_with_filename(Some("[::1]:8080:".to_string()), "/dest/", "file.txt"),
+            "[::1]:8080:/dest/file.txt"
+        );
+
+        // test local path joining
+        assert_eq!(
+            join_path_with_filename(None, "/backup/", "file.txt"),
+            "/backup/file.txt"
+        );
+        assert_eq!(
+            join_path_with_filename(None, "relative/", "file.txt"),
+            "relative/file.txt"
+        );
+    }
+
+    #[test]
+    fn test_ipv6_edge_cases_consistency() {
+        // Test that helper functions and parse_path handle IPv6 consistently
+        let test_cases = [
+            "[::1]:/path/file",
+            "[2001:db8::1]:/path/file",
+            "[2001:db8::1]:8080:/path/file",
+            "user@[::1]:/path/file",
+            "user@[2001:db8::1]:22:/path/file",
+        ];
+
+        for case in test_cases {
+            // Test that split_remote_path works correctly
+            let (prefix, _path_part) = split_remote_path(case);
+            assert!(prefix.is_some(), "Should detect {case} as remote");
+
+            // Test that extract_filesystem_path works correctly
+            let fs_path = extract_filesystem_path(case);
+            assert_eq!(
+                fs_path, "/path/file",
+                "Should extract filesystem path from {case}"
+            );
+
+            // Test that parse_path can parse the same string
+            match parse_path(case) {
+                PathType::Remote(remote) => {
+                    assert_eq!(
+                        remote.path().to_str().unwrap(),
+                        "/path/file",
+                        "parse_path should extract same filesystem path from {case}"
+                    );
+                }
+                PathType::Local(_) => panic!("parse_path should detect {case} as remote"),
+            }
+
+            // Test that join_path_with_filename can reconstruct correctly
+            if let (Some(host_prefix), dir_path) = split_remote_path(&case.replace("file", "")) {
+                let reconstructed = join_path_with_filename(Some(host_prefix), dir_path, "file");
+                assert_eq!(
+                    reconstructed, case,
+                    "Should be able to reconstruct {case} correctly"
+                );
+            }
+        }
     }
 }
