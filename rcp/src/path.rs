@@ -96,7 +96,7 @@ pub fn validate_destination_path(dst_path_str: &str) -> anyhow::Result<()> {
         dst_path_str
     };
     // Check the raw string for problematic endings, since Path::file_name() normalizes
-    if path_part.ends_with("/.") && !path_part.ends_with("/..") {
+    if path_part.ends_with("/.") {
         return Err(anyhow::anyhow!(
             "Destination path cannot end with '/.' (current directory).\n\
             If you want to copy into the current directory, use './' instead.\n\
