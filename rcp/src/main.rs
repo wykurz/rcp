@@ -346,7 +346,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
     let dst_string = args.paths.last().unwrap();
     // validate destination path for problematic patterns (applies to both local and remote)
     path::validate_destination_path(dst_string)?;
-    // check if we have remote paths to determine if we need path resolution
+    // check if we have remote paths
     let has_remote_paths = match first_src_path_type {
         path::PathType::Remote(_) => true,
         path::PathType::Local(_) => {
@@ -354,32 +354,31 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
             matches!(path::parse_path(dst_string), path::PathType::Remote(_))
         }
     };
-    // apply path resolution logic for remote case
-    let resolved_dst_string = if has_remote_paths {
-        // for remote paths, we only support single source
-        if src_strings.len() > 1 {
-            return Err(anyhow!(
-                "Multiple sources are currently not supported when using remote paths!"
-            ));
-        }
-        // resolve destination path with trailing slash logic
-        path::resolve_destination_path(&src_strings[0], dst_string)?
-    } else {
-        dst_string.to_string()
-    };
-    let dst_path_type = path::parse_path(&resolved_dst_string);
+    // for remote paths, we only support single source
+    if has_remote_paths && src_strings.len() > 1 {
+        return Err(anyhow!(
+            "Multiple sources are currently not supported when using remote paths!"
+        ));
+    }
     // if any of the src/dst paths are remote, we'll be using the rcpd
-    let remote_src_dst = match (first_src_path_type, dst_path_type) {
-        (path::PathType::Remote(src_remote), path::PathType::Remote(dst_remote)) => {
-            Some((src_remote, dst_remote))
+    let remote_src_dst = if has_remote_paths {
+        // resolve destination path with trailing slash logic for remote case
+        let resolved_dst_string = path::resolve_destination_path(&src_strings[0], dst_string)?;
+        let resolved_dst_path_type = path::parse_path(&resolved_dst_string);
+        match (first_src_path_type, resolved_dst_path_type) {
+            (path::PathType::Remote(src_remote), path::PathType::Remote(dst_remote)) => {
+                Some((src_remote, dst_remote))
+            }
+            (path::PathType::Remote(src_remote), path::PathType::Local(dst_local)) => {
+                Some((src_remote, path::RemotePath::from_local(&dst_local)))
+            }
+            (path::PathType::Local(src_local), path::PathType::Remote(dst_remote)) => {
+                Some((path::RemotePath::from_local(&src_local), dst_remote))
+            }
+            (path::PathType::Local(_), path::PathType::Local(_)) => None,
         }
-        (path::PathType::Remote(src_remote), path::PathType::Local(src_local)) => {
-            Some((src_remote, path::RemotePath::from_local(&src_local)))
-        }
-        (path::PathType::Local(src_local), path::PathType::Remote(dst_remote)) => {
-            Some((path::RemotePath::from_local(&src_local), dst_remote))
-        }
-        (path::PathType::Local(_), path::PathType::Local(_)) => None,
+    } else {
+        None
     };
     if args.preserve_settings.is_some() && args.preserve {
         tracing::warn!("The --preserve flag is ignored when --preserve-settings is specified!");
@@ -396,39 +395,29 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
     if let Some((remote_src, remote_dst)) = remote_src_dst {
         return run_rcpd_master(&args, &preserve, &remote_src, &remote_dst).await;
     }
-    let src_dst: Vec<(std::path::PathBuf, std::path::PathBuf)> = if dst_string.ends_with('/') {
-        // rcp foo bar baz/ -> copy foo to baz/foo and bar to baz/bar
-        src_strings
-            .iter()
-            .map(|src| {
-                let resolved_dst = path::resolve_destination_path(src, dst_string)?;
-                Ok((
-                    std::path::PathBuf::from(src),
-                    std::path::PathBuf::from(resolved_dst),
-                ))
-            })
-            .collect::<anyhow::Result<Vec<(std::path::PathBuf, std::path::PathBuf)>>>()?
-    } else {
-        if src_strings.len() > 1 {
-            return Err(anyhow!(
-                "Multiple sources can only be copied INTO a directory; if this is your intent - follow the \
-                destination path with a trailing slash"
-            ));
-        }
-        let dst_path = std::path::PathBuf::from(dst_string);
-        if dst_path.exists() && !args.overwrite {
-            return Err(anyhow!(
-                "Destination path {dst_path:?} already exists! \n\
-                If you want to copy INTO it, then follow the destination path with a trailing slash (/). Use \
-                --overwrite if you want to overwrite it"
-            ));
-        }
-        assert_eq!(src_strings.len(), 1);
-        vec![(
-            std::path::PathBuf::from(src_strings[0].clone()),
-            std::path::PathBuf::from(dst_string),
-        )]
-    };
+    // handle multiple sources only when destination ends with '/'
+    if src_strings.len() > 1 && !dst_string.ends_with('/') {
+        return Err(anyhow!(
+            "Multiple sources can only be copied INTO a directory; if this is your intent - follow the \
+            destination path with a trailing slash"
+        ));
+    }
+    let src_dst: Vec<(std::path::PathBuf, std::path::PathBuf)> = src_strings
+        .iter()
+        .map(|src| {
+            let resolved_dst = path::resolve_destination_path(src, dst_string)?;
+            let dst_path = std::path::PathBuf::from(&resolved_dst);
+            // check for existing destination only when not using trailing slash (single source case)
+            if src_strings.len() == 1 && !dst_string.ends_with('/') && dst_path.exists() && !args.overwrite {
+                return Err(anyhow!(
+                    "Destination path {dst_path:?} already exists! \n\
+                    If you want to copy INTO it, then follow the destination path with a trailing slash (/). Use \
+                    --overwrite if you want to overwrite it"
+                ));
+            }
+            Ok((std::path::PathBuf::from(src), dst_path))
+        })
+        .collect::<anyhow::Result<Vec<(std::path::PathBuf, std::path::PathBuf)>>>()?;
     let settings = common::copy::Settings {
         dereference: args.dereference,
         fail_early: args.fail_early,
