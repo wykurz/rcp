@@ -80,6 +80,50 @@ pub fn parse_path(path: &str) -> PathType {
     }
 }
 
+/// Validates that destination path doesn't end with problematic patterns like . or ..
+///
+/// # Arguments
+/// * `dst_path_str` - Destination path string to validate
+///
+/// # Returns
+/// * `Ok(())` - If path is valid
+/// * `Err(...)` - If path ends with . or .. with clear error message
+pub fn validate_destination_path(dst_path_str: &str) -> anyhow::Result<()> {
+    // Extract the path part for remote paths (after the last ':')
+    let path_part = if let Some(colon_pos) = dst_path_str.rfind(':') {
+        &dst_path_str[colon_pos + 1..]
+    } else {
+        dst_path_str
+    };
+    // Check the raw string for problematic endings, since Path::file_name() normalizes
+    if path_part.ends_with("/.") && !path_part.ends_with("/..") {
+        return Err(anyhow::anyhow!(
+            "Destination path cannot end with '/.' (current directory).\n\
+            If you want to copy into the current directory, use './' instead.\n\
+            Example: 'rcp source.txt ./' copies source.txt into current directory as source.txt"
+        ));
+    } else if path_part.ends_with("/..") {
+        return Err(anyhow::anyhow!(
+            "Destination path cannot end with '/..' (parent directory).\n\
+            If you want to copy into the parent directory, use '../' instead.\n\
+            Example: 'rcp source.txt ../' copies source.txt into parent directory as source.txt"
+        ));
+    } else if path_part == "." {
+        return Err(anyhow::anyhow!(
+            "Destination path cannot be '.' (current directory).\n\
+            If you want to copy into the current directory, use './' instead.\n\
+            Example: 'rcp source.txt ./' copies source.txt into current directory as source.txt"
+        ));
+    } else if path_part == ".." {
+        return Err(anyhow::anyhow!(
+            "Destination path cannot be '..' (parent directory).\n\
+            If you want to copy into the parent directory, use '../' instead.\n\
+            Example: 'rcp source.txt ../' copies source.txt into parent directory as source.txt"
+        ));
+    }
+    Ok(())
+}
+
 /// Resolves destination path handling trailing slash semantics for both local and remote paths.
 ///
 /// This function implements the logic: "foo/bar -> baz/" becomes "foo/bar -> baz/bar"
@@ -93,21 +137,15 @@ pub fn parse_path(path: &str) -> PathType {
 /// # Returns
 /// * `Ok(resolved_dst_path)` - Destination path with trailing slash logic applied
 /// * `Err(...)` - If path resolution fails or invalid combination detected
-pub fn resolve_destination_path(
-    src_path_str: &str,
-    dst_path_str: &str,
-    allow_multiple_sources: bool,
-) -> anyhow::Result<String> {
+pub fn resolve_destination_path(src_path_str: &str, dst_path_str: &str) -> anyhow::Result<String> {
+    // validate destination path doesn't end with problematic patterns
+    validate_destination_path(dst_path_str)?;
     if dst_path_str.ends_with('/') {
-        if !allow_multiple_sources {
-            // for remote case, still support "foo -> bar/" -> "foo -> bar/foo" logic
-            // but we don't support multiple sources
-        }
         // extract source file name to append to destination directory
         let src_path = std::path::Path::new(src_path_str);
         // handle remote path case - extract just the path part after ':'
         let actual_src_path = if let Some(colon_pos) = src_path_str.rfind(':') {
-            // This is a remote path like "host:/path/to/file"
+            // this is a remote path like "host:/path/to/file"
             let path_part = &src_path_str[colon_pos + 1..];
             std::path::Path::new(path_part)
         } else {
@@ -117,7 +155,7 @@ pub fn resolve_destination_path(
         let src_file_name = actual_src_path.file_name().ok_or_else(|| {
             anyhow::anyhow!("Source path {:?} does not have a basename", actual_src_path)
         })?;
-        // Construct destination: "baz/" + "bar" -> "baz/bar"
+        // construct destination: "baz/" + "bar" -> "baz/bar"
         let dst_dir = std::path::Path::new(dst_path_str);
         let resolved_dst = dst_dir.join(src_file_name);
         Ok(resolved_dst.to_string_lossy().to_string())
@@ -180,38 +218,121 @@ mod tests {
 
     #[test]
     fn test_resolve_destination_path_local_with_trailing_slash() {
-        let result = resolve_destination_path("/path/to/file.txt", "/dest/", true).unwrap();
+        let result = resolve_destination_path("/path/to/file.txt", "/dest/").unwrap();
         assert_eq!(result, "/dest/file.txt");
     }
 
     #[test]
     fn test_resolve_destination_path_local_without_trailing_slash() {
-        let result =
-            resolve_destination_path("/path/to/file.txt", "/dest/newname.txt", true).unwrap();
+        let result = resolve_destination_path("/path/to/file.txt", "/dest/newname.txt").unwrap();
         assert_eq!(result, "/dest/newname.txt");
     }
 
     #[test]
     fn test_resolve_destination_path_remote_with_trailing_slash() {
-        let result = resolve_destination_path("host:/path/to/file.txt", "/dest/", false).unwrap();
+        let result = resolve_destination_path("host:/path/to/file.txt", "/dest/").unwrap();
         assert_eq!(result, "/dest/file.txt");
     }
 
     #[test]
     fn test_resolve_destination_path_remote_without_trailing_slash() {
         let result =
-            resolve_destination_path("host:/path/to/file.txt", "/dest/newname.txt", false).unwrap();
+            resolve_destination_path("host:/path/to/file.txt", "/dest/newname.txt").unwrap();
         assert_eq!(result, "/dest/newname.txt");
     }
 
     #[test]
     fn test_resolve_destination_path_remote_complex() {
-        let result = resolve_destination_path(
-            "user@host:22:/home/user/docs/report.pdf",
-            "host2:/backup/",
-            false,
-        )
-        .unwrap();
+        let result =
+            resolve_destination_path("user@host:22:/home/user/docs/report.pdf", "host2:/backup/")
+                .unwrap();
         assert_eq!(result, "host2:/backup/report.pdf");
+    }
+
+    #[test]
+    fn test_validate_destination_path_dot_local() {
+        let result = resolve_destination_path("/path/to/file.txt", "/dest/.");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("cannot end with '/.'"));
+        assert!(error.to_string().contains("use './' instead"));
+    }
+
+    #[test]
+    fn test_validate_destination_path_double_dot_local() {
+        let result = resolve_destination_path("/path/to/file.txt", "/dest/..");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("cannot end with '/..'"));
+        assert!(error.to_string().contains("use '../' instead"));
+    }
+
+    #[test]
+    fn test_validate_destination_path_dot_remote() {
+        let result = resolve_destination_path("host:/path/to/file.txt", "host2:/dest/.");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("cannot end with '/.'"));
+    }
+
+    #[test]
+    fn test_validate_destination_path_double_dot_remote() {
+        let result = resolve_destination_path("host:/path/to/file.txt", "host2:/dest/..");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("cannot end with '/..'"));
+    }
+
+    #[test]
+    fn test_validate_destination_path_bare_dot() {
+        let result = resolve_destination_path("/path/to/file.txt", ".");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("cannot be '.'"));
+    }
+
+    #[test]
+    fn test_validate_destination_path_bare_double_dot() {
+        let result = resolve_destination_path("/path/to/file.txt", "..");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("cannot be '..'"));
+    }
+
+    #[test]
+    fn test_validate_destination_path_remote_bare_dot() {
+        let result = resolve_destination_path("host:/path/to/file.txt", "host2:.");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("cannot be '.'"));
+    }
+
+    #[test]
+    fn test_validate_destination_path_remote_bare_double_dot() {
+        let result = resolve_destination_path("host:/path/to/file.txt", "host2:..");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("cannot be '..'"));
+    }
+
+    #[test]
+    fn test_validate_destination_path_dot_with_slash_allowed() {
+        // these should work fine because they end with '/' not '.'
+        let result = resolve_destination_path("/path/to/file.txt", "./").unwrap();
+        assert_eq!(result, "./file.txt");
+        let result = resolve_destination_path("/path/to/file.txt", "../").unwrap();
+        assert_eq!(result, "../file.txt");
+    }
+
+    #[test]
+    fn test_validate_destination_path_normal_paths_allowed() {
+        // normal paths should work fine
+        let result = resolve_destination_path("/path/to/file.txt", "/dest/normal").unwrap();
+        assert_eq!(result, "/dest/normal");
+        let result = resolve_destination_path("/path/to/file.txt", "/dest.txt").unwrap();
+        assert_eq!(result, "/dest.txt");
+        // paths containing dots but not ending with them should work
+        let result = resolve_destination_path("/path/to/file.txt", "/dest.backup/").unwrap();
+        assert_eq!(result, "/dest.backup/file.txt");
     }
 }

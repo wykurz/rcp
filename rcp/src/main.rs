@@ -344,6 +344,8 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         }
     }
     let dst_string = args.paths.last().unwrap();
+    // validate destination path for problematic patterns (applies to both local and remote)
+    path::validate_destination_path(dst_string)?;
     // check if we have remote paths to determine if we need path resolution
     let has_remote_paths = match first_src_path_type {
         path::PathType::Remote(_) => true,
@@ -361,7 +363,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
             ));
         }
         // resolve destination path with trailing slash logic
-        path::resolve_destination_path(&src_strings[0], dst_string, false)?
+        path::resolve_destination_path(&src_strings[0], dst_string)?
     } else {
         dst_string.to_string()
     };
@@ -399,7 +401,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         src_strings
             .iter()
             .map(|src| {
-                let resolved_dst = path::resolve_destination_path(src, dst_string, true)?;
+                let resolved_dst = path::resolve_destination_path(src, dst_string)?;
                 Ok((
                     std::path::PathBuf::from(src.clone()),
                     std::path::PathBuf::from(resolved_dst),
