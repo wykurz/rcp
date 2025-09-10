@@ -132,7 +132,6 @@ pub fn validate_destination_path(dst_path_str: &str) -> anyhow::Result<()> {
 /// # Arguments
 /// * `src_path_str` - Source path as string (before parsing)
 /// * `dst_path_str` - Destination path as string (before parsing)
-/// * `allow_multiple_sources` - Whether multiple sources are allowed (false for remote)
 ///
 /// # Returns
 /// * `Ok(resolved_dst_path)` - Destination path with trailing slash logic applied
