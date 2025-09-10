@@ -403,7 +403,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
             .map(|src| {
                 let resolved_dst = path::resolve_destination_path(src, dst_string)?;
                 Ok((
-                    std::path::PathBuf::from(src.clone()),
+                    std::path::PathBuf::from(src),
                     std::path::PathBuf::from(resolved_dst),
                 ))
             })
