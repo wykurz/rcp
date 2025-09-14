@@ -192,7 +192,7 @@ async fn run_rcpd_master(
         .context("Failed to receive tracing hello from source rcpd")?;
     let source_tracing_task = {
         tokio::spawn(async move {
-            if let Err(e) = remote::run_remote_tracing_receiver(source_tracing_stream).await {
+            if let Err(e) = remote::tracelog::run_receiver(source_tracing_stream).await {
                 tracing::warn!("Source remote tracing receiver failed: {}", e);
             }
         })
@@ -241,7 +241,7 @@ async fn run_rcpd_master(
         .context("Failed to receive tracing hello from destination rcpd")?;
     let dest_tracing_task = {
         tokio::spawn(async move {
-            if let Err(e) = remote::run_remote_tracing_receiver(dest_tracing_stream).await {
+            if let Err(e) = remote::tracelog::run_receiver(dest_tracing_stream).await {
                 tracing::warn!("Destination remote tracing receiver failed: {}", e);
             }
         })

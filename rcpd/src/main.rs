@@ -113,7 +113,7 @@ async fn async_main(
         .await?;
     // setup tracing
     let cancellation_token = tokio_util::sync::CancellationToken::new();
-    let tracing_sender_task = tokio::spawn(remote::run_remote_tracing_sender(
+    let tracing_sender_task = tokio::spawn(remote::tracelog::run_sender(
         tracing_receiver,
         tracing_stream,
         cancellation_token.clone(),
