@@ -168,10 +168,10 @@ impl<'a> ProgressPrinter<'a> {
         let ops = self.progress.ops.get();
         let total_duration_secs = self.progress.get_duration().as_secs_f64();
         let curr_duration_secs = (time_now - self.last_update).as_secs_f64();
-        let avarage_ops_rate = ops.finished as f64 / total_duration_secs;
+        let average_ops_rate = ops.finished as f64 / total_duration_secs;
         let current_ops_rate = (ops.finished - self.last_ops) as f64 / curr_duration_secs;
         let bytes = self.progress.bytes_copied.get();
-        let avarage_bytes_rate = bytes as f64 / total_duration_secs;
+        let average_bytes_rate = bytes as f64 / total_duration_secs;
         let current_bytes_rate = (bytes - self.last_bytes) as f64 / curr_duration_secs;
         // update self
         self.last_ops = ops.finished;
@@ -206,10 +206,10 @@ impl<'a> ProgressPrinter<'a> {
             symlinks:    {:>10}\n\
             directories: {:>10}",
             ops.started - ops.finished, // pending
-            avarage_ops_rate,
+            average_ops_rate,
             current_ops_rate,
             // copy
-            bytesize::ByteSize(avarage_bytes_rate as u64),
+            bytesize::ByteSize(average_bytes_rate as u64),
             bytesize::ByteSize(current_bytes_rate as u64),
             bytesize::ByteSize(self.progress.bytes_copied.get()),
             self.progress.files_copied.get(),

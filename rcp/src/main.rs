@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Context};
-use common::ProgressType;
 use structopt::StructOpt;
 use tracing::instrument;
 
@@ -42,7 +41,7 @@ struct Args {
     /// Options are: ProgressBar (animated progress bar), TextUpdates (appropriate for logging), Auto (default, will
     /// choose between ProgressBar or TextUpdates depending on the type of terminal attached to stderr)
     #[structopt(long)]
-    progress_type: Option<ProgressType>,
+    progress_type: Option<common::ProgressType>,
 
     /// Sets the delay between progress updates.
     ///
@@ -479,7 +478,9 @@ fn main() -> Result<(), anyhow::Error> {
     let res = common::run(
         if args.progress || args.progress_type.is_some() {
             Some(common::ProgressSettings {
-                progress_type: args.progress_type.unwrap_or_default(),
+                progress_type: common::GeneralProgressType::User(
+                    args.progress_type.unwrap_or_default(),
+                ),
                 progress_delay: args.progress_delay,
             })
         } else {
