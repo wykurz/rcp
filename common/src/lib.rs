@@ -39,6 +39,12 @@ pub enum ProgressType {
     TextUpdates,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum GeneralProgressType {
+    User(ProgressType),
+    Remote,
+}
+
 impl std::fmt::Debug for ProgressType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -74,7 +80,7 @@ impl std::str::FromStr for ProgressType {
 
 #[derive(Debug)]
 pub struct ProgressSettings {
-    pub progress_type: ProgressType,
+    pub progress_type: GeneralProgressType,
     pub progress_delay: Option<String>,
 }
 
@@ -121,22 +127,48 @@ fn text_updates(
     }
 }
 
+fn remote_updates(
+    lock: &std::sync::Mutex<bool>,
+    cvar: &std::sync::Condvar,
+    _delay_opt: &Option<std::time::Duration>,
+) {
+    // for remote updates, we'll implement the special behavior later for now, just wait for
+    // completion without any output
+    let mut is_done = lock.lock().unwrap();
+    loop {
+        is_done = cvar.wait(is_done).unwrap();
+        if *is_done {
+            break;
+        }
+    }
+}
+
 impl ProgressTracker {
-    pub fn new(progress_type: ProgressType, delay_opt: Option<std::time::Duration>) -> Self {
+    pub fn new(progress_type: GeneralProgressType, delay_opt: Option<std::time::Duration>) -> Self {
         let lock_cvar =
             std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let lock_cvar_clone = lock_cvar.clone();
         let pbar_thread = std::thread::spawn(move || {
             let (lock, cvar) = &*lock_cvar_clone;
-            let interactive = match progress_type {
-                ProgressType::Auto => std::io::stderr().is_terminal(),
-                ProgressType::ProgressBar => true,
-                ProgressType::TextUpdates => false,
-            };
-            if interactive {
-                progress_bar(lock, cvar, &delay_opt);
-            } else {
-                text_updates(lock, cvar, &delay_opt);
+            match progress_type {
+                GeneralProgressType::Remote => {
+                    remote_updates(lock, cvar, &delay_opt);
+                }
+                _ => {
+                    let interactive = match progress_type {
+                        GeneralProgressType::User(ProgressType::Auto) => {
+                            std::io::stderr().is_terminal()
+                        }
+                        GeneralProgressType::User(ProgressType::ProgressBar) => true,
+                        GeneralProgressType::User(ProgressType::TextUpdates) => false,
+                        _ => unreachable!("Invalid progress type: {progress_type:?}"),
+                    };
+                    if interactive {
+                        progress_bar(lock, cvar, &delay_opt);
+                    } else {
+                        text_updates(lock, cvar, &delay_opt);
+                    }
+                }
             }
         });
         Self {

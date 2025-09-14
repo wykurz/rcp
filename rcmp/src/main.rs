@@ -1,5 +1,4 @@
 use anyhow::Result;
-use common::ProgressType;
 use structopt::StructOpt;
 
 #[derive(StructOpt, Debug, Clone)]
@@ -33,15 +32,6 @@ struct Args {
     /// Show progress
     #[structopt(long)]
     progress: bool,
-
-    /// Toggles the type of progress to show.
-    ///
-    /// If specified, --progress flag is implied.
-    ///
-    /// Options are: ProgressBar (animated progress bar), TextUpdates (appropriate for logging), Auto (default, will
-    /// choose between ProgressBar or TextUpdates depending on the type of terminal attached to stderr)
-    #[structopt(long)]
-    progress_type: Option<ProgressType>,
 
     /// Sets the delay between progress updates.
     ///
@@ -140,9 +130,9 @@ fn main() -> Result<()> {
         || async_main(args)
     };
     let res = common::run(
-        if args.progress || args.progress_type.is_some() {
+        if args.progress {
             Some(common::ProgressSettings {
-                progress_type: args.progress_type.unwrap_or_default(),
+                progress_type: common::GeneralProgressType::User(common::ProgressType::Auto),
                 progress_delay: args.progress_delay,
             })
         } else {
