@@ -14,9 +14,19 @@ pub struct RemoteTracingLayer {
 }
 
 impl RemoteTracingLayer {
-    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<TracingMessage>) {
+    pub fn new() -> (
+        Self,
+        tokio::sync::mpsc::UnboundedSender<TracingMessage>,
+        tokio::sync::mpsc::UnboundedReceiver<TracingMessage>,
+    ) {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        (Self { sender }, receiver)
+        (
+            Self {
+                sender: sender.clone(),
+            },
+            sender,
+            receiver,
+        )
     }
 }
 
