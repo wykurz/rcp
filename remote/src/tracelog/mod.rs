@@ -23,46 +23,57 @@ pub async fn run_receiver(mut recv_stream: crate::streams::RecvStream) -> anyhow
         .recv_object::<common::remote_tracing::TracingMessage>()
         .await?
     {
-        let level = match tracing_message.level.as_str() {
-            "ERROR" => tracing::Level::ERROR,
-            "WARN" => tracing::Level::WARN,
-            "INFO" => tracing::Level::INFO,
-            "DEBUG" => tracing::Level::DEBUG,
-            "TRACE" => tracing::Level::TRACE,
-            _ => tracing::Level::INFO,
-        };
-        let remote_target = format!("remote::{}", tracing_message.target);
-        let timestamp_str = match tracing_message
-            .timestamp
-            .duration_since(std::time::UNIX_EPOCH)
-        {
-            Ok(duration) => {
-                let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(
-                    duration.as_secs() as i64,
-                    duration.subsec_nanos(),
-                );
-                match datetime {
-                    Some(dt) => dt.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string(),
-                    None => format!("{:?}", tracing_message.timestamp),
+        match tracing_message {
+            common::remote_tracing::TracingMessage::Log {
+                timestamp,
+                level,
+                target,
+                message,
+            } => {
+                let log_level = match level.as_str() {
+                    "ERROR" => tracing::Level::ERROR,
+                    "WARN" => tracing::Level::WARN,
+                    "INFO" => tracing::Level::INFO,
+                    "DEBUG" => tracing::Level::DEBUG,
+                    "TRACE" => tracing::Level::TRACE,
+                    _ => tracing::Level::INFO,
+                };
+                let remote_target = format!("remote::{target}");
+                let timestamp_str = match timestamp.duration_since(std::time::UNIX_EPOCH) {
+                    Ok(duration) => {
+                        let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                            duration.as_secs() as i64,
+                            duration.subsec_nanos(),
+                        );
+                        match datetime {
+                            Some(dt) => dt.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string(),
+                            None => format!("{timestamp:?}"),
+                        }
+                    }
+                    Err(_) => format!("{timestamp:?}"),
+                };
+                match log_level {
+                    tracing::Level::ERROR => {
+                        tracing::error!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
+                    }
+                    tracing::Level::WARN => {
+                        tracing::warn!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
+                    }
+                    tracing::Level::INFO => {
+                        tracing::info!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
+                    }
+                    tracing::Level::DEBUG => {
+                        tracing::debug!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
+                    }
+                    tracing::Level::TRACE => {
+                        tracing::trace!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
+                    }
                 }
             }
-            Err(_) => format!("{:?}", tracing_message.timestamp),
-        };
-        match level {
-            tracing::Level::ERROR => {
-                tracing::error!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, tracing_message.message)
-            }
-            tracing::Level::WARN => {
-                tracing::warn!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, tracing_message.message)
-            }
-            tracing::Level::INFO => {
-                tracing::info!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, tracing_message.message)
-            }
-            tracing::Level::DEBUG => {
-                tracing::debug!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, tracing_message.message)
-            }
-            tracing::Level::TRACE => {
-                tracing::trace!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, tracing_message.message)
+            common::remote_tracing::TracingMessage::Progress(_progress) => {
+                // For now, we just ignore progress messages in the receiver
+                // TODO: Implement progress handling in the master process
+                tracing::debug!(target: "remote", "Received progress update from remote");
             }
         }
     }

@@ -466,14 +466,13 @@ mod tests {
         for case in test_cases {
             // Test that split_remote_path works correctly
             let (prefix, _path_part) = split_remote_path(case);
-            assert!(prefix.is_some(), "Should detect {} as remote", case);
+            assert!(prefix.is_some(), "Should detect {case} as remote");
 
             // Test that extract_filesystem_path works correctly
             let fs_path = extract_filesystem_path(case);
             assert_eq!(
                 fs_path, "/path/file",
-                "Should extract filesystem path from {}",
-                case
+                "Should extract filesystem path from {case}"
             );
 
             // Test that parse_path can parse the same string
@@ -482,8 +481,7 @@ mod tests {
                     assert_eq!(
                         remote.path().to_str().unwrap(),
                         "/path/file",
-                        "parse_path should extract same filesystem path from {}",
-                        case
+                        "parse_path should extract same filesystem path from {case}"
                     );
                 }
                 PathType::Local(_) => panic!("parse_path should detect {case} as remote"),
@@ -494,8 +492,7 @@ mod tests {
                 let reconstructed = join_path_with_filename(Some(host_prefix), dir_path, "file");
                 assert_eq!(
                     reconstructed, case,
-                    "Should be able to reconstruct {} correctly",
-                    case
+                    "Should be able to reconstruct {case} correctly"
                 );
             }
         }
