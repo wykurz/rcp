@@ -35,6 +35,21 @@ struct Args {
     #[structopt(short = "-e", long = "fail-early")]
     fail_early: bool,
 
+    /// Show progress
+    #[structopt(long)]
+    progress: bool,
+
+    /// Sets the delay between progress updates.
+    ///
+    /// - For the interactive (--progress-type=ProgressBar), the default is 200ms.
+    /// - For the non-interactive (--progress-type=TextUpdates), the default is 10s.
+    ///
+    /// If specified, --progress flag is implied.
+    ///
+    /// This option accepts a human readable duration, e.g. "200ms", "10s", "5min" etc.
+    #[structopt(long)]
+    progress_delay: Option<String>,
+
     /// Always follow symbolic links in source
     #[structopt(short = "-L", long)]
     dereference: bool,
@@ -192,7 +207,8 @@ async fn async_main(
 
 fn main() -> Result<(), anyhow::Error> {
     let args = Args::from_args();
-    let (tracing_layer, tracing_receiver) = common::remote_tracing::RemoteTracingLayer::new();
+    let (tracing_layer, tracing_sender, tracing_receiver) =
+        common::remote_tracing::RemoteTracingLayer::new();
     let func = {
         let args = args.clone();
         || async_main(args, tracing_receiver)
@@ -203,7 +219,14 @@ fn main() -> Result<(), anyhow::Error> {
         filename
     });
     let res = common::run(
-        None,
+        if args.progress {
+            Some(common::ProgressSettings {
+                progress_type: common::GeneralProgressType::Remote(tracing_sender),
+                progress_delay: args.progress_delay,
+            })
+        } else {
+            None
+        },
         args.quiet,
         args.verbose,
         false,

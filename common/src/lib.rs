@@ -39,10 +39,10 @@ pub enum ProgressType {
     TextUpdates,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub enum GeneralProgressType {
     User(ProgressType),
-    Remote,
+    Remote(tokio::sync::mpsc::UnboundedSender<remote_tracing::TracingMessage>),
 }
 
 impl std::fmt::Debug for ProgressType {
@@ -131,6 +131,7 @@ fn remote_updates(
     lock: &std::sync::Mutex<bool>,
     cvar: &std::sync::Condvar,
     _delay_opt: &Option<std::time::Duration>,
+    _sender: tokio::sync::mpsc::UnboundedSender<remote_tracing::TracingMessage>,
 ) {
     // for remote updates, we'll implement the special behavior later for now, just wait for
     // completion without any output
@@ -151,8 +152,8 @@ impl ProgressTracker {
         let pbar_thread = std::thread::spawn(move || {
             let (lock, cvar) = &*lock_cvar_clone;
             match progress_type {
-                GeneralProgressType::Remote => {
-                    remote_updates(lock, cvar, &delay_opt);
+                GeneralProgressType::Remote(sender) => {
+                    remote_updates(lock, cvar, &delay_opt, sender);
                 }
                 _ => {
                     let interactive = match progress_type {
