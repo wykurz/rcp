@@ -146,6 +146,48 @@ impl Default for Progress {
     }
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SerializableProgress {
+    pub ops_started: u64,
+    pub ops_finished: u64,
+    pub bytes_copied: u64,
+    pub hard_links_created: u64,
+    pub files_copied: u64,
+    pub symlinks_created: u64,
+    pub directories_created: u64,
+    pub files_unchanged: u64,
+    pub symlinks_unchanged: u64,
+    pub directories_unchanged: u64,
+    pub hard_links_unchanged: u64,
+    pub files_removed: u64,
+    pub symlinks_removed: u64,
+    pub directories_removed: u64,
+    pub current_time: std::time::SystemTime,
+}
+
+impl From<&Progress> for SerializableProgress {
+    /// Creates a SerializableProgress from a Progress, capturing the current time at the moment of conversion
+    fn from(progress: &Progress) -> Self {
+        Self {
+            ops_started: progress.ops.started.get(),
+            ops_finished: progress.ops.finished.get(),
+            bytes_copied: progress.bytes_copied.get(),
+            hard_links_created: progress.hard_links_created.get(),
+            files_copied: progress.files_copied.get(),
+            symlinks_created: progress.symlinks_created.get(),
+            directories_created: progress.directories_created.get(),
+            files_unchanged: progress.files_unchanged.get(),
+            symlinks_unchanged: progress.symlinks_unchanged.get(),
+            directories_unchanged: progress.directories_unchanged.get(),
+            hard_links_unchanged: progress.hard_links_unchanged.get(),
+            files_removed: progress.files_removed.get(),
+            symlinks_removed: progress.symlinks_removed.get(),
+            directories_removed: progress.directories_removed.get(),
+            current_time: std::time::SystemTime::now(),
+        }
+    }
+}
+
 pub struct ProgressPrinter<'a> {
     progress: &'a Progress,
     last_ops: u64,
@@ -232,6 +274,7 @@ impl<'a> ProgressPrinter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote_tracing::TracingMessage;
     use anyhow::Result;
 
     #[test]
@@ -265,6 +308,27 @@ mod tests {
     fn basic_guard() -> Result<()> {
         let tls_progress = ProgressCounter::new();
         let _guard = tls_progress.guard();
+        Ok(())
+    }
+
+    #[test]
+    fn test_serializable_progress() -> Result<()> {
+        let progress = Progress::new();
+
+        // Add some test data
+        progress.files_copied.inc();
+        progress.bytes_copied.add(1024);
+        progress.directories_created.add(2);
+
+        // Test conversion to serializable format
+        let serializable = SerializableProgress::from(&progress);
+        assert_eq!(serializable.files_copied, 1);
+        assert_eq!(serializable.bytes_copied, 1024);
+        assert_eq!(serializable.directories_created, 2);
+
+        // Test that we can create a TracingMessage with progress
+        let _tracing_msg = TracingMessage::Progress(serializable);
+
         Ok(())
     }
 }

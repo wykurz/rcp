@@ -1,11 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TracingMessage {
-    pub timestamp: std::time::SystemTime,
-    pub level: String,
-    pub target: String,
-    pub message: String,
+pub enum TracingMessage {
+    Log {
+        timestamp: std::time::SystemTime,
+        level: String,
+        target: String,
+        message: String,
+    },
+    Progress(crate::progress::SerializableProgress),
 }
 
 #[derive(Debug)]
@@ -28,6 +31,15 @@ impl RemoteTracingLayer {
             receiver,
         )
     }
+}
+
+pub fn send_progress_update(
+    sender: &tokio::sync::mpsc::UnboundedSender<TracingMessage>,
+    progress: &crate::progress::Progress,
+) -> anyhow::Result<()> {
+    let serializable_progress = crate::progress::SerializableProgress::from(progress);
+    sender.send(TracingMessage::Progress(serializable_progress))?;
+    Ok(())
 }
 
 struct FieldVisitor {
@@ -102,7 +114,7 @@ where
                 format!("{:?}", visitor.fields)
             }
         });
-        let tracing_message = TracingMessage {
+        let tracing_message = TracingMessage::Log {
             timestamp: std::time::SystemTime::now(),
             level: event.metadata().level().to_string(),
             target: event.metadata().target().to_string(),
