@@ -1,3 +1,18 @@
+#[derive(Debug, Clone, Copy)]
+pub enum RcpdType {
+    Source,
+    Destination,
+}
+
+impl std::fmt::Display for RcpdType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RcpdType::Source => write!(f, "source"),
+            RcpdType::Destination => write!(f, "destination"),
+        }
+    }
+}
+
 pub async fn run_sender(
     mut receiver: tokio::sync::mpsc::UnboundedReceiver<common::remote_tracing::TracingMessage>,
     mut send_stream: crate::streams::SendStream,
@@ -18,7 +33,13 @@ pub async fn run_sender(
     Ok(())
 }
 
-pub async fn run_receiver(mut recv_stream: crate::streams::RecvStream) -> anyhow::Result<()> {
+pub async fn run_receiver(
+    mut recv_stream: crate::streams::RecvStream,
+    rcpd_type: RcpdType,
+) -> anyhow::Result<()> {
+    // Storage for the latest progress update from this rcpd process
+    let mut _latest_progress: Option<common::SerializableProgress> = None;
+
     while let Some(tracing_message) = recv_stream
         .recv_object::<common::remote_tracing::TracingMessage>()
         .await?
@@ -38,7 +59,7 @@ pub async fn run_receiver(mut recv_stream: crate::streams::RecvStream) -> anyhow
                     "TRACE" => tracing::Level::TRACE,
                     _ => tracing::Level::INFO,
                 };
-                let remote_target = format!("remote::{target}");
+                let remote_target = format!("remote::{}::{target}", rcpd_type);
                 let timestamp_str = match timestamp.duration_since(std::time::UNIX_EPOCH) {
                     Ok(duration) => {
                         let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(
@@ -70,12 +91,30 @@ pub async fn run_receiver(mut recv_stream: crate::streams::RecvStream) -> anyhow
                     }
                 }
             }
-            common::remote_tracing::TracingMessage::Progress(_progress) => {
-                // For now, we just ignore progress messages in the receiver
-                // TODO: Implement progress handling in the master process
-                tracing::debug!(target: "remote", "Received progress update from remote");
+            common::remote_tracing::TracingMessage::Progress(progress) => {
+                // Store the latest progress update from this rcpd process
+                _latest_progress = Some(progress.clone());
+                tracing::debug!(target: "remote", "Received progress update from {} rcpd", rcpd_type);
+                // TODO: Send the progress to the master process for aggregation
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rcpd_type_display() {
+        assert_eq!(format!("{}", RcpdType::Source), "source");
+        assert_eq!(format!("{}", RcpdType::Destination), "destination");
+    }
+
+    #[test]
+    fn test_rcpd_type_debug() {
+        assert_eq!(format!("{:?}", RcpdType::Source), "Source");
+        assert_eq!(format!("{:?}", RcpdType::Destination), "Destination");
+    }
 }
