@@ -21,6 +21,8 @@ mod filecmp;
 mod progress;
 mod testutils;
 
+pub use progress::SerializableProgress;
+
 lazy_static! {
     static ref PROGRESS: progress::Progress = progress::Progress::new();
     static ref PBAR: indicatif::ProgressBar = indicatif::ProgressBar::new_spinner();
