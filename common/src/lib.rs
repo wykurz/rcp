@@ -130,14 +130,17 @@ fn text_updates(
 fn remote_updates(
     lock: &std::sync::Mutex<bool>,
     cvar: &std::sync::Condvar,
-    _delay_opt: &Option<std::time::Duration>,
-    _sender: tokio::sync::mpsc::UnboundedSender<remote_tracing::TracingMessage>,
+    delay_opt: &Option<std::time::Duration>,
+    sender: tokio::sync::mpsc::UnboundedSender<remote_tracing::TracingMessage>,
 ) {
-    // for remote updates, we'll implement the special behavior later for now, just wait for
-    // completion without any output
+    let delay = delay_opt.unwrap_or(std::time::Duration::from_millis(200));
     let mut is_done = lock.lock().unwrap();
     loop {
-        is_done = cvar.wait(is_done).unwrap();
+        remote_tracing::send_progress_update(&sender, &PROGRESS)
+            .context("Failed to send progress update")
+            .unwrap();
+        let result = cvar.wait_timeout(is_done, delay).unwrap();
+        is_done = result.0;
         if *is_done {
             break;
         }
