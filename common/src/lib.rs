@@ -45,6 +45,7 @@ pub enum ProgressType {
 pub enum GeneralProgressType {
     User(ProgressType),
     Remote(tokio::sync::mpsc::UnboundedSender<remote_tracing::TracingMessage>),
+    RemoteMaster,
 }
 
 impl std::fmt::Debug for ProgressType {
@@ -129,7 +130,7 @@ fn text_updates(
     }
 }
 
-fn remote_updates(
+fn rcpd_updates(
     lock: &std::sync::Mutex<bool>,
     cvar: &std::sync::Condvar,
     delay_opt: &Option<std::time::Duration>,
@@ -149,6 +150,16 @@ fn remote_updates(
     }
 }
 
+fn remote_master_updates(
+    _lock: &std::sync::Mutex<bool>,
+    _cvar: &std::sync::Condvar,
+    _delay_opt: &Option<std::time::Duration>,
+) {
+    // TODO: Get latest progress snapshots from source and destination rcpd processes
+    // This will be implemented when the caller provides access to the snapshot function
+    todo!("Remote master progress updates not yet implemented");
+}
+
 impl ProgressTracker {
     pub fn new(progress_type: GeneralProgressType, delay_opt: Option<std::time::Duration>) -> Self {
         let lock_cvar =
@@ -158,7 +169,10 @@ impl ProgressTracker {
             let (lock, cvar) = &*lock_cvar_clone;
             match progress_type {
                 GeneralProgressType::Remote(sender) => {
-                    remote_updates(lock, cvar, &delay_opt, sender);
+                    rcpd_updates(lock, cvar, &delay_opt, sender);
+                }
+                GeneralProgressType::RemoteMaster => {
+                    remote_master_updates(lock, cvar, &delay_opt);
                 }
                 _ => {
                     let interactive = match progress_type {
@@ -167,7 +181,9 @@ impl ProgressTracker {
                         }
                         GeneralProgressType::User(ProgressType::ProgressBar) => true,
                         GeneralProgressType::User(ProgressType::TextUpdates) => false,
-                        _ => unreachable!("Invalid progress type: {progress_type:?}"),
+                        GeneralProgressType::Remote(_) | GeneralProgressType::RemoteMaster => {
+                            unreachable!("Invalid progress type: {progress_type:?}")
+                        }
                     };
                     if interactive {
                         progress_bar(lock, cvar, &delay_opt);
