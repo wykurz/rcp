@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, enum_map::Enum)]
 pub enum RcpdType {
     Source,
     Destination,
@@ -11,6 +11,18 @@ impl std::fmt::Display for RcpdType {
             RcpdType::Destination => write!(f, "destination"),
         }
     }
+}
+
+lazy_static::lazy_static! {
+    // static storage for the latest progress from each rcpd process
+    static ref PROGRESS_MAP: std::sync::Mutex<enum_map::EnumMap<RcpdType, Option<common::SerializableProgress>>> =
+        std::sync::Mutex::new(enum_map::EnumMap::default());
+}
+
+/// Get the latest progress snapshot from all rcpd processes
+pub fn get_latest_progress_snapshot(
+) -> enum_map::EnumMap<RcpdType, Option<common::SerializableProgress>> {
+    PROGRESS_MAP.lock().unwrap().clone()
 }
 
 pub async fn run_sender(
@@ -37,9 +49,6 @@ pub async fn run_receiver(
     mut recv_stream: crate::streams::RecvStream,
     rcpd_type: RcpdType,
 ) -> anyhow::Result<()> {
-    // Storage for the latest progress update from this rcpd process
-    let mut _latest_progress: Option<common::SerializableProgress> = None;
-
     while let Some(tracing_message) = recv_stream
         .recv_object::<common::remote_tracing::TracingMessage>()
         .await?
@@ -59,7 +68,7 @@ pub async fn run_receiver(
                     "TRACE" => tracing::Level::TRACE,
                     _ => tracing::Level::INFO,
                 };
-                let remote_target = format!("remote::{}::{target}", rcpd_type);
+                let remote_target = format!("remote::{rcpd_type}::{target}");
                 let timestamp_str = match timestamp.duration_since(std::time::UNIX_EPOCH) {
                     Ok(duration) => {
                         let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(
@@ -92,10 +101,8 @@ pub async fn run_receiver(
                 }
             }
             common::remote_tracing::TracingMessage::Progress(progress) => {
-                // Store the latest progress update from this rcpd process
-                _latest_progress = Some(progress.clone());
                 tracing::debug!(target: "remote", "Received progress update from {} rcpd", rcpd_type);
-                // TODO: Send the progress to the master process for aggregation
+                PROGRESS_MAP.lock().unwrap()[rcpd_type] = Some(progress.clone());
             }
         }
     }
