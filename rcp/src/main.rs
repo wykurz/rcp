@@ -359,7 +359,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
     let has_remote_paths = match first_src_path_type {
         path::PathType::Remote(_) => true,
         path::PathType::Local(_) => {
-            // Check if destination is remote
+            // check if destination is remote
             matches!(path::parse_path(dst_string), path::PathType::Remote(_))
         }
     };
@@ -479,8 +479,18 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
     Ok(copy_summary)
 }
 
+fn has_remote_paths(args: &Args) -> bool {
+    for path in &args.paths {
+        if let path::PathType::Remote(_) = path::parse_path(path) {
+            return true;
+        }
+    }
+    false
+}
+
 fn main() -> Result<(), anyhow::Error> {
     let args = Args::from_args();
+    let is_remote_operation = has_remote_paths(&args);
     let func = {
         let args = args.clone();
         || async_main(args)
@@ -488,9 +498,11 @@ fn main() -> Result<(), anyhow::Error> {
     let res = common::run(
         if args.progress || args.progress_type.is_some() {
             Some(common::ProgressSettings {
-                progress_type: common::GeneralProgressType::User(
-                    args.progress_type.unwrap_or_default(),
-                ),
+                progress_type: if is_remote_operation {
+                    common::GeneralProgressType::RemoteMaster
+                } else {
+                    common::GeneralProgressType::User(args.progress_type.unwrap_or_default())
+                },
                 progress_delay: args.progress_delay,
             })
         } else {

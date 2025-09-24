@@ -151,13 +151,23 @@ fn rcpd_updates(
 }
 
 fn remote_master_updates(
-    _lock: &std::sync::Mutex<bool>,
-    _cvar: &std::sync::Condvar,
-    _delay_opt: &Option<std::time::Duration>,
+    lock: &std::sync::Mutex<bool>,
+    cvar: &std::sync::Condvar,
+    delay_opt: &Option<std::time::Duration>,
 ) {
-    // TODO: Get latest progress snapshots from source and destination rcpd processes
-    // This will be implemented when the caller provides access to the snapshot function
-    todo!("Remote master progress updates not yet implemented");
+    let delay = delay_opt.unwrap_or(std::time::Duration::from_millis(200));
+    loop {
+        let guard = lock.lock().unwrap();
+        let result = cvar.wait_timeout(guard, delay).unwrap();
+        if *result.0 {
+            break;
+        }
+        drop(result.0);
+        // TODO: Get latest progress snapshots from source and destination rcpd processes
+        // and aggregate them for display. For now, we just sleep and loop.
+        // This will be fully implemented once we can access remote::tracelog::get_latest_progress_snapshot()
+        // from here without circular dependency issues.
+    }
 }
 
 impl ProgressTracker {
