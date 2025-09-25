@@ -1,27 +1,14 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, enum_map::Enum)]
-pub enum RcpdType {
-    Source,
-    Destination,
-}
-
-impl std::fmt::Display for RcpdType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RcpdType::Source => write!(f, "source"),
-            RcpdType::Destination => write!(f, "destination"),
-        }
-    }
-}
+// Re-export RcpdType from common to avoid duplication
+pub use common::RcpdType;
 
 lazy_static::lazy_static! {
     // static storage for the latest progress from each rcpd process
-    static ref PROGRESS_MAP: std::sync::Mutex<enum_map::EnumMap<RcpdType, Option<common::SerializableProgress>>> =
+    static ref PROGRESS_MAP: std::sync::Mutex<enum_map::EnumMap<RcpdType, common::SerializableProgress>> =
         std::sync::Mutex::new(enum_map::EnumMap::default());
 }
 
 /// Get the latest progress snapshot from all rcpd processes
-pub fn get_latest_progress_snapshot(
-) -> enum_map::EnumMap<RcpdType, Option<common::SerializableProgress>> {
+pub fn get_latest_progress_snapshot() -> enum_map::EnumMap<RcpdType, common::SerializableProgress> {
     PROGRESS_MAP.lock().unwrap().clone()
 }
 
@@ -102,7 +89,7 @@ pub async fn run_receiver(
             }
             common::remote_tracing::TracingMessage::Progress(progress) => {
                 tracing::debug!(target: "remote", "Received progress update from {} rcpd", rcpd_type);
-                PROGRESS_MAP.lock().unwrap()[rcpd_type] = Some(progress.clone());
+                PROGRESS_MAP.lock().unwrap()[rcpd_type] = progress.clone();
             }
         }
     }
