@@ -165,6 +165,28 @@ pub struct SerializableProgress {
     pub current_time: std::time::SystemTime,
 }
 
+impl Default for SerializableProgress {
+    fn default() -> Self {
+        Self {
+            ops_started: 0,
+            ops_finished: 0,
+            bytes_copied: 0,
+            hard_links_created: 0,
+            files_copied: 0,
+            symlinks_created: 0,
+            directories_created: 0,
+            files_unchanged: 0,
+            symlinks_unchanged: 0,
+            directories_unchanged: 0,
+            hard_links_unchanged: 0,
+            files_removed: 0,
+            symlinks_removed: 0,
+            directories_removed: 0,
+            current_time: std::time::SystemTime::now(),
+        }
+    }
+}
+
 impl From<&Progress> for SerializableProgress {
     /// Creates a SerializableProgress from a Progress, capturing the current time at the moment of conversion
     fn from(progress: &Progress) -> Self {

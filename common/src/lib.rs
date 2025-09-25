@@ -4,7 +4,6 @@ extern crate lazy_static;
 use crate::cmp::ObjType;
 use anyhow::anyhow;
 use anyhow::Context;
-use std::fmt;
 use std::io::IsTerminal;
 use tracing::instrument;
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -23,6 +22,25 @@ mod testutils;
 
 pub use progress::SerializableProgress;
 
+// Define RcpdType in common since remote depends on common
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, enum_map::Enum)]
+pub enum RcpdType {
+    Source,
+    Destination,
+}
+
+impl std::fmt::Display for RcpdType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RcpdType::Source => write!(f, "source"),
+            RcpdType::Destination => write!(f, "destination"),
+        }
+    }
+}
+
+// Type alias for progress snapshots
+pub type ProgressSnapshot<T> = enum_map::EnumMap<RcpdType, T>;
+
 lazy_static! {
     static ref PROGRESS: progress::Progress = progress::Progress::new();
     static ref PBAR: indicatif::ProgressBar = indicatif::ProgressBar::new_spinner();
@@ -33,7 +51,7 @@ struct ProgressTracker {
     pbar_thread: Option<std::thread::JoinHandle<()>>,
 }
 
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Debug, Default)]
 pub enum ProgressType {
     #[default]
     Auto,
@@ -41,29 +59,18 @@ pub enum ProgressType {
     TextUpdates,
 }
 
-#[derive(Clone, Debug)]
 pub enum GeneralProgressType {
     User(ProgressType),
     Remote(tokio::sync::mpsc::UnboundedSender<remote_tracing::TracingMessage>),
-    RemoteMaster,
+    RemoteMaster(Box<dyn Fn() -> ProgressSnapshot<SerializableProgress> + Send + 'static>),
 }
 
-impl std::fmt::Debug for ProgressType {
+impl std::fmt::Debug for GeneralProgressType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProgressType::Auto => write!(f, "Auto"),
-            ProgressType::ProgressBar => write!(f, "ProgressBar"),
-            ProgressType::TextUpdates => write!(f, "TextUpdates"),
-        }
-    }
-}
-
-impl fmt::Display for ProgressType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            ProgressType::Auto => write!(f, "Auto"),
-            ProgressType::ProgressBar => write!(f, "ProgressBar"),
-            ProgressType::TextUpdates => write!(f, "TextUpdates"),
+            GeneralProgressType::User(pt) => write!(f, "User({pt:?})"),
+            GeneralProgressType::Remote(_) => write!(f, "Remote(<sender>)"),
+            GeneralProgressType::RemoteMaster(_) => write!(f, "RemoteMaster(<function>)"),
         }
     }
 }
@@ -150,11 +157,14 @@ fn rcpd_updates(
     }
 }
 
-fn remote_master_updates(
+fn remote_master_updates<F>(
     lock: &std::sync::Mutex<bool>,
     cvar: &std::sync::Condvar,
     delay_opt: &Option<std::time::Duration>,
-) {
+    get_progress_snapshot: F,
+) where
+    F: Fn() -> ProgressSnapshot<SerializableProgress> + Send + 'static,
+{
     let delay = delay_opt.unwrap_or(std::time::Duration::from_millis(200));
     loop {
         let guard = lock.lock().unwrap();
@@ -163,10 +173,12 @@ fn remote_master_updates(
             break;
         }
         drop(result.0);
-        // TODO: Get latest progress snapshots from source and destination rcpd processes
-        // and aggregate them for display. For now, we just sleep and loop.
-        // This will be fully implemented once we can access remote::tracelog::get_latest_progress_snapshot()
-        // from here without circular dependency issues.
+        // Get latest progress snapshots from source and destination rcpd processes
+        let progress_map = get_progress_snapshot();
+        // TODO: Aggregate progress from source and destination and display to user
+        // Available data: progress_map[RcpdType::Source] and progress_map[RcpdType::Destination]
+        let _source_progress = &progress_map[RcpdType::Source];
+        let _destination_progress = &progress_map[RcpdType::Destination];
     }
 }
 
@@ -181,8 +193,8 @@ impl ProgressTracker {
                 GeneralProgressType::Remote(sender) => {
                     rcpd_updates(lock, cvar, &delay_opt, sender);
                 }
-                GeneralProgressType::RemoteMaster => {
-                    remote_master_updates(lock, cvar, &delay_opt);
+                GeneralProgressType::RemoteMaster(get_progress_snapshot) => {
+                    remote_master_updates(lock, cvar, &delay_opt, get_progress_snapshot);
                 }
                 _ => {
                     let interactive = match progress_type {
@@ -191,7 +203,7 @@ impl ProgressTracker {
                         }
                         GeneralProgressType::User(ProgressType::ProgressBar) => true,
                         GeneralProgressType::User(ProgressType::TextUpdates) => false,
-                        GeneralProgressType::Remote(_) | GeneralProgressType::RemoteMaster => {
+                        GeneralProgressType::Remote(_) | GeneralProgressType::RemoteMaster(_) => {
                             unreachable!("Invalid progress type: {progress_type:?}")
                         }
                     };
