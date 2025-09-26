@@ -165,6 +165,11 @@ fn remote_master_updates<F>(
 ) where
     F: Fn() -> ProgressSnapshot<SerializableProgress> + Send + 'static,
 {
+    PBAR.set_style(
+        indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
     let delay = delay_opt.unwrap_or(std::time::Duration::from_millis(200));
     let mut printer = RcpdProgressPrinter::new();
     let mut is_done = lock.lock().unwrap();
@@ -172,11 +177,11 @@ fn remote_master_updates<F>(
         let progress_map = get_progress_snapshot();
         let source_progress = &progress_map[RcpdType::Source];
         let destination_progress = &progress_map[RcpdType::Destination];
-        eprintln!(
-            "--{}",
+        PBAR.set_position(PBAR.position() + 1); // do we need to update?
+        PBAR.set_message(
             printer
                 .print(source_progress, destination_progress)
-                .unwrap()
+                .unwrap(),
         );
         let result = cvar.wait_timeout(is_done, delay).unwrap();
         is_done = result.0;

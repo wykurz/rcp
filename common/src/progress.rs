@@ -314,6 +314,14 @@ impl RcpdProgressPrinter {
         }
     }
 
+    fn calculate_rate(&self, current: u64, last: u64, duration_secs: f64) -> f64 {
+        if duration_secs > 0.0 {
+            (current - last) as f64 / duration_secs
+        } else {
+            0.0
+        }
+    }
+
     pub fn print(
         &mut self,
         source_progress: &SerializableProgress,
@@ -321,97 +329,94 @@ impl RcpdProgressPrinter {
     ) -> anyhow::Result<String> {
         let time_now = std::time::Instant::now();
         let curr_duration_secs = (time_now - self.last_update).as_secs_f64();
-
-        // Source metrics (ops, bytes, files)
-        let source_ops_rate = if curr_duration_secs > 0.0 {
-            (source_progress.ops_finished - self.last_source_ops) as f64 / curr_duration_secs
-        } else {
-            0.0
-        };
-        let source_bytes_rate = if curr_duration_secs > 0.0 {
-            (source_progress.bytes_copied - self.last_source_bytes) as f64 / curr_duration_secs
-        } else {
-            0.0
-        };
-        let source_files_rate = if curr_duration_secs > 0.0 {
-            (source_progress.files_copied - self.last_source_files) as f64 / curr_duration_secs
-        } else {
-            0.0
-        };
-
-        // Destination metrics (ops, bytes)
-        let dest_ops_rate = if curr_duration_secs > 0.0 {
-            (dest_progress.ops_finished - self.last_dest_ops) as f64 / curr_duration_secs
-        } else {
-            0.0
-        };
-        let dest_bytes_rate = if curr_duration_secs > 0.0 {
-            (dest_progress.bytes_copied - self.last_dest_bytes) as f64 / curr_duration_secs
-        } else {
-            0.0
-        };
-
-        // Update last values
+        // source metrics (ops, bytes, files)
+        let source_ops_rate = self.calculate_rate(
+            source_progress.ops_finished,
+            self.last_source_ops,
+            curr_duration_secs,
+        );
+        let source_bytes_rate = self.calculate_rate(
+            source_progress.bytes_copied,
+            self.last_source_bytes,
+            curr_duration_secs,
+        );
+        let source_files_rate = self.calculate_rate(
+            source_progress.files_copied,
+            self.last_source_files,
+            curr_duration_secs,
+        );
+        // destination metrics (ops, bytes)
+        let dest_ops_rate = self.calculate_rate(
+            dest_progress.ops_finished,
+            self.last_dest_ops,
+            curr_duration_secs,
+        );
+        let dest_bytes_rate = self.calculate_rate(
+            dest_progress.bytes_copied,
+            self.last_dest_bytes,
+            curr_duration_secs,
+        );
+        // update last values
         self.last_source_ops = source_progress.ops_finished;
         self.last_source_bytes = source_progress.bytes_copied;
         self.last_source_files = source_progress.files_copied;
         self.last_dest_ops = dest_progress.ops_finished;
         self.last_dest_bytes = dest_progress.bytes_copied;
         self.last_update = time_now;
-
         Ok(format!(
-            "---------------------\\n\\\
-            SOURCE:\\n\\\
-            ops pending: {:>10}\\n\\\
-            ops rate:    {:>10.2} items/s\\n\\\
-            bytes rate:  {:>10}/s\\n\\\
-            bytes total: {:>10}\\n\\\
-            files rate:  {:>10.2} files/s\\n\\\
-            files total: {:>10}\\n\\\
-            -----------------------\\n\\\
-            DESTINATION:\\n\\\
-            ops pending: {:>10}\\n\\\
-            ops rate:    {:>10.2} items/s\\n\\\
-            bytes rate:  {:>10}/s\\n\\\
-            bytes total: {:>10}\\n\\\n\\\
-            files:       {:>10}\\n\\\
-            symlinks:    {:>10}\\n\\\
-            directories: {:>10}\\n\\\
-            hard-links:  {:>10}\\n\\\
-            -----------------------\\n\\\
-            UNCHANGED:\\n\\\
-            files:       {:>10}\\n\\\
-            symlinks:    {:>10}\\n\\\
-            directories: {:>10}\\n\\\
-            hard-links:  {:>10}\\n\\\
-            -----------------------\\n\\\
-            REMOVED:\\n\\\
-            files:       {:>10}\\n\\\
-            symlinks:    {:>10}\\n\\\
+            "---------------------\n\
+            SOURCE:\n\
+            ops pending: {:>10}\n\
+            ops rate:    {:>10.2} items/s\n\
+            bytes rate:  {:>10}/s\n\
+            bytes total: {:>10}\n\
+            files rate:  {:>10.2} files/s\n\
+            files total: {:>10}\n\
+            -----------------------\n\
+            DESTINATION:\n\
+            ops pending: {:>10}\n\
+            ops rate:    {:>10.2} items/s\n\
+            bytes rate:  {:>10}/s\n\
+            bytes total: {:>10}\n\
+            \n\
+            files:       {:>10}\n\
+            symlinks:    {:>10}\n\
+            directories: {:>10}\n\
+            hard-links:  {:>10}\n\
+            -----------------------\n\
+            UNCHANGED:\n\
+            files:       {:>10}\n\
+            symlinks:    {:>10}\n\
+            directories: {:>10}\n\
+            hard-links:  {:>10}\n\
+            -----------------------\n\
+            REMOVED:\n\
+            files:       {:>10}\n\
+            symlinks:    {:>10}\n\
             directories: {:>10}",
-            // Source section
+            // source section
             source_progress.ops_started - source_progress.ops_finished, // pending
             source_ops_rate,
             bytesize::ByteSize(source_bytes_rate as u64),
             bytesize::ByteSize(source_progress.bytes_copied),
             source_files_rate,
             source_progress.files_copied,
-            // Destination section
+            // destination section
             dest_progress.ops_started - dest_progress.ops_finished, // pending
             dest_ops_rate,
             bytesize::ByteSize(dest_bytes_rate as u64),
             bytesize::ByteSize(dest_progress.bytes_copied),
-            // Destination detailed stats
+            // destination detailed stats
             dest_progress.files_copied,
             dest_progress.symlinks_created,
             dest_progress.directories_created,
             dest_progress.hard_links_created,
-            // Unchanged
+            // unchanged
             dest_progress.files_unchanged,
             dest_progress.symlinks_unchanged,
             dest_progress.directories_unchanged,
             dest_progress.hard_links_unchanged,
-            // Removed
+            // removed
             dest_progress.files_removed,
             dest_progress.symlinks_removed,
             dest_progress.directories_removed,
