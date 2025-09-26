@@ -293,6 +293,138 @@ impl<'a> ProgressPrinter<'a> {
     }
 }
 
+pub struct RcpdProgressPrinter {
+    last_source_ops: u64,
+    last_source_bytes: u64,
+    last_source_files: u64,
+    last_dest_ops: u64,
+    last_dest_bytes: u64,
+    last_update: std::time::Instant,
+}
+
+impl RcpdProgressPrinter {
+    pub fn new() -> Self {
+        Self {
+            last_source_ops: 0,
+            last_source_bytes: 0,
+            last_source_files: 0,
+            last_dest_ops: 0,
+            last_dest_bytes: 0,
+            last_update: std::time::Instant::now(),
+        }
+    }
+
+    pub fn print(
+        &mut self,
+        source_progress: &SerializableProgress,
+        dest_progress: &SerializableProgress,
+    ) -> anyhow::Result<String> {
+        let time_now = std::time::Instant::now();
+        let curr_duration_secs = (time_now - self.last_update).as_secs_f64();
+
+        // Source metrics (ops, bytes, files)
+        let source_ops_rate = if curr_duration_secs > 0.0 {
+            (source_progress.ops_finished - self.last_source_ops) as f64 / curr_duration_secs
+        } else {
+            0.0
+        };
+        let source_bytes_rate = if curr_duration_secs > 0.0 {
+            (source_progress.bytes_copied - self.last_source_bytes) as f64 / curr_duration_secs
+        } else {
+            0.0
+        };
+        let source_files_rate = if curr_duration_secs > 0.0 {
+            (source_progress.files_copied - self.last_source_files) as f64 / curr_duration_secs
+        } else {
+            0.0
+        };
+
+        // Destination metrics (ops, bytes)
+        let dest_ops_rate = if curr_duration_secs > 0.0 {
+            (dest_progress.ops_finished - self.last_dest_ops) as f64 / curr_duration_secs
+        } else {
+            0.0
+        };
+        let dest_bytes_rate = if curr_duration_secs > 0.0 {
+            (dest_progress.bytes_copied - self.last_dest_bytes) as f64 / curr_duration_secs
+        } else {
+            0.0
+        };
+
+        // Update last values
+        self.last_source_ops = source_progress.ops_finished;
+        self.last_source_bytes = source_progress.bytes_copied;
+        self.last_source_files = source_progress.files_copied;
+        self.last_dest_ops = dest_progress.ops_finished;
+        self.last_dest_bytes = dest_progress.bytes_copied;
+        self.last_update = time_now;
+
+        Ok(format!(
+            "---------------------\\n\\\
+            SOURCE:\\n\\\
+            ops pending: {:>10}\\n\\\
+            ops rate:    {:>10.2} items/s\\n\\\
+            bytes rate:  {:>10}/s\\n\\\
+            bytes total: {:>10}\\n\\\
+            files rate:  {:>10.2} files/s\\n\\\
+            files total: {:>10}\\n\\\
+            -----------------------\\n\\\
+            DESTINATION:\\n\\\
+            ops pending: {:>10}\\n\\\
+            ops rate:    {:>10.2} items/s\\n\\\
+            bytes rate:  {:>10}/s\\n\\\
+            bytes total: {:>10}\\n\\\n\\\
+            files:       {:>10}\\n\\\
+            symlinks:    {:>10}\\n\\\
+            directories: {:>10}\\n\\\
+            hard-links:  {:>10}\\n\\\
+            -----------------------\\n\\\
+            UNCHANGED:\\n\\\
+            files:       {:>10}\\n\\\
+            symlinks:    {:>10}\\n\\\
+            directories: {:>10}\\n\\\
+            hard-links:  {:>10}\\n\\\
+            -----------------------\\n\\\
+            REMOVED:\\n\\\
+            files:       {:>10}\\n\\\
+            symlinks:    {:>10}\\n\\\
+            directories: {:>10}",
+            // Source section
+            source_progress.ops_started - source_progress.ops_finished, // pending
+            source_ops_rate,
+            bytesize::ByteSize(source_bytes_rate as u64),
+            bytesize::ByteSize(source_progress.bytes_copied),
+            source_files_rate,
+            source_progress.files_copied,
+            // Destination section
+            dest_progress.ops_started - dest_progress.ops_finished, // pending
+            dest_ops_rate,
+            bytesize::ByteSize(dest_bytes_rate as u64),
+            bytesize::ByteSize(dest_progress.bytes_copied),
+            // Destination detailed stats
+            dest_progress.files_copied,
+            dest_progress.symlinks_created,
+            dest_progress.directories_created,
+            dest_progress.hard_links_created,
+            // Unchanged
+            dest_progress.files_unchanged,
+            dest_progress.symlinks_unchanged,
+            dest_progress.directories_unchanged,
+            dest_progress.hard_links_unchanged,
+            // Removed
+            dest_progress.files_removed,
+            dest_progress.symlinks_removed,
+            dest_progress.directories_removed,
+        ))
+    }
+}
+
+impl Default for RcpdProgressPrinter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +482,36 @@ mod tests {
 
         // Test that we can create a TracingMessage with progress
         let _tracing_msg = TracingMessage::Progress(serializable);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rcpd_progress_printer() -> Result<()> {
+        let mut printer = RcpdProgressPrinter::new();
+
+        // Create test progress data
+        let mut source_progress = SerializableProgress::default();
+        source_progress.ops_started = 100;
+        source_progress.ops_finished = 80;
+        source_progress.bytes_copied = 1024;
+        source_progress.files_copied = 5;
+
+        let mut dest_progress = SerializableProgress::default();
+        dest_progress.ops_started = 80;
+        dest_progress.ops_finished = 70;
+        dest_progress.bytes_copied = 1024;
+        dest_progress.files_copied = 5;
+        dest_progress.symlinks_created = 2;
+        dest_progress.directories_created = 1;
+
+        // Test that print returns a formatted string
+        let output = printer.print(&source_progress, &dest_progress)?;
+        assert!(output.contains("SOURCE:"));
+        assert!(output.contains("DESTINATION:"));
+        assert!(output.contains("ops pending"));
+        assert!(output.contains("20")); // source pending ops (100-80)
+        assert!(output.contains("10")); // dest pending ops (80-70)
 
         Ok(())
     }

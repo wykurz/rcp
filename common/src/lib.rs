@@ -20,7 +20,7 @@ mod filecmp;
 mod progress;
 mod testutils;
 
-pub use progress::SerializableProgress;
+pub use progress::{RcpdProgressPrinter, SerializableProgress};
 
 // Define RcpdType in common since remote depends on common
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, enum_map::Enum)]
