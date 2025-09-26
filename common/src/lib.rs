@@ -166,19 +166,23 @@ fn remote_master_updates<F>(
     F: Fn() -> ProgressSnapshot<SerializableProgress> + Send + 'static,
 {
     let delay = delay_opt.unwrap_or(std::time::Duration::from_millis(200));
+    let mut printer = RcpdProgressPrinter::new();
+    let mut is_done = lock.lock().unwrap();
     loop {
-        let guard = lock.lock().unwrap();
-        let result = cvar.wait_timeout(guard, delay).unwrap();
-        if *result.0 {
+        let progress_map = get_progress_snapshot();
+        let source_progress = &progress_map[RcpdType::Source];
+        let destination_progress = &progress_map[RcpdType::Destination];
+        eprintln!(
+            "--{}",
+            printer
+                .print(source_progress, destination_progress)
+                .unwrap()
+        );
+        let result = cvar.wait_timeout(is_done, delay).unwrap();
+        is_done = result.0;
+        if *is_done {
             break;
         }
-        drop(result.0);
-        // Get latest progress snapshots from source and destination rcpd processes
-        let progress_map = get_progress_snapshot();
-        // TODO: Aggregate progress from source and destination and display to user
-        // Available data: progress_map[RcpdType::Source] and progress_map[RcpdType::Destination]
-        let _source_progress = &progress_map[RcpdType::Source];
-        let _destination_progress = &progress_map[RcpdType::Destination];
     }
 }
 
