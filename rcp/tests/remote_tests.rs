@@ -210,24 +210,22 @@ fn test_remote_copy_symlink_with_dereference() {
 }
 
 #[test]
-#[ignore = "functionality not working yet"]
 fn test_remote_copy_with_overwrite() {
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("overwrite_test.txt");
     let dst_file = dst_dir.path().join("overwrite_test.txt");
-    // create source file
-    create_test_file(&src_file, "new content", 0o644);
-    // create existing destination file with different content
+    // create source file with longer content to ensure different size
+    create_test_file(&src_file, "new content that is longer", 0o644);
+    // create existing destination file with different, shorter content
     create_test_file(&dst_file, "old content", 0o644);
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
     run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
     // verify content was overwritten
-    assert_eq!(get_file_content(&dst_file), "new content");
+    assert_eq!(get_file_content(&dst_file), "new content that is longer");
 }
 
 #[test]
-#[ignore = "functionality not working yet"]
 fn test_remote_copy_without_overwrite_fails() {
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("no_overwrite_test.txt");
@@ -244,7 +242,6 @@ fn test_remote_copy_without_overwrite_fails() {
 }
 
 #[test]
-#[ignore = "functionality not working yet"]
 fn test_remote_copy_comprehensive() {
     let (src_dir, dst_dir) = setup_test_env();
     // create a complex directory structure with files and symlinks
@@ -515,4 +512,190 @@ fn test_remote_copy_port_range() {
     run_rcp_and_expect_success(&["--quic-port-ranges", port_range, &src_remote, &dst_remote]);
     // verify the file was copied successfully
     assert_eq!(get_file_content(&dst_file), "port range test content");
+}
+
+#[test]
+fn test_remote_overwrite_directory_with_directory() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // create source directory structure
+    let src_subdir = src_dir.path().join("mydir");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("file1.txt"), "content1", 0o644);
+    create_test_file(&src_subdir.join("file2.txt"), "content2", 0o644);
+    create_test_file(&src_subdir.join("file3.txt"), "content3", 0o644);
+    // create destination directory with different contents
+    let dst_subdir = dst_dir.path().join("mydir");
+    std::fs::create_dir(&dst_subdir).unwrap();
+    create_test_file(&dst_subdir.join("file1.txt"), "old content1", 0o644);
+    create_test_file(&dst_subdir.join("file4.txt"), "old file4", 0o644); // will remain
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
+    // verify the directory was updated recursively
+    assert_eq!(get_file_content(&dst_subdir.join("file1.txt")), "content1"); // updated
+    assert_eq!(get_file_content(&dst_subdir.join("file2.txt")), "content2"); // new
+    assert_eq!(get_file_content(&dst_subdir.join("file3.txt")), "content3"); // new
+    assert_eq!(get_file_content(&dst_subdir.join("file4.txt")), "old file4"); // unchanged
+}
+
+#[test]
+fn test_remote_overwrite_file_with_directory() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // create source directory
+    let src_subdir = src_dir.path().join("mydir");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("nested.txt"), "nested content", 0o644);
+    // create destination as a file (will be replaced with directory)
+    let dst_path = dst_dir.path().join("mydir");
+    create_test_file(&dst_path, "this is a file", 0o644);
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_path.to_str().unwrap());
+    run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
+    // verify the file was replaced with a directory
+    assert!(dst_path.is_dir());
+    assert_eq!(
+        get_file_content(&dst_path.join("nested.txt")),
+        "nested content"
+    );
+}
+
+#[test]
+fn test_remote_overwrite_directory_with_file() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // create source file
+    let src_file = src_dir.path().join("myfile.txt");
+    create_test_file(&src_file, "file content", 0o644);
+    // create destination as a directory (will be replaced with file)
+    let dst_path = dst_dir.path().join("myfile.txt");
+    std::fs::create_dir(&dst_path).unwrap();
+    create_test_file(&dst_path.join("nested.txt"), "nested", 0o644);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_path.to_str().unwrap());
+    run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
+    // verify the directory was replaced with a file
+    assert!(dst_path.is_file());
+    assert_eq!(get_file_content(&dst_path), "file content");
+}
+
+#[test]
+fn test_remote_overwrite_symlink_with_symlink_same_target() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // create target file
+    let target = src_dir.path().join("target.txt");
+    create_test_file(&target, "target content", 0o644);
+    // create source symlink
+    let src_link = src_dir.path().join("link.txt");
+    std::os::unix::fs::symlink("target.txt", &src_link).unwrap();
+    // create destination symlink pointing to same target
+    let dst_target = dst_dir.path().join("target.txt");
+    create_test_file(&dst_target, "target content", 0o644);
+    let dst_link = dst_dir.path().join("link.txt");
+    std::os::unix::fs::symlink("target.txt", &dst_link).unwrap();
+    let src_remote = format!("localhost:{}", src_link.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_link.to_str().unwrap());
+    run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
+    // verify symlink still points to same target
+    assert!(dst_link.is_symlink());
+    assert_eq!(
+        std::fs::read_link(&dst_link).unwrap().to_str().unwrap(),
+        "target.txt"
+    );
+}
+
+#[test]
+fn test_remote_overwrite_symlink_with_symlink_different_target() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // create source symlink
+    let src_link = src_dir.path().join("link.txt");
+    std::os::unix::fs::symlink("new_target.txt", &src_link).unwrap();
+    // create destination symlink pointing to different target
+    let dst_link = dst_dir.path().join("link.txt");
+    std::os::unix::fs::symlink("old_target.txt", &dst_link).unwrap();
+    let src_remote = format!("localhost:{}", src_link.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_link.to_str().unwrap());
+    run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
+    // verify symlink was updated to new target
+    assert!(dst_link.is_symlink());
+    assert_eq!(
+        std::fs::read_link(&dst_link).unwrap().to_str().unwrap(),
+        "new_target.txt"
+    );
+}
+
+#[test]
+fn test_remote_overwrite_file_with_symlink() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // create source symlink
+    let src_link = src_dir.path().join("item.txt");
+    std::os::unix::fs::symlink("target.txt", &src_link).unwrap();
+    // create destination as a file (will be replaced with symlink)
+    let dst_path = dst_dir.path().join("item.txt");
+    create_test_file(&dst_path, "this is a file", 0o644);
+    let src_remote = format!("localhost:{}", src_link.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_path.to_str().unwrap());
+    run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
+    // verify the file was replaced with a symlink
+    assert!(dst_path.is_symlink());
+    assert_eq!(
+        std::fs::read_link(&dst_path).unwrap().to_str().unwrap(),
+        "target.txt"
+    );
+}
+
+#[test]
+fn test_remote_overwrite_symlink_with_file() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // create source file
+    let src_file = src_dir.path().join("item.txt");
+    create_test_file(&src_file, "file content", 0o644);
+    // create destination as a symlink (will be replaced with file)
+    let dst_path = dst_dir.path().join("item.txt");
+    std::os::unix::fs::symlink("target.txt", &dst_path).unwrap();
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_path.to_str().unwrap());
+    run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
+    // verify the symlink was replaced with a file
+    assert!(dst_path.is_file());
+    assert!(!dst_path.is_symlink());
+    assert_eq!(get_file_content(&dst_path), "file content");
+}
+
+#[test]
+fn test_remote_overwrite_directory_with_symlink() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // create source symlink
+    let src_link = src_dir.path().join("item");
+    std::os::unix::fs::symlink("target", &src_link).unwrap();
+    // create destination as a directory (will be replaced with symlink)
+    let dst_path = dst_dir.path().join("item");
+    std::fs::create_dir(&dst_path).unwrap();
+    create_test_file(&dst_path.join("nested.txt"), "nested", 0o644);
+    let src_remote = format!("localhost:{}", src_link.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_path.to_str().unwrap());
+    run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
+    // verify the directory was replaced with a symlink
+    assert!(dst_path.is_symlink());
+    assert_eq!(
+        std::fs::read_link(&dst_path).unwrap().to_str().unwrap(),
+        "target"
+    );
+}
+
+#[test]
+fn test_remote_overwrite_symlink_with_directory() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // Create source directory
+    let src_subdir = src_dir.path().join("item");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("file.txt"), "content", 0o644);
+    // create destination as a symlink (will be replaced with directory)
+    let dst_path = dst_dir.path().join("item");
+    std::os::unix::fs::symlink("target", &dst_path).unwrap();
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_path.to_str().unwrap());
+    run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
+    // verify the symlink was replaced with a directory
+    assert!(dst_path.is_dir());
+    assert!(!dst_path.is_symlink());
+    assert_eq!(get_file_content(&dst_path.join("file.txt")), "content");
 }

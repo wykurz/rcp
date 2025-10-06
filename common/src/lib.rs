@@ -16,7 +16,7 @@ pub mod preserve;
 pub mod remote_tracing;
 pub mod rm;
 
-mod filecmp;
+pub mod filecmp;
 pub mod progress;
 mod testutils;
 

@@ -40,6 +40,69 @@ async fn handle_file_stream(
         file_header.src,
         file_header.dst
     );
+    // check if destination exists and handle overwrite logic
+    let dst_exists = tokio::fs::symlink_metadata(&file_header.dst).await.is_ok();
+    if dst_exists {
+        if settings.overwrite {
+            tracing::debug!("file exists, check if it's identical");
+            let dst_metadata = tokio::fs::symlink_metadata(&file_header.dst).await?;
+            // check if file type is the same (both must be files)
+            let same_type = dst_metadata.is_file();
+            if same_type {
+                // create wrapper that includes size for comparison
+                let src_file_metadata = remote::protocol::FileMetadata {
+                    metadata: &file_header.metadata,
+                    size: file_header.size,
+                };
+                // check metadata fields including size
+                let same_metadata = common::filecmp::metadata_equal(
+                    &settings.overwrite_compare,
+                    &src_file_metadata,
+                    &dst_metadata,
+                );
+                if same_metadata {
+                    tracing::debug!("file is identical, skipping");
+                    prog.files_unchanged.inc();
+                    // drain the stream without writing
+                    let mut sink = tokio::io::sink();
+                    file_recv_stream.copy_to(&mut sink).await?;
+                    file_recv_stream.close().await;
+                    if file_header.is_root {
+                        tracing::info!("Root file processed (unchanged)");
+                        send_root_done(control_send_stream).await?;
+                    } else {
+                        directory_tracker
+                            .lock()
+                            .await
+                            .decrement_entry(&file_header.src, &file_header.dst)
+                            .await
+                            .context("Failed to decrement directory entry count after skipping unchanged file")?;
+                    }
+                    return Ok(());
+                }
+                // file exists but is different, remove it
+                tracing::debug!("file exists but is different, removing");
+                tokio::fs::remove_file(&file_header.dst).await?;
+            } else {
+                // destination is not a file (could be symlink or directory), remove it
+                tracing::info!("destination is not a file, removing");
+                common::rm::rm(
+                    common::get_progress(),
+                    &file_header.dst,
+                    &common::rm::Settings {
+                        fail_early: settings.fail_early,
+                    },
+                )
+                .await
+                .map_err(|err| anyhow::anyhow!("Failed to remove destination: {err}"))?;
+            }
+        } else {
+            return Err(anyhow::anyhow!(
+                "destination {:?} already exists, did you intend to specify --overwrite?",
+                file_header.dst
+            ));
+        }
+    }
     throttle::get_file_iops_tokens(settings.chunk_size, file_header.size as u64).await;
     let mut file = tokio::fs::File::create(&file_header.dst).await?;
     let copied = file_recv_stream.copy_to(&mut file).await?;
@@ -124,9 +187,8 @@ async fn create_directory_structure(
         .await
         .context("Failed to receive FS object message")?
     {
-        // throttle::get_ops_token().await;
+        throttle::get_ops_token().await;
         tracing::debug!("Received source message: {:?}", source_message);
-        let mut directory_tracker = directory_tracker.lock().await;
         let prog = progress();
         match source_message {
             remote::protocol::SourceMessage::DirStub {
@@ -135,9 +197,48 @@ async fn create_directory_structure(
                 num_entries,
             } => {
                 let _ops_guard = prog.ops.guard();
-                tokio::fs::create_dir(&dst).await?;
-                prog.directories_created.inc();
+                if let Err(error) = tokio::fs::create_dir(&dst).await {
+                    if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
+                        // check if the destination is a directory - if so, leave it
+                        // use symlink_metadata to not follow symlinks
+                        let dst_metadata =
+                            tokio::fs::symlink_metadata(dst).await.with_context(|| {
+                                format!("failed reading metadata from dst: {dst:?}")
+                            })?;
+                        if dst_metadata.is_dir() {
+                            tracing::debug!("destination is a directory, leaving it as is");
+                            prog.directories_unchanged.inc();
+                        } else {
+                            tracing::info!(
+                                "destination is not a directory, removing and creating a new one"
+                            );
+                            // do NOT hold directory_tracker lock while calling rm::rm() as it might deadlock
+                            // with file streams trying to decrement entries
+                            common::rm::rm(
+                                common::get_progress(),
+                                dst,
+                                &common::rm::Settings {
+                                    fail_early: settings.fail_early,
+                                },
+                            )
+                            .await
+                            .map_err(|err| {
+                                anyhow::anyhow!("Failed to remove destination: {err}")
+                            })?;
+                            tokio::fs::create_dir(&dst)
+                                .await
+                                .with_context(|| format!("cannot create directory {dst:?}"))?;
+                            prog.directories_created.inc();
+                        }
+                    } else {
+                        return Err(error.into());
+                    }
+                } else {
+                    prog.directories_created.inc();
+                }
                 directory_tracker
+                    .lock()
+                    .await
                     .add_directory(src, dst, num_entries)
                     .await
                     .context("Failed to add directory to tracker")?;
@@ -157,6 +258,8 @@ async fn create_directory_structure(
                     break;
                 } else {
                     directory_tracker
+                        .lock()
+                        .await
                         .decrement_entry(src, dst)
                         .await
                         .with_context(|| format!("Failed to decrement directory entry count after receiving directory metadata src: {src:?}, dst: {dst:?}"))?;
@@ -170,17 +273,91 @@ async fn create_directory_structure(
                 is_root,
             } => {
                 let _ops_guard = prog.ops.guard();
-                tokio::fs::symlink(target, dst).await?;
-                common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
-                prog.symlinks_created.inc();
+                if let Err(error) = tokio::fs::symlink(target, dst).await {
+                    if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
+                        let dst_metadata =
+                            tokio::fs::symlink_metadata(dst).await.with_context(|| {
+                                format!("failed reading metadata from dst: {dst:?}")
+                            })?;
+                        if dst_metadata.is_symlink() {
+                            let dst_link = tokio::fs::read_link(dst)
+                                .await
+                                .with_context(|| format!("failed reading dst symlink: {dst:?}"))?;
+                            if target == &dst_link {
+                                tracing::debug!("destination is a symlink and points to the same location as source");
+                                if preserve.symlink.any() {
+                                    // check if we need to update the metadata for this symlink
+                                    if !common::filecmp::metadata_equal(
+                                        &settings.overwrite_compare,
+                                        metadata,
+                                        &dst_metadata,
+                                    ) {
+                                        tracing::debug!(
+                                            "destination metadata is different, updating"
+                                        );
+                                        common::preserve::set_symlink_metadata(
+                                            preserve, metadata, dst,
+                                        )
+                                        .await?;
+                                        prog.symlinks_removed.inc();
+                                        prog.symlinks_created.inc();
+                                    } else {
+                                        tracing::debug!(
+                                            "destination symlink is identical, skipping"
+                                        );
+                                        prog.symlinks_unchanged.inc();
+                                    }
+                                } else {
+                                    tracing::debug!("destination symlink is identical, skipping");
+                                    prog.symlinks_unchanged.inc();
+                                }
+                            } else {
+                                tracing::info!("destination is a symlink but points to a different location, removing");
+                                tokio::fs::remove_file(dst).await?;
+                                tokio::fs::symlink(target, dst).await?;
+                                common::preserve::set_symlink_metadata(preserve, metadata, dst)
+                                    .await?;
+                                prog.symlinks_removed.inc();
+                                prog.symlinks_created.inc();
+                            }
+                        } else {
+                            tracing::info!("destination is not a symlink, removing");
+                            // do NOT hold directory_tracker lock while calling rm::rm()
+                            common::rm::rm(
+                                common::get_progress(),
+                                dst,
+                                &common::rm::Settings {
+                                    fail_early: settings.fail_early,
+                                },
+                            )
+                            .await
+                            .map_err(|err| {
+                                anyhow::anyhow!("Failed to remove destination: {err}")
+                            })?;
+                            tokio::fs::symlink(target, dst).await?;
+                            common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
+                            prog.symlinks_created.inc();
+                        }
+                    } else {
+                        return Err(error.into());
+                    }
+                } else {
+                    common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
+                    prog.symlinks_created.inc();
+                }
                 if is_root {
                     tracing::info!("Root symlink processed");
                     send_root_done(control_send_stream).await?;
                     break;
                 } else {
-                    directory_tracker.decrement_entry(src, dst).await.context(
-                        "Failed to decrement directory entry count after receiving a symlink",
-                    )?;
+                    directory_tracker
+                        .lock()
+                        .await
+                        .decrement_entry(src, dst)
+                        .await
+                        .context(
+                            "Failed to decrement directory entry count after receiving a symlink",
+                        )?;
                 }
             }
             remote::protocol::SourceMessage::DirStructureComplete => {
