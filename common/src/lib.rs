@@ -151,9 +151,11 @@ fn rcpd_updates(
     let delay = delay_opt.unwrap_or(std::time::Duration::from_millis(200));
     let mut is_done = lock.lock().unwrap();
     loop {
-        remote_tracing::send_progress_update(&sender, &PROGRESS)
-            .context("Failed to send progress update")
-            .unwrap();
+        if remote_tracing::send_progress_update(&sender, &PROGRESS).is_err() {
+            // channel closed, receiver is done
+            tracing::debug!("Progress update channel closed, stopping progress updates");
+            break;
+        }
         let result = cvar.wait_timeout(is_done, delay).unwrap();
         is_done = result.0;
         if *is_done {
