@@ -140,6 +140,8 @@ pub struct RcpdConfig {
     pub overwrite_compare: String,
     pub debug_log_prefix: Option<String>,
     pub quic_port_ranges: Option<String>,
+    pub progress: bool,
+    pub progress_delay: Option<String>,
 }
 
 impl RcpdConfig {
@@ -173,6 +175,12 @@ impl RcpdConfig {
         }
         if let Some(ref ranges) = self.quic_port_ranges {
             args.push(format!("--quic-port-ranges={ranges}"));
+        }
+        if self.progress {
+            args.push("--progress".to_string());
+        }
+        if let Some(ref delay) = self.progress_delay {
+            args.push(format!("--progress-delay={delay}"));
         }
         args
     }

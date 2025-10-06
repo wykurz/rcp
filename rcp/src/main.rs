@@ -164,6 +164,8 @@ async fn run_rcpd_master(
         overwrite_compare: args.overwrite_compare.clone(),
         debug_log_prefix: args.rcpd_debug_log_prefix.clone(),
         quic_port_ranges: args.quic_port_ranges.clone(),
+        progress: args.progress,
+        progress_delay: args.progress_delay.clone(),
     };
     for session in [src.session(), dst.session()] {
         let rcpd = remote::start_rcpd(&rcpd_config, session, &server_addr, &server_name).await?;
