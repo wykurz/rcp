@@ -89,7 +89,7 @@ pub async fn run_receiver(
             }
             common::remote_tracing::TracingMessage::Progress(progress) => {
                 tracing::debug!(target: "remote", "Received progress update from {} rcpd: {:?}", rcpd_type, progress);
-                PROGRESS_MAP.lock().unwrap()[rcpd_type] = progress.clone();
+                PROGRESS_MAP.lock().unwrap()[rcpd_type] = progress;
             }
         }
     }
