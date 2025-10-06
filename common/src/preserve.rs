@@ -12,6 +12,19 @@ pub trait Metadata {
     fn mtime(&self) -> i64;
     fn mtime_nsec(&self) -> i64;
     fn permissions(&self) -> std::fs::Permissions;
+    // ctime cannot be set manually, but we include it for comparison purposes
+    // default implementation returns 0 to indicate ctime is not available (e.g., in protocol::Metadata)
+    fn ctime(&self) -> i64 {
+        0
+    }
+    fn ctime_nsec(&self) -> i64 {
+        0
+    }
+    // size is not preserved (cannot be set), but included for comparison purposes
+    // default implementation returns 0 to indicate size is not available or not applicable
+    fn size(&self) -> u64 {
+        0
+    }
 }
 
 impl Metadata for std::fs::Metadata {
@@ -35,6 +48,15 @@ impl Metadata for std::fs::Metadata {
     }
     fn permissions(&self) -> std::fs::Permissions {
         self.permissions()
+    }
+    fn ctime(&self) -> i64 {
+        MetadataExt::ctime(self)
+    }
+    fn ctime_nsec(&self) -> i64 {
+        MetadataExt::ctime_nsec(self)
+    }
+    fn size(&self) -> u64 {
+        self.len()
     }
 }
 

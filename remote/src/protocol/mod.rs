@@ -85,6 +85,40 @@ pub struct File {
     pub is_root: bool,
 }
 
+// wrapper that includes size for comparison purposes
+#[derive(Debug)]
+pub struct FileMetadata<'a> {
+    pub metadata: &'a Metadata,
+    pub size: u64,
+}
+
+impl<'a> common::preserve::Metadata for FileMetadata<'a> {
+    fn uid(&self) -> u32 {
+        self.metadata.uid()
+    }
+    fn gid(&self) -> u32 {
+        self.metadata.gid()
+    }
+    fn atime(&self) -> i64 {
+        self.metadata.atime()
+    }
+    fn atime_nsec(&self) -> i64 {
+        self.metadata.atime_nsec()
+    }
+    fn mtime(&self) -> i64 {
+        self.metadata.mtime()
+    }
+    fn mtime_nsec(&self) -> i64 {
+        self.metadata.mtime_nsec()
+    }
+    fn permissions(&self) -> std::fs::Permissions {
+        self.metadata.permissions()
+    }
+    fn size(&self) -> u64 {
+        self.size
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub enum SourceMessage {
     DirStub {

@@ -1,4 +1,4 @@
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::prelude::PermissionsExt;
 use tracing::instrument;
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -12,10 +12,13 @@ pub struct MetadataCmpSettings {
 }
 
 #[instrument]
-pub fn metadata_equal(
+pub fn metadata_equal<
+    M1: crate::preserve::Metadata + std::fmt::Debug,
+    M2: crate::preserve::Metadata + std::fmt::Debug,
+>(
     settings: &MetadataCmpSettings,
-    metadata1: &std::fs::Metadata,
-    metadata2: &std::fs::Metadata,
+    metadata1: &M1,
+    metadata2: &M2,
 ) -> bool {
     if settings.uid && metadata1.uid() != metadata2.uid() {
         return false;
@@ -23,7 +26,7 @@ pub fn metadata_equal(
     if settings.gid && metadata1.gid() != metadata2.gid() {
         return false;
     }
-    if settings.mode && metadata1.mode() != metadata2.mode() {
+    if settings.mode && metadata1.permissions().mode() != metadata2.permissions().mode() {
         return false;
     }
     if settings.size && metadata1.size() != metadata2.size() {
@@ -42,14 +45,18 @@ pub fn metadata_equal(
         }
     }
     if settings.ctime {
-        if metadata1.ctime() != metadata2.ctime() {
-            return false;
-        }
-        if metadata1.ctime_nsec() != 0
-            && metadata2.ctime_nsec() != 0
-            && metadata1.ctime_nsec() != metadata2.ctime_nsec()
-        {
-            return false;
+        // ctime() returns 0 if not available (e.g., in protocol::Metadata)
+        // only compare if both have ctime available
+        if metadata1.ctime() != 0 && metadata2.ctime() != 0 {
+            if metadata1.ctime() != metadata2.ctime() {
+                return false;
+            }
+            if metadata1.ctime_nsec() != 0
+                && metadata2.ctime_nsec() != 0
+                && metadata1.ctime_nsec() != metadata2.ctime_nsec()
+            {
+                return false;
+            }
         }
     }
     true
