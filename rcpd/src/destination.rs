@@ -3,6 +3,10 @@ use tracing::instrument;
 
 use crate::directory_tracker;
 
+fn progress() -> &'static common::progress::Progress {
+    common::get_progress()
+}
+
 async fn send_root_done(
     control_send_stream: remote::streams::SharedSendStream,
 ) -> anyhow::Result<()> {
@@ -24,6 +28,8 @@ async fn handle_file_stream(
     mut file_recv_stream: remote::streams::RecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
+    let prog = progress();
+    let _ops_guard = prog.ops.guard();
     tracing::info!("Processing file stream");
     let file_header = file_recv_stream
         .recv_object::<remote::protocol::File>()
@@ -53,6 +59,8 @@ async fn handle_file_stream(
         file_header.size
     );
     common::preserve::set_file_metadata(&preserve, &file_header.metadata, &file_header.dst).await?;
+    prog.files_copied.inc();
+    prog.bytes_copied.add(file_header.size);
     if file_header.is_root {
         tracing::info!("Root file processed");
         send_root_done(control_send_stream).await?;
@@ -119,13 +127,16 @@ async fn create_directory_structure(
         // throttle::get_ops_token().await;
         tracing::debug!("Received source message: {:?}", source_message);
         let mut directory_tracker = directory_tracker.lock().await;
+        let prog = progress();
         match source_message {
             remote::protocol::SourceMessage::DirStub {
                 ref src,
                 ref dst,
                 num_entries,
             } => {
+                let _ops_guard = prog.ops.guard();
                 tokio::fs::create_dir(&dst).await?;
+                prog.directories_created.inc();
                 directory_tracker
                     .add_directory(src, dst, num_entries)
                     .await
@@ -137,6 +148,7 @@ async fn create_directory_structure(
                 ref metadata,
                 is_root,
             } => {
+                let _ops_guard = prog.ops.guard();
                 // apply metadata changes now that directory is complete
                 common::preserve::set_dir_metadata(preserve, metadata, dst).await?;
                 if is_root {
@@ -157,8 +169,10 @@ async fn create_directory_structure(
                 ref metadata,
                 is_root,
             } => {
+                let _ops_guard = prog.ops.guard();
                 tokio::fs::symlink(target, dst).await?;
                 common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
+                prog.symlinks_created.inc();
                 if is_root {
                     tracing::info!("Root symlink processed");
                     send_root_done(control_send_stream).await?;
