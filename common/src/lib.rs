@@ -17,7 +17,7 @@ pub mod remote_tracing;
 pub mod rm;
 
 mod filecmp;
-mod progress;
+pub mod progress;
 mod testutils;
 
 pub use progress::{RcpdProgressPrinter, SerializableProgress};
@@ -44,6 +44,10 @@ pub type ProgressSnapshot<T> = enum_map::EnumMap<RcpdType, T>;
 lazy_static! {
     static ref PROGRESS: progress::Progress = progress::Progress::new();
     static ref PBAR: indicatif::ProgressBar = indicatif::ProgressBar::new_spinner();
+}
+
+pub fn get_progress() -> &'static progress::Progress {
+    &PROGRESS
 }
 
 struct ProgressTracker {

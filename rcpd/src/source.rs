@@ -2,6 +2,10 @@ use anyhow::Context;
 use async_recursion::async_recursion;
 use tracing::instrument;
 
+fn progress() -> &'static common::progress::Progress {
+    common::get_progress()
+}
+
 #[instrument]
 #[async_recursion]
 async fn send_directories_and_symlinks(
@@ -139,6 +143,8 @@ async fn send_file(
     is_root: bool,
     connection: remote::streams::Connection,
 ) -> anyhow::Result<()> {
+    let prog = progress();
+    let _ops_guard = prog.ops.guard();
     let _open_file_guard = throttle::open_file_permit().await;
     let metadata = remote::protocol::Metadata::from(src_metadata);
     let file_header = remote::protocol::File {
@@ -156,6 +162,8 @@ async fn send_file(
         .await
         .with_context(|| format!("failed sending file content: {:?}", &src))?;
     file_send_stream.close().await?;
+    prog.files_copied.inc();
+    prog.bytes_copied.add(src_metadata.len());
     tracing::info!("Sent file: {:?} -> {:?}", src, dst);
     Ok(())
 }
