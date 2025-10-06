@@ -143,6 +143,7 @@ fn rcpd_updates(
     delay_opt: &Option<std::time::Duration>,
     sender: tokio::sync::mpsc::UnboundedSender<remote_tracing::TracingMessage>,
 ) {
+    tracing::debug!("Starting rcpd progress updates");
     let delay = delay_opt.unwrap_or(std::time::Duration::from_millis(200));
     let mut is_done = lock.lock().unwrap();
     loop {
@@ -608,6 +609,7 @@ where
     }
     let res = {
         let _progress = progress.map(|settings| {
+            tracing::debug!("Requesting progress updates {settings:?}");
             let delay = settings.progress_delay.map(|delay_str| {
                 humantime::parse_duration(&delay_str)
                     .expect("Couldn't parse duration out of --progress-delay")
