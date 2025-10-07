@@ -304,15 +304,26 @@ async fn run_rcpd_master(
             errors.push(format!("Destination: {error}"));
         }
     }
-    for rcpd in rcpds {
-        tracing::info!("Waiting for rcpd process to finish: {:?}", rcpd);
-        remote::wait_for_rcpd_process(rcpd).await?;
-    }
-    source_tracing_task.await?;
-    dest_tracing_task.await?;
+    // close connections which will cause rcpd processes to exit and tracing tasks to finish
     source_connection.close();
     dest_connection.close();
-    server_endpoint.wait_idle().await;
+    // wait for endpoint to become idle with a timeout to avoid blocking too long
+    tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        server_endpoint.wait_idle(),
+    )
+    .await
+    .ok();
+    // wait for rcpd processes to fully exit and capture any error output
+    for rcpd in rcpds {
+        if let Err(e) = remote::wait_for_rcpd_process(rcpd).await {
+            tracing::error!("Failed to wait for rcpd process: {e}");
+        }
+    }
+    // wait for tracing tasks to complete (they should finish when streams close)
+    // we ignore errors here since connection loss is expected during shutdown
+    let _ = source_tracing_task.await;
+    let _ = dest_tracing_task.await;
     tracing::info!("All rcpd processes finished");
     // propagate any errors from rcpd processes
     if !errors.is_empty() {
