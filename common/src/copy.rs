@@ -130,7 +130,7 @@ pub async fn copy_file(
     Ok(copy_summary)
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Summary {
     pub bytes_copied: u64,
     pub files_copied: usize,

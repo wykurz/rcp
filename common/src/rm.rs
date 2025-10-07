@@ -24,7 +24,7 @@ pub struct Settings {
     pub fail_early: bool,
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Summary {
     pub files_removed: usize,
     pub symlinks_removed: usize,

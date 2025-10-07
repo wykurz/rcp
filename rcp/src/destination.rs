@@ -397,7 +397,7 @@ pub async fn run_destination(
     src_server_name: &str,
     settings: &common::copy::Settings,
     preserve: &common::preserve::Settings,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, common::copy::Summary)> {
     let client = remote::get_client()?;
     let connection = client.connect(*src_endpoint, src_server_name)?.await?;
     tracing::info!("Connected to Source");
@@ -443,5 +443,21 @@ pub async fn run_destination(
     tracing::info!("Destination is done");
     connection.close();
     client.wait_idle().await;
-    Ok("destination OK".to_string())
+    // build summary from progress counters
+    let prog = progress();
+    let summary = common::copy::Summary {
+        bytes_copied: prog.bytes_copied.get(),
+        files_copied: prog.files_copied.get() as usize,
+        symlinks_created: prog.symlinks_created.get() as usize,
+        directories_created: prog.directories_created.get() as usize,
+        files_unchanged: prog.files_unchanged.get() as usize,
+        symlinks_unchanged: prog.symlinks_unchanged.get() as usize,
+        directories_unchanged: prog.directories_unchanged.get() as usize,
+        rm_summary: common::rm::Summary {
+            files_removed: prog.files_removed.get() as usize,
+            symlinks_removed: prog.symlinks_removed.get() as usize,
+            directories_removed: prog.directories_removed.get() as usize,
+        },
+    };
+    Ok(("destination OK".to_string(), summary))
 }
