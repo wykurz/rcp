@@ -715,3 +715,34 @@ fn test_remote_copy_nonexistent_source() {
     let combined = format!("{}{}", stdout, stderr);
     assert!(combined.contains("does_not_exist") && combined.contains("No such file"));
 }
+
+#[test]
+fn test_remote_copy_destination_parent_missing() {
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("source.txt");
+    create_test_file(&src_file, "content", 0o644);
+    // destination parent doesn't exist
+    let dst_file = dst_dir.path().join("nonexistent_dir/destination.txt");
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    let output = run_rcp_and_expect_failure(&[&src_remote, &dst_remote]);
+    // verify error message mentions the missing directory
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
+    assert!(combined.contains("No such file") || combined.contains("nonexistent_dir"));
+}
+
+#[test]
+fn test_remote_copy_unreadable_source() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // test with a single unreadable file case (no permissions)
+    let src_file = src_dir.path().join("unreadable.txt");
+    let dst_file = dst_dir.path().join("unreadable.txt");
+    create_test_file(&src_file, "no permissions", 0o000);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    run_rcp_and_expect_failure(&[&src_remote, &dst_remote]);
+    // verify the destination file was not created
+    assert!(!dst_file.exists());
+}
