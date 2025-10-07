@@ -91,6 +91,52 @@ fn run_rcp_and_expect_failure(args: &[&str]) -> std::process::Output {
     output
 }
 
+fn parse_summary_from_output(output: &std::process::Output) -> Option<common::copy::Summary> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut summary = common::copy::Summary::default();
+    let mut found_any = false;
+    for line in stdout.lines() {
+        if let Some(value) = line.strip_prefix("bytes copied: ") {
+            if let Some(num_str) = value.split_whitespace().next() {
+                summary.bytes_copied = num_str.parse().ok()?;
+                found_any = true;
+            }
+        } else if let Some(value) = line.strip_prefix("files copied: ") {
+            summary.files_copied = value.parse().ok()?;
+            found_any = true;
+        } else if let Some(value) = line.strip_prefix("symlinks created: ") {
+            summary.symlinks_created = value.parse().ok()?;
+            found_any = true;
+        } else if let Some(value) = line.strip_prefix("directories created: ") {
+            summary.directories_created = value.parse().ok()?;
+            found_any = true;
+        } else if let Some(value) = line.strip_prefix("files unchanged: ") {
+            summary.files_unchanged = value.parse().ok()?;
+            found_any = true;
+        } else if let Some(value) = line.strip_prefix("symlinks unchanged: ") {
+            summary.symlinks_unchanged = value.parse().ok()?;
+            found_any = true;
+        } else if let Some(value) = line.strip_prefix("directories unchanged: ") {
+            summary.directories_unchanged = value.parse().ok()?;
+            found_any = true;
+        } else if let Some(value) = line.strip_prefix("files removed: ") {
+            summary.rm_summary.files_removed = value.parse().ok()?;
+            found_any = true;
+        } else if let Some(value) = line.strip_prefix("symlinks removed: ") {
+            summary.rm_summary.symlinks_removed = value.parse().ok()?;
+            found_any = true;
+        } else if let Some(value) = line.strip_prefix("directories removed: ") {
+            summary.rm_summary.directories_removed = value.parse().ok()?;
+            found_any = true;
+        }
+    }
+    if found_any {
+        Some(summary)
+    } else {
+        None
+    }
+}
+
 #[test]
 fn test_remote_copy_basic() {
     let (src_dir, dst_dir) = setup_test_env();
@@ -162,7 +208,7 @@ fn test_remote_copy_directory() {
     create_test_file(&src_file2, "remote dir content 2", 0o755);
     let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
-    run_rcp_and_expect_success(&["--preserve", &src_remote, &dst_remote]);
+    let output = run_rcp_and_expect_success(&["--preserve", "--summary", &src_remote, &dst_remote]);
     let dst_file1 = dst_subdir.join("file1.txt");
     let dst_file2 = dst_subdir.join("file2.txt");
     assert_eq!(get_file_content(&dst_file1), "remote dir content 1");
@@ -171,6 +217,11 @@ fn test_remote_copy_directory() {
     let mode2 = std::fs::metadata(&dst_file2).unwrap().permissions().mode() & 0o7777;
     assert_eq!(mode1, 0o644);
     assert_eq!(mode2, 0o755);
+    // verify summary
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 2);
+    assert_eq!(summary.directories_created, 1);
+    assert_eq!(summary.bytes_copied, 40); // "remote dir content 1" (20) + "remote dir content 2" (20)
 }
 
 #[test]
@@ -183,11 +234,15 @@ fn test_remote_copy_symlink_no_dereference() {
     std::os::unix::fs::symlink(&target_file, &symlink_file).unwrap();
     let src_remote = format!("localhost:{}", symlink_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_symlink.to_str().unwrap());
-    run_rcp_and_expect_success(&[&src_remote, &dst_remote]);
+    let output = run_rcp_and_expect_success(&["--summary", &src_remote, &dst_remote]);
     // verify destination is a symlink
     assert!(dst_symlink.is_symlink());
     let link_target = std::fs::read_link(&dst_symlink).unwrap();
     assert_eq!(link_target, target_file);
+    // verify summary
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.symlinks_created, 1);
+    assert_eq!(summary.files_copied, 0);
 }
 
 #[test]
@@ -221,9 +276,15 @@ fn test_remote_copy_with_overwrite() {
     create_test_file(&dst_file, "old content", 0o644);
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
-    run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
+    let output =
+        run_rcp_and_expect_success(&["--overwrite", "--summary", &src_remote, &dst_remote]);
     // verify content was overwritten
     assert_eq!(get_file_content(&dst_file), "new content that is longer");
+    // verify summary
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 1);
+    assert_eq!(summary.rm_summary.files_removed, 0); // file-to-file overwrite is atomic, no removal counted
+    assert_eq!(summary.bytes_copied, 26); // "new content that is longer"
 }
 
 #[test]
@@ -237,9 +298,13 @@ fn test_remote_copy_without_overwrite_fails() {
     create_test_file(&dst_file, "old content", 0o644);
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
-    run_rcp_and_expect_failure(&[&src_remote, &dst_remote]);
+    let output = run_rcp_and_expect_failure(&["--summary", &src_remote, &dst_remote]);
     // verify content was not overwritten
     assert_eq!(get_file_content(&dst_file), "old content");
+    // verify summary shows no files copied (error occurred before copy)
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 0);
+    assert_eq!(summary.bytes_copied, 0);
 }
 
 #[test]
@@ -531,12 +596,19 @@ fn test_remote_overwrite_directory_with_directory() {
     create_test_file(&dst_subdir.join("file4.txt"), "old file4", 0o644); // will remain
     let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
-    run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
+    let output =
+        run_rcp_and_expect_success(&["--overwrite", "--summary", &src_remote, &dst_remote]);
     // verify the directory was updated recursively
     assert_eq!(get_file_content(&dst_subdir.join("file1.txt")), "content1"); // updated
     assert_eq!(get_file_content(&dst_subdir.join("file2.txt")), "content2"); // new
     assert_eq!(get_file_content(&dst_subdir.join("file3.txt")), "content3"); // new
     assert_eq!(get_file_content(&dst_subdir.join("file4.txt")), "old file4"); // unchanged
+                                                                              // verify summary
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 3); // file1, file2, file3
+    assert_eq!(summary.rm_summary.files_removed, 0); // file1.txt overwrite is atomic, not counted as removal
+    assert_eq!(summary.directories_created, 0); // directory already existed
+    assert_eq!(summary.bytes_copied, 24); // "content1" (8) + "content2" (8) + "content3" (8)
 }
 
 #[test]
@@ -551,13 +623,20 @@ fn test_remote_overwrite_file_with_directory() {
     create_test_file(&dst_path, "this is a file", 0o644);
     let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_path.to_str().unwrap());
-    run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
+    let output =
+        run_rcp_and_expect_success(&["--overwrite", "--summary", &src_remote, &dst_remote]);
     // verify the file was replaced with a directory
     assert!(dst_path.is_dir());
     assert_eq!(
         get_file_content(&dst_path.join("nested.txt")),
         "nested content"
     );
+    // verify summary shows file removed and directory + nested file created
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.rm_summary.files_removed, 1); // old "mydir" file was removed
+    assert_eq!(summary.directories_created, 1); // new "mydir" directory created
+    assert_eq!(summary.files_copied, 1); // nested.txt copied
+    assert_eq!(summary.bytes_copied, 14); // "nested content"
 }
 
 #[test]
@@ -572,10 +651,17 @@ fn test_remote_overwrite_directory_with_file() {
     create_test_file(&dst_path.join("nested.txt"), "nested", 0o644);
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_path.to_str().unwrap());
-    run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
+    let output =
+        run_rcp_and_expect_success(&["--overwrite", "--summary", &src_remote, &dst_remote]);
     // verify the directory was replaced with a file
     assert!(dst_path.is_file());
     assert_eq!(get_file_content(&dst_path), "file content");
+    // verify summary shows directory and nested file removed, then file copied
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.rm_summary.files_removed, 1); // nested.txt was removed
+    assert_eq!(summary.rm_summary.directories_removed, 1); // old directory was removed
+    assert_eq!(summary.files_copied, 1); // new file copied
+    assert_eq!(summary.bytes_copied, 12); // "file content"
 }
 
 #[test]
