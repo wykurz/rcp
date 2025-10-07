@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context};
 use structopt::StructOpt;
 use tracing::instrument;
 
-mod path;
+use rcp_tools_rcp::path;
 
 #[derive(StructOpt, Debug, Clone)]
 #[structopt(

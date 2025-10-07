@@ -1,9 +1,13 @@
 [package]
-name = "rlink"
+name = "rcp-tools-rlink"
 version = "0.19.0"
 description = "Tool for hard-linking files inspired by pcp/dsync."
 license = "MIT"
 edition = "2021"
+
+[[bin]]
+name = "rlink"
+path = "src/main.rs"
 
 [dev-dependencies]
 assert_cmd = "2"
