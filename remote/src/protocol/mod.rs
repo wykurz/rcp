@@ -244,6 +244,12 @@ pub struct SourceMasterHello {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum RcpdResult {
-    Success { message: String },
-    Failure { error: String },
+    Success {
+        message: String,
+        summary: common::copy::Summary,
+    },
+    Failure {
+        error: String,
+        summary: common::copy::Summary,
+    },
 }

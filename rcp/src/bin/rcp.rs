@@ -286,24 +286,28 @@ async fn run_rcpd_master(
     tracing::debug!("Received RcpdResult from both source and destination rcpds");
     // check for failures and collect error details
     let mut errors = Vec::new();
-    match source_result {
-        remote::protocol::RcpdResult::Success { message } => {
+    let _source_summary = match source_result {
+        remote::protocol::RcpdResult::Success { message, summary } => {
             tracing::info!("Source rcpd completed successfully: {message}");
+            summary
         }
-        remote::protocol::RcpdResult::Failure { error } => {
+        remote::protocol::RcpdResult::Failure { error, summary } => {
             tracing::error!("Source rcpd failed: {error}");
             errors.push(format!("Source: {error}"));
+            summary
         }
-    }
-    match dest_result {
-        remote::protocol::RcpdResult::Success { message } => {
+    };
+    let dest_summary = match dest_result {
+        remote::protocol::RcpdResult::Success { message, summary } => {
             tracing::info!("Destination rcpd completed successfully: {message}");
+            summary
         }
-        remote::protocol::RcpdResult::Failure { error } => {
+        remote::protocol::RcpdResult::Failure { error, summary } => {
             tracing::error!("Destination rcpd failed: {error}");
             errors.push(format!("Destination: {error}"));
+            summary
         }
-    }
+    };
     // close connections which will cause rcpd processes to exit and tracing tasks to finish
     source_connection.close();
     dest_connection.close();
@@ -329,11 +333,14 @@ async fn run_rcpd_master(
     if !errors.is_empty() {
         let combined_error = errors.join("; ");
         tracing::error!("rcpd operation(s) failed: {combined_error}");
-        return Err(anyhow::anyhow!(
-            "rcpd operation(s) failed: {combined_error}"
-        ));
+        return Err(common::copy::Error::new(
+            anyhow::anyhow!("rcpd operation(s) failed: {combined_error}"),
+            dest_summary,
+        )
+        .into());
     }
-    Ok(common::copy::Summary::default())
+    // return summary from destination (source summary is empty/unused)
+    Ok(dest_summary)
 }
 
 #[instrument]
@@ -415,7 +422,17 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
     };
     tracing::debug!("preserve settings: {:?}", &preserve);
     if let Some((remote_src, remote_dst)) = remote_src_dst {
-        return run_rcpd_master(&args, &preserve, &remote_src, &remote_dst).await;
+        return match run_rcpd_master(&args, &preserve, &remote_src, &remote_dst).await {
+            Ok(summary) => Ok(summary),
+            Err(error) => {
+                if let Some(copy_error) = error.downcast_ref::<common::copy::Error>() {
+                    if args.summary {
+                        return Err(anyhow!("{}\n\n{}", copy_error, &copy_error.summary));
+                    }
+                }
+                Err(error)
+            }
+        };
     }
     // handle multiple sources only when destination ends with '/'
     if src_strings.len() > 1 && !dst_string.ends_with('/') {

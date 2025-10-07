@@ -158,9 +158,12 @@ async fn async_main(
             )
             .await
             {
-                Ok(message) => remote::protocol::RcpdResult::Success { message },
+                Ok((message, summary)) => {
+                    remote::protocol::RcpdResult::Success { message, summary }
+                }
                 Err(error) => remote::protocol::RcpdResult::Failure {
                     error: format!("{error:#}"),
+                    summary: common::copy::Summary::default(),
                 },
             }
         }
@@ -173,9 +176,12 @@ async fn async_main(
             match destination::run_destination(&source_addr, &server_name, &settings, &preserve)
                 .await
             {
-                Ok(message) => remote::protocol::RcpdResult::Success { message },
+                Ok((message, summary)) => {
+                    remote::protocol::RcpdResult::Success { message, summary }
+                }
                 Err(error) => remote::protocol::RcpdResult::Failure {
                     error: format!("{error:#}"),
+                    summary: common::copy::Summary::default(),
                 },
             }
         }
@@ -195,8 +201,11 @@ async fn async_main(
     master_connection.close();
     client.wait_idle().await;
     match rcpd_result {
-        remote::protocol::RcpdResult::Success { message } => Ok(message),
-        remote::protocol::RcpdResult::Failure { error } => {
+        remote::protocol::RcpdResult::Success {
+            message,
+            summary: _,
+        } => Ok(message),
+        remote::protocol::RcpdResult::Failure { error, summary: _ } => {
             tracing::error!("rcpd operation failed: {error}");
             Err(anyhow::anyhow!("rcpd operation failed: {error}"))
         }

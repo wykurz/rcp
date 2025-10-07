@@ -338,7 +338,7 @@ pub async fn run_source(
     dst: &std::path::Path,
     settings: &common::copy::Settings,
     quic_port_ranges: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, common::copy::Summary)> {
     let server_endpoint = remote::get_server_with_port_ranges(quic_port_ranges)?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
     tracing::info!("Source server listening on {}", server_addr);
@@ -364,5 +364,6 @@ pub async fn run_source(
     }
     tracing::info!("Source is done");
     server_endpoint.wait_idle().await;
-    Ok("source OK".to_string())
+    // source doesn't track summary - destination is authoritative
+    Ok(("source OK".to_string(), common::copy::Summary::default()))
 }
