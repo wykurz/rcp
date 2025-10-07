@@ -48,17 +48,32 @@ pub async fn wait_for_rcpd_process(
     process: openssh::Child<std::sync::Arc<openssh::Session>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Waiting on rcpd server on: {:?}", process);
-    let output = process
-        .wait_with_output()
-        .await
-        .context("Failed to wait for rcpd server (source) completion")?;
+    // wait for process to exit with a timeout and capture output
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        process.wait_with_output(),
+    )
+    .await
+    .context("Timeout waiting for rcpd process to exit")?
+    .context("Failed to wait for rcpd process")?;
     if !output.status.success() {
-        return Err(anyhow!(
-            "rcpd command failed on remote host, status code: {:?}\nstdout:\n{:?}\nstderr:\n{:?}",
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!(
+            "rcpd command failed on remote host, status code: {:?}\nstdout:\n{}\nstderr:\n{}",
             output.status.code(),
-            output.stdout,
-            output.stderr,
+            stdout,
+            stderr
+        );
+        return Err(anyhow!(
+            "rcpd command failed on remote host, status code: {:?}",
+            output.status.code(),
         ));
+    }
+    // log stderr even on success if there's any output (might contain warnings)
+    if !output.stderr.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::debug!("rcpd stderr output:\n{}", stderr);
     }
     Ok(())
 }
@@ -86,6 +101,9 @@ pub async fn start_rcpd(
         .arg("--server-name")
         .arg(master_server_name)
         .args(rcpd_args);
+    // capture stdout and stderr so we can read them later
+    cmd.stdout(openssh::Stdio::piped());
+    cmd.stderr(openssh::Stdio::piped());
     tracing::info!("Will run remotely: {cmd:?}");
     cmd.spawn().await.context("Failed to spawn rcpd command")
 }
@@ -168,24 +186,21 @@ pub fn get_client() -> anyhow::Result<quinn::Endpoint> {
 
 #[instrument]
 pub fn get_client_with_port_ranges(port_ranges: Option<&str>) -> anyhow::Result<quinn::Endpoint> {
-    // Create a crypto backend that accepts any server certificate (for development only)
+    // create a crypto backend that accepts any server certificate (for development only)
     let crypto = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyCertificate))
         .with_no_client_auth();
-
-    // Create QUIC client config
+    // create QUIC client config
     let client_config = quinn::ClientConfig::new(std::sync::Arc::new(crypto));
-
     let socket = if let Some(ranges_str) = port_ranges {
         let ranges = port_ranges::PortRanges::parse(ranges_str)?;
         ranges.bind_udp_socket(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))?
     } else {
-        // Default behavior: bind to any available port
+        // default behavior: bind to any available port
         std::net::UdpSocket::bind("0.0.0.0:0")?
     };
-
-    // Create and configure endpoint
+    // create and configure endpoint
     let mut endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         None, // No server config for client
@@ -194,6 +209,5 @@ pub fn get_client_with_port_ranges(port_ranges: Option<&str>) -> anyhow::Result<
     )
     .context("Failed to create QUIC endpoint")?;
     endpoint.set_default_client_config(client_config);
-
     Ok(endpoint)
 }
