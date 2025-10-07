@@ -700,3 +700,18 @@ fn test_remote_overwrite_symlink_with_directory() {
     assert!(!dst_path.is_symlink());
     assert_eq!(get_file_content(&dst_path.join("file.txt")), "content");
 }
+
+#[test]
+fn test_remote_copy_nonexistent_source() {
+    let (src_dir, dst_dir) = setup_test_env();
+    let nonexistent_src = src_dir.path().join("does_not_exist.txt");
+    let dst_file = dst_dir.path().join("destination.txt");
+    let src_remote = format!("localhost:{}", nonexistent_src.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    let output = run_rcp_and_expect_failure(&[&src_remote, &dst_remote]);
+    // verify error message mentions the source file
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
+    assert!(combined.contains("does_not_exist") && combined.contains("No such file"));
+}
