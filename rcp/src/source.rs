@@ -319,7 +319,13 @@ async fn handle_connection(
         connection.clone(),
         src.to_path_buf(),
     ));
-    send_fs_objects(settings, src, dst, control_send_stream, connection).await?;
+    let send_result =
+        send_fs_objects(settings, src, dst, control_send_stream, connection.clone()).await;
+    // if sending failed, close connection to unblock destination immediately
+    if send_result.is_err() {
+        connection.close();
+    }
+    send_result?;
     dispatch_task.await??;
     tracing::info!("Data sent successfully");
     Ok(())
