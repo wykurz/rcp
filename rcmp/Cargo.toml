@@ -1,9 +1,13 @@
 [package]
-name = "rcmp"
+name = "rcp-tools-rcmp"
 version = "0.19.0"
 description = "Tool for comparing large filesets."
 license = "MIT"
 edition = "2021"
+
+[[bin]]
+name = "rcmp"
+path = "src/main.rs"
 
 [dev-dependencies]
 assert_cmd = "2"

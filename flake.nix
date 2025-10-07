@@ -33,26 +33,25 @@
           pkg-config
         ];
 
-        # Common package builder for all RCP tools
-        mkRcpPackage = name: pkgs.rustPlatform.buildRustPackage {
-          pname = name;
-          version = "0.1.0";
+        # Package builder for RCP tools with custom binary names
+        mkRcpPackage = { packageName, binaryName, description }: pkgs.rustPlatform.buildRustPackage {
+          pname = binaryName;
+          version = "0.19.0";
           src = ./.;
-          
+
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
 
           inherit buildInputs nativeBuildInputs;
 
-          # Build only the specific binary
-          buildAndTestSubdir = name;
-          cargoBuildFlags = [ "-p" name ];
-          cargoTestFlags = [ "-p" name ];
+          # Build only the specific package
+          cargoBuildFlags = [ "-p" packageName ];
+          cargoTestFlags = [ "-p" packageName ];
 
           meta = with pkgs.lib; {
-            description = "Fast file operations tool";
-            homepage = "https://github.com/mateusz/rcp";
+            description = description;
+            homepage = "https://github.com/wykurz/rcp";
             license = licenses.mit;
             maintainers = [ ];
           };
@@ -62,21 +61,40 @@
       {
         packages = {
           default = self.packages.${system}.rcp;
-          
+
           # Individual packages for each tool
-          rcp = mkRcpPackage "rcp";
-          rrm = mkRcpPackage "rrm";
-          rlink = mkRcpPackage "rlink";
-          rcmp = mkRcpPackage "rcmp";
-          rcpd = mkRcpPackage "rcpd";
-          filegen = mkRcpPackage "filegen";
-          
+          rcp = mkRcpPackage {
+            packageName = "rcp-tools-rcp";
+            binaryName = "rcp";
+            description = "Fast file copy tool with remote support";
+          };
+          rrm = mkRcpPackage {
+            packageName = "rcp-tools-rrm";
+            binaryName = "rrm";
+            description = "Fast file removal tool";
+          };
+          rlink = mkRcpPackage {
+            packageName = "rcp-tools-rlink";
+            binaryName = "rlink";
+            description = "Fast hard-linking tool";
+          };
+          rcmp = mkRcpPackage {
+            packageName = "rcp-tools-rcmp";
+            binaryName = "rcmp";
+            description = "Fast file comparison tool";
+          };
+          filegen = mkRcpPackage {
+            packageName = "rcp-tools-filegen";
+            binaryName = "filegen";
+            description = "File generation tool for testing";
+          };
+
           # All tools in one package
           rcp-all = pkgs.rustPlatform.buildRustPackage {
             pname = "rcp-all";
-            version = "0.1.0";
+            version = "0.19.0";
             src = ./.;
-            
+
             cargoLock = {
               lockFile = ./Cargo.lock;
             };
@@ -85,7 +103,7 @@
 
             meta = with pkgs.lib; {
               description = "Fast file operations tools suite";
-              homepage = "https://github.com/mateusz/rcp";
+              homepage = "https://github.com/wykurz/rcp";
               license = licenses.mit;
               maintainers = [ ];
             };
@@ -128,7 +146,8 @@
             echo "  cargo fmt            - Format code"
             echo "  cargo clippy         - Lint code"
             echo ""
-            echo "Individual tools: rcp, rrm, rlink, rcmp, rcpd, filegen"
+            echo "Individual tools: rcp, rrm, rlink, rcmp, filegen"
+            echo "Note: rcpd is included with rcp (rcp-tools-rcp package)"
           '';
         };
       });

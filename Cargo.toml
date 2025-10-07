@@ -6,7 +6,6 @@ members = [
   "filegen",
   "rcmp",
   "rcp",
-  "rcpd",
   "remote",
   "rlink",
   "rrm",

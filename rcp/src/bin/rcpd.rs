@@ -2,9 +2,7 @@ use anyhow::Context;
 use structopt::StructOpt;
 use tracing::instrument;
 
-mod destination;
-mod directory_tracker;
-mod source;
+use rcp_tools_rcp::{destination, source};
 
 #[derive(structopt::StructOpt, std::fmt::Debug, std::clone::Clone)]
 #[structopt(

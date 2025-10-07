@@ -1,7 +1,7 @@
 use anyhow::Context;
 use tracing::instrument;
 
-use crate::directory_tracker;
+use super::directory_tracker;
 
 fn progress() -> &'static common::progress::Progress {
     common::get_progress()

@@ -1,9 +1,13 @@
 [package]
-name = "rrm"
+name = "rcp-tools-rrm"
 version = "0.19.0"
 description = "Tool for removing files similar to rm but MUCH faster."
 license = "MIT"
 edition = "2021"
+
+[[bin]]
+name = "rrm"
+path = "src/main.rs"
 
 [dev-dependencies]
 assert_cmd = "2"
