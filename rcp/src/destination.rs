@@ -147,25 +147,41 @@ async fn process_incoming_file_streams(
     directory_tracker: directory_tracker::SharedDirectoryTracker,
 ) -> anyhow::Result<()> {
     let mut join_set = tokio::task::JoinSet::new();
-    while let Ok(file_recv_stream) = connection.accept_uni().await {
-        tracing::info!("Received new unidirectional stream for file");
-        let open_file_guard = throttle::open_file_permit().await;
-        throttle::get_ops_token().await;
-        let tracker = directory_tracker.clone();
-        join_set.spawn(handle_file_stream(
-            open_file_guard,
-            settings,
-            preserve,
-            control_send_stream.clone(),
-            file_recv_stream,
-            tracker.clone(),
-        ));
-        // opportunistically cleanup finished tasks
-        while let Some(result) = join_set.try_join_next() {
-            result??;
+    loop {
+        tokio::select! {
+            // check if any spawned task completed (potentially with error)
+            Some(result) = join_set.join_next() => {
+                tracing::debug!("File handling task completed");
+                result??; // propagate error immediately
+            }
+            // accept new file streams
+            stream_result = connection.accept_uni() => {
+                match stream_result {
+                    Ok(file_recv_stream) => {
+                        tracing::info!("Received new unidirectional stream for file");
+                        let open_file_guard = throttle::open_file_permit().await;
+                        throttle::get_ops_token().await;
+                        let tracker = directory_tracker.clone();
+                        join_set.spawn(handle_file_stream(
+                            open_file_guard,
+                            settings,
+                            preserve,
+                            control_send_stream.clone(),
+                            file_recv_stream,
+                            tracker.clone(),
+                        ));
+                    }
+                    Err(e) => {
+                        // connection closed, wait for remaining tasks to complete
+                        tracing::debug!("Connection closed: {e}");
+                        break;
+                    }
+                }
+            }
         }
     }
-    // handle completion of existing file streams
+    tracing::debug!("Waiting for remaining file handling tasks to complete");
+    // handle completion of remaining file streams
     while let Some(result) = join_set.join_next().await {
         result??;
     }
@@ -390,25 +406,40 @@ pub async fn run_destination(
     let (control_send_stream, control_recv_stream) = connection.accept_bi().await?;
     tracing::info!("Received directory creation streams");
     let directory_tracker = directory_tracker::make_shared(control_send_stream.clone());
-    let file_handler_task = tokio::spawn(process_incoming_file_streams(
+    let file_handler_future = process_incoming_file_streams(
         *settings,
         *preserve,
         control_send_stream.clone(),
         connection.clone(),
         directory_tracker.clone(),
-    ));
-    create_directory_structure(
+    );
+    let directory_future = create_directory_structure(
         settings,
         preserve,
         control_send_stream,
         control_recv_stream,
         directory_tracker,
-    )
-    .await
-    .context("Failed to create directory structure")?;
-    file_handler_task
-        .await
-        .context("Failed to process incoming file streams")??;
+    );
+    tokio::pin!(file_handler_future);
+    tokio::pin!(directory_future);
+    // race both futures - if either completes first, handle it and then wait for the other
+    // if either fails, close connection to unblock the other
+    tokio::select! {
+        file_result = &mut file_handler_future => {
+            if file_result.is_err() {
+                connection.close();
+            }
+            file_result.context("Failed to process incoming file streams")?;
+            directory_future.await.context("Failed to create directory structure")?;
+        }
+        dir_result = &mut directory_future => {
+            if dir_result.is_err() {
+                connection.close();
+            }
+            dir_result.context("Failed to create directory structure")?;
+            file_handler_future.await.context("Failed to process incoming file streams")?;
+        }
+    }
     tracing::info!("Destination is done");
     connection.close();
     client.wait_idle().await;
