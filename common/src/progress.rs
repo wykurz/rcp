@@ -496,19 +496,23 @@ mod tests {
         let mut printer = RcpdProgressPrinter::new();
 
         // Create test progress data
-        let mut source_progress = SerializableProgress::default();
-        source_progress.ops_started = 100;
-        source_progress.ops_finished = 80;
-        source_progress.bytes_copied = 1024;
-        source_progress.files_copied = 5;
+        let source_progress = SerializableProgress {
+            ops_started: 100,
+            ops_finished: 80,
+            bytes_copied: 1024,
+            files_copied: 5,
+            ..Default::default()
+        };
 
-        let mut dest_progress = SerializableProgress::default();
-        dest_progress.ops_started = 80;
-        dest_progress.ops_finished = 70;
-        dest_progress.bytes_copied = 1024;
-        dest_progress.files_copied = 5;
-        dest_progress.symlinks_created = 2;
-        dest_progress.directories_created = 1;
+        let dest_progress = SerializableProgress {
+            ops_started: 80,
+            ops_finished: 70,
+            bytes_copied: 1024,
+            files_copied: 5,
+            symlinks_created: 2,
+            directories_created: 1,
+            ..Default::default()
+        };
 
         // Test that print returns a formatted string
         let output = printer.print(&source_progress, &dest_progress)?;

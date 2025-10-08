@@ -795,7 +795,7 @@ fn test_remote_copy_nonexistent_source() {
     // verify error message mentions the source file
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}{}", stdout, stderr);
+    let combined = format!("{stdout}{stderr}");
     assert!(combined.contains("does_not_exist") && combined.contains("No such file"));
 }
 
@@ -812,7 +812,7 @@ fn test_remote_copy_destination_parent_missing() {
     // verify error message mentions the missing directory
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}{}", stdout, stderr);
+    let combined = format!("{stdout}{stderr}");
     assert!(combined.contains("No such file") || combined.contains("nonexistent_dir"));
 }
 

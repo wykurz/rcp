@@ -134,6 +134,11 @@ struct Args {
     /// If not specified, uses dynamic port allocation (default behavior)
     #[structopt(long)]
     quic_port_ranges: Option<String>,
+
+    /// Timeout for remote copy connections in seconds (default: 5)
+    /// This applies to: rcpd connecting to master, destination connecting to source
+    #[structopt(long, default_value = "5")]
+    remote_copy_conn_timeout_sec: u64,
 }
 
 #[instrument]
@@ -166,6 +171,7 @@ async fn run_rcpd_master(
         quic_port_ranges: args.quic_port_ranges.clone(),
         progress: args.progress,
         progress_delay: args.progress_delay.clone(),
+        remote_copy_conn_timeout_sec: args.remote_copy_conn_timeout_sec,
     };
     for session in [src.session(), dst.session()] {
         let rcpd = remote::start_rcpd(&rcpd_config, session, &server_addr, &server_name).await?;
@@ -174,11 +180,20 @@ async fn run_rcpd_master(
     tracing::info!("Waiting for connections from rcpd processes...");
     // accept connection from source
     tracing::info!("Waiting for connection from source rcpd...");
+    let rcpd_connect_timeout = std::time::Duration::from_secs(args.remote_copy_conn_timeout_sec);
     let source_connection = {
-        let source_connecting = match server_endpoint.accept().await {
-            Some(conn) => conn,
-            None => return Err(anyhow!("Server endpoint closed before source connected")),
-        };
+        let source_connecting =
+            match tokio::time::timeout(rcpd_connect_timeout, server_endpoint.accept()).await {
+                Ok(Some(conn)) => conn,
+                Ok(None) => return Err(anyhow!("Server endpoint closed before source connected")),
+                Err(_) => {
+                    return Err(anyhow!(
+                        "Timed out waiting for source rcpd to connect after {:?}. \
+                    Check if source host is reachable and rcpd can be executed.",
+                        rcpd_connect_timeout
+                    ))
+                }
+            };
         tracing::info!("Source rcpd connected");
         remote::streams::Connection::new(source_connecting.await?)
     };
@@ -225,14 +240,22 @@ async fn run_rcpd_master(
     // accept connection from destination
     tracing::info!("Waiting for connection from destination rcpd...");
     let dest_connection = {
-        let dest_connecting = match server_endpoint.accept().await {
-            Some(conn) => conn,
-            None => {
-                return Err(anyhow!(
-                    "Server endpoint closed before destination connected"
-                ))
-            }
-        };
+        let dest_connecting =
+            match tokio::time::timeout(rcpd_connect_timeout, server_endpoint.accept()).await {
+                Ok(Some(conn)) => conn,
+                Ok(None) => {
+                    return Err(anyhow!(
+                        "Server endpoint closed before destination connected"
+                    ))
+                }
+                Err(_) => {
+                    return Err(anyhow!(
+                        "Timed out waiting for destination rcpd to connect after {:?}. \
+                    Check if destination host is reachable and rcpd can be executed.",
+                        rcpd_connect_timeout
+                    ))
+                }
+            };
         tracing::info!("Destination rcpd connected");
         remote::streams::Connection::new(dest_connecting.await?)
     };

@@ -338,6 +338,7 @@ pub async fn run_source(
     dst: &std::path::Path,
     settings: &common::copy::Settings,
     quic_port_ranges: Option<&str>,
+    conn_timeout_sec: u64,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
     let server_endpoint = remote::get_server_with_port_ranges(quic_port_ranges)?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
@@ -353,14 +354,30 @@ pub async fn run_source(
         .send_control_message(&master_hello)
         .await?;
     tracing::info!("Waiting for connection from destination");
-    if let Some(conn) = server_endpoint.accept().await {
-        tracing::info!("New destination connection incoming");
-        handle_connection(conn, settings, src, dst).await?;
-    } else {
-        tracing::error!("Timed out waiting for destination to connect");
-        return Err(anyhow::anyhow!(
-            "Timed out waiting for destination to connect"
-        ));
+    // wait for destination to connect with a timeout
+    // destination should connect within a reasonable time after receiving the source address
+    let accept_timeout = std::time::Duration::from_secs(conn_timeout_sec);
+    match tokio::time::timeout(accept_timeout, server_endpoint.accept()).await {
+        Ok(Some(conn)) => {
+            tracing::info!("New destination connection incoming");
+            handle_connection(conn, settings, src, dst).await?;
+        }
+        Ok(None) => {
+            tracing::error!("Server endpoint closed unexpectedly");
+            return Err(anyhow::anyhow!("Server endpoint closed unexpectedly"));
+        }
+        Err(_) => {
+            tracing::error!(
+                "Timed out waiting for destination to connect after {:?}. \
+                This usually means the destination cannot reach the source. \
+                Check network connectivity and firewall rules.",
+                accept_timeout
+            );
+            return Err(anyhow::anyhow!(
+                "Timed out waiting for destination to connect after {:?}",
+                accept_timeout
+            ));
+        }
     }
     tracing::info!("Source is done");
     server_endpoint.wait_idle().await;

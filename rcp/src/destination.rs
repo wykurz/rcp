@@ -397,9 +397,20 @@ pub async fn run_destination(
     src_server_name: &str,
     settings: &common::copy::Settings,
     preserve: &common::preserve::Settings,
+    _conn_timeout_sec: u64,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
     let client = remote::get_client()?;
-    let connection = client.connect(*src_endpoint, src_server_name)?.await?;
+    tracing::info!("Connecting to source at {}", src_endpoint);
+    let connection = client
+        .connect(*src_endpoint, src_server_name)?
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to connect to source at {src_endpoint}. \
+                This usually means the source is unreachable from the destination. \
+                Check network connectivity and firewall rules."
+            )
+        })?;
     tracing::info!("Connected to Source");
     let connection = remote::streams::Connection::new(connection);
     // Always accept the directory streams first (even for single files)

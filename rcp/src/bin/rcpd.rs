@@ -102,6 +102,11 @@ struct Args {
     /// If not specified, uses dynamic port allocation (default behavior)
     #[structopt(long)]
     quic_port_ranges: Option<String>,
+
+    /// Timeout for remote copy connections in seconds (default: 5)
+    /// This applies to: rcpd connecting to master, destination connecting to source
+    #[structopt(long, default_value = "5")]
+    remote_copy_conn_timeout_sec: u64,
 }
 
 #[instrument]
@@ -116,7 +121,17 @@ async fn async_main(
     );
     let client = remote::get_client_with_port_ranges(args.quic_port_ranges.as_deref())?;
     let master_connection = {
-        let master_connection = client.connect(args.master_addr, &args.server_name)?.await?;
+        let master_connection = client
+            .connect(args.master_addr, &args.server_name)?
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to connect to master at {}. \
+                    This usually means the master is unreachable from this host. \
+                    Check network connectivity and firewall rules.",
+                    args.master_addr
+                )
+            })?;
         remote::streams::Connection::new(master_connection)
     };
     tracing::info!("Connected to master");
@@ -155,6 +170,7 @@ async fn async_main(
                 &dst,
                 &settings,
                 args.quic_port_ranges.as_deref(),
+                args.remote_copy_conn_timeout_sec,
             )
             .await
             {
@@ -173,8 +189,14 @@ async fn async_main(
             preserve,
         } => {
             tracing::info!("Starting destination");
-            match destination::run_destination(&source_addr, &server_name, &settings, &preserve)
-                .await
+            match destination::run_destination(
+                &source_addr,
+                &server_name,
+                &settings,
+                &preserve,
+                args.remote_copy_conn_timeout_sec,
+            )
+            .await
             {
                 Ok((message, summary)) => {
                     remote::protocol::RcpdResult::Success { message, summary }
