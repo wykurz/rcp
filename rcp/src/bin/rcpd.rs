@@ -103,9 +103,9 @@ struct Args {
     #[structopt(long)]
     quic_port_ranges: Option<String>,
 
-    /// Timeout for remote copy connections in seconds (default: 5)
+    /// Timeout for remote copy connections in seconds (default: 15)
     /// This applies to: rcpd connecting to master, destination connecting to source
-    #[structopt(long, default_value = "5")]
+    #[structopt(long, default_value = "15")]
     remote_copy_conn_timeout_sec: u64,
 }
 
