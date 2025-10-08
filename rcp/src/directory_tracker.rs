@@ -19,7 +19,20 @@ impl DirectoryTracker {
         src: &std::path::Path,
         dst: &std::path::Path,
         num_entries: usize,
+        failed: bool,
     ) -> anyhow::Result<()> {
+        if failed {
+            // mark directory as failed, don't send DirectoryCreated message
+            let failure = remote::protocol::SrcDst {
+                src: src.to_path_buf(),
+                dst: dst.to_path_buf(),
+            };
+            let message = remote::protocol::DestinationMessage::DirectoryFailed(failure);
+            let mut stream = self.control_send_stream.lock().await;
+            stream.send_control_message(&message).await?;
+            tracing::info!("Sent directory failure notification: {src:?} -> {dst:?}");
+            return Ok(());
+        }
         if num_entries > 0 {
             self.remaining_dir_entries
                 .insert(dst.to_path_buf(), num_entries);
