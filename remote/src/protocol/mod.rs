@@ -176,6 +176,7 @@ pub struct RcpdConfig {
     pub quic_port_ranges: Option<String>,
     pub progress: bool,
     pub progress_delay: Option<String>,
+    pub remote_copy_conn_timeout_sec: u64,
 }
 
 impl RcpdConfig {
@@ -216,6 +217,10 @@ impl RcpdConfig {
         if let Some(ref delay) = self.progress_delay {
             args.push(format!("--progress-delay={delay}"));
         }
+        args.push(format!(
+            "--remote-copy-conn-timeout-sec={}",
+            self.remote_copy_conn_timeout_sec
+        ));
         args
     }
 }
