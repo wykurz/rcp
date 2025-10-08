@@ -55,12 +55,12 @@ Master (rcp)
 
 **Handling**:
 - SSH command execution fails
-- Master waits for rcpd to connect (timeout: configurable, default 5s)
+- Master waits for rcpd to connect (timeout: configurable, default 15s)
 - Master returns timeout error
 
 **Error Message**:
 ```
-Timed out waiting for source/destination rcpd to connect after 5s.
+Timed out waiting for source/destination rcpd to connect after 15s.
 Check if source/destination host is reachable and rcpd can be executed.
 ```
 
@@ -71,7 +71,7 @@ Check if source/destination host is reachable and rcpd can be executed.
 **Handling**:
 - rcpd connection attempt times out (QUIC default timeout)
 - rcpd exits with error
-- Master waits for connection (timeout: configurable, default 5s)
+- Master waits for connection (timeout: configurable, default 15s)
 - Master returns timeout error
 
 **Error Message** (in rcpd logs):
@@ -83,7 +83,7 @@ Check network connectivity and firewall rules.
 
 **Error Message** (in Master):
 ```
-Timed out waiting for source/destination rcpd to connect after 5s.
+Timed out waiting for source/destination rcpd to connect after 15s.
 Check if source/destination host is reachable and rcpd can be executed.
 ```
 
@@ -92,13 +92,13 @@ Check if source/destination host is reachable and rcpd can be executed.
 **Scenario**: Destination rcpd cannot reach Source rcpd's QUIC server (firewall, routing issue)
 
 **Handling**:
-- Source waits for Destination connection (timeout: configurable, default 5s)
+- Source waits for Destination connection (timeout: configurable, default 15s)
 - Destination connection attempt times out (QUIC default timeout)
 - Both return errors
 
 **Error Message** (in Source):
 ```
-Timed out waiting for destination to connect after 5s.
+Timed out waiting for destination to connect after 15s.
 This usually means the destination cannot reach the source.
 Check network connectivity and firewall rules.
 ```
@@ -114,13 +114,13 @@ Check network connectivity and firewall rules.
 
 - **SSH connection**: ~30s (openssh default, configurable via SSH config)
 - **QUIC connection attempt**: ~10s (quinn library default)
-- **Waiting for rcpd to connect to Master**: 5s (default, configurable via `--remote-copy-conn-timeout-sec`)
-- **Waiting for Destination to connect to Source**: 5s (default, configurable via `--remote-copy-conn-timeout-sec`)
+- **Waiting for rcpd to connect to Master**: 15s (default, configurable via `--remote-copy-conn-timeout-sec`)
+- **Waiting for Destination to connect to Source**: 15s (default, configurable via `--remote-copy-conn-timeout-sec`)
 
 The `--remote-copy-conn-timeout-sec` argument can be used with both `rcp` and `rcpd` to customize the timeout for remote copy connections. For example:
 
 ```bash
-rcp --remote-copy-conn-timeout-sec 10 source:/path dest:/path
+rcp --remote-copy-conn-timeout-sec 20 source:/path dest:/path
 ```
 
 ## Testing Strategy
@@ -137,7 +137,7 @@ For realistic connectivity testing, use actual remote hosts with various network
    # Run rcp with port ranges
    rcp --quic-port-ranges 10000-30000 source:/path dest:/path
 
-   # Expected: Timeout after 5s with clear error message
+   # Expected: Timeout after 15s with clear error message
    ```
 
 2. **Test rcpd cannot connect to master**:
@@ -148,7 +148,7 @@ For realistic connectivity testing, use actual remote hosts with various network
    # Run rcp
    rcp source:/path dest:/path
 
-   # Expected: Timeout after 5s
+   # Expected: Timeout after 15s
    ```
 
 3. **Test SSH failure**:

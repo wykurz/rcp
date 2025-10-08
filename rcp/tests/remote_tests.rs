@@ -36,8 +36,9 @@ fn interpret_exit_code(code: i32) -> String {
 fn run_rcp_with_args(args: &[&str]) -> std::process::Output {
     let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
     let mut cmd = std::process::Command::new("timeout");
-    // 10 second timeout - SSH connection setup can take 3-4s per connection
-    cmd.args(["10", rcp_path.to_str().unwrap()]);
+    // 20 second timeout - SSH connection setup can take 3-4s per connection
+    // and we need to allow for 2 SSH connections + 10s internal timeout
+    cmd.args(["20", rcp_path.to_str().unwrap()]);
     cmd.arg("-vv"); // Always use maximum verbosity
     cmd.args(args);
     cmd.output().expect("Failed to execute rcp command")
