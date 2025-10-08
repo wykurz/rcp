@@ -154,7 +154,8 @@ pub struct SrcDst {
 pub enum DestinationMessage {
     DirectoryCreated(SrcDst),
     DirectoryComplete(SrcDst),
-    DestinationDone, // must be the last message sent by the destination
+    DirectoryFailed(SrcDst), // directory creation failed, source should skip its contents
+    DestinationDone,         // must be the last message sent by the destination
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
