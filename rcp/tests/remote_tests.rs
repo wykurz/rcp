@@ -91,44 +91,33 @@ fn run_rcp_and_expect_failure(args: &[&str]) -> std::process::Output {
     output
 }
 
+macro_rules! parse_field {
+    ($line:expr, $prefix:expr, $target:expr, $found_any:expr) => {
+        if let Some(value) = $line.strip_prefix($prefix) {
+            $target = value.parse().ok()?;
+            $found_any = true;
+            continue;
+        }
+    };
+}
+
+#[rustfmt::skip]
 fn parse_summary_from_output(output: &std::process::Output) -> Option<common::copy::Summary> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut summary = common::copy::Summary::default();
     let mut found_any = false;
     for line in stdout.lines() {
-        if let Some(value) = line.strip_prefix("bytes copied: ") {
-            if let Some(num_str) = value.split_whitespace().next() {
-                summary.bytes_copied = num_str.parse().ok()?;
-                found_any = true;
-            }
-        } else if let Some(value) = line.strip_prefix("files copied: ") {
-            summary.files_copied = value.parse().ok()?;
-            found_any = true;
-        } else if let Some(value) = line.strip_prefix("symlinks created: ") {
-            summary.symlinks_created = value.parse().ok()?;
-            found_any = true;
-        } else if let Some(value) = line.strip_prefix("directories created: ") {
-            summary.directories_created = value.parse().ok()?;
-            found_any = true;
-        } else if let Some(value) = line.strip_prefix("files unchanged: ") {
-            summary.files_unchanged = value.parse().ok()?;
-            found_any = true;
-        } else if let Some(value) = line.strip_prefix("symlinks unchanged: ") {
-            summary.symlinks_unchanged = value.parse().ok()?;
-            found_any = true;
-        } else if let Some(value) = line.strip_prefix("directories unchanged: ") {
-            summary.directories_unchanged = value.parse().ok()?;
-            found_any = true;
-        } else if let Some(value) = line.strip_prefix("files removed: ") {
-            summary.rm_summary.files_removed = value.parse().ok()?;
-            found_any = true;
-        } else if let Some(value) = line.strip_prefix("symlinks removed: ") {
-            summary.rm_summary.symlinks_removed = value.parse().ok()?;
-            found_any = true;
-        } else if let Some(value) = line.strip_prefix("directories removed: ") {
-            summary.rm_summary.directories_removed = value.parse().ok()?;
-            found_any = true;
-        }
+        parse_field!(line, "bytes copied: ", summary.bytes_copied, found_any);
+        parse_field!(line, "files copied: ", summary.files_copied, found_any);
+        parse_field!(line, "symlinks created: ", summary.symlinks_created, found_any);
+        parse_field!(line, "directories created: ", summary.directories_created, found_any);
+        parse_field!(line, "files unchanged: ", summary.files_unchanged, found_any);
+        parse_field!(line, "symlinks unchanged: ", summary.symlinks_unchanged, found_any);
+        parse_field!(line, "directories unchanged: ", summary.directories_unchanged, found_any);
+        parse_field!(line, "files removed: ", summary.rm_summary.files_removed, found_any);
+        parse_field!(line, "symlinks removed: ", summary.rm_summary.symlinks_removed, found_any);
+        parse_field!(line, "directories removed: ", summary.rm_summary.directories_removed, found_any);
+        // If no prefix matched, do nothing.
     }
     if found_any {
         Some(summary)
