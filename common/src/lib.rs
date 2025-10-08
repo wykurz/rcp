@@ -196,6 +196,7 @@ fn remote_master_updates<F>(
             break;
         }
     }
+    PBAR.finish_and_clear();
 }
 
 impl ProgressTracker {

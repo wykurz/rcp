@@ -107,7 +107,15 @@ fn parse_summary_from_output(output: &std::process::Output) -> Option<common::co
     let mut summary = common::copy::Summary::default();
     let mut found_any = false;
     for line in stdout.lines() {
-        parse_field!(line, "bytes copied: ", summary.bytes_copied, found_any);
+        // special handling for bytes_copied which has a unit suffix (e.g., "40 B")
+        if let Some(value_str) = line.strip_prefix("bytes copied: ") {
+            // strip unit suffix by taking only the numeric part
+            if let Some(num_str) = value_str.split_whitespace().next() {
+                summary.bytes_copied = num_str.parse().ok()?;
+                found_any = true;
+                continue;
+            }
+        }
         parse_field!(line, "files copied: ", summary.files_copied, found_any);
         parse_field!(line, "symlinks created: ", summary.symlinks_created, found_any);
         parse_field!(line, "directories created: ", summary.directories_created, found_any);
