@@ -123,53 +123,6 @@ The `--remote-copy-conn-timeout-sec` argument can be used with both `rcp` and `r
 rcp --remote-copy-conn-timeout-sec 20 source:/path dest:/path
 ```
 
-## Testing Strategy
-
-### Manual Testing
-
-For realistic connectivity testing, use actual remote hosts with various network configurations:
-
-1. **Test source unreachable from destination**:
-   ```bash
-   # On source: Block incoming connections
-   sudo iptables -A INPUT -p udp --dport 10000:30000 -j DROP
-
-   # Run rcp with port ranges
-   rcp --quic-port-ranges 10000-30000 source:/path dest:/path
-
-   # Expected: Timeout after 15s with clear error message
-   ```
-
-2. **Test rcpd cannot connect to master**:
-   ```bash
-   # On master: Block incoming connections from specific host
-   sudo iptables -A INPUT -s <rcpd-host-ip> -p udp -j DROP
-
-   # Run rcp
-   rcp source:/path dest:/path
-
-   # Expected: Timeout after 15s
-   ```
-
-3. **Test SSH failure**:
-   ```bash
-   # Use invalid hostname
-   rcp nonexistent-host:/path dest:/path
-
-   # Expected: Immediate SSH error
-   ```
-
-### Automated Testing
-
-Automated testing of network failures requires either:
-
-1. **Mocking**: Mock the QUIC/SSH layers (doesn't test real networking)
-2. **Network namespaces**: Use Linux network namespaces + iptables (Linux-only, requires root)
-3. **Containers**: Use Docker with controlled networking (requires Docker)
-4. **Chaos engineering tools**: Use tools like toxiproxy (complex setup)
-
-Currently, automated network failure testing is not implemented but can be added using one of the above approaches.
-
 ## Troubleshooting
 
 ### Connection Times Out
@@ -179,18 +132,3 @@ Currently, automated network failure testing is not implemented but can be added
 3. **Check rcpd binary**: Ensure rcpd exists and is executable on remote hosts
 4. **Check NAT**: If hosts are behind NAT, ensure proper port forwarding
 5. **Use verbose logging**: Run with `-vv` to see detailed connection attempts
-
-### Connection Hangs
-
-If connection appears to hang (no timeout):
-1. Check if using old version of rcp without timeouts
-2. Check if QUIC library is waiting on something (shouldn't happen with current timeouts)
-3. Check system resources (open file descriptors, memory)
-
-## Future Improvements
-
-1. **Configurable timeouts**: Allow users to configure timeout values
-2. **Retry logic**: Automatically retry failed connections
-3. **Better diagnostics**: Test connectivity before starting transfer
-4. **Alternative connection methods**: Support direct connections when source-destination connectivity exists
-5. **Connection health checks**: Periodically verify connections are alive during long transfers
