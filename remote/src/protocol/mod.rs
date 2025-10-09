@@ -180,6 +180,9 @@ pub struct RcpdConfig {
     pub progress: bool,
     pub progress_delay: Option<String>,
     pub remote_copy_conn_timeout_sec: u64,
+    /// SHA-256 fingerprint of the Master's TLS certificate (32 bytes)
+    /// Used for certificate pinning when rcpd connects to Master
+    pub master_cert_fingerprint: Vec<u8>,
 }
 
 impl RcpdConfig {
@@ -223,6 +226,11 @@ impl RcpdConfig {
         args.push(format!(
             "--remote-copy-conn-timeout-sec={}",
             self.remote_copy_conn_timeout_sec
+        ));
+        // pass master cert fingerprint as hex-encoded string
+        args.push(format!(
+            "--master-cert-fingerprint={}",
+            hex::encode(&self.master_cert_fingerprint)
         ));
         args
     }

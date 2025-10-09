@@ -150,7 +150,7 @@ async fn run_rcpd_master(
 ) -> anyhow::Result<common::copy::Summary> {
     tracing::debug!("running rcpd src/dst");
     // open a port and wait from server & client hello, respond to client with server port
-    let (server_endpoint, _master_cert_fingerprint) =
+    let (server_endpoint, master_cert_fingerprint) =
         remote::get_server_with_port_ranges(args.quic_port_ranges.as_deref())?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
     let server_name = remote::get_random_server_name();
@@ -173,6 +173,7 @@ async fn run_rcpd_master(
         progress: args.progress,
         progress_delay: args.progress_delay.clone(),
         remote_copy_conn_timeout_sec: args.remote_copy_conn_timeout_sec,
+        master_cert_fingerprint,
     };
     for session in [src.session(), dst.session()] {
         let rcpd = remote::start_rcpd(&rcpd_config, session, &server_addr, &server_name).await?;

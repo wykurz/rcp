@@ -83,14 +83,124 @@
 //! - Aggregate progress information across multiple remote operations
 //! - Display unified progress for distributed operations
 //!
-//! # Security Considerations
+//! # Security Model
 //!
-//! - **SSH Authentication**: Uses SSH for initial authentication and authorization
-//! - **Self-Signed Certificates**: QUIC connections use self-signed certificates (trusted implicitly)
-//! - **No Certificate Validation**: Accepts any server certificate (development mode)
+//! The remote copy system implements a defense-in-depth security model using SSH for authentication
+//! and certificate pinning for QUIC connection integrity. This provides protection against
+//! man-in-the-middle (MITM) attacks while maintaining ease of deployment.
 //!
-//! ⚠️ **Note**: The current implementation prioritizes ease of deployment over strict security.
-//! For production use in untrusted networks, consider enhancing certificate validation.
+//! ## Authentication & Authorization
+//!
+//! **SSH is the security perimeter**: All remote operations begin with SSH authentication.
+//! - Initial access control is handled entirely by SSH
+//! - Users must be authenticated and authorized via SSH before any QUIC connections are established
+//! - SSH configuration (keys, permissions, etc.) determines who can initiate remote copies
+//!
+//! ## Transport Encryption & Integrity
+//!
+//! **QUIC with TLS 1.3**: All data transfer uses QUIC protocol built on TLS 1.3
+//! - Provides encryption for data confidentiality
+//! - Ensures data integrity through cryptographic authentication
+//! - Built-in protection against replay attacks
+//!
+//! ## Trust Bootstrap via Certificate Pinning
+//!
+//! **Two secured QUIC connections** in every remote copy operation:
+//!
+//! ### 1. Master ← rcpd (Control Connection)
+//! ```text
+//! Master (rcp)                    Remote Host (rcpd)
+//!    |                                   |
+//!    | 1. SSH connection established     |
+//!    |<--------------------------------->|
+//!    | 2. Master generates self-signed   |
+//!    |    cert, computes SHA-256         |
+//!    |    fingerprint                    |
+//!    |                                   |
+//!    | 3. Launch rcpd via SSH with       |
+//!    |    fingerprint as argument        |
+//!    |---------------------------------->|
+//!    |                                   |
+//!    | 4. rcpd validates Master's cert   |
+//!    |    against received fingerprint   |
+//!    |<---(QUIC + cert pinning)----------|
+//! ```
+//!
+//! - Master generates ephemeral self-signed certificate at startup
+//! - Certificate fingerprint (SHA-256) is passed to rcpd via SSH command-line arguments
+//! - rcpd validates Master's certificate by computing its fingerprint and comparing
+//! - Connection fails if fingerprints don't match (MITM protection)
+//!
+//! ### 2. Source → Destination (Data Transfer Connection)
+//! ```text
+//! Source (rcpd)                   Destination (rcpd)
+//!    |                                   |
+//!    | 1. Source generates self-signed   |
+//!    |    cert, computes SHA-256         |
+//!    |    fingerprint                    |
+//!    |                                   |
+//!    | 2. Send fingerprint + address     |
+//!    |    to Master via secure channel   |
+//!    |---------------------------------->|
+//!    |                    Master         |
+//!    |                      |            |
+//!    | 3. Master forwards   |            |
+//!    |    to Destination    |            |
+//!    |                      |----------->|
+//!    |                                   |
+//!    | 4. Destination validates Source's |
+//!    |    cert against received          |
+//!    |    fingerprint                    |
+//!    |<---(QUIC + cert pinning)----------|
+//! ```
+//!
+//! - Source generates ephemeral self-signed certificate
+//! - Fingerprint is sent to Master over already-secured Master←Source connection
+//! - Master forwards fingerprint to Destination over already-secured Master←Destination connection
+//! - Destination validates Source's certificate against fingerprint
+//! - Direct Source→Destination connection established only after successful validation
+//!
+//! ## SSH as Secure Out-of-Band Channel
+//!
+//! **Key insight**: SSH provides a secure, authenticated channel for bootstrapping QUIC trust
+//!
+//! - Certificate fingerprints are transmitted through SSH (Master→rcpd command-line arguments)
+//! - SSH connection is already authenticated and encrypted
+//! - This creates a "chain of trust":
+//!   1. User trusts SSH (proven by successful authentication)
+//!   2. SSH carries the certificate fingerprint securely
+//!   3. QUIC connection validates against that fingerprint
+//!   4. Therefore, QUIC connection is trustworthy
+//!
+//! ## Attack Resistance
+//!
+//! ### ✅ Protected Against
+//!
+//! - **Man-in-the-Middle (MITM)**: Certificate pinning prevents attackers from impersonating endpoints
+//! - **Replay Attacks**: TLS 1.3 in QUIC provides built-in replay protection
+//! - **Eavesdropping**: All data encrypted with TLS 1.3
+//! - **Tampering**: Cryptographic integrity checks prevent data modification
+//! - **Unauthorized Access**: SSH authentication is required before any operations
+//!
+//! ### ⚠️ Threat Model Assumptions
+//!
+//! - **SSH is secure**: The security model depends on SSH being properly configured and uncompromised
+//! - **Certificate fingerprints are short-lived**: Ephemeral certificates are generated per-session
+//! - **Trusted network for Master**: The machine running Master (rcp) should be trusted
+//!
+//! ## Insecure Mode (Not Recommended)
+//!
+//! For testing or trusted network environments, certificate verification can be disabled:
+//! - Use `get_client_with_port_ranges(ranges, true)` to skip certificate validation
+//! - **WARNING**: This makes connections vulnerable to MITM attacks
+//! - Only use in development or completely trusted networks
+//!
+//! ## Best Practices
+//!
+//! 1. **Secure SSH Configuration**: Use key-based authentication, disable password auth
+//! 2. **Keep Systems Updated**: Ensure SSH, TLS libraries, and QUIC implementations are current
+//! 3. **Network Segmentation**: Run remote copies on trusted network segments when possible
+//! 4. **Monitor Logs**: Certificate validation failures indicate potential security issues
 //!
 //! # Network Troubleshooting
 //!

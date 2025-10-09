@@ -107,6 +107,11 @@ struct Args {
     /// This applies to: rcpd connecting to master, destination connecting to source
     #[structopt(long, default_value = "15")]
     remote_copy_conn_timeout_sec: u64,
+
+    /// SHA-256 fingerprint of the Master's TLS certificate (hex-encoded)
+    /// Used for certificate pinning to prevent MITM attacks
+    #[structopt(long, required = true)]
+    master_cert_fingerprint: String,
 }
 
 #[instrument]
@@ -119,9 +124,19 @@ async fn async_main(
         args.master_addr,
         args.server_name
     );
-    // Note: Currently using insecure mode for Master→rcpd connections
-    // TODO: Implement certificate pinning for Master→rcpd (Phase 2)
-    let client = remote::get_client_with_port_ranges(args.quic_port_ranges.as_deref(), true)?;
+    // decode hex-encoded master cert fingerprint
+    let master_cert_fingerprint =
+        hex::decode(&args.master_cert_fingerprint).with_context(|| {
+            format!(
+                "Failed to decode master cert fingerprint: {}",
+                args.master_cert_fingerprint
+            )
+        })?;
+    // use certificate pinning for Master→rcpd connection
+    let client = remote::get_client_with_port_ranges_and_pinning(
+        args.quic_port_ranges.as_deref(),
+        master_cert_fingerprint,
+    )?;
     let master_connection = {
         let master_connection = client
             .connect(args.master_addr, &args.server_name)?
