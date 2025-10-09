@@ -46,7 +46,6 @@
 //!
 //! Key functions:
 //! - [`get_server_with_port_ranges`] - Create QUIC server endpoint with optional port restrictions
-//! - [`get_insecure_client_with_port_ranges`] - Create insecure QUIC client (testing only)
 //! - [`get_client_with_port_ranges_and_pinning`] - Create secure QUIC client with certificate pinning
 //! - [`get_endpoint_addr`] - Get the local address of an endpoint
 //!
@@ -188,13 +187,6 @@
 //! - **SSH is secure**: The security model depends on SSH being properly configured and uncompromised
 //! - **Certificate fingerprints are short-lived**: Ephemeral certificates are generated per-session
 //! - **Trusted network for Master**: The machine running Master (rcp) should be trusted
-//!
-//! ## Insecure Mode (Not Recommended)
-//!
-//! For testing or trusted network environments, certificate verification can be disabled:
-//! - Use `get_insecure_client_with_port_ranges()` to skip certificate validation
-//! - **WARNING**: This makes connections vulnerable to MITM attacks
-//! - Only use in development or completely trusted networks
 //!
 //! ## Best Practices
 //!
@@ -425,25 +417,6 @@ pub fn get_server_with_port_ranges(
     Ok((endpoint, cert_fingerprint))
 }
 
-// certificate verifier that accepts any server certificate
-// WARNING: This provides NO authentication and is vulnerable to MITM attacks
-// Only use with --insecure-skip-cert-verification flag in trusted networks
-struct AcceptAnyCertificate;
-
-impl rustls::client::ServerCertVerifier for AcceptAnyCertificate {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
-    }
-}
-
 // certificate verifier that validates against a pinned certificate fingerprint
 // This prevents MITM attacks by ensuring we're connecting to the expected server
 struct PinnedCertVerifier {
@@ -523,22 +496,6 @@ pub fn get_random_server_name() -> String {
 #[instrument]
 pub fn get_client_with_cert_pinning(cert_fingerprint: Vec<u8>) -> anyhow::Result<quinn::Endpoint> {
     get_client_with_port_ranges_and_pinning(None, cert_fingerprint)
-}
-
-#[instrument]
-pub fn get_insecure_client_with_port_ranges(
-    port_ranges: Option<&str>,
-) -> anyhow::Result<quinn::Endpoint> {
-    tracing::warn!(
-        "SECURITY WARNING: Certificate verification is DISABLED. \
-        Connection is vulnerable to man-in-the-middle attacks!"
-    );
-    // create a crypto backend that accepts any server certificate (INSECURE!)
-    let crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyCertificate))
-        .with_no_client_auth();
-    create_client_endpoint(port_ranges, crypto)
 }
 
 #[instrument]
