@@ -49,8 +49,8 @@ async fn handle_file_stream(
             if settings.overwrite {
                 tracing::debug!("file exists, check if it's identical");
                 let dst_metadata = tokio::fs::symlink_metadata(&file_header.dst).await?;
-                let same_type = dst_metadata.is_file();
-                if same_type {
+                let is_file = dst_metadata.is_file();
+                if is_file {
                     let src_file_metadata = remote::protocol::FileMetadata {
                         metadata: &file_header.metadata,
                         size: file_header.size,
@@ -462,6 +462,34 @@ async fn create_directory_structure(
             }
             remote::protocol::SourceMessage::DirStructureComplete => {
                 tracing::info!("All directories creation completed");
+            }
+            remote::protocol::SourceMessage::FileSkipped(ref skip_info) => {
+                tracing::info!(
+                    "File was skipped by source: {:?} -> {:?}",
+                    skip_info.src,
+                    skip_info.dst
+                );
+                // decrement directory counter since this file won't be sent
+                directory_tracker
+                    .lock()
+                    .await
+                    .decrement_entry(&skip_info.src, &skip_info.dst)
+                    .await
+                    .context("Failed to decrement directory entry for skipped file")?;
+            }
+            remote::protocol::SourceMessage::SymlinkSkipped(ref skip_info) => {
+                tracing::info!(
+                    "Symlink was skipped by source: {:?} -> {:?}",
+                    skip_info.src,
+                    skip_info.dst
+                );
+                // decrement directory counter since this symlink won't be sent
+                directory_tracker
+                    .lock()
+                    .await
+                    .decrement_entry(&skip_info.src, &skip_info.dst)
+                    .await
+                    .context("Failed to decrement directory entry for skipped symlink")?;
             }
             remote::protocol::SourceMessage::SourceDone => {
                 tracing::info!("Received source done message received");

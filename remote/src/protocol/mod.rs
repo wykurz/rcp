@@ -141,7 +141,9 @@ pub enum SourceMessage {
         metadata: Metadata,
         is_root: bool,
     },
-    SourceDone, // must be the last message sent by the source
+    FileSkipped(SrcDst),    // file failed to send, decrement directory counter
+    SymlinkSkipped(SrcDst), // symlink failed to send, decrement directory counter
+    SourceDone,             // must be the last message sent by the source
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

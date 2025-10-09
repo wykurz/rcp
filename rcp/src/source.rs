@@ -41,6 +41,19 @@ async fn send_directories_and_symlinks(
             Err(e) => {
                 tracing::error!("Failed reading symlink {src:?}: {e}");
                 error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
+                // notify destination that this symlink was skipped (for directory tracking)
+                if !is_root {
+                    let skip_msg =
+                        remote::protocol::SourceMessage::SymlinkSkipped(remote::protocol::SrcDst {
+                            src: src.to_path_buf(),
+                            dst: dst.to_path_buf(),
+                        });
+                    control_send_stream
+                        .lock()
+                        .await
+                        .send_batch_message(&skip_msg)
+                        .await?;
+                }
                 if settings.fail_early {
                     return Err(e.into());
                 }
@@ -226,6 +239,7 @@ async fn send_fs_objects(
             true,
             connection,
             &error_occurred,
+            control_send_stream.clone(),
         )
         .await
         {
@@ -239,8 +253,9 @@ async fn send_fs_objects(
     return Ok(());
 }
 
-#[instrument(skip(error_occurred))]
+#[instrument(skip(error_occurred, control_send_stream))]
 #[async_recursion]
+#[allow(clippy::too_many_arguments)]
 async fn send_file(
     settings: &common::copy::Settings,
     src: &std::path::Path,
@@ -249,10 +264,39 @@ async fn send_file(
     is_root: bool,
     connection: remote::streams::Connection,
     error_occurred: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    control_send_stream: remote::streams::SharedSendStream,
 ) -> anyhow::Result<()> {
     let prog = progress();
     let _ops_guard = prog.ops.guard();
     let _open_file_guard = throttle::open_file_permit().await;
+    tracing::debug!("Sending file content for {:?}", src);
+    throttle::get_file_iops_tokens(settings.chunk_size, src_metadata.len()).await;
+    // open the file BEFORE opening the stream to avoid leaving destination waiting
+    let mut file = match tokio::fs::File::open(src).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!("Failed to open file {src:?}: {e}");
+            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
+            // notify destination that this file was skipped (for directory tracking)
+            if !is_root {
+                let skip_msg =
+                    remote::protocol::SourceMessage::FileSkipped(remote::protocol::SrcDst {
+                        src: src.to_path_buf(),
+                        dst: dst.to_path_buf(),
+                    });
+                control_send_stream
+                    .lock()
+                    .await
+                    .send_batch_message(&skip_msg)
+                    .await?;
+            }
+            if settings.fail_early {
+                return Err(e.into());
+            } else {
+                return Ok(());
+            }
+        }
+    };
     let metadata = remote::protocol::Metadata::from(src_metadata);
     let file_header = remote::protocol::File {
         src: src.to_path_buf(),
@@ -262,39 +306,23 @@ async fn send_file(
         is_root,
     };
     let mut file_send_stream = connection.open_uni().await?;
-    tracing::debug!("Sending file content for {:?}", src);
-    throttle::get_file_iops_tokens(settings.chunk_size, src_metadata.len()).await;
-    match tokio::fs::File::open(src).await {
-        Ok(mut file) => {
-            match file_send_stream
-                .send_message_with_data(&file_header, &mut file)
-                .await
-            {
-                Ok(_bytes_sent) => {
-                    file_send_stream.close().await?;
-                    prog.files_copied.inc();
-                    prog.bytes_copied.add(src_metadata.len());
-                    tracing::info!("Sent file: {:?} -> {:?}", src, dst);
-                    Ok(())
-                }
-                Err(e) => {
-                    tracing::error!("Failed to send file content for {src:?}: {e}");
-                    error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
-                    file_send_stream.close().await?;
-                    if settings.fail_early {
-                        Err(e)
-                    } else {
-                        Ok(())
-                    }
-                }
-            }
+    match file_send_stream
+        .send_message_with_data(&file_header, &mut file)
+        .await
+    {
+        Ok(_bytes_sent) => {
+            file_send_stream.close().await?;
+            prog.files_copied.inc();
+            prog.bytes_copied.add(src_metadata.len());
+            tracing::info!("Sent file: {:?} -> {:?}", src, dst);
+            Ok(())
         }
         Err(e) => {
-            tracing::error!("Failed to open file {src:?}: {e}");
+            tracing::error!("Failed to send file content for {src:?}: {e}");
             error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             file_send_stream.close().await?;
             if settings.fail_early {
-                Err(e.into())
+                Err(e)
             } else {
                 Ok(())
             }
@@ -302,13 +330,14 @@ async fn send_file(
     }
 }
 
-#[instrument(skip(error_occurred))]
+#[instrument(skip(error_occurred, control_send_stream))]
 async fn send_files_in_directory(
     settings: common::copy::Settings,
     src: std::path::PathBuf,
     dst: std::path::PathBuf,
     connection: remote::streams::Connection,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    control_send_stream: remote::streams::SharedSendStream,
 ) -> anyhow::Result<()> {
     tracing::info!("Sending files from {src:?}");
     let mut entries = match tokio::fs::read_dir(&src).await {
@@ -350,6 +379,7 @@ async fn send_files_in_directory(
                 throttle::get_ops_token().await;
                 let connection = connection.clone();
                 let error_flag = error_occurred.clone();
+                let control_stream = control_send_stream.clone();
                 join_set.spawn(async move {
                     send_file(
                         &settings,
@@ -359,6 +389,7 @@ async fn send_files_in_directory(
                         false,
                         connection,
                         &error_flag,
+                        control_stream,
                     )
                     .await
                 });
@@ -425,6 +456,7 @@ async fn dispatch_control_messages(
                     confirmation.dst.clone(),
                     connection.clone(),
                     error_flag,
+                    control_send_stream.clone(),
                 ));
             }
             remote::protocol::DestinationMessage::DirectoryFailed(failure) => {
