@@ -830,3 +830,238 @@ fn test_remote_copy_unreadable_source() {
     // verify the destination file was not created
     assert!(!dst_file.exists());
 }
+
+#[test]
+fn test_remote_copy_directory_with_unreadable_files_continue() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // create directory structure with some unreadable files
+    let src_subdir = src_dir.path().join("mixed_dir");
+    std::fs::create_dir(&src_subdir).unwrap();
+    // readable files
+    create_test_file(&src_subdir.join("file1.txt"), "readable content 1", 0o644);
+    create_test_file(&src_subdir.join("file2.txt"), "readable content 2", 0o644);
+    // unreadable files
+    create_test_file(&src_subdir.join("unreadable1.txt"), "secret 1", 0o000);
+    create_test_file(&src_subdir.join("file3.txt"), "readable content 3", 0o644);
+    create_test_file(&src_subdir.join("unreadable2.txt"), "secret 2", 0o000);
+    let dst_subdir = dst_dir.path().join("mixed_dir");
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    // without --fail-early, should continue copying readable files
+    let output = run_rcp_and_expect_failure(&["--summary", &src_remote, &dst_remote]);
+    // verify readable files were copied
+    assert!(dst_subdir.join("file1.txt").exists());
+    assert!(dst_subdir.join("file2.txt").exists());
+    assert!(dst_subdir.join("file3.txt").exists());
+    assert_eq!(
+        get_file_content(&dst_subdir.join("file1.txt")),
+        "readable content 1"
+    );
+    assert_eq!(
+        get_file_content(&dst_subdir.join("file2.txt")),
+        "readable content 2"
+    );
+    assert_eq!(
+        get_file_content(&dst_subdir.join("file3.txt")),
+        "readable content 3"
+    );
+    // verify unreadable files were not copied
+    assert!(!dst_subdir.join("unreadable1.txt").exists());
+    assert!(!dst_subdir.join("unreadable2.txt").exists());
+    // verify summary shows partial success: 3 files copied, 1 directory created
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 3);
+    assert_eq!(summary.directories_created, 1);
+    assert_eq!(summary.bytes_copied, 54); // sum of 3 readable files
+                                          // verify non-zero exit code
+    assert!(!output.status.success());
+}
+
+#[test]
+fn test_remote_copy_directory_with_unreadable_files_fail_early() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // create test with readable file first, then unreadable file
+    // this ensures directory gets created before failure
+    let src_subdir = src_dir.path().join("fail_early_test");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("a_good.txt"), "good", 0o644);
+    create_test_file(&src_subdir.join("b_unreadable.txt"), "secret", 0o000);
+    create_test_file(&src_subdir.join("c_good.txt"), "also good", 0o644);
+    let dst_subdir = dst_dir.path().join("fail_early_test");
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    // with --fail-early, should stop on first error
+    let output =
+        run_rcp_and_expect_failure(&["--fail-early", "--summary", &src_remote, &dst_remote]);
+    // with fail-early, exact behavior depends on timing
+    // we just verify:
+    // 1. operation failed (non-zero exit)
+    // 2. not all files were copied (< 3)
+    // 3. some progress may have been made before the error
+    assert!(
+        !output.status.success(),
+        "Operation should fail with non-zero exit code"
+    );
+
+    // try to parse summary, but it might not be available if connection closed too quickly
+    if let Some(summary) = parse_summary_from_output(&output) {
+        assert!(
+            summary.files_copied < 3,
+            "Should not copy all files with fail-early, got {}",
+            summary.files_copied
+        );
+    }
+}
+
+#[test]
+fn test_remote_copy_nested_directories_with_unreadable_files() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // create nested directory structure with some unreadable files
+    let src_root = src_dir.path().join("root");
+    std::fs::create_dir(&src_root).unwrap();
+    create_test_file(&src_root.join("root_file.txt"), "root content", 0o644);
+    create_test_file(&src_root.join("unreadable_root.txt"), "secret root", 0o000);
+    // readable subdirectory with mixed readable/unreadable files
+    let subdir = src_root.join("subdir");
+    std::fs::create_dir(&subdir).unwrap();
+    create_test_file(&subdir.join("good.txt"), "good content", 0o644);
+    create_test_file(&subdir.join("secret.txt"), "secret content", 0o000);
+    // another readable file
+    create_test_file(&src_root.join("zzz_last.txt"), "last content", 0o644);
+    let dst_root = dst_dir.path().join("root");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // without --fail-early, should continue despite unreadable files
+    let output = run_rcp_and_expect_failure(&["--summary", &src_remote, &dst_remote]);
+    // verify readable content was copied
+    assert!(dst_root.join("root_file.txt").exists());
+    assert!(dst_root.join("subdir").exists());
+    assert!(dst_root.join("subdir/good.txt").exists());
+    assert!(dst_root.join("zzz_last.txt").exists());
+    assert_eq!(
+        get_file_content(&dst_root.join("root_file.txt")),
+        "root content"
+    );
+    assert_eq!(
+        get_file_content(&dst_root.join("subdir/good.txt")),
+        "good content"
+    );
+    assert_eq!(
+        get_file_content(&dst_root.join("zzz_last.txt")),
+        "last content"
+    );
+    // verify unreadable files were not copied
+    assert!(!dst_root.join("unreadable_root.txt").exists());
+    assert!(!dst_root.join("subdir/secret.txt").exists());
+    // verify summary: 3 readable files copied, 2 directories created
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 3);
+    assert_eq!(summary.directories_created, 2); // root + subdir
+                                                // verify non-zero exit code
+    assert!(!output.status.success());
+}
+
+#[test]
+fn test_remote_copy_mixed_success_with_symlink_errors() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // create directory with files and symlinks, some operations will fail
+    let src_subdir = src_dir.path().join("mixed_ops");
+    std::fs::create_dir(&src_subdir).unwrap();
+    // regular file that will succeed
+    create_test_file(&src_subdir.join("good_file.txt"), "good content", 0o644);
+    // create a symlink to a file
+    let target = src_subdir.join("target.txt");
+    create_test_file(&target, "target content", 0o644);
+    std::os::unix::fs::symlink(&target, src_subdir.join("good_symlink")).unwrap();
+    // unreadable file
+    create_test_file(&src_subdir.join("unreadable.txt"), "secret", 0o000);
+    // another good file
+    create_test_file(
+        &src_subdir.join("zzz_another.txt"),
+        "another content",
+        0o644,
+    );
+    let dst_subdir = dst_dir.path().join("mixed_ops");
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    let output = run_rcp_and_expect_failure(&["--summary", &src_remote, &dst_remote]);
+    // verify successful operations
+    assert!(dst_subdir.join("good_file.txt").exists());
+    assert!(dst_subdir.join("good_symlink").exists());
+    assert!(dst_subdir.join("target.txt").exists());
+    assert!(dst_subdir.join("zzz_another.txt").exists());
+    assert_eq!(
+        get_file_content(&dst_subdir.join("good_file.txt")),
+        "good content"
+    );
+    assert_eq!(
+        get_file_content(&dst_subdir.join("target.txt")),
+        "target content"
+    );
+    assert_eq!(
+        get_file_content(&dst_subdir.join("zzz_another.txt")),
+        "another content"
+    );
+    // verify symlink
+    assert!(dst_subdir.join("good_symlink").is_symlink());
+    // verify failed operations
+    assert!(!dst_subdir.join("unreadable.txt").exists());
+    // verify summary
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 3); // good_file.txt, target.txt, zzz_another.txt
+    assert_eq!(summary.symlinks_created, 1); // good_symlink
+    assert_eq!(summary.directories_created, 1); // mixed_ops
+                                                // verify non-zero exit code
+    assert!(!output.status.success());
+}
+
+#[test]
+fn test_remote_copy_all_operations_fail() {
+    let (src_dir, dst_dir) = setup_test_env();
+    // create a directory with only unreadable files
+    let src_subdir = src_dir.path().join("all_fail");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("unreadable1.txt"), "secret 1", 0o000);
+    create_test_file(&src_subdir.join("unreadable2.txt"), "secret 2", 0o000);
+    create_test_file(&src_subdir.join("unreadable3.txt"), "secret 3", 0o000);
+    let dst_subdir = dst_dir.path().join("all_fail");
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    let output = run_rcp_and_expect_failure(&["--summary", &src_remote, &dst_remote]);
+    // verify directory was created but no files
+    assert!(dst_subdir.exists());
+    assert!(!dst_subdir.join("unreadable1.txt").exists());
+    assert!(!dst_subdir.join("unreadable2.txt").exists());
+    assert!(!dst_subdir.join("unreadable3.txt").exists());
+    // verify summary shows only directory creation
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 0);
+    assert_eq!(summary.directories_created, 1);
+    assert_eq!(summary.bytes_copied, 0);
+    // verify non-zero exit code
+    assert!(!output.status.success());
+}
+
+#[test]
+fn test_remote_copy_unwritable_destination() {
+    // this test verifies behavior when destination directory is not writable
+    let (src_dir, dst_dir) = setup_test_env();
+    // create source file
+    let src_file = src_dir.path().join("source.txt");
+    create_test_file(&src_file, "source content", 0o644);
+    // create destination directory with no write permissions
+    let dst_subdir = dst_dir.path().join("readonly_dir");
+    std::fs::create_dir(&dst_subdir).unwrap();
+    std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let dst_file = dst_subdir.join("destination.txt");
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    let output = run_rcp_and_expect_failure(&["--summary", &src_remote, &dst_remote]);
+    // verify file was not created
+    assert!(!dst_file.exists());
+    // verify summary shows no files copied
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 0);
+    // restore permissions for cleanup
+    std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
