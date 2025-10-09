@@ -3,13 +3,19 @@
 RCP TOOLS
 =========
 
-This repo contains tools to efficiently copy, remove and link large filesets.
+This repo contains tools to efficiently copy, remove and link large filesets, both locally and across remote hosts.
 
 [![Build status](https://github.com/wykurz/rcp/actions/workflows/rust.yml/badge.svg)](https://github.com/wykurz/rcp/actions)
 
 - `rcp` is a tool for copying files; similar to `cp` but generally MUCH faster when dealing with a large number of files.
 
+    Supports both local and remote copying using `host:/path` syntax (similar to `scp`).
+
     Inspired by tools like `dsync`(1) and `pcp`(2).
+
+- `rcpd` is the remote copy daemon that enables distributed copying operations.
+
+    Automatically launched by `rcp` when using remote paths. Uses QUIC protocol for efficient data transfer.
 
 - `rrm` is a tool for removing files.
 
@@ -28,7 +34,7 @@ This repo contains tools to efficiently copy, remove and link large filesets.
 examples
 ========
 
-### basic copy with progress-bar and summary at the end:
+### basic local copy with progress-bar and summary at the end:
 ```fish
 > rcp <foo> <bar> --progress --summary
 ```
@@ -39,6 +45,22 @@ Roughly equivalent to `cp -R --update=none <foo> <bar>`.
 > rcp <foo> <bar> --preserve --progress --summary --overwrite
 ```
 Roughly equivalent to: `cp -pR <foo> <bar>`.
+
+### remote copy from one host to another:
+```fish
+> rcp user@host1:/path/to/source user@host2:/path/to/dest --progress --summary
+```
+Copies files from `host1` to `host2`. The `rcpd` daemon is automatically started on both hosts via SSH.
+
+### copy from remote host to local machine:
+```fish
+> rcp host:/remote/path /local/path --progress --summary
+```
+
+### copy from local machine to remote host:
+```fish
+> rcp /local/path host:/remote/path --progress --summary --preserve
+```
 
 ### log tool output to a file while using progress bar
 Progress bar is sent to `stderr` while log messages go to `stdout`. This allows us to pipe `stdout` to a file to preserve the tool output while still viewing the interactive progress bar. This works for all RCP tools.
@@ -125,8 +147,29 @@ Using `rcp` it's also possible to copy multiple sources into a single destinatio
 
 ## error handling
 
-- `rcp` tools will log non-terminal errors and continue
+- `rcp` tools will log non-terminal errors and continue by default
 - to fail immediately on any error use the `--fail-early` flag
+
+## remote copy configuration
+
+When using remote paths (`host:/path` syntax), `rcp` automatically starts `rcpd` daemons on remote hosts via SSH.
+
+**Requirements:**
+- SSH access to remote hosts (uses your SSH config and keys)
+- `rcpd` binary must be available in the same directory as `rcp` on remote hosts
+
+**Configuration options:**
+- `--quic-port-ranges` - restrict QUIC to specific port ranges (e.g., "8000-8999")
+- `--remote-copy-conn-timeout-sec` - connection timeout in seconds (default: 15)
+
+**Architecture:**
+The remote copy uses a three-node architecture with QUIC protocol:
+- Master (`rcp`) orchestrates the copy operation
+- Source `rcpd` reads files from source host
+- Destination `rcpd` writes files to destination host
+- Data flows directly from source to destination (not through master)
+
+For detailed network connectivity and troubleshooting information, see `docs/network_connectivity.md`.
 
 ## terminal output
 
