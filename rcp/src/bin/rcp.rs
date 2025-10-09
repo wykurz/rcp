@@ -150,7 +150,8 @@ async fn run_rcpd_master(
 ) -> anyhow::Result<common::copy::Summary> {
     tracing::debug!("running rcpd src/dst");
     // open a port and wait from server & client hello, respond to client with server port
-    let server_endpoint = remote::get_server_with_port_ranges(args.quic_port_ranges.as_deref())?;
+    let (server_endpoint, _master_cert_fingerprint) =
+        remote::get_server_with_port_ranges(args.quic_port_ranges.as_deref())?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
     let server_name = remote::get_random_server_name();
     let mut rcpds = vec![];
@@ -292,6 +293,7 @@ async fn run_rcpd_master(
             .send_control_message(&remote::protocol::MasterHello::Destination {
                 source_addr: source_hello.source_addr,
                 server_name: source_hello.server_name.clone(),
+                source_cert_fingerprint: source_hello.cert_fingerprint.clone(),
                 preserve: *preserve,
             })
             .await?;

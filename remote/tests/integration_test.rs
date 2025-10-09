@@ -22,7 +22,7 @@ fn test_port_binding_with_ranges() -> Result<()> {
 #[tokio::test]
 async fn test_quic_server_creation_with_port_ranges() -> Result<()> {
     // Test the complete QUIC server creation with port ranges
-    let endpoint = remote::get_server_with_port_ranges(Some("21000-21999"))?;
+    let (endpoint, _cert_fingerprint) = remote::get_server_with_port_ranges(Some("21000-21999"))?;
     let addr = endpoint.local_addr()?;
 
     // Verify the port is within our specified range
@@ -38,7 +38,7 @@ async fn test_quic_server_creation_with_port_ranges() -> Result<()> {
 #[tokio::test]
 async fn test_quic_client_creation_with_port_ranges() -> Result<()> {
     // Test the complete QUIC client creation with port ranges
-    let endpoint = remote::get_client_with_port_ranges(Some("22000-22999"))?;
+    let endpoint = remote::get_client_with_port_ranges(Some("22000-22999"), true)?;
     let addr = endpoint.local_addr()?;
 
     // Verify the port is within our specified range
@@ -73,10 +73,10 @@ fn test_multiple_port_ranges() -> Result<()> {
 #[tokio::test]
 async fn test_full_quic_endpoint_functionality() -> Result<()> {
     // Test that we can create both server and client with port ranges and they work together
-    let server = remote::get_server_with_port_ranges(Some("16000-16999"))?;
+    let (server, _cert_fingerprint) = remote::get_server_with_port_ranges(Some("16000-16999"))?;
     let server_addr = remote::get_endpoint_addr(&server)?;
 
-    let client = remote::get_client_with_port_ranges(Some("17000-17999"))?;
+    let client = remote::get_client_with_port_ranges(Some("17000-17999"), true)?;
     let client_addr = client.local_addr()?;
 
     // Verify both are in their respective ranges
