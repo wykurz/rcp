@@ -46,7 +46,8 @@
 //!
 //! Key functions:
 //! - [`get_server_with_port_ranges`] - Create QUIC server endpoint with optional port restrictions
-//! - [`get_client`] - Create QUIC client endpoint
+//! - [`get_insecure_client_with_port_ranges`] - Create insecure QUIC client (testing only)
+//! - [`get_client_with_port_ranges_and_pinning`] - Create secure QUIC client with certificate pinning
 //! - [`get_endpoint_addr`] - Get the local address of an endpoint
 //!
 //! ## Port Range Configuration
@@ -191,7 +192,7 @@
 //! ## Insecure Mode (Not Recommended)
 //!
 //! For testing or trusted network environments, certificate verification can be disabled:
-//! - Use `get_client_with_port_ranges(ranges, true)` to skip certificate validation
+//! - Use `get_insecure_client_with_port_ranges()` to skip certificate validation
 //! - **WARNING**: This makes connections vulnerable to MITM attacks
 //! - Only use in development or completely trusted networks
 //!
@@ -520,33 +521,23 @@ pub fn get_random_server_name() -> String {
 }
 
 #[instrument]
-pub fn get_client() -> anyhow::Result<quinn::Endpoint> {
-    get_client_with_port_ranges(None, true)
-}
-
-#[instrument]
 pub fn get_client_with_cert_pinning(cert_fingerprint: Vec<u8>) -> anyhow::Result<quinn::Endpoint> {
     get_client_with_port_ranges_and_pinning(None, cert_fingerprint)
 }
 
 #[instrument]
-pub fn get_client_with_port_ranges(
+pub fn get_insecure_client_with_port_ranges(
     port_ranges: Option<&str>,
-    insecure_skip_verification: bool,
 ) -> anyhow::Result<quinn::Endpoint> {
-    if insecure_skip_verification {
-        tracing::warn!(
-            "SECURITY WARNING: Certificate verification is DISABLED. \
-            Connection is vulnerable to man-in-the-middle attacks!"
-        );
-    }
-
+    tracing::warn!(
+        "SECURITY WARNING: Certificate verification is DISABLED. \
+        Connection is vulnerable to man-in-the-middle attacks!"
+    );
     // create a crypto backend that accepts any server certificate (INSECURE!)
     let crypto = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyCertificate))
         .with_no_client_auth();
-
     create_client_endpoint(port_ranges, crypto)
 }
 
@@ -559,7 +550,6 @@ pub fn get_client_with_port_ranges_and_pinning(
         "Creating QUIC client with certificate pinning (fingerprint: {})",
         hex::encode(&cert_fingerprint)
     );
-
     // create a crypto backend with certificate pinning
     let crypto = rustls::ClientConfig::builder()
         .with_safe_defaults()
@@ -567,7 +557,6 @@ pub fn get_client_with_port_ranges_and_pinning(
             cert_fingerprint,
         )))
         .with_no_client_auth();
-
     create_client_endpoint(port_ranges, crypto)
 }
 

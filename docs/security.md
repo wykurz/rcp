@@ -332,7 +332,7 @@ Insecure mode is used when no certificate pinning is configured:
 
 ```rust
 // Explicitly skip verification (not recommended)
-let client = get_client_with_port_ranges(Some("8000-8999"), true)?;
+let client = get_insecure_client_with_port_ranges(Some("8000-8999"))?;
 ```
 
 ### Security Warning
