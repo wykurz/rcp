@@ -199,7 +199,7 @@ For detailed network connectivity and troubleshooting information, see `docs/net
 - Certificate fingerprints are ephemeral (generated per session)
 - No PKI or long-term certificate management needed
 
-For detailed security architecture and threat model, see `SECURITY.md`.
+For detailed security architecture and threat model, see `docs/security.md`.
 
 ## terminal output
 
