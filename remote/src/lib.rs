@@ -268,21 +268,35 @@ pub async fn start_rcpd(
     cmd.spawn().await.context("Failed to spawn rcpd command")
 }
 
-fn configure_server() -> anyhow::Result<quinn::ServerConfig> {
+/// Configure QUIC server with a self-signed certificate
+/// Returns the server config and the SHA-256 fingerprint of the certificate
+fn configure_server() -> anyhow::Result<(quinn::ServerConfig, Vec<u8>)> {
     tracing::info!("Configuring QUIC server");
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let key_der = cert.serialize_private_key_der();
     let cert_der = cert.serialize_der()?;
+
+    // compute SHA-256 fingerprint of the certificate for pinning
+    let fingerprint = ring::digest::digest(&ring::digest::SHA256, &cert_der);
+    let fingerprint_vec = fingerprint.as_ref().to_vec();
+
+    tracing::debug!(
+        "Generated certificate with fingerprint: {}",
+        hex::encode(&fingerprint_vec)
+    );
+
     let key = rustls::PrivateKey(key_der);
     let cert = rustls::Certificate(cert_der);
     let server_config = quinn::ServerConfig::with_single_cert(vec![cert], key)
         .context("Failed to create server config")?;
-    Ok(server_config)
+    Ok((server_config, fingerprint_vec))
 }
 
 #[instrument]
-pub fn get_server_with_port_ranges(port_ranges: Option<&str>) -> anyhow::Result<quinn::Endpoint> {
-    let server_config = configure_server()?;
+pub fn get_server_with_port_ranges(
+    port_ranges: Option<&str>,
+) -> anyhow::Result<(quinn::Endpoint, Vec<u8>)> {
+    let (server_config, cert_fingerprint) = configure_server()?;
     let socket = if let Some(ranges_str) = port_ranges {
         let ranges = port_ranges::PortRanges::parse(ranges_str)?;
         ranges.bind_udp_socket(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))?
@@ -290,16 +304,19 @@ pub fn get_server_with_port_ranges(port_ranges: Option<&str>) -> anyhow::Result<
         // default behavior: bind to any available port
         std::net::UdpSocket::bind("0.0.0.0:0")?
     };
-    quinn::Endpoint::new(
+    let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(server_config),
         socket,
         std::sync::Arc::new(quinn::TokioRuntime),
     )
-    .context("Failed to create QUIC endpoint")
+    .context("Failed to create QUIC endpoint")?;
+    Ok((endpoint, cert_fingerprint))
 }
 
 // certificate verifier that accepts any server certificate
+// WARNING: This provides NO authentication and is vulnerable to MITM attacks
+// Only use with --insecure-skip-cert-verification flag in trusted networks
 struct AcceptAnyCertificate;
 
 impl rustls::client::ServerCertVerifier for AcceptAnyCertificate {
@@ -313,6 +330,59 @@ impl rustls::client::ServerCertVerifier for AcceptAnyCertificate {
         _now: std::time::SystemTime,
     ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::ServerCertVerified::assertion())
+    }
+}
+
+// certificate verifier that validates against a pinned certificate fingerprint
+// This prevents MITM attacks by ensuring we're connecting to the expected server
+struct PinnedCertVerifier {
+    expected_fingerprint: Vec<u8>,
+}
+
+impl PinnedCertVerifier {
+    fn new(expected_fingerprint: Vec<u8>) -> Self {
+        Self {
+            expected_fingerprint,
+        }
+    }
+}
+
+impl rustls::client::ServerCertVerifier for PinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        // compute SHA-256 fingerprint of the received certificate
+        let received_fingerprint = ring::digest::digest(&ring::digest::SHA256, &end_entity.0);
+
+        if received_fingerprint.as_ref() == self.expected_fingerprint.as_slice() {
+            tracing::debug!(
+                "Certificate fingerprint validated successfully: {}",
+                hex::encode(&self.expected_fingerprint)
+            );
+            Ok(rustls::client::ServerCertVerified::assertion())
+        } else {
+            tracing::error!(
+                "Certificate fingerprint mismatch! Expected: {}, Got: {}",
+                hex::encode(&self.expected_fingerprint),
+                hex::encode(received_fingerprint)
+            );
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Other(std::sync::Arc::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Certificate fingerprint mismatch (expected {}, got {})",
+                        hex::encode(&self.expected_fingerprint),
+                        hex::encode(received_fingerprint)
+                    ),
+                ))),
+            ))
+        }
     }
 }
 
@@ -341,16 +411,61 @@ pub fn get_random_server_name() -> String {
 
 #[instrument]
 pub fn get_client() -> anyhow::Result<quinn::Endpoint> {
-    get_client_with_port_ranges(None)
+    get_client_with_port_ranges(None, true)
 }
 
 #[instrument]
-pub fn get_client_with_port_ranges(port_ranges: Option<&str>) -> anyhow::Result<quinn::Endpoint> {
-    // create a crypto backend that accepts any server certificate (for development only)
+pub fn get_client_with_cert_pinning(cert_fingerprint: Vec<u8>) -> anyhow::Result<quinn::Endpoint> {
+    get_client_with_port_ranges_and_pinning(None, cert_fingerprint)
+}
+
+#[instrument]
+pub fn get_client_with_port_ranges(
+    port_ranges: Option<&str>,
+    insecure_skip_verification: bool,
+) -> anyhow::Result<quinn::Endpoint> {
+    if insecure_skip_verification {
+        tracing::warn!(
+            "SECURITY WARNING: Certificate verification is DISABLED. \
+            Connection is vulnerable to man-in-the-middle attacks!"
+        );
+    }
+
+    // create a crypto backend that accepts any server certificate (INSECURE!)
     let crypto = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyCertificate))
         .with_no_client_auth();
+
+    create_client_endpoint(port_ranges, crypto)
+}
+
+#[instrument]
+pub fn get_client_with_port_ranges_and_pinning(
+    port_ranges: Option<&str>,
+    cert_fingerprint: Vec<u8>,
+) -> anyhow::Result<quinn::Endpoint> {
+    tracing::info!(
+        "Creating QUIC client with certificate pinning (fingerprint: {})",
+        hex::encode(&cert_fingerprint)
+    );
+
+    // create a crypto backend with certificate pinning
+    let crypto = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_custom_certificate_verifier(std::sync::Arc::new(PinnedCertVerifier::new(
+            cert_fingerprint,
+        )))
+        .with_no_client_auth();
+
+    create_client_endpoint(port_ranges, crypto)
+}
+
+// helper function to create client endpoint with given crypto config
+fn create_client_endpoint(
+    port_ranges: Option<&str>,
+    crypto: rustls::ClientConfig,
+) -> anyhow::Result<quinn::Endpoint> {
     // create QUIC client config
     let client_config = quinn::ClientConfig::new(std::sync::Arc::new(crypto));
     let socket = if let Some(ranges_str) = port_ranges {

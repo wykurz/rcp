@@ -507,11 +507,12 @@ async fn create_directory_structure(
 pub async fn run_destination(
     src_endpoint: &std::net::SocketAddr,
     src_server_name: &str,
+    src_cert_fingerprint: &[u8],
     settings: &common::copy::Settings,
     preserve: &common::preserve::Settings,
     _conn_timeout_sec: u64,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
-    let client = remote::get_client()?;
+    let client = remote::get_client_with_cert_pinning(src_cert_fingerprint.to_vec())?;
     tracing::info!("Connecting to source at {}", src_endpoint);
     let connection = client
         .connect(*src_endpoint, src_server_name)?

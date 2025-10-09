@@ -609,12 +609,14 @@ pub async fn run_source(
     quic_port_ranges: Option<&str>,
     conn_timeout_sec: u64,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
-    let server_endpoint = remote::get_server_with_port_ranges(quic_port_ranges)?;
+    let (server_endpoint, cert_fingerprint) =
+        remote::get_server_with_port_ranges(quic_port_ranges)?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
     tracing::info!("Source server listening on {}", server_addr);
     let master_hello = remote::protocol::SourceMasterHello {
         source_addr: server_addr,
         server_name: remote::get_random_server_name(),
+        cert_fingerprint,
     };
     tracing::info!("Sending master hello: {:?}", master_hello);
     master_send_stream

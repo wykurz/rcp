@@ -119,7 +119,9 @@ async fn async_main(
         args.master_addr,
         args.server_name
     );
-    let client = remote::get_client_with_port_ranges(args.quic_port_ranges.as_deref())?;
+    // Note: Currently using insecure mode for Master→rcpd connections
+    // TODO: Implement certificate pinning for Master→rcpd (Phase 2)
+    let client = remote::get_client_with_port_ranges(args.quic_port_ranges.as_deref(), true)?;
     let master_connection = {
         let master_connection = client
             .connect(args.master_addr, &args.server_name)?
@@ -186,12 +188,14 @@ async fn async_main(
         remote::protocol::MasterHello::Destination {
             source_addr,
             server_name,
+            source_cert_fingerprint,
             preserve,
         } => {
             tracing::info!("Starting destination");
             match destination::run_destination(
                 &source_addr,
                 &server_name,
+                &source_cert_fingerprint,
                 &settings,
                 &preserve,
                 args.remote_copy_conn_timeout_sec,

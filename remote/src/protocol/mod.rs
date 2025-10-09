@@ -240,6 +240,9 @@ pub enum MasterHello {
     Destination {
         source_addr: std::net::SocketAddr,
         server_name: String,
+        /// SHA-256 fingerprint of the source's TLS certificate (32 bytes)
+        /// Used for certificate pinning to prevent MITM attacks
+        source_cert_fingerprint: Vec<u8>,
         preserve: common::preserve::Settings,
     },
 }
@@ -248,6 +251,9 @@ pub enum MasterHello {
 pub struct SourceMasterHello {
     pub source_addr: std::net::SocketAddr,
     pub server_name: String,
+    /// SHA-256 fingerprint of this source's TLS certificate (32 bytes)
+    /// Used for certificate pinning to prevent MITM attacks
+    pub cert_fingerprint: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
