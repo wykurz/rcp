@@ -34,7 +34,10 @@ async fn test_quic_server_creation_with_port_ranges() -> Result<()> {
 #[tokio::test]
 async fn test_quic_client_creation_with_port_ranges() -> Result<()> {
     // Test the complete QUIC client creation with port ranges
-    let endpoint = remote::get_insecure_client_with_port_ranges(Some("22000-22999"))?;
+    // We use a dummy fingerprint since we're only testing port binding, not actual connections
+    let dummy_fingerprint = vec![0u8; 32]; // dummy SHA-256 fingerprint
+    let endpoint =
+        remote::get_client_with_port_ranges_and_pinning(Some("22000-22999"), dummy_fingerprint)?;
     let addr = endpoint.local_addr()?;
     // Verify the port is within our specified range
     assert!(
@@ -67,7 +70,10 @@ async fn test_full_quic_endpoint_functionality() -> Result<()> {
     // Test that we can create both server and client with port ranges and they work together
     let (server, _cert_fingerprint) = remote::get_server_with_port_ranges(Some("16000-16999"))?;
     let server_addr = remote::get_endpoint_addr(&server)?;
-    let client = remote::get_insecure_client_with_port_ranges(Some("17000-17999"))?;
+    // Use a dummy fingerprint since we're only testing port binding, not actual connections
+    let dummy_fingerprint = vec![0u8; 32];
+    let client =
+        remote::get_client_with_port_ranges_and_pinning(Some("17000-17999"), dummy_fingerprint)?;
     let client_addr = client.local_addr()?;
     // Verify both are in their respective ranges
     assert!(

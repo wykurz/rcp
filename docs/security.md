@@ -316,33 +316,6 @@ The following attacks are **not** protected by rcp itself:
 3. **Certificate Validation Only**: We don't validate hostname, expiry, or CA chains (not needed for ephemeral certs)
 4. **No Client Certificates**: rcpd doesn't present certificates to Master (authentication is via fingerprint validation)
 
-## Insecure Mode
-
-For testing or completely trusted network environments, certificate verification can be disabled.
-
-### When to Use
-
-- **Development and testing** on localhost
-- **Completely isolated networks** with physical security
-- **Debugging connection issues** (temporarily)
-
-### How to Enable
-
-Insecure mode is used when no certificate pinning is configured:
-
-```rust
-// Explicitly skip verification (not recommended)
-let client = get_insecure_client_with_port_ranges(Some("8000-8999"))?;
-```
-
-### Security Warning
-
-⚠️ **CRITICAL**: Insecure mode makes connections vulnerable to man-in-the-middle attacks!
-
-- An attacker on the network can intercept and modify all data
-- No validation of peer identity is performed
-- Only use in completely trusted environments
-
 ## Compliance and Standards
 
 ### Standards Compliance
