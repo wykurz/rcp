@@ -1,3 +1,88 @@
+//! Common utilities and types for RCP file operation tools
+//!
+//! This crate provides shared functionality used across all RCP tools (`rcp`, `rrm`, `rlink`, `rcmp`).
+//! It includes core operations (copy, remove, link, compare), progress reporting, metadata preservation,
+//! and runtime configuration.
+//!
+//! # Core Modules
+//!
+//! - [`mod@copy`] - File copying operations with metadata preservation and error handling
+//! - [`mod@rm`] - File removal operations
+//! - [`mod@link`] - Hard-linking operations
+//! - [`mod@cmp`] - File comparison operations (metadata-based)
+//! - [`mod@preserve`] - Metadata preservation settings and operations
+//! - [`mod@progress`] - Progress tracking and reporting
+//! - [`mod@filecmp`] - File metadata comparison utilities
+//! - [`mod@remote_tracing`] - Remote tracing support for distributed operations
+//!
+//! # Key Types
+//!
+//! ## RcpdType
+//!
+//! Identifies the role of a remote copy daemon:
+//! - `Source` - reads files from source host
+//! - `Destination` - writes files to destination host
+//!
+//! ## ProgressType
+//!
+//! Controls progress reporting display:
+//! - `Auto` - automatically choose based on terminal type
+//! - `ProgressBar` - animated progress bar (for interactive terminals)
+//! - `TextUpdates` - periodic text updates (for logging/non-interactive)
+//!
+//! # Progress Reporting
+//!
+//! The crate provides a global progress tracking system accessible via [`get_progress()`].
+//! Progress can be displayed in different formats depending on the execution context.
+//!
+//! Progress output goes to stderr, while logs go to stdout, allowing users to redirect
+//! logs to a file while still viewing interactive progress.
+//!
+//! # Runtime Configuration
+//!
+//! The [`run`] function provides a unified entry point for all RCP tools with support for:
+//! - Progress tracking and reporting
+//! - Logging configuration (quiet/verbose modes)
+//! - Resource limits (max workers, open files, throttling)
+//! - Tokio runtime setup
+//! - Remote tracing integration
+//!
+//! # Examples
+//!
+//! ## Basic Copy Operation
+//!
+//! ```rust,no_run
+//! use std::path::Path;
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let src = Path::new("/source");
+//! let dst = Path::new("/destination");
+//!
+//! let settings = common::copy::Settings::default();
+//! let preserve = common::preserve::preserve_default();
+//!
+//! let summary = common::copy(src, dst, &settings, &preserve).await?;
+//! println!("Copied {} files", summary.ok_cnt);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Metadata Comparison
+//!
+//! ```rust,no_run
+//! use std::path::Path;
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let src = Path::new("/path1");
+//! let dst = Path::new("/path2");
+//!
+//! let log = common::cmp::LogWriter::new(None)?;
+//! let settings = common::cmp::Settings::default();
+//!
+//! let summary = common::cmp(src, dst, &log, &settings).await?;
+//! println!("Differences found: {}", summary.ne_cnt);
+//! # Ok(())
+//! # }
+//! ```
+
 #[macro_use]
 extern crate lazy_static;
 

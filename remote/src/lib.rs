@@ -1,3 +1,163 @@
+//! Remote copy protocol and networking for distributed file operations
+//!
+//! This crate provides the networking layer and protocol definitions for remote file copying
+//! in the RCP tools suite. It enables efficient distributed copying between remote hosts using
+//! SSH for orchestration and QUIC for high-performance data transfer.
+//!
+//! # Overview
+//!
+//! The remote copy system uses a three-node architecture:
+//!
+//! ```text
+//! Master (rcp)
+//! ├── SSH → Source Host (rcpd)
+//! │   └── QUIC → Master (control)
+//! │   └── QUIC Server (waits for Destination)
+//! └── SSH → Destination Host (rcpd)
+//!     └── QUIC → Master (control)
+//!     └── QUIC Client → Source (data transfer)
+//! ```
+//!
+//! ## Connection Flow
+//!
+//! 1. **Initialization**: Master starts `rcpd` processes on source and destination via SSH
+//! 2. **Control Connections**: Both `rcpd` processes connect back to Master via QUIC
+//! 3. **Address Exchange**: Source starts QUIC server and sends its address to Master
+//! 4. **Direct Connection**: Master forwards address to Destination, which connects to Source
+//! 5. **Data Transfer**: Files flow directly from Source to Destination (not through Master)
+//!
+//! This design ensures efficient data transfer while allowing the Master to coordinate
+//! operations and monitor progress.
+//!
+//! # Key Components
+//!
+//! ## SSH Session Management
+//!
+//! The [`SshSession`] type represents an SSH connection to a remote host and is used to:
+//! - Launch `rcpd` daemons on remote hosts
+//! - Configure connection parameters (user, host, port)
+//!
+//! ## QUIC Networking
+//!
+//! QUIC protocol provides:
+//! - Multiplexed streams over a single connection
+//! - Built-in encryption and authentication
+//! - Efficient data transfer with congestion control
+//!
+//! Key functions:
+//! - [`get_server_with_port_ranges`] - Create QUIC server endpoint with optional port restrictions
+//! - [`get_client`] - Create QUIC client endpoint
+//! - [`get_endpoint_addr`] - Get the local address of an endpoint
+//!
+//! ## Port Range Configuration
+//!
+//! The [`port_ranges`] module allows restricting QUIC to specific port ranges, useful for
+//! firewall-restricted environments:
+//!
+//! ```rust,no_run
+//! # use remote::get_server_with_port_ranges;
+//! // Bind to ports in the 8000-8999 range
+//! let endpoint = get_server_with_port_ranges(Some("8000-8999"))?;
+//! # Ok::<(), anyhow::Error>(())
+//! ```
+//!
+//! ## Protocol Messages
+//!
+//! The [`protocol`] module defines the message types exchanged between nodes:
+//! - `MasterHello` - Master → rcpd configuration
+//! - `SourceMasterHello` - Source → Master address information
+//! - `RcpdResult` - rcpd → Master operation results
+//! - `TracingHello` - rcpd → Master tracing initialization
+//!
+//! ## Stream Communication
+//!
+//! The [`streams`] module provides high-level abstractions over QUIC streams:
+//! - Bidirectional streams for request/response communication
+//! - Unidirectional streams for tracing and logging
+//! - Object serialization/deserialization using bincode
+//!
+//! ## Remote Tracing
+//!
+//! The [`tracelog`] module enables distributed logging and progress tracking:
+//! - Forward tracing events from remote `rcpd` processes to Master
+//! - Aggregate progress information across multiple remote operations
+//! - Display unified progress for distributed operations
+//!
+//! # Security Considerations
+//!
+//! - **SSH Authentication**: Uses SSH for initial authentication and authorization
+//! - **Self-Signed Certificates**: QUIC connections use self-signed certificates (trusted implicitly)
+//! - **No Certificate Validation**: Accepts any server certificate (development mode)
+//!
+//! ⚠️ **Note**: The current implementation prioritizes ease of deployment over strict security.
+//! For production use in untrusted networks, consider enhancing certificate validation.
+//!
+//! # Network Troubleshooting
+//!
+//! Common failure scenarios and their handling:
+//!
+//! ## SSH Connection Fails
+//! - **Cause**: Host unreachable, authentication failure
+//! - **Timeout**: ~30s (SSH default)
+//! - **Error**: Standard SSH error messages
+//!
+//! ## rcpd Cannot Connect to Master
+//! - **Cause**: Firewall blocks QUIC, network routing issue
+//! - **Timeout**: Configurable via `--remote-copy-conn-timeout-sec` (default: 15s)
+//! - **Solution**: Check firewall rules for QUIC ports
+//!
+//! ## Destination Cannot Connect to Source
+//! - **Cause**: Firewall blocks direct connection between hosts
+//! - **Timeout**: Configurable (default: 15s)
+//! - **Solution**: Use `--quic-port-ranges` to specify allowed ports, configure firewall
+//!
+//! For detailed troubleshooting, see the repository's `docs/network_connectivity.md`.
+//!
+//! # Examples
+//!
+//! ## Starting a Remote Copy Daemon
+//!
+//! ```rust,no_run
+//! use remote::{SshSession, protocol::RcpdConfig, start_rcpd};
+//! use std::net::SocketAddr;
+//!
+//! # async fn example() -> anyhow::Result<()> {
+//! let session = SshSession {
+//!     user: Some("user".to_string()),
+//!     host: "example.com".to_string(),
+//!     port: None,
+//! };
+//!
+//! let config = RcpdConfig::default();
+//! let master_addr: SocketAddr = "192.168.1.100:5000".parse()?;
+//! let server_name = "master-server";
+//!
+//! let process = start_rcpd(&config, &session, &master_addr, server_name).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Creating a QUIC Server with Port Ranges
+//!
+//! ```rust,no_run
+//! use remote::{get_server_with_port_ranges, get_endpoint_addr};
+//!
+//! # fn example() -> anyhow::Result<()> {
+//! // Create server restricted to ports 8000-8999
+//! let endpoint = get_server_with_port_ranges(Some("8000-8999"))?;
+//! let addr = get_endpoint_addr(&endpoint)?;
+//! println!("Server listening on: {}", addr);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Module Organization
+//!
+//! - [`port_ranges`] - Port range parsing and UDP socket binding
+//! - [`protocol`] - Protocol message definitions and serialization
+//! - [`streams`] - QUIC stream wrappers with typed message passing
+//! - [`tracelog`] - Remote tracing and progress aggregation
+
 use anyhow::{anyhow, Context};
 use rand::Rng;
 use tracing::instrument;
