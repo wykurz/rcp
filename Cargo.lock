@@ -1498,6 +1498,7 @@ dependencies = [
  "common",
  "enum-map",
  "futures",
+ "hex",
  "predicates",
  "quinn",
  "rand",

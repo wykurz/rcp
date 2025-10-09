@@ -171,6 +171,36 @@ The remote copy uses a three-node architecture with QUIC protocol:
 
 For detailed network connectivity and troubleshooting information, see `docs/network_connectivity.md`.
 
+## security
+
+**Remote copy operations are secured against man-in-the-middle (MITM) attacks** using a combination of SSH authentication and certificate pinning.
+
+**Security Model:**
+- **SSH Authentication**: All remote operations require SSH authentication first
+- **TLS 1.3 Encryption**: Data transfer uses QUIC with TLS 1.3 for encryption
+- **Certificate Pinning**: SHA-256 fingerprints prevent endpoint impersonation
+- **No Configuration Required**: Security features work automatically
+
+**How It Works:**
+1. SSH authenticates and launches `rcpd` on remote hosts
+2. Certificate fingerprints are transmitted via the secure SSH channel
+3. QUIC connections validate certificates against these fingerprints
+4. Connections fail if fingerprints don't match (MITM detected)
+
+**What's Protected:**
+- ✅ Man-in-the-middle attacks
+- ✅ Eavesdropping (all data encrypted)
+- ✅ Data tampering (cryptographic integrity)
+- ✅ Connection hijacking
+- ✅ Unauthorized access (SSH authentication required)
+
+**Trust Model:**
+- SSH is the root of trust (use SSH best practices)
+- Certificate fingerprints are ephemeral (generated per session)
+- No PKI or long-term certificate management needed
+
+For detailed security architecture and threat model, see `SECURITY.md`.
+
 ## terminal output
 
 **Log messages**
