@@ -1,43 +1,61 @@
 use anyhow::Context;
-use structopt::StructOpt;
+use clap::Parser;
 use tracing::instrument;
 
 use rcp_tools_rcp::{destination, source};
 
-#[derive(structopt::StructOpt, std::fmt::Debug, std::clone::Clone)]
-#[structopt(
+#[derive(Parser, Debug, Clone)]
+#[command(
     name = "rcpd",
+    version,
     about = "`rcpd` is used by the `rcp` command for performing remote data copies. Please see `rcp` for more \
 information."
 )]
 struct Args {
     /// The master (rcp) address to connect to
-    #[structopt(long, required = true)]
+    #[arg(long)]
     master_addr: std::net::SocketAddr,
 
     /// The server name to use for the QUIC connection
-    #[structopt(long, required = true)]
+    #[arg(long)]
     server_name: String,
 
+    /// SHA-256 fingerprint of the Master's TLS certificate (hex-encoded)
+    ///
+    /// Used for certificate pinning to prevent MITM attacks
+    #[arg(long)]
+    master_cert_fingerprint: String,
+
+    // Copy options
     /// Overwrite existing files/directories
-    #[structopt(short, long)]
+    #[arg(short, long, help_heading = "Copy options")]
     overwrite: bool,
 
-    /// Comma separated list of file attributes to compare when when deciding if files are "identical", used with
-    /// --overwrite flag.
+    /// Comma separated list of file attributes to compare when deciding if files are "identical", used with --overwrite flag
+    ///
     /// Options are: uid, gid, mode, size, mtime, ctime
-    #[structopt(long, default_value = "size,mtime")]
+    #[arg(
+        long,
+        default_value = "size,mtime",
+        value_name = "OPTIONS",
+        help_heading = "Copy options"
+    )]
     overwrite_compare: String,
 
     /// Exit on first error
-    #[structopt(short = "-e", long = "fail-early")]
+    #[arg(short = 'e', long = "fail-early", help_heading = "Copy options")]
     fail_early: bool,
 
+    /// Always follow symbolic links in source
+    #[arg(short = 'L', long, help_heading = "Copy options")]
+    dereference: bool,
+
+    // Progress & output
     /// Show progress
-    #[structopt(long)]
+    #[arg(long, help_heading = "Progress & output")]
     progress: bool,
 
-    /// Sets the delay between progress updates.
+    /// Sets the delay between progress updates
     ///
     /// - For the interactive (--progress-type=ProgressBar), the default is 200ms.
     /// - For the non-interactive (--progress-type=TextUpdates), the default is 10s.
@@ -45,69 +63,94 @@ struct Args {
     /// If specified, --progress flag is implied.
     ///
     /// This option accepts a human readable duration, e.g. "200ms", "10s", "5min" etc.
-    #[structopt(long)]
+    #[arg(long, value_name = "DELAY", help_heading = "Progress & output")]
     progress_delay: Option<String>,
 
-    /// Always follow symbolic links in source
-    #[structopt(short = "-L", long)]
-    dereference: bool,
-
-    /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
-    #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
+    /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR)
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, help_heading = "Progress & output")]
     verbose: u8,
 
     /// Quiet mode, don't report errors
-    #[structopt(short = "q", long = "quiet")]
+    #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
     quiet: bool,
 
-    /// Number of worker threads, 0 means number of cores
-    #[structopt(long, default_value = "0")]
-    max_workers: usize,
-
-    /// Number of blocking worker threads, 0 means Tokio runtime default (512)
-    #[structopt(long, default_value = "0")]
-    max_blocking_threads: usize,
-
-    /// Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system
-    /// limit
-    #[structopt(long)]
+    // Performance & throttling
+    /// Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system limit
+    #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
     max_open_files: Option<usize>,
 
     /// Throttle the number of operations per second, 0 means no throttle
-    #[structopt(long, default_value = "0")]
+    #[arg(
+        long,
+        default_value = "0",
+        value_name = "N",
+        help_heading = "Performance & throttling"
+    )]
     ops_throttle: usize,
 
-    /// Throttle the number of I/O operations per second, 0 means no throttle.
+    /// Throttle the number of I/O operations per second, 0 means no throttle
     ///
     /// I/O is calculated based on provided chunk size -- number of I/O operations for a file is calculated as:
     /// ((file size - 1) / chunk size) + 1
-    #[structopt(long, default_value = "0")]
+    #[arg(
+        long,
+        default_value = "0",
+        value_name = "N",
+        help_heading = "Performance & throttling"
+    )]
     iops_throttle: usize,
 
-    /// Chunk size used to calculate number of I/O per file.
+    /// Chunk size used to calculate number of I/O per file
     ///
     /// Modifying this setting to a value > 0 is REQUIRED when using --iops-throttle.
-    #[structopt(long, default_value = "0")]
+    #[arg(
+        long,
+        default_value = "0",
+        value_name = "SIZE",
+        help_heading = "Performance & throttling"
+    )]
     chunk_size: u64,
 
-    /// Enable file-based debug logging with given prefix
-    #[structopt(long)]
-    debug_log_prefix: Option<String>,
+    // Advanced settings
+    /// Number of worker threads, 0 means number of cores
+    #[arg(
+        long,
+        default_value = "0",
+        value_name = "N",
+        help_heading = "Advanced settings"
+    )]
+    max_workers: usize,
 
+    /// Number of blocking worker threads, 0 means Tokio runtime default (512)
+    #[arg(
+        long,
+        default_value = "0",
+        value_name = "N",
+        help_heading = "Advanced settings"
+    )]
+    max_blocking_threads: usize,
+
+    // Remote copy options
     /// Restrict QUIC binding to specific port ranges (e.g., "8000-8999,10000-10999")
+    ///
     /// If not specified, uses dynamic port allocation (default behavior)
-    #[structopt(long)]
+    #[arg(long, value_name = "RANGES", help_heading = "Remote copy options")]
     quic_port_ranges: Option<String>,
 
     /// Timeout for remote copy connections in seconds (default: 15)
+    ///
     /// This applies to: rcpd connecting to master, destination connecting to source
-    #[structopt(long, default_value = "15")]
+    #[arg(
+        long,
+        default_value = "15",
+        value_name = "N",
+        help_heading = "Remote copy options"
+    )]
     remote_copy_conn_timeout_sec: u64,
 
-    /// SHA-256 fingerprint of the Master's TLS certificate (hex-encoded)
-    /// Used for certificate pinning to prevent MITM attacks
-    #[structopt(long, required = true)]
-    master_cert_fingerprint: String,
+    /// Enable file-based debug logging with given prefix
+    #[arg(long, value_name = "PREFIX", help_heading = "Remote copy options")]
+    debug_log_prefix: Option<String>,
 }
 
 #[instrument]
@@ -250,7 +293,7 @@ async fn async_main(
 }
 
 fn main() -> Result<(), anyhow::Error> {
-    let args = Args::from_args();
+    let args = Args::parse();
     let (tracing_layer, tracing_sender, tracing_receiver) =
         common::remote_tracing::RemoteTracingLayer::new();
     let func = {
