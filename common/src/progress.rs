@@ -7,6 +7,7 @@ pub struct TlsCounter {
 }
 
 impl TlsCounter {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             count: thread_local::ThreadLocal::new(),
@@ -69,6 +70,7 @@ pub struct Status {
 }
 
 impl ProgressCounter {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             started: TlsCounter::new(),
@@ -116,6 +118,7 @@ pub struct Progress {
 }
 
 impl Progress {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             ops: Default::default(),
@@ -188,7 +191,7 @@ impl Default for SerializableProgress {
 }
 
 impl From<&Progress> for SerializableProgress {
-    /// Creates a SerializableProgress from a Progress, capturing the current time at the moment of conversion
+    /// Creates a `SerializableProgress` from a Progress, capturing the current time at the moment of conversion
     fn from(progress: &Progress) -> Self {
         Self {
             ops_started: progress.ops.started.get(),
@@ -303,6 +306,7 @@ pub struct RcpdProgressPrinter {
 }
 
 impl RcpdProgressPrinter {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             last_source_ops: 0,

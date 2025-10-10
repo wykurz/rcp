@@ -86,9 +86,10 @@ fn run_rcp_and_expect_success(args: &[&str]) -> std::process::Output {
 fn run_rcp_and_expect_failure(args: &[&str]) -> std::process::Output {
     let output = run_rcp_with_args(args);
     print_command_output(&output);
-    if output.status.success() {
-        panic!("Command succeeded when failure was expected");
-    }
+    assert!(
+        !output.status.success(),
+        "Command succeeded when failure was expected"
+    );
     output
 }
 
@@ -529,20 +530,19 @@ fn test_remote_debug_log_file_creation() {
     // Check that debug log files were created
     let tmp_entries = std::fs::read_dir(temp_dir)
         .expect("Failed to read temp directory")
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|entry| {
             entry
                 .file_name()
                 .to_str()
-                .map(|name| name.starts_with(&format!("rcpd-test-{}", std::process::id())))
-                .unwrap_or(false)
+                .is_some_and(|name| name.starts_with(&format!("rcpd-test-{}", std::process::id())))
         })
         .collect::<Vec<_>>();
     eprintln!(
         "Found debug log files: {:?}",
         tmp_entries
             .iter()
-            .map(|e| e.file_name())
+            .map(std::fs::DirEntry::file_name)
             .collect::<Vec<_>>()
     );
     assert!(!tmp_entries.is_empty(), "Debug log files should be created");

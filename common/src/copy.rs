@@ -20,6 +20,7 @@ pub struct Error {
 }
 
 impl Error {
+    #[must_use]
     pub fn new(source: anyhow::Error, summary: Summary) -> Self {
         Error { source, summary }
     }

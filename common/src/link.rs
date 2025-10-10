@@ -23,6 +23,7 @@ pub struct Error {
 }
 
 impl Error {
+    #[must_use]
     pub fn new(source: anyhow::Error, summary: Summary) -> Self {
         Error { source, summary }
     }
@@ -197,33 +198,32 @@ pub async fn link(
             if filecmp::metadata_equal(&settings.update_compare, &src_metadata, update_metadata) {
                 tracing::debug!("no change, hard link 'src'");
                 return hard_link_helper(prog_track, src, &src_metadata, dst, settings).await;
-            } else {
-                tracing::debug!(
-                    "link: {:?} metadata has changed, copying from {:?}",
-                    src,
-                    update
-                );
-                return Ok(Summary {
-                    copy_summary: copy::copy_file(
-                        prog_track,
-                        update,
-                        dst,
-                        &settings.copy_settings,
-                        &RLINK_PRESERVE_SETTINGS,
-                        is_fresh,
-                    )
-                    .await
-                    .map_err(|err| {
-                        let copy_summary = err.summary;
-                        let link_summary = Summary {
-                            copy_summary,
-                            ..Default::default()
-                        };
-                        Error::new(err.source, link_summary)
-                    })?,
-                    ..Default::default()
-                });
             }
+            tracing::debug!(
+                "link: {:?} metadata has changed, copying from {:?}",
+                src,
+                update
+            );
+            return Ok(Summary {
+                copy_summary: copy::copy_file(
+                    prog_track,
+                    update,
+                    dst,
+                    &settings.copy_settings,
+                    &RLINK_PRESERVE_SETTINGS,
+                    is_fresh,
+                )
+                .await
+                .map_err(|err| {
+                    let copy_summary = err.summary;
+                    let link_summary = Summary {
+                        copy_summary,
+                        ..Default::default()
+                    };
+                    Error::new(err.source, link_summary)
+                })?,
+                ..Default::default()
+            });
         }
         if update_metadata.is_symlink() {
             tracing::debug!("'update' is a symlink so just symlink that");

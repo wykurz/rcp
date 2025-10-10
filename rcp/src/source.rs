@@ -63,7 +63,7 @@ async fn send_directories_and_symlinks(
         let symlink = remote::protocol::SourceMessage::Symlink {
             src: src.to_path_buf(),
             dst: dst.to_path_buf(),
-            target: target.to_path_buf(),
+            target: target.clone(),
             metadata: remote::protocol::Metadata::from(&src_metadata),
             is_root,
         };
@@ -292,9 +292,8 @@ async fn send_file(
             }
             if settings.fail_early {
                 return Err(e.into());
-            } else {
-                return Ok(());
             }
+            return Ok(());
         }
     };
     let metadata = remote::protocol::Metadata::from(src_metadata);

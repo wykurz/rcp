@@ -12,6 +12,7 @@ impl RemotePath {
         Ok(Self { session, path })
     }
 
+    #[must_use]
     pub fn from_local(path: &std::path::Path) -> Self {
         Self {
             session: remote::SshSession::local(),
@@ -19,10 +20,12 @@ impl RemotePath {
         }
     }
 
+    #[must_use]
     pub fn session(&self) -> &remote::SshSession {
         &self.session
     }
 
+    #[must_use]
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
@@ -47,7 +50,7 @@ impl PartialEq for PathType {
     }
 }
 
-/// Gets the compiled regex for parsing remote paths (shared with parse_path)
+/// Gets the compiled regex for parsing remote paths (shared with `parse_path`)
 fn get_remote_path_regex() -> &'static regex::Regex {
     use std::sync::OnceLock;
     static REGEX: OnceLock<regex::Regex> = OnceLock::new();
@@ -58,9 +61,9 @@ fn get_remote_path_regex() -> &'static regex::Regex {
     })
 }
 
-/// Splits a remote path string into (host_prefix, path_part) using the same logic as parse_path
+/// Splits a remote path string into (`host_prefix`, `path_part`) using the same logic as `parse_path`
 /// For example: "user@host:22:/path/to/file" -> ("user@host:22:", "/path/to/file")
-/// For local paths, returns (None, original_path)
+/// For local paths, returns (None, `original_path`)
 fn split_remote_path(path_str: &str) -> (Option<String>, &str) {
     let re = get_remote_path_regex();
     if let Some(captures) = re.captures(path_str) {
@@ -95,6 +98,7 @@ fn join_path_with_filename(host_prefix: Option<String>, dir_path: &str, filename
     }
 }
 
+#[must_use]
 pub fn parse_path(path: &str) -> PathType {
     let re = get_remote_path_regex();
     if let Some(captures) = re.captures(path) {

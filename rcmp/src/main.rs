@@ -192,10 +192,10 @@ fn main() -> Result<()> {
         func,
     );
     match res {
-        Some(summary) => match args.no_check {
-            // when --no-check is specified, return error code only if there were errors
-            true => std::process::exit(0),
-            false => {
+        Some(summary) => {
+            if args.no_check {
+                std::process::exit(0)
+            } else {
                 // if there are any differences, return error code 1
                 for (_, cmp_result) in &summary.mismatch {
                     let different = cmp_result[common::cmp::CompareResult::Different] > 0
@@ -207,7 +207,7 @@ fn main() -> Result<()> {
                 }
                 std::process::exit(0);
             }
-        },
+        }
         None => std::process::exit(2),
     }
 }

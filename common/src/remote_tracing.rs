@@ -17,6 +17,7 @@ pub struct RemoteTracingLayer {
 }
 
 impl RemoteTracingLayer {
+    #[must_use]
     pub fn new() -> (
         Self,
         tokio::sync::mpsc::UnboundedSender<TracingMessage>,
@@ -109,7 +110,7 @@ where
         event.record(&mut visitor);
         let message = visitor.message.unwrap_or_else(|| {
             if visitor.fields.is_empty() {
-                "".to_string()
+                String::new()
             } else {
                 format!("{:?}", visitor.fields)
             }

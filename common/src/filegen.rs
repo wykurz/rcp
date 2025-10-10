@@ -13,6 +13,7 @@ pub struct Error {
 }
 
 impl Error {
+    #[must_use]
     pub fn new(source: anyhow::Error, summary: Summary) -> Self {
         Error { source, summary }
     }
@@ -316,7 +317,7 @@ mod tests {
         assert_eq!(summary.bytes_written, 1000); // 200 × 5
         for i in 0..5 {
             // verify files
-            let file_path = test_path.join(format!("file{}", i));
+            let file_path = test_path.join(format!("file{i}"));
             assert!(file_path.exists());
             let metadata = tokio::fs::metadata(&file_path).await?;
             assert_eq!(metadata.len(), 200);

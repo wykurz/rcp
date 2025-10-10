@@ -359,14 +359,13 @@ async fn create_directory_structure(
                     tracing::info!("Root directory processed");
                     send_root_done(control_send_stream).await?;
                     break;
-                } else {
-                    directory_tracker
-                        .lock()
-                        .await
-                        .decrement_entry(src, dst)
-                        .await
-                        .with_context(|| format!("Failed to decrement directory entry count after receiving directory metadata src: {src:?}, dst: {dst:?}"))?;
                 }
+                directory_tracker
+                    .lock()
+                    .await
+                    .decrement_entry(src, dst)
+                    .await
+                    .with_context(|| format!("Failed to decrement directory entry count after receiving directory metadata src: {src:?}, dst: {dst:?}"))?;
             }
             remote::protocol::SourceMessage::Symlink {
                 ref src,
@@ -393,18 +392,18 @@ async fn create_directory_structure(
                                 if target == &dst_link {
                                     tracing::debug!("destination is a symlink and points to the same location as source");
                                     if preserve.symlink.any() {
-                                        if !common::filecmp::metadata_equal(
+                                        if common::filecmp::metadata_equal(
                                             &settings.overwrite_compare,
                                             metadata,
                                             &dst_metadata,
                                         ) {
+                                            tracing::debug!("destination symlink is identical, skipping");
+                                            prog.symlinks_unchanged.inc();
+                                        } else {
                                             tracing::debug!("destination metadata is different, updating");
                                             common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
                                             prog.symlinks_removed.inc();
                                             prog.symlinks_created.inc();
-                                        } else {
-                                            tracing::debug!("destination symlink is identical, skipping");
-                                            prog.symlinks_unchanged.inc();
                                         }
                                     } else {
                                         tracing::debug!("destination symlink is identical, skipping");
@@ -449,16 +448,15 @@ async fn create_directory_structure(
                     tracing::info!("Root symlink processed");
                     send_root_done(control_send_stream).await?;
                     break;
-                } else {
-                    directory_tracker
-                        .lock()
-                        .await
-                        .decrement_entry(src, dst)
-                        .await
-                        .context(
-                            "Failed to decrement directory entry count after receiving a symlink",
-                        )?;
                 }
+                directory_tracker
+                    .lock()
+                    .await
+                    .decrement_entry(src, dst)
+                    .await
+                    .context(
+                        "Failed to decrement directory entry count after receiving a symlink",
+                    )?;
             }
             remote::protocol::SourceMessage::DirStructureComplete => {
                 tracing::info!("All directories creation completed");

@@ -84,7 +84,7 @@ struct Args {
 
     /// Set delay between progress updates
     ///
-    /// Default is 200ms for interactive mode (ProgressBar) and 10s for non-interactive mode (TextUpdates). If specified, --progress flag is implied. Accepts human-readable durations like "200ms", "10s", "5min".
+    /// Default is 200ms for interactive mode (`ProgressBar`) and 10s for non-interactive mode (`TextUpdates`). If specified, --progress flag is implied. Accepts human-readable durations like "200ms", "10s", "5min".
     #[arg(long, value_name = "DELAY", help_heading = "Progress & output")]
     progress_delay: Option<String>,
 
@@ -116,7 +116,7 @@ struct Args {
 
     /// Limit I/O operations per second (0 = no throttle)
     ///
-    /// Requires --chunk-size to calculate I/O operations per file: ((file_size - 1) / chunk_size) + 1
+    /// Requires --chunk-size to calculate I/O operations per file: ((`file_size` - 1) / `chunk_size`) + 1
     #[arg(
         long,
         default_value = "0",
@@ -431,7 +431,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
     }
     // pick the path type of the first source in the list and ensure all other sources match
     let first_src_path_type = path::parse_path(&src_strings[0]);
-    for src in src_strings[1..].iter() {
+    for src in &src_strings[1..] {
         let path_type = path::parse_path(src);
         if path_type != first_src_path_type {
             return Err(anyhow!(
