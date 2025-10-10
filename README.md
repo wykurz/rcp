@@ -7,29 +7,19 @@ This repo contains tools to efficiently copy, remove and link large filesets, bo
 
 [![Build status](https://github.com/wykurz/rcp/actions/workflows/rust.yml/badge.svg)](https://github.com/wykurz/rcp/actions)
 
-- `rcp` is a tool for copying files; similar to `cp` but generally MUCH faster when dealing with a large number of files.
+- `rcp` is for copying files; similar to `cp` but generally MUCH faster when dealing with large filesets.
 
     Supports both local and remote copying using `host:/path` syntax (similar to `scp`).
 
     Inspired by tools like `dsync`(1) and `pcp`(2).
 
-- `rcpd` is the remote copy daemon that enables distributed copying operations.
+- `rrm` is for removing large filesets.
 
-    Automatically launched by `rcp` when using remote paths. Uses QUIC protocol for efficient data transfer.
+- `rlink` allows hard-linking filesets with optional update path; typically used for hard-linking datasets with a delta.
 
-- `rrm` is a tool for removing files.
+- `rcmp` tool is for comparing filesets.
 
-    Basic usage is equivalent to `rm -rf`.
-
-- `rlink` allows hard-linking files.
-
-    A common pattern is to also provide `--update <path>` that overrides any paths in `src` to instead be copied over from there.
-
-- `rcmp` is a tool for comparing filesets.
-
-    Currently, it only supports comparing metadata (no content checking).
-
-    Returns error code 1 if there are differences, 2 if there were errors.
+- `filegen` tool generates sample filesets, useful for testing.
 
 Examples
 ========
