@@ -371,6 +371,11 @@ pub async fn start_rcpd(
     cmd.spawn().await.context("Failed to spawn rcpd command")
 }
 
+/// Compute SHA-256 fingerprint of a DER-encoded certificate
+fn compute_cert_fingerprint(cert_der: &[u8]) -> ring::digest::Digest {
+    ring::digest::digest(&ring::digest::SHA256, cert_der)
+}
+
 /// Configure QUIC server with a self-signed certificate
 /// Returns the server config and the SHA-256 fingerprint of the certificate
 fn configure_server() -> anyhow::Result<(quinn::ServerConfig, Vec<u8>)> {
@@ -378,16 +383,12 @@ fn configure_server() -> anyhow::Result<(quinn::ServerConfig, Vec<u8>)> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let key_der = cert.serialize_private_key_der();
     let cert_der = cert.serialize_der()?;
-
-    // compute SHA-256 fingerprint of the certificate for pinning
-    let fingerprint = ring::digest::digest(&ring::digest::SHA256, &cert_der);
+    let fingerprint = compute_cert_fingerprint(&cert_der);
     let fingerprint_vec = fingerprint.as_ref().to_vec();
-
     tracing::debug!(
         "Generated certificate with fingerprint: {}",
         hex::encode(&fingerprint_vec)
     );
-
     let key = rustls::PrivateKey(key_der);
     let cert = rustls::Certificate(cert_der);
     let server_config = quinn::ServerConfig::with_single_cert(vec![cert], key)
@@ -441,9 +442,7 @@ impl rustls::client::ServerCertVerifier for PinnedCertVerifier {
         _ocsp_response: &[u8],
         _now: std::time::SystemTime,
     ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        // compute SHA-256 fingerprint of the received certificate
-        let received_fingerprint = ring::digest::digest(&ring::digest::SHA256, &end_entity.0);
-
+        let received_fingerprint = compute_cert_fingerprint(&end_entity.0);
         if received_fingerprint.as_ref() == self.expected_fingerprint.as_slice() {
             tracing::debug!(
                 "Certificate fingerprint validated successfully: {}",
