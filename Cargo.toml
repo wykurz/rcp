@@ -12,6 +12,10 @@ members = [
   "throttle",
 ]
 
+[workspace.lints.clippy]
+# Deny all warnings to enforce code quality
+all = { level = "deny", priority = -1 }
+
 [profile.dev]
 panic = "abort"
 
