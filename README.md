@@ -31,68 +31,65 @@ This repo contains tools to efficiently copy, remove and link large filesets, bo
 
     Returns error code 1 if there are differences, 2 if there were errors.
 
-examples
+Examples
 ========
 
-### basic local copy with progress-bar and summary at the end:
+Basic local copy with progress-bar and summary at the end:
 ```fish
 > rcp <foo> <bar> --progress --summary
 ```
-Roughly equivalent to `cp -R --update=none <foo> <bar>`.
 
-### copy while preserving metadata, overwrite/update destination if it already exists:
+Copy while preserving metadata, overwrite/update destination if it already exists:
 ```fish
 > rcp <foo> <bar> --preserve --progress --summary --overwrite
 ```
-Roughly equivalent to: `cp -pR <foo> <bar>`.
 
-### remote copy from one host to another:
+Remote copy from one host to another:
 ```fish
 > rcp user@host1:/path/to/source user@host2:/path/to/dest --progress --summary
 ```
-Copies files from `host1` to `host2`. The `rcpd` daemon is automatically started on both hosts via SSH.
+Copies files from `host1` to `host2`. The `rcpd` process is automatically started on both hosts via SSH.
 
-### copy from remote host to local machine:
+Copy from remote host to local machine:
 ```fish
 > rcp host:/remote/path /local/path --progress --summary
 ```
 
-### copy from local machine to remote host:
+Copy from local machine to remote host and preserve metadata:
 ```fish
 > rcp /local/path host:/remote/path --progress --summary --preserve
 ```
 
-### log tool output to a file while using progress bar
-Progress bar is sent to `stderr` while log messages go to `stdout`. This allows us to pipe `stdout` to a file to preserve the tool output while still viewing the interactive progress bar. This works for all RCP tools.
+Log tool output to a file while using progress bar:
 ```fish
 > rcp <foo> <bar> --progress --summary > copy.log
 ```
+Progress bar is sent to `stderr` while log messages go to `stdout`. This allows us to pipe `stdout` to a file to preserve the tool output while still viewing the interactive progress bar. This works for all RCP tools.
 
-### remove a path:
+Remove a path recursively:
 ```fish
 > rrm <bar> --progress --summary
 ```
-Roughly equivalent to: `rm -rf <bar>`.
 
-### hard-link contents of one path to another:
+Hard-link contents of one path to another:
 ```fish
 > rlink <foo> <bar> --progress --summary
 ```
 Roughly equivalent to: `cp -p --link <foo> <bar>`.
 
-### hard-link contents of `<foo>` to `<baz>` if they are identical to `<bar>`:
+Hard-link contents of `<foo>` to `<baz>` if they are identical to `<bar>`:
 ```fish
 > rlink <foo> --update <bar> <baz> --update-exclusive --progress --summary
 ```
 Using `--update-exclusive` means that if a file is present in `<foo>` but not in `<bar>` it will be ignored.
 Roughly equivalent to: `rsync -a --link-dest=<foo> <bar> <baz>`.
 
-### compare `<foo>` vs. `<bar>`:
+Compare `<foo>` vs. `<bar>`:
 ```fish
 > rcmp <foo> <bar> --progress --summary --log compare.log
 ```
 
-installation
+Installation
 ============
 
 <picture>
@@ -115,10 +112,10 @@ debian / rhel
 
 Starting with release `v0.10.1`, .deb and .rpm packages are available as part of each release.
 
-general controls
+General controls
 ================
 
-## copy semantics
+## Copy semantics
 
 The copy semantics for RCP tools differ slightly from how e.g. the `cp` tool works. This is because of the ambiguity in the result of a `cp` operation that we wanted to avoid.
 
@@ -137,20 +134,23 @@ The following examples illustrate this (_those rules apply to both `rcp` and `rl
 Using `rcp` it's also possible to copy multiple sources into a single destination, but the destination MUST have a trailing slash (`/`):
 - `rcp A B C D/` - copy `A`, `B` and `C` into `D` WITHOUT renaming i.e., the resulting paths will be `D/A`, `D/B` and `D/C`; if any of which exist fail immediately
 
-## throttling
+## Throttling
 
-- set `--ops-throttle` to reduce the maximum number of operations per second
+- set `--ops-throttle` to limit the maximum number of operations per second
   - useful if you want to avoid interfering with other work on the storage / host
 
-- set `--max-open-files` to reduce the maximum number of open files
+- set `--iops-throttle` to limit the maximum number of I/O operations per second
+  - MUST be used with `--chunk-size`, which is used to calculate I/O operations per file
+
+- set `--max-open-files` to limit the maximum number of open files
   - RCP tools will automatically adjust the maximum based on the system limits however, this setting can be used if there are additional constraints
 
-## error handling
+## Error handling
 
 - `rcp` tools will log non-terminal errors and continue by default
 - to fail immediately on any error use the `--fail-early` flag
 
-## remote copy configuration
+## Remote copy configuration
 
 When using remote paths (`host:/path` syntax), `rcp` automatically starts `rcpd` daemons on remote hosts via SSH.
 
@@ -171,7 +171,7 @@ The remote copy uses a three-node architecture with QUIC protocol:
 
 For detailed network connectivity and troubleshooting information, see `docs/network_connectivity.md`.
 
-## security
+## Security
 
 **Remote copy operations are secured against man-in-the-middle (MITM) attacks** using a combination of SSH authentication and certificate pinning.
 
@@ -201,7 +201,7 @@ For detailed network connectivity and troubleshooting information, see `docs/net
 
 For detailed security architecture and threat model, see `docs/security.md`.
 
-## terminal output
+## Terminal output
 
 **Log messages**
 - sent to `stdout`
@@ -218,7 +218,7 @@ For detailed security architecture and threat model, see `docs/security.md`.
 - by default disabled
 - enabled using `--summary`
 
-## overwrite
+## Overwrite
 
 `rcp` tools will not-overwrite pre-existing data unless used with the `--overwrite` flag.
 
@@ -231,15 +231,15 @@ tracing and tokio-console
 
 The `rcp` tools now use the `tracing` crate for logging and support sending data to the `tokio-console` subscriber.
 
-## enabling
+## Enabling
 
 To enable the `console-subscriber` you need to set the environment variable `RCP_TOKIO_TRACING_CONSOLE_ENABLED=1` (or `true` with any case).
 
-## sever port
+## Server port
 
 By default port `6669` is used (`tokio-console` default) but this can be changed by setting `RCP_TOKIO_TRACING_CONSOLE_SERVER_PORT=1234`.
 
-## retention time
+## Retention time
 
 The trace events are retained for 60s. This can be modified by setting `RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS=120`.
 
