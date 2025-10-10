@@ -170,7 +170,6 @@ pub struct RcpdConfig {
     pub ops_throttle: usize,
     pub iops_throttle: usize,
     pub chunk_size: usize,
-    pub tput_throttle: usize,
     // common::copy::Settings
     pub dereference: bool,
     pub overwrite: bool,
@@ -193,7 +192,6 @@ impl RcpdConfig {
             format!("--ops-throttle={}", self.ops_throttle),
             format!("--iops-throttle={}", self.iops_throttle),
             format!("--chunk-size={}", self.chunk_size),
-            format!("--tput-throttle={}", self.tput_throttle),
             format!("--overwrite-compare={}", self.overwrite_compare),
         ];
         if self.verbose > 0 {

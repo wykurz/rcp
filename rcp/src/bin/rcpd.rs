@@ -90,10 +90,6 @@ struct Args {
     #[structopt(long, default_value = "0")]
     chunk_size: u64,
 
-    /// Throttle the number of bytes per second, 0 means no throttle
-    #[structopt(long, default_value = "0")]
-    tput_throttle: usize,
-
     /// Enable file-based debug logging with given prefix
     #[structopt(long)]
     debug_log_prefix: Option<String>,
@@ -284,7 +280,6 @@ fn main() -> Result<(), anyhow::Error> {
         args.ops_throttle,
         args.iops_throttle,
         args.chunk_size,
-        args.tput_throttle,
         Some(tracing_layer),
         debug_log_file,
         func,
