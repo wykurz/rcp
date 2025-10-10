@@ -23,9 +23,9 @@ struct Args {
     // Comparison options
     /// Attributes to compare when deciding if objects are "identical"
     ///
-    /// The format is: "<type1>:<attributes1> <type2>:<attributes2> ..."
-    /// Where <type> is one of: "f" (file), "d" (directory), "l" (symlink)
-    /// And <attributes> is a comma separated list of: uid, gid, mode, size, mtime, ctime
+    /// The format is: "`<type1>:<attributes1> <type2>:<attributes2>` ..."
+    /// Where `<type>` is one of: "f" (file), "d" (directory), "l" (symlink)
+    /// And `<attributes>` is a comma separated list of: uid, gid, mode, size, mtime, ctime
     ///
     /// Example: "f:mtime,ctime,mode,size d:mtime,ctime,mode l:mtime,ctime,mode"
     #[arg(

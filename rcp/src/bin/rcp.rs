@@ -65,7 +65,7 @@ struct Args {
 
     /// Specify exactly what attributes to preserve
     ///
-    /// If specified, the --preserve flag is ignored. Format: "<type1>:<attributes1> <type2>:<attributes2> ..." where <type> is one of f (file), d (directory), l (symlink), and <attributes> is a comma-separated list of uid, gid, time, or a 4-digit octal mode mask.
+    /// If specified, the --preserve flag is ignored. Format: "`<type1>:<attributes1> <type2>:<attributes2>` ..." where `<type>` is one of f (file), d (directory), l (symlink), and `<attributes>` is a comma-separated list of uid, gid, time, or a 4-digit octal mode mask.
     ///
     /// Example: "f:uid,gid,time,0777 d:uid,gid,time,0777 l:uid,gid,time"
     #[arg(long, value_name = "SETTINGS", help_heading = "Copy options")]
