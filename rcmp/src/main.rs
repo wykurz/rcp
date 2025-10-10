@@ -1,9 +1,10 @@
 use anyhow::Result;
-use structopt::StructOpt;
+use clap::Parser;
 
-#[derive(StructOpt, Debug, Clone)]
-#[structopt(
+#[derive(Parser, Debug, Clone)]
+#[command(
     name = "rcmp",
+    version,
     about = "`rcmp` is a tool for comparing large filesets.
 
 Currently, it only supports comparing metadata (no content checking).
@@ -11,29 +12,44 @@ Currently, it only supports comparing metadata (no content checking).
 Returns error code 1 if there are differences, 2 if there were errors."
 )]
 struct Args {
-    /// Attributes to compare when when deciding if objects are "identical". Options are: uid, gid, mode, size, mtime, ctime
+    // Comparison options
+    /// Attributes to compare when deciding if objects are "identical"
     ///
     /// The format is: "<type1>:<attributes1> <type2>:<attributes2> ..."
     /// Where <type> is one of: "f" (file), "d" (directory), "l" (symlink)
-    /// And <attributes> is a comma separated list of: uid, gid, size, mtime, ctime
+    /// And <attributes> is a comma separated list of: uid, gid, mode, size, mtime, ctime
     ///
     /// Example: "f:mtime,ctime,mode,size d:mtime,ctime,mode l:mtime,ctime,mode"
-    #[structopt(long, default_value = "f:mtime,size d:mtime l:mtime")]
+    #[arg(
+        long,
+        default_value = "f:mtime,size d:mtime l:mtime",
+        value_name = "SETTINGS",
+        help_heading = "Comparison options"
+    )]
     metadata_compare: String,
 
     /// Exit on first error
-    #[structopt(short = "-e", long = "fail-early")]
+    #[arg(short = 'e', long = "fail-early", help_heading = "Comparison options")]
     fail_early: bool,
 
     /// Exit on first mismatch
-    #[structopt(short = "-m", long = "exit-early")]
+    #[arg(short = 'm', long = "exit-early", help_heading = "Comparison options")]
     exit_early: bool,
 
+    /// Return non-zero exit code only if there were errors performing the comparison
+    #[arg(long, help_heading = "Comparison options")]
+    no_check: bool,
+
+    /// File name where to store comparison mismatch output
+    #[arg(long, value_name = "PATH", help_heading = "Comparison options")]
+    log: Option<std::path::PathBuf>,
+
+    // Progress & output
     /// Show progress
-    #[structopt(long)]
+    #[arg(long, help_heading = "Progress & output")]
     progress: bool,
 
-    /// Sets the delay between progress updates.
+    /// Sets the delay between progress updates
     ///
     /// - For the interactive (--progress-type=ProgressBar), the default is 200ms.
     /// - For the non-interactive (--progress-type=TextUpdates), the default is 10s.
@@ -41,65 +57,85 @@ struct Args {
     /// If specified, --progress flag is implied.
     ///
     /// This option accepts a human readable duration, e.g. "200ms", "10s", "5min" etc.
-    #[structopt(long)]
+    #[arg(long, value_name = "DELAY", help_heading = "Progress & output")]
     progress_delay: Option<String>,
 
-    /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR))
-    #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
+    /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR)
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, help_heading = "Progress & output")]
     verbose: u8,
 
-    /// Return non-zero exit code only if there were errors performing the comparison.
-    #[structopt(long)]
-    no_check: bool,
-
     /// Print summary at the end
-    #[structopt(long)]
+    #[arg(long, help_heading = "Progress & output")]
     summary: bool,
 
     /// Quiet mode, don't report errors
-    #[structopt(short = "q", long = "quiet")]
+    #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
     quiet: bool,
 
-    /// File name where to store comparison mismatch output
-    #[structopt(long)]
-    log: Option<std::path::PathBuf>,
-
-    /// File or directory to compare
-    #[structopt()]
-    src: std::path::PathBuf,
-
-    /// File or directory to compare
-    #[structopt()]
-    dst: std::path::PathBuf,
-
-    /// Number of worker threads, 0 means number of cores
-    #[structopt(long, default_value = "0")]
-    max_workers: usize,
-
-    /// Number of blocking worker threads, 0 means Tokio runtime default (512)
-    #[structopt(long, default_value = "0")]
-    max_blocking_threads: usize,
-
+    // Performance & throttling
     /// Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system limit
-    #[structopt(long)]
+    #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
     max_open_files: Option<usize>,
 
     /// Throttle the number of operations per second, 0 means no throttle
-    #[structopt(long, default_value = "0")]
+    #[arg(
+        long,
+        default_value = "0",
+        value_name = "N",
+        help_heading = "Performance & throttling"
+    )]
     ops_throttle: usize,
 
-    /// Throttle the number of I/O operations per second, 0 means no throttle.
+    /// Throttle the number of I/O operations per second, 0 means no throttle
     ///
     /// I/O is calculated based on provided chunk size -- number of I/O operations for a file is calculated as:
     /// ((file size - 1) / chunk size) + 1
-    #[structopt(long, default_value = "0")]
+    #[arg(
+        long,
+        default_value = "0",
+        value_name = "N",
+        help_heading = "Performance & throttling"
+    )]
     iops_throttle: usize,
 
-    /// Chunk size used to calculate number of I/O per file.
+    /// Chunk size used to calculate number of I/O per file
     ///
     /// Modifying this setting to a value > 0 is REQUIRED when using --iops-throttle.
-    #[structopt(long, default_value = "0")]
+    #[arg(
+        long,
+        default_value = "0",
+        value_name = "SIZE",
+        help_heading = "Performance & throttling"
+    )]
     chunk_size: u64,
+
+    // Advanced settings
+    /// Number of worker threads, 0 means number of cores
+    #[arg(
+        long,
+        default_value = "0",
+        value_name = "N",
+        help_heading = "Advanced settings"
+    )]
+    max_workers: usize,
+
+    /// Number of blocking worker threads, 0 means Tokio runtime default (512)
+    #[arg(
+        long,
+        default_value = "0",
+        value_name = "N",
+        help_heading = "Advanced settings"
+    )]
+    max_blocking_threads: usize,
+
+    // ARGUMENTS
+    /// File or directory to compare
+    #[arg()]
+    src: std::path::PathBuf,
+
+    /// File or directory to compare
+    #[arg()]
+    dst: std::path::PathBuf,
 }
 
 async fn async_main(args: Args) -> Result<common::cmp::Summary> {
@@ -120,7 +156,7 @@ async fn async_main(args: Args) -> Result<common::cmp::Summary> {
 }
 
 fn main() -> Result<()> {
-    let args = Args::from_args();
+    let args = Args::parse();
     let func = {
         let args = args.clone();
         || async_main(args)

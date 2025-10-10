@@ -140,7 +140,7 @@ struct ProgressTracker {
     pbar_thread: Option<std::thread::JoinHandle<()>>,
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, clap::ValueEnum)]
 pub enum ProgressType {
     #[default]
     Auto,
@@ -164,6 +164,7 @@ impl std::fmt::Debug for GeneralProgressType {
     }
 }
 
+// Keep FromStr for backwards compatibility, but ValueEnum will be used by clap
 impl std::str::FromStr for ProgressType {
     type Err = anyhow::Error;
 
