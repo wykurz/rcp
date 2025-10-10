@@ -8,6 +8,9 @@ repository = "https://github.com/wykurz/rcp"
 keywords = ["cli", "file", "copy", "remote", "performance"]
 categories = ["command-line-utilities", "filesystem"]
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "rcp"
 path = "src/bin/rcp.rs"

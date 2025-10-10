@@ -152,16 +152,14 @@
 //! }
 //! ```
 
-#[macro_use]
-extern crate lazy_static;
-
 mod semaphore;
 
-lazy_static! {
-    static ref OPEN_FILES_LIMIT: semaphore::Semaphore = semaphore::Semaphore::new();
-    static ref OPS_THROTTLE: semaphore::Semaphore = semaphore::Semaphore::new();
-    static ref IOPS_THROTTLE: semaphore::Semaphore = semaphore::Semaphore::new();
-}
+static OPEN_FILES_LIMIT: std::sync::LazyLock<semaphore::Semaphore> =
+    std::sync::LazyLock::new(semaphore::Semaphore::new);
+static OPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
+    std::sync::LazyLock::new(semaphore::Semaphore::new);
+static IOPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
+    std::sync::LazyLock::new(semaphore::Semaphore::new);
 
 pub fn set_max_open_files(max_open_files: usize) {
     OPEN_FILES_LIMIT.setup(max_open_files);
@@ -203,6 +201,8 @@ pub async fn get_file_iops_tokens(chunk_size: u64, file_size: u64) {
                 file_size,
             );
         } else {
+            // we already checked that tokens <= u32::MAX, so the cast is safe
+            #[allow(clippy::cast_possible_truncation)]
             get_iops_tokens(tokens as u32).await;
         }
     }

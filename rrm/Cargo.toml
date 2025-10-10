@@ -5,6 +5,9 @@ description = "Tool for removing files similar to rm but MUCH faster."
 license = "MIT"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "rrm"
 path = "src/main.rs"

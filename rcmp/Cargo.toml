@@ -5,6 +5,9 @@ description = "Tool for comparing large filesets."
 license = "MIT"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "rcmp"
 path = "src/main.rs"
