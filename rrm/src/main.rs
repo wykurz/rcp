@@ -30,8 +30,8 @@ struct Args {
     ///
     /// If specified, --progress flag is implied.
     ///
-    /// Options are: ProgressBar (animated progress bar), TextUpdates (appropriate for logging), Auto (default, will
-    /// choose between ProgressBar or TextUpdates depending on the type of terminal attached to stderr)
+    /// Options are: `ProgressBar` (animated progress bar), `TextUpdates` (appropriate for logging), Auto (default, will
+    /// choose between `ProgressBar` or `TextUpdates` depending on the type of terminal attached to stderr)
     #[arg(long, value_name = "TYPE", help_heading = "Progress & output")]
     progress_type: Option<common::ProgressType>,
 

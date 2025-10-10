@@ -68,6 +68,7 @@ pub struct UserAndTimeSettings {
 }
 
 impl UserAndTimeSettings {
+    #[must_use]
     pub fn any(&self) -> bool {
         self.uid || self.gid || self.time
     }
@@ -111,6 +112,7 @@ pub struct SymlinkSettings {
 }
 
 impl SymlinkSettings {
+    #[must_use]
     pub fn any(&self) -> bool {
         self.user_and_time.any()
     }
@@ -225,6 +227,7 @@ pub async fn set_symlink_metadata<Meta: Metadata + std::fmt::Debug>(
     Ok(())
 }
 
+#[must_use]
 pub fn preserve_all() -> Settings {
     let user_and_time = UserAndTimeSettings {
         uid: true,
@@ -245,6 +248,7 @@ pub fn preserve_all() -> Settings {
     }
 }
 
+#[must_use]
 pub fn preserve_default() -> Settings {
     Settings::default()
 }

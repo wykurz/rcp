@@ -17,13 +17,13 @@
 //!
 //! # Key Types
 //!
-//! ## RcpdType
+//! ## `RcpdType`
 //!
 //! Identifies the role of a remote copy daemon:
 //! - `Source` - reads files from source host
 //! - `Destination` - writes files to destination host
 //!
-//! ## ProgressType
+//! ## `ProgressType`
 //!
 //! Controls progress reporting display:
 //! - `Auto` - automatically choose based on terminal type
@@ -142,6 +142,7 @@ lazy_static! {
     static ref PBAR: indicatif::ProgressBar = indicatif::ProgressBar::new_spinner();
 }
 
+#[must_use]
 pub fn get_progress() -> &'static progress::Progress {
     &PROGRESS
 }
@@ -404,14 +405,14 @@ pub fn parse_preserve_settings(settings: &str) -> Result<preserve::Settings, any
                     preserve_settings.file.user_and_time = user_and_time_settings;
                     if let Some(mode) = mode_opt {
                         preserve_settings.file.mode_mask = mode;
-                    };
+                    }
                 }
                 "d" | "dir" | "directory" => {
                     preserve_settings.dir = preserve::DirSettings::default();
                     preserve_settings.dir.user_and_time = user_and_time_settings;
                     if let Some(mode) = mode_opt {
                         preserve_settings.dir.mode_mask = mode;
-                    };
+                    }
                 }
                 "l" | "link" | "symlink" => {
                     preserve_settings.symlink = preserve::SymlinkSettings::default();
@@ -516,7 +517,7 @@ fn get_max_open_files() -> Result<u64, std::io::Error> {
         rlim_max: 0,
     };
     // Safety: we pass a valid "rlim" pointer and the result is checked
-    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) };
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rlim) };
     if result == 0 {
         Ok(rlim.rlim_cur)
     } else {
@@ -541,6 +542,7 @@ impl std::io::Write for ProgWriter {
     }
 }
 
+#[must_use]
 pub fn generate_debug_log_filename(prefix: &str) -> String {
     let now = chrono::Utc::now();
     let timestamp = now.format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -571,7 +573,12 @@ where
     Error: std::fmt::Display + std::fmt::Debug,
     Fut: std::future::Future<Output = Result<Summary, Error>>,
 {
-    if !quiet {
+    if quiet {
+        assert!(
+            verbose == 0,
+            "Quiet mode and verbose mode are mutually exclusive"
+        );
+    } else {
         let env_filter =
             tracing_subscriber::EnvFilter::from_default_env().add_directive(match verbose {
                 0 => "error".parse().unwrap(),
@@ -646,11 +653,6 @@ where
             .with(remote_tracing_layer)
             .with(console_layer)
             .init();
-    } else {
-        assert!(
-            verbose == 0,
-            "Quiet mode and verbose mode are mutually exclusive"
-        );
     }
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();

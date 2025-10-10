@@ -97,7 +97,7 @@
 //! Tokens are replenished using a background task that periodically adds tokens to the semaphore.
 //! The replenishment rate can be tuned by adjusting:
 //!
-//! - **tokens_per_interval**: Number of tokens added each interval
+//! - **`tokens_per_interval`**: Number of tokens added each interval
 //! - **interval**: Time between replenishments
 //!
 //! For example, to achieve 1000 ops/sec:
@@ -110,7 +110,7 @@
 //! # Thread Safety
 //!
 //! All throttling mechanisms are thread-safe and can be used across multiple async tasks
-//! and threads. The semaphores use efficient parking_lot mutexes internally.
+//! and threads. The semaphores use efficient `parking_lot` mutexes internally.
 //!
 //! # Performance Considerations
 //!
@@ -196,7 +196,7 @@ async fn get_iops_tokens(tokens: u32) {
 pub async fn get_file_iops_tokens(chunk_size: u64, file_size: u64) {
     if chunk_size > 0 {
         let tokens = 1 + (std::cmp::max(1, file_size) - 1) / chunk_size;
-        if tokens > u32::MAX as u64 {
+        if tokens > u64::from(u32::MAX) {
             tracing::error!(
                 "chunk size: {} is too small to limit throughput for files this big, size: {}",
                 chunk_size,
