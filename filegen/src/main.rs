@@ -1,8 +1,5 @@
-use anyhow::{Context, Result};
-use async_recursion::async_recursion;
+use anyhow::Result;
 use clap::Parser;
-use rand::Rng;
-use tokio::io::AsyncWriteExt;
 use tracing::instrument;
 
 #[derive(Clone, Debug)]
@@ -172,78 +169,8 @@ struct Args {
 }
 
 #[instrument]
-async fn write_file(
-    path: std::path::PathBuf,
-    mut filesize: usize,
-    bufsize: usize,
-    chunk_size: u64,
-) -> Result<()> {
-    let _permit = throttle::open_file_permit().await;
-    throttle::get_file_iops_tokens(chunk_size, filesize as u64).await;
-    let mut bytes = vec![0u8; bufsize];
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .await
-        .context(format!("Error opening {:?}", &path))?;
-    while filesize > 0 {
-        {
-            // make sure rng falls out of scope before await
-            let mut rng = rand::thread_rng();
-            rng.fill(&mut bytes[..]);
-        }
-        let writesize = std::cmp::min(filesize, bufsize) as usize;
-        file.write_all(&bytes[..writesize])
-            .await
-            .context(format!("Error writing to {:?}", &path))?;
-        filesize -= writesize;
-    }
-    Ok(())
-}
-
-#[async_recursion]
-#[instrument]
-async fn filegen(
-    root: &std::path::Path,
-    dirwidth: &[usize],
-    numfiles: usize,
-    filesize: usize,
-    writebuf: usize,
-    chunk_size: u64,
-) -> Result<()> {
-    let numdirs = *dirwidth.first().unwrap_or(&0);
-    let mut join_set = tokio::task::JoinSet::new();
-    // generate directories and recurse into them
-    for i in 0..numdirs {
-        let path = root.join(format!("dir{i}"));
-        let dirwidth = dirwidth[1..].to_owned();
-        let recurse = || async move {
-            tokio::fs::create_dir(&path)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            filegen(&path, &dirwidth, numfiles, filesize, writebuf, chunk_size).await
-        };
-        join_set.spawn(recurse());
-    }
-    // generate files
-    for i in 0..numfiles {
-        // it's better to await the token here so that we throttle how many tasks we spawn. the
-        // ops-throttle will never cause a deadlock (unlike max-open-files limit) so it's safe to
-        // do here.
-        throttle::get_ops_token().await;
-        let path = root.join(format!("file{i}"));
-        join_set.spawn(write_file(path.clone(), filesize, writebuf, chunk_size));
-    }
-    while let Some(res) = join_set.join_next().await {
-        res??
-    }
-    Ok(())
-}
-
-#[instrument]
-async fn async_main(args: Args) -> Result<String> {
+async fn async_main(args: Args) -> Result<common::filegen::Summary> {
+    use anyhow::Context;
     let filesize = args
         .filesize
         .parse::<bytesize::ByteSize>()
@@ -253,8 +180,21 @@ async fn async_main(args: Args) -> Result<String> {
     let root = args.root.join("filegen");
     tokio::fs::create_dir(&root)
         .await
-        .context(format!("Error creating {:?}", &root))?;
-    filegen(
+        .with_context(|| format!("Error creating {:?}", &root))
+        .map_err(|err| {
+            common::filegen::Error::new(
+                anyhow::Error::msg(err),
+                common::filegen::Summary::default(),
+            )
+        })?;
+    let prog_track = common::get_progress();
+    prog_track.directories_created.inc();
+    let mut summary = common::filegen::Summary {
+        directories_created: 1,
+        ..Default::default()
+    };
+    let filegen_summary = common::filegen::filegen(
+        prog_track,
         &root,
         &args.dirwidth.value,
         args.numfiles,
@@ -263,7 +203,8 @@ async fn async_main(args: Args) -> Result<String> {
         args.chunk_size,
     )
     .await?;
-    Ok("OK".to_string())
+    summary = summary + filegen_summary;
+    Ok(summary)
 }
 
 fn main() -> Result<(), anyhow::Error> {

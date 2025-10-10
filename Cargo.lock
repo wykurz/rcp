@@ -392,6 +392,7 @@ dependencies = [
  "libc",
  "nix",
  "procfs",
+ "rand",
  "serde",
  "sysinfo",
  "thiserror 1.0.55",
