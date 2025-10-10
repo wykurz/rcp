@@ -29,6 +29,8 @@ jobs:
       run: cargo fmt --check
     - name: Lint
       run: cargo clippy
+    - name: Documentation
+      run: cargo doc --no-deps
     - name: Install cargo-nextest
       run: cargo install cargo-nextest
     - name: Test
