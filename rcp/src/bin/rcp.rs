@@ -8,10 +8,28 @@ use rcp_tools_rcp::path;
 #[command(
     name = "rcp",
     version,
-    about = "`rcp` is a tool for copying files similar to `cp` but generally MUCH faster when dealing with a large \
-    number of files.
+    about = "Copy files efficiently - similar to `cp` but generally MUCH faster when dealing with large filesets",
+    long_about = "`rcp` is a tool for copying files similar to `cp` but generally MUCH faster when dealing with a large number of files.
+
+Supports both local and remote copying using `host:/path` syntax (similar to `scp`).
 
 Inspired by tools like `dsync`(1) and `pcp`(2).
+
+EXAMPLES:
+    # Basic local copy with progress
+    rcp /source /dest --progress --summary
+
+    # Copy with metadata preservation and overwrite
+    rcp /source /dest --preserve --overwrite --progress
+
+    # Remote copy from one host to another
+    rcp user@host1:/path/to/source user@host2:/path/to/dest --progress
+
+    # Copy from remote to local
+    rcp host:/remote/path /local/path --progress
+
+    # Copy from local to remote
+    rcp /local/path host:/remote/path --preserve --progress
 
 1) https://mpifileutils.readthedocs.io/en/v0.11.1/dsync.1.html
 2) https://github.com/wtsi-ssg/pcp"
@@ -22,9 +40,9 @@ struct Args {
     #[arg(short, long, help_heading = "Copy options")]
     overwrite: bool,
 
-    /// Comma separated list of file attributes to compare when deciding if files are "identical", used with --overwrite flag
+    /// File attributes to compare when deciding if files are identical (used with --overwrite)
     ///
-    /// Options are: uid, gid, mode, size, mtime, ctime
+    /// Comma-separated list. Available: uid, gid, mode, size, mtime, ctime
     #[arg(
         long,
         default_value = "size,mtime",
@@ -47,12 +65,7 @@ struct Args {
 
     /// Specify exactly what attributes to preserve
     ///
-    /// If specified, the "preserve" flag is ignored.
-    ///
-    /// The format is: "<type1>:<attributes1> <type2>:<attributes2> ..."
-    /// Where <type> is one of: f (file), d (directory), l (symlink)
-    /// And <attributes> is a comma separated list of: uid, gid, time, <mode mask>
-    /// Where <mode mask> is a 4 digit octal number
+    /// If specified, the --preserve flag is ignored. Format: "<type1>:<attributes1> <type2>:<attributes2> ..." where <type> is one of f (file), d (directory), l (symlink), and <attributes> is a comma-separated list of uid, gid, time, or a 4-digit octal mode mask.
     ///
     /// Example: "f:uid,gid,time,0777 d:uid,gid,time,0777 l:uid,gid,time"
     #[arg(long, value_name = "SETTINGS", help_heading = "Copy options")]
@@ -63,23 +76,15 @@ struct Args {
     #[arg(long, help_heading = "Progress & output")]
     progress: bool,
 
-    /// Toggles the type of progress to show
+    /// Set the type of progress display
     ///
     /// If specified, --progress flag is implied.
-    ///
-    /// Options are: ProgressBar (animated progress bar), TextUpdates (appropriate for logging), Auto (default, will
-    /// choose between ProgressBar or TextUpdates depending on the type of terminal attached to stderr)
     #[arg(long, value_name = "TYPE", help_heading = "Progress & output")]
     progress_type: Option<common::ProgressType>,
 
-    /// Sets the delay between progress updates
+    /// Set delay between progress updates
     ///
-    /// - For the interactive (--progress-type=ProgressBar), the default is 200ms.
-    /// - For the non-interactive (--progress-type=TextUpdates), the default is 10s.
-    ///
-    /// If specified, --progress flag is implied.
-    ///
-    /// This option accepts a human readable duration, e.g. "200ms", "10s", "5min" etc.
+    /// Default is 200ms for interactive mode (ProgressBar) and 10s for non-interactive mode (TextUpdates). If specified, --progress flag is implied. Accepts human-readable durations like "200ms", "10s", "5min".
     #[arg(long, value_name = "DELAY", help_heading = "Progress & output")]
     progress_delay: Option<String>,
 
@@ -96,7 +101,7 @@ struct Args {
     quiet: bool,
 
     // Performance & throttling
-    /// Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system limit
+    /// Maximum number of open files (0 = no limit, unspecified = 80% of system limit)
     #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
     max_open_files: Option<usize>,
 
@@ -109,10 +114,9 @@ struct Args {
     )]
     ops_throttle: usize,
 
-    /// Throttle the number of I/O operations per second, 0 means no throttle
+    /// Limit I/O operations per second (0 = no throttle)
     ///
-    /// I/O is calculated based on provided chunk size -- number of I/O operations for a file is calculated as:
-    /// ((file size - 1) / chunk size) + 1
+    /// Requires --chunk-size to calculate I/O operations per file: ((file_size - 1) / chunk_size) + 1
     #[arg(
         long,
         default_value = "0",
@@ -121,9 +125,9 @@ struct Args {
     )]
     iops_throttle: usize,
 
-    /// Chunk size used to calculate number of I/O per file
+    /// Chunk size for calculating I/O operations per file
     ///
-    /// Modifying this setting to a value > 0 is REQUIRED when using --iops-throttle.
+    /// Required when using --iops-throttle (must be > 0)
     #[arg(
         long,
         default_value = "0",
@@ -133,7 +137,7 @@ struct Args {
     chunk_size: bytesize::ByteSize,
 
     // Advanced settings
-    /// Number of worker threads, 0 means number of cores
+    /// Number of worker threads (0 = number of CPU cores)
     #[arg(
         long,
         default_value = "0",
@@ -142,7 +146,7 @@ struct Args {
     )]
     max_workers: usize,
 
-    /// Number of blocking worker threads, 0 means Tokio runtime default (512)
+    /// Number of blocking worker threads (0 = Tokio default of 512)
     #[arg(
         long,
         default_value = "0",
@@ -152,15 +156,15 @@ struct Args {
     max_blocking_threads: usize,
 
     // Remote copy options
-    /// Restrict QUIC binding to specific port ranges (e.g., "8000-8999,10000-10999")
+    /// Restrict QUIC to specific port ranges (e.g., "8000-8999,10000-10999")
     ///
-    /// If not specified, uses dynamic port allocation (default behavior)
+    /// Defaults to dynamic port allocation if not specified
     #[arg(long, value_name = "RANGES", help_heading = "Remote copy options")]
     quic_port_ranges: Option<String>,
 
-    /// Timeout for remote copy connections in seconds (default: 15)
+    /// Connection timeout for remote copy operations in seconds
     ///
-    /// This applies to: rcpd connecting to master, destination connecting to source
+    /// Applies to: rcpd→master connection, destination→source connection
     #[arg(
         long,
         default_value = "15",
@@ -169,9 +173,9 @@ struct Args {
     )]
     remote_copy_conn_timeout_sec: u64,
 
-    /// Enable file-based debug logging for rcpd processes with given prefix
+    /// Enable file-based debug logging for rcpd processes
     ///
-    /// (e.g., /tmp/rcpd-log will create /tmp/rcpd-log-YYYY-MM-DDTHH-MM-SS-RANDOM)
+    /// Example: /tmp/rcpd-log creates /tmp/rcpd-log-YYYY-MM-DDTHH-MM-SS-RANDOM
     #[arg(long, value_name = "PREFIX", help_heading = "Remote copy options")]
     rcpd_debug_log_prefix: Option<String>,
 
