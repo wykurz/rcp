@@ -97,6 +97,7 @@ pub async fn write_file(
 
 #[async_recursion]
 #[instrument(skip(prog_track))]
+#[allow(clippy::too_many_arguments)]
 pub async fn filegen(
     prog_track: &'static progress::Progress,
     root: &std::path::Path,
@@ -105,6 +106,7 @@ pub async fn filegen(
     filesize: usize,
     writebuf: usize,
     chunk_size: u64,
+    leaf_files: bool,
 ) -> Result<Summary, Error> {
     let numdirs = *dirwidth.first().unwrap_or(&0);
     let mut join_set = tokio::task::JoinSet::new();
@@ -123,21 +125,26 @@ pub async fn filegen(
                 ..Default::default()
             };
             let recurse_summary = filegen(
-                prog_track, &path, &dirwidth, numfiles, filesize, writebuf, chunk_size,
+                prog_track, &path, &dirwidth, numfiles, filesize, writebuf, chunk_size, leaf_files,
             )
             .await?;
             Ok(dir_summary + recurse_summary)
         };
         join_set.spawn(recurse());
     }
-    // generate files
-    for i in 0..numfiles {
-        // it's better to await the token here so that we throttle how many tasks we spawn. the
-        // ops-throttle will never cause a deadlock (unlike max-open-files limit) so it's safe to
-        // do here.
-        throttle::get_ops_token().await;
-        let path = root.join(format!("file{i}"));
-        join_set.spawn(write_file(prog_track, path, filesize, writebuf, chunk_size));
+    // generate files (only if we're not in leaf_files mode, or if we are a leaf directory)
+    // a directory is a leaf when dirwidth is empty (no more subdirectories to create)
+    let is_leaf = dirwidth.is_empty();
+    let should_generate_files = !leaf_files || is_leaf;
+    if should_generate_files {
+        for i in 0..numfiles {
+            // it's better to await the token here so that we throttle how many tasks we spawn. the
+            // ops-throttle will never cause a deadlock (unlike max-open-files limit) so it's safe to
+            // do here.
+            throttle::get_ops_token().await;
+            let path = root.join(format!("file{i}"));
+            join_set.spawn(write_file(prog_track, path, filesize, writebuf, chunk_size));
+        }
     }
     let mut success = true;
     let mut filegen_summary = Summary::default();
@@ -182,8 +189,9 @@ mod tests {
             &[2],
             3,
             100,
-            50, // buffer size
-            0,  // chunk_size
+            50,    // buffer size
+            0,     // chunk_size
+            false, // leaf_files
         )
         .await?;
         // verify summary
@@ -221,8 +229,9 @@ mod tests {
             &[2, 3],
             4,
             50,
-            25, // buffer size
-            0,  // chunk_size
+            25,    // buffer size
+            0,     // chunk_size
+            false, // leaf_files
         )
         .await?;
         // calculate expected values:
@@ -255,8 +264,9 @@ mod tests {
             &[2, 2, 2],
             2,
             10,
-            10, // buffer size
-            0,  // chunk_size
+            10,    // buffer size
+            0,     // chunk_size
+            false, // leaf_files
         )
         .await?;
         // directories: 2 + (2×2) + (2×2×2) = 2 + 4 + 8 = 14 dirs
@@ -293,11 +303,12 @@ mod tests {
         let summary = filegen(
             &PROGRESS,
             test_path,
-            &[], // no subdirectories
-            5,   // 5 files
-            200, // 200 bytes each
-            100, // buffer size
-            0,   // chunk_size
+            &[],   // no subdirectories
+            5,     // 5 files
+            200,   // 200 bytes each
+            100,   // buffer size
+            0,     // chunk_size
+            false, // leaf_files
         )
         .await?;
         assert_eq!(summary.files_created, 5);
@@ -329,6 +340,7 @@ mod tests {
             100,
             50,
             0,
+            false, // leaf_files
         )
         .await?;
         // directories: 3 + (3×2) = 9 dirs
@@ -339,6 +351,43 @@ mod tests {
         assert!(test_path.join("dir0").join("dir0").exists());
         assert!(test_path.join("dir2").join("dir1").exists());
         assert!(!test_path.join("dir0").join("file0").exists());
+        // cleanup
+        tokio::fs::remove_dir_all(test_path).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_leaf_files_only() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let test_path = tmp_dir.as_path();
+        // generate with leaf_files=true, meaning files only in deepest directories
+        let summary = filegen(
+            &PROGRESS,
+            test_path,
+            &[2, 3],
+            4,
+            50,
+            25,   // buffer size
+            0,    // chunk_size
+            true, // leaf_files - only generate files in leaf directories
+        )
+        .await?;
+        // directories: 2 top-level + (2 × 3) subdirs = 8 total
+        // files: ONLY in leaf dirs (6 leaf dirs) × 4 files each = 24 files
+        // bytes: 50 bytes × 24 files = 1200 bytes
+        assert_eq!(summary.files_created, 24);
+        assert_eq!(summary.directories_created, 8);
+        assert_eq!(summary.bytes_written, 1200);
+        // verify NO files in root or intermediate directories
+        assert!(!test_path.join("file0").exists()); // no root files
+        assert!(!test_path.join("dir0").join("file0").exists()); // no intermediate files
+        assert!(!test_path.join("dir1").join("file0").exists());
+        // verify files ONLY in leaf directories
+        assert!(test_path.join("dir0").join("dir0").join("file0").exists());
+        assert!(test_path.join("dir0").join("dir0").join("file3").exists());
+        assert!(test_path.join("dir0").join("dir2").join("file0").exists());
+        assert!(test_path.join("dir1").join("dir1").join("file0").exists());
         // cleanup
         tokio::fs::remove_dir_all(test_path).await?;
         Ok(())
