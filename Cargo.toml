@@ -16,6 +16,12 @@ members = [
 # Deny all warnings to enforce code quality
 all = { level = "deny", priority = -1 }
 
+[workspace.lints.rustdoc]
+# Deny documentation warnings
+all = { level = "deny", priority = -1 }
+# Allow missing crate-level docs for binary crates
+missing_crate_level_docs = "allow"
+
 [profile.dev]
 panic = "abort"
 

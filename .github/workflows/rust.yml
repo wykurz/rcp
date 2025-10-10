@@ -30,6 +30,8 @@ jobs:
     - uses: actions/checkout@v5
     - name: Documentation
       run: cargo doc --no-deps
+      env:
+        RUSTDOCFLAGS: -D warnings
 
   test:
     runs-on: ubuntu-latest
