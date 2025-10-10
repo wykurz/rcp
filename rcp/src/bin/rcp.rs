@@ -121,10 +121,6 @@ struct Args {
     #[structopt(long, default_value = "0")]
     chunk_size: bytesize::ByteSize,
 
-    /// Throttle the number of bytes per second, 0 means no throttle
-    #[structopt(long, default_value = "0")]
-    tput_throttle: usize,
-
     /// Enable file-based debug logging for rcpd processes with given prefix
     /// (e.g., /tmp/rcpd-log will create /tmp/rcpd-log-YYYY-MM-DDTHH-MM-SS-RANDOM)
     #[structopt(long)]
@@ -164,7 +160,6 @@ async fn run_rcpd_master(
         ops_throttle: args.ops_throttle,
         iops_throttle: args.iops_throttle,
         chunk_size: args.chunk_size.0 as usize,
-        tput_throttle: args.tput_throttle,
         dereference: args.dereference,
         overwrite: args.overwrite,
         overwrite_compare: args.overwrite_compare.clone(),
@@ -575,7 +570,6 @@ fn main() -> Result<(), anyhow::Error> {
         args.ops_throttle,
         args.iops_throttle,
         args.chunk_size.0,
-        args.tput_throttle,
         None,
         None,
         func,

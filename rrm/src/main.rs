@@ -83,10 +83,6 @@ struct Args {
     /// Modifying this setting to a value > 0 is REQUIRED when using --iops-throttle.
     #[structopt(long, default_value = "0")]
     chunk_size: u64,
-
-    /// Throttle the number of bytes per second, 0 means no throttle
-    #[structopt(long, default_value = "0")]
-    tput_throttle: usize,
 }
 
 #[instrument]
@@ -152,7 +148,6 @@ fn main() -> Result<()> {
         args.ops_throttle,
         args.iops_throttle,
         args.chunk_size,
-        args.tput_throttle,
         None,
         None,
         func,

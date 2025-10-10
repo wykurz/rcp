@@ -549,7 +549,6 @@ pub fn run<Fut, Summary, Error>(
     ops_throttle: usize,
     iops_throttle: usize,
     chunk_size: u64,
-    tput_throttle: usize,
     remote_tracing_layer: Option<remote_tracing::RemoteTracingLayer>,
     debug_log_file: Option<String>,
     func: impl FnOnce() -> Fut,
@@ -690,12 +689,6 @@ where
     } else if chunk_size > 0 {
         tracing::error!(
             "--chunk-size > 0 but --iops-throttle is 0 -- did you intend to use --iops-throttle?"
-        );
-        return None;
-    }
-    if tput_throttle > 0 {
-        tracing::error!(
-            "Throughput throttling is not supported yet, please use --iops-throttle instead"
         );
         return None;
     }
