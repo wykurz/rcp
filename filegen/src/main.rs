@@ -10,10 +10,24 @@ struct Dirwidth {
 impl std::str::FromStr for Dirwidth {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
+        if s.is_empty() {
+            anyhow::bail!(
+                "Invalid dirwidth specification: must contain at least one value (e.g., \"3,2\")"
+            );
+        }
         let value = s
             .split(',')
             .map(|s| s.parse::<usize>())
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("Invalid dirwidth specification '{}': {}", s, e))?;
+        // validate that all values are > 0
+        if let Some((index, _)) = value.iter().enumerate().find(|(_, &v)| v == 0) {
+            anyhow::bail!(
+                "Invalid dirwidth specification '{}': value at position {} is 0. All values must be greater than 0.",
+                s,
+                index + 1
+            );
+        }
         Ok(Dirwidth { value })
     }
 }
@@ -33,18 +47,9 @@ This creates a directory tree at /tmp/filegen/ with 3 top-level dirs, each conta
 )]
 struct Args {
     // Generation options
-    /// Number of sub-directories in the generated directory tree
+    /// Directory structure specification (comma-separated list of subdirectory counts per level)
     ///
-    /// E.g., "3,2" will generate:
-    /// |- d1
-    ///    |- d1a
-    ///    |- d1b
-    /// |- d2
-    ///    |- d2a
-    ///    |- d2b
-    /// |- d3
-    ///    |- d3a
-    ///    |- d3b
+    /// For example, "3,2" creates 3 top-level directories, each containing 2 subdirectories (total: 3 + 3×2 = 9 directories)
     #[arg(value_name = "SPEC", help_heading = "Generation options")]
     dirwidth: Dirwidth,
 
@@ -68,6 +73,10 @@ struct Args {
         help_heading = "Generation options"
     )]
     bufsize: String,
+
+    /// Generate files only in leaf directories (deepest level), not in intermediate directories
+    #[arg(long, help_heading = "Generation options")]
+    leaf_files: bool,
 
     // Progress & output
     /// Show progress
@@ -201,6 +210,7 @@ async fn async_main(args: Args) -> Result<common::filegen::Summary> {
         filesize,
         writebuf,
         args.chunk_size,
+        args.leaf_files,
     )
     .await?;
     summary = summary + filegen_summary;
