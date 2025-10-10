@@ -5,9 +5,17 @@ use clap::Parser;
 #[command(
     name = "rlink",
     version,
-    about = "`rlink` allows hard-linking large number of files.
+    about = "Hard-link large filesets efficiently with optional update path",
+    long_about = "`rlink` allows hard-linking large number of files with optional update path for handling deltas.
 
-A common pattern is to also provide `--update <path>` that overrides any paths in `src` to instead be copied over from there."
+EXAMPLES:
+    # Hard-link contents of one path to another
+    rlink /foo /bar --progress --summary
+
+    # Hard-link with update (similar to rsync --link-dest)
+    rlink /foo --update /bar /baz --update-exclusive --progress
+
+In the second example, files from /foo are hard-linked to /baz if they match files in /bar. Using --update-exclusive means files present in /foo but not in /bar are ignored."
 )]
 struct Args {
     // Linking options
@@ -15,9 +23,9 @@ struct Args {
     #[arg(short, long, help_heading = "Linking options")]
     overwrite: bool,
 
-    /// Comma separated list of file attributes to compare when deciding if files are "identical", used with --overwrite flag
+    /// File attributes to compare when deciding if files are identical (used with --overwrite)
     ///
-    /// Options are: uid, gid, mode, size, mtime, ctime
+    /// Comma-separated list. Available: uid, gid, mode, size, mtime, ctime
     #[arg(
         long,
         default_value = "size,mtime",
@@ -38,9 +46,9 @@ struct Args {
     #[arg(long, help_heading = "Linking options")]
     update_exclusive: bool,
 
-    /// Same as overwrite-compare, but for deciding if we can hard-link or if we need to copy a file from the update directory
+    /// Attributes to compare when deciding whether to hard-link or copy from update directory
     ///
-    /// Used with --update flag
+    /// Same format as --overwrite-compare. Used with --update flag.
     #[arg(
         long,
         default_value = "size,mtime",
@@ -54,23 +62,15 @@ struct Args {
     #[arg(long, help_heading = "Progress & output")]
     progress: bool,
 
-    /// Toggles the type of progress to show
+    /// Set the type of progress display
     ///
     /// If specified, --progress flag is implied.
-    ///
-    /// Options are: ProgressBar (animated progress bar), TextUpdates (appropriate for logging), Auto (default, will
-    /// choose between ProgressBar or TextUpdates depending on the type of terminal attached to stderr)
     #[arg(long, value_name = "TYPE", help_heading = "Progress & output")]
     progress_type: Option<common::ProgressType>,
 
-    /// Sets the delay between progress updates
+    /// Set delay between progress updates
     ///
-    /// - For the interactive (--progress-type=ProgressBar), the default is 200ms.
-    /// - For the non-interactive (--progress-type=TextUpdates), the default is 10s.
-    ///
-    /// If specified, --progress flag is implied.
-    ///
-    /// This option accepts a human readable duration, e.g. "200ms", "10s", "5min" etc.
+    /// Default is 200ms for interactive mode (ProgressBar) and 10s for non-interactive mode (TextUpdates). If specified, --progress flag is implied. Accepts human-readable durations like "200ms", "10s", "5min".
     #[arg(long, value_name = "DELAY", help_heading = "Progress & output")]
     progress_delay: Option<String>,
 
@@ -87,11 +87,11 @@ struct Args {
     quiet: bool,
 
     // Performance & throttling
-    /// Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system limit
+    /// Maximum number of open files (0 = no limit, unspecified = 80% of system limit)
     #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
     max_open_files: Option<usize>,
 
-    /// Throttle the number of operations per second, 0 means no throttle
+    /// Throttle the number of operations per second (0 = no throttle)
     #[arg(
         long,
         default_value = "0",
@@ -100,10 +100,9 @@ struct Args {
     )]
     ops_throttle: usize,
 
-    /// Throttle the number of I/O operations per second, 0 means no throttle
+    /// Limit I/O operations per second (0 = no throttle)
     ///
-    /// I/O is calculated based on provided chunk size -- number of I/O operations for a file is calculated as:
-    /// ((file size - 1) / chunk size) + 1
+    /// Requires --chunk-size to calculate I/O operations per file: ((file_size - 1) / chunk_size) + 1
     #[arg(
         long,
         default_value = "0",
@@ -112,9 +111,9 @@ struct Args {
     )]
     iops_throttle: usize,
 
-    /// Chunk size used to calculate number of I/O per file
+    /// Chunk size for calculating I/O operations per file
     ///
-    /// Modifying this setting to a value > 0 is REQUIRED when using --iops-throttle.
+    /// Required when using --iops-throttle (must be > 0)
     #[arg(
         long,
         default_value = "0",
@@ -124,7 +123,7 @@ struct Args {
     chunk_size: u64,
 
     // Advanced settings
-    /// Number of worker threads, 0 means number of cores
+    /// Number of worker threads (0 = number of CPU cores)
     #[arg(
         long,
         default_value = "0",
@@ -133,7 +132,7 @@ struct Args {
     )]
     max_workers: usize,
 
-    /// Number of blocking worker threads, 0 means Tokio runtime default (512)
+    /// Number of blocking worker threads (0 = Tokio default of 512)
     #[arg(
         long,
         default_value = "0",

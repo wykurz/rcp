@@ -5,11 +5,19 @@ use clap::Parser;
 #[command(
     name = "rcmp",
     version,
-    about = "`rcmp` is a tool for comparing large filesets.
+    about = "Compare large filesets efficiently (metadata only)",
+    long_about = "`rcmp` is a tool for comparing large filesets based on metadata attributes.
 
-Currently, it only supports comparing metadata (no content checking).
+Currently supports metadata comparison only (no content checking).
 
-Returns error code 1 if there are differences, 2 if there were errors."
+EXIT CODES:
+    0 - No differences found
+    1 - Differences found
+    2 - Errors occurred during comparison
+
+EXAMPLE:
+    # Compare two directories and log differences
+    rcmp /foo /bar --progress --summary --log compare.log"
 )]
 struct Args {
     // Comparison options

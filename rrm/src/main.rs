@@ -6,9 +6,14 @@ use tracing::instrument;
 #[command(
     name = "rrm",
     version,
-    about = "`rrm` is a tool for removing large number of files.
+    about = "Remove large filesets efficiently - equivalent to `rm -rf`",
+    long_about = "`rrm` is a tool for removing large number of files efficiently.
 
-Basic usage is equivalent to `rm -rf`."
+EXAMPLE:
+    # Remove a path recursively with progress
+    rrm /path/to/remove --progress --summary
+
+Note: Like `rm -rf`, this is a destructive operation. Use with caution."
 )]
 struct Args {
     // Removal options

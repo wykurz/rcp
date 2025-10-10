@@ -22,7 +22,18 @@ impl std::str::FromStr for Dirwidth {
 }
 
 #[derive(Clone, Parser, Debug)]
-#[command(name = "filegen", version)]
+#[command(
+    name = "filegen",
+    version,
+    about = "Generate sample filesets for testing",
+    long_about = "`filegen` generates sample filesets with configurable directory structure and file sizes.
+
+EXAMPLE:
+    # Generate a test fileset with 2 levels, 10 files per dir, 1MB each
+    filegen /tmp 3,2 10 1M --progress
+
+This creates a directory tree at /tmp/filegen/ with 3 top-level dirs, each containing 2 subdirs, with 10 files of 1MB each in every directory."
+)]
 struct Args {
     // Generation options
     /// Number of sub-directories in the generated directory tree
