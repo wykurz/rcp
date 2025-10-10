@@ -57,11 +57,17 @@
 //! let src = Path::new("/source");
 //! let dst = Path::new("/destination");
 //!
-//! let settings = common::copy::Settings::default();
+//! let settings = common::copy::Settings {
+//!     dereference: false,
+//!     fail_early: false,
+//!     overwrite: false,
+//!     overwrite_compare: Default::default(),
+//!     chunk_size: 0,
+//! };
 //! let preserve = common::preserve::preserve_default();
 //!
 //! let summary = common::copy(src, dst, &settings, &preserve).await?;
-//! println!("Copied {} files", summary.ok_cnt);
+//! println!("Copied {} files", summary.files_copied);
 //! # Ok(())
 //! # }
 //! ```
@@ -74,11 +80,15 @@
 //! let src = Path::new("/path1");
 //! let dst = Path::new("/path2");
 //!
-//! let log = common::cmp::LogWriter::new(None)?;
-//! let settings = common::cmp::Settings::default();
+//! let log = common::cmp::LogWriter::new(None).await?;
+//! let settings = common::cmp::Settings {
+//!     fail_early: false,
+//!     exit_early: false,
+//!     compare: Default::default(),
+//! };
 //!
 //! let summary = common::cmp(src, dst, &log, &settings).await?;
-//! println!("Differences found: {}", summary.ne_cnt);
+//! println!("Comparison complete: {}", summary);
 //! # Ok(())
 //! # }
 //! ```
@@ -96,6 +106,7 @@ use tracing_subscriber::prelude::*;
 
 pub mod cmp;
 pub mod copy;
+pub mod filegen;
 pub mod link;
 pub mod preserve;
 pub mod remote_tracing;
