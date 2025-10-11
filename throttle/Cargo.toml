@@ -1,17 +1,20 @@
 [package]
-name = "throttle"
+name = "rcp-tools-throttle"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Internal library for RCP tools - resource throttling and rate limiting (not intended for direct use)"
 readme = "../README.md"
-documentation = "https://docs.rs/throttle"
+documentation = "https://docs.rs/rcp-tools-throttle"
 keywords = ["internal", "throttle", "ratelimit"]
 categories = ["development-tools"]
 
 [lints]
 workspace = true
+
+[lib]
+name = "throttle"
 
 [dependencies]
 tokio = { version = "1.38", features = ["full", "parking_lot", "tracing"] }

@@ -37,17 +37,17 @@ bincode = "1.3"
 bytes = "1.10"
 bytesize = "1.3"
 clap = { version = "4", features = ["derive"] }
-common = { version = "0.19.0", path = "../common" }
+common = { package = "rcp-tools-common", version = "0.19.0", path = "../common" }
 enum-map = "2.7"
 futures = "0.3"
 hex = "0.4"
 quinn = "0.10"
 rand = "0.8"
 regex = "1.11"
-remote = { version = "0.19.0", path = "../remote" }
+remote = { package = "rcp-tools-remote", version = "0.19.0", path = "../remote" }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
-throttle = { version = "0.19.0", path = "../throttle" }
+throttle = { package = "rcp-tools-throttle", version = "0.19.0", path = "../throttle" }
 tokio = { version = "1.38", features = ["full", "parking_lot", "tracing"] }
 tokio-util = "0.7"
 tracing = "0.1"

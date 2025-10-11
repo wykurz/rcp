@@ -373,38 +373,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
 
 [[package]]
-name = "common"
-version = "0.19.0"
-dependencies = [
- "anyhow",
- "async-recursion",
- "bincode",
- "bytes",
- "bytesize",
- "chrono",
- "clap",
- "console-subscriber",
- "enum-map",
- "futures",
- "humantime",
- "indicatif",
- "lazy_static",
- "libc",
- "nix",
- "procfs",
- "rand",
- "serde",
- "sysinfo",
- "thiserror 1.0.55",
- "thread_local",
- "throttle",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tracing-test",
-]
-
-[[package]]
 name = "console"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1488,6 +1456,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcp-tools-common"
+version = "0.19.0"
+dependencies = [
+ "anyhow",
+ "async-recursion",
+ "bincode",
+ "bytes",
+ "bytesize",
+ "chrono",
+ "clap",
+ "console-subscriber",
+ "enum-map",
+ "futures",
+ "humantime",
+ "indicatif",
+ "lazy_static",
+ "libc",
+ "nix",
+ "procfs",
+ "rand",
+ "rcp-tools-throttle",
+ "serde",
+ "sysinfo",
+ "thiserror 1.0.55",
+ "thread_local",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tracing-test",
+]
+
+[[package]]
 name = "rcp-tools-filegen"
 version = "0.19.0"
 dependencies = [
@@ -1496,10 +1496,10 @@ dependencies = [
  "async-recursion",
  "bytesize",
  "clap",
- "common",
  "rand",
+ "rcp-tools-common",
+ "rcp-tools-throttle",
  "thiserror 1.0.55",
- "throttle",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1513,7 +1513,7 @@ dependencies = [
  "assert_cmd",
  "bytesize",
  "clap",
- "common",
+ "rcp-tools-common",
  "thiserror 1.0.55",
  "tokio",
  "tracing",
@@ -1530,19 +1530,47 @@ dependencies = [
  "bytes",
  "bytesize",
  "clap",
- "common",
  "enum-map",
  "futures",
  "hex",
  "predicates",
  "quinn",
  "rand",
+ "rcp-tools-common",
+ "rcp-tools-remote",
+ "rcp-tools-throttle",
  "regex",
- "remote",
  "serde",
  "tempfile",
  "thiserror 1.0.55",
- "throttle",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rcp-tools-remote"
+version = "0.19.0"
+dependencies = [
+ "anyhow",
+ "async-recursion",
+ "bincode",
+ "bytes",
+ "chrono",
+ "enum-map",
+ "futures",
+ "hex",
+ "lazy_static",
+ "openssh",
+ "quinn",
+ "rand",
+ "rcgen",
+ "rcp-tools-common",
+ "ring 0.17.13",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "strum",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1556,8 +1584,8 @@ dependencies = [
  "assert_cmd",
  "bytesize",
  "clap",
- "common",
  "predicates",
+ "rcp-tools-common",
  "tempfile",
  "thiserror 1.0.55",
  "tokio",
@@ -1572,8 +1600,16 @@ dependencies = [
  "assert_cmd",
  "async-recursion",
  "clap",
- "common",
+ "rcp-tools-common",
  "thiserror 1.0.55",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rcp-tools-throttle"
+version = "0.19.0"
+dependencies = [
  "tokio",
  "tracing",
 ]
@@ -1615,34 +1651,6 @@ name = "regex-syntax"
 version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b15c43186be67a4fd63bee50d0303afffcef381492ebe2c5d87f324e1b8815c"
-
-[[package]]
-name = "remote"
-version = "0.19.0"
-dependencies = [
- "anyhow",
- "async-recursion",
- "bincode",
- "bytes",
- "chrono",
- "common",
- "enum-map",
- "futures",
- "hex",
- "lazy_static",
- "openssh",
- "quinn",
- "rand",
- "rcgen",
- "ring 0.17.13",
- "rustls",
- "rustls-pemfile",
- "serde",
- "strum",
- "tokio",
- "tokio-util",
- "tracing",
-]
 
 [[package]]
 name = "ring"
@@ -2021,14 +2029,6 @@ checksum = "3fdd6f064ccff2d6567adcb3873ca630700f00b5ad3f060c25b5dcfd9a4ce152"
 dependencies = [
  "cfg-if",
  "once_cell",
-]
-
-[[package]]
-name = "throttle"
-version = "0.19.0"
-dependencies = [
- "tokio",
- "tracing",
 ]
 
 [[package]]
