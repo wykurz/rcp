@@ -17,8 +17,8 @@
         pkgs = import nixpkgs {
           inherit system overlays;
         };
-        
-        rustToolchain = pkgs.rust-bin.stable."1.88.0".default.override {
+
+        rustToolchain = pkgs.rust-bin.stable."1.90.0".default.override {
           extensions = [ "rust-analysis" "rust-src" ];
         };
 
@@ -114,7 +114,7 @@
           buildInputs = with pkgs; [
             rustToolchain
             rust-analyzer
-            
+
             # Development tools from the original default.nix
             binutils
             cargo-bloat
@@ -129,13 +129,13 @@
             gdb
             llvmPackages.bintools
             tokio-console
-            
+
             # Additional useful tools
             pkg-config
           ] ++ buildInputs;
 
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/src";
-          
+
           # Environment variables for development
           shellHook = ''
             echo "RCP development environment"
