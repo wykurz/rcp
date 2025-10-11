@@ -38,7 +38,7 @@ rand = "0.8"
 sysinfo = "0.30"
 thiserror = "1.0"
 thread_local = "1.1"
-throttle = { package = "rcp-tools-throttle", version = "0.19.0", path = "../throttle" }
+throttle = { workspace = true }
 tokio = { version = "1.38", features = ["full", "parking_lot", "tracing"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "parking_lot"] }
