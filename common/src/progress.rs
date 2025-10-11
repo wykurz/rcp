@@ -78,7 +78,7 @@ impl ProgressCounter {
         }
     }
 
-    pub fn guard(&self) -> ProgressGuard {
+    pub fn guard(&self) -> ProgressGuard<'_> {
         ProgressGuard::new(self)
     }
 

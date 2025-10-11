@@ -21,7 +21,7 @@ impl Semaphore {
         self.sem.add_permits(value);
     }
 
-    pub async fn acquire(&self) -> Option<tokio::sync::SemaphorePermit> {
+    pub async fn acquire(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
         if self.flag.load(Ordering::Acquire) {
             Some(self.sem.acquire().await.unwrap())
         } else {
