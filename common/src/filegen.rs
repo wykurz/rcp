@@ -80,7 +80,7 @@ pub async fn write_file(
             let mut rng = rand::thread_rng();
             rng.fill(&mut bytes[..]);
         }
-        let writesize = std::cmp::min(filesize, bufsize) as usize;
+        let writesize = std::cmp::min(filesize, bufsize);
         file.write_all(&bytes[..writesize])
             .await
             .with_context(|| format!("Error writing to {:?}", &path))
