@@ -12,6 +12,13 @@ members = [
   "throttle",
 ]
 
+[workspace.package]
+version = "0.19.0"
+authors = ["Mateusz Wykurz <wykurz@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/wykurz/rcp"
+edition = "2021"
+
 [workspace.lints.clippy]
 # Deny all warnings to enforce code quality
 all = { level = "deny", priority = -1 }

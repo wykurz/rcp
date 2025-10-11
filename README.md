@@ -6,6 +6,9 @@ RCP TOOLS
 This repo contains tools to efficiently copy, remove and link large filesets, both locally and across remote hosts.
 
 [![Build status](https://github.com/wykurz/rcp/actions/workflows/rust.yml/badge.svg)](https://github.com/wykurz/rcp/actions)
+[![Crates.io](https://img.shields.io/crates/v/rcp-tools-rcp.svg)](https://crates.io/crates/rcp-tools-rcp)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Documentation](https://img.shields.io/badge/docs-GitHub-blue)](https://github.com/wykurz/rcp#readme)
 
 - `rcp` is for copying files; similar to `cp` but generally MUCH faster when dealing with large filesets.
 
