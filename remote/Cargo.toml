@@ -2,6 +2,7 @@
 name = "remote"
 version = "0.19.0"
 edition = "2021"
+publish = false
 
 [lints]
 workspace = true

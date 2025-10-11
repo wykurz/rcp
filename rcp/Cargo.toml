@@ -1,10 +1,12 @@
 [package]
 name = "rcp-tools-rcp"
-version = "0.19.0"
+version.workspace = true
 description = "Fast file operations tools - rcp (copy) and rcpd (remote copy daemon)"
-license = "MIT"
-edition = "2021"
-repository = "https://github.com/wykurz/rcp"
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+readme = "../README.md"
+documentation = "https://github.com/wykurz/rcp#readme"
 keywords = ["cli", "file", "copy", "remote", "performance"]
 categories = ["command-line-utilities", "filesystem"]
 
