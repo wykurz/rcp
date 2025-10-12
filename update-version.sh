@@ -1,3 +1,3 @@
 #!/bin/sh
 
-sed -i "s/^version = .*/version = \"$1\"/" **/Cargo.toml
+sed -i "s/version = \"$1\"/version = \"$2\"/" Cargo.toml flake.nix
