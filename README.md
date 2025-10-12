@@ -1,4 +1,4 @@
-<picture><img src="assets/logo.svg" height="64"></picture>
+<img src="https://raw.githubusercontent.com/wykurz/rcp/main/assets/logo.svg" height="64" alt="RCP Tools Logo">
 
 RCP TOOLS
 =========
@@ -85,9 +85,7 @@ Compare `<foo>` vs. `<bar>`:
 Installation
 ============
 
-<picture>
-<img src="https://github.com/NixOS/nixos-artwork/blob/master/logo/nix-snowflake-colours.svg" height="64">
-</picture>
+<img src="https://raw.githubusercontent.com/NixOS/nixos-artwork/master/logo/nix-snowflake-colours.svg" height="64" alt="Nix">
 
 nixpkgs
 -------
@@ -218,9 +216,7 @@ For detailed security architecture and threat model, see `docs/security.md`.
 tracing and tokio-console
 =========================
 
-<picture>
-<img src="https://github.com/tokio-rs/tracing/blob/master/assets/logo-type.png" height="64">
-</picture>
+<img src="https://raw.githubusercontent.com/tokio-rs/tracing/master/assets/logo-type.png" height="64" alt="Tracing">
 
 The `rcp` tools now use the `tracing` crate for logging and support sending data to the `tokio-console` subscriber.
 
