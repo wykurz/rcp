@@ -18,9 +18,7 @@
           inherit system overlays;
         };
 
-        rustToolchain = pkgs.rust-bin.stable."1.90.0".default.override {
-          extensions = [ "rust-analysis" "rust-src" ];
-        };
+        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
         # Build inputs needed for the Rust project
         buildInputs = with pkgs; lib.optionals stdenv.isDarwin [
