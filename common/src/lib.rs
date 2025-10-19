@@ -147,6 +147,18 @@ pub fn get_progress() -> &'static progress::Progress {
     &PROGRESS
 }
 
+struct LocalTimeFormatter;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTimeFormatter {
+    fn format_time(
+        &self,
+        writer: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    ) -> std::fmt::Result {
+        let now = chrono::Local::now();
+        writer.write_str(&now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    }
+}
+
 struct ProgressTracker {
     lock_cvar: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     pbar_thread: Option<std::thread::JoinHandle<()>>,
@@ -645,6 +657,7 @@ where
                 .with_target(true)
                 .with_line_number(true)
                 .with_thread_ids(true)
+                .with_timer(LocalTimeFormatter)
                 .with_ansi(false)
                 .with_writer(file)
                 .with_filter(
@@ -672,6 +685,7 @@ where
                 } else {
                     FmtSpan::NONE
                 })
+                .with_timer(LocalTimeFormatter)
                 .pretty()
                 .with_writer(ProgWriter::new);
             Some(fmt_layer)
