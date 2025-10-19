@@ -598,9 +598,12 @@ fn main() -> Result<(), anyhow::Error> {
         if args.progress || args.progress_type.is_some() {
             Some(common::ProgressSettings {
                 progress_type: if is_remote_operation {
-                    common::GeneralProgressType::RemoteMaster(Box::new(
-                        remote::tracelog::get_latest_progress_snapshot,
-                    ))
+                    common::GeneralProgressType::RemoteMaster {
+                        progress_type: args.progress_type.unwrap_or_default(),
+                        get_progress_snapshot: Box::new(
+                            remote::tracelog::get_latest_progress_snapshot,
+                        ),
+                    }
                 } else {
                     common::GeneralProgressType::User(args.progress_type.unwrap_or_default())
                 },

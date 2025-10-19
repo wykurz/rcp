@@ -338,7 +338,10 @@ pub async fn copy(
         .map_err(|err| Error::new(err, Default::default()))?;
     let mut copy_summary = {
         if let Err(error) = tokio::fs::create_dir(dst).await {
-            assert!(!is_fresh, "unexpected error creating directory: {:?}", &dst);
+            assert!(
+                !is_fresh,
+                "unexpected error creating directory: {dst:?}: {error}"
+            );
             if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
                 // check if the destination is a directory - if so, leave it
                 //
