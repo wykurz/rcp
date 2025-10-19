@@ -20,4 +20,4 @@ Add focused unit tests beside their modules and cross-tool scenarios under `<too
 Keep commit subjects concise and imperative, following the existing history (`Fix how we manage dependencies`, `Bump version ...`). Provide context and issue links in the body when applicable. PRs should summarize behavior changes, list validation commands (`cargo test`, `cargo clippy`, `cargo fmt --check`), and note any documentation updates or UI captures affecting users.
 
 ## Security & Configuration Tips
-Remote workflows launch `rcpd` via SSH; verify binaries exist on participating hosts and avoid committing SSH config or keys. Use disposable credentials or localhost tunnels when exercising remote paths. Redirect verbose logs to files under `target/` to keep sensitive host details out of terminal transcripts.
+Remote workflows launch `rcpd` via SSH; verify binaries exist on participating hosts and avoid committing SSH config or keys.
