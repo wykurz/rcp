@@ -242,6 +242,12 @@ fn progress_bar(
     PBAR.finish_and_clear();
 }
 
+fn get_datetime_prefix() -> String {
+    chrono::Local::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
+        .to_string()
+}
+
 fn text_updates(
     lock: &std::sync::Mutex<bool>,
     cvar: &std::sync::Condvar,
@@ -251,7 +257,12 @@ fn text_updates(
     let mut prog_printer = progress::ProgressPrinter::new(&PROGRESS);
     let mut is_done = lock.lock().unwrap();
     loop {
-        eprintln!("--{}", prog_printer.print().unwrap());
+        eprintln!("=======================");
+        eprintln!(
+            "{}\n--{}",
+            get_datetime_prefix(),
+            prog_printer.print().unwrap()
+        );
         let result = cvar.wait_timeout(is_done, delay).unwrap();
         is_done = result.0;
         if *is_done {
@@ -331,8 +342,10 @@ fn remote_master_updates<F>(
             let progress_map = get_progress_snapshot();
             let source_progress = &progress_map[RcpdType::Source];
             let destination_progress = &progress_map[RcpdType::Destination];
+            eprintln!("=======================");
             eprintln!(
-                "--{}",
+                "{}\n--{}",
+                get_datetime_prefix(),
                 printer
                     .print(source_progress, destination_progress)
                     .unwrap()
