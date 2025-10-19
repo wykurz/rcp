@@ -46,6 +46,11 @@ EXAMPLE:
 This creates a directory tree at /tmp/filegen/ with 3 top-level dirs, each containing 2 subdirs, with 10 files of 1MB each in every directory."
 )]
 struct Args {
+    // ARGUMENTS
+    /// Root directory where files are generated
+    #[arg()]
+    root: std::path::PathBuf,
+
     // Generation options
     /// Directory structure specification (comma-separated list of subdirectory counts per level)
     ///
@@ -170,11 +175,6 @@ struct Args {
         help_heading = "Advanced settings"
     )]
     max_blocking_threads: usize,
-
-    // ARGUMENTS
-    /// Root directory where files are generated
-    #[arg()]
-    root: std::path::PathBuf,
 }
 
 #[instrument]
