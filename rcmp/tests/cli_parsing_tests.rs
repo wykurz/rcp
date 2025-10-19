@@ -3,9 +3,6 @@
 //! These tests verify that command-line arguments are parsed correctly and maintain
 //! backward compatibility. The focus is on ensuring that argument values, aliases,
 //! and formats continue to work as expected across versions.
-//!
-//! NOTE: rcmp currently does not support --progress-type (unlike rcp, rrm, and rlink).
-//! If this is added in the future, tests should be added here.
 
 use assert_cmd::Command;
 
@@ -25,6 +22,74 @@ fn test_version_runs() {
         .arg("--version")
         .assert()
         .success();
+}
+
+// ============================================================================
+// ProgressType Argument Parsing Tests
+// ============================================================================
+
+#[test]
+fn test_progress_type_auto_lowercase() {
+    Command::cargo_bin("rcmp")
+        .unwrap()
+        .args(["--progress-type", "auto", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_progress_type_auto_capitalized() {
+    Command::cargo_bin("rcmp")
+        .unwrap()
+        .args(["--progress-type", "Auto", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_progress_type_progress_bar_pascal_case() {
+    Command::cargo_bin("rcmp")
+        .unwrap()
+        .args(["--progress-type", "ProgressBar", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_progress_type_progress_bar_kebab_case() {
+    Command::cargo_bin("rcmp")
+        .unwrap()
+        .args(["--progress-type", "progress-bar", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_progress_type_text_updates_pascal_case() {
+    Command::cargo_bin("rcmp")
+        .unwrap()
+        .args(["--progress-type", "TextUpdates", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_progress_type_text_updates_kebab_case() {
+    Command::cargo_bin("rcmp")
+        .unwrap()
+        .args(["--progress-type", "text-updates", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_progress_type_invalid_value() {
+    Command::cargo_bin("rcmp")
+        .unwrap()
+        .args(["--progress-type", "invalid-value", "--help"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("invalid value 'invalid-value'"));
 }
 
 // ============================================================================

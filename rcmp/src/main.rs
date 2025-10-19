@@ -57,6 +57,12 @@ struct Args {
     #[arg(long, help_heading = "Progress & output")]
     progress: bool,
 
+    /// Set the type of progress display
+    ///
+    /// If specified, --progress flag is implied.
+    #[arg(long, value_name = "TYPE", help_heading = "Progress & output")]
+    progress_type: Option<common::ProgressType>,
+
     /// Sets the delay between progress updates
     ///
     /// - For the interactive (--progress-type=ProgressBar), the default is 200ms.
@@ -170,9 +176,11 @@ fn main() -> Result<()> {
         || async_main(args)
     };
     let res = common::run(
-        if args.progress {
+        if args.progress || args.progress_type.is_some() {
             Some(common::ProgressSettings {
-                progress_type: common::GeneralProgressType::User(common::ProgressType::Auto),
+                progress_type: common::GeneralProgressType::User(
+                    args.progress_type.unwrap_or_default(),
+                ),
                 progress_delay: args.progress_delay,
             })
         } else {
