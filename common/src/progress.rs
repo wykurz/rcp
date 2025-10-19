@@ -256,7 +256,6 @@ impl<'a> ProgressPrinter<'a> {
             average: {:>10}/s\n\
             current: {:>10}/s\n\
             total:   {:>10}\n\
-            \n\
             files:       {:>10}\n\
             symlinks:    {:>10}\n\
             directories: {:>10}\n\
@@ -382,7 +381,6 @@ impl RcpdProgressPrinter {
             ops rate:    {:>10.2} items/s\n\
             bytes rate:  {:>10}/s\n\
             bytes total: {:>10}\n\
-            \n\
             files:       {:>10}\n\
             symlinks:    {:>10}\n\
             directories: {:>10}\n\
