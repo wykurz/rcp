@@ -167,8 +167,11 @@ struct ProgressTracker {
 #[derive(Copy, Clone, Debug, Default, clap::ValueEnum)]
 pub enum ProgressType {
     #[default]
+    #[value(name = "auto", alias = "Auto")]
     Auto,
+    #[value(name = "ProgressBar", alias = "progress-bar")]
     ProgressBar,
+    #[value(name = "TextUpdates", alias = "text-updates")]
     TextUpdates,
 }
 
@@ -193,20 +196,6 @@ impl std::fmt::Debug for GeneralProgressType {
                     "RemoteMaster(progress_type: {progress_type:?}, <function>)"
                 )
             }
-        }
-    }
-}
-
-// Keep FromStr for backwards compatibility, but ValueEnum will be used by clap
-impl std::str::FromStr for ProgressType {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "auto" | "Auto" => Ok(ProgressType::Auto),
-            "ProgressBar" => Ok(ProgressType::ProgressBar),
-            "TextUpdates" => Ok(ProgressType::TextUpdates),
-            _ => Err(anyhow!("Invalid progress type: {}", s)),
         }
     }
 }
