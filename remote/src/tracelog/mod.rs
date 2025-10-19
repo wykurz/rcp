@@ -1,4 +1,5 @@
 // Re-export RcpdType from common to avoid duplication
+use chrono::TimeZone;
 pub use common::RcpdType;
 
 lazy_static::lazy_static! {
@@ -58,12 +59,10 @@ pub async fn run_receiver(
                 let remote_target = format!("remote::{rcpd_type}::{target}");
                 let timestamp_str = match timestamp.duration_since(std::time::UNIX_EPOCH) {
                     Ok(duration) => {
-                        let datetime = chrono::DateTime::<chrono::Utc>::from_timestamp(
-                            duration.as_secs() as i64,
-                            duration.subsec_nanos(),
-                        );
-                        match datetime {
-                            Some(dt) => dt.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string(),
+                        let datetime = chrono::Local
+                            .timestamp_opt(duration.as_secs() as i64, duration.subsec_nanos());
+                        match datetime.single() {
+                            Some(dt) => dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                             None => format!("{timestamp:?}"),
                         }
                     }
