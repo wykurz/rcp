@@ -163,7 +163,11 @@ pub enum ProgressType {
 pub enum GeneralProgressType {
     User(ProgressType),
     Remote(tokio::sync::mpsc::UnboundedSender<remote_tracing::TracingMessage>),
-    RemoteMaster(Box<dyn Fn() -> ProgressSnapshot<SerializableProgress> + Send + 'static>),
+    RemoteMaster {
+        progress_type: ProgressType,
+        get_progress_snapshot:
+            Box<dyn Fn() -> ProgressSnapshot<SerializableProgress> + Send + 'static>,
+    },
 }
 
 impl std::fmt::Debug for GeneralProgressType {
@@ -171,7 +175,12 @@ impl std::fmt::Debug for GeneralProgressType {
         match self {
             GeneralProgressType::User(pt) => write!(f, "User({pt:?})"),
             GeneralProgressType::Remote(_) => write!(f, "Remote(<sender>)"),
-            GeneralProgressType::RemoteMaster(_) => write!(f, "RemoteMaster(<function>)"),
+            GeneralProgressType::RemoteMaster { progress_type, .. } => {
+                write!(
+                    f,
+                    "RemoteMaster(progress_type: {progress_type:?}, <function>)"
+                )
+            }
         }
     }
 }
@@ -267,34 +276,62 @@ fn remote_master_updates<F>(
     cvar: &std::sync::Condvar,
     delay_opt: &Option<std::time::Duration>,
     get_progress_snapshot: F,
+    progress_type: ProgressType,
 ) where
     F: Fn() -> ProgressSnapshot<SerializableProgress> + Send + 'static,
 {
-    PBAR.set_style(
-        indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .unwrap()
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-    );
-    let delay = delay_opt.unwrap_or(std::time::Duration::from_millis(200));
-    let mut printer = RcpdProgressPrinter::new();
-    let mut is_done = lock.lock().unwrap();
-    loop {
-        let progress_map = get_progress_snapshot();
-        let source_progress = &progress_map[RcpdType::Source];
-        let destination_progress = &progress_map[RcpdType::Destination];
-        PBAR.set_position(PBAR.position() + 1); // do we need to update?
-        PBAR.set_message(
-            printer
-                .print(source_progress, destination_progress)
-                .unwrap(),
+    let interactive = match progress_type {
+        ProgressType::Auto => std::io::stderr().is_terminal(),
+        ProgressType::ProgressBar => true,
+        ProgressType::TextUpdates => false,
+    };
+    if interactive {
+        PBAR.set_style(
+            indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
         );
-        let result = cvar.wait_timeout(is_done, delay).unwrap();
-        is_done = result.0;
-        if *is_done {
-            break;
+        let delay = delay_opt.unwrap_or(std::time::Duration::from_millis(200));
+        let mut printer = RcpdProgressPrinter::new();
+        let mut is_done = lock.lock().unwrap();
+        loop {
+            let progress_map = get_progress_snapshot();
+            let source_progress = &progress_map[RcpdType::Source];
+            let destination_progress = &progress_map[RcpdType::Destination];
+            PBAR.set_position(PBAR.position() + 1); // do we need to update?
+            PBAR.set_message(
+                printer
+                    .print(source_progress, destination_progress)
+                    .unwrap(),
+            );
+            let result = cvar.wait_timeout(is_done, delay).unwrap();
+            is_done = result.0;
+            if *is_done {
+                break;
+            }
+        }
+        PBAR.finish_and_clear();
+    } else {
+        let delay = delay_opt.unwrap_or(std::time::Duration::from_secs(10));
+        let mut printer = RcpdProgressPrinter::new();
+        let mut is_done = lock.lock().unwrap();
+        loop {
+            let progress_map = get_progress_snapshot();
+            let source_progress = &progress_map[RcpdType::Source];
+            let destination_progress = &progress_map[RcpdType::Destination];
+            eprintln!(
+                "--{}",
+                printer
+                    .print(source_progress, destination_progress)
+                    .unwrap()
+            );
+            let result = cvar.wait_timeout(is_done, delay).unwrap();
+            is_done = result.0;
+            if *is_done {
+                break;
+            }
         }
     }
-    PBAR.finish_and_clear();
 }
 
 impl ProgressTracker {
@@ -308,8 +345,17 @@ impl ProgressTracker {
                 GeneralProgressType::Remote(sender) => {
                     rcpd_updates(lock, cvar, &delay_opt, sender);
                 }
-                GeneralProgressType::RemoteMaster(get_progress_snapshot) => {
-                    remote_master_updates(lock, cvar, &delay_opt, get_progress_snapshot);
+                GeneralProgressType::RemoteMaster {
+                    progress_type,
+                    get_progress_snapshot,
+                } => {
+                    remote_master_updates(
+                        lock,
+                        cvar,
+                        &delay_opt,
+                        get_progress_snapshot,
+                        progress_type,
+                    );
                 }
                 _ => {
                     let interactive = match progress_type {
@@ -318,7 +364,8 @@ impl ProgressTracker {
                         }
                         GeneralProgressType::User(ProgressType::ProgressBar) => true,
                         GeneralProgressType::User(ProgressType::TextUpdates) => false,
-                        GeneralProgressType::Remote(_) | GeneralProgressType::RemoteMaster(_) => {
+                        GeneralProgressType::Remote(_)
+                        | GeneralProgressType::RemoteMaster { .. } => {
                             unreachable!("Invalid progress type: {progress_type:?}")
                         }
                     };
