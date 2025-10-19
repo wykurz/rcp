@@ -21,6 +21,7 @@ pub enum ObjType {
     File,
     Dir,
     Symlink,
+    Other, // sockets, block devices, character devices, FIFOs, etc.
 }
 
 pub type ObjSettings = EnumMap<ObjType, filecmp::MetadataCmpSettings>;
@@ -126,7 +127,8 @@ fn obj_type(metadata: &std::fs::Metadata) -> ObjType {
     } else if metadata.is_symlink() {
         ObjType::Symlink
     } else {
-        unreachable!("Unknown object type! {:?}", &metadata);
+        // sockets, block devices, character devices, FIFOs, etc.
+        ObjType::Other
     }
 }
 
@@ -369,6 +371,10 @@ mod cmp_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                ObjType::Other => filecmp::MetadataCmpSettings {
+                    mtime: true,
+                    ..Default::default()
+                },
             },
         };
         let summary = cmp(
@@ -395,6 +401,12 @@ mod cmp_tests {
             ObjType::Symlink => enum_map! {
                 CompareResult::Different => 0,
                 CompareResult::Same => 2,
+                CompareResult::SrcMissing => 0,
+                CompareResult::DstMissing => 0,
+            },
+            ObjType::Other => enum_map! {
+                CompareResult::Different => 0,
+                CompareResult::Same => 0,
                 CompareResult::SrcMissing => 0,
                 CompareResult::DstMissing => 0,
             },

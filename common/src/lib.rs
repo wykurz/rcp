@@ -501,6 +501,7 @@ pub fn parse_compare_settings(settings: &str) -> Result<cmp::ObjSettings, anyhow
                 "f" | "file" => ObjType::File,
                 "d" | "dir" | "directory" => ObjType::Dir,
                 "l" | "link" | "symlink" => ObjType::Symlink,
+                "o" | "other" => ObjType::Other,
                 _ => {
                     return Err(anyhow!("Unknown obj type: {}", obj_type));
                 }
