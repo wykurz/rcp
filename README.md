@@ -114,6 +114,15 @@ The following command will install all the tools on your system:
 > nix-env -iA nixpkgs.rcp
 ```
 
+crates.io
+---------
+
+All tools are available on [crates.io](https://crates.io/search?q=rcp-tools). Individual tools can be installed using `cargo install`:
+
+```fish
+> cargo install rcp-tools-rcp
+```
+
 debian / rhel
 -------------
 
