@@ -59,11 +59,11 @@ jobs:
     - name: Build RPM package
       run: |
         cargo build --release
-        cargo generate-rpm -p rcp-tools-rcp
-        cargo generate-rpm -p rcp-tools-rlink
-        cargo generate-rpm -p rcp-tools-rrm
-        cargo generate-rpm -p rcp-tools-rcmp
-        cargo generate-rpm -p rcp-tools-filegen
+        cargo generate-rpm -p rcp
+        cargo generate-rpm -p rlink
+        cargo generate-rpm -p rrm
+        cargo generate-rpm -p rcmp
+        cargo generate-rpm -p filegen
         zip rcp-rpm-amd64-${{ github.event.release.tag_name }}.zip target/generate-rpm/*.rpm
         echo $(pwd)/rcp-rpm-amd64-${{ github.event.release.tag_name }}
         ls -ld $(pwd)/rcp-rpm-amd64-${{ github.event.release.tag_name }}*
