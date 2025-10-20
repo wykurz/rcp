@@ -6,7 +6,7 @@ license.workspace = true
 edition.workspace = true
 repository.workspace = true
 readme = "../README.md"
-documentation = "https://github.com/wykurz/rcp#readme"
+documentation = "https://docs.rs/rcp-tools-rcp"
 keywords = ["cli", "file", "copy", "remote", "performance"]
 categories = ["command-line-utilities", "filesystem"]
 
