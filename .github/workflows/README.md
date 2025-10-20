@@ -38,7 +38,8 @@ Publishes all crates to crates.io when a new release is created.
    - Tag format: `vX.Y.Z` (e.g., `v0.20.0`)
    - The workflow will automatically:
      - Verify the tag matches the version in Cargo.toml
-     - Build and test all crates
+     - Check formatting, run clippy, and build documentation
+     - Run the full test suite
      - Publish all workspace crates to crates.io in dependency order
      - Skip already published versions automatically
 
@@ -61,8 +62,9 @@ This approach is much simpler than manually listing crates and eliminates the ne
 #### Safety Features
 
 - **Version verification**: Ensures release tag matches Cargo.toml version
+- **Quality checks**: Runs formatting, clippy, and documentation checks before publishing
 - **Automatic dependency ordering**: cargo-workspaces handles dependency resolution
-- **Build & test**: Runs full build and test suite before publishing
+- **Full test suite**: Runs all tests before publishing
 - **Dry-run mode**: Can test the workflow without actually publishing
 - **Idempotent**: Safely handles already-published versions
 
