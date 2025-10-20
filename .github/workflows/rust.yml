@@ -69,6 +69,8 @@ jobs:
       run: |
         # Run tests with nextest for better output
         cargo nextest run --no-capture 2>&1 | tee test_output.log
+    - name: Doctests
+      run: cargo test --doc
     - name: Upload test logs
       if: always()
       uses: actions/upload-artifact@v4
