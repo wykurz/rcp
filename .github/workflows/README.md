@@ -84,5 +84,5 @@ This approach is much simpler than manually listing crates and eliminates the ne
 - cargo-workspaces automatically waits for crates.io to update between dependent crates
 - If issues persist, wait a few minutes and re-run the workflow
 
-### release-amd64.yml / release-arm64.yaml
+### release-amd64.yml / release-arm64.yml
 Build binary releases for different architectures.
