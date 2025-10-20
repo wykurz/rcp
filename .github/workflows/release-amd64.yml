@@ -25,11 +25,11 @@ jobs:
       run: cargo install cargo-deb
     - name: Build Debian package
       run: |
-        cargo deb -p rcp
-        cargo deb -p rlink
-        cargo deb -p rrm
-        cargo deb -p rcmp
-        cargo deb -p filegen
+        cargo deb -p rcp-tools-rcp
+        cargo deb -p rcp-tools-rlink
+        cargo deb -p rcp-tools-rrm
+        cargo deb -p rcp-tools-rcmp
+        cargo deb -p rcp-tools-filegen
         zip rcp-deb-amd64-${{ github.event.release.tag_name }}.zip target/debian/*.deb
         echo $(pwd)/rcp-deb-amd64-${{ github.event.release.tag_name }}
         ls -ld $(pwd)/rcp-deb-amd64-${{ github.event.release.tag_name }}*
@@ -59,11 +59,11 @@ jobs:
     - name: Build RPM package
       run: |
         cargo build --release
-        cargo generate-rpm -p rcp
-        cargo generate-rpm -p rlink
-        cargo generate-rpm -p rrm
-        cargo generate-rpm -p rcmp
-        cargo generate-rpm -p filegen
+        cargo generate-rpm -p rcp-tools-rcp
+        cargo generate-rpm -p rcp-tools-rlink
+        cargo generate-rpm -p rcp-tools-rrm
+        cargo generate-rpm -p rcp-tools-rcmp
+        cargo generate-rpm -p rcp-tools-filegen
         zip rcp-rpm-amd64-${{ github.event.release.tag_name }}.zip target/generate-rpm/*.rpm
         echo $(pwd)/rcp-rpm-amd64-${{ github.event.release.tag_name }}
         ls -ld $(pwd)/rcp-rpm-amd64-${{ github.event.release.tag_name }}*
