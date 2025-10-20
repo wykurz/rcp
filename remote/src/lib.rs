@@ -231,7 +231,25 @@
 //!     port: None,
 //! };
 //!
-//! let config = RcpdConfig::default();
+//! let config = RcpdConfig {
+//!     verbose: 0,
+//!     fail_early: false,
+//!     max_workers: 4,
+//!     max_blocking_threads: 512,
+//!     max_open_files: None,
+//!     ops_throttle: 0,
+//!     iops_throttle: 0,
+//!     chunk_size: 1024 * 1024,
+//!     dereference: false,
+//!     overwrite: false,
+//!     overwrite_compare: String::new(),
+//!     debug_log_prefix: None,
+//!     quic_port_ranges: None,
+//!     progress: false,
+//!     progress_delay: None,
+//!     remote_copy_conn_timeout_sec: 15,
+//!     master_cert_fingerprint: Vec::new(),
+//! };
 //! let master_addr: SocketAddr = "192.168.1.100:5000".parse()?;
 //! let server_name = "master-server";
 //!
@@ -247,7 +265,7 @@
 //!
 //! # fn example() -> anyhow::Result<()> {
 //! // Create server restricted to ports 8000-8999
-//! let endpoint = get_server_with_port_ranges(Some("8000-8999"))?;
+//! let (endpoint, _cert_fingerprint) = get_server_with_port_ranges(Some("8000-8999"))?;
 //! let addr = get_endpoint_addr(&endpoint)?;
 //! println!("Server listening on: {}", addr);
 //! # Ok(())

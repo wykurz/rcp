@@ -14,6 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain-file: rust-toolchain.toml
     - name: Format
       run: cargo fmt --check
 
@@ -21,6 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain-file: rust-toolchain.toml
     - name: Lint
       run: cargo clippy
 
@@ -28,6 +36,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain-file: rust-toolchain.toml
     - name: Documentation
       run: cargo doc --no-deps
       env:
@@ -38,6 +50,10 @@ jobs:
     needs: [format, lint, documentation]
     steps:
     - uses: actions/checkout@v5
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain-file: rust-toolchain.toml
     - name: Setup SSH for localhost
       run: |
         sudo apt-get update
