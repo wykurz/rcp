@@ -238,7 +238,7 @@ For detailed security architecture and threat model, see `docs/security.md`.
 
 `rcp` tools will not-overwrite pre-existing data unless used with the `--overwrite` flag.
 
-tracing and tokio-console
+Tracing and tokio-console
 =========================
 
 <img src="https://raw.githubusercontent.com/tokio-rs/tracing/master/assets/logo-type.png" height="64" alt="Tracing">
@@ -257,7 +257,7 @@ By default port `6669` is used (`tokio-console` default) but this can be changed
 
 The trace events are retained for 60s. This can be modified by setting `RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS=120`.
 
-references
+References
 ==========
 1) https://mpifileutils.readthedocs.io/en/v0.11.1/dsync.1.html
 2) https://github.com/wtsi-ssg/pcp
