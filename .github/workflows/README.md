@@ -51,8 +51,9 @@ Publishes all crates to crates.io when a new release is created.
 
 #### How It Works
 
-The workflow uses [`cargo-workspaces`](https://crates.io/crates/cargo-workspaces) to automatically:
-- Discover all workspace members
+The workflow uses [`cargo-workspaces`](https://crates.io/crates/cargo-workspaces) with the `--publish-as-is` flag to:
+- Publish crates from the current commit without versioning changes
+- Automatically discover all workspace members
 - Determine correct publishing order based on dependencies
 - Handle already-published versions gracefully
 - Publish crates in the correct sequence

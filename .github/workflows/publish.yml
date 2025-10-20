@@ -84,11 +84,8 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
           cargo workspaces publish \
-            --from-git \
+            --publish-as-is \
             --yes \
-            --no-git-commit \
-            --no-git-push \
-            --no-git-tag \
             ${{ env.DRY_RUN }}
 
       - name: Summary
