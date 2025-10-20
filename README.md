@@ -8,7 +8,7 @@ This repo contains tools to efficiently copy, remove and link large filesets, bo
 [![Build status](https://github.com/wykurz/rcp/actions/workflows/rust.yml/badge.svg)](https://github.com/wykurz/rcp/actions)
 [![Crates.io](https://img.shields.io/crates/v/rcp-tools-rcp.svg)](https://crates.io/crates/rcp-tools-rcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Documentation](https://img.shields.io/badge/docs-GitHub-blue)](https://github.com/wykurz/rcp#readme)
+[![Documentation](https://docs.rs/rcp-tools-rcp/badge.svg)](https://docs.rs/rcp-tools-rcp)
 
 - `rcp` is for copying files; similar to `cp` but generally MUCH faster when dealing with large filesets.
 
@@ -23,6 +23,22 @@ This repo contains tools to efficiently copy, remove and link large filesets, bo
 - `rcmp` tool is for comparing filesets.
 
 - `filegen` tool generates sample filesets, useful for testing.
+
+Documentation
+=============
+
+API documentation for the command-line tools is available on docs.rs:
+
+- [rcp-tools-rcp](https://docs.rs/rcp-tools-rcp) - File copying tool (rcp & rcpd)
+- [rcp-tools-rrm](https://docs.rs/rcp-tools-rrm) - File removal tool
+- [rcp-tools-rlink](https://docs.rs/rcp-tools-rlink) - Hard-linking tool
+- [rcp-tools-rcmp](https://docs.rs/rcp-tools-rcmp) - File comparison tool
+- [rcp-tools-filegen](https://docs.rs/rcp-tools-filegen) - Test file generation utility
+
+**For contributors**: Internal library crates used by the tools above:
+- [rcp-tools-common](https://docs.rs/rcp-tools-common) - Shared utilities and types
+- [rcp-tools-remote](https://docs.rs/rcp-tools-remote) - Remote operation protocol
+- [rcp-tools-throttle](https://docs.rs/rcp-tools-throttle) - Resource throttling
 
 Examples
 ========
