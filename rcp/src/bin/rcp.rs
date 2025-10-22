@@ -162,6 +162,28 @@ struct Args {
     #[arg(long, value_name = "RANGES", help_heading = "Remote copy options")]
     quic_port_ranges: Option<String>,
 
+    /// QUIC idle timeout in seconds
+    ///
+    /// Maximum time a QUIC connection can be idle before being closed
+    #[arg(
+        long,
+        default_value = "10",
+        value_name = "N",
+        help_heading = "Remote copy options"
+    )]
+    quic_idle_timeout_sec: u64,
+
+    /// QUIC keep-alive interval in seconds
+    ///
+    /// Interval for sending QUIC keep-alive packets to detect dead connections
+    #[arg(
+        long,
+        default_value = "1",
+        value_name = "N",
+        help_heading = "Remote copy options"
+    )]
+    quic_keep_alive_interval_sec: u64,
+
     /// Connection timeout for remote copy operations in seconds
     ///
     /// Applies to: rcpd→master connection, destination→source connection
@@ -194,8 +216,11 @@ async fn run_rcpd_master(
 ) -> anyhow::Result<common::copy::Summary> {
     tracing::debug!("running rcpd src/dst");
     // open a port and wait from server & client hello, respond to client with server port
-    let (server_endpoint, master_cert_fingerprint) =
-        remote::get_server_with_port_ranges(args.quic_port_ranges.as_deref())?;
+    let (server_endpoint, master_cert_fingerprint) = remote::get_server_with_port_ranges(
+        args.quic_port_ranges.as_deref(),
+        args.quic_idle_timeout_sec,
+        args.quic_keep_alive_interval_sec,
+    )?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
     let server_name = remote::get_random_server_name();
     let mut rcpds = vec![];
@@ -213,6 +238,8 @@ async fn run_rcpd_master(
         overwrite_compare: args.overwrite_compare.clone(),
         debug_log_prefix: args.rcpd_debug_log_prefix.clone(),
         quic_port_ranges: args.quic_port_ranges.clone(),
+        quic_idle_timeout_sec: args.quic_idle_timeout_sec,
+        quic_keep_alive_interval_sec: args.quic_keep_alive_interval_sec,
         progress: args.progress,
         progress_delay: args.progress_delay.clone(),
         remote_copy_conn_timeout_sec: args.remote_copy_conn_timeout_sec,

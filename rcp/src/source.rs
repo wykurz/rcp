@@ -599,6 +599,7 @@ async fn handle_connection(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument]
 pub async fn run_source(
     master_send_stream: remote::streams::SharedSendStream,
@@ -606,10 +607,15 @@ pub async fn run_source(
     dst: &std::path::Path,
     settings: &common::copy::Settings,
     quic_port_ranges: Option<&str>,
+    quic_idle_timeout_sec: u64,
+    quic_keep_alive_interval_sec: u64,
     conn_timeout_sec: u64,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
-    let (server_endpoint, cert_fingerprint) =
-        remote::get_server_with_port_ranges(quic_port_ranges)?;
+    let (server_endpoint, cert_fingerprint) = remote::get_server_with_port_ranges(
+        quic_port_ranges,
+        quic_idle_timeout_sec,
+        quic_keep_alive_interval_sec,
+    )?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
     tracing::info!("Source server listening on {}", server_addr);
     let master_hello = remote::protocol::SourceMasterHello {

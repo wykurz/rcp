@@ -176,6 +176,8 @@ pub struct RcpdConfig {
     pub overwrite_compare: String,
     pub debug_log_prefix: Option<String>,
     pub quic_port_ranges: Option<String>,
+    pub quic_idle_timeout_sec: u64,
+    pub quic_keep_alive_interval_sec: u64,
     pub progress: bool,
     pub progress_delay: Option<String>,
     pub remote_copy_conn_timeout_sec: u64,
@@ -215,6 +217,14 @@ impl RcpdConfig {
         if let Some(ref ranges) = self.quic_port_ranges {
             args.push(format!("--quic-port-ranges={ranges}"));
         }
+        args.push(format!(
+            "--quic-idle-timeout-sec={}",
+            self.quic_idle_timeout_sec
+        ));
+        args.push(format!(
+            "--quic-keep-alive-interval-sec={}",
+            self.quic_keep_alive_interval_sec
+        ));
         if self.progress {
             args.push("--progress".to_string());
         }

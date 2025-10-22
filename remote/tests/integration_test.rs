@@ -1,6 +1,10 @@
 use anyhow::Result;
 use remote::port_ranges::PortRanges;
 
+// test-only default values for QUIC timeouts
+const DEFAULT_QUIC_IDLE_TIMEOUT_SEC: u64 = 10;
+const DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC: u64 = 1;
+
 #[test]
 fn test_port_binding_with_ranges() -> Result<()> {
     // Test that we can bind to a specific port range
@@ -20,7 +24,11 @@ fn test_port_binding_with_ranges() -> Result<()> {
 #[tokio::test]
 async fn test_quic_server_creation_with_port_ranges() -> Result<()> {
     // Test the complete QUIC server creation with port ranges
-    let (endpoint, _cert_fingerprint) = remote::get_server_with_port_ranges(Some("21000-21999"))?;
+    let (endpoint, _cert_fingerprint) = remote::get_server_with_port_ranges(
+        Some("21000-21999"),
+        DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
+        DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
+    )?;
     let addr = endpoint.local_addr()?;
     // Verify the port is within our specified range
     assert!(
@@ -36,8 +44,12 @@ async fn test_quic_client_creation_with_port_ranges() -> Result<()> {
     // Test the complete QUIC client creation with port ranges
     // We use a dummy fingerprint since we're only testing port binding, not actual connections
     let dummy_fingerprint = vec![0u8; 32]; // dummy SHA-256 fingerprint
-    let endpoint =
-        remote::get_client_with_port_ranges_and_pinning(Some("22000-22999"), dummy_fingerprint)?;
+    let endpoint = remote::get_client_with_port_ranges_and_pinning(
+        Some("22000-22999"),
+        dummy_fingerprint,
+        DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
+        DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
+    )?;
     let addr = endpoint.local_addr()?;
     // Verify the port is within our specified range
     assert!(
@@ -68,12 +80,20 @@ fn test_multiple_port_ranges() -> Result<()> {
 #[tokio::test]
 async fn test_full_quic_endpoint_functionality() -> Result<()> {
     // Test that we can create both server and client with port ranges and they work together
-    let (server, _cert_fingerprint) = remote::get_server_with_port_ranges(Some("16000-16999"))?;
+    let (server, _cert_fingerprint) = remote::get_server_with_port_ranges(
+        Some("16000-16999"),
+        DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
+        DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
+    )?;
     let server_addr = remote::get_endpoint_addr(&server)?;
     // Use a dummy fingerprint since we're only testing port binding, not actual connections
     let dummy_fingerprint = vec![0u8; 32];
-    let client =
-        remote::get_client_with_port_ranges_and_pinning(Some("17000-17999"), dummy_fingerprint)?;
+    let client = remote::get_client_with_port_ranges_and_pinning(
+        Some("17000-17999"),
+        dummy_fingerprint,
+        DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
+        DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
+    )?;
     let client_addr = client.local_addr()?;
     // Verify both are in their respective ranges
     assert!(
