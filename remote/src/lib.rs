@@ -245,6 +245,8 @@
 //!     overwrite_compare: String::new(),
 //!     debug_log_prefix: None,
 //!     quic_port_ranges: None,
+//!     quic_idle_timeout_sec: 10,
+//!     quic_keep_alive_interval_sec: 1,
 //!     progress: false,
 //!     progress_delay: None,
 //!     remote_copy_conn_timeout_sec: 15,
@@ -265,6 +267,8 @@
 //!
 //! # fn example() -> anyhow::Result<()> {
 //! // Create server restricted to ports 8000-8999
+//! // Timeouts are read from RCP_QUIC_IDLE_TIMEOUT_SEC and RCP_QUIC_KEEP_ALIVE_INTERVAL_SEC
+//! // environment variables, or defaults are used (10s idle, 1s keep-alive)
 //! let (endpoint, _cert_fingerprint) = get_server_with_port_ranges(Some("8000-8999"))?;
 //! let addr = get_endpoint_addr(&endpoint)?;
 //! println!("Server listening on: {}", addr);
@@ -396,8 +400,15 @@ fn compute_cert_fingerprint(cert_der: &[u8]) -> ring::digest::Digest {
 
 /// Configure QUIC server with a self-signed certificate
 /// Returns the server config and the SHA-256 fingerprint of the certificate
-fn configure_server() -> anyhow::Result<(quinn::ServerConfig, Vec<u8>)> {
-    tracing::info!("Configuring QUIC server");
+fn configure_server(
+    idle_timeout_sec: u64,
+    keep_alive_interval_sec: u64,
+) -> anyhow::Result<(quinn::ServerConfig, Vec<u8>)> {
+    tracing::info!(
+        "Configuring QUIC server (idle_timeout={}s, keep_alive={}s)",
+        idle_timeout_sec,
+        keep_alive_interval_sec
+    );
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let key_der = cert.serialize_private_key_der();
     let cert_der = cert.serialize_der()?;
@@ -409,16 +420,30 @@ fn configure_server() -> anyhow::Result<(quinn::ServerConfig, Vec<u8>)> {
     );
     let key = rustls::PrivateKey(key_der);
     let cert = rustls::Certificate(cert_der);
-    let server_config = quinn::ServerConfig::with_single_cert(vec![cert], key)
+    let mut server_config = quinn::ServerConfig::with_single_cert(vec![cert], key)
         .context("Failed to create server config")?;
+    // configure transport timeouts for connection liveness detection
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.max_idle_timeout(Some(
+        std::time::Duration::from_secs(idle_timeout_sec)
+            .try_into()
+            .context("Failed to convert idle timeout to VarInt")?,
+    ));
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
+        keep_alive_interval_sec,
+    )));
+    server_config.transport_config(std::sync::Arc::new(transport_config));
     Ok((server_config, fingerprint_vec))
 }
 
 #[instrument]
 pub fn get_server_with_port_ranges(
     port_ranges: Option<&str>,
+    idle_timeout_sec: u64,
+    keep_alive_interval_sec: u64,
 ) -> anyhow::Result<(quinn::Endpoint, Vec<u8>)> {
-    let (server_config, cert_fingerprint) = configure_server()?;
+    let (server_config, cert_fingerprint) =
+        configure_server(idle_timeout_sec, keep_alive_interval_sec)?;
     let socket = if let Some(ranges_str) = port_ranges {
         let ranges = port_ranges::PortRanges::parse(ranges_str)?;
         ranges.bind_udp_socket(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))?
@@ -511,18 +536,17 @@ pub fn get_random_server_name() -> String {
 }
 
 #[instrument]
-pub fn get_client_with_cert_pinning(cert_fingerprint: Vec<u8>) -> anyhow::Result<quinn::Endpoint> {
-    get_client_with_port_ranges_and_pinning(None, cert_fingerprint)
-}
-
-#[instrument]
 pub fn get_client_with_port_ranges_and_pinning(
     port_ranges: Option<&str>,
     cert_fingerprint: Vec<u8>,
+    idle_timeout_sec: u64,
+    keep_alive_interval_sec: u64,
 ) -> anyhow::Result<quinn::Endpoint> {
     tracing::info!(
-        "Creating QUIC client with certificate pinning (fingerprint: {})",
-        hex::encode(&cert_fingerprint)
+        "Creating QUIC client with certificate pinning (fingerprint: {}, idle_timeout={}s, keep_alive={}s)",
+        hex::encode(&cert_fingerprint),
+        idle_timeout_sec,
+        keep_alive_interval_sec
     );
     // create a crypto backend with certificate pinning
     let crypto = rustls::ClientConfig::builder()
@@ -531,16 +555,33 @@ pub fn get_client_with_port_ranges_and_pinning(
             cert_fingerprint,
         )))
         .with_no_client_auth();
-    create_client_endpoint(port_ranges, crypto)
+    create_client_endpoint(
+        port_ranges,
+        crypto,
+        idle_timeout_sec,
+        keep_alive_interval_sec,
+    )
 }
 
 // helper function to create client endpoint with given crypto config
 fn create_client_endpoint(
     port_ranges: Option<&str>,
     crypto: rustls::ClientConfig,
+    idle_timeout_sec: u64,
+    keep_alive_interval_sec: u64,
 ) -> anyhow::Result<quinn::Endpoint> {
-    // create QUIC client config
-    let client_config = quinn::ClientConfig::new(std::sync::Arc::new(crypto));
+    // create QUIC client config with timeouts
+    let mut client_config = quinn::ClientConfig::new(std::sync::Arc::new(crypto));
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.max_idle_timeout(Some(
+        std::time::Duration::from_secs(idle_timeout_sec)
+            .try_into()
+            .context("Failed to convert idle timeout to VarInt")?,
+    ));
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
+        keep_alive_interval_sec,
+    )));
+    client_config.transport_config(std::sync::Arc::new(transport_config));
     let socket = if let Some(ranges_str) = port_ranges {
         let ranges = port_ranges::PortRanges::parse(ranges_str)?;
         ranges.bind_udp_socket(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))?
@@ -558,4 +599,17 @@ fn create_client_endpoint(
     .context("Failed to create QUIC endpoint")?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
+}
+
+#[cfg(test)]
+pub mod test_defaults {
+    //! Test-only constants for QUIC timeout defaults
+    //! These should not be used in production code - all production code should
+    //! receive timeout values from CLI arguments
+
+    /// Default QUIC idle timeout in seconds for tests
+    pub const DEFAULT_QUIC_IDLE_TIMEOUT_SEC: u64 = 10;
+
+    /// Default QUIC keep-alive interval in seconds for tests
+    pub const DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC: u64 = 1;
 }

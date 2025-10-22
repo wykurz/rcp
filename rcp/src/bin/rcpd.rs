@@ -133,6 +133,28 @@ struct Args {
     #[arg(long, value_name = "RANGES", help_heading = "Remote copy options")]
     quic_port_ranges: Option<String>,
 
+    /// QUIC idle timeout in seconds
+    ///
+    /// Maximum time a QUIC connection can be idle before being closed
+    #[arg(
+        long,
+        default_value = "10",
+        value_name = "N",
+        help_heading = "Remote copy options"
+    )]
+    quic_idle_timeout_sec: u64,
+
+    /// QUIC keep-alive interval in seconds
+    ///
+    /// Interval for sending QUIC keep-alive packets to detect dead connections
+    #[arg(
+        long,
+        default_value = "1",
+        value_name = "N",
+        help_heading = "Remote copy options"
+    )]
+    quic_keep_alive_interval_sec: u64,
+
     /// Connection timeout for remote copy operations in seconds
     ///
     /// Applies to: rcpd→master connection, destination→source connection
@@ -173,6 +195,8 @@ async fn async_main(
     let client = remote::get_client_with_port_ranges_and_pinning(
         args.quic_port_ranges.as_deref(),
         master_cert_fingerprint,
+        args.quic_idle_timeout_sec,
+        args.quic_keep_alive_interval_sec,
     )?;
     let master_connection = {
         let master_connection = client
@@ -224,6 +248,8 @@ async fn async_main(
                 &dst,
                 &settings,
                 args.quic_port_ranges.as_deref(),
+                args.quic_idle_timeout_sec,
+                args.quic_keep_alive_interval_sec,
                 args.remote_copy_conn_timeout_sec,
             )
             .await
@@ -250,6 +276,8 @@ async fn async_main(
                 &source_cert_fingerprint,
                 &settings,
                 &preserve,
+                args.quic_idle_timeout_sec,
+                args.quic_keep_alive_interval_sec,
                 args.remote_copy_conn_timeout_sec,
             )
             .await

@@ -501,6 +501,7 @@ async fn create_directory_structure(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument]
 pub async fn run_destination(
     src_endpoint: &std::net::SocketAddr,
@@ -508,9 +509,16 @@ pub async fn run_destination(
     src_cert_fingerprint: &[u8],
     settings: &common::copy::Settings,
     preserve: &common::preserve::Settings,
+    quic_idle_timeout_sec: u64,
+    quic_keep_alive_interval_sec: u64,
     _conn_timeout_sec: u64,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
-    let client = remote::get_client_with_cert_pinning(src_cert_fingerprint.to_vec())?;
+    let client = remote::get_client_with_port_ranges_and_pinning(
+        None,
+        src_cert_fingerprint.to_vec(),
+        quic_idle_timeout_sec,
+        quic_keep_alive_interval_sec,
+    )?;
     tracing::info!("Connecting to source at {}", src_endpoint);
     let connection = client
         .connect(*src_endpoint, src_server_name)?
