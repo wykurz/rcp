@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Configurable QUIC connection timeouts for remote operations via CLI arguments:
+  - `--quic-idle-timeout-sec` (default: 10s) - maximum idle time before closing QUIC connection
+  - `--quic-keep-alive-interval-sec` (default: 1s) - interval for sending keep-alive packets
+  - `--remote-copy-conn-timeout-sec` (default: 15s) - connection timeout for remote operations
+- stdin watchdog in `rcpd` to detect master process disconnection immediately
+- Automatic cleanup of `rcpd` processes when master (`rcp`) dies or disconnects
+- Comprehensive lifecycle management tests for remote copy operations
+
+### Changed
+- `rcpd` now automatically exits when master process dies (via stdin monitoring + QUIC timeouts)
+- QUIC connections now have explicit idle timeout and keep-alive configuration
+
+### Fixed
+- `rcpd` processes no longer remain orphaned on remote hosts after master crash
+- Remote copy operations now detect dead connections within seconds instead of hanging indefinitely
+
 ## [0.20.0] - 2025-01-19
 
 ### Added

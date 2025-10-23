@@ -60,3 +60,25 @@ The project uses standard Cargo testing. Each tool has its own `tests/` director
 ## Remote Operations
 
 The `rcpd` daemon enables distributed copying operations. It connects to a master process (`rcp`) and can run as either source or destination side, using QUIC protocol for communication.
+
+### QUIC Connection Timeouts
+
+Both `rcp` and `rcpd` accept CLI arguments to configure QUIC connection behavior:
+
+- `--quic-idle-timeout-sec=N` (default: 10) - Maximum idle time before closing connection
+- `--quic-keep-alive-interval-sec=N` (default: 1) - Interval for keep-alive packets
+- `--remote-copy-conn-timeout-sec=N` (default: 15) - Connection timeout for remote operations
+
+These can be tuned for different network environments:
+- **LAN**: More aggressive values (5-8s idle timeout) for faster failure detection
+- **WAN**: Higher values (15-30s idle timeout) to handle network hiccups
+- **High latency**: Increase all timeouts proportionally
+
+### rcpd Lifecycle Management
+
+The `rcpd` daemon automatically exits when the master (`rcp`) process dies or disconnects:
+
+1. **stdin watchdog** (primary): Monitors stdin EOF to detect master disconnection immediately
+2. **QUIC idle timeout** (backup): Detects dead connections if stdin monitoring unavailable
+
+This ensures no orphaned `rcpd` processes remain on remote hosts after the master exits unexpectedly.
