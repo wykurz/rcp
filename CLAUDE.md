@@ -14,6 +14,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Format code**: `cargo fmt`
 - **Check formatting**: `cargo fmt --check`
 - **Lint code**: `cargo clippy`
+- **Build documentation**: `cargo doc --no-deps` (checks doc examples compile)
+- **Build docs with warnings**: `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` (treats warnings as errors)
 
 ## Project Architecture
 
@@ -56,6 +58,12 @@ From CONVENTIONS.md:
 ## Testing
 
 The project uses standard Cargo testing. Each tool has its own `tests/` directory with integration tests.
+
+**Important for AI Agents**: When modifying function signatures or adding new parameters, always verify that:
+1. All tests still pass: `cargo nextest run` or `cargo test`
+2. Documentation examples compile: `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
+
+This ensures doc examples stay in sync with actual function signatures.
 
 ## Remote Operations
 
