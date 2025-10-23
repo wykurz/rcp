@@ -181,13 +181,35 @@ async fn stdin_monitor() {
     let mut buf = [0u8; 1];
     loop {
         match stdin.read(&mut buf).await {
-            Ok(0) | Err(_) => {
-                // stdin closed or error - master connection lost
-                tracing::warn!("stdin closed, master (rcp) connection lost - initiating shutdown");
+            Ok(0) => {
+                // EOF - stdin closed, master disconnected
+                tracing::warn!(
+                    "stdin closed (EOF), master (rcp) connection lost - initiating shutdown"
+                );
                 return;
             }
             Ok(_) => {
                 // ignore any data sent to stdin
+            }
+            Err(e) => {
+                // distinguish between transient and permanent errors
+                match e.kind() {
+                    std::io::ErrorKind::Interrupted => {
+                        // signal interrupted the read, retry
+                        tracing::debug!("stdin read interrupted by signal, retrying");
+                        continue;
+                    }
+                    std::io::ErrorKind::WouldBlock => {
+                        // resource temporarily unavailable, retry
+                        tracing::debug!("stdin read would block, retrying");
+                        continue;
+                    }
+                    _ => {
+                        // other errors are likely permanent - treat as disconnect
+                        tracing::warn!("stdin read error ({}), treating as master disconnect", e);
+                        return;
+                    }
+                }
             }
         }
     }
