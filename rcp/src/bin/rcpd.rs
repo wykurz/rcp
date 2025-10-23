@@ -373,12 +373,14 @@ async fn async_main(
                 }
             }
             _ = watchdog => {
-                // stdin closed - master disconnected
-                remote::protocol::RcpdResult::Failure {
-                    error: "Master (rcp) disconnected - stdin closed. This usually means the master process \
-                            was killed or the SSH connection was terminated.".to_string(),
-                    summary: common::copy::Summary::default(),
-                }
+                // stdin closed - master disconnected, exit immediately
+                // no point in cleanup since master is dead and can't receive results
+                tracing::error!(
+                    "Master (rcp) disconnected - stdin closed. \
+                     This usually means the master process was killed or the SSH connection was terminated. \
+                     Exiting immediately."
+                );
+                std::process::exit(1);
             }
         }
     } else {
@@ -391,12 +393,21 @@ async fn async_main(
             },
         }
     };
-    // shutdown tracing sender
+    // shutdown tracing sender with timeout to handle dead connections
     cancellation_token.cancel();
     tracing::debug!("Cancelling tracing sender");
-    tracing_sender_task.await??;
+    match tokio::time::timeout(std::time::Duration::from_secs(2), tracing_sender_task).await {
+        Ok(Ok(Ok(_))) => tracing::debug!("Tracing sender shut down cleanly"),
+        Ok(Ok(Err(e))) => tracing::warn!("Tracing sender task failed: {e}"),
+        Ok(Err(e)) => tracing::warn!("Tracing sender task panicked: {e}"),
+        Err(_) => tracing::warn!("Tracing sender shutdown timed out (master likely disconnected)"),
+    }
     master_connection.close();
-    client.wait_idle().await;
+    // wait for client to become idle with timeout
+    match tokio::time::timeout(std::time::Duration::from_secs(2), client.wait_idle()).await {
+        Ok(_) => tracing::debug!("QUIC client became idle"),
+        Err(_) => tracing::warn!("QUIC client idle timeout (master likely disconnected)"),
+    }
     match rcpd_result {
         remote::protocol::RcpdResult::Success {
             message,
