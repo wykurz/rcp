@@ -1065,3 +1065,316 @@ fn test_remote_copy_unwritable_destination() {
     // restore permissions for cleanup
     std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+// ============================================================================
+// Lifecycle Management Tests
+// ============================================================================
+
+/// find rcpd processes running on the system
+fn find_rcpd_processes() -> Vec<u32> {
+    let output = std::process::Command::new("pgrep")
+        .arg("-x") // exact match
+        .arg("rcpd")
+        .output()
+        .expect("Failed to run pgrep");
+    if !output.status.success() {
+        return vec![];
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect()
+}
+
+/// wait for rcpd processes to exit (with timeout)
+fn wait_for_rcpd_exit(initial_pids: &[u32], timeout_secs: u64) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        let current_pids = find_rcpd_processes();
+        let remaining: Vec<_> = initial_pids
+            .iter()
+            .filter(|pid| current_pids.contains(pid))
+            .collect();
+        if remaining.is_empty() {
+            return true;
+        }
+        if start.elapsed().as_secs() >= timeout_secs {
+            eprintln!("Timeout waiting for rcpd processes to exit. Remaining PIDs: {remaining:?}");
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// create a large test file to ensure copy takes several seconds
+fn create_large_test_file(path: &std::path::Path, size_mb: usize) {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path).unwrap();
+    let chunk = vec![b'A'; 1024 * 1024]; // 1MB chunk
+    for _ in 0..size_mb {
+        file.write_all(&chunk).unwrap();
+    }
+    file.flush().unwrap();
+}
+
+#[test]
+fn test_remote_rcpd_exits_when_master_killed() {
+    // verify that rcpd processes exit when the master (rcp) is killed
+    // the stdin watchdog should detect master death immediately
+    let (src_dir, dst_dir) = setup_test_env();
+    // create a very large file (200MB) to ensure copy takes ~10 seconds over localhost
+    let src_file = src_dir.path().join("large_file.dat");
+    eprintln!("Creating 200MB test file...");
+    create_large_test_file(&src_file, 200);
+    let dst_file = dst_dir.path().join("large_file.dat");
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    // get initial rcpd processes
+    let initial_pids = find_rcpd_processes();
+    eprintln!("Initial rcpd processes: {initial_pids:?}");
+    // spawn rcp as subprocess
+    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
+    eprintln!("Spawning rcp subprocess...");
+    let mut child = std::process::Command::new(rcp_path)
+        .args(["-vv", &src_remote, &dst_remote])
+        .spawn()
+        .expect("Failed to spawn rcp");
+    // wait 1 second to ensure copy starts and rcpd processes are spawned
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // check that rcpd processes were spawned
+    let running_pids = find_rcpd_processes();
+    eprintln!("Running rcpd processes after 1.5s: {running_pids:?}");
+    let new_pids: Vec<_> = running_pids
+        .iter()
+        .filter(|pid| !initial_pids.contains(pid))
+        .copied()
+        .collect();
+    if new_pids.is_empty() {
+        // copy might have completed already - this is okay, skip the test
+        eprintln!("⚠ Copy completed too quickly to test master kill scenario - skipping");
+        child.wait().ok();
+        return;
+    }
+    eprintln!("New rcpd PIDs spawned by this test: {new_pids:?}");
+    // kill the master with SIGKILL (simulates crash)
+    eprintln!("Killing master process (PID: {}) with SIGKILL", child.id());
+    child.kill().expect("Failed to kill master");
+    child.wait().expect("Failed to wait for master");
+    // stdin watchdog should detect master death immediately
+    // wait up to 5 seconds for rcpd to exit (should be much faster with stdin watchdog)
+    let exited = wait_for_rcpd_exit(&new_pids, 5);
+    assert!(
+        exited,
+        "rcpd processes should exit within 5 seconds after master is killed"
+    );
+    eprintln!("✓ All rcpd processes exited successfully");
+}
+
+#[test]
+fn test_remote_rcpd_exits_when_master_killed_with_throttle() {
+    // alternative test that uses throttling to ensure copy is in progress when killed
+    // verifies the stdin watchdog works correctly
+    let (src_dir, dst_dir) = setup_test_env();
+    // create a moderate file (50MB)
+    let src_file = src_dir.path().join("throttled_file.dat");
+    eprintln!("Creating 50MB test file...");
+    create_large_test_file(&src_file, 50);
+    let dst_file = dst_dir.path().join("throttled_file.dat");
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    // get initial rcpd processes
+    let initial_pids = find_rcpd_processes();
+    eprintln!("Initial rcpd processes: {initial_pids:?}");
+    // spawn rcp with throttling to slow down the copy
+    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
+    eprintln!("Spawning rcp subprocess with throttling...");
+    let mut child = std::process::Command::new(rcp_path)
+        .args([
+            "-vv",
+            "--ops-throttle=100", // limit to 100 operations per second
+            &src_remote,
+            &dst_remote,
+        ])
+        .spawn()
+        .expect("Failed to spawn rcp");
+    // wait 2 seconds to ensure copy is in progress with throttling
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    // check that rcpd processes were spawned
+    let running_pids = find_rcpd_processes();
+    eprintln!("Running rcpd processes after 2s: {running_pids:?}");
+    let new_pids: Vec<_> = running_pids
+        .iter()
+        .filter(|pid| !initial_pids.contains(pid))
+        .copied()
+        .collect();
+    if new_pids.is_empty() {
+        eprintln!("⚠ No rcpd processes found - copy may have completed too quickly - skipping");
+        child.wait().ok();
+        return;
+    }
+    eprintln!("New rcpd PIDs spawned by this test: {new_pids:?}");
+    // kill the master with SIGKILL (simulates crash)
+    eprintln!("Killing master process (PID: {}) with SIGKILL", child.id());
+    child.kill().expect("Failed to kill master");
+    child.wait().expect("Failed to wait for master");
+    // stdin watchdog should detect master death immediately
+    // wait up to 3 seconds for rcpd to exit (stdin watchdog should be instant, QUIC timeout is 10s backup)
+    let start = std::time::Instant::now();
+    let exited = wait_for_rcpd_exit(&new_pids, 3);
+    let elapsed = start.elapsed();
+    assert!(
+        exited,
+        "rcpd processes should exit within 3 seconds after master is killed (stdin watchdog)"
+    );
+    eprintln!("✓ All rcpd processes exited in {elapsed:?} (stdin watchdog worked!)");
+    // verify it was faster than QUIC timeout would be (10 seconds)
+    assert!(
+        elapsed.as_secs() < 5,
+        "rcpd should exit quickly via stdin watchdog, not wait for QUIC timeout (10s)"
+    );
+}
+
+#[test]
+fn test_remote_rcpd_no_zombie_processes() {
+    // verify that rcpd processes don't become zombies after master exits
+    let (src_dir, dst_dir) = setup_test_env();
+    // create a small file for quick copy
+    let src_file = src_dir.path().join("test.txt");
+    create_test_file(&src_file, "test content", 0o644);
+    let dst_file = dst_dir.path().join("test.txt");
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    // get initial rcpd processes before starting our test
+    let initial_pids = find_rcpd_processes();
+    eprintln!("Initial rcpd PIDs: {initial_pids:?}");
+    // run a successful copy
+    let output = run_rcp_with_args(&[&src_remote, &dst_remote]);
+    assert!(output.status.success(), "Copy should succeed");
+    // get rcpd processes spawned during copy (right after completion)
+    let during_pids = find_rcpd_processes();
+    let test_spawned_pids: Vec<_> = during_pids
+        .iter()
+        .filter(|pid| !initial_pids.contains(pid))
+        .copied()
+        .collect();
+    eprintln!("PIDs spawned by this test: {test_spawned_pids:?}");
+    // wait for cleanup of the processes spawned by THIS test
+    // rcpd processes need time to cleanly shutdown: send result, close connections, etc.
+    if !test_spawned_pids.is_empty() {
+        // wait up to 5 seconds for rcpd processes to exit
+        let cleanup_timeout = std::time::Duration::from_secs(5);
+        let start = std::time::Instant::now();
+        let mut exited = false;
+        while start.elapsed() < cleanup_timeout {
+            let final_pids = find_rcpd_processes();
+            let remaining: Vec<_> = test_spawned_pids
+                .iter()
+                .filter(|pid| final_pids.contains(pid))
+                .copied()
+                .collect();
+            if remaining.is_empty() {
+                exited = true;
+                eprintln!("✓ All test rcpd processes exited in {:?}", start.elapsed());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !exited {
+            let final_pids = find_rcpd_processes();
+            let remaining: Vec<_> = test_spawned_pids
+                .iter()
+                .filter(|pid| final_pids.contains(pid))
+                .copied()
+                .collect();
+            assert!(
+                remaining.is_empty(),
+                "No rcpd processes from this test should remain after successful copy. Found: {remaining:?}"
+            );
+        }
+    }
+    // check for zombie processes spawned by this test
+    if !test_spawned_pids.is_empty() {
+        let ps_output = std::process::Command::new("ps")
+            .args(["aux"])
+            .output()
+            .expect("Failed to run ps");
+        let ps_stdout = String::from_utf8_lossy(&ps_output.stdout);
+        let zombie_lines: Vec<_> = ps_stdout
+            .lines()
+            .filter(|line| {
+                line.contains("rcpd") && line.contains(" Z ") && {
+                    // only check for zombies matching our test's PIDs
+                    test_spawned_pids.iter().any(|pid| {
+                        line.split_whitespace()
+                            .nth(1)
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .map(|line_pid| line_pid == *pid)
+                            .unwrap_or(false)
+                    })
+                }
+            })
+            .collect();
+        assert!(
+            zombie_lines.is_empty(),
+            "No zombie rcpd processes should exist from this test. Found:\n{}",
+            zombie_lines.join("\n")
+        );
+    }
+    eprintln!("✓ No zombie processes found");
+}
+
+#[test]
+fn test_remote_rcpd_with_custom_quic_timeouts() {
+    // verify that custom QUIC timeout values are accepted and work correctly
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("test.txt");
+    create_test_file(&src_file, "test content", 0o644);
+    let dst_file = dst_dir.path().join("test.txt");
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    // test with custom timeout values
+    let output = run_rcp_with_args(&[
+        "--quic-idle-timeout-sec=5",
+        "--quic-keep-alive-interval-sec=2",
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output);
+    assert!(
+        output.status.success(),
+        "Copy with custom QUIC timeouts should succeed"
+    );
+    assert!(dst_file.exists(), "Destination file should exist");
+    let content = get_file_content(&dst_file);
+    assert_eq!(content, "test content");
+    eprintln!("✓ Copy with custom QUIC timeouts succeeded");
+}
+
+#[test]
+fn test_remote_rcpd_aggressive_timeout_configuration() {
+    // verify that moderately aggressive timeout values work correctly (for LAN environments)
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("test.txt");
+    create_test_file(&src_file, "test content", 0o644);
+    let dst_file = dst_dir.path().join("test.txt");
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    // test with moderately aggressive timeouts suitable for fast LAN environments
+    // note: very aggressive values (3s-5s) can be too tight even for localhost
+    // using 8s idle timeout as a reasonable "aggressive but safe" value
+    let output = run_rcp_with_args(&[
+        "--quic-idle-timeout-sec=8",
+        "--quic-keep-alive-interval-sec=1",
+        "--remote-copy-conn-timeout-sec=10",
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output);
+    assert!(
+        output.status.success(),
+        "Copy with aggressive timeouts should succeed"
+    );
+    assert!(dst_file.exists(), "Destination file should exist");
+    eprintln!("✓ Copy with aggressive timeouts succeeded");
+}
