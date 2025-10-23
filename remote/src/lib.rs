@@ -56,8 +56,13 @@
 //!
 //! ```rust,no_run
 //! # use remote::get_server_with_port_ranges;
-//! // Bind to ports in the 8000-8999 range
-//! let endpoint = get_server_with_port_ranges(Some("8000-8999"))?;
+//! // bind to ports in the 8000-8999 range with default timeouts
+//! // idle_timeout: 10 seconds, keep_alive: 1 second
+//! let (endpoint, cert_fingerprint) = get_server_with_port_ranges(
+//!     Some("8000-8999"),
+//!     10,  // idle_timeout_sec
+//!     1,   // keep_alive_interval_sec
+//! )?;
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 //!
@@ -266,10 +271,13 @@
 //! use remote::{get_server_with_port_ranges, get_endpoint_addr};
 //!
 //! # fn example() -> anyhow::Result<()> {
-//! // Create server restricted to ports 8000-8999
-//! // Timeouts are read from RCP_QUIC_IDLE_TIMEOUT_SEC and RCP_QUIC_KEEP_ALIVE_INTERVAL_SEC
-//! // environment variables, or defaults are used (10s idle, 1s keep-alive)
-//! let (endpoint, _cert_fingerprint) = get_server_with_port_ranges(Some("8000-8999"))?;
+//! // create server restricted to ports 8000-8999
+//! // timeouts: 10s idle, 1s keep-alive (CLI defaults)
+//! let (endpoint, _cert_fingerprint) = get_server_with_port_ranges(
+//!     Some("8000-8999"),
+//!     10,  // idle_timeout_sec
+//!     1,   // keep_alive_interval_sec
+//! )?;
 //! let addr = get_endpoint_addr(&endpoint)?;
 //! println!("Server listening on: {}", addr);
 //! # Ok(())
