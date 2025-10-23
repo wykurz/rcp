@@ -14,6 +14,14 @@ lazy_static! {
     static ref RLINK_PRESERVE_SETTINGS: preserve::Settings = preserve::preserve_all();
 }
 
+/// Error type for link operations that preserves operation summary even on failure.
+///
+/// # Logging Convention
+/// When logging this error, use `{:#}` or `{:?}` format to preserve the error chain:
+/// ```ignore
+/// tracing::error!("operation failed: {:#}", &error);  // ✅ Shows full chain
+/// tracing::error!("operation failed: {}", &error);    // ❌ Loses root cause
+/// ```
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
 pub struct Error {
@@ -474,7 +482,7 @@ pub async fn link(
                 Ok(summary) => link_summary = link_summary + summary,
                 Err(error) => {
                     tracing::error!(
-                        "link: {:?} {:?} -> {:?} failed with: {}",
+                        "link: {:?} {:?} -> {:?} failed with: {:#}",
                         src,
                         update,
                         dst,

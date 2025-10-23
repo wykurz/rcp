@@ -119,12 +119,16 @@ async fn handle_file_stream(
     match file_result {
         Ok(()) => {}
         Err(e) => {
-            tracing::error!("Failed to handle file {}: {}", file_header.dst.display(), e);
+            tracing::error!(
+                "Failed to handle file {}: {:#}",
+                file_header.dst.display(),
+                e
+            );
             error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             // ensure stream is drained to avoid blocking source
             let mut sink = tokio::io::sink();
             if let Err(drain_err) = file_recv_stream.copy_to(&mut sink).await {
-                tracing::error!("Failed to drain file stream: {}", drain_err);
+                tracing::error!("Failed to drain file stream: {:#}", drain_err);
             }
             file_recv_stream.close().await;
             if settings.fail_early {

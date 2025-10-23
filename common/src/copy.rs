@@ -11,6 +11,14 @@ use crate::progress;
 use crate::rm;
 use crate::rm::{Settings as RmSettings, Summary as RmSummary};
 
+/// Error type for copy operations that preserves operation summary even on failure.
+///
+/// # Logging Convention
+/// When logging this error, use `{:#}` or `{:?}` format to preserve the error chain:
+/// ```ignore
+/// tracing::error!("operation failed: {:#}", &error);  // ✅ Shows full chain
+/// tracing::error!("operation failed: {}", &error);    // ❌ Loses root cause
+/// ```
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
 pub struct Error {
@@ -450,7 +458,7 @@ pub async fn copy(
             Ok(result) => match result {
                 Ok(summary) => copy_summary = copy_summary + summary,
                 Err(error) => {
-                    tracing::error!("copy: {:?} -> {:?} failed with: {}", src, dst, &error);
+                    tracing::error!("copy: {:?} -> {:?} failed with: {:#}", src, dst, &error);
                     copy_summary = copy_summary + error.summary;
                     if settings.fail_early {
                         return Err(Error::new(error.source, copy_summary));
@@ -1528,5 +1536,129 @@ mod copy_tests {
         )
         .await?;
         Ok(())
+    }
+
+    /// Tests to verify error messages include root causes for debugging
+    mod error_message_tests {
+        use super::*;
+
+        /// Helper to extract full error message with chain
+        fn get_full_error_message(error: &Error) -> String {
+            format!("{:#}", error.source)
+        }
+
+        #[tokio::test]
+        #[traced_test]
+        async fn test_permission_error_includes_root_cause() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+            let unreadable = tmp_dir.join("unreadable.txt");
+            tokio::fs::write(&unreadable, "test").await?;
+            tokio::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).await?;
+
+            let result = copy_file(
+                &PROGRESS,
+                &unreadable,
+                &tmp_dir.join("dest.txt"),
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    chunk_size: 0,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await;
+
+            assert!(result.is_err(), "Should fail with permission error");
+            let err_msg = get_full_error_message(&result.unwrap_err());
+
+            // The error message MUST include the root cause
+            assert!(
+                err_msg.to_lowercase().contains("permission")
+                    || err_msg.contains("EACCES")
+                    || err_msg.contains("denied"),
+                "Error message must include permission-related text. Got: {}",
+                err_msg
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[traced_test]
+        async fn test_nonexistent_source_includes_root_cause() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+
+            let result = copy_file(
+                &PROGRESS,
+                &tmp_dir.join("does_not_exist.txt"),
+                &tmp_dir.join("dest.txt"),
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    chunk_size: 0,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await;
+
+            assert!(result.is_err());
+            let err_msg = get_full_error_message(&result.unwrap_err());
+
+            assert!(
+                err_msg.to_lowercase().contains("no such file")
+                    || err_msg.to_lowercase().contains("not found")
+                    || err_msg.contains("ENOENT"),
+                "Error message must include file not found text. Got: {}",
+                err_msg
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[traced_test]
+        async fn test_unreadable_directory_includes_root_cause() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+            let unreadable_dir = tmp_dir.join("unreadable_dir");
+            tokio::fs::create_dir(&unreadable_dir).await?;
+            tokio::fs::set_permissions(&unreadable_dir, std::fs::Permissions::from_mode(0o000))
+                .await?;
+
+            let result = copy(
+                &PROGRESS,
+                &unreadable_dir,
+                &tmp_dir.join("dest"),
+                &Settings {
+                    dereference: false,
+                    fail_early: true,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    chunk_size: 0,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await;
+
+            assert!(result.is_err());
+            let err_msg = get_full_error_message(&result.unwrap_err());
+
+            assert!(
+                err_msg.to_lowercase().contains("permission")
+                    || err_msg.contains("EACCES")
+                    || err_msg.contains("denied"),
+                "Error message must include permission-related text. Got: {}",
+                err_msg
+            );
+
+            // Clean up - restore permissions so cleanup can remove it
+            tokio::fs::set_permissions(&unreadable_dir, std::fs::Permissions::from_mode(0o700))
+                .await?;
+            Ok(())
+        }
     }
 }

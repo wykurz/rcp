@@ -5,6 +5,14 @@ use tracing::instrument;
 
 use crate::progress;
 
+/// Error type for remove operations that preserves operation summary even on failure.
+///
+/// # Logging Convention
+/// When logging this error, use `{:#}` or `{:?}` format to preserve the error chain:
+/// ```ignore
+/// tracing::error!("operation failed: {:#}", &error);  // ✅ Shows full chain
+/// tracing::error!("operation failed: {}", &error);    // ❌ Loses root cause
+/// ```
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
 pub struct Error {
