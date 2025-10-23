@@ -174,8 +174,8 @@ struct Args {
     debug_log_prefix: Option<String>,
 }
 
-/// Monitor stdin for EOF to detect master disconnection
-/// When SSH connection dies, stdin is closed and we should exit immediately
+/// monitor stdin for EOF to detect master disconnection
+/// when SSH connection dies, stdin is closed and we should exit immediately
 async fn stdin_monitor() {
     let mut stdin = tokio::io::stdin();
     let mut buf = [0u8; 1];
@@ -193,7 +193,7 @@ async fn stdin_monitor() {
     }
 }
 
-/// Async operation for rcpd - runs the actual source or destination logic
+/// async operation for rcpd - runs the actual source or destination logic
 async fn run_operation(
     args: Args,
     master_connection: remote::streams::Connection,
@@ -317,18 +317,18 @@ async fn async_main(
         remote::streams::Connection::new(master_connection)
     };
     tracing::info!("Connected to master");
-    // Check if stdin is available for monitoring
+    // check if stdin is available for monitoring
     // SSH with -T closes stdin immediately, so we only monitor if it's actually open
     let stdin_available = {
         let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 1];
-        // Try a non-blocking peek - if stdin is EOF immediately, don't monitor it
+        // try a non-blocking peek - if stdin is EOF immediately, don't monitor it
         match tokio::time::timeout(std::time::Duration::from_millis(1), stdin.read(&mut buf)).await
         {
             Ok(Ok(0)) => false,  // EOF - stdin closed
-            Ok(Ok(_)) => true,   // Has data - stdin open
-            Ok(Err(_)) => false, // Error - treat as closed
-            Err(_) => true,      // Timeout - stdin open (waiting for data)
+            Ok(Ok(_)) => true,   // has data - stdin open
+            Ok(Err(_)) => false, // error - treat as closed
+            Err(_) => true,      // timeout - stdin open (waiting for data)
         }
     };
     tracing::debug!(
@@ -339,7 +339,7 @@ async fn async_main(
             "disabled (stdin closed)"
         }
     );
-    // Only start monitoring stdin if it's actually available
+    // only start monitoring stdin if it's actually available
     let stdin_watchdog = if stdin_available {
         Some(tokio::spawn(stdin_monitor()))
     } else {
