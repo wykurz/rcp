@@ -4,6 +4,37 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build Commands
 
+This project uses [`just`](https://github.com/casey/just) for common development tasks.
+
+### Setup
+
+**Using nix (recommended):**
+```bash
+nix develop  # Automatically includes just and all dev tools
+```
+
+**Without nix:**
+```bash
+cargo install just
+cargo install cargo-nextest  # Optional but recommended for testing
+```
+
+### Common Commands
+
+- **List all commands**: `just --list` or just `just`
+- **Run lints**: `just lint` (fmt, clippy, error logging)
+- **Format code**: `just fmt`
+- **Run tests**: `just test` (uses nextest)
+- **Quick check**: `just check` (faster than build)
+- **Build all**: `just build`
+- **Build release**: `just build-release`
+- **Check docs**: `just doc`
+- **Run all CI checks**: `just ci` (lint + test + doc)
+
+### Direct Cargo Commands
+
+You can also use cargo directly:
+
 - **Build all packages**: `cargo build`
 - **Build specific package**: `cargo build -p <package_name>` (e.g., `cargo build -p rcp`)
 - **Build for release**: `cargo build --release`
@@ -54,6 +85,25 @@ From CONVENTIONS.md:
 - Avoid empty lines in functions or type definitions
 - Specify only major.minor versions for crate dependencies, not patch versions
 - Don't start comments from a capital letter and use dot only to separate multiple sentences.
+
+### Error Logging Convention
+
+**CRITICAL**: When logging `anyhow::Error` or custom `Error` types that wrap `anyhow::Error`, **ALWAYS** use alternate display format `{:#}` or debug format `{:?}` to preserve the error chain:
+
+```rust
+// ✅ CORRECT - Shows full error chain
+tracing::error!("operation failed: {:#}", &error);  // Inline: "failed: Permission denied"
+tracing::error!("operation failed: {:?}", &error);  // Multi-line with "Caused by:"
+
+// ❌ WRONG - Loses root cause (will fail CI)
+tracing::error!("operation failed: {}", &error);   // Only shows outer message!
+```
+
+**Rationale**: Using `{}` (Display format) only shows the outermost error message, hiding critical root causes like "Permission denied", "No space left on device", "Disk quota exceeded", etc. Users need to see the underlying system error to debug issues.
+
+**CI Enforcement**: The `scripts/check-error-logging.sh` script automatically checks for this pattern and will fail CI if violations are found.
+
+**Exception**: Direct `io::Error` or other leaf errors (without an error chain) can use `{}` since there's no chain to lose.
 
 ## Testing
 

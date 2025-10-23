@@ -125,6 +125,7 @@
             cargo-outdated
             cargo-udeps
             gdb
+            just
             llvmPackages.bintools
             tokio-console
 
@@ -137,12 +138,18 @@
           # Environment variables for development
           shellHook = ''
             echo "RCP development environment"
-            echo "Available commands:"
-            echo "  cargo build          - Build all packages"
-            echo "  cargo test           - Test all packages"
-            echo "  cargo nextest run    - Test with better output (recommended)"
-            echo "  cargo fmt            - Format code"
-            echo "  cargo clippy         - Lint code"
+            echo ""
+            echo "Quick start:"
+            echo "  just            - List all available commands"
+            echo "  just lint       - Run all lints (fmt + clippy + error logging)"
+            echo "  just test       - Run tests with nextest"
+            echo "  just ci         - Run all CI checks locally"
+            echo ""
+            echo "Other commands:"
+            echo "  just fmt        - Format code"
+            echo "  just check      - Quick compilation check"
+            echo "  just build      - Build all packages"
+            echo "  just doc        - Check documentation"
             echo ""
             echo "Individual tools: rcp, rrm, rlink, rcmp, filegen"
             echo "Note: rcpd is included with rcp (rcp-tools-rcp package)"

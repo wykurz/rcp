@@ -267,7 +267,7 @@ pub async fn cmp(
         match res? {
             Ok(summary) => cmp_summary = cmp_summary + summary,
             Err(error) => {
-                tracing::error!("cmp: {:?} vs {:?} failed with: {}", src, dst, &error);
+                tracing::error!("cmp: {:?} vs {:?} failed with: {:#}", src, dst, &error);
                 if settings.fail_early {
                     return Err(error);
                 }
