@@ -105,6 +105,7 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::prelude::*;
 
 pub mod cmp;
+pub mod config;
 pub mod copy;
 pub mod filegen;
 pub mod link;
@@ -116,6 +117,7 @@ pub mod filecmp;
 pub mod progress;
 mod testutils;
 
+pub use config::{OutputConfig, RuntimeConfig, ThrottleConfig, TracingConfig};
 pub use progress::{RcpdProgressPrinter, SerializableProgress};
 
 // Define RcpdType in common since remote depends on common
@@ -613,20 +615,12 @@ pub fn generate_debug_log_filename(prefix: &str) -> String {
 }
 
 #[instrument(skip(func))] // "func" is not Debug printable
-#[allow(clippy::too_many_arguments)]
 pub fn run<Fut, Summary, Error>(
     progress: Option<ProgressSettings>,
-    quiet: bool,
-    verbose: u8,
-    print_summary: bool,
-    max_workers: usize,
-    max_blocking_threads: usize,
-    max_open_files: Option<usize>,
-    ops_throttle: usize,
-    iops_throttle: usize,
-    chunk_size: u64,
-    remote_tracing_layer: Option<remote_tracing::RemoteTracingLayer>,
-    debug_log_file: Option<String>,
+    output: OutputConfig,
+    runtime: RuntimeConfig,
+    throttle: ThrottleConfig,
+    tracing_config: TracingConfig,
     func: impl FnOnce() -> Fut,
 ) -> Option<Summary>
 // we return an Option rather than a Result to indicate that callers of this function should NOT print the error
@@ -635,6 +629,31 @@ where
     Error: std::fmt::Display + std::fmt::Debug,
     Fut: std::future::Future<Output = Result<Summary, Error>>,
 {
+    // validate configuration
+    if let Err(e) = throttle.validate() {
+        eprintln!("Configuration error: {e}");
+        return None;
+    }
+    // unpack configs for internal use
+    let OutputConfig {
+        quiet,
+        verbose,
+        print_summary,
+    } = output;
+    let RuntimeConfig {
+        max_workers,
+        max_blocking_threads,
+    } = runtime;
+    let ThrottleConfig {
+        max_open_files,
+        ops_throttle,
+        iops_throttle,
+        chunk_size: _,
+    } = throttle;
+    let TracingConfig {
+        remote_layer: remote_tracing_layer,
+        debug_log_file,
+    } = tracing_config;
     if quiet {
         assert!(
             verbose == 0,
@@ -757,18 +776,9 @@ where
         runtime.spawn(throttle::run_ops_replenish_thread(replenish, interval));
     }
     if iops_throttle > 0 {
-        if chunk_size == 0 {
-            tracing::error!("Chunk size must be specified when using --iops-throttle");
-            return None;
-        }
         let (replenish, interval) = get_replenish_interval(iops_throttle);
         throttle::init_iops_tokens(replenish);
         runtime.spawn(throttle::run_iops_replenish_thread(replenish, interval));
-    } else if chunk_size > 0 {
-        tracing::error!(
-            "--chunk-size > 0 but --iops-throttle is 0 -- did you intend to use --iops-throttle?"
-        );
-        return None;
     }
     let res = {
         let _progress = progress.map(|settings| {
