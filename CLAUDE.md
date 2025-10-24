@@ -105,6 +105,31 @@ tracing::error!("operation failed: {}", &error);   // Only shows outer message!
 
 **CI Enforcement**: The `scripts/check-error-logging.sh` script automatically checks for this pattern and will fail CI if violations are found.
 
+### Error Chain Preservation
+
+**CRITICAL**: **NEVER** use `anyhow::Error::msg()` to wrap errors. This converts errors to strings and **destroys the error chain**, hiding root causes.
+
+```rust
+// ❌ WRONG - Destroys error chain
+.map_err(|err| Error::new(anyhow::Error::msg(err), summary))
+
+// ✅ CORRECT - Preserves error chain
+// When err is already anyhow::Error (from .with_context()):
+.map_err(|err| Error::new(err, summary))
+
+// When err is JoinError:
+.map_err(|err| Error::new(err.into(), summary))
+
+// When err is custom Error type:
+.map_err(|err| Error::new(err.source, summary))
+```
+
+**Rationale**: `anyhow::Error::msg()` converts the error to a string, completely losing the error chain. This is why you won't see "Permission denied" and other underlying errors in logs.
+
+**CI Enforcement**: The `scripts/check-anyhow-error-msg.sh` script automatically detects any usage of `anyhow::Error::msg()` and will fail CI if found.
+
+**Test Coverage**: The `parent_dir_no_write_permission` test in `common/src/rm.rs` specifically verifies that permission errors are preserved in the error chain.
+
 ## Testing
 
 The project uses standard Cargo testing. Each tool has its own `tests/` directory with integration tests.

@@ -122,7 +122,7 @@ pub async fn write_file(
         .open(&path)
         .await
         .with_context(|| format!("Error opening {:?}", &path))
-        .map_err(|err| Error::new(anyhow::Error::msg(err), Default::default()))?;
+        .map_err(|err| Error::new(err, Default::default()))?;
     while filesize > 0 {
         {
             // make sure rng falls out of scope before await
@@ -133,7 +133,7 @@ pub async fn write_file(
         file.write_all(&bytes[..writesize])
             .await
             .with_context(|| format!("Error writing to {:?}", &path))
-            .map_err(|err| Error::new(anyhow::Error::msg(err), Default::default()))?;
+            .map_err(|err| Error::new(err, Default::default()))?;
         filesize -= writesize;
     }
     prog_track.files_copied.inc();
@@ -179,7 +179,7 @@ pub async fn filegen(
             tokio::fs::create_dir(&path)
                 .await
                 .with_context(|| format!("Error creating directory {:?}", &path))
-                .map_err(|err| Error::new(anyhow::Error::msg(err), Default::default()))?;
+                .map_err(|err| Error::new(err, Default::default()))?;
             prog_track.directories_created.inc();
             let dir_summary = Summary {
                 directories_created: 1,
@@ -213,7 +213,7 @@ pub async fn filegen(
     let mut success = true;
     let mut filegen_summary = Summary::default();
     while let Some(res) = join_set.join_next().await {
-        match res.map_err(|err| Error::new(anyhow::Error::msg(err), Default::default()))? {
+        match res.map_err(|err| Error::new(err.into(), Default::default()))? {
             Ok(summary) => filegen_summary = filegen_summary + summary,
             Err(error) => {
                 tracing::error!("filegen: {:?} failed with: {:#}", root, &error);

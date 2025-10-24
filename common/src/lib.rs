@@ -545,7 +545,8 @@ pub async fn link(
     settings: &link::Settings,
 ) -> Result<link::Summary, link::Error> {
     let cwd = std::env::current_dir()
-        .map_err(|err| link::Error::new(anyhow::Error::msg(err), link::Summary::default()))?;
+        .with_context(|| "failed to get current working directory")
+        .map_err(|err| link::Error::new(err, link::Summary::default()))?;
     link::link(&PROGRESS, &cwd, src, dst, update, settings, false).await
 }
 

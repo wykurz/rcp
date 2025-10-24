@@ -575,7 +575,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
             Ok(result) => match result {
                 Ok(summary) => copy_summary = copy_summary + summary,
                 Err(error) => {
-                    tracing::error!("{:?}", &error);
+                    tracing::error!("{:#}", &error);
                     copy_summary = copy_summary + error.summary;
                     if args.fail_early {
                         if args.summary {

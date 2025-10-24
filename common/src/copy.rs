@@ -108,7 +108,7 @@ pub async fn copy_file(
                     rm_summary,
                     ..Default::default()
                 };
-                Error::new(anyhow::Error::msg(err), copy_summary)
+                Error::new(err.source, copy_summary)
             })?;
         } else {
             return Err(Error::new(
@@ -394,7 +394,7 @@ pub async fn copy(
                                 rm_summary,
                                 ..Default::default()
                             };
-                            Error::new(anyhow::Error::msg(err), copy_summary)
+                            Error::new(err, copy_summary)
                         })?;
                     // anything copied into dst may assume they don't need to check for conflicts
                     is_fresh = true;
@@ -470,7 +470,7 @@ pub async fn copy(
             },
             Err(error) => {
                 if settings.fail_early {
-                    return Err(Error::new(anyhow::Error::msg(error), copy_summary));
+                    return Err(Error::new(error.into(), copy_summary));
                 }
             }
         }

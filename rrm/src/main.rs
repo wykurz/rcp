@@ -136,7 +136,7 @@ async fn async_main(args: Args) -> Result<common::rm::Summary> {
         match res? {
             Ok(summary) => rm_summary = rm_summary + summary,
             Err(error) => {
-                tracing::error!("{:?}", &error);
+                tracing::error!("{:#}", &error);
                 rm_summary = rm_summary + error.summary;
                 if args.fail_early {
                     if args.summary {

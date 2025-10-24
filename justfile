@@ -5,7 +5,7 @@
 default:
     @just --list
 
-# Run all lints (fmt, clippy, error logging)
+# Run all lints (fmt, clippy, error logging, anyhow error msg)
 lint:
     @echo "🔍 Checking formatting..."
     cargo fmt --check
@@ -13,6 +13,8 @@ lint:
     cargo clippy --workspace -- -D warnings
     @echo "🔍 Checking error logging format..."
     ./scripts/check-error-logging.sh
+    @echo "🔍 Checking anyhow::Error::msg usage..."
+    ./scripts/check-anyhow-error-msg.sh
     @echo "✅ All lints passed!"
 
 # Format code
