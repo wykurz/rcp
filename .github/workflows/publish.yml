@@ -18,8 +18,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+
   publish:
     runs-on: ubuntu-latest
+    needs: validate
     permissions:
       contents: read
     steps:
@@ -44,30 +48,6 @@ jobs:
             echo "Error: Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
             exit 1
           fi
-
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Lint with Clippy
-        run: cargo clippy
-
-      - name: Build documentation
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps
-
-      - name: Setup SSH for localhost
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openssh-server
-          sudo systemctl start ssh
-          ssh-keygen -t rsa -f ~/.ssh/id_rsa -N ""
-          cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
-          chmod 600 ~/.ssh/authorized_keys
-          ssh-keyscan -H localhost >> ~/.ssh/known_hosts
-
-      - name: Run tests
-        run: cargo test --workspace --all-features --release
 
       - name: Set publish flags
         run: |

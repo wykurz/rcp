@@ -10,19 +10,25 @@ on:
         required: true
 
 jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+
   build-deb-package:
     runs-on: ubuntu-latest
+    needs: validate
     permissions: write-all
     steps:
     - name: Checkout repository
       uses: actions/checkout@v5
-    - name: Set up Rust
-      uses: actions-rs/toolchain@v1
+
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        toolchain: stable
-        profile: minimal
+        toolchain-file: rust-toolchain.toml
+
     - name: Install builders
       run: cargo install cargo-deb
+
     - name: Build Debian package
       run: |
         cargo deb -p rcp-tools-rcp
@@ -45,15 +51,15 @@ jobs:
 
   build-rpm-package:
     runs-on: ubuntu-latest
+    needs: build-deb-package
     permissions: write-all
     steps:
     - name: Checkout repository
       uses: actions/checkout@v5
-    - name: Set up Rust
-      uses: actions-rs/toolchain@v1
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        toolchain: stable
-        profile: minimal
+        toolchain-file: rust-toolchain.toml
     - name: Install builders
       run: cargo install cargo-generate-rpm
     - name: Build RPM package
