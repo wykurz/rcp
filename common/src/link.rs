@@ -17,13 +17,13 @@ lazy_static! {
 /// Error type for link operations that preserves operation summary even on failure.
 ///
 /// # Logging Convention
-/// The Display implementation automatically shows the full error chain, so you can log it
-/// with any format specifier:
+/// When logging this error, use `{:#}` or `{:?}` format to preserve the error chain:
 /// ```ignore
-/// tracing::error!("operation failed: {}", &error);   // ✅ Shows full chain
 /// tracing::error!("operation failed: {:#}", &error); // ✅ Shows full chain
 /// tracing::error!("operation failed: {:?}", &error); // ✅ Shows full chain
 /// ```
+/// The Display implementation also shows the full chain, but workspace linting enforces `{:#}`
+/// for consistency.
 #[derive(Debug, thiserror::Error)]
 #[error("{source:#}")]
 pub struct Error {
@@ -638,6 +638,46 @@ mod link_tests {
             testutils::FileEqualityCheck::Timestamp,
         )
         .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_link_destination_permission_error_includes_root_cause(
+    ) -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let readonly_parent = test_path.join("readonly_dest");
+        tokio::fs::create_dir(&readonly_parent).await?;
+        tokio::fs::set_permissions(&readonly_parent, std::fs::Permissions::from_mode(0o555))
+            .await?;
+
+        let mut settings = common_settings(false, false);
+        settings.copy_settings.fail_early = true;
+
+        let result = link(
+            &PROGRESS,
+            test_path,
+            &test_path.join("foo"),
+            &readonly_parent.join("bar"),
+            &None,
+            &settings,
+            false,
+        )
+        .await;
+
+        // restore permissions to allow temporary directory cleanup
+        tokio::fs::set_permissions(&readonly_parent, std::fs::Permissions::from_mode(0o755))
+            .await?;
+
+        assert!(result.is_err(), "link into read-only parent should fail");
+        let err = result.unwrap_err();
+        let err_msg = format!("{:#}", err.source);
+        assert!(
+            err_msg.to_lowercase().contains("permission denied") || err_msg.contains("EACCES"),
+            "Error message must include permission denied text. Got: {}",
+            err_msg
+        );
         Ok(())
     }
 
