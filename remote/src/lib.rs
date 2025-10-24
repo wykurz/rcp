@@ -300,6 +300,52 @@ pub mod protocol;
 pub mod streams;
 pub mod tracelog;
 
+/// Configuration for QUIC connections
+#[derive(Debug, Clone)]
+pub struct QuicConfig {
+    /// Port ranges to use for QUIC connections (e.g., "8000-8999,9000-9999")
+    pub port_ranges: Option<String>,
+    /// Maximum idle time before closing connection (seconds)
+    pub idle_timeout_sec: u64,
+    /// Interval for keep-alive packets (seconds)
+    pub keep_alive_interval_sec: u64,
+    /// Connection timeout for remote operations (seconds)
+    pub conn_timeout_sec: u64,
+}
+
+impl Default for QuicConfig {
+    fn default() -> Self {
+        Self {
+            port_ranges: None,
+            idle_timeout_sec: 10,
+            keep_alive_interval_sec: 1,
+            conn_timeout_sec: 15,
+        }
+    }
+}
+
+impl QuicConfig {
+    /// Create QuicConfig with custom timeout values
+    pub fn with_timeouts(
+        idle_timeout_sec: u64,
+        keep_alive_interval_sec: u64,
+        conn_timeout_sec: u64,
+    ) -> Self {
+        Self {
+            port_ranges: None,
+            idle_timeout_sec,
+            keep_alive_interval_sec,
+            conn_timeout_sec,
+        }
+    }
+
+    /// Set port ranges
+    pub fn with_port_ranges(mut self, ranges: impl Into<String>) -> Self {
+        self.port_ranges = Some(ranges.into());
+        self
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct SshSession {
     pub user: Option<String>,

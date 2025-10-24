@@ -599,22 +599,18 @@ async fn handle_connection(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 #[instrument]
 pub async fn run_source(
     master_send_stream: remote::streams::SharedSendStream,
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &common::copy::Settings,
-    quic_port_ranges: Option<&str>,
-    quic_idle_timeout_sec: u64,
-    quic_keep_alive_interval_sec: u64,
-    conn_timeout_sec: u64,
+    quic_config: &remote::QuicConfig,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
     let (server_endpoint, cert_fingerprint) = remote::get_server_with_port_ranges(
-        quic_port_ranges,
-        quic_idle_timeout_sec,
-        quic_keep_alive_interval_sec,
+        quic_config.port_ranges.as_deref(),
+        quic_config.idle_timeout_sec,
+        quic_config.keep_alive_interval_sec,
     )?;
     let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
     tracing::info!("Source server listening on {}", server_addr);
@@ -633,7 +629,7 @@ pub async fn run_source(
     // wait for destination to connect with a timeout
     // destination should connect within a reasonable time after receiving the source address
     let error_occurred = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let accept_timeout = std::time::Duration::from_secs(conn_timeout_sec);
+    let accept_timeout = std::time::Duration::from_secs(quic_config.conn_timeout_sec);
     match tokio::time::timeout(accept_timeout, server_endpoint.accept()).await {
         Ok(Some(conn)) => {
             tracing::info!("New destination connection incoming");

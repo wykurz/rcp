@@ -201,9 +201,10 @@ pub async fn get_file_iops_tokens(chunk_size: u64, file_size: u64) {
                 file_size,
             );
         } else {
-            // we already checked that tokens <= u32::MAX, so the cast is safe
-            #[allow(clippy::cast_possible_truncation)]
-            get_iops_tokens(tokens as u32).await;
+            // tokens is guaranteed to be <= u32::MAX by check above
+            let tokens_u32 =
+                u32::try_from(tokens).expect("tokens should fit in u32 after bounds check");
+            get_iops_tokens(tokens_u32).await;
         }
     }
 }

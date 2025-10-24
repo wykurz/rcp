@@ -235,6 +235,12 @@ async fn run_operation(
         overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
         chunk_size: args.chunk_size,
     };
+    let quic_config = remote::QuicConfig {
+        port_ranges: args.quic_port_ranges.clone(),
+        idle_timeout_sec: args.quic_idle_timeout_sec,
+        keep_alive_interval_sec: args.quic_keep_alive_interval_sec,
+        conn_timeout_sec: args.remote_copy_conn_timeout_sec,
+    };
     let rcpd_result = match master_hello {
         remote::protocol::MasterHello::Source { src, dst } => {
             tracing::info!("Starting source");
@@ -243,10 +249,7 @@ async fn run_operation(
                 &src,
                 &dst,
                 &settings,
-                args.quic_port_ranges.as_deref(),
-                args.quic_idle_timeout_sec,
-                args.quic_keep_alive_interval_sec,
-                args.remote_copy_conn_timeout_sec,
+                &quic_config,
             )
             .await
             {
@@ -272,9 +275,7 @@ async fn run_operation(
                 &source_cert_fingerprint,
                 &settings,
                 &preserve,
-                args.quic_idle_timeout_sec,
-                args.quic_keep_alive_interval_sec,
-                args.remote_copy_conn_timeout_sec,
+                &quic_config,
             )
             .await
             {
@@ -455,6 +456,25 @@ fn main() -> Result<(), anyhow::Error> {
         println!("rcpd: Debug logging to file: {filename}");
         filename
     });
+    let output = common::OutputConfig {
+        quiet: args.quiet,
+        verbose: args.verbose,
+        print_summary: false,
+    };
+    let runtime = common::RuntimeConfig {
+        max_workers: args.max_workers,
+        max_blocking_threads: args.max_blocking_threads,
+    };
+    let throttle = common::ThrottleConfig {
+        max_open_files: args.max_open_files,
+        ops_throttle: args.ops_throttle,
+        iops_throttle: args.iops_throttle,
+        chunk_size: args.chunk_size,
+    };
+    let tracing = common::TracingConfig {
+        remote_layer: Some(tracing_layer),
+        debug_log_file,
+    };
     let res = common::run(
         if args.progress {
             Some(common::ProgressSettings {
@@ -464,17 +484,10 @@ fn main() -> Result<(), anyhow::Error> {
         } else {
             None
         },
-        args.quiet,
-        args.verbose,
-        false,
-        args.max_workers,
-        args.max_blocking_threads,
-        args.max_open_files,
-        args.ops_throttle,
-        args.iops_throttle,
-        args.chunk_size,
-        Some(tracing_layer),
-        debug_log_file,
+        output,
+        runtime,
+        throttle,
+        tracing,
         func,
     );
     if res.is_none() {

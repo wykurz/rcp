@@ -175,6 +175,25 @@ fn main() -> Result<()> {
         let args = args.clone();
         || async_main(args)
     };
+    let output = common::OutputConfig {
+        quiet: args.quiet,
+        verbose: args.verbose,
+        print_summary: args.summary,
+    };
+    let runtime = common::RuntimeConfig {
+        max_workers: args.max_workers,
+        max_blocking_threads: args.max_blocking_threads,
+    };
+    let throttle = common::ThrottleConfig {
+        max_open_files: args.max_open_files,
+        ops_throttle: args.ops_throttle,
+        iops_throttle: args.iops_throttle,
+        chunk_size: args.chunk_size,
+    };
+    let tracing = common::TracingConfig {
+        remote_layer: None,
+        debug_log_file: None,
+    };
     let res = common::run(
         if args.progress || args.progress_type.is_some() {
             Some(common::ProgressSettings {
@@ -186,17 +205,10 @@ fn main() -> Result<()> {
         } else {
             None
         },
-        args.quiet,
-        args.verbose,
-        args.summary,
-        args.max_workers,
-        args.max_blocking_threads,
-        args.max_open_files,
-        args.ops_throttle,
-        args.iops_throttle,
-        args.chunk_size,
-        None,
-        None,
+        output,
+        runtime,
+        throttle,
+        tracing,
         func,
     );
     match res {
