@@ -15,14 +15,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - stdin watchdog in `rcpd` to detect master process disconnection immediately
 - Automatic cleanup of `rcpd` processes when master (`rcp`) dies or disconnects
 - Comprehensive lifecycle management tests for remote copy operations
+- CI lint to detect and prevent `anyhow::Error::msg()` usage that destroys error chains
+- Test coverage for error chain preservation across `rcp`, `rrm`, `rlink`, `rcmp`, and `filegen`:
+  - `parent_dir_no_write_permission` - verifies permission errors are visible in rm operations
+  - `test_destination_permission_error_includes_root_cause` - verifies permission errors in copy operations
+  - `test_permission_error_includes_root_cause` - verifies permission errors in filegen and link operations
 
 ### Changed
 - `rcpd` now automatically exits when master process dies (via stdin monitoring + QUIC timeouts)
 - QUIC connections now have explicit idle timeout and keep-alive configuration
+- Error types (`copy::Error`, `link::Error`, `rm::Error`, `filegen::Error`) now use `#[error("{source:#}")]` to automatically display full error chains
+- All error logging now uses `{:#}` format consistently for better error chain visibility
+- Multi-operation failures now preserve the first error with context instead of generic failure messages
 
 ### Fixed
+- **CRITICAL**: Fixed error chain destruction in 21 locations across all tools where `anyhow::Error::msg()` was converting errors to strings
 - `rcpd` processes no longer remain orphaned on remote hosts after master crash
 - Remote copy operations now detect dead connections within seconds instead of hanging indefinitely
+- Error messages now consistently show root causes (e.g., "Permission denied", "No space left on device", "Disk quota exceeded")
+- Permission denied errors in parent directories are now properly reported with full context
+- Error logging in main binaries (`rcp`, `rrm`, `rlink`) now uses consistent `{:#}` format
 
 ## [0.20.0] - 2025-01-19
 
