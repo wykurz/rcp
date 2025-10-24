@@ -8,13 +8,13 @@ use crate::progress;
 /// Error type for remove operations that preserves operation summary even on failure.
 ///
 /// # Logging Convention
-/// The Display implementation automatically shows the full error chain, so you can log it
-/// with any format specifier:
+/// When logging this error, use `{:#}` or `{:?}` format to preserve the error chain:
 /// ```ignore
-/// tracing::error!("operation failed: {}", &error);   // ✅ Shows full chain
 /// tracing::error!("operation failed: {:#}", &error); // ✅ Shows full chain
 /// tracing::error!("operation failed: {:?}", &error); // ✅ Shows full chain
 /// ```
+/// The Display implementation also shows the full chain, but workspace linting enforces `{:#}`
+/// for consistency.
 #[derive(Debug, thiserror::Error)]
 #[error("{source:#}")]
 pub struct Error {

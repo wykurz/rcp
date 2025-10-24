@@ -19,18 +19,68 @@ VIOLATIONS_FOUND=0
 # Directories to check
 SEARCH_DIRS="common/src rcp/src rlink/src rrm/src rcmp/src filegen/src"
 
-# Find all uses of anyhow::Error::msg(
+# Detect usages outside of comments
+check_file() {
+    local file="$1"
+    awk '
+    function ltrim(str) {
+        sub(/^[[:space:]]+/, "", str)
+        return str
+    }
+    BEGIN {
+        in_block = 0
+    }
+    {
+        line = $0
+        trimmed = ltrim(line)
+
+        if (in_block) {
+            if (index(trimmed, "*/")) {
+                trimmed = substr(trimmed, index(trimmed, "*/") + 2)
+                trimmed = ltrim(trimmed)
+                in_block = 0
+            } else {
+                next
+            }
+        }
+
+        while ((start = index(trimmed, "/*")) > 0) {
+            before = substr(trimmed, 1, start - 1)
+            rest = substr(trimmed, start + 2)
+            end = index(rest, "*/")
+            if (end > 0) {
+                rest = substr(rest, end + 2)
+                trimmed = before rest
+            } else {
+                trimmed = before
+                in_block = 1
+                break
+            }
+        }
+
+        trimmed = ltrim(trimmed)
+        if (trimmed ~ /^\/\// || trimmed ~ /^$/) {
+            next
+        }
+        if (trimmed ~ /anyhow::Error::msg[[:space:]]*\(/) {
+            print NR ":" line
+        }
+    }
+    ' "$file"
+}
+
+# Find all uses of anyhow::Error::msg outside comments
 for dir in $SEARCH_DIRS; do
     if [ -d "$dir" ]; then
         while IFS= read -r file; do
-            # Search for anyhow::Error::msg pattern
-            while IFS=: read -r line_num line_content; do
-                if [ -n "$line_num" ]; then
-                    echo -e "${RED}Found violation in $file:$line_num${NC}"
-                    echo -e "  ${YELLOW}$line_content${NC}"
-                    VIOLATIONS_FOUND=1
-                fi
-            done < <(grep -n "anyhow::Error::msg(" "$file" 2>/dev/null || true)
+            matches=$(check_file "$file")
+            if [ -n "$matches" ]; then
+                echo -e "${RED}Found violation in $file:${NC}"
+                while IFS=: read -r line_num line_content; do
+                    echo -e "  Line $line_num: ${YELLOW}$line_content${NC}"
+                done <<< "$matches"
+                VIOLATIONS_FOUND=1
+            fi
         done < <(find "$dir" -name "*.rs" -type f)
     fi
 done

@@ -128,7 +128,11 @@ tracing::error!("operation failed: {}", &error);   // Only shows outer message!
 
 **CI Enforcement**: The `scripts/check-anyhow-error-msg.sh` script automatically detects any usage of `anyhow::Error::msg()` and will fail CI if found.
 
-**Test Coverage**: The `parent_dir_no_write_permission` test in `common/src/rm.rs` specifically verifies that permission errors are preserved in the error chain.
+**Test Coverage**:
+- `common/src/rm.rs::tests::parent_dir_no_write_permission`
+- `common/src/copy.rs::copy_tests::error_message_tests::test_destination_permission_error_includes_root_cause`
+- `common/src/link.rs::link_tests::test_link_destination_permission_error_includes_root_cause`
+- `common/src/filegen.rs::tests::test_permission_error_includes_root_cause`
 
 ## Testing
 

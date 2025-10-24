@@ -7,13 +7,13 @@ use crate::progress;
 /// Error type for filegen operations that preserves operation summary even on failure.
 ///
 /// # Logging Convention
-/// The Display implementation automatically shows the full error chain, so you can log it
-/// with any format specifier:
+/// When logging this error, use `{:#}` or `{:?}` format to preserve the error chain:
 /// ```ignore
-/// tracing::error!("operation failed: {}", &error);   // ✅ Shows full chain
 /// tracing::error!("operation failed: {:#}", &error); // ✅ Shows full chain
 /// tracing::error!("operation failed: {:?}", &error); // ✅ Shows full chain
 /// ```
+/// The Display implementation also shows the full chain, but workspace linting enforces `{:#}`
+/// for consistency.
 #[derive(Debug, thiserror::Error)]
 #[error("{source:#}")]
 pub struct Error {
@@ -211,6 +211,7 @@ pub async fn filegen(
         }
     }
     let mut success = true;
+    let mut last_error: Option<anyhow::Error> = None;
     let mut filegen_summary = Summary::default();
     while let Some(res) = join_set.join_next().await {
         match res.map_err(|err| Error::new(err.into(), Default::default()))? {
@@ -218,15 +219,20 @@ pub async fn filegen(
             Err(error) => {
                 tracing::error!("filegen: {:?} failed with: {:#}", root, &error);
                 filegen_summary = filegen_summary + error.summary;
+                if last_error.is_none() {
+                    last_error = Some(error.source);
+                }
                 success = false;
             }
         }
     }
     if !success {
-        return Err(Error::new(
-            anyhow!("filegen: {:?} failed!", &root),
-            filegen_summary,
-        ));
+        let error = if let Some(error) = last_error {
+            error.context(format!("filegen: {:?} failed!", &root))
+        } else {
+            anyhow!("filegen: {:?} failed!", &root)
+        };
+        return Err(Error::new(error, filegen_summary));
     }
     Ok(filegen_summary)
 }
@@ -235,6 +241,7 @@ pub async fn filegen(
 mod tests {
     use super::*;
     use crate::testutils;
+    use std::os::unix::fs::PermissionsExt;
     use tracing_test::traced_test;
 
     lazy_static! {
@@ -448,6 +455,42 @@ mod tests {
         assert!(test_path.join("dir1").join("dir1").join("file0").exists());
         // cleanup
         tokio::fs::remove_dir_all(test_path).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_permission_error_includes_root_cause() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let root = tmp_dir.join("readonly");
+        tokio::fs::create_dir(&root).await?;
+        tokio::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).await?;
+
+        let config = FileGenConfig {
+            root: root.clone(),
+            dirwidth: Vec::new(),
+            numfiles: 1,
+            filesize: 10,
+            writebuf: 10,
+            chunk_size: 0,
+            leaf_files: false,
+        };
+        let result = filegen(&PROGRESS, &config).await;
+
+        // restore permissions to allow cleanup
+        tokio::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).await?;
+
+        assert!(
+            result.is_err(),
+            "filegen inside read-only directory should fail"
+        );
+        let err = result.unwrap_err();
+        let err_msg = format!("{:#}", err.source);
+        assert!(
+            err_msg.to_lowercase().contains("permission denied") || err_msg.contains("EACCES"),
+            "Error message must include permission denied text. Got: {}",
+            err_msg
+        );
         Ok(())
     }
 }
