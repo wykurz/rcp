@@ -4,8 +4,18 @@ use tracing::instrument;
 
 use crate::progress;
 
+/// Error type for filegen operations that preserves operation summary even on failure.
+///
+/// # Logging Convention
+/// The Display implementation automatically shows the full error chain, so you can log it
+/// with any format specifier:
+/// ```ignore
+/// tracing::error!("operation failed: {}", &error);   // ✅ Shows full chain
+/// tracing::error!("operation failed: {:#}", &error); // ✅ Shows full chain
+/// tracing::error!("operation failed: {:?}", &error); // ✅ Shows full chain
+/// ```
 #[derive(Debug, thiserror::Error)]
-#[error("{source}")]
+#[error("{source:#}")]
 pub struct Error {
     #[source]
     pub source: anyhow::Error,
@@ -206,7 +216,7 @@ pub async fn filegen(
         match res.map_err(|err| Error::new(anyhow::Error::msg(err), Default::default()))? {
             Ok(summary) => filegen_summary = filegen_summary + summary,
             Err(error) => {
-                tracing::error!("filegen: {:?} failed with: {:?}", root, &error);
+                tracing::error!("filegen: {:?} failed with: {:#}", root, &error);
                 filegen_summary = filegen_summary + error.summary;
                 success = false;
             }

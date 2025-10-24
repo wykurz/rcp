@@ -88,22 +88,22 @@ From CONVENTIONS.md:
 
 ### Error Logging Convention
 
-**CRITICAL**: When logging `anyhow::Error` or custom `Error` types that wrap `anyhow::Error`, **ALWAYS** use alternate display format `{:#}` or debug format `{:?}` to preserve the error chain:
+**CRITICAL**: When logging errors (both custom `Error` types and raw errors), **ALWAYS** use alternate display format `{:#}` or debug format `{:?}` to preserve the error chain:
 
 ```rust
 // ✅ CORRECT - Shows full error chain
 tracing::error!("operation failed: {:#}", &error);  // Inline: "failed: Permission denied"
 tracing::error!("operation failed: {:?}", &error);  // Multi-line with "Caused by:"
 
-// ❌ WRONG - Loses root cause (will fail CI)
+// ❌ WRONG - May lose root cause (will fail CI)
 tracing::error!("operation failed: {}", &error);   // Only shows outer message!
 ```
 
-**Rationale**: Using `{}` (Display format) only shows the outermost error message, hiding critical root causes like "Permission denied", "No space left on device", "Disk quota exceeded", etc. Users need to see the underlying system error to debug issues.
+**Rationale**: Using `{}` (Display format) may hide critical root causes like "Permission denied", "No space left on device", "Disk quota exceeded", etc. Using `{:#}` everywhere ensures consistency and guarantees users always see the underlying system error.
+
+**Implementation**: Custom Error types in `common/src/copy.rs`, `common/src/link.rs`, `common/src/rm.rs`, and `common/src/filegen.rs` use `#[error("{source:#}")]` in their thiserror definition. While this means they work correctly with any format specifier, we use `{:#}` consistently everywhere for simplicity.
 
 **CI Enforcement**: The `scripts/check-error-logging.sh` script automatically checks for this pattern and will fail CI if violations are found.
-
-**Exception**: Direct `io::Error` or other leaf errors (without an error chain) can use `{}` since there's no chain to lose.
 
 ## Testing
 

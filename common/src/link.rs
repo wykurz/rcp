@@ -17,13 +17,15 @@ lazy_static! {
 /// Error type for link operations that preserves operation summary even on failure.
 ///
 /// # Logging Convention
-/// When logging this error, use `{:#}` or `{:?}` format to preserve the error chain:
+/// The Display implementation automatically shows the full error chain, so you can log it
+/// with any format specifier:
 /// ```ignore
-/// tracing::error!("operation failed: {:#}", &error);  // ✅ Shows full chain
-/// tracing::error!("operation failed: {}", &error);    // ❌ Loses root cause
+/// tracing::error!("operation failed: {}", &error);   // ✅ Shows full chain
+/// tracing::error!("operation failed: {:#}", &error); // ✅ Shows full chain
+/// tracing::error!("operation failed: {:?}", &error); // ✅ Shows full chain
 /// ```
 #[derive(Debug, thiserror::Error)]
-#[error("{source}")]
+#[error("{source:#}")]
 pub struct Error {
     #[source]
     pub source: anyhow::Error,
