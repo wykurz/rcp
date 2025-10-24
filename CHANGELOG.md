@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2025-10-24
+
 ### Added
 - Configurable QUIC connection timeouts for remote operations via CLI arguments:
   - `--quic-idle-timeout-sec` (default: 10s) - maximum idle time before closing QUIC connection
@@ -55,4 +57,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See git history for changes in previous versions.
 
+[0.21.0]: https://github.com/wykurz/rcp/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/wykurz/rcp/compare/v0.19.0...v0.20.0
