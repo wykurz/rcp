@@ -14,8 +14,6 @@ jobs:
 
     - name: Setup Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        toolchain-file: rust-toolchain.toml
 
     - name: Format
       run: cargo fmt --check
@@ -42,8 +40,6 @@ jobs:
 
     - name: Setup Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        toolchain-file: rust-toolchain.toml
 
     - name: Setup SSH for localhost
       run: |
@@ -81,8 +77,6 @@ jobs:
 
     - name: Setup Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        toolchain-file: rust-toolchain.toml
 
     - name: Setup SSH for localhost
       run: |
