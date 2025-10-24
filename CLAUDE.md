@@ -24,12 +24,18 @@ cargo install cargo-nextest  # Optional but recommended for testing
 - **List all commands**: `just --list` or just `just`
 - **Run lints**: `just lint` (fmt, clippy, error logging)
 - **Format code**: `just fmt`
-- **Run tests**: `just test` (uses nextest)
+- **Run tests (debug)**: `just test` (uses nextest)
+- **Run tests (release)**: `just test-release` (uses nextest --release)
+- **Run doctests**: `just doctest` (debug mode)
+- **Run doctests (release)**: `just doctest-release`
+- **Run all tests**: `just test-all` (debug + release + doctests)
 - **Quick check**: `just check` (faster than build)
 - **Build all**: `just build`
 - **Build release**: `just build-release`
 - **Check docs**: `just doc`
-- **Run all CI checks**: `just ci` (lint + test + doc)
+- **Run all CI checks**: `just ci` (lint + doc + test-all)
+
+**Note**: CI workflows (GitHub Actions) run both debug and release tests in parallel to catch optimization-related bugs. Use `just ci` locally to ensure your changes pass CI.
 
 ### Direct Cargo Commands
 
@@ -39,9 +45,12 @@ You can also use cargo directly:
 - **Build specific package**: `cargo build -p <package_name>` (e.g., `cargo build -p rcp`)
 - **Build for release**: `cargo build --release`
 - **Test all packages**: `cargo nextest run` (recommended) or `cargo test --verbose`
+- **Test with release optimizations**: `cargo nextest run --release`
 - **Test with full output**: `cargo nextest run --no-capture`
 - **Test specific package**: `cargo nextest run -p <package_name>` or `cargo test -p <package_name>`
 - **Test specific test**: `cargo nextest run --no-capture <test_name>`
+- **Run doctests**: `cargo test --doc`
+- **Run doctests (release)**: `cargo test --doc --release`
 - **Format code**: `cargo fmt`
 - **Check formatting**: `cargo fmt --check`
 - **Lint code**: `cargo clippy`

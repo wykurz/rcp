@@ -21,9 +21,25 @@ lint:
 fmt:
     cargo fmt
 
-# Run tests (using nextest by default)
+# Run tests (debug mode, using nextest by default)
 test:
     cargo nextest run
+
+# Run tests in release mode
+test-release:
+    cargo nextest run --release
+
+# Run doctests (debug mode)
+doctest:
+    cargo test --doc
+
+# Run doctests in release mode
+doctest-release:
+    cargo test --doc --release
+
+# Run all tests (both debug and release)
+test-all: test doctest test-release doctest-release
+    @echo "✅ All tests passed!"
 
 # Quick compilation check (faster than full build)
 check:
@@ -41,8 +57,8 @@ build-release:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
-# Run all CI checks locally before pushing
-ci: lint test doc
+# Run all CI checks locally before pushing (matches GitHub Actions)
+ci: lint doc test-all
     @echo "✅ All CI checks passed! Safe to push."
 
 # Clean build artifacts
