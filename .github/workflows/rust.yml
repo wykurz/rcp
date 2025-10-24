@@ -27,6 +27,8 @@ jobs:
     - uses: actions/checkout@v5
     - name: Check error logging format
       run: ./scripts/check-error-logging.sh
+    - name: Check anyhow::Error::msg usage
+      run: ./scripts/check-anyhow-error-msg.sh
 
   lint:
     runs-on: ubuntu-latest

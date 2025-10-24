@@ -116,12 +116,13 @@ async fn hard_link_helper(
             .map_err(|err| {
                 let rm_summary = err.summary;
                 link_summary.copy_summary.rm_summary = rm_summary;
-                Error::new(anyhow::Error::msg(err), link_summary)
+                Error::new(err.source, link_summary)
             })?;
             link_summary.copy_summary.rm_summary = rm_summary;
             tokio::fs::hard_link(src, dst)
                 .await
-                .map_err(|err| Error::new(anyhow::Error::msg(err), link_summary))?;
+                .with_context(|| format!("failed to hard link {:?} to {:?}", src, dst))
+                .map_err(|err| Error::new(err, link_summary))?;
         }
     }
     prog_track.hard_links_created.inc();
@@ -343,7 +344,7 @@ pub async fn link(
                         let rm_summary = err.summary;
                         copy_summary.rm_summary = rm_summary;
                         Error::new(
-                            anyhow::Error::msg(err),
+                            err.source,
                             Summary {
                                 copy_summary,
                                 ..Default::default()
@@ -356,7 +357,7 @@ pub async fn link(
                         .map_err(|err| {
                             copy_summary.rm_summary = rm_summary;
                             Error::new(
-                                anyhow::Error::msg(err),
+                                err,
                                 Summary {
                                     copy_summary,
                                     ..Default::default()
@@ -498,7 +499,7 @@ pub async fn link(
             },
             Err(error) => {
                 if settings.copy_settings.fail_early {
-                    return Err(Error::new(anyhow::Error::msg(error), link_summary));
+                    return Err(Error::new(error.into(), link_summary));
                 }
             }
         }

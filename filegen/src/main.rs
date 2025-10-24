@@ -190,12 +190,7 @@ async fn async_main(args: Args) -> Result<common::filegen::Summary> {
     tokio::fs::create_dir(&root)
         .await
         .with_context(|| format!("Error creating {:?}", &root))
-        .map_err(|err| {
-            common::filegen::Error::new(
-                anyhow::Error::msg(err),
-                common::filegen::Summary::default(),
-            )
-        })?;
+        .map_err(|err| common::filegen::Error::new(err, common::filegen::Summary::default()))?;
     let prog_track = common::get_progress();
     prog_track.directories_created.inc();
     let mut summary = common::filegen::Summary {
