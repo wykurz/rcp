@@ -172,6 +172,12 @@ struct Args {
     /// Example: /tmp/rcpd-log creates /tmp/rcpd-log-YYYY-MM-DDTHH-MM-SS-RANDOM
     #[arg(long, value_name = "PREFIX", help_heading = "Remote copy options")]
     debug_log_prefix: Option<String>,
+
+    /// Print protocol version information as JSON and exit
+    ///
+    /// Used by rcp to verify version compatibility before launching remote operations
+    #[arg(long)]
+    protocol_version: bool,
 }
 
 /// monitor stdin for EOF to detect master disconnection
@@ -444,6 +450,23 @@ async fn async_main(
 }
 
 fn main() -> Result<(), anyhow::Error> {
+    // handle --protocol-version flag before parsing full arguments
+    // this allows it to work without required arguments
+    // respect -- separator: only check args before -- to allow files named --protocol-version
+    let args: Vec<String> = std::env::args().collect();
+    let separator_pos = args.iter().position(|arg| arg == "--");
+    let args_to_check = if let Some(pos) = separator_pos {
+        &args[..pos]
+    } else {
+        &args[..]
+    };
+    if args_to_check.iter().any(|arg| arg == "--protocol-version") {
+        let version = common::version::ProtocolVersion::current();
+        let json = version.to_json()?;
+        println!("{}", json);
+        return Ok(());
+    }
+
     let args = Args::parse();
     let (tracing_layer, tracing_sender, tracing_receiver) =
         common::remote_tracing::RemoteTracingLayer::new();

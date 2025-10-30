@@ -201,6 +201,18 @@ struct Args {
     #[arg(long, value_name = "PREFIX", help_heading = "Remote copy options")]
     rcpd_debug_log_prefix: Option<String>,
 
+    /// Print protocol version information as JSON and exit
+    ///
+    /// Used to verify version compatibility with rcpd
+    #[arg(long, help_heading = "Remote copy options")]
+    protocol_version: bool,
+
+    /// Path to rcpd binary on remote hosts
+    ///
+    /// If not specified, rcp will search for rcpd in standard locations
+    #[arg(long, value_name = "PATH", help_heading = "Remote copy options")]
+    rcpd_path: Option<String>,
+
     // ARGUMENTS
     /// Source path(s) and destination path
     #[arg()]
@@ -246,7 +258,14 @@ async fn run_rcpd_master(
         master_cert_fingerprint,
     };
     for session in [src.session(), dst.session()] {
-        let rcpd = remote::start_rcpd(&rcpd_config, session, &server_addr, &server_name).await?;
+        let rcpd = remote::start_rcpd(
+            &rcpd_config,
+            session,
+            &server_addr,
+            &server_name,
+            args.rcpd_path.as_deref(),
+        )
+        .await?;
         rcpds.push(rcpd);
     }
     tracing::info!("Waiting for connections from rcpd processes...");
@@ -615,6 +634,23 @@ fn has_remote_paths(args: &Args) -> bool {
 }
 
 fn main() -> Result<(), anyhow::Error> {
+    // handle --protocol-version flag before parsing full arguments
+    // this allows it to work without required arguments (paths)
+    // respect -- separator: only check args before -- to allow files named --protocol-version
+    let args: Vec<String> = std::env::args().collect();
+    let separator_pos = args.iter().position(|arg| arg == "--");
+    let args_to_check = if let Some(pos) = separator_pos {
+        &args[..pos]
+    } else {
+        &args[..]
+    };
+    if args_to_check.iter().any(|arg| arg == "--protocol-version") {
+        let version = common::version::ProtocolVersion::current();
+        let json = version.to_json()?;
+        println!("{}", json);
+        return Ok(());
+    }
+
     let args = Args::parse();
     let is_remote_operation = has_remote_paths(&args);
     let func = {
