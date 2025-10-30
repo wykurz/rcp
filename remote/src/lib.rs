@@ -260,7 +260,7 @@
 //! let master_addr: SocketAddr = "192.168.1.100:5000".parse()?;
 //! let server_name = "master-server";
 //!
-//! let process = start_rcpd(&config, &session, &master_addr, server_name).await?;
+//! let process = start_rcpd(&config, &session, &master_addr, server_name, None).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -417,24 +417,227 @@ pub async fn wait_for_rcpd_process(
     Ok(())
 }
 
+/// Escape a string for safe use in POSIX shell single quotes
+///
+/// Wraps the string in single quotes and escapes any single quotes within
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+#[cfg(test)]
+mod shell_escape_tests {
+    use super::*;
+
+    #[test]
+    fn test_shell_escape_simple() {
+        assert_eq!(shell_escape("simple"), "'simple'");
+    }
+
+    #[test]
+    fn test_shell_escape_with_spaces() {
+        assert_eq!(shell_escape("path with spaces"), "'path with spaces'");
+    }
+
+    #[test]
+    fn test_shell_escape_with_single_quote() {
+        // single quote becomes: close quote, escaped quote, open quote
+        assert_eq!(
+            shell_escape("path'with'quotes"),
+            r"'path'\''with'\''quotes'"
+        );
+    }
+
+    #[test]
+    fn test_shell_escape_injection_attempt() {
+        // attempt to inject command
+        assert_eq!(shell_escape("foo; rm -rf /"), "'foo; rm -rf /'");
+        // the semicolon is now safely quoted and won't execute
+    }
+
+    #[test]
+    fn test_shell_escape_special_chars() {
+        assert_eq!(shell_escape("$PATH && echo pwned"), "'$PATH && echo pwned'");
+        // special chars are safely quoted
+    }
+}
+
+/// Discover rcpd binary on remote host
+///
+/// Searches in the following order:
+/// 1. Explicit path (if provided)
+/// 2. Same directory as local rcp binary
+/// 3. PATH (via `which rcpd`)
+///
+/// Returns the path to rcpd if found, otherwise an error
+async fn discover_rcpd_path(
+    session: &std::sync::Arc<openssh::Session>,
+    explicit_path: Option<&str>,
+) -> anyhow::Result<String> {
+    let local_version = common::version::ProtocolVersion::current();
+
+    // try explicit path first
+    if let Some(path) = explicit_path {
+        tracing::debug!("Trying explicit rcpd path: {}", path);
+        let output = session
+            .command("sh")
+            .arg("-c")
+            .arg(format!("test -x {}", shell_escape(path)))
+            .output()
+            .await?;
+        if output.status.success() {
+            tracing::info!("Found rcpd at explicit path: {}", path);
+            return Ok(path.to_string());
+        }
+        tracing::warn!("Explicit rcpd path not found or not executable: {}", path);
+    }
+
+    // try same directory as local rcp binary
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(bin_dir) = current_exe.parent() {
+            let path = bin_dir.join("rcpd").display().to_string();
+            tracing::debug!("Trying same directory as rcp: {}", path);
+            let output = session
+                .command("sh")
+                .arg("-c")
+                .arg(format!("test -x {}", shell_escape(&path)))
+                .output()
+                .await?;
+            if output.status.success() {
+                tracing::info!("Found rcpd in same directory as rcp: {}", path);
+                return Ok(path);
+            }
+        }
+    }
+
+    // try PATH
+    tracing::debug!("Trying to find rcpd in PATH");
+    let output = session.command("which").arg("rcpd").output().await?;
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout);
+        let path = path.trim();
+        if !path.is_empty() {
+            tracing::info!("Found rcpd in PATH: {}", path);
+            return Ok(path.to_string());
+        }
+    }
+
+    // build error message with what we searched
+    let mut searched = vec![
+        "- Same directory as local rcp binary".to_string(),
+        "- PATH (via 'which rcpd')".to_string(),
+    ];
+    if let Some(path) = explicit_path {
+        searched.insert(
+            0,
+            format!("- Explicit path: {} (not found or not executable)", path),
+        );
+    }
+
+    Err(anyhow::anyhow!(
+        "rcpd binary not found on remote host\n\
+        \n\
+        Searched in:\n\
+        {}\n\
+        \n\
+        Please install rcpd on the remote host and ensure it's in PATH:\n\
+        - cargo install rcp-tools-rcp --version {}\n\
+        Or specify the path explicitly:\n\
+        - rcp --rcpd-path=/path/to/rcpd ...",
+        searched.join("\n"),
+        local_version.semantic
+    ))
+}
+
+/// Check version compatibility between local rcp and remote rcpd
+///
+/// Returns Ok if versions are compatible, Err with detailed message if not
+async fn check_rcpd_version(
+    session: &std::sync::Arc<openssh::Session>,
+    rcpd_path: &str,
+    remote_host: &str,
+) -> anyhow::Result<()> {
+    let local_version = common::version::ProtocolVersion::current();
+
+    tracing::debug!("Checking rcpd version on remote host: {}", remote_host);
+
+    // run rcpd --protocol-version on remote (call binary directly, no shell)
+    let output = session
+        .command(rcpd_path)
+        .arg("--protocol-version")
+        .output()
+        .await
+        .context("Failed to execute rcpd --protocol-version on remote host")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "rcpd --protocol-version failed on remote host '{}'\n\
+            \n\
+            stderr: {}\n\
+            \n\
+            This may indicate an old version of rcpd that does not support --protocol-version.\n\
+            Please install a matching version of rcpd on the remote host:\n\
+            - cargo install rcp-tools-rcp --version {}",
+            remote_host,
+            stderr,
+            local_version.semantic
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let remote_version = common::version::ProtocolVersion::from_json(stdout.trim())
+        .context("Failed to parse rcpd version JSON from remote host")?;
+
+    tracing::info!(
+        "Local version: {}, Remote version: {}",
+        local_version,
+        remote_version
+    );
+
+    if !local_version.is_compatible_with(&remote_version) {
+        return Err(anyhow::anyhow!(
+            "rcpd version mismatch\n\
+            \n\
+            Local:  rcp {}\n\
+            Remote: rcpd {} on host '{}'\n\
+            \n\
+            The rcpd version on the remote host must exactly match the rcp version.\n\
+            \n\
+            To fix this, install the matching version on the remote host:\n\
+            - ssh {} 'cargo install rcp-tools-rcp --version {}'",
+            local_version,
+            remote_version,
+            remote_host,
+            shell_escape(remote_host),
+            local_version.semantic
+        ));
+    }
+
+    Ok(())
+}
+
 #[instrument]
 pub async fn start_rcpd(
     rcpd_config: &protocol::RcpdConfig,
     session: &SshSession,
     master_addr: &std::net::SocketAddr,
     master_server_name: &str,
+    explicit_rcpd_path: Option<&str>,
 ) -> anyhow::Result<openssh::Child<std::sync::Arc<openssh::Session>>> {
     tracing::info!("Starting rcpd server on: {:?}", session);
-    let session = setup_ssh_session(session).await?;
-    // Run rcpd command remotely
-    let current_exe = std::env::current_exe().context("Failed to get current executable path")?;
-    let bin_dir = current_exe
-        .parent()
-        .context("Failed to get parent directory of current executable")?;
-    tracing::debug!("Running rcpd from: {:?}", bin_dir);
+    let remote_host = &session.host;
+    let ssh_session = setup_ssh_session(session).await?;
+
+    // discover rcpd binary on remote host
+    let rcpd_path = discover_rcpd_path(&ssh_session, explicit_rcpd_path).await?;
+
+    // check version compatibility
+    check_rcpd_version(&ssh_session, &rcpd_path, remote_host).await?;
+
+    // run rcpd command remotely
     let rcpd_args = rcpd_config.to_args();
     tracing::debug!("rcpd arguments: {:?}", rcpd_args);
-    let mut cmd = session.arc_command(format!("{}/rcpd", bin_dir.display()));
+    let mut cmd = ssh_session.arc_command(&rcpd_path);
     cmd.arg("--master-addr")
         .arg(master_addr.to_string())
         .arg("--server-name")

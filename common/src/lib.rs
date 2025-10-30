@@ -112,6 +112,7 @@ pub mod link;
 pub mod preserve;
 pub mod remote_tracing;
 pub mod rm;
+pub mod version;
 
 pub mod filecmp;
 pub mod progress;

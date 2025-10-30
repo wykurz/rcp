@@ -9,6 +9,7 @@ readme = "../README.md"
 documentation = "https://docs.rs/rcp-tools-common"
 keywords = ["internal", "library", "file-operations"]
 categories = ["development-tools"]
+build = "build.rs"
 
 [lints]
 workspace = true
@@ -24,6 +25,7 @@ bytes = "1.10"
 bytesize = "1.3"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
 chrono = "0.4"
 console-subscriber = "0.2"
 enum-map = "2.7"

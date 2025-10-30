@@ -30,6 +30,114 @@ fn test_version_runs() {
         .success();
 }
 
+/// Test --protocol-version flag works and returns valid JSON with git info
+#[test]
+fn test_protocol_version_has_git_info() {
+    let output = Command::cargo_bin("rcp")
+        .unwrap()
+        .arg("--protocol-version")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let output_str = String::from_utf8(output).expect("output should be valid UTF-8");
+    let version: serde_json::Value =
+        serde_json::from_str(&output_str).expect("output should be valid JSON");
+
+    // verify semantic version is present
+    assert!(
+        version["semantic"].is_string(),
+        "semantic version should be present"
+    );
+    assert!(
+        !version["semantic"].as_str().unwrap().is_empty(),
+        "semantic version should not be empty"
+    );
+
+    // verify git info is populated (this catches build.rs not being activated)
+    assert!(
+        version["git_describe"].is_string(),
+        "git_describe should be present when building from git repo (check that build.rs is activated in common/Cargo.toml)"
+    );
+    assert!(
+        version["git_hash"].is_string(),
+        "git_hash should be present when building from git repo (check that build.rs is activated in common/Cargo.toml)"
+    );
+}
+
+/// Test that rcpd also has --protocol-version with git info
+#[test]
+fn test_rcpd_protocol_version_has_git_info() {
+    let output = Command::cargo_bin("rcpd")
+        .unwrap()
+        .arg("--protocol-version")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let output_str = String::from_utf8(output).expect("output should be valid UTF-8");
+    let version: serde_json::Value =
+        serde_json::from_str(&output_str).expect("output should be valid JSON");
+
+    // verify git info is populated for rcpd too
+    assert!(
+        version["git_describe"].is_string(),
+        "rcpd git_describe should be present (check that build.rs is activated in common/Cargo.toml)"
+    );
+    assert!(
+        version["git_hash"].is_string(),
+        "rcpd git_hash should be present (check that build.rs is activated in common/Cargo.toml)"
+    );
+}
+
+/// Test that --protocol-version after -- is treated as a filename (Unix convention)
+#[test]
+fn test_protocol_version_after_separator_is_filename() {
+    // with --protocol-version after --, it should be treated as a filename
+    // and require both source and destination paths
+    let output = Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--", "--protocol-version"])
+        .assert()
+        .failure(); // should fail because we need src and dst
+
+    let out = output.get_output();
+    let stderr = String::from_utf8(out.stderr.clone()).unwrap();
+    let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+
+    // should complain about missing paths, not print version JSON
+    // error might be on stdout or stderr
+    let combined = format!("{}{}", stdout, stderr);
+    assert!(
+        combined.contains("must specify") || combined.contains("required"),
+        "should complain about missing arguments, got stdout: '{}', stderr: '{}'",
+        stdout,
+        stderr
+    );
+}
+
+/// Test that --protocol-version works when it appears before --
+#[test]
+fn test_protocol_version_before_separator_works() {
+    let output = Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--protocol-version", "--", "some-file"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let output_str = String::from_utf8(output).expect("output should be valid UTF-8");
+    // should be valid JSON (version output)
+    let _version: serde_json::Value =
+        serde_json::from_str(&output_str).expect("output should be valid JSON");
+}
+
 // ============================================================================
 // ProgressType Argument Parsing Tests
 // ============================================================================
