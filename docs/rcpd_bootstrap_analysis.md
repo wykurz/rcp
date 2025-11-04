@@ -638,10 +638,10 @@ ssh_exec(host,
 **Tasks**:
 
 1. **Add musl target to build system**
-   - Update `flake.nix` with `pkgsCross.musl64` build
-   - Add `justfile` recipe: `just build-static-rcpd`
+   - Update `flake.nix` / `default.nix` so the dev shell ships the Rust 1.90.0 toolchain with the `x86_64-unknown-linux-musl` target plus cross binutils.
+   - Set `CARGO_BUILD_TARGET=x86_64-unknown-linux-musl` inside the nix shell so `cargo build` emits static binaries by default.
+   - Document how to produce musl builds both inside (`cargo build`, `cargo build --release`) and outside the nix shell (`cargo build --target x86_64-unknown-linux-musl`).
    - Test on CI: GitHub Actions with musl target
-   - Document build process
 
 2. **Test static binary on various distros**
    - Ubuntu (glibc-based)
@@ -674,6 +674,7 @@ ssh_exec(host,
 - Reliable static builds that work on all major Linux distros
 - Architecture detection prevents invalid deployments
 - Clear documentation for building static binaries
+  - ✅ Development environments now default to musl static builds; standalone instructions documented in `README.md`
 
 **Timeline**: 1-2 days
 
