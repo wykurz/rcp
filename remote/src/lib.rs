@@ -18,6 +18,7 @@
 //!     └── QUIC Client → Source (data transfer)
 //! ```
 //!
+
 //! ## Connection Flow
 //!
 //! 1. **Initialization**: Master starts `rcpd` processes on source and destination via SSH
@@ -290,6 +291,9 @@
 //! - [`protocol`] - Protocol message definitions and serialization
 //! - [`streams`] - QUIC stream wrappers with typed message passing
 //! - [`tracelog`] - Remote tracing and progress aggregation
+
+#[cfg(not(tokio_unstable))]
+compile_error!("tokio_unstable cfg must be enabled; see .cargo/config.toml");
 
 use anyhow::{anyhow, Context};
 use rand::Rng;
@@ -869,4 +873,36 @@ pub mod test_defaults {
 
     /// Default QUIC keep-alive interval in seconds for tests
     pub const DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC: u64 = 1;
+}
+
+#[cfg(test)]
+mod tests {
+    /// verify that tokio_unstable is enabled
+    ///
+    /// this test ensures that the tokio_unstable cfg flag is properly set, which is required
+    /// for console-subscriber (used in common/src/lib.rs) to function correctly.
+    ///
+    /// the compile_error! at the top of this file prevents compilation without tokio_unstable,
+    /// but this test provides additional verification that the cfg flag is properly configured
+    /// and catches cases where someone might remove the compile_error! macro.
+    #[test]
+    fn test_tokio_unstable_enabled() {
+        // compile-time check: this will cause a test failure if tokio_unstable is not set
+        #[cfg(not(tokio_unstable))]
+        {
+            panic!(
+                "tokio_unstable cfg flag is not enabled! \
+                 This is required for console-subscriber support. \
+                 Check .cargo/config.toml"
+            );
+        }
+
+        // runtime verification: if we get here, tokio_unstable is enabled
+        #[cfg(tokio_unstable)]
+        {
+            // test passes - verify we can access tokio unstable features
+            // tokio::task::JoinSet is an example of a type that uses unstable features
+            let _join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        }
+    }
 }

@@ -18,7 +18,16 @@
           inherit system overlays;
         };
 
-        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        rustToolchain = pkgs.rust-bin.stable."1.90.0".default.override {
+          extensions = [ "rustfmt" "clippy" "rust-src" ];
+          targets = [ "x86_64-unknown-linux-musl" ];
+        };
+
+        muslTools =
+          if pkgs.stdenv.isLinux then {
+            gcc = pkgs.pkgsCross.musl64.buildPackages.gcc;
+            binutils = pkgs.pkgsCross.musl64.buildPackages.binutils;
+          } else null;
 
         # Build inputs needed for the Rust project
         buildInputs = with pkgs; lib.optionals stdenv.isDarwin [
@@ -26,10 +35,12 @@
           darwin.apple_sdk.frameworks.SystemConfiguration
         ];
 
-        nativeBuildInputs = with pkgs; [
-          rustToolchain
-          pkg-config
-        ];
+        nativeBuildInputs =
+          [ rustToolchain pkgs.pkg-config ]
+          ++ pkgs.lib.optionals (muslTools != null) [
+            muslTools.gcc
+            muslTools.binutils
+          ];
 
         # Package builder for RCP tools with custom binary names
         mkRcpPackage = { packageName, binaryName, description }: pkgs.rustPlatform.buildRustPackage {
@@ -108,52 +119,73 @@
           };
         };
 
-        devShells.default = pkgs.mkShell {
-          buildInputs = with pkgs; [
-            rustToolchain
-            rust-analyzer
+        devShells.default = pkgs.mkShell (
+          {
+            buildInputs =
+              [
+                rustToolchain
+                pkgs.rust-analyzer
 
-            # Development tools from the original default.nix
-            binutils
-            cargo-bloat
-            cargo-deny
-            cargo-edit
-            cargo-expand
-            cargo-flamegraph
-            cargo-generate
-            cargo-nextest
-            cargo-outdated
-            cargo-udeps
-            gdb
-            just
-            llvmPackages.bintools
-            tokio-console
+                # Development tools from the original default.nix
+                pkgs.binutils
+                pkgs.cargo-bloat
+                pkgs.cargo-deny
+                pkgs.cargo-edit
+                pkgs.cargo-expand
+                pkgs.cargo-flamegraph
+                pkgs.cargo-generate
+                pkgs.cargo-nextest
+                pkgs.cargo-outdated
+                pkgs.cargo-udeps
+                pkgs.gdb
+                pkgs.just
+                pkgs.llvmPackages.bintools
+                pkgs.tokio-console
 
-            # Additional useful tools
-            pkg-config
-          ] ++ buildInputs;
+                # Additional useful tools
+                pkgs.pkg-config
+              ]
+              ++ buildInputs
+              ++ pkgs.lib.optionals (muslTools != null) [
+                muslTools.gcc
+                muslTools.binutils
+              ];
 
-          RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/src";
+            RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/src";
 
-          # Environment variables for development
-          shellHook = ''
-            echo "RCP development environment"
-            echo ""
-            echo "Quick start:"
-            echo "  just            - List all available commands"
-            echo "  just lint       - Run all lints (fmt + clippy + error logging)"
-            echo "  just test       - Run tests with nextest"
-            echo "  just ci         - Run all CI checks locally"
-            echo ""
-            echo "Other commands:"
-            echo "  just fmt        - Format code"
-            echo "  just check      - Quick compilation check"
-            echo "  just build      - Build all packages"
-            echo "  just doc        - Check documentation"
-            echo ""
-            echo "Individual tools: rcp, rrm, rlink, rcmp, filegen"
-            echo "Note: rcpd is included with rcp (rcp-tools-rcp package)"
-          '';
-        };
+            # Environment variables for development
+            shellHook = ''
+              echo "RCP development environment"
+              echo ""
+              echo "Quick start:"
+              echo "  just            - List all available commands"
+              echo "  just lint       - Run all lints (fmt + clippy + error logging)"
+              echo "  just test       - Run tests with nextest"
+              echo "  just ci         - Run all CI checks locally"
+              echo ""
+              echo "Other commands:"
+              echo "  just fmt        - Format code"
+              echo "  just check      - Quick compilation check"
+              echo "  just build      - Build all packages"
+              echo "  just doc        - Check documentation"
+              echo ""
+              echo "Individual tools: rcp, rrm, rlink, rcmp, filegen"
+              echo "Note: rcpd is included with rcp (rcp-tools-rcp package)"
+              if [ "$CARGO_BUILD_TARGET" = "x86_64-unknown-linux-musl" ]; then
+                echo ""
+                echo "Static musl target enabled:"
+                echo "  cargo build     -> x86_64-unknown-linux-musl"
+              fi
+            '';
+          }
+          // (
+            if muslTools != null then {
+              CARGO_BUILD_TARGET = "x86_64-unknown-linux-musl";
+              CC_x86_64_unknown_linux_musl = "${muslTools.gcc}/bin/x86_64-unknown-linux-musl-gcc";
+              AR_x86_64_unknown_linux_musl = "${muslTools.binutils}/bin/x86_64-unknown-linux-musl-ar";
+              PKG_CONFIG_ALLOW_CROSS = "1";
+            } else {}
+          )
+        );
       });
 }

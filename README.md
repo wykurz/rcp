@@ -129,6 +129,11 @@ debian / rhel
 
 Starting with release `v0.10.1`, .deb and .rpm packages are available as part of each release.
 
+Static musl builds
+------------------
+
+Enter the development environment (`nix develop`) to pick up the musl-enabled toolchain and default `CARGO_BUILD_TARGET=x86_64-unknown-linux-musl`. Inside that shell, `cargo build` (or `cargo build --release`) produces fully static binaries automatically; outside the shell you can invoke `cargo build --target x86_64-unknown-linux-musl` (after installing the musl target with `rustup target add x86_64-unknown-linux-musl`).
+
 General controls
 ================
 

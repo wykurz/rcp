@@ -5,6 +5,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: --cfg tokio_unstable
 
 jobs:
   lint-and-docs:
@@ -14,6 +15,16 @@ jobs:
 
     - name: Setup Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        components: rustfmt, clippy
+        targets: x86_64-unknown-linux-musl
+        target: x86_64-unknown-linux-musl
+
+    - name: Install musl toolchain deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools pkg-config
+        sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
 
     - name: Format
       run: cargo fmt --check
@@ -25,14 +36,17 @@ jobs:
       run: ./scripts/check-anyhow-error-msg.sh
 
     - name: Lint
-      run: cargo clippy --workspace -- -D warnings
+      run: cargo clippy --workspace --target x86_64-unknown-linux-musl -- -D warnings
+      env:
+        PKG_CONFIG_ALLOW_CROSS: "1"
 
     - name: Documentation
-      run: cargo doc --no-deps --workspace
+      run: cargo doc --no-deps --workspace --target x86_64-unknown-linux-musl
       env:
-        RUSTDOCFLAGS: -D warnings
+        RUSTDOCFLAGS: --cfg tokio_unstable -D warnings
+        PKG_CONFIG_ALLOW_CROSS: "1"
 
-  test-debug:
+  test-musl-debug:
     runs-on: ubuntu-latest
     needs: lint-and-docs
     steps:
@@ -40,10 +54,17 @@ jobs:
 
     - name: Setup Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        target: x86_64-unknown-linux-musl
+
+    - name: Install musl toolchain deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools pkg-config
+        sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
 
     - name: Setup SSH for localhost
       run: |
-        sudo apt-get update
         sudo apt-get install -y openssh-server
         sudo systemctl start ssh
         ssh-keygen -t rsa -f ~/.ssh/id_rsa -N ""
@@ -54,22 +75,26 @@ jobs:
     - name: Install cargo-nextest
       run: cargo install cargo-nextest
 
-    - name: Test (debug)
+    - name: Test (musl debug)
+      env:
+        PKG_CONFIG_ALLOW_CROSS: "1"
       run: |
         # Run tests with nextest for better output
-        cargo nextest run --no-capture 2>&1 | tee test_output_debug.log
+        cargo nextest run --target x86_64-unknown-linux-musl --no-capture 2>&1 | tee test_output_musl_debug.log
 
-    - name: Doctests (debug)
-      run: cargo test --doc
+    - name: Doctests (musl debug)
+      env:
+        PKG_CONFIG_ALLOW_CROSS: "1"
+      run: cargo test --doc --target x86_64-unknown-linux-musl
 
     - name: Upload test logs
       if: always()
       uses: actions/upload-artifact@v5
       with:
-        name: test-logs-debug
-        path: test_output_debug.log
+        name: test-logs-musl-debug
+        path: test_output_musl_debug.log
 
-  test-release:
+  test-musl-release:
     runs-on: ubuntu-latest
     needs: lint-and-docs
     steps:
@@ -77,10 +102,17 @@ jobs:
 
     - name: Setup Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        target: x86_64-unknown-linux-musl
+
+    - name: Install musl toolchain deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools pkg-config
+        sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
 
     - name: Setup SSH for localhost
       run: |
-        sudo apt-get update
         sudo apt-get install -y openssh-server
         sudo systemctl start ssh
         ssh-keygen -t rsa -f ~/.ssh/id_rsa -N ""
@@ -91,17 +123,33 @@ jobs:
     - name: Install cargo-nextest
       run: cargo install cargo-nextest
 
-    - name: Test (release)
+    - name: Test (musl release)
+      env:
+        PKG_CONFIG_ALLOW_CROSS: "1"
       run: |
         # Run tests with nextest in release mode
-        cargo nextest run --release --no-capture 2>&1 | tee test_output_release.log
+        cargo nextest run --release --target x86_64-unknown-linux-musl --no-capture 2>&1 | tee test_output_musl_release.log
 
-    - name: Doctests (release)
-      run: cargo test --doc --release
+    - name: Doctests (musl release)
+      env:
+        PKG_CONFIG_ALLOW_CROSS: "1"
+      run: cargo test --doc --release --target x86_64-unknown-linux-musl
 
     - name: Upload test logs
       if: always()
       uses: actions/upload-artifact@v5
       with:
-        name: test-logs-release
-        path: test_output_release.log
+        name: test-logs-musl-release
+        path: test_output_musl_release.log
+
+  build-glibc:
+    runs-on: ubuntu-latest
+    needs: lint-and-docs
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+
+    - name: Build all binaries (glibc)
+      run: cargo build --workspace --release --target x86_64-unknown-linux-gnu

@@ -55,7 +55,7 @@ build-release:
 
 # Build and check documentation
 doc:
-    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+    RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" cargo doc --no-deps --workspace
 
 # Run all CI checks locally before pushing (matches GitHub Actions)
 ci: lint doc test-all
