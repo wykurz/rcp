@@ -1557,6 +1557,7 @@ version = "0.22.0"
 dependencies = [
  "anyhow",
  "async-recursion",
+ "base64 0.22.1",
  "bincode",
  "bytes",
  "chrono",

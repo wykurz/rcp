@@ -36,9 +36,10 @@ fn interpret_exit_code(code: i32) -> String {
 fn run_rcp_with_args(args: &[&str]) -> std::process::Output {
     let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
     let mut cmd = std::process::Command::new("timeout");
-    // 35 second timeout - SSH connection setup + version checking takes ~10s per connection
-    // and we need to allow for 2 SSH connections (20s) + some buffer for actual operations
-    cmd.args(["35", rcp_path.to_str().unwrap()]);
+    // 90 second timeout - SSH connection setup + auto-deployment can take ~40-50s total
+    // for 2 connections (src + dst) with binary transfer, checksum verification, cleanup,
+    // plus QUIC connection establishment and actual copy operations
+    cmd.args(["90", rcp_path.to_str().unwrap()]);
     cmd.arg("-vv"); // Always use maximum verbosity
     cmd.args(args);
     cmd.output().expect("Failed to execute rcp command")
@@ -1377,4 +1378,143 @@ fn test_remote_rcpd_aggressive_timeout_configuration() {
     );
     assert!(dst_file.exists(), "Destination file should exist");
     eprintln!("✓ Copy with aggressive timeouts succeeded");
+}
+
+#[test]
+fn test_remote_auto_deploy_rcpd() {
+    // test automatic deployment of rcpd binary to remote host
+    // NOTE: This test temporarily moves rcpd binary to force deployment
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("auto_deploy_test.txt");
+    let dst_file = dst_dir.path().join("auto_deploy_test.txt");
+    create_test_file(&src_file, "testing auto-deployment", 0o644);
+
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    // get current version to check for deployed binary
+    let version_output = std::process::Command::new(assert_cmd::cargo::cargo_bin("rcp"))
+        .arg("--protocol-version")
+        .output()
+        .expect("Failed to get version");
+    let version_json: serde_json::Value =
+        serde_json::from_slice(&version_output.stdout).expect("Failed to parse version JSON");
+    let semantic_version = version_json["semantic"]
+        .as_str()
+        .expect("Missing semantic version");
+    // clean up any previously deployed rcpd for this version to force deployment
+    let cache_dir = std::path::PathBuf::from(
+        std::env::var("HOME").expect("HOME environment variable not set - required for test"),
+    )
+    .join(".cache/rcp/bin");
+    let deployed_rcpd = cache_dir.join(format!("rcpd-{}", semantic_version));
+    if deployed_rcpd.exists() {
+        eprintln!(
+            "Removing existing deployed rcpd to force re-deployment: {}",
+            deployed_rcpd.display()
+        );
+        std::fs::remove_file(&deployed_rcpd).ok();
+    }
+    // use --rcpd-path=/nonexistent to force discovery failure and trigger auto-deployment.
+    // this allows deployment to find the correct local rcpd binary (same build as rcp) to transfer.
+    // we can't reliably hide all rcpd binaries (e.g., nix profile is owned by root).
+    eprintln!(
+        "Testing auto-deployment with version {} (using --rcpd-path=/nonexistent/rcpd)",
+        semantic_version
+    );
+    let output = run_rcp_with_args(&[
+        "--auto-deploy-rcpd",
+        "--rcpd-path=/nonexistent/rcpd",
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output);
+    // verify the copy succeeded
+    assert!(
+        output.status.success(),
+        "Copy with auto-deploy should succeed"
+    );
+    assert!(dst_file.exists(), "Destination file should exist");
+    assert_eq!(get_file_content(&dst_file), "testing auto-deployment");
+    // verify that rcpd was deployed to cache
+    assert!(
+        deployed_rcpd.exists(),
+        "rcpd should be deployed to {}",
+        deployed_rcpd.display()
+    );
+    // verify it's executable
+    let metadata = std::fs::metadata(&deployed_rcpd).expect("Failed to get deployed rcpd metadata");
+    let permissions = metadata.permissions();
+    assert!(
+        permissions.mode() & 0o100 != 0,
+        "deployed rcpd should be executable"
+    );
+
+    eprintln!("✓ Auto-deployment test succeeded");
+    eprintln!("✓ Deployed binary at: {}", deployed_rcpd.display());
+}
+
+#[test]
+fn test_remote_auto_deploy_reuses_cached_binary() {
+    // test that auto-deployment reuses already-deployed binary
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("cached_deploy_test.txt");
+    let dst_file = dst_dir.path().join("cached_deploy_test.txt");
+    create_test_file(&src_file, "testing cached deployment", 0o644);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    // first run with --auto-deploy-rcpd to ensure binary is deployed
+    // use --rcpd-path=/nonexistent to force deployment (discovery will fail)
+    eprintln!("First run: ensuring rcpd is deployed");
+    let output1 = run_rcp_with_args(&[
+        "--auto-deploy-rcpd",
+        "--rcpd-path=/nonexistent/rcpd",
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output1);
+    assert!(
+        output1.status.success(),
+        "First copy with auto-deploy should succeed"
+    );
+    // get modification time of deployed binary
+    let version_output = std::process::Command::new(assert_cmd::cargo::cargo_bin("rcp"))
+        .arg("--protocol-version")
+        .output()
+        .expect("Failed to get version");
+    let version_json: serde_json::Value =
+        serde_json::from_slice(&version_output.stdout).expect("Failed to parse version JSON");
+    let semantic_version = version_json["semantic"]
+        .as_str()
+        .expect("Missing semantic version");
+    let cache_dir = std::path::PathBuf::from(
+        std::env::var("HOME").expect("HOME environment variable not set - required for test"),
+    )
+    .join(".cache/rcp/bin");
+    let deployed_rcpd = cache_dir.join(format!("rcpd-{}", semantic_version));
+    let first_mtime = std::fs::metadata(&deployed_rcpd)
+        .expect("deployed rcpd should exist")
+        .modified()
+        .expect("should have modified time");
+    // second run should reuse the deployed binary (no re-deployment needed)
+    // to ensure we're testing caching, use a different file
+    let src_file2 = src_dir.path().join("cached_deploy_test2.txt");
+    let dst_file2 = dst_dir.path().join("cached_deploy_test2.txt");
+    create_test_file(&src_file2, "second test", 0o644);
+    let src_remote2 = format!("localhost:{}", src_file2.to_str().unwrap());
+    let dst_remote2 = format!("localhost:{}", dst_file2.to_str().unwrap());
+    eprintln!("Second run: should reuse deployed binary");
+    let output2 = run_rcp_with_args(&["--auto-deploy-rcpd", &src_remote2, &dst_remote2]);
+    print_command_output(&output2);
+    assert!(output2.status.success(), "Second copy should also succeed");
+    // verify mtime hasn't changed (binary wasn't re-deployed)
+    let second_mtime = std::fs::metadata(&deployed_rcpd)
+        .expect("deployed rcpd should still exist")
+        .modified()
+        .expect("should have modified time");
+    assert_eq!(
+        first_mtime, second_mtime,
+        "deployed binary should not be re-deployed (mtime should match)"
+    );
+    eprintln!("✓ Cached deployment test succeeded");
+    eprintln!("✓ Binary was reused, not re-deployed");
 }
