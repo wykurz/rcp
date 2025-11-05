@@ -1,0 +1,11 @@
+name: 'Setup musl toolchain'
+description: 'Install musl-tools and create symlink for x86_64-unknown-linux-musl-gcc'
+runs:
+  using: 'composite'
+  steps:
+    - name: Install musl toolchain deps
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools pkg-config
+        sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
