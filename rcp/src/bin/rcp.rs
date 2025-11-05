@@ -213,6 +213,14 @@ struct Args {
     #[arg(long, value_name = "PATH", help_heading = "Remote copy options")]
     rcpd_path: Option<String>,
 
+    /// Automatically deploy rcpd binary to remote hosts if missing or version mismatch
+    ///
+    /// When enabled, rcp will transfer the local rcpd binary to remote hosts
+    /// at ~/.cache/rcp/bin/rcpd-{version} if not found or if version doesn't match.
+    /// The binary is transferred securely via SSH and verified with SHA-256 checksum.
+    #[arg(long, help_heading = "Remote copy options")]
+    auto_deploy_rcpd: bool,
+
     // ARGUMENTS
     /// Source path(s) and destination path
     #[arg()]
@@ -257,13 +265,36 @@ async fn run_rcpd_master(
         remote_copy_conn_timeout_sec: args.remote_copy_conn_timeout_sec,
         master_cert_fingerprint,
     };
-    for session in [src.session(), dst.session()] {
+    // deduplicate sessions if src and dst are the same host
+    // this avoids deploying rcpd twice to the same location
+    let sessions = if src.session() == dst.session() {
+        vec![src.session()]
+    } else {
+        vec![src.session(), dst.session()]
+    };
+
+    for session in sessions {
         let rcpd = remote::start_rcpd(
             &rcpd_config,
             session,
             &server_addr,
             &server_name,
             args.rcpd_path.as_deref(),
+            args.auto_deploy_rcpd,
+        )
+        .await?;
+        rcpds.push(rcpd);
+    }
+
+    // if src and dst are the same, we need to start rcpd twice even though we only deployed once
+    if src.session() == dst.session() && rcpds.len() == 1 {
+        let rcpd = remote::start_rcpd(
+            &rcpd_config,
+            src.session(),
+            &server_addr,
+            &server_name,
+            args.rcpd_path.as_deref(),
+            args.auto_deploy_rcpd,
         )
         .await?;
         rcpds.push(rcpd);

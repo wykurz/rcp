@@ -35,7 +35,15 @@ cargo install cargo-nextest  # Optional but recommended for testing
 - **Check docs**: `just doc`
 - **Run all CI checks**: `just ci` (lint + doc + test-all)
 
-**Note**: CI workflows (GitHub Actions) run both debug and release tests in parallel to catch optimization-related bugs. Use `just ci` locally to ensure your changes pass CI.
+**IMPORTANT**: Always run `just ci` before committing changes to ensure:
+- ✅ Code formatting is correct (`cargo fmt --check`)
+- ✅ Clippy lints pass (`cargo clippy`)
+- ✅ Error logging format is correct (custom script checks)
+- ✅ Documentation builds without warnings (`cargo doc --no-deps`)
+- ✅ All tests pass in both debug and release modes (`cargo nextest run`)
+- ✅ All doctests compile and run (`cargo test --doc`)
+
+**Note**: CI workflows (GitHub Actions) run both debug and release tests in parallel to catch optimization-related bugs. The `just ci` command replicates this locally.
 
 ### Direct Cargo Commands
 
