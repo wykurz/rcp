@@ -1,4 +1,5 @@
 [build]
+target = "x86_64-unknown-linux-musl"
 rustflags = ["--cfg", "tokio_unstable"]
 rustdocflags = ["--cfg", "tokio_unstable"]
 
