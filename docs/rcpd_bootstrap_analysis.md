@@ -259,8 +259,8 @@ $ rcpd --protocol-version
 
 **For Linux** (primary target):
 ```bash
-# Build with musl for fully static binary
-cargo build --release --target x86_64-unknown-linux-musl
+# Build with musl for fully static binary (default target)
+cargo build --release
 ```
 
 **Benefits**:
@@ -315,9 +315,9 @@ packages = {
 
 **Add to justfile**:
 ```makefile
-# Build static rcpd binary for Linux
+# Build static rcpd binary for Linux (default target)
 build-static-rcpd:
-    cargo build --release --target x86_64-unknown-linux-musl --bin rcpd
+    cargo build --release --bin rcpd
 
 # Or using nix
 build-static-rcpd-nix:
@@ -639,8 +639,8 @@ ssh_exec(host,
 
 1. **Add musl target to build system**
    - Update `flake.nix` / `default.nix` so the dev shell ships the Rust 1.90.0 toolchain with the `x86_64-unknown-linux-musl` target plus cross binutils.
-   - Set `CARGO_BUILD_TARGET=x86_64-unknown-linux-musl` inside the nix shell so `cargo build` emits static binaries by default.
-   - Document how to produce musl builds both inside (`cargo build`, `cargo build --release`) and outside the nix shell (`cargo build --target x86_64-unknown-linux-musl`).
+   - Set `target = "x86_64-unknown-linux-musl"` in `.cargo/config.toml` so `cargo build` emits static binaries by default everywhere.
+   - Document how to produce musl builds (`cargo build`, `cargo build --release`) and how to explicitly build glibc versions (`cargo build --target x86_64-unknown-linux-gnu`).
    - Test on CI: GitHub Actions with musl target
 
 2. **Test static binary on various distros**

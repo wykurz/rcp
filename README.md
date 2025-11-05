@@ -132,7 +132,9 @@ Starting with release `v0.10.1`, .deb and .rpm packages are available as part of
 Static musl builds
 ------------------
 
-Enter the development environment (`nix develop`) to pick up the musl-enabled toolchain and default `CARGO_BUILD_TARGET=x86_64-unknown-linux-musl`. Inside that shell, `cargo build` (or `cargo build --release`) produces fully static binaries automatically; outside the shell you can invoke `cargo build --target x86_64-unknown-linux-musl` (after installing the musl target with `rustup target add x86_64-unknown-linux-musl`).
+The repository is configured to build static musl binaries by default via `.cargo/config.toml`. Simply run `cargo build` or `cargo build --release` to produce fully static binaries. To build glibc binaries instead, use `cargo build --target x86_64-unknown-linux-gnu`.
+
+For development, enter the nix environment (`nix develop`) to get all required tools including the musl toolchain. Outside nix shell, install the musl target with `rustup target add x86_64-unknown-linux-musl` and ensure you have musl-tools installed (e.g., `apt-get install musl-tools` on Ubuntu/Debian).
 
 General controls
 ================
