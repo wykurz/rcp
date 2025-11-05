@@ -261,7 +261,7 @@
 //! let master_addr: SocketAddr = "192.168.1.100:5000".parse()?;
 //! let server_name = "master-server";
 //!
-//! let process = start_rcpd(&config, &session, &master_addr, server_name, None).await?;
+//! let process = start_rcpd(&config, &session, &master_addr, server_name, None, false).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -299,6 +299,7 @@ use anyhow::{anyhow, Context};
 use rand::Rng;
 use tracing::instrument;
 
+pub mod deploy;
 pub mod port_ranges;
 pub mod protocol;
 pub mod streams;
@@ -424,8 +425,63 @@ pub async fn wait_for_rcpd_process(
 /// Escape a string for safe use in POSIX shell single quotes
 ///
 /// Wraps the string in single quotes and escapes any single quotes within
-fn shell_escape(s: &str) -> String {
+pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Validate and retrieve HOME directory on remote host
+///
+/// Checks that $HOME is set and non-empty on the remote host.
+/// This prevents constructing invalid paths like `/.cache/rcp/bin/rcpd-{version}`
+/// when HOME is not set.
+///
+/// # Arguments
+///
+/// * `session` - SSH session to the remote host
+///
+/// # Returns
+///
+/// The value of $HOME on the remote host
+///
+/// # Errors
+///
+/// Returns an error if HOME is not set or is empty
+pub(crate) async fn get_remote_home(
+    session: &std::sync::Arc<openssh::Session>,
+) -> anyhow::Result<String> {
+    let output = session
+        .command("sh")
+        .arg("-c")
+        .arg("echo \"${HOME:?HOME not set}\"")
+        .output()
+        .await
+        .context("failed to check HOME environment variable on remote host")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "HOME environment variable is not set on remote host\n\
+            \n\
+            stderr: {}\n\
+            \n\
+            The HOME environment variable is required for rcpd deployment and discovery.\n\
+            Please ensure your SSH configuration preserves environment variables.",
+            stderr
+        );
+    }
+
+    let home = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    if home.is_empty() {
+        anyhow::bail!(
+            "HOME environment variable is empty on remote host\n\
+            \n\
+            The HOME environment variable is required for rcpd deployment and discovery.\n\
+            Please ensure your SSH configuration sets HOME correctly."
+        );
+    }
+
+    Ok(home)
 }
 
 #[cfg(test)]
@@ -492,7 +548,28 @@ async fn discover_rcpd_path(
             tracing::info!("Found rcpd at explicit path: {}", path);
             return Ok(path.to_string());
         }
-        tracing::warn!("Explicit rcpd path not found or not executable: {}", path);
+        // explicit path was provided but not found - return error immediately
+        // don't fall back to other discovery methods
+        return Err(anyhow::anyhow!(
+            "rcpd binary not found or not executable at explicit path: {}",
+            path
+        ));
+    }
+
+    // try deployed cache directory first (reuse already-deployed binaries)
+    // validate HOME is set before constructing the cache path
+    let home = get_remote_home(session).await?;
+    let cache_path = format!("{}/.cache/rcp/bin/rcpd-{}", home, local_version.semantic);
+    tracing::debug!("Trying deployed cache path: {}", cache_path);
+    let output = session
+        .command("sh")
+        .arg("-c")
+        .arg(format!("test -x {}", shell_escape(&cache_path)))
+        .output()
+        .await?;
+    if output.status.success() {
+        tracing::info!("Found rcpd in deployed cache: {}", cache_path);
+        return Ok(cache_path);
     }
 
     // try same directory as local rcp binary
@@ -527,6 +604,7 @@ async fn discover_rcpd_path(
 
     // build error message with what we searched
     let mut searched = vec![
+        format!("- Deployed cache: {}", cache_path),
         "- Same directory as local rcp binary".to_string(),
         "- PATH (via 'which rcpd')".to_string(),
     ];
@@ -550,6 +628,24 @@ async fn discover_rcpd_path(
         searched.join("\n"),
         local_version.semantic
     ))
+}
+
+/// Try to discover rcpd and check version compatibility
+///
+/// Combines discovery and version checking into one function for cleaner error handling.
+/// Returns the path to a compatible rcpd if found, or an error describing the problem.
+async fn try_discover_and_check_version(
+    session: &std::sync::Arc<openssh::Session>,
+    explicit_path: Option<&str>,
+    remote_host: &str,
+) -> anyhow::Result<String> {
+    // discover rcpd binary on remote host
+    let rcpd_path = discover_rcpd_path(session, explicit_path).await?;
+
+    // check version compatibility
+    check_rcpd_version(session, &rcpd_path, remote_host).await?;
+
+    Ok(rcpd_path)
 }
 
 /// Check version compatibility between local rcp and remote rcpd
@@ -627,16 +723,59 @@ pub async fn start_rcpd(
     master_addr: &std::net::SocketAddr,
     master_server_name: &str,
     explicit_rcpd_path: Option<&str>,
+    auto_deploy_rcpd: bool,
 ) -> anyhow::Result<openssh::Child<std::sync::Arc<openssh::Session>>> {
     tracing::info!("Starting rcpd server on: {:?}", session);
     let remote_host = &session.host;
     let ssh_session = setup_ssh_session(session).await?;
 
-    // discover rcpd binary on remote host
-    let rcpd_path = discover_rcpd_path(&ssh_session, explicit_rcpd_path).await?;
+    // try to discover rcpd binary on remote host and check version
+    let rcpd_path =
+        match try_discover_and_check_version(&ssh_session, explicit_rcpd_path, remote_host).await {
+            Ok(path) => {
+                // found compatible rcpd
+                path
+            }
+            Err(e) => {
+                // discovery or version check failed
+                if auto_deploy_rcpd {
+                    tracing::info!(
+                        "rcpd not found or version mismatch, attempting auto-deployment"
+                    );
 
-    // check version compatibility
-    check_rcpd_version(&ssh_session, &rcpd_path, remote_host).await?;
+                    // find local rcpd binary
+                    let local_rcpd = deploy::find_local_rcpd_binary()
+                        .context("failed to find local rcpd binary for deployment")?;
+
+                    tracing::info!("Found local rcpd binary at {}", local_rcpd.display());
+
+                    // get version for deployment path
+                    let local_version = common::version::ProtocolVersion::current();
+
+                    // deploy to remote host
+                    let deployed_path = deploy::deploy_rcpd(
+                        &ssh_session,
+                        &local_rcpd,
+                        &local_version.semantic,
+                        remote_host,
+                    )
+                    .await
+                    .context("failed to deploy rcpd to remote host")?;
+
+                    tracing::info!("Successfully deployed rcpd to {}", deployed_path);
+
+                    // cleanup old versions (best effort, don't fail if this errors)
+                    if let Err(e) = deploy::cleanup_old_versions(&ssh_session, 3).await {
+                        tracing::warn!("failed to cleanup old versions (non-fatal): {:#}", e);
+                    }
+
+                    deployed_path
+                } else {
+                    // no auto-deploy, return original error
+                    return Err(e);
+                }
+            }
+        };
 
     // run rcpd command remotely
     let rcpd_args = rcpd_config.to_args();
