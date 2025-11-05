@@ -18,7 +18,6 @@ jobs:
       with:
         components: rustfmt, clippy
         targets: x86_64-unknown-linux-musl
-        target: x86_64-unknown-linux-musl
 
     - name: Install musl toolchain deps
       run: |
@@ -36,12 +35,12 @@ jobs:
       run: ./scripts/check-anyhow-error-msg.sh
 
     - name: Lint
-      run: cargo clippy --workspace --target x86_64-unknown-linux-musl -- -D warnings
+      run: cargo clippy --workspace -- -D warnings
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
 
     - name: Documentation
-      run: cargo doc --no-deps --workspace --target x86_64-unknown-linux-musl
+      run: cargo doc --no-deps --workspace
       env:
         RUSTDOCFLAGS: --cfg tokio_unstable -D warnings
         PKG_CONFIG_ALLOW_CROSS: "1"
@@ -55,7 +54,7 @@ jobs:
     - name: Setup Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        target: x86_64-unknown-linux-musl
+        targets: x86_64-unknown-linux-musl
 
     - name: Install musl toolchain deps
       run: |
@@ -80,12 +79,12 @@ jobs:
         PKG_CONFIG_ALLOW_CROSS: "1"
       run: |
         # Run tests with nextest for better output
-        cargo nextest run --target x86_64-unknown-linux-musl --no-capture 2>&1 | tee test_output_musl_debug.log
+        cargo nextest run --no-capture 2>&1 | tee test_output_musl_debug.log
 
     - name: Doctests (musl debug)
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
-      run: cargo test --doc --target x86_64-unknown-linux-musl
+      run: cargo test --doc
 
     - name: Upload test logs
       if: always()
@@ -103,7 +102,7 @@ jobs:
     - name: Setup Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        target: x86_64-unknown-linux-musl
+        targets: x86_64-unknown-linux-musl
 
     - name: Install musl toolchain deps
       run: |
@@ -128,12 +127,12 @@ jobs:
         PKG_CONFIG_ALLOW_CROSS: "1"
       run: |
         # Run tests with nextest in release mode
-        cargo nextest run --release --target x86_64-unknown-linux-musl --no-capture 2>&1 | tee test_output_musl_release.log
+        cargo nextest run --release --no-capture 2>&1 | tee test_output_musl_release.log
 
     - name: Doctests (musl release)
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
-      run: cargo test --doc --release --target x86_64-unknown-linux-musl
+      run: cargo test --doc --release
 
     - name: Upload test logs
       if: always()

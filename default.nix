@@ -43,7 +43,6 @@ in
         RUST_SRC_PATH = "${myrust}/lib/rustlib/src/rust/src";
       };
       muslAttrs = if muslTools != null then {
-        CARGO_BUILD_TARGET = "x86_64-unknown-linux-musl";
         CC_x86_64_unknown_linux_musl = "${muslTools.gcc}/bin/x86_64-unknown-linux-musl-gcc";
         AR_x86_64_unknown_linux_musl = "${muslTools.binutils}/bin/x86_64-unknown-linux-musl-ar";
         PKG_CONFIG_ALLOW_CROSS = "1";

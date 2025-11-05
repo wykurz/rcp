@@ -171,16 +171,13 @@
               echo ""
               echo "Individual tools: rcp, rrm, rlink, rcmp, filegen"
               echo "Note: rcpd is included with rcp (rcp-tools-rcp package)"
-              if [ "$CARGO_BUILD_TARGET" = "x86_64-unknown-linux-musl" ]; then
-                echo ""
-                echo "Static musl target enabled:"
-                echo "  cargo build     -> x86_64-unknown-linux-musl"
-              fi
+              echo ""
+              echo "Static musl target enabled by default (.cargo/config.toml):"
+              echo "  cargo build     -> x86_64-unknown-linux-musl"
             '';
           }
           // (
             if muslTools != null then {
-              CARGO_BUILD_TARGET = "x86_64-unknown-linux-musl";
               CC_x86_64_unknown_linux_musl = "${muslTools.gcc}/bin/x86_64-unknown-linux-musl-gcc";
               AR_x86_64_unknown_linux_musl = "${muslTools.binutils}/bin/x86_64-unknown-linux-musl-ar";
               PKG_CONFIG_ALLOW_CROSS = "1";
