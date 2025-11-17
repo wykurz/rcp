@@ -252,6 +252,71 @@ The following attacks are **not** protected by rcp itself:
    - Implement file permission policies
    - Regular access audits
 
+5. **Binary Deployment**
+   - **Auto-deployment** (v0.22.0+): Use `--auto-deploy-rcpd` to automatically deploy rcpd binaries
+     - Binaries are transferred over SSH (already authenticated)
+     - SHA-256 checksums verify integrity after transfer
+     - Binaries are cached at `~/.cache/rcp/bin/rcpd-{version}` on remote hosts
+     - Old versions are automatically cleaned up (keeps last 3 by default)
+   - **Manual deployment**: Preferred for air-gapped environments or strict change control
+     - Verify binary checksums before deploying
+     - Use package managers when available (nixpkgs, cargo install)
+     - Keep rcpd versions synchronized across environments
+
+### Auto-deployment Security
+
+Starting with v0.22.0, rcp can automatically deploy rcpd binaries to remote hosts using the `--auto-deploy-rcpd` flag. This feature maintains security through:
+
+**Integrity Verification:**
+- Local rcpd binary is read and SHA-256 checksum is computed
+- Binary is transferred via SSH using base64 encoding (already authenticated and encrypted)
+- Remote checksum is computed and compared with the local checksum
+- Transfer fails if checksums don't match (detects corruption or tampering)
+
+**Secure Transfer Channel:**
+- Binary transfer occurs over the existing SSH connection
+- SSH provides authentication, encryption, and integrity protection
+- No separate authentication required (SSH is the root of trust)
+
+**Binary Discovery:**
+- Searches for rcpd in same directory as rcp (development builds)
+- Falls back to PATH (covers cargo install, nixpkgs)
+- Fails safely if no suitable binary found
+
+**Version Management:**
+- Deployed binaries are named `rcpd-{version}` (e.g., `rcpd-0.22.0`)
+- Keeps last 3 versions to allow rollback if needed
+- Automatic cleanup prevents unbounded disk usage
+
+**Security Considerations:**
+
+| Aspect | Auto-deployment | Manual deployment |
+|--------|----------------|-------------------|
+| **Integrity** | SHA-256 verified after transfer | Verify checksums manually |
+| **Authentication** | SSH (same as manual) | SSH (same as auto) |
+| **Binary source** | Local machine (must be trusted) | Package manager or manual build |
+| **Change control** | Automatic on version mismatch | Explicit admin action |
+| **Air-gapped** | Requires SSH access | Works offline |
+| **Audit trail** | Logged in rcp output | Depends on deployment method |
+
+**When to Use Auto-deployment:**
+- Development and testing environments
+- Dynamic or ephemeral infrastructure (containers, cloud VMs)
+- Environments where you control both local and remote machines
+- Situations where rcpd version synchronization is important
+
+**When to Use Manual Deployment:**
+- Production systems with strict change control
+- Air-gapped or restricted network environments
+- Compliance requirements for binary deployment procedures
+- Situations where you want to verify binaries before deployment
+
+**Trust Model:**
+- Auto-deployment relies on the **local machine being trusted**
+- The deployed binary is whatever rcpd is found locally (same directory or PATH)
+- If the local machine is compromised, auto-deployment will deploy the compromised binary
+- This is equivalent to the trust model for the master (rcp) binary itself
+
 ### For Users
 
 1. **Verify Connections**

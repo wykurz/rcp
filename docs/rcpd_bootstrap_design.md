@@ -55,10 +55,16 @@ pub struct ProtocolVersion {
    - Uses `which rcpd` on remote host
    - Respects user's PATH configuration
 
+**Graceful handling of HOME not set**:
+- If `HOME` is not available on the remote host, the cache directory check is skipped
+- Discovery continues with same-directory and PATH checks
+- Error message indicates cache was skipped due to missing HOME
+
 **Error handling**:
 - If not found in any location, returns clear error with:
   - List of locations searched
-  - Installation command with exact version: `cargo install rcp-tools-rcp --version X.Y.Z`
+  - Suggestion to use automatic deployment: `rcp --auto-deploy-rcpd ...`
+  - Manual installation command: `cargo install rcp-tools-rcp --version X.Y.Z`
   - Suggestion to use `--rcpd-path` for custom locations
 
 ### Version Checking
@@ -125,12 +131,21 @@ rustflags = ["--cfg", "tokio_unstable", "-C", "target-feature=+crt-static"]
 ### rcp flags
 
 ```bash
+# Override rcpd binary path
 rcp --rcpd-path=/path/to/rcpd [other options] src dst
+
+# Enable automatic deployment
+rcp --auto-deploy-rcpd [other options] src dst
 ```
 
 - `--rcpd-path` - Override rcpd binary path for remote operations
   - Applies to whichever side is remote (source or destination)
   - Takes precedence over automatic discovery
+
+- `--auto-deploy-rcpd` - Enable automatic deployment of rcpd to remote hosts
+  - Deploys static rcpd binary when version mismatch detected
+  - Binaries cached at `~/.cache/rcp/bin/rcpd-{version}` on remote hosts
+  - Requires local rcpd binary (same directory or PATH)
 
 ### Version query
 
@@ -212,6 +227,250 @@ When starting a remote copy operation:
 - All operations start with SSH authentication
 - Version checking happens after SSH auth succeeds
 - QUIC connections use certificate pinning for integrity
+
+## Automatic Deployment
+
+### Overview
+
+**Status**: Implemented in v0.22.0
+
+Automatic deployment allows rcp to transfer and install rcpd binaries to remote hosts automatically, eliminating the need for manual installation. This feature is opt-in via the `--auto-deploy-rcpd` flag.
+
+**Location**: `remote/src/deploy.rs`
+
+### Architecture
+
+#### Deployment Workflow
+
+When `--auto-deploy-rcpd` is enabled and a version mismatch is detected:
+
+1. **Find local rcpd binary**:
+   - Search same directory as rcp binary first (ensures matching build)
+   - Fall back to PATH via `which rcpd`
+   - Error if no suitable binary found
+
+2. **Transfer binary to remote**:
+   - Read local rcpd binary
+   - Compute SHA-256 checksum
+   - Base64 encode binary
+   - Create target directory: `~/.cache/rcp/bin`
+   - Transfer via SSH stdin with atomic rename
+   - Verify checksum on remote
+
+3. **Set permissions and cleanup**:
+   - Set permissions to 700 (user-only execute)
+   - Clean up old versions (keeps last 3)
+
+4. **Use deployed binary**:
+   - Update discovery to use cached binary
+   - Reuse on subsequent operations (no re-deployment needed)
+
+#### Binary Transfer Mechanism
+
+**Base64 transfer over SSH**:
+
+```bash
+# Remote command executed via SSH
+mkdir -p ~/.cache/rcp/bin && \
+base64 -d > ~/.cache/rcp/bin/.rcpd-{version}.tmp.$$ && \
+chmod 700 ~/.cache/rcp/bin/.rcpd-{version}.tmp.$$ && \
+mv -f ~/.cache/rcp/bin/.rcpd-{version}.tmp.$$ ~/.cache/rcp/bin/rcpd-{version}
+```
+
+**Why base64**:
+- Universal availability (POSIX standard)
+- No external dependencies (no scp/rsync needed)
+- Handles binary data safely through text channels
+- Works with restricted shells
+
+#### Atomic Deployment
+
+**Unique temporary files**:
+- Each deployment uses `.rcpd-{version}.tmp.$$` where `$$` is the shell PID
+- Guarantees uniqueness even with concurrent deployments
+- Prevents interference between multiple rcp instances
+
+**Atomic rename**:
+- Final step uses `mv -f` which is atomic on POSIX filesystems
+- Binary is either fully present or not present at all (no partial writes visible)
+- Concurrent renames complete in a well-defined order
+- Readers see either old or new inode, never corruption
+
+#### Integrity Verification
+
+**SHA-256 checksum verification**:
+
+1. **Before transfer**: Compute checksum of local binary
+2. **After transfer**: Run `sha256sum` on remote to verify
+3. **Compare**: Checksums must match exactly
+4. **Fail on mismatch**: Indicates corruption or tampering
+
+This ensures the transferred binary is identical to the local binary.
+
+#### Caching and Cleanup
+
+**Deployment location**:
+- Binaries stored in `~/.cache/rcp/bin/rcpd-{version}`
+- XDG standard cache location (user-specific, no sudo needed)
+- Version-specific naming allows multiple versions and rollback
+
+**Caching behavior**:
+- Deployed binary is reused for all subsequent operations
+- No re-deployment until version changes
+- Cache persists across rcp invocations
+
+**Automatic cleanup**:
+```bash
+# Keeps last 3 versions, removes older
+cd ~/.cache/rcp/bin && ls -t rcpd-* | tail -n +4 | xargs -r rm
+```
+
+**Benefits**:
+- Prevents unbounded disk usage
+- Keeps recent versions for potential rollback
+- Automatic maintenance, no user intervention needed
+
+### Concurrency and Safety
+
+#### Atomic Operations
+
+1. **Unique temporary files**: Shell PID (`$$`) ensures each deployment has a unique temp file
+2. **Atomic rename**: `mv -f` is atomic on POSIX filesystems
+3. **Write-then-verify**: Binary is fully written, marked executable, moved atomically, then checksummed
+
+#### Race Condition Scenarios
+
+**Scenario 1: Multiple rcp instances deploying same version concurrently**
+- Each uses unique temp file (`.rcpd-0.22.0.tmp.1234`, `.rcpd-0.22.0.tmp.5678`)
+- Both write and verify their temp files successfully
+- Both attempt `mv -f` to final location
+- Filesystem ensures one wins atomically, the other overwrites atomically
+- Result: Final binary is valid (both were identical and checksummed)
+
+**Scenario 2: One deployment while another is reading**
+- Reader opens `rcpd-0.22.0` and gets a valid file descriptor
+- Writer completes deployment and `mv -f` replaces the inode
+- Reader continues reading from the original inode (POSIX semantics)
+- Result: Reader gets the old version (but it's still valid)
+
+**Scenario 3: Deployment interrupted (network failure, SIGKILL)**
+- Temp file may be left in `.cache/rcp/bin/.rcpd-{version}.tmp.*`
+- Final file is either: not present (safe to retry) or present and valid (mv completed)
+- Temp files are hidden (dotfiles) and don't interfere with discovery
+- Result: Safe to retry; old temp files are harmless
+
+#### Assumptions
+
+1. **POSIX filesystem semantics**: Assumes atomic `mv` (rename) operations
+   - True for ext4, xfs, btrfs, zfs
+   - May not hold for NFSv3 without proper locking
+
+2. **Unique shell PIDs**: `$$` is unique during deployment lifetime
+   - Guaranteed by OS
+   - Requires PIDs not wrap around extremely rapidly
+
+3. **Checksum integrity**: SHA-256 collision resistance
+   - Astronomically unlikely for different binaries to match
+
+4. **No malicious interference**: Assumes remote host is not actively malicious
+   - SSH authentication provides trust boundary
+
+### CLI Interface
+
+```bash
+# Enable automatic deployment
+rcp --auto-deploy-rcpd host1:/source host2:/dest --progress
+
+# Works with other flags
+rcp --auto-deploy-rcpd --preserve /local/data remote:/backup
+```
+
+**Flag behavior**:
+- Only deploys if version mismatch detected
+- Reuses cached binary if already deployed
+- Fails with clear error if local rcpd not found
+
+### Error Handling
+
+**Local binary not found**:
+```
+no local rcpd binary found for deployment
+
+Searched in:
+- Same directory: /path/to/rcp/../rcpd
+- PATH: (via 'which rcpd')
+
+To use auto-deployment, ensure rcpd is available:
+- cargo install rcp-tools-rcp (installs to ~/.cargo/bin)
+- or add rcpd to PATH
+- or build with: cargo build --release --bin rcpd
+```
+
+**Deployment failure**:
+```
+failed to transfer binary to remote host
+
+stderr: Permission denied
+
+This may indicate:
+- Insufficient disk space on remote host
+- Permission denied creating $HOME/.cache/rcp/bin
+- base64 command not available on remote host
+```
+
+**Checksum mismatch**:
+```
+checksum mismatch after transfer
+
+Expected: abc123...
+Got:      def456...
+
+The binary transfer may have been corrupted.
+Please try again or check network connectivity.
+```
+
+### Testing
+
+**Location**: `rcp/tests/remote_tests.rs`
+
+**Integration tests**:
+- `test_remote_auto_deploy` - Full deployment workflow
+- `test_remote_auto_deploy_reuses_cached_binary` - Caching verification
+- `test_auto_deploy_cleanup_old_versions` - Cleanup verification
+- `test_auto_deploy_error_explicit_rcpd_not_found` - Local binary not found
+- `test_auto_deploy_error_permission_denied` - Permission failure handling
+- `test_auto_deploy_error_checksum_mismatch` - Checksum verification presence
+
+**Test coverage**:
+- ✅ Successful deployment and execution
+- ✅ Binary caching and reuse
+- ✅ Cleanup of old versions
+- ✅ Error handling for missing binary, permissions, checksum issues
+
+### Security Considerations
+
+**Integrity**:
+- SHA-256 checksums verify binary integrity after transfer
+- Detects corruption or tampering
+- Fails deployment if mismatch detected
+
+**Authentication**:
+- All transfers occur over authenticated SSH connections
+- Same security model as manual scp/rsync
+- No separate authentication required
+
+**Trust model**:
+- Local machine must be trusted (binary source)
+- Deployed binary is whatever rcpd is found locally
+- If local machine is compromised, deployed binary will be compromised
+- Equivalent to trust model for master (rcp) binary itself
+
+**File permissions**:
+- Deployed binaries are 700 (user-only executable)
+- Prevents unauthorized modification by other users
+- Follows principle of least privilege
+
+For comprehensive security analysis, see `docs/security.md`.
 
 ## Error Messages
 
@@ -353,18 +612,6 @@ Please install a matching version of rcpd on the remote host:
 
 ## Future Work
 
-### Automatic Deployment (Phase 3)
-
-**Status**: Implemented in v0.23.0.  
-
-The following features are now available:
-- `--auto-deploy-rcpd` flag enables automatic transfer of the rcpd binary to remote hosts as needed
-- Secure base64 transfer over SSH
-- Caching of deployed binaries in `~/.cache/rcp/bin/rcpd-{version}` on remote hosts
-- Checksum verification to ensure binary integrity
-- Automatic cleanup of old versions
-
-**Risk**: Medium-High (monitored; no major issues reported)
 ### Architecture Support
 
 **Current**: x86_64-linux-musl only
@@ -386,26 +633,19 @@ The following features are now available:
 - Requires semantic versioning discipline
 - Communicate protocol changes clearly
 
-### Installation Helper
-
-**Alternative to auto-deployment**:
-
-```bash
-rcp --install-rcpd-on=host1,host2,host3
-```
-
-- Simpler than full auto-deployment
-- More transparent to users
-- One-time setup per host
-- Familiar workflow (like `ssh-copy-id`)
-
-**Estimated effort**: 2-3 days
-**Risk**: Low
-
 ## References
 
-- **Bootstrap Analysis**: `docs/rcpd_bootstrap_analysis.md` - Historical analysis and planning
-- **Implementation**: `remote/src/lib.rs::discover_rcpd_path`, `remote/src/lib.rs::check_rcpd_version`
-- **Version Module**: `common/src/version.rs`
-- **Build Script**: `common/build.rs`
-- **Tests**: `rcp/tests/cli_parsing_tests.rs`, `common/src/version.rs`
+- **Implementation**:
+  - Binary discovery and version checking: `remote/src/lib.rs::discover_rcpd_path`, `remote/src/lib.rs::check_rcpd_version`
+  - Automatic deployment: `remote/src/deploy.rs`
+  - Version module: `common/src/version.rs`
+  - Build script: `common/build.rs`
+
+- **Tests**:
+  - CLI and version tests: `rcp/tests/cli_parsing_tests.rs`
+  - Remote operations tests: `rcp/tests/remote_tests.rs`
+  - Unit tests: `common/src/version.rs`, `remote/src/deploy.rs`
+
+- **Documentation**:
+  - Security analysis: `docs/security.md`
+  - User-facing documentation: `README.md`

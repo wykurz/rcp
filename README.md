@@ -70,6 +70,12 @@ Copy from local machine to remote host and preserve metadata:
 > rcp /local/path host:/remote/path --progress --summary --preserve
 ```
 
+Remote copy with automatic rcpd deployment:
+```fish
+> rcp /local/data remote-host:/backup --auto-deploy-rcpd --progress
+```
+Automatically deploys rcpd to the remote host if not already installed. Useful for dynamic infrastructure, development environments, or when rcpd is not pre-installed on remote hosts.
+
 Log tool output to a file while using progress bar:
 ```fish
 > rcp <foo> <bar> --progress --summary > copy.log
@@ -180,7 +186,27 @@ When using remote paths (`host:/path` syntax), `rcp` automatically starts `rcpd`
 
 **Requirements:**
 - SSH access to remote hosts (uses your SSH config and keys)
-- `rcpd` binary must be available in the same directory as `rcp` on remote hosts
+- `rcpd` binary available on remote hosts (see **Auto-deployment** below for automatic setup)
+
+**Auto-deployment:**
+Starting with v0.22.0, `rcp` can automatically deploy `rcpd` to remote hosts using the `--auto-deploy-rcpd` flag. This eliminates the need to manually install `rcpd` on each remote host.
+
+```fish
+# automatic deployment - no manual setup required
+> rcp --auto-deploy-rcpd host1:/source host2:/dest --progress
+```
+
+When auto-deployment is enabled:
+- `rcp` finds the local `rcpd` binary (same directory or PATH)
+- Deploys it to `~/.cache/rcp/bin/rcpd-{version}` on remote hosts via SSH
+- Verifies integrity using SHA-256 checksums
+- Keeps the last 3 versions and cleans up older ones
+- Reuses deployed binaries for subsequent operations (cached until version changes)
+
+Manual deployment is still supported and may be preferred for:
+- Air-gapped environments where auto-deployment is not feasible
+- Production systems with strict change control
+- Situations where you want to verify the binary before deployment
 
 **Configuration options:**
 - `--quic-port-ranges` - restrict QUIC to specific port ranges (e.g., "8000-8999")
