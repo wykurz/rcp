@@ -5,7 +5,7 @@
 default:
     @just --list
 
-# Run all lints (fmt, clippy, error logging, anyhow error msg)
+# Run all lints (fmt, clippy, error logging, anyhow error msg, rust version)
 lint:
     @echo "🔍 Checking formatting..."
     cargo fmt --check
@@ -15,6 +15,8 @@ lint:
     ./scripts/check-error-logging.sh
     @echo "🔍 Checking anyhow::Error::msg usage..."
     ./scripts/check-anyhow-error-msg.sh
+    @echo "🔍 Checking rust version consistency..."
+    ./scripts/check-rust-version.sh
     @echo "✅ All lints passed!"
 
 # Format code

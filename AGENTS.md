@@ -4,7 +4,7 @@
 The workspace bundles eight crates: CLI binaries (`rcp`, `rrm`, `rlink`, `rcmp`) and supporting libraries (`common`, `remote`, `throttle`, `filegen`). Binary entry points live in `<tool>/src`, with integration suites in `<tool>/tests/` (for example, `rcp/tests/remote_tests.rs`). Shared logic and transport code reside in `common/src` and `remote/src`. Documentation assets live under `assets/`, long-form references in `docs/`, and helper tooling in `scripts/`.
 
 ## Build, Test, and Development Commands
-- `cargo build --workspace` compiles every crate with the pinned Rust 1.90.0 toolchain.
+- `cargo build --workspace` compiles every crate with the pinned toolchain from rust-toolchain.toml.
 - `cargo test --workspace --all-features` runs unit and integration coverage, including CLI smoke tests.
 - `cargo clippy --workspace --all-targets --all-features` must stay clean; warnings fail CI via workspace lints.
 - `cargo fmt --all` formats code; use `cargo fmt --all --check` before submitting.

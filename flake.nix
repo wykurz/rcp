@@ -18,7 +18,7 @@
           inherit system overlays;
         };
 
-        rustToolchain = pkgs.rust-bin.stable."1.90.0".default.override {
+        rustToolchain = pkgs.rust-bin.stable."1.91.1".default.override {
           extensions = [ "rustfmt" "clippy" "rust-src" ];
           targets = [ "x86_64-unknown-linux-musl" ];
         };
