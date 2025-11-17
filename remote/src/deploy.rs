@@ -3,6 +3,88 @@
 //! This module handles automatic deployment of rcpd binaries to remote hosts.
 //! It transfers static rcpd binaries via SSH using base64 encoding, verifies
 //! integrity with SHA-256 checksums, and manages cached versions.
+//!
+//! ## Atomicity and Concurrent Deployment Safety
+//!
+//! The deployment mechanism is designed to handle concurrent deployments from
+//! multiple rcp instances safely:
+//!
+//! ### Atomic Operations
+//!
+//! 1. **Unique Temporary Files**: Each deployment uses a shell-PID-unique temp file
+//!    (`.rcpd-{version}.tmp.$$`) which ensures concurrent deployments don't
+//!    interfere with each other. The `$$` expands to the shell process PID,
+//!    guaranteeing uniqueness even when multiple deployments run simultaneously.
+//!
+//! 2. **Atomic Rename**: The final deployment step uses `mv -f` which is atomic
+//!    on POSIX-compliant filesystems. This means:
+//!    - The binary is either fully present at the final location or not present at all
+//!    - No partial writes are visible to readers
+//!    - Concurrent renames of the same file complete in a well-defined order
+//!
+//! 3. **Write-Then-Verify**: The deployment sequence ensures the binary is:
+//!    - Fully written to the temp file
+//!    - Marked executable (chmod 700)
+//!    - Moved atomically to the final location
+//!    - Checksummed after the move completes
+//!
+//! ### Race Condition Scenarios
+//!
+//! **Scenario 1: Multiple rcp instances deploying the same version concurrently**
+//!
+//! - Each uses a unique temp file (`.rcpd-0.22.0.tmp.1234`, `.rcpd-0.22.0.tmp.5678`)
+//! - Both successfully write and verify their temp files
+//! - Both attempt `mv -f .rcpd-0.22.0.tmp.$$ rcpd-0.22.0`
+//! - The filesystem ensures one wins atomically, the other overwrites atomically
+//! - Result: Final binary is valid (both were identical and checksummed)
+//!
+//! **Scenario 2: One deployment while another is reading**
+//!
+//! - Reader opens `rcpd-0.22.0` and gets a valid file descriptor
+//! - Writer completes deployment and `mv -f` replaces the inode
+//! - Reader continues reading from the original inode (POSIX semantics)
+//! - Result: Reader gets the old version (but it's still valid)
+//!
+//! **Scenario 3: Deployment interrupted (network failure, SIGKILL)**
+//!
+//! - Temp file may be left in `.cache/rcp/bin/.rcpd-{version}.tmp.*`
+//! - Final file is either:
+//!   - Not present (deployment never completed)
+//!   - Present and valid (mv completed before interruption)
+//! - Temp files are hidden (dotfiles) and don't interfere with discovery
+//! - Result: Safe to retry; old temp files are harmless
+//!
+//! ### Assumptions
+//!
+//! 1. **POSIX Filesystem Semantics**: The deployment assumes the remote filesystem
+//!    supports atomic `mv` (rename) operations. This is true for all POSIX-compliant
+//!    filesystems (ext4, xfs, btrfs, etc.) but may not hold for network filesystems
+//!    with relaxed consistency (NFSv3 without proper locking).
+//!
+//! 2. **Unique Shell PIDs**: The `$$` shell variable expands to the process ID,
+//!    which is assumed to be unique during the lifetime of the deployment. This is
+//!    guaranteed by the OS but requires PIDs not to wrap around extremely rapidly.
+//!
+//! 3. **Checksum Integrity**: SHA-256 checksums are assumed to be collision-resistant.
+//!    If two different binaries produce the same checksum (astronomically unlikely),
+//!    the deployment would consider them identical.
+//!
+//! 4. **No Malicious Interference**: The deployment assumes the remote host is not
+//!    actively malicious (no adversary replacing files during deployment). Protection
+//!    against malicious hosts is provided by SSH authentication, not by this module.
+//!
+//! ### Non-Atomic Operations
+//!
+//! The following operations are **not** atomic and may observe intermediate states:
+//!
+//! - **Cleanup of old versions**: Uses `ls -t | tail | xargs rm` which may race with
+//!   concurrent deployments. This is acceptable because cleanup only removes old
+//!   versions, never the current version being deployed. Worst case: a version is
+//!   not cleaned up and remains on disk.
+//!
+//! - **Directory creation**: `mkdir -p` may race with concurrent deployments creating
+//!   the same directory. This is safe because `mkdir -p` is idempotent and succeeds
+//!   if the directory already exists.
 
 use anyhow::Context;
 use std::path::PathBuf;
@@ -193,7 +275,9 @@ async fn transfer_binary_base64(
         .to_str()
         .context("remote filename must be valid UTF-8")?;
 
-    // use $$ (shell PID) for unique temp filename
+    // use $$ (shell PID) for unique temp filename to prevent concurrent deployment conflicts
+    // the $$ expands to the shell process PID at runtime, ensuring each deployment has a unique temp file
+    // this allows multiple rcp instances to deploy simultaneously without interfering with each other
     // extract version from filename (format: rcpd-{version})
     let temp_filename = if let Some(version) = filename.strip_prefix("rcpd-") {
         format!(".rcpd-{}.tmp.$$", version)
@@ -208,6 +292,16 @@ async fn transfer_binary_base64(
     let final_path = format!("{}/{}", dir, filename);
     let final_path_escaped = crate::shell_escape(&final_path);
 
+    // deployment command sequence (all connected with && to fail fast on any error):
+    // 1. mkdir -p: create cache directory (idempotent, safe for concurrent execution)
+    // 2. base64 -d > temp: decode and write to unique temp file ($$-suffixed)
+    // 3. chmod 700: mark temp file executable
+    // 4. mv -f: atomic rename to final location (POSIX guarantees atomicity)
+    //
+    // the final 'mv -f' is the critical atomic operation:
+    // - on POSIX filesystems, rename(2) is atomic - either the new file appears or the old remains
+    // - concurrent deployments will each complete their mv atomically in some order
+    // - readers of the final file will see either the old or new inode, never partial writes
     let cmd = format!(
         "mkdir -p {} && \
          base64 -d > {} && \

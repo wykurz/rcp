@@ -557,20 +557,25 @@ async fn discover_rcpd_path(
     }
 
     // try deployed cache directory first (reuse already-deployed binaries)
-    // validate HOME is set before constructing the cache path
-    let home = get_remote_home(session).await?;
-    let cache_path = format!("{}/.cache/rcp/bin/rcpd-{}", home, local_version.semantic);
-    tracing::debug!("Trying deployed cache path: {}", cache_path);
-    let output = session
-        .command("sh")
-        .arg("-c")
-        .arg(format!("test -x {}", shell_escape(&cache_path)))
-        .output()
-        .await?;
-    if output.status.success() {
-        tracing::info!("Found rcpd in deployed cache: {}", cache_path);
-        return Ok(cache_path);
-    }
+    // if HOME is not set, skip cache check and continue to other discovery methods
+    let cache_path = if let Ok(home) = get_remote_home(session).await {
+        let path = format!("{}/.cache/rcp/bin/rcpd-{}", home, local_version.semantic);
+        tracing::debug!("Trying deployed cache path: {}", path);
+        let output = session
+            .command("sh")
+            .arg("-c")
+            .arg(format!("test -x {}", shell_escape(&path)))
+            .output()
+            .await?;
+        if output.status.success() {
+            tracing::info!("Found rcpd in deployed cache: {}", path);
+            return Ok(path);
+        }
+        Some(path)
+    } else {
+        tracing::debug!("HOME not set on remote host, skipping cache directory check");
+        None
+    };
 
     // try same directory as local rcp binary
     if let Ok(current_exe) = std::env::current_exe() {
@@ -603,11 +608,15 @@ async fn discover_rcpd_path(
     }
 
     // build error message with what we searched
-    let mut searched = vec![
-        format!("- Deployed cache: {}", cache_path),
-        "- Same directory as local rcp binary".to_string(),
-        "- PATH (via 'which rcpd')".to_string(),
-    ];
+    let mut searched = vec![];
+    if let Some(path) = cache_path.as_ref() {
+        searched.push(format!("- Deployed cache: {}", path));
+    } else {
+        searched.push("- Deployed cache: (skipped, HOME not set)".to_string());
+    }
+    searched.push("- Same directory as local rcp binary".to_string());
+    searched.push("- PATH (via 'which rcpd')".to_string());
+
     if let Some(path) = explicit_path {
         searched.insert(
             0,
@@ -621,10 +630,10 @@ async fn discover_rcpd_path(
         Searched in:\n\
         {}\n\
         \n\
-        Please install rcpd on the remote host and ensure it's in PATH:\n\
-        - cargo install rcp-tools-rcp --version {}\n\
-        Or specify the path explicitly:\n\
-        - rcp --rcpd-path=/path/to/rcpd ...",
+        Options:\n\
+        - Use automatic deployment: rcp --auto-deploy-rcpd ...\n\
+        - Install rcpd manually: cargo install rcp-tools-rcp --version {}\n\
+        - Specify explicit path: rcp --rcpd-path=/path/to/rcpd ...",
         searched.join("\n"),
         local_version.semantic
     ))
