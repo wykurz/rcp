@@ -34,6 +34,9 @@ jobs:
     - name: Check anyhow::Error::msg usage
       run: ./scripts/check-anyhow-error-msg.sh
 
+    - name: Check rust version consistency
+      run: ./scripts/check-rust-version.sh
+
     - name: Lint
       run: cargo clippy --workspace -- -D warnings
       env:
