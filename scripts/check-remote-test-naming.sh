@@ -16,7 +16,6 @@ NC='\033[0m' # no color
 
 echo "🔍 checking remote test naming conventions..."
 
-VIOLATIONS=0
 TEMP_FILE=$(mktemp)
 trap 'rm -f "$TEMP_FILE"' EXIT
 
