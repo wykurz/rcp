@@ -1520,7 +1520,7 @@ fn test_remote_auto_deploy_reuses_cached_binary() {
 }
 
 #[test]
-fn test_auto_deploy_cleanup_old_versions() {
+fn test_remote_auto_deploy_cleanup_old_versions() {
     // test that auto-deployment cleans up old versions (keeps last 3)
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("cleanup_test.txt");
@@ -1603,7 +1603,7 @@ fn test_auto_deploy_cleanup_old_versions() {
 }
 
 #[test]
-fn test_auto_deploy_error_explicit_rcpd_not_found() {
+fn test_remote_auto_deploy_error_explicit_rcpd_not_found() {
     // test error handling when explicit --rcpd-path points to nonexistent binary
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("test.txt");
@@ -1642,7 +1642,7 @@ fn test_auto_deploy_error_explicit_rcpd_not_found() {
 }
 
 #[test]
-fn test_auto_deploy_error_permission_denied() {
+fn test_remote_auto_deploy_error_permission_denied() {
     // test error handling when deployment fails due to permission denied
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("test.txt");
@@ -1697,7 +1697,7 @@ fn test_auto_deploy_error_permission_denied() {
 }
 
 #[test]
-fn test_auto_deploy_error_checksum_mismatch() {
+fn test_remote_auto_deploy_error_checksum_mismatch() {
     // test that checksum mismatch is detected and reported.
     // this test verifies the integrity verification works
     let (src_dir, dst_dir) = setup_test_env();
