@@ -922,9 +922,180 @@ impl rustls::client::ServerCertVerifier for PinnedCertVerifier {
 }
 
 fn get_local_ip() -> anyhow::Result<std::net::IpAddr> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect("8.8.8.8:80")?;
-    Ok(socket.local_addr()?.ip())
+    if let Some(ipv4) = try_ipv4_via_kernel_routing()? {
+        return Ok(std::net::IpAddr::V4(ipv4));
+    }
+
+    tracing::debug!("routing-based detection failed, falling back to interface enumeration");
+    let interfaces = collect_ipv4_interfaces().context("Failed to enumerate network interfaces")?;
+    if let Some(ipv4) = choose_best_ipv4(&interfaces) {
+        tracing::debug!("using IPv4 address from interface scan: {}", ipv4);
+        return Ok(std::net::IpAddr::V4(ipv4));
+    }
+
+    anyhow::bail!("No IPv4 interfaces found (QUIC endpoint requires IPv4 as it binds to 0.0.0.0)")
+}
+
+fn try_ipv4_via_kernel_routing() -> anyhow::Result<Option<std::net::Ipv4Addr>> {
+    // important: our QUIC endpoints bind to 0.0.0.0 (IPv4-only), so we must return IPv4
+    // strategy: ask the kernel which interface it would use by connecting to RFC1918 targets.
+    // these addresses never leave the local network but still exercise the routing table.
+    let private_ips = [
+        "10.0.0.1:80",    // class a private
+        "172.16.0.1:80",  // class b private
+        "192.168.1.1:80", // class c private
+    ];
+    for addr_str in &private_ips {
+        let addr = addr_str
+            .parse::<std::net::SocketAddr>()
+            .expect("hardcoded socket addresses are valid");
+        let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
+            Ok(socket) => socket,
+            Err(err) => {
+                tracing::debug!(?err, "failed to bind UDP socket for routing detection");
+                continue;
+            }
+        };
+        if let Err(err) = socket.connect(addr) {
+            tracing::debug!(?err, "connect() failed for routing target {}", addr);
+            continue;
+        }
+        match socket.local_addr() {
+            Ok(std::net::SocketAddr::V4(local_addr)) => {
+                let ipv4 = *local_addr.ip();
+                if !ipv4.is_loopback() && !ipv4.is_unspecified() {
+                    tracing::debug!(
+                        "using IPv4 address from kernel routing (via {}): {}",
+                        addr,
+                        ipv4
+                    );
+                    return Ok(Some(ipv4));
+                }
+            }
+            Ok(_) => {
+                tracing::debug!("kernel routing returned IPv6 despite IPv4 bind, ignoring");
+            }
+            Err(err) => {
+                tracing::debug!(?err, "local_addr() failed for routing-based detection");
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InterfaceIpv4 {
+    name: String,
+    addr: std::net::Ipv4Addr,
+}
+
+fn collect_ipv4_interfaces() -> anyhow::Result<Vec<InterfaceIpv4>> {
+    use if_addrs::get_if_addrs;
+    let mut interfaces = Vec::new();
+    for iface in get_if_addrs()? {
+        if let std::net::IpAddr::V4(ipv4) = iface.addr.ip() {
+            interfaces.push(InterfaceIpv4 {
+                name: iface.name,
+                addr: ipv4,
+            });
+        }
+    }
+    Ok(interfaces)
+}
+
+fn choose_best_ipv4(interfaces: &[InterfaceIpv4]) -> Option<std::net::Ipv4Addr> {
+    interfaces
+        .iter()
+        .filter(|iface| !iface.addr.is_unspecified())
+        .min_by_key(|iface| interface_priority(&iface.name, &iface.addr))
+        .map(|iface| iface.addr)
+}
+
+fn interface_priority(name: &str, addr: &std::net::Ipv4Addr) -> (InterfaceCategory, u8, u8, std::net::Ipv4Addr) {
+    (
+        classify_interface(name, addr),
+        if addr.is_link_local() { 1 } else { 0 },
+        if addr.is_private() { 1 } else { 0 },
+        *addr,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum InterfaceCategory {
+    Preferred = 0,
+    Normal = 1,
+    Virtual = 2,
+    Loopback = 3,
+}
+
+fn classify_interface(name: &str, addr: &std::net::Ipv4Addr) -> InterfaceCategory {
+    if addr.is_loopback() {
+        return InterfaceCategory::Loopback;
+    }
+
+    let normalized = normalize_interface_name(name);
+    if is_virtual_interface(&normalized) {
+        return InterfaceCategory::Virtual;
+    }
+    if is_preferred_physical_interface(&normalized) {
+        return InterfaceCategory::Preferred;
+    }
+    InterfaceCategory::Normal
+}
+
+fn normalize_interface_name(original: &str) -> String {
+    let mut normalized = String::with_capacity(original.len());
+    for ch in original.chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+        }
+    }
+    normalized
+}
+
+fn is_virtual_interface(name: &str) -> bool {
+    const VIRTUAL_PREFIXES: &[&str] = &[
+        "br",
+        "docker",
+        "veth",
+        "virbr",
+        "vmnet",
+        "wg",
+        "tailscale",
+        "zt",
+        "zerotier",
+        "tap",
+        "tun",
+        "utun",
+        "ham",
+        "vpn",
+        "lo",
+        "lxc",
+    ];
+    VIRTUAL_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        || name.contains("virtual")
+}
+
+fn is_preferred_physical_interface(name: &str) -> bool {
+    const PHYSICAL_PREFIXES: &[&str] = &[
+        "en",  // linux + macos ethernet (en0, enp3s0, eno1, etc.)
+        "eth", // legacy ethernet naming
+        "em",  // embedded NICs (em1, etc.)
+        "eno",
+        "ens",
+        "enp",
+        "wl", // wi-fi
+        "ww", // wwan
+        "wlan",
+        "ethernet", // windows
+        "lan",
+        "wifi",
+    ];
+    PHYSICAL_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 #[instrument]
@@ -1025,6 +1196,8 @@ pub mod test_defaults {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// verify that tokio_unstable is enabled
     ///
     /// this test ensures that the tokio_unstable cfg flag is properly set, which is required
@@ -1052,5 +1225,63 @@ mod tests {
             // tokio::task::JoinSet is an example of a type that uses unstable features
             let _join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         }
+    }
+
+    fn iface(name: &str, addr: [u8; 4]) -> InterfaceIpv4 {
+        InterfaceIpv4 {
+            name: name.to_string(),
+            addr: std::net::Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]),
+        }
+    }
+
+    #[test]
+    fn choose_best_ipv4_prefers_physical_interfaces() {
+        let interfaces = vec![
+            iface("docker0", [172, 17, 0, 1]),
+            iface("enp3s0", [192, 168, 1, 44]),
+            iface("tailscale0", [100, 115, 92, 5]),
+        ];
+        assert_eq!(
+            choose_best_ipv4(&interfaces),
+            Some(std::net::Ipv4Addr::new(192, 168, 1, 44))
+        );
+    }
+
+    #[test]
+    fn choose_best_ipv4_deprioritizes_link_local() {
+        let interfaces = vec![
+            iface("enp0s8", [169, 254, 10, 2]),
+            iface("wlan0", [10, 0, 0, 23]),
+        ];
+        assert_eq!(
+            choose_best_ipv4(&interfaces),
+            Some(std::net::Ipv4Addr::new(10, 0, 0, 23))
+        );
+    }
+
+    #[test]
+    fn choose_best_ipv4_falls_back_to_loopback() {
+        let interfaces = vec![iface("lo", [127, 0, 0, 1]), iface("docker0", [0, 0, 0, 0])];
+        assert_eq!(
+            choose_best_ipv4(&interfaces),
+            Some(std::net::Ipv4Addr::new(127, 0, 0, 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_addr_returns_ipv4() {
+        // verify that get_endpoint_addr also returns IPv4 only
+        // create a test endpoint
+        let (endpoint, _fingerprint) = get_server_with_port_ranges(
+            None,
+            test_defaults::DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
+            test_defaults::DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
+        )
+        .expect("should create endpoint");
+        let addr = get_endpoint_addr(&endpoint).expect("should get endpoint address");
+        assert!(
+            addr.is_ipv4(),
+            "get_endpoint_addr must return IPv4 address (got {addr})"
+        );
     }
 }
