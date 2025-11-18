@@ -37,6 +37,9 @@ jobs:
     - name: Check rust version consistency
       run: ./scripts/check-rust-version.sh
 
+    - name: Check remote test naming
+      run: ./scripts/check-remote-test-naming.sh
+
     - name: Lint
       run: cargo clippy --workspace -- -D warnings
       env:
