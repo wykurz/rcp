@@ -156,6 +156,18 @@ struct Args {
     max_blocking_threads: usize,
 
     // Remote copy options
+    /// IP address to bind the master QUIC server to
+    ///
+    /// By default, the best available network interface is automatically selected.
+    /// Use this option to explicitly bind to a specific IP address (e.g., "192.168.1.5").
+    /// This is useful for multi-homed hosts or when you want to control which network
+    /// is used for QUIC traffic. Only IPv4 addresses are supported.
+    ///
+    /// When the source path uses an IP address (e.g., "192.168.1.100:/path"), that IP
+    /// is automatically passed to the source rcpd so it binds explicitly to that address.
+    #[arg(long, value_name = "IP", help_heading = "Remote copy options")]
+    bind_ip: Option<String>,
+
     /// Restrict QUIC to specific port ranges (e.g., "8000-8999,10000-10999")
     ///
     /// Defaults to dynamic port allocation if not specified
@@ -227,6 +239,16 @@ struct Args {
     paths: Vec<String>,
 }
 
+/// extract IP from host if it's an IPv4 address (for explicit binding)
+fn extract_bind_ip_from_host(host: &str) -> Option<String> {
+    // try parsing as IPv4
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        Some(host.to_string())
+    } else {
+        None
+    }
+}
+
 #[instrument]
 async fn run_rcpd_master(
     args: &Args,
@@ -241,7 +263,8 @@ async fn run_rcpd_master(
         args.quic_idle_timeout_sec,
         args.quic_keep_alive_interval_sec,
     )?;
-    let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
+    let server_addr =
+        remote::get_endpoint_addr_with_bind_ip(&server_endpoint, args.bind_ip.as_deref())?;
     let server_name = remote::get_random_server_name();
     let mut rcpds = vec![];
     let rcpd_config = remote::protocol::RcpdConfig {
@@ -274,6 +297,12 @@ async fn run_rcpd_master(
     };
 
     for session in sessions {
+        // determine bind IP: source uses host IP if available, destination uses None
+        let bind_ip = if session == src.session() {
+            extract_bind_ip_from_host(&session.host)
+        } else {
+            None
+        };
         let rcpd = remote::start_rcpd(
             &rcpd_config,
             session,
@@ -281,6 +310,7 @@ async fn run_rcpd_master(
             &server_name,
             args.rcpd_path.as_deref(),
             args.auto_deploy_rcpd,
+            bind_ip.as_deref(),
         )
         .await?;
         rcpds.push(rcpd);
@@ -288,6 +318,7 @@ async fn run_rcpd_master(
 
     // if src and dst are the same, we need to start rcpd twice even though we only deployed once
     if src.session() == dst.session() && rcpds.len() == 1 {
+        let bind_ip = extract_bind_ip_from_host(&src.session().host);
         let rcpd = remote::start_rcpd(
             &rcpd_config,
             src.session(),
@@ -295,6 +326,7 @@ async fn run_rcpd_master(
             &server_name,
             args.rcpd_path.as_deref(),
             args.auto_deploy_rcpd,
+            bind_ip.as_deref(),
         )
         .await?;
         rcpds.push(rcpd);

@@ -128,6 +128,10 @@ struct Args {
     max_blocking_threads: usize,
 
     // Remote copy options
+    /// IP address to bind QUIC server to (set by master, internal use only)
+    #[arg(long, value_name = "IP", help_heading = "Remote copy options")]
+    bind_ip: Option<String>,
+
     /// Restrict QUIC to specific port ranges (e.g., "8000-8999,10000-10999")
     ///
     /// Defaults to dynamic port allocation if not specified
@@ -256,6 +260,7 @@ async fn run_operation(
                 &dst,
                 &settings,
                 &quic_config,
+                args.bind_ip.as_deref(),
             )
             .await
             {

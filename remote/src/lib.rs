@@ -261,7 +261,7 @@
 //! let master_addr: SocketAddr = "192.168.1.100:5000".parse()?;
 //! let server_name = "master-server";
 //!
-//! let process = start_rcpd(&config, &session, &master_addr, server_name, None, false).await?;
+//! let process = start_rcpd(&config, &session, &master_addr, server_name, None, false, None).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -733,6 +733,7 @@ pub async fn start_rcpd(
     master_server_name: &str,
     explicit_rcpd_path: Option<&str>,
     auto_deploy_rcpd: bool,
+    bind_ip: Option<&str>,
 ) -> anyhow::Result<openssh::Child<std::sync::Arc<openssh::Session>>> {
     tracing::info!("Starting rcpd server on: {:?}", session);
     let remote_host = &session.host;
@@ -795,6 +796,11 @@ pub async fn start_rcpd(
         .arg("--server-name")
         .arg(master_server_name)
         .args(rcpd_args);
+    // add bind-ip if explicitly provided
+    if let Some(ip) = bind_ip {
+        tracing::debug!("passing --bind-ip {} to rcpd", ip);
+        cmd.arg("--bind-ip").arg(ip);
+    }
     // capture stdout and stderr so we can read them later
     cmd.stdout(openssh::Stdio::piped());
     cmd.stderr(openssh::Stdio::piped());
@@ -921,11 +927,33 @@ impl rustls::client::ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
-fn get_local_ip() -> anyhow::Result<std::net::IpAddr> {
+fn get_local_ip(explicit_bind_ip: Option<&str>) -> anyhow::Result<std::net::IpAddr> {
+    // if explicit IP provided, validate and use it
+    if let Some(ip_str) = explicit_bind_ip {
+        let ip = ip_str
+            .parse::<std::net::IpAddr>()
+            .with_context(|| format!("invalid IP address: {}", ip_str))?;
+        match ip {
+            std::net::IpAddr::V4(ipv4) => {
+                tracing::debug!("using explicit bind IP: {}", ipv4);
+                return Ok(std::net::IpAddr::V4(ipv4));
+            }
+            std::net::IpAddr::V6(_) => {
+                anyhow::bail!(
+                    "IPv6 address not supported for binding (got {}). \
+                     QUIC endpoint binds to 0.0.0.0 (IPv4 only)",
+                    ip
+                );
+            }
+        }
+    }
+
+    // auto-detection: try kernel routing first
     if let Some(ipv4) = try_ipv4_via_kernel_routing()? {
         return Ok(std::net::IpAddr::V4(ipv4));
     }
 
+    // fallback to interface enumeration
     tracing::debug!("routing-based detection failed, falling back to interface enumeration");
     let interfaces = collect_ipv4_interfaces().context("Failed to enumerate network interfaces")?;
     if let Some(ipv4) = choose_best_ipv4(&interfaces) {
@@ -1011,7 +1039,10 @@ fn choose_best_ipv4(interfaces: &[InterfaceIpv4]) -> Option<std::net::Ipv4Addr> 
         .map(|iface| iface.addr)
 }
 
-fn interface_priority(name: &str, addr: &std::net::Ipv4Addr) -> (InterfaceCategory, u8, u8, std::net::Ipv4Addr) {
+fn interface_priority(
+    name: &str,
+    addr: &std::net::Ipv4Addr,
+) -> (InterfaceCategory, u8, u8, std::net::Ipv4Addr) {
     (
         classify_interface(name, addr),
         if addr.is_link_local() { 1 } else { 0 },
@@ -1083,15 +1114,10 @@ fn is_preferred_physical_interface(name: &str) -> bool {
         "en",  // linux + macos ethernet (en0, enp3s0, eno1, etc.)
         "eth", // legacy ethernet naming
         "em",  // embedded NICs (em1, etc.)
-        "eno",
-        "ens",
-        "enp",
-        "wl", // wi-fi
+        "eno", "ens", "enp", "wl", // wi-fi
         "ww", // wwan
-        "wlan",
-        "ethernet", // windows
-        "lan",
-        "wifi",
+        "wlan", "ethernet", // windows
+        "lan", "wifi",
     ];
     PHYSICAL_PREFIXES
         .iter()
@@ -1100,8 +1126,15 @@ fn is_preferred_physical_interface(name: &str) -> bool {
 
 #[instrument]
 pub fn get_endpoint_addr(endpoint: &quinn::Endpoint) -> anyhow::Result<std::net::SocketAddr> {
+    get_endpoint_addr_with_bind_ip(endpoint, None)
+}
+
+pub fn get_endpoint_addr_with_bind_ip(
+    endpoint: &quinn::Endpoint,
+    bind_ip: Option<&str>,
+) -> anyhow::Result<std::net::SocketAddr> {
     // endpoint is bound to 0.0.0.0 so we need to get the local IP address
-    let local_ip = get_local_ip().context("Failed to get local IP address")?;
+    let local_ip = get_local_ip(bind_ip).context("Failed to get local IP address")?;
     let endpoint_addr = endpoint.local_addr()?;
     Ok(std::net::SocketAddr::new(local_ip, endpoint_addr.port()))
 }
@@ -1283,5 +1316,120 @@ mod tests {
             addr.is_ipv4(),
             "get_endpoint_addr must return IPv4 address (got {addr})"
         );
+    }
+
+    #[test]
+    fn test_get_local_ip_with_explicit_ipv4() {
+        // test that providing a valid IPv4 address works
+        let result = get_local_ip(Some("192.168.1.100"));
+        assert!(result.is_ok(), "should accept valid IPv4 address");
+        let ip = result.unwrap();
+        assert_eq!(
+            ip,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 100))
+        );
+    }
+
+    #[test]
+    fn test_get_local_ip_with_explicit_loopback() {
+        // test that providing loopback address works
+        let result = get_local_ip(Some("127.0.0.1"));
+        assert!(result.is_ok(), "should accept loopback address");
+        let ip = result.unwrap();
+        assert_eq!(
+            ip,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn test_get_local_ip_rejects_ipv6() {
+        // test that providing an IPv6 address fails with a good error message
+        let result = get_local_ip(Some("::1"));
+        assert!(result.is_err(), "should reject IPv6 address");
+        let err = result.unwrap_err();
+        let err_msg = format!("{err:#}");
+        assert!(
+            err_msg.contains("IPv6 address not supported"),
+            "error should mention IPv6 not supported, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("0.0.0.0"),
+            "error should mention IPv4-only binding, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_get_local_ip_rejects_ipv6_full() {
+        // test that providing a full IPv6 address fails
+        let result = get_local_ip(Some("2001:db8::1"));
+        assert!(result.is_err(), "should reject IPv6 address");
+        let err = result.unwrap_err();
+        let err_msg = format!("{err:#}");
+        assert!(
+            err_msg.contains("IPv6 address not supported"),
+            "error should mention IPv6 not supported, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_get_local_ip_rejects_invalid_ip() {
+        // test that providing an invalid IP format fails with a good error message
+        let result = get_local_ip(Some("not-an-ip"));
+        assert!(result.is_err(), "should reject invalid IP format");
+        let err = result.unwrap_err();
+        let err_msg = format!("{err:#}");
+        assert!(
+            err_msg.contains("invalid IP address"),
+            "error should mention invalid IP address, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_get_local_ip_rejects_invalid_ipv4() {
+        // test that providing an invalid IPv4 format fails
+        let result = get_local_ip(Some("999.999.999.999"));
+        assert!(result.is_err(), "should reject invalid IPv4 address");
+        let err = result.unwrap_err();
+        let err_msg = format!("{err:#}");
+        assert!(
+            err_msg.contains("invalid IP address"),
+            "error should mention invalid IP address, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_addr_with_bind_ip_explicit() {
+        // test that get_endpoint_addr_with_bind_ip works with explicit IP
+        let (endpoint, _fingerprint) = get_server_with_port_ranges(
+            None,
+            test_defaults::DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
+            test_defaults::DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
+        )
+        .expect("should create endpoint");
+        let addr = get_endpoint_addr_with_bind_ip(&endpoint, Some("127.0.0.1"))
+            .expect("should get endpoint address with bind IP");
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+        );
+        // port should come from the endpoint
+        assert_eq!(addr.port(), endpoint.local_addr().unwrap().port());
+    }
+
+    #[tokio::test]
+    async fn test_get_endpoint_addr_with_bind_ip_auto() {
+        // test that get_endpoint_addr_with_bind_ip works with auto-detection (None)
+        let (endpoint, _fingerprint) = get_server_with_port_ranges(
+            None,
+            test_defaults::DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
+            test_defaults::DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
+        )
+        .expect("should create endpoint");
+        let addr =
+            get_endpoint_addr_with_bind_ip(&endpoint, None).expect("should get endpoint address");
+        assert!(addr.is_ipv4(), "should return IPv4 address");
+        // port should come from the endpoint
+        assert_eq!(addr.port(), endpoint.local_addr().unwrap().port());
     }
 }
