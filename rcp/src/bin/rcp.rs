@@ -298,10 +298,13 @@ async fn run_rcpd_master(
 
     for session in sessions {
         // determine bind IP: source uses host IP if available, destination uses None
-        let bind_ip = if session == src.session() {
-            extract_bind_ip_from_host(&session.host)
+        let (bind_ip, role) = if session == src.session() {
+            (
+                extract_bind_ip_from_host(&session.host),
+                remote::protocol::RcpdRole::Source,
+            )
         } else {
-            None
+            (None, remote::protocol::RcpdRole::Destination)
         };
         let rcpd = remote::start_rcpd(
             &rcpd_config,
@@ -311,6 +314,7 @@ async fn run_rcpd_master(
             args.rcpd_path.as_deref(),
             args.auto_deploy_rcpd,
             bind_ip.as_deref(),
+            role,
         )
         .await?;
         rcpds.push(rcpd);
@@ -327,39 +331,87 @@ async fn run_rcpd_master(
             args.rcpd_path.as_deref(),
             args.auto_deploy_rcpd,
             bind_ip.as_deref(),
+            remote::protocol::RcpdRole::Destination,
         )
         .await?;
         rcpds.push(rcpd);
     }
     tracing::info!("Waiting for connections from rcpd processes...");
-    // accept connection from source
-    tracing::info!("Waiting for connection from source rcpd...");
     let rcpd_connect_timeout = std::time::Duration::from_secs(args.remote_copy_conn_timeout_sec);
-    let source_connection = {
-        let source_connecting =
+
+    // accept first connection
+    tracing::info!("Waiting for first rcpd connection...");
+    let conn1 = {
+        let connecting =
             match tokio::time::timeout(rcpd_connect_timeout, server_endpoint.accept()).await {
                 Ok(Some(conn)) => conn,
-                Ok(None) => return Err(anyhow!("Server endpoint closed before source connected")),
+                Ok(None) => {
+                    return Err(anyhow!(
+                        "Server endpoint closed before first rcpd connected"
+                    ))
+                }
                 Err(_) => {
                     return Err(anyhow!(
-                        "Timed out waiting for source rcpd to connect after {:?}. \
-                    Check if source host is reachable and rcpd can be executed.",
+                        "Timed out waiting for first rcpd to connect after {:?}. \
+                    Check if hosts are reachable and rcpd can be executed.",
                         rcpd_connect_timeout
                     ))
                 }
             };
-        tracing::info!("Source rcpd connected");
-        remote::streams::Connection::new(source_connecting.await?)
+        tracing::info!("First rcpd connected");
+        remote::streams::Connection::new(connecting.await?)
     };
-    let mut source_tracing_stream = source_connection
+    let mut conn1_tracing_stream = conn1
         .accept_uni()
         .await
-        .context("Failed to open unidirectional stream with source rcpd")?;
-    // receiving some data guarantees that the stream is established in the right order
-    source_tracing_stream
+        .context("Failed to open unidirectional stream with first rcpd")?;
+    let conn1_hello = conn1_tracing_stream
         .recv_object::<remote::protocol::TracingHello>()
         .await
-        .context("Failed to receive tracing hello from source rcpd")?;
+        .context("Failed to receive tracing hello from first rcpd")?
+        .expect("Expected TracingHello from first rcpd");
+    tracing::info!("First rcpd identified as: {}", conn1_hello.role);
+
+    // accept second connection
+    tracing::info!("Waiting for second rcpd connection...");
+    let conn2 = {
+        let connecting =
+            match tokio::time::timeout(rcpd_connect_timeout, server_endpoint.accept()).await {
+                Ok(Some(conn)) => conn,
+                Ok(None) => {
+                    return Err(anyhow!(
+                        "Server endpoint closed before second rcpd connected"
+                    ))
+                }
+                Err(_) => {
+                    return Err(anyhow!(
+                        "Timed out waiting for second rcpd to connect after {:?}. \
+                    Check if hosts are reachable and rcpd can be executed.",
+                        rcpd_connect_timeout
+                    ))
+                }
+            };
+        tracing::info!("Second rcpd connected");
+        remote::streams::Connection::new(connecting.await?)
+    };
+    let mut conn2_tracing_stream = conn2
+        .accept_uni()
+        .await
+        .context("Failed to open unidirectional stream with second rcpd")?;
+    let conn2_hello = conn2_tracing_stream
+        .recv_object::<remote::protocol::TracingHello>()
+        .await
+        .context("Failed to receive tracing hello from second rcpd")?
+        .expect("Expected TracingHello from second rcpd");
+    tracing::info!("Second rcpd identified as: {}", conn2_hello.role);
+
+    // match connections by role
+    let (source_connection, source_tracing_stream, dest_connection, dest_tracing_stream) =
+        if conn1_hello.role == remote::protocol::RcpdRole::Source {
+            (conn1, conn1_tracing_stream, conn2, conn2_tracing_stream)
+        } else {
+            (conn2, conn2_tracing_stream, conn1, conn1_tracing_stream)
+        };
     let source_tracing_task = {
         tokio::spawn(async move {
             if let Err(e) = remote::tracelog::run_receiver(
@@ -372,6 +424,19 @@ async fn run_rcpd_master(
             }
         })
     };
+    let dest_tracing_task = {
+        tokio::spawn(async move {
+            if let Err(e) = remote::tracelog::run_receiver(
+                dest_tracing_stream,
+                remote::tracelog::RcpdType::Destination,
+            )
+            .await
+            {
+                tracing::warn!("Destination remote tracing receiver failed: {}", e);
+            }
+        })
+    };
+    // send MasterHello to source rcpd
     let (source_send_stream, mut source_recv_stream) = source_connection
         .open_bi()
         .await
@@ -391,51 +456,7 @@ async fn run_rcpd_master(
         .recv_object::<remote::protocol::SourceMasterHello>()
         .await?
         .expect("Failed to receive source hello from source rcpd");
-    // accept connection from destination
-    tracing::info!("Waiting for connection from destination rcpd...");
-    let dest_connection = {
-        let dest_connecting =
-            match tokio::time::timeout(rcpd_connect_timeout, server_endpoint.accept()).await {
-                Ok(Some(conn)) => conn,
-                Ok(None) => {
-                    return Err(anyhow!(
-                        "Server endpoint closed before destination connected"
-                    ))
-                }
-                Err(_) => {
-                    return Err(anyhow!(
-                        "Timed out waiting for destination rcpd to connect after {:?}. \
-                    Check if destination host is reachable and rcpd can be executed.",
-                        rcpd_connect_timeout
-                    ))
-                }
-            };
-        tracing::info!("Destination rcpd connected");
-        remote::streams::Connection::new(dest_connecting.await?)
-    };
-    let mut dest_tracing_stream = dest_connection
-        .accept_uni()
-        .await
-        .context("Failed to open unidirectional stream with destination rcpd")?;
-    // receiving some data guarantees that the stream is established in the right order
-    dest_tracing_stream
-        .recv_object::<remote::protocol::TracingHello>()
-        .await
-        .context("Failed to receive tracing hello from destination rcpd")?;
-    let dest_tracing_task = {
-        tokio::spawn(async move {
-            if let Err(e) = remote::tracelog::run_receiver(
-                dest_tracing_stream,
-                remote::tracelog::RcpdType::Destination,
-            )
-            .await
-            {
-                tracing::warn!("Destination remote tracing receiver failed: {}", e);
-            }
-        })
-    };
-    // rcpd doesn't know if it's source or destination so we need to match the stream type to source (bidirectional)
-    // although a unidirectional stream would be enough here
+    // send MasterHello to destination rcpd
     let (dest_send_stream, mut dest_recv_stream) = dest_connection
         .open_bi()
         .await
