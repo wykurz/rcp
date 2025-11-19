@@ -29,6 +29,13 @@ struct Args {
     #[arg(long)]
     master_cert_fingerprint: String,
 
+    /// Role of this rcpd instance (source or destination)
+    ///
+    /// This is set by the master (rcp) to distinguish between source and destination
+    /// rcpd processes, especially for same-host copies
+    #[arg(long, value_name = "ROLE")]
+    role: remote::protocol::RcpdRole,
+
     // Copy options
     /// Overwrite existing files/directories
     #[arg(short, long, help_heading = "Copy options")]
@@ -381,7 +388,7 @@ async fn async_main(
     };
     let mut tracing_stream = master_connection.open_uni().await?;
     tracing_stream
-        .send_control_message(&remote::protocol::TracingHello {})
+        .send_control_message(&remote::protocol::TracingHello { role: args.role })
         .await?;
     // setup tracing
     let cancellation_token = tokio_util::sync::CancellationToken::new();

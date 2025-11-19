@@ -261,7 +261,7 @@
 //! let master_addr: SocketAddr = "192.168.1.100:5000".parse()?;
 //! let server_name = "master-server";
 //!
-//! let process = start_rcpd(&config, &session, &master_addr, server_name, None, false, None).await?;
+//! let process = start_rcpd(&config, &session, &master_addr, server_name, None, false, None, remote::protocol::RcpdRole::Source).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -725,6 +725,7 @@ async fn check_rcpd_version(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument]
 pub async fn start_rcpd(
     rcpd_config: &protocol::RcpdConfig,
@@ -734,6 +735,7 @@ pub async fn start_rcpd(
     explicit_rcpd_path: Option<&str>,
     auto_deploy_rcpd: bool,
     bind_ip: Option<&str>,
+    role: protocol::RcpdRole,
 ) -> anyhow::Result<openssh::Child<std::sync::Arc<openssh::Session>>> {
     tracing::info!("Starting rcpd server on: {:?}", session);
     let remote_host = &session.host;
@@ -795,6 +797,8 @@ pub async fn start_rcpd(
         .arg(master_addr.to_string())
         .arg("--server-name")
         .arg(master_server_name)
+        .arg("--role")
+        .arg(role.to_string())
         .args(rcpd_args);
     // add bind-ip if explicitly provided
     if let Some(ip) = bind_ip {

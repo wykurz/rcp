@@ -244,8 +244,37 @@ impl RcpdConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum RcpdRole {
+    Source,
+    Destination,
+}
+
+impl std::fmt::Display for RcpdRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RcpdRole::Source => write!(f, "source"),
+            RcpdRole::Destination => write!(f, "destination"),
+        }
+    }
+}
+
+impl std::str::FromStr for RcpdRole {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "source" => Ok(RcpdRole::Source),
+            "destination" | "dest" => Ok(RcpdRole::Destination),
+            _ => Err(anyhow::anyhow!("invalid role: {}", s)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TracingHello {}
+pub struct TracingHello {
+    pub role: RcpdRole,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum MasterHello {
