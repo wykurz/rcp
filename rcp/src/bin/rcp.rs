@@ -339,71 +339,44 @@ async fn run_rcpd_master(
     tracing::info!("Waiting for connections from rcpd processes...");
     let rcpd_connect_timeout = std::time::Duration::from_secs(args.remote_copy_conn_timeout_sec);
 
-    // accept first connection
-    tracing::info!("Waiting for first rcpd connection...");
-    let conn1 = {
-        let connecting =
-            match tokio::time::timeout(rcpd_connect_timeout, server_endpoint.accept()).await {
+    // helper to accept a connection and read its role
+    let accept_rcpd_connection = |endpoint: quinn::Endpoint, timeout: std::time::Duration| async move {
+        let conn = {
+            let connecting = match tokio::time::timeout(timeout, endpoint.accept()).await {
                 Ok(Some(conn)) => conn,
-                Ok(None) => {
-                    return Err(anyhow!(
-                        "Server endpoint closed before first rcpd connected"
-                    ))
-                }
+                Ok(None) => return Err(anyhow!("Server endpoint closed before rcpd connected")),
                 Err(_) => {
                     return Err(anyhow!(
-                        "Timed out waiting for first rcpd to connect after {:?}. \
-                    Check if hosts are reachable and rcpd can be executed.",
-                        rcpd_connect_timeout
+                        "Timed out waiting for rcpd to connect after {:?}. \
+                            Check if hosts are reachable and rcpd can be executed.",
+                        timeout
                     ))
                 }
             };
-        tracing::info!("First rcpd connected");
-        remote::streams::Connection::new(connecting.await?)
+            remote::streams::Connection::new(connecting.await?)
+        };
+        let mut tracing_stream = conn
+            .accept_uni()
+            .await
+            .context("Failed to open unidirectional stream with rcpd")?;
+        let hello = tracing_stream
+            .recv_object::<remote::protocol::TracingHello>()
+            .await
+            .context("Failed to receive tracing hello from rcpd")?
+            .context("Expected TracingHello from rcpd")?;
+        Ok::<_, anyhow::Error>((conn, tracing_stream, hello))
     };
-    let mut conn1_tracing_stream = conn1
-        .accept_uni()
-        .await
-        .context("Failed to open unidirectional stream with first rcpd")?;
-    let conn1_hello = conn1_tracing_stream
-        .recv_object::<remote::protocol::TracingHello>()
-        .await
-        .context("Failed to receive tracing hello from first rcpd")?
-        .expect("Expected TracingHello from first rcpd");
-    tracing::info!("First rcpd identified as: {}", conn1_hello.role);
 
-    // accept second connection
+    // accept both connections
+    tracing::info!("Waiting for first rcpd connection...");
+    let (conn1, conn1_tracing_stream, conn1_hello) =
+        accept_rcpd_connection(server_endpoint.clone(), rcpd_connect_timeout).await?;
+    tracing::info!("First rcpd connected with role: {}", conn1_hello.role);
+
     tracing::info!("Waiting for second rcpd connection...");
-    let conn2 = {
-        let connecting =
-            match tokio::time::timeout(rcpd_connect_timeout, server_endpoint.accept()).await {
-                Ok(Some(conn)) => conn,
-                Ok(None) => {
-                    return Err(anyhow!(
-                        "Server endpoint closed before second rcpd connected"
-                    ))
-                }
-                Err(_) => {
-                    return Err(anyhow!(
-                        "Timed out waiting for second rcpd to connect after {:?}. \
-                    Check if hosts are reachable and rcpd can be executed.",
-                        rcpd_connect_timeout
-                    ))
-                }
-            };
-        tracing::info!("Second rcpd connected");
-        remote::streams::Connection::new(connecting.await?)
-    };
-    let mut conn2_tracing_stream = conn2
-        .accept_uni()
-        .await
-        .context("Failed to open unidirectional stream with second rcpd")?;
-    let conn2_hello = conn2_tracing_stream
-        .recv_object::<remote::protocol::TracingHello>()
-        .await
-        .context("Failed to receive tracing hello from second rcpd")?
-        .expect("Expected TracingHello from second rcpd");
-    tracing::info!("Second rcpd identified as: {}", conn2_hello.role);
+    let (conn2, conn2_tracing_stream, conn2_hello) =
+        accept_rcpd_connection(server_endpoint.clone(), rcpd_connect_timeout).await?;
+    tracing::info!("Second rcpd connected with role: {}", conn2_hello.role);
 
     // match connections by role
     let (source_connection, source_tracing_stream, dest_connection, dest_tracing_stream) =
