@@ -606,13 +606,14 @@ pub async fn run_source(
     dst: &std::path::Path,
     settings: &common::copy::Settings,
     quic_config: &remote::QuicConfig,
+    bind_ip: Option<&str>,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
     let (server_endpoint, cert_fingerprint) = remote::get_server_with_port_ranges(
         quic_config.port_ranges.as_deref(),
         quic_config.idle_timeout_sec,
         quic_config.keep_alive_interval_sec,
     )?;
-    let server_addr = remote::get_endpoint_addr(&server_endpoint)?;
+    let server_addr = remote::get_endpoint_addr_with_bind_ip(&server_endpoint, bind_ip)?;
     tracing::info!("Source server listening on {}", server_addr);
     let master_hello = remote::protocol::SourceMasterHello {
         source_addr: server_addr,
