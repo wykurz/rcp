@@ -534,7 +534,6 @@ async fn discover_rcpd_path(
     explicit_path: Option<&str>,
 ) -> anyhow::Result<String> {
     let local_version = common::version::ProtocolVersion::current();
-
     // try explicit path first
     if let Some(path) = explicit_path {
         tracing::debug!("Trying explicit rcpd path: {}", path);
@@ -555,7 +554,6 @@ async fn discover_rcpd_path(
             path
         ));
     }
-
     // try deployed cache directory first (reuse already-deployed binaries)
     // if HOME is not set, skip cache check and continue to other discovery methods
     let cache_path = if let Ok(home) = get_remote_home(session).await {
@@ -576,7 +574,6 @@ async fn discover_rcpd_path(
         tracing::debug!("HOME not set on remote host, skipping cache directory check");
         None
     };
-
     // try same directory as local rcp binary
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(bin_dir) = current_exe.parent() {
@@ -594,7 +591,6 @@ async fn discover_rcpd_path(
             }
         }
     }
-
     // try PATH
     tracing::debug!("Trying to find rcpd in PATH");
     let output = session.command("which").arg("rcpd").output().await?;
@@ -606,7 +602,6 @@ async fn discover_rcpd_path(
             return Ok(path.to_string());
         }
     }
-
     // build error message with what we searched
     let mut searched = vec![];
     if let Some(path) = cache_path.as_ref() {
@@ -616,14 +611,12 @@ async fn discover_rcpd_path(
     }
     searched.push("- Same directory as local rcp binary".to_string());
     searched.push("- PATH (via 'which rcpd')".to_string());
-
     if let Some(path) = explicit_path {
         searched.insert(
             0,
             format!("- Explicit path: {} (not found or not executable)", path),
         );
     }
-
     Err(anyhow::anyhow!(
         "rcpd binary not found on remote host\n\
         \n\
@@ -650,10 +643,8 @@ async fn try_discover_and_check_version(
 ) -> anyhow::Result<String> {
     // discover rcpd binary on remote host
     let rcpd_path = discover_rcpd_path(session, explicit_path).await?;
-
     // check version compatibility
     check_rcpd_version(session, &rcpd_path, remote_host).await?;
-
     Ok(rcpd_path)
 }
 
@@ -740,7 +731,6 @@ pub async fn start_rcpd(
     tracing::info!("Starting rcpd server on: {:?}", session);
     let remote_host = &session.host;
     let ssh_session = setup_ssh_session(session).await?;
-
     // try to discover rcpd binary on remote host and check version
     let rcpd_path =
         match try_discover_and_check_version(&ssh_session, explicit_rcpd_path, remote_host).await {
@@ -754,16 +744,12 @@ pub async fn start_rcpd(
                     tracing::info!(
                         "rcpd not found or version mismatch, attempting auto-deployment"
                     );
-
                     // find local rcpd binary
                     let local_rcpd = deploy::find_local_rcpd_binary()
                         .context("failed to find local rcpd binary for deployment")?;
-
                     tracing::info!("Found local rcpd binary at {}", local_rcpd.display());
-
                     // get version for deployment path
                     let local_version = common::version::ProtocolVersion::current();
-
                     // deploy to remote host
                     let deployed_path = deploy::deploy_rcpd(
                         &ssh_session,
@@ -773,14 +759,11 @@ pub async fn start_rcpd(
                     )
                     .await
                     .context("failed to deploy rcpd to remote host")?;
-
                     tracing::info!("Successfully deployed rcpd to {}", deployed_path);
-
                     // cleanup old versions (best effort, don't fail if this errors)
                     if let Err(e) = deploy::cleanup_old_versions(&ssh_session, 3).await {
                         tracing::warn!("failed to cleanup old versions (non-fatal): {:#}", e);
                     }
-
                     deployed_path
                 } else {
                     // no auto-deploy, return original error
@@ -788,7 +771,6 @@ pub async fn start_rcpd(
                 }
             }
         };
-
     // run rcpd command remotely
     let rcpd_args = rcpd_config.to_args();
     tracing::debug!("rcpd arguments: {:?}", rcpd_args);

@@ -41,7 +41,7 @@ jobs:
       run: ./scripts/check-remote-test-naming.sh
 
     - name: Lint
-      run: cargo clippy --workspace -- -D warnings
+      run: cargo clippy --workspace --all-targets -- -D warnings
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
 
@@ -84,6 +84,7 @@ jobs:
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
       run: |
+        set -o pipefail
         # Run tests with nextest for better output
         cargo nextest run --no-capture 2>&1 | tee test_output_musl_debug.log
 
@@ -132,6 +133,7 @@ jobs:
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
       run: |
+        set -o pipefail
         # Run tests with nextest in release mode
         cargo nextest run --release --no-capture 2>&1 | tee test_output_musl_release.log
 
@@ -146,6 +148,85 @@ jobs:
       with:
         name: test-logs-musl-release
         path: test_output_musl_release.log
+
+  test-docker:
+    runs-on: ubuntu-latest
+    needs: lint-and-docs
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        targets: x86_64-unknown-linux-musl
+
+    - name: Install musl toolchain deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools pkg-config
+        sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
+
+    - name: Install just
+      uses: taiki-e/install-action@v2
+      with:
+        tool: just
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest
+
+    - name: Build binaries for Docker
+      env:
+        PKG_CONFIG_ALLOW_CROSS: "1"
+      run: cargo build --workspace
+
+    - name: Start Docker containers
+      run: |
+        cd tests/docker
+        docker compose up -d
+
+        # Wait for containers to be healthy and SSH to be ready
+        echo "Waiting for containers to start..."
+        sleep 3
+
+        # Check if SSH daemon is running in containers
+        echo "Checking SSH daemon status..."
+        docker exec rcp-test-master pgrep sshd || echo "SSH not running in master"
+        docker exec rcp-test-host-a pgrep sshd || echo "SSH not running in host-a"
+        docker exec rcp-test-host-b pgrep sshd || echo "SSH not running in host-b"
+
+        # Wait for SSH connectivity (with timeout)
+        echo "Testing SSH connectivity from master to host-a..."
+        TIMEOUT=60
+        ELAPSED=0
+        until docker exec -u testuser rcp-test-master ssh -o ConnectTimeout=5 host-a hostname &> /dev/null; do
+          if [ $ELAPSED -ge $TIMEOUT ]; then
+            echo "ERROR: SSH connectivity timeout after ${TIMEOUT}s"
+            docker exec -u testuser rcp-test-master ssh -v host-a hostname 2>&1 || true
+            docker compose logs
+            exit 1
+          fi
+          echo "Waiting for SSH... (${ELAPSED}s/${TIMEOUT}s)"
+          sleep 2
+          ELAPSED=$((ELAPSED + 2))
+        done
+        echo "SSH connectivity confirmed"
+
+    - name: Run Docker multi-host tests
+      run: cargo nextest run --profile docker --run-ignored only
+
+    - name: Show Docker logs on failure
+      if: failure()
+      run: |
+        cd tests/docker
+        docker compose logs
+
+    - name: Stop Docker containers
+      if: always()
+      run: |
+        cd tests/docker
+        docker compose down
 
   build-glibc:
     runs-on: ubuntu-latest

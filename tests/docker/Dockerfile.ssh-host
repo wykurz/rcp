@@ -1,0 +1,49 @@
+# Alpine-based SSH server for RCP multi-host testing
+FROM alpine:3.19
+
+# Install OpenSSH server and required utilities
+RUN apk add --no-cache \
+    openssh-server \
+    openssh-client \
+    bash \
+    coreutils \
+    findutils \
+    && mkdir -p /var/run/sshd
+
+# Create test user with home directory
+# Use passwd -d to remove password, allowing SSH public key auth
+RUN adduser -D -s /bin/bash testuser \
+    && passwd -d testuser \
+    && mkdir -p /home/testuser/.ssh \
+    && mkdir -p /home/testuser/.local/bin \
+    && chown -R testuser:testuser /home/testuser
+
+# Configure SSH server
+RUN ssh-keygen -A && \
+    sed -i 's/#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && \
+    sed -i 's/#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && \
+    sed -i 's/#AuthorizedKeysFile.*/AuthorizedKeysFile .ssh\/authorized_keys/' /etc/ssh/sshd_config
+
+# Copy SSH keys for authentication
+COPY ssh_keys/id_ed25519 /home/testuser/.ssh/id_ed25519
+COPY ssh_keys/id_ed25519.pub /home/testuser/.ssh/authorized_keys
+COPY ssh_keys/config /home/testuser/.ssh/config
+RUN chown -R testuser:testuser /home/testuser/.ssh && \
+    chmod 700 /home/testuser/.ssh && \
+    chmod 600 /home/testuser/.ssh/id_ed25519 && \
+    chmod 600 /home/testuser/.ssh/authorized_keys && \
+    chmod 600 /home/testuser/.ssh/config
+
+# Add ~/.local/bin to PATH for all users
+ENV PATH="/home/testuser/.local/bin:${PATH}"
+
+# Create test directories
+RUN mkdir -p /tmp/test-data && \
+    chown testuser:testuser /tmp/test-data
+
+# Expose SSH port
+EXPOSE 22
+
+# Start SSH server
+CMD ["/usr/sbin/sshd", "-D", "-e"]
