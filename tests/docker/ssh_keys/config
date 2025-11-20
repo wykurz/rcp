@@ -1,0 +1,25 @@
+# SSH config for RCP Docker test environment
+# This file is copied into the master container by the Dockerfile
+
+Host host-a
+    HostName host-a
+    User testuser
+    IdentityFile ~/.ssh/id_ed25519
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+
+Host host-b
+    HostName host-b
+    User testuser
+    IdentityFile ~/.ssh/id_ed25519
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+
+# Default settings for all hosts
+Host *
+    User testuser
+    IdentityFile ~/.ssh/id_ed25519
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null

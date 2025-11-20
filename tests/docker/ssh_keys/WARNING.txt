@@ -1,0 +1,14 @@
+╔═══════════════════════════════════════════════════════════════════╗
+║                                                                   ║
+║                      ⚠️  TEST KEYS ONLY ⚠️                        ║
+║                                                                   ║
+║  These SSH keys are PUBLICLY VISIBLE and ONLY for Docker tests.  ║
+║                                                                   ║
+║  NEVER use these keys on real servers or production systems!     ║
+║                                                                   ║
+║  They are intentionally checked into version control for test     ║
+║  reproducibility. This is safe ONLY because they're test-only.   ║
+║                                                                   ║
+╚═══════════════════════════════════════════════════════════════════╝
+
+See README.md in this directory for more information.

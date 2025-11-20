@@ -295,7 +295,6 @@ async fn run_rcpd_master(
     } else {
         vec![src.session(), dst.session()]
     };
-
     for session in sessions {
         // determine bind IP: source uses host IP if available, destination uses None
         let (bind_ip, role) = if session == src.session() {
@@ -319,7 +318,6 @@ async fn run_rcpd_master(
         .await?;
         rcpds.push(rcpd);
     }
-
     // if src and dst are the same, we need to start rcpd twice even though we only deployed once
     if src.session() == dst.session() && rcpds.len() == 1 {
         let bind_ip = extract_bind_ip_from_host(&src.session().host);
@@ -338,7 +336,6 @@ async fn run_rcpd_master(
     }
     tracing::info!("Waiting for connections from rcpd processes...");
     let rcpd_connect_timeout = std::time::Duration::from_secs(args.remote_copy_conn_timeout_sec);
-
     // helper to accept a connection and read its role
     let accept_rcpd_connection = |endpoint: quinn::Endpoint, timeout: std::time::Duration| async move {
         let conn = {
