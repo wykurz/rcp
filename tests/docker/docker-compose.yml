@@ -1,0 +1,71 @@
+services:
+  # Master node - where we run rcp commands from
+  master:
+    build:
+      context: .
+      dockerfile: Dockerfile.ssh-host
+    container_name: rcp-test-master
+    hostname: master
+    networks:
+      - rcp-test-net
+    volumes:
+      # Mount compiled binaries (must be built first with: cargo build)
+      # Using musl target (project default) - musl binaries are required; no fallback is implemented
+      - ../../target/x86_64-unknown-linux-musl/debug/rcp:/home/testuser/.local/bin/rcp:ro
+      - ../../target/x86_64-unknown-linux-musl/debug/rcpd:/home/testuser/.local/bin/rcpd:ro
+      - ../../target/x86_64-unknown-linux-musl/debug/rrm:/home/testuser/.local/bin/rrm:ro
+      - ../../target/x86_64-unknown-linux-musl/debug/rlink:/home/testuser/.local/bin/rlink:ro
+      - ../../target/x86_64-unknown-linux-musl/debug/rcmp:/home/testuser/.local/bin/rcmp:ro
+      # SSH keys are copied in Dockerfile with correct permissions
+    ports:
+      # Expose SSH for debugging (ssh -p 2220 testuser@localhost)
+      - "2220:22"
+    # Explicitly run SSH daemon (tty/stdin_open would otherwise override Dockerfile CMD)
+    command: /usr/sbin/sshd -D -e
+
+  # Host A - first remote host
+  host-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.ssh-host
+    container_name: rcp-test-host-a
+    hostname: host-a
+    networks:
+      - rcp-test-net
+    volumes:
+      # Mount compiled binaries
+      - ../../target/x86_64-unknown-linux-musl/debug/rcp:/home/testuser/.local/bin/rcp:ro
+      - ../../target/x86_64-unknown-linux-musl/debug/rcpd:/home/testuser/.local/bin/rcpd:ro
+      - ../../target/x86_64-unknown-linux-musl/debug/rrm:/home/testuser/.local/bin/rrm:ro
+      - ../../target/x86_64-unknown-linux-musl/debug/rlink:/home/testuser/.local/bin/rlink:ro
+      - ../../target/x86_64-unknown-linux-musl/debug/rcmp:/home/testuser/.local/bin/rcmp:ro
+    ports:
+      # Expose SSH for debugging (ssh -p 2221 testuser@localhost)
+      - "2221:22"
+    command: /usr/sbin/sshd -D -e
+
+  # Host B - second remote host
+  host-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.ssh-host
+    container_name: rcp-test-host-b
+    hostname: host-b
+    networks:
+      - rcp-test-net
+    volumes:
+      # Mount compiled binaries
+      - ../../target/x86_64-unknown-linux-musl/debug/rcp:/home/testuser/.local/bin/rcp:ro
+      - ../../target/x86_64-unknown-linux-musl/debug/rcpd:/home/testuser/.local/bin/rcpd:ro
+      - ../../target/x86_64-unknown-linux-musl/debug/rrm:/home/testuser/.local/bin/rrm:ro
+      - ../../target/x86_64-unknown-linux-musl/debug/rlink:/home/testuser/.local/bin/rlink:ro
+      - ../../target/x86_64-unknown-linux-musl/debug/rcmp:/home/testuser/.local/bin/rcmp:ro
+    ports:
+      # Expose SSH for debugging (ssh -p 2222 testuser@localhost)
+      - "2222:22"
+    command: /usr/sbin/sshd -D -e
+
+networks:
+  rcp-test-net:
+    driver: bridge
+    name: rcp-test-network

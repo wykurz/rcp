@@ -68,3 +68,49 @@ ci: lint doc test-all
 # Clean build artifacts
 clean:
     cargo clean
+
+# Docker multi-host integration tests
+# =====================================
+
+# Build binaries for Docker tests (musl target required)
+docker-build:
+    @echo "🔨 Building binaries for Docker tests (musl target)..."
+    cargo build --workspace
+
+# Start Docker containers for multi-host tests
+docker-up: docker-build
+    @echo "🐳 Starting Docker test containers..."
+    cd tests/docker && ./test-helpers.sh start
+
+# Stop Docker containers
+docker-down:
+    @echo "🐳 Stopping Docker test containers..."
+    cd tests/docker && ./test-helpers.sh stop
+
+# Clean test files from containers (keeps containers running)
+docker-clean:
+    @echo "🧹 Cleaning test files from containers..."
+    cd tests/docker && ./test-helpers.sh cleanup
+
+# View logs from all containers
+docker-logs:
+    @echo "📋 Container logs:"
+    cd tests/docker && ./test-helpers.sh logs
+
+# Run Docker tests (requires containers already running)
+docker-test-only:
+    @echo "🧪 Running Docker multi-host tests..."
+    cargo nextest run --profile docker --run-ignored only
+
+# Run Docker tests with full lifecycle (setup -> test -> cleanup)
+docker-test: docker-up docker-test-only docker-down
+    @echo "✅ Docker tests completed!"
+
+# Run Docker tests but keep containers running (useful for development)
+docker-test-keep: docker-up docker-test-only
+    @echo "✅ Docker tests completed (containers still running)"
+    @echo "💡 Run 'just docker-down' when finished"
+
+# Run all tests including Docker integration tests
+test-all-with-docker: test-all docker-test
+    @echo "✅ All tests (including Docker) passed!"

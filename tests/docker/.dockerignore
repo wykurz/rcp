@@ -1,0 +1,10 @@
+# Don't copy build artifacts into Docker build context
+../../target/
+../../.git/
+../../.github/
+
+# Don't copy other test files
+../../tests/
+
+# Keep only what we need: ssh_keys/
+!ssh_keys/
