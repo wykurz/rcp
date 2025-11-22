@@ -787,7 +787,9 @@ pub async fn start_rcpd(
         tracing::debug!("passing --bind-ip {} to rcpd", ip);
         cmd.arg("--bind-ip").arg(ip);
     }
-    // capture stdout and stderr so we can read them later
+    // configure stdin/stdout/stderr
+    // stdin must be piped so rcpd can monitor it for master disconnection (stdin watchdog)
+    cmd.stdin(openssh::Stdio::piped());
     cmd.stdout(openssh::Stdio::piped());
     cmd.stderr(openssh::Stdio::piped());
     tracing::info!("Will run remotely: {cmd:?}");
