@@ -15,6 +15,9 @@ async fn send_root_done(
         .send_control_message(&remote::protocol::DestinationMessage::DestinationDone)
         .await?;
     stream.close().await?;
+    tracing::info!("Sent source done message");
+    // DO NOT close recv stream here - we need to keep it open to receive SourceDone
+    // the stream will be closed after the message loop completes
     tracing::info!("Sent destination done message");
     Ok(())
 }
@@ -361,9 +364,12 @@ async fn create_directory_structure(
                 common::preserve::set_dir_metadata(preserve, metadata, dst).await?;
                 if is_root {
                     tracing::info!("Root directory processed");
-                    send_root_done(control_send_stream).await?;
-                    break;
+                    send_root_done(control_send_stream.clone()).await?;
+                    // continue loop to receive SourceDone from source before closing
+                    // skip decrement_entry since root isn't tracked
+                    continue;
                 }
+                eprintln!("DEBUG: is_root=false, about to decrement");
                 directory_tracker
                     .lock()
                     .await
@@ -450,8 +456,10 @@ async fn create_directory_structure(
                 }
                 if is_root {
                     tracing::info!("Root symlink processed");
-                    send_root_done(control_send_stream).await?;
-                    break;
+                    send_root_done(control_send_stream.clone()).await?;
+                    // continue loop to receive SourceDone from source before closing
+                    // skip decrement_entry since root isn't tracked
+                    continue;
                 }
                 directory_tracker
                     .lock()
@@ -494,7 +502,7 @@ async fn create_directory_structure(
                     .context("Failed to decrement directory entry for skipped symlink")?;
             }
             remote::protocol::SourceMessage::SourceDone => {
-                tracing::info!("Received source done message received");
+                tracing::info!("Received source done message");
                 break;
             }
         }
