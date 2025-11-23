@@ -369,7 +369,6 @@ async fn create_directory_structure(
                     // skip decrement_entry since root isn't tracked
                     continue;
                 }
-                eprintln!("DEBUG: is_root=false, about to decrement");
                 directory_tracker
                     .lock()
                     .await
