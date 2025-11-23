@@ -772,46 +772,139 @@ The codebase has comprehensive test coverage for the remote copy protocol across
 - ✅ Nonexistent source handling
 - ✅ Role ordering scenarios (destination connects first, bidirectional copies, rapid operations)
 
-### 8.3 Potential Coverage Gaps
+### 8.3 Additional Coverage (Added)
 
-The following scenarios may benefit from additional test coverage:
+The following edge cases have been added to the test suite:
 
-**Empty directory handling:**
-- Empty directory as root (directory with `num_entries=0`)
-- Empty nested directories
-- Rationale: Tests DirectoryTracker behavior with zero-entry directories
+**Empty directory handling:** ✅ (remote_tests.rs)
+- `test_remote_copy_empty_directory_root` - Empty directory as root (directory with `num_entries=0`)
+- `test_remote_copy_empty_nested_directories` - Empty nested directories
+- Tests DirectoryTracker behavior with zero-entry directories and proper completion cascading
 
-**Stress testing:**
-- Very deep nesting (100+ levels) to test stack depth and recursion limits
-- Very wide directories (10,000+ files in single directory) to test concurrency limits
-- Large directory trees (100,000+ total files) to test protocol scaling
-- Rationale: Validates resource usage and performance characteristics at scale
+**Deep nesting stress test:** ✅ (remote_tests.rs)
+- `test_remote_copy_very_deep_nesting` - 100+ levels of directory nesting
+- Tests stack depth, recursion limits, and DirectoryTracker cascade over many levels
 
-**Concurrent modification scenarios:**
-- Directory modified during copy to verify assertion behavior
+**Remote protocol edge cases:** ✅ (remote_tests.rs)
+- `test_remote_copy_empty_file_root` - Single empty file as root (zero-byte file transfer)
+- `test_remote_copy_broken_symlink_root` - Root symlink pointing to nonexistent target
+- `test_remote_copy_circular_symlink_root` - Circular symlink references
+- Tests `is_root=true` handling for files and symlinks
+
+### 8.4 Remaining Coverage Gaps
+
+The following scenarios are documented for future test development:
+
+**Large fileset stress tests:** (Deferred to performance test suite)
+- Very wide directories (10,000+ files in single directory)
+- Large directory trees (100,000+ total files)
+- Rationale: Resource-intensive, better suited for dedicated performance/stress testing
+
+**Concurrent modification scenarios:** (Challenging to test reliably)
+- Directory modified during copy (currently causes panic)
 - File modified between stat and read
 - Symlink changed during traversal
-- Rationale: Currently causes panic, but explicit test coverage would document this behavior
+- Rationale: Difficult to trigger reliably in integration tests; current fail-fast behavior is documented
 
-**Network resilience:**
+**Network resilience:** (Requires infrastructure)
 - QUIC connection interruption and recovery
 - Partial stream failures
 - Maximum concurrent stream limits
-- Rationale: Validates protocol behavior under adverse network conditions
+- Rationale: Requires network simulation framework (toxiproxy, tc/netem) not currently available
 
-**Edge cases:**
-- Single empty file as root
-- Root symlink pointing to nonexistent target
-- Directory with only unreadable entries
-- Circular symlink references
-- Rationale: Validates boundary condition handling
+### 8.5 Coverage Assessment
 
-### 8.4 Coverage Assessment
-
-**Overall:** Test coverage is excellent for common use cases and error scenarios. The protocol has been validated across:
+**Overall:** Test coverage is excellent for common use cases, error scenarios, and edge cases. The protocol has been validated across:
 - Local copies (localhost→localhost)
 - Remote copies (client→remote host)
 - Multi-host copies (remote→remote via Docker containers)
 - Error conditions and lifecycle management
 
 **Recommendation:** Current coverage is sufficient for production use. The identified gaps are primarily edge cases and stress scenarios that could be added incrementally to further harden the implementation.
+
+## 9. Future Work
+
+The following improvements and test scenarios are documented for future development:
+
+### 9.1 Graceful Concurrent Modification Handling
+
+**Current Behavior:** Directory modification during copy causes assertion panic and aborts the entire operation.
+
+**Future Enhancement:**
+- Detect directory modification without aborting
+- Continue copy with clear error message indicating which directory was modified
+- Report potentially incomplete directory in final summary
+- Allow users to re-run copy to capture missed files
+
+**Benefits:**
+- Improved robustness when copying from live filesystems
+- Better user experience with partial success rather than complete failure
+- Maintains data integrity by clearly reporting incomplete operations
+
+### 9.2 Performance and Stress Testing
+
+**Large Fileset Tests:**
+- Very wide directories: 10,000+ files in single directory
+- Large directory trees: 100,000+ total files across multiple levels
+- Mixed workload: combination of large files, small files, and many symlinks
+
+**Purpose:**
+- Validate resource usage at scale
+- Identify memory or file descriptor leaks
+- Verify throttle mechanism effectiveness under extreme load
+- Measure throughput characteristics
+
+**Implementation:** Should be added to separate performance/stress test suite with appropriate timeouts and resource monitoring.
+
+### 9.3 Network Resilience Testing
+
+**Scenarios:**
+- QUIC connection interruption during transfer
+- Partial stream failures (some file streams fail while others succeed)
+- Maximum concurrent stream limits reached
+- High latency and packet loss simulation
+- Bandwidth constraints
+
+**Requirements:**
+- Network simulation framework (e.g., toxiproxy, tc/netem)
+- Fault injection infrastructure
+- Multi-machine test environment
+
+**Benefits:**
+- Validates protocol behavior under adverse network conditions
+- Identifies edge cases in error handling and recovery
+- Improves reliability for WAN deployments
+
+### 9.4 Additional Edge Cases
+
+**File Descriptor Exhaustion:**
+- Test behavior when `--max-open-files` limit is reached
+- Verify graceful degradation rather than crash
+
+**Filesystem-Specific Features:**
+- Extended attributes (xattrs) preservation
+- Access Control Lists (ACLs) handling
+- Special filesystem features (CoW, deduplication, compression)
+
+**Platform-Specific Scenarios:**
+- macOS resource forks
+- Windows file attributes (if cross-platform support added)
+- Different filesystem types (NFS, CIFS, FUSE)
+
+### 9.5 Observability Improvements
+
+**Enhanced Metrics:**
+- Per-directory transfer statistics
+- Real-time throughput monitoring
+- QUIC connection statistics (packet loss, RTT, congestion window)
+- Detailed error categorization
+
+**Progress Reporting:**
+- Estimated time remaining based on transfer rate
+- Current directory being processed
+- Number of pending file streams
+
+**Benefits:**
+- Better user visibility into long-running operations
+- Easier troubleshooting of performance issues
+- Foundation for future optimization work

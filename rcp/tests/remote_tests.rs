@@ -1775,3 +1775,155 @@ fn test_remote_auto_deploy_error_checksum_mismatch() {
         "✓ checksum verification is present in deployment (mismatch test requires unit test)"
     );
 }
+
+#[test]
+fn test_remote_copy_empty_directory_root() {
+    // test copying an empty directory via remote protocol
+    // verifies DirStub{num_entries=0} is handled correctly
+    // verifies DirectoryTracker handles zero-entry directory
+    // verifies DirectoryComplete sent immediately
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_subdir = src_dir.path().join("empty_dir");
+    std::fs::create_dir(&src_subdir).unwrap();
+    let dst_subdir = dst_dir.path().join("empty_dir");
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&["--summary", &src_remote, &dst_remote]);
+    // verify directory was created
+    assert!(dst_subdir.exists());
+    assert!(dst_subdir.is_dir());
+    // verify summary shows directory created but no files
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 0);
+    assert_eq!(summary.directories_created, 1);
+    assert_eq!(summary.bytes_copied, 0);
+}
+
+#[test]
+fn test_remote_copy_empty_nested_directories() {
+    // test directory tree with multiple empty directories at various levels
+    // verifies all directories created
+    // verifies DirectoryTracker properly cascades completion
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_root = src_dir.path().join("nested_empty");
+    std::fs::create_dir(&src_root).unwrap();
+    std::fs::create_dir(src_root.join("empty1")).unwrap();
+    std::fs::create_dir(src_root.join("empty2")).unwrap();
+    std::fs::create_dir(src_root.join("empty1/empty1a")).unwrap();
+    let dst_root = dst_dir.path().join("nested_empty");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&["--summary", &src_remote, &dst_remote]);
+    // verify all directories were created
+    assert!(dst_root.exists());
+    assert!(dst_root.join("empty1").exists());
+    assert!(dst_root.join("empty2").exists());
+    assert!(dst_root.join("empty1/empty1a").exists());
+    // verify all are directories
+    assert!(dst_root.is_dir());
+    assert!(dst_root.join("empty1").is_dir());
+    assert!(dst_root.join("empty2").is_dir());
+    assert!(dst_root.join("empty1/empty1a").is_dir());
+    // verify summary
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 0);
+    assert_eq!(summary.directories_created, 4); // root + 3 subdirs
+    assert_eq!(summary.bytes_copied, 0);
+}
+
+#[test]
+fn test_remote_copy_very_deep_nesting() {
+    // test very deep directory structure (100+ levels) via remote protocol
+    // verifies no stack overflow in recursive traversal
+    // verifies DirectoryTracker handles deep nesting
+    // verifies proper completion cascading from deepest to root
+    let (src_dir, dst_dir) = setup_test_env();
+    // create 100 levels of nesting
+    let mut current_path = src_dir.path().join("deep");
+    std::fs::create_dir(&current_path).unwrap();
+    for i in 0..100 {
+        current_path = current_path.join(format!("level{}", i));
+        std::fs::create_dir(&current_path).unwrap();
+    }
+    // create a file at the deepest level
+    create_test_file(&current_path.join("deep.txt"), "deepest", 0o644);
+    let src_root = src_dir.path().join("deep");
+    let dst_root = dst_dir.path().join("deep");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&["--summary", &src_remote, &dst_remote]);
+    // verify deepest file exists
+    let mut verify_path = dst_root.clone();
+    for i in 0..100 {
+        verify_path = verify_path.join(format!("level{}", i));
+    }
+    assert_eq!(get_file_content(&verify_path.join("deep.txt")), "deepest");
+    // verify summary
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 1);
+    assert_eq!(summary.directories_created, 101); // root + 100 levels
+}
+
+#[test]
+fn test_remote_copy_empty_file_root() {
+    // test empty file (0 bytes) copied via remote protocol
+    // verifies File{is_root=true} with zero-byte file transfer
+    // verifies file stream created and closed correctly for zero-byte file
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("empty.txt");
+    let dst_file = dst_dir.path().join("empty.txt");
+    create_test_file(&src_file, "", 0o644);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&["--summary", &src_remote, &dst_remote]);
+    // verify empty file was created
+    assert_eq!(get_file_content(&dst_file), "");
+    // verify summary
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 1);
+    assert_eq!(summary.bytes_copied, 0);
+}
+
+#[test]
+fn test_remote_copy_broken_symlink_root() {
+    // test symlink pointing to nonexistent target via remote protocol
+    // verifies Symlink{is_root=true} message sent
+    // verifies broken symlink created at destination
+    let (src_dir, dst_dir) = setup_test_env();
+    let nonexistent = src_dir.path().join("does_not_exist.txt");
+    let src_link = src_dir.path().join("broken.txt");
+    let dst_link = dst_dir.path().join("broken.txt");
+    std::os::unix::fs::symlink(&nonexistent, &src_link).unwrap();
+    let src_remote = format!("localhost:{}", src_link.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_link.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&["--summary", &src_remote, &dst_remote]);
+    // verify symlink was created and points to nonexistent target
+    assert!(dst_link.is_symlink());
+    assert_eq!(std::fs::read_link(&dst_link).unwrap(), nonexistent);
+    // verify summary
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.symlinks_created, 1);
+}
+
+#[test]
+fn test_remote_copy_circular_symlink_root() {
+    // test circular symlink reference via remote protocol
+    // verifies symlink copied (not dereferenced by default)
+    // verifies root symlink handling
+    let (src_dir, dst_dir) = setup_test_env();
+    let link1 = src_dir.path().join("link1.txt");
+    let link2 = src_dir.path().join("link2.txt");
+    let dst_link = dst_dir.path().join("link1.txt");
+    std::os::unix::fs::symlink(&link2, &link1).unwrap();
+    std::os::unix::fs::symlink(&link1, &link2).unwrap();
+    let src_remote = format!("localhost:{}", link1.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_link.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&["--summary", &src_remote, &dst_remote]);
+    // verify symlink was created
+    assert!(dst_link.is_symlink());
+    // verify it points to link2 (circular reference maintained)
+    assert_eq!(std::fs::read_link(&dst_link).unwrap(), link2);
+    // verify summary
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.symlinks_created, 1);
+}
