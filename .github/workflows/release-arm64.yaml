@@ -15,7 +15,7 @@ jobs:
     permissions: write-all
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v5
+      uses: actions/checkout@v6
     - name: Set up Rust
       uses: actions-rs/toolchain@v1
       with:
@@ -55,7 +55,7 @@ jobs:
     permissions: write-all
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v5
+      uses: actions/checkout@v6
     - name: Set up Rust
       uses: actions-rs/toolchain@v1
       with:
