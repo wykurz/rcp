@@ -41,19 +41,22 @@ pub struct ProtocolVersion {
    - Applies to whichever side is remote (source or destination)
    - Checked via SSH: `test -x /path/to/rcpd`
 
-2. **Deployed cache** - Versioned binary in cache directory (`~/.cache/rcp/bin/rcpd-{version}`)
-   - Used for binaries deployed by rcp itself
-   - Ensures the exact version is available even if not installed system-wide
-   - Checked via SSH on remote host
-
-3. **Same directory** - Next to local rcp binary
-   - Maintains backward compatibility with co-located installations
+2. **Same directory** - Next to local rcp binary
+   - Most likely the rcpd that was built/installed alongside rcp
    - Path derived from `std::env::current_exe()`
    - Checked via SSH on remote host
+   - Preferred over PATH and cache as it represents the most recent local installation
 
-4. **PATH** - Standard Unix locations
+3. **PATH** - Standard Unix locations
    - Uses `which rcpd` on remote host
    - Respects user's PATH configuration
+   - Indicates intentional system-wide or user installation (e.g., via `cargo install`)
+
+4. **Deployed cache** - Versioned binary in cache directory (`~/.cache/rcp/bin/rcpd-{version}`)
+   - Used as last resort for binaries auto-deployed by rcp itself
+   - Ensures the exact version is available even if not installed elsewhere
+   - Checked via SSH on remote host
+   - Only used when rcpd not found in same-directory or PATH
 
 **Graceful handling of HOME not set**:
 - If `HOME` is not available on the remote host, the cache directory check is skipped

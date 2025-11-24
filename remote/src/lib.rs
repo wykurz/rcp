@@ -527,6 +527,10 @@ mod shell_escape_tests {
 /// 1. Explicit path (if provided)
 /// 2. Same directory as local rcp binary
 /// 3. PATH (via `which rcpd`)
+/// 4. Deployed cache directory (~/.cache/rcp/bin/rcpd-{version})
+///
+/// The cache is checked last as it contains auto-deployed binaries and should
+/// only be used as a fallback after checking user-installed locations.
 ///
 /// Returns the path to rcpd if found, otherwise an error
 async fn discover_rcpd_path(
@@ -554,26 +558,6 @@ async fn discover_rcpd_path(
             path
         ));
     }
-    // try deployed cache directory first (reuse already-deployed binaries)
-    // if HOME is not set, skip cache check and continue to other discovery methods
-    let cache_path = if let Ok(home) = get_remote_home(session).await {
-        let path = format!("{}/.cache/rcp/bin/rcpd-{}", home, local_version.semantic);
-        tracing::debug!("Trying deployed cache path: {}", path);
-        let output = session
-            .command("sh")
-            .arg("-c")
-            .arg(format!("test -x {}", shell_escape(&path)))
-            .output()
-            .await?;
-        if output.status.success() {
-            tracing::info!("Found rcpd in deployed cache: {}", path);
-            return Ok(path);
-        }
-        Some(path)
-    } else {
-        tracing::debug!("HOME not set on remote host, skipping cache directory check");
-        None
-    };
     // try same directory as local rcp binary
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(bin_dir) = current_exe.parent() {
@@ -602,15 +586,35 @@ async fn discover_rcpd_path(
             return Ok(path.to_string());
         }
     }
+    // try deployed cache directory as last resort (reuse already-deployed binaries)
+    // if HOME is not set, skip cache check
+    let cache_path = if let Ok(home) = get_remote_home(session).await {
+        let path = format!("{}/.cache/rcp/bin/rcpd-{}", home, local_version.semantic);
+        tracing::debug!("Trying deployed cache path: {}", path);
+        let output = session
+            .command("sh")
+            .arg("-c")
+            .arg(format!("test -x {}", shell_escape(&path)))
+            .output()
+            .await?;
+        if output.status.success() {
+            tracing::info!("Found rcpd in deployed cache: {}", path);
+            return Ok(path);
+        }
+        Some(path)
+    } else {
+        tracing::debug!("HOME not set on remote host, skipping cache directory check");
+        None
+    };
     // build error message with what we searched
     let mut searched = vec![];
+    searched.push("- Same directory as local rcp binary".to_string());
+    searched.push("- PATH (via 'which rcpd')".to_string());
     if let Some(path) = cache_path.as_ref() {
         searched.push(format!("- Deployed cache: {}", path));
     } else {
         searched.push("- Deployed cache: (skipped, HOME not set)".to_string());
     }
-    searched.push("- Same directory as local rcp binary".to_string());
-    searched.push("- PATH (via 'which rcpd')".to_string());
     if let Some(path) = explicit_path {
         searched.insert(
             0,
