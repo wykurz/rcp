@@ -521,6 +521,68 @@ mod shell_escape_tests {
     }
 }
 
+trait DiscoverySession {
+    fn test_executable<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>;
+    fn which<'a>(
+        &'a self,
+        binary: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<Option<String>>> + Send + 'a>,
+    >;
+    fn remote_home<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>;
+}
+
+struct RealDiscoverySession<'a> {
+    session: &'a std::sync::Arc<openssh::Session>,
+}
+
+impl<'a> DiscoverySession for RealDiscoverySession<'a> {
+    fn test_executable<'b>(
+        &'b self,
+        path: &'b str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'b>>
+    {
+        Box::pin(async move {
+            let output = self
+                .session
+                .command("sh")
+                .arg("-c")
+                .arg(format!("test -x {}", shell_escape(path)))
+                .output()
+                .await?;
+            Ok(output.status.success())
+        })
+    }
+    fn which<'b>(
+        &'b self,
+        binary: &'b str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<Option<String>>> + Send + 'b>,
+    > {
+        Box::pin(async move {
+            let output = self.session.command("which").arg(binary).output().await?;
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Ok(Some(path));
+                }
+            }
+            Ok(None)
+        })
+    }
+    fn remote_home<'b>(
+        &'b self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'b>>
+    {
+        Box::pin(get_remote_home(self.session))
+    }
+}
+
 /// Discover rcpd binary on remote host
 ///
 /// Searches in the following order:
@@ -537,17 +599,20 @@ async fn discover_rcpd_path(
     session: &std::sync::Arc<openssh::Session>,
     explicit_path: Option<&str>,
 ) -> anyhow::Result<String> {
+    let real_session = RealDiscoverySession { session };
+    discover_rcpd_path_internal(&real_session, explicit_path, None).await
+}
+
+async fn discover_rcpd_path_internal<S: DiscoverySession + ?Sized>(
+    session: &S,
+    explicit_path: Option<&str>,
+    current_exe_override: Option<std::path::PathBuf>,
+) -> anyhow::Result<String> {
     let local_version = common::version::ProtocolVersion::current();
     // try explicit path first
     if let Some(path) = explicit_path {
         tracing::debug!("Trying explicit rcpd path: {}", path);
-        let output = session
-            .command("sh")
-            .arg("-c")
-            .arg(format!("test -x {}", shell_escape(path)))
-            .output()
-            .await?;
-        if output.status.success() {
+        if session.test_executable(path).await? {
             tracing::info!("Found rcpd at explicit path: {}", path);
             return Ok(path.to_string());
         }
@@ -559,17 +624,14 @@ async fn discover_rcpd_path(
         ));
     }
     // try same directory as local rcp binary
-    if let Ok(current_exe) = std::env::current_exe() {
+    if let Ok(current_exe) = current_exe_override
+        .map(Ok)
+        .unwrap_or_else(std::env::current_exe)
+    {
         if let Some(bin_dir) = current_exe.parent() {
             let path = bin_dir.join("rcpd").display().to_string();
             tracing::debug!("Trying same directory as rcp: {}", path);
-            let output = session
-                .command("sh")
-                .arg("-c")
-                .arg(format!("test -x {}", shell_escape(&path)))
-                .output()
-                .await?;
-            if output.status.success() {
+            if session.test_executable(&path).await? {
                 tracing::info!("Found rcpd in same directory as rcp: {}", path);
                 return Ok(path);
             }
@@ -577,34 +639,29 @@ async fn discover_rcpd_path(
     }
     // try PATH
     tracing::debug!("Trying to find rcpd in PATH");
-    let output = session.command("which").arg("rcpd").output().await?;
-    if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout);
-        let path = path.trim();
-        if !path.is_empty() {
-            tracing::info!("Found rcpd in PATH: {}", path);
-            return Ok(path.to_string());
-        }
+    if let Some(path) = session.which("rcpd").await? {
+        tracing::info!("Found rcpd in PATH: {}", path);
+        return Ok(path);
     }
     // try deployed cache directory as last resort (reuse already-deployed binaries)
     // if HOME is not set, skip cache check
-    let cache_path = if let Ok(home) = get_remote_home(session).await {
-        let path = format!("{}/.cache/rcp/bin/rcpd-{}", home, local_version.semantic);
-        tracing::debug!("Trying deployed cache path: {}", path);
-        let output = session
-            .command("sh")
-            .arg("-c")
-            .arg(format!("test -x {}", shell_escape(&path)))
-            .output()
-            .await?;
-        if output.status.success() {
-            tracing::info!("Found rcpd in deployed cache: {}", path);
-            return Ok(path);
+    let cache_path = match session.remote_home().await {
+        Ok(home) => {
+            let path = format!("{}/.cache/rcp/bin/rcpd-{}", home, local_version.semantic);
+            tracing::debug!("Trying deployed cache path: {}", path);
+            if session.test_executable(&path).await? {
+                tracing::info!("Found rcpd in deployed cache: {}", path);
+                return Ok(path);
+            }
+            Some(path)
         }
-        Some(path)
-    } else {
-        tracing::debug!("HOME not set on remote host, skipping cache directory check");
-        None
+        Err(e) => {
+            tracing::debug!(
+                "HOME not set on remote host, skipping cache directory check: {:#}",
+                e
+            );
+            None
+        }
     };
     // build error message with what we searched
     let mut searched = vec![];
@@ -1222,6 +1279,179 @@ pub mod test_defaults {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    struct MockDiscoverySession {
+        test_responses: HashMap<String, bool>,
+        which_response: Option<String>,
+        home_response: Result<String, String>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl Default for MockDiscoverySession {
+        fn default() -> Self {
+            Self {
+                test_responses: HashMap::new(),
+                which_response: None,
+                home_response: Err("HOME not set".to_string()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl MockDiscoverySession {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with_home(mut self, home: Option<&str>) -> Self {
+            self.home_response = match home {
+                Some(home) => Ok(home.to_string()),
+                None => Err("HOME not set".to_string()),
+            };
+            self
+        }
+        fn with_which(mut self, path: Option<&str>) -> Self {
+            self.which_response = path.map(|p| p.to_string());
+            self
+        }
+        fn set_test_response(&mut self, path: &str, exists: bool) {
+            self.test_responses.insert(path.to_string(), exists);
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl DiscoverySession for MockDiscoverySession {
+        fn test_executable<'a>(
+            &'a self,
+            path: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>
+        {
+            self.calls.lock().unwrap().push(format!("test:{}", path));
+            let exists = self.test_responses.get(path).copied().unwrap_or(false);
+            Box::pin(async move { Ok(exists) })
+        }
+        fn which<'a>(
+            &'a self,
+            binary: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<Option<String>>> + Send + 'a>,
+        > {
+            self.calls.lock().unwrap().push(format!("which:{}", binary));
+            let result = self.which_response.clone();
+            Box::pin(async move { Ok(result) })
+        }
+        fn remote_home<'a>(
+            &'a self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>
+        {
+            self.calls.lock().unwrap().push("home".to_string());
+            let result = self.home_response.clone();
+            Box::pin(async move {
+                match result {
+                    Ok(home) => Ok(home),
+                    Err(e) => Err(anyhow::anyhow!(e)),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_rcpd_prefers_explicit_path() {
+        let mut session = MockDiscoverySession::new();
+        session.set_test_response("/opt/rcpd", true);
+        let path = discover_rcpd_path_internal(&session, Some("/opt/rcpd"), None)
+            .await
+            .expect("should return explicit path");
+        assert_eq!(path, "/opt/rcpd");
+        assert_eq!(session.calls(), vec!["test:/opt/rcpd"]);
+    }
+
+    #[tokio::test]
+    async fn discover_rcpd_explicit_path_errors_without_fallbacks() {
+        let session = MockDiscoverySession::new();
+        let err = discover_rcpd_path_internal(&session, Some("/missing/rcpd"), None)
+            .await
+            .expect_err("should fail when explicit path is missing");
+        assert!(
+            err.to_string()
+                .contains("rcpd binary not found or not executable"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(session.calls(), vec!["test:/missing/rcpd"]);
+    }
+
+    #[tokio::test]
+    async fn discover_rcpd_uses_same_dir_first() {
+        let mut session = MockDiscoverySession::new();
+        session.set_test_response("/custom/bin/rcpd", true);
+        let path =
+            discover_rcpd_path_internal(&session, None, Some(PathBuf::from("/custom/bin/rcp")))
+                .await
+                .expect("should find in same directory");
+        assert_eq!(path, "/custom/bin/rcpd");
+        assert_eq!(session.calls(), vec!["test:/custom/bin/rcpd"]);
+    }
+
+    #[tokio::test]
+    async fn discover_rcpd_falls_back_to_path_after_same_dir() {
+        let mut session = MockDiscoverySession::new().with_which(Some("/usr/bin/rcpd"));
+        session.set_test_response("/custom/bin/rcpd", false);
+        let path =
+            discover_rcpd_path_internal(&session, None, Some(PathBuf::from("/custom/bin/rcp")))
+                .await
+                .expect("should find in PATH after same dir miss");
+        assert_eq!(path, "/usr/bin/rcpd");
+        assert_eq!(session.calls(), vec!["test:/custom/bin/rcpd", "which:rcpd"]);
+    }
+
+    #[tokio::test]
+    async fn discover_rcpd_uses_cache_last() {
+        let mut session = MockDiscoverySession::new()
+            .with_home(Some("/home/rcp"))
+            .with_which(None);
+        session.set_test_response("/custom/bin/rcpd", false);
+        let local_version = common::version::ProtocolVersion::current();
+        let cache_path = format!("/home/rcp/.cache/rcp/bin/rcpd-{}", local_version.semantic);
+        session.set_test_response(&cache_path, true);
+        let path =
+            discover_rcpd_path_internal(&session, None, Some(PathBuf::from("/custom/bin/rcp")))
+                .await
+                .expect("should fall back to cache");
+        assert_eq!(path, cache_path);
+        assert_eq!(
+            session.calls(),
+            vec![
+                "test:/custom/bin/rcpd".to_string(),
+                "which:rcpd".to_string(),
+                "home".to_string(),
+                format!("test:{cache_path}")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_rcpd_reports_home_missing_in_error() {
+        let mut session = MockDiscoverySession::new().with_which(None);
+        session.set_test_response("/custom/bin/rcpd", false);
+        let err =
+            discover_rcpd_path_internal(&session, None, Some(PathBuf::from("/custom/bin/rcp")))
+                .await
+                .expect_err("should fail when nothing is found");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Deployed cache: (skipped, HOME not set)"),
+            "expected searched list to mention skipped cache, got: {msg}"
+        );
+        assert_eq!(
+            session.calls(),
+            vec!["test:/custom/bin/rcpd", "which:rcpd", "home"]
+        );
+    }
 
     /// verify that tokio_unstable is enabled
     ///
