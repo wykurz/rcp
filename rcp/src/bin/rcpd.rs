@@ -272,12 +272,21 @@ async fn run_operation(
             .await
             {
                 Ok((message, summary)) => {
-                    remote::protocol::RcpdResult::Success { message, summary }
+                    let runtime_stats = common::collect_runtime_stats();
+                    remote::protocol::RcpdResult::Success {
+                        message,
+                        summary,
+                        runtime_stats,
+                    }
                 }
-                Err(error) => remote::protocol::RcpdResult::Failure {
-                    error: format!("{error:#}"),
-                    summary: common::copy::Summary::default(),
-                },
+                Err(error) => {
+                    let runtime_stats = common::collect_runtime_stats();
+                    remote::protocol::RcpdResult::Failure {
+                        error: format!("{error:#}"),
+                        summary: common::copy::Summary::default(),
+                        runtime_stats,
+                    }
+                }
             }
         }
         remote::protocol::MasterHello::Destination {
@@ -298,12 +307,21 @@ async fn run_operation(
             .await
             {
                 Ok((message, summary)) => {
-                    remote::protocol::RcpdResult::Success { message, summary }
+                    let runtime_stats = common::collect_runtime_stats();
+                    remote::protocol::RcpdResult::Success {
+                        message,
+                        summary,
+                        runtime_stats,
+                    }
                 }
-                Err(error) => remote::protocol::RcpdResult::Failure {
-                    error: format!("{error:#}"),
-                    summary: common::copy::Summary::default(),
-                },
+                Err(error) => {
+                    let runtime_stats = common::collect_runtime_stats();
+                    remote::protocol::RcpdResult::Failure {
+                        error: format!("{error:#}"),
+                        summary: common::copy::Summary::default(),
+                        runtime_stats,
+                    }
+                }
             }
         }
     };
@@ -406,9 +424,11 @@ async fn async_main(
                 match result {
                     Ok(r) => r,
                     Err(e) => {
+                        let runtime_stats = common::collect_runtime_stats();
                         remote::protocol::RcpdResult::Failure {
                             error: format!("{e:#}"),
                             summary: common::copy::Summary::default(),
+                            runtime_stats,
                         }
                     }
                 }
@@ -428,10 +448,14 @@ async fn async_main(
         // stdin not available - rely on QUIC timeouts only
         match run_operation(args.clone(), master_connection.clone()).await {
             Ok(r) => r,
-            Err(e) => remote::protocol::RcpdResult::Failure {
-                error: format!("{e:#}"),
-                summary: common::copy::Summary::default(),
-            },
+            Err(e) => {
+                let runtime_stats = common::collect_runtime_stats();
+                remote::protocol::RcpdResult::Failure {
+                    error: format!("{e:#}"),
+                    summary: common::copy::Summary::default(),
+                    runtime_stats,
+                }
+            }
         }
     };
     // shutdown tracing sender with timeout to handle dead connections
@@ -453,8 +477,13 @@ async fn async_main(
         remote::protocol::RcpdResult::Success {
             message,
             summary: _,
+            runtime_stats: _,
         } => Ok(message),
-        remote::protocol::RcpdResult::Failure { error, summary: _ } => {
+        remote::protocol::RcpdResult::Failure {
+            error,
+            summary: _,
+            runtime_stats: _,
+        } => {
             tracing::error!("rcpd operation failed: {error}");
             Err(anyhow::anyhow!("rcpd operation failed: {error}"))
         }

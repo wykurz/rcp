@@ -301,14 +301,19 @@ pub struct SourceMasterHello {
     pub cert_fingerprint: Vec<u8>,
 }
 
+// re-export RuntimeStats from common for convenience
+pub use common::RuntimeStats;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum RcpdResult {
     Success {
         message: String,
         summary: common::copy::Summary,
+        runtime_stats: common::RuntimeStats,
     },
     Failure {
         error: String,
         summary: common::copy::Summary,
+        runtime_stats: common::RuntimeStats,
     },
 }

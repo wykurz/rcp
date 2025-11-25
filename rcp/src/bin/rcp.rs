@@ -453,30 +453,53 @@ async fn run_rcpd_master(
         .await?
         .expect("Failed to receive RcpdResult from destination rcpd");
     tracing::debug!("Received RcpdResult from both source and destination rcpds");
-    // check for failures and collect error details
+    // check for failures and collect error details + runtime stats
     let mut errors = Vec::new();
-    let _source_summary = match source_result {
-        remote::protocol::RcpdResult::Success { message, summary } => {
+    let (_source_summary, source_runtime_stats) = match source_result {
+        remote::protocol::RcpdResult::Success {
+            message,
+            summary,
+            runtime_stats,
+        } => {
             tracing::info!("Source rcpd completed successfully: {message}");
-            summary
+            (summary, runtime_stats)
         }
-        remote::protocol::RcpdResult::Failure { error, summary } => {
+        remote::protocol::RcpdResult::Failure {
+            error,
+            summary,
+            runtime_stats,
+        } => {
             tracing::error!("Source rcpd failed: {error}");
             errors.push(format!("Source: {error}"));
-            summary
+            (summary, runtime_stats)
         }
     };
-    let dest_summary = match dest_result {
-        remote::protocol::RcpdResult::Success { message, summary } => {
+    let (dest_summary, dest_runtime_stats) = match dest_result {
+        remote::protocol::RcpdResult::Success {
+            message,
+            summary,
+            runtime_stats,
+        } => {
             tracing::info!("Destination rcpd completed successfully: {message}");
-            summary
+            (summary, runtime_stats)
         }
-        remote::protocol::RcpdResult::Failure { error, summary } => {
+        remote::protocol::RcpdResult::Failure {
+            error,
+            summary,
+            runtime_stats,
+        } => {
             tracing::error!("Destination rcpd failed: {error}");
             errors.push(format!("Destination: {error}"));
-            summary
+            (summary, runtime_stats)
         }
     };
+    // store remote runtime stats for display at the end
+    common::set_remote_runtime_stats(common::RemoteRuntimeStats {
+        source_host: src.session().host.clone(),
+        source_stats: source_runtime_stats,
+        dest_host: dst.session().host.clone(),
+        dest_stats: dest_runtime_stats,
+    });
     // close connections which will cause rcpd processes to exit and tracing tasks to finish
     source_connection.close();
     dest_connection.close();
