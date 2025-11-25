@@ -552,11 +552,14 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
             );
         }
     }
+    let parsed_srcs: Vec<path::PathType> = src_strings
+        .iter()
+        .map(|src| path::parse_path(src))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     // pick the path type of the first source in the list and ensure all other sources match
-    let first_src_path_type = path::parse_path(&src_strings[0]);
-    for src in &src_strings[1..] {
-        let path_type = path::parse_path(src);
-        if path_type != first_src_path_type {
+    let first_src_path_type = parsed_srcs[0].clone();
+    for path_type in &parsed_srcs[1..] {
+        if *path_type != first_src_path_type {
             return Err(anyhow!(
                 "Cannot mix different path types in the source list: {:?} and {:?}",
                 first_src_path_type,
@@ -567,13 +570,11 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
     let dst_string = args.paths.last().unwrap();
     // validate destination path for problematic patterns (applies to both local and remote)
     path::validate_destination_path(dst_string)?;
+    let dst_parsed = path::parse_path(dst_string)?;
     // check if we have remote paths
     let has_remote_paths = match first_src_path_type {
         path::PathType::Remote(_) => true,
-        path::PathType::Local(_) => {
-            // check if destination is remote
-            matches!(path::parse_path(dst_string), path::PathType::Remote(_))
-        }
+        path::PathType::Local(_) => matches!(dst_parsed, path::PathType::Remote(_)),
     };
     // for remote paths, we only support single source
     if has_remote_paths && src_strings.len() > 1 {
@@ -585,8 +586,8 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
     let remote_src_dst = if has_remote_paths {
         // resolve destination path with trailing slash logic for remote case
         let resolved_dst_string = path::resolve_destination_path(&src_strings[0], dst_string)?;
-        let resolved_dst_path_type = path::parse_path(&resolved_dst_string);
-        match (first_src_path_type, resolved_dst_path_type) {
+        let resolved_dst_path_type = path::parse_path(&resolved_dst_string)?;
+        match (first_src_path_type.clone(), resolved_dst_path_type) {
             (path::PathType::Remote(src_remote), path::PathType::Remote(dst_remote)) => {
                 Some((src_remote, dst_remote))
             }
@@ -613,7 +614,30 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         common::preserve::preserve_default()
     };
     tracing::debug!("preserve settings: {:?}", &preserve);
-    if let Some((remote_src, remote_dst)) = remote_src_dst {
+    if let Some((mut remote_src, mut remote_dst)) = remote_src_dst {
+        // expand remote '~' using remote HOME if needed
+        let same_session = remote_src.session() == remote_dst.session();
+        if same_session && (remote_src.needs_remote_home() || remote_dst.needs_remote_home()) {
+            let home = remote::get_remote_home_for_session(remote_src.session()).await?;
+            remote_src.apply_remote_home(&home);
+            remote_dst.apply_remote_home(&home);
+        } else {
+            if remote_src.needs_remote_home() {
+                let home = remote::get_remote_home_for_session(remote_src.session()).await?;
+                remote_src.apply_remote_home(&home);
+            }
+            if remote_dst.needs_remote_home() {
+                let home = remote::get_remote_home_for_session(remote_dst.session()).await?;
+                remote_dst.apply_remote_home(&home);
+            }
+        }
+        if !remote_src.path().is_absolute() || !remote_dst.path().is_absolute() {
+            return Err(anyhow!(
+                "Remote paths must be absolute after expansion: src={:?}, dst={:?}",
+                remote_src.path(),
+                remote_dst.path()
+            ));
+        }
         return match run_rcpd_master(&args, &preserve, &remote_src, &remote_dst).await {
             Ok(summary) => Ok(summary),
             Err(error) => {
@@ -635,9 +659,18 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
     }
     let src_dst: Vec<(std::path::PathBuf, std::path::PathBuf)> = src_strings
         .iter()
-        .map(|src| {
-            let resolved_dst = path::resolve_destination_path(src, dst_string)?;
-            let dst_path = std::path::PathBuf::from(&resolved_dst);
+        .zip(parsed_srcs.iter())
+        .map(|(src_str, parsed_src)| {
+            let resolved_dst = path::resolve_destination_path(src_str, dst_string)?;
+            let dst_path = path::expand_local_home(&resolved_dst)?;
+            let src_path = match parsed_src {
+                path::PathType::Local(p) => p.clone(),
+                path::PathType::Remote(_) => {
+                    return Err(anyhow!(
+                        "Internal error: unexpected remote path in local copy branch"
+                    ))
+                }
+            };
             // check for existing destination only when not using trailing slash (single source case)
             if src_strings.len() == 1 && !dst_string.ends_with('/') && dst_path.exists() && !args.overwrite {
                 return Err(anyhow!(
@@ -646,7 +679,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
                     --overwrite if you want to overwrite it"
                 ));
             }
-            Ok((std::path::PathBuf::from(src), dst_path))
+            Ok((src_path, dst_path))
         })
         .collect::<anyhow::Result<Vec<(std::path::PathBuf, std::path::PathBuf)>>>()?;
     let settings = common::copy::Settings {
@@ -703,7 +736,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
 
 fn has_remote_paths(args: &Args) -> bool {
     for path in &args.paths {
-        if let path::PathType::Remote(_) = path::parse_path(path) {
+        if matches!(path::parse_path(path), Ok(path::PathType::Remote(_))) {
             return true;
         }
     }

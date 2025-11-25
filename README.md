@@ -82,6 +82,13 @@ Log tool output to a file while using progress bar:
 ```
 Progress bar is sent to `stderr` while log messages go to `stdout`. This allows us to pipe `stdout` to a file to preserve the tool output while still viewing the interactive progress bar. This works for all RCP tools.
 
+Path handling (tilde `~` support)
+----------------------------------
+
+- Local paths: leading `~` or `~/...` expands to your local `$HOME`.
+- Remote paths: leading `~/...` expands to the remote user’s `$HOME` (resolved over SSH). Other `~user` forms are not supported.
+- Remote paths may be absolute, start with `~/`, or be relative. Relative remote paths are resolved against the local current working directory before being used remotely.
+
 Remove a path recursively:
 ```fish
 > rrm <bar> --progress --summary

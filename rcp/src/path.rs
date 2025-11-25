@@ -1,15 +1,26 @@
-#[derive(Debug)]
+use anyhow::Context;
+
+#[derive(Debug, Clone)]
 pub struct RemotePath {
     session: remote::SshSession,
     path: std::path::PathBuf,
+    needs_remote_home: bool,
 }
 
 impl RemotePath {
-    pub fn new(session: remote::SshSession, path: std::path::PathBuf) -> anyhow::Result<Self> {
-        if !path.is_absolute() {
+    pub fn new(
+        session: remote::SshSession,
+        path: std::path::PathBuf,
+        needs_remote_home: bool,
+    ) -> anyhow::Result<Self> {
+        if !needs_remote_home && !path.is_absolute() {
             return Err(anyhow::anyhow!("Path must be absolute: {}", path.display()));
         }
-        Ok(Self { session, path })
+        Ok(Self {
+            session,
+            path,
+            needs_remote_home,
+        })
     }
 
     #[must_use]
@@ -17,6 +28,7 @@ impl RemotePath {
         Self {
             session: remote::SshSession::local(),
             path: path.to_path_buf(),
+            needs_remote_home: false,
         }
     }
 
@@ -28,6 +40,19 @@ impl RemotePath {
     #[must_use]
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    #[must_use]
+    pub fn needs_remote_home(&self) -> bool {
+        self.needs_remote_home
+    }
+
+    pub fn apply_remote_home(&mut self, home: &std::path::Path) {
+        if self.needs_remote_home {
+            let suffix = &self.path;
+            self.path = home.join(suffix);
+            self.needs_remote_home = false;
+        }
     }
 }
 
@@ -46,6 +71,15 @@ impl PartialEq for PathType {
             (PathType::Remote(remote1), PathType::Remote(remote2)) => {
                 remote1.session() == remote2.session()
             }
+        }
+    }
+}
+
+impl Clone for PathType {
+    fn clone(&self) -> Self {
+        match self {
+            PathType::Local(p) => PathType::Local(p.clone()),
+            PathType::Remote(r) => PathType::Remote(r.clone()),
         }
     }
 }
@@ -98,8 +132,22 @@ fn join_path_with_filename(host_prefix: Option<String>, dir_path: &str, filename
     }
 }
 
-#[must_use]
-pub fn parse_path(path: &str) -> PathType {
+pub fn expand_local_home(path: &str) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .context("HOME environment variable is not set; required for '~/' expansion")?;
+        return Ok(home.join(rest));
+    } else if path == "~" {
+        let home = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .context("HOME environment variable is not set; required for '~' expansion")?;
+        return Ok(home);
+    }
+    Ok(std::path::PathBuf::from(path))
+}
+
+pub fn parse_path(path: &str) -> anyhow::Result<PathType> {
     let re = get_remote_path_regex();
     if let Some(captures) = re.captures(path) {
         // It's a remote path
@@ -108,23 +156,32 @@ pub fn parse_path(path: &str) -> PathType {
         let port = captures
             .name("port")
             .and_then(|m| m.as_str().parse::<u16>().ok());
-        let remote_path = captures
+        let path_part = captures
             .name("path")
             .expect("Unable to extract file system path from provided remote path")
             .as_str();
-        let remote_path = if std::path::Path::new(remote_path).is_absolute() {
-            std::path::Path::new(remote_path).to_path_buf()
+        let (remote_path, needs_remote_home) = if path_part == "~" || path_part == "~/" {
+            (std::path::PathBuf::new(), true)
+        } else if path_part.starts_with("~/") {
+            let suffix = path_part.trim_start_matches("~/");
+            (std::path::PathBuf::from(suffix), true)
         } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("/"))
-                .join(remote_path)
+            let remote_path = std::path::PathBuf::from(path_part);
+            if remote_path.is_absolute() {
+                (remote_path, false)
+            } else {
+                let cwd = std::env::current_dir().context("failed to read current directory")?;
+                (cwd.join(remote_path), false)
+            }
         };
-        PathType::Remote(
-            RemotePath::new(remote::SshSession { user, host, port }, remote_path).unwrap(), // parse_path assumes valid paths for now
-        )
+        Ok(PathType::Remote(RemotePath::new(
+            remote::SshSession { user, host, port },
+            remote_path,
+            needs_remote_home,
+        )?))
     } else {
         // It's a local path
-        PathType::Local(path.into())
+        Ok(PathType::Local(expand_local_home(path)?))
     }
 }
 
@@ -205,7 +262,7 @@ mod tests {
 
     #[test]
     fn test_parse_path_local() {
-        match parse_path("/path/to/file") {
+        match parse_path("/path/to/file").unwrap() {
             PathType::Local(path) => assert_eq!(path.to_str().unwrap(), "/path/to/file"),
             _ => panic!("Expected local path"),
         }
@@ -213,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_parse_path_remote_basic() {
-        match parse_path("host:/path/to/file") {
+        match parse_path("host:/path/to/file").unwrap() {
             PathType::Remote(remote_path) => {
                 assert_eq!(remote_path.session().user, None);
                 assert_eq!(remote_path.session().host, "host");
@@ -226,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_parse_path_remote_full() {
-        match parse_path("user@host:22:/path/to/file") {
+        match parse_path("user@host:22:/path/to/file").unwrap() {
             PathType::Remote(remote_path) => {
                 assert_eq!(remote_path.session().user, Some("user".to_string()));
                 assert_eq!(remote_path.session().host, "host");
@@ -239,7 +296,7 @@ mod tests {
 
     #[test]
     fn test_parse_path_ipv6() {
-        match parse_path("[2001:db8::1]:/path/to/file") {
+        match parse_path("[2001:db8::1]:/path/to/file").unwrap() {
             PathType::Remote(remote_path) => {
                 assert_eq!(remote_path.session().user, None);
                 assert_eq!(remote_path.session().host, "[2001:db8::1]");
@@ -248,6 +305,79 @@ mod tests {
             }
             _ => panic!("Expected remote path"),
         }
+    }
+
+    #[test]
+    fn test_parse_path_local_tilde_expands() {
+        let tmp_home = tempfile::tempdir().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", tmp_home.path());
+        match parse_path("~/docs/file.txt").unwrap() {
+            PathType::Local(path) => {
+                assert_eq!(path, tmp_home.path().join("docs/file.txt"));
+            }
+            _ => panic!("Expected local path"),
+        }
+        if let Some(prev) = original_home {
+            std::env::set_var("HOME", prev);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn test_parse_path_remote_tilde_requires_resolution() {
+        match parse_path("host:~/file.txt").unwrap() {
+            PathType::Remote(remote_path) => {
+                assert!(remote_path.needs_remote_home());
+                assert_eq!(remote_path.path(), std::path::Path::new("file.txt"));
+            }
+            _ => panic!("Expected remote path"),
+        }
+    }
+
+    #[test]
+    fn test_parse_path_remote_bare_tilde() {
+        match parse_path("host:~").unwrap() {
+            PathType::Remote(remote_path) => {
+                assert!(remote_path.needs_remote_home());
+                assert_eq!(remote_path.path(), std::path::Path::new(""));
+            }
+            _ => panic!("Expected remote path"),
+        }
+    }
+
+    #[test]
+    fn test_parse_path_remote_tilde_dir() {
+        match parse_path("host:~/").unwrap() {
+            PathType::Remote(remote_path) => {
+                assert!(remote_path.needs_remote_home());
+                assert_eq!(remote_path.path(), std::path::Path::new(""));
+            }
+            _ => panic!("Expected remote path"),
+        }
+    }
+
+    #[test]
+    fn test_parse_path_remote_relative_resolved_to_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        match parse_path("host:relative/path").unwrap() {
+            PathType::Remote(remote_path) => {
+                assert_eq!(remote_path.path(), &cwd.join("relative/path"));
+            }
+            _ => panic!("Expected remote path"),
+        }
+    }
+
+    #[test]
+    fn test_remote_path_apply_home() {
+        let session = remote::SshSession::local();
+        let mut remote_path =
+            RemotePath::new(session, std::path::PathBuf::from("file.txt"), true).unwrap();
+        let home = std::path::Path::new("/home/tester");
+        remote_path.apply_remote_home(home);
+        assert_eq!(remote_path.path(), &home.join("file.txt"));
+        assert!(!remote_path.needs_remote_home());
     }
 
     #[test]
@@ -480,7 +610,7 @@ mod tests {
             );
 
             // Test that parse_path can parse the same string
-            match parse_path(case) {
+            match parse_path(case).unwrap() {
                 PathType::Remote(remote) => {
                     assert_eq!(
                         remote.path().to_str().unwrap(),

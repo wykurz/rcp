@@ -234,6 +234,66 @@ fn test_remote_copy_localhost() {
 }
 
 #[test]
+fn test_remote_copy_tilde_source_to_local() {
+    require_local_ssh();
+    let home = make_test_home();
+    let override_home = home.path().to_str().unwrap().to_string();
+    let src_file = home.path().join("tilde_source.txt");
+    create_test_file(&src_file, "tilde home content", 0o644);
+    let dst_dir = tempfile::tempdir().unwrap();
+    let dst_file = dst_dir.path().join("tilde_source.txt");
+    let src_remote = "localhost:~/tilde_source.txt".to_string();
+    let output = run_rcp_with_args_home_and_env(
+        &[&src_remote, dst_file.to_str().unwrap()],
+        home.path(),
+        &[("RCP_REMOTE_HOME_OVERRIDE", override_home.as_str())],
+    );
+    print_command_output(&output);
+    assert!(output.status.success());
+    assert_eq!(get_file_content(&dst_file), "tilde home content");
+}
+
+#[test]
+fn test_remote_copy_local_to_tilde_destination() {
+    require_local_ssh();
+    let home = make_test_home();
+    let override_home = home.path().to_str().unwrap().to_string();
+    let (src_dir, _) = setup_test_env();
+    let src_file = src_dir.path().join("tilde_dest.txt");
+    create_test_file(&src_file, "tilde dest content", 0o644);
+    let dst_remote = "localhost:~/tilde_dest.txt".to_string();
+    let output = run_rcp_with_args_home_and_env(
+        &[src_file.to_str().unwrap(), &dst_remote],
+        home.path(),
+        &[("RCP_REMOTE_HOME_OVERRIDE", override_home.as_str())],
+    );
+    print_command_output(&output);
+    assert!(output.status.success());
+    let remote_dst = home.path().join("tilde_dest.txt");
+    assert_eq!(get_file_content(&remote_dst), "tilde dest content");
+}
+
+#[test]
+fn test_remote_copy_local_to_tilde_home_directory() {
+    require_local_ssh();
+    let home = make_test_home();
+    let override_home = home.path().to_str().unwrap().to_string();
+    let (src_dir, _) = setup_test_env();
+    let src_file = src_dir.path().join("tilde_home_dir.txt");
+    create_test_file(&src_file, "tilde home dir content", 0o644);
+    let dst_remote = "localhost:~/".to_string();
+    let output = run_rcp_with_args_home_and_env(
+        &[src_file.to_str().unwrap(), &dst_remote],
+        home.path(),
+        &[("RCP_REMOTE_HOME_OVERRIDE", override_home.as_str())],
+    );
+    print_command_output(&output);
+    assert!(output.status.success());
+    let remote_dst = home.path().join("tilde_home_dir.txt");
+    assert_eq!(get_file_content(&remote_dst), "tilde home dir content");
+}
+
+#[test]
 fn test_remote_copy_localhost_to_local() {
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
