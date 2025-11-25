@@ -631,6 +631,10 @@ where
     Error: std::fmt::Display + std::fmt::Debug,
     Fut: std::future::Future<Output = Result<Summary, Error>>,
 {
+    // force initialization of PROGRESS to set start_time at the beginning of the run
+    // (for remote master operations, PROGRESS is otherwise only accessed at the end in
+    // print_runtime_stats(), leading to near-zero walltime)
+    let _ = get_progress();
     // validate configuration
     if let Err(e) = throttle.validate() {
         eprintln!("Configuration error: {e}");
