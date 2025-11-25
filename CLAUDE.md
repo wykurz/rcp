@@ -165,6 +165,8 @@ This ensures doc examples stay in sync with actual function signatures.
 
 The `rcpd` daemon enables distributed copying operations. It connects to a master process (`rcp`) and can run as either source or destination side, using QUIC protocol for communication.
 
+**Environment requirements for remote tests:** localhost SSH must be available and usable (running sshd, accessible via `ssh localhost`). Remote integration tests assert this requirement and will **fail fast** if it is not met; they are never skipped based on environment.
+
 ### QUIC Connection Timeouts
 
 Both `rcp` and `rcpd` accept CLI arguments to configure QUIC connection behavior:

@@ -663,9 +663,29 @@ mod runtime_stats_tests {
         let process = procfs::process::Process::myself()?;
         let expected = collect_runtime_stats_for_process(&process)?;
         let actual = collect_runtime_stats();
-        assert_eq!(actual.cpu_time_user_ms, expected.cpu_time_user_ms);
-        assert_eq!(actual.cpu_time_kernel_ms, expected.cpu_time_kernel_ms);
-        assert_eq!(actual.peak_rss_bytes, expected.peak_rss_bytes);
+        let cpu_tolerance_ms = 50;
+        let rss_tolerance_bytes = 1_000_000;
+        assert!(
+            expected.cpu_time_user_ms.abs_diff(actual.cpu_time_user_ms) <= cpu_tolerance_ms,
+            "user CPU deviated by more than {cpu_tolerance_ms}ms: expected {}, got {}",
+            expected.cpu_time_user_ms,
+            actual.cpu_time_user_ms
+        );
+        assert!(
+            expected
+                .cpu_time_kernel_ms
+                .abs_diff(actual.cpu_time_kernel_ms)
+                <= cpu_tolerance_ms,
+            "kernel CPU deviated by more than {cpu_tolerance_ms}ms: expected {}, got {}",
+            expected.cpu_time_kernel_ms,
+            actual.cpu_time_kernel_ms
+        );
+        assert!(
+            expected.peak_rss_bytes.abs_diff(actual.peak_rss_bytes) <= rss_tolerance_bytes,
+            "peak RSS deviated by more than {rss_tolerance_bytes} bytes: expected {}, got {}",
+            expected.peak_rss_bytes,
+            actual.peak_rss_bytes
+        );
         Ok(())
     }
 

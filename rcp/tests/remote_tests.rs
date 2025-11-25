@@ -33,7 +33,11 @@ fn interpret_exit_code(code: i32) -> String {
     }
 }
 
-fn run_rcp_with_args(args: &[&str]) -> std::process::Output {
+fn run_rcp_with_args_internal(
+    args: &[&str],
+    home: Option<&std::path::Path>,
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
     let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
     let mut cmd = std::process::Command::new("timeout");
     // 90 second timeout - SSH connection setup + auto-deployment can take ~40-50s total
@@ -42,7 +46,74 @@ fn run_rcp_with_args(args: &[&str]) -> std::process::Output {
     cmd.args(["90", rcp_path.to_str().unwrap()]);
     cmd.arg("-vv"); // Always use maximum verbosity
     cmd.args(args);
+    if let Some(home) = home {
+        cmd.env("HOME", home);
+    }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
     cmd.output().expect("Failed to execute rcp command")
+}
+
+fn run_rcp_with_args(args: &[&str]) -> std::process::Output {
+    run_rcp_with_args_internal(args, None, &[])
+}
+
+fn run_rcp_with_args_home_and_env(
+    args: &[&str],
+    home: &std::path::Path,
+    envs: &[(&str, &str)],
+) -> std::process::Output {
+    run_rcp_with_args_internal(args, Some(home), envs)
+}
+
+fn cache_bin_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".cache/rcp/bin")
+}
+
+fn make_test_home() -> tempfile::TempDir {
+    let temp_home = tempfile::tempdir().unwrap();
+    if let Ok(real_home) = std::env::var("HOME") {
+        let ssh_src = std::path::Path::new(&real_home).join(".ssh");
+        let ssh_dest = temp_home.path().join(".ssh");
+        if ssh_src.exists() && !ssh_dest.exists() {
+            // allow SSH to find existing keys/known_hosts when we override HOME
+            let _ = std::os::unix::fs::symlink(&ssh_src, &ssh_dest);
+        }
+    }
+    temp_home
+}
+
+fn local_ssh_available() -> bool {
+    static SSH_AVAILABLE: std::sync::OnceLock<(bool, String)> = std::sync::OnceLock::new();
+    let (ok, msg) = SSH_AVAILABLE.get_or_init(|| {
+        match std::process::Command::new("ssh")
+            .args(["-o", "BatchMode=yes", "localhost", "true"])
+            .output()
+        {
+            Ok(output) => (
+                output.status.success(),
+                format!(
+                    "ssh exit: {:?}, stdout: {}, stderr: {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ),
+            Err(err) => (false, format!("failed to invoke ssh: {err:#}")),
+        }
+    });
+    if !ok {
+        eprintln!("localhost ssh check failed: {msg}");
+    }
+    *ok
+}
+
+fn require_local_ssh() {
+    assert!(
+        local_ssh_available(),
+        "localhost SSH is required for remote tests. Please ensure sshd is running and accessible."
+    );
 }
 
 fn print_command_output(output: &std::process::Output) {
@@ -139,6 +210,7 @@ fn parse_summary_from_output(output: &std::process::Output) -> Option<common::co
 
 #[test]
 fn test_remote_copy_basic() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("test.txt");
     let dst_file = dst_dir.path().join("test.txt");
@@ -150,6 +222,7 @@ fn test_remote_copy_basic() {
 
 #[test]
 fn test_remote_copy_localhost() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("test.txt");
     let dst_file = dst_dir.path().join("test.txt");
@@ -162,6 +235,7 @@ fn test_remote_copy_localhost() {
 
 #[test]
 fn test_remote_copy_localhost_to_local() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("source.txt");
     let dst_file = dst_dir.path().join("destination.txt");
@@ -173,6 +247,7 @@ fn test_remote_copy_localhost_to_local() {
 
 #[test]
 fn test_remote_copy_local_to_localhost() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("local_source.txt");
     let dst_file = dst_dir.path().join("remote_destination.txt");
@@ -184,6 +259,7 @@ fn test_remote_copy_local_to_localhost() {
 
 #[test]
 fn test_remote_copy_with_preserve() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("preserve_test.txt");
     let dst_file = dst_dir.path().join("preserve_test.txt");
@@ -198,6 +274,7 @@ fn test_remote_copy_with_preserve() {
 
 #[test]
 fn test_remote_copy_directory() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_subdir = src_dir.path().join("remote_subdir");
     let dst_subdir = dst_dir.path().join("remote_subdir");
@@ -226,6 +303,7 @@ fn test_remote_copy_directory() {
 
 #[test]
 fn test_remote_copy_symlink_no_dereference() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let target_file = src_dir.path().join("target.txt");
     let symlink_file = src_dir.path().join("symlink.txt");
@@ -247,6 +325,7 @@ fn test_remote_copy_symlink_no_dereference() {
 
 #[test]
 fn test_remote_copy_symlink_with_dereference() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let target_file = src_dir.path().join("target.txt");
     let symlink_file = src_dir.path().join("symlink.txt");
@@ -267,6 +346,7 @@ fn test_remote_copy_symlink_with_dereference() {
 
 #[test]
 fn test_remote_copy_with_overwrite() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("overwrite_test.txt");
     let dst_file = dst_dir.path().join("overwrite_test.txt");
@@ -289,6 +369,7 @@ fn test_remote_copy_with_overwrite() {
 
 #[test]
 fn test_remote_copy_without_overwrite_fails() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("no_overwrite_test.txt");
     let dst_file = dst_dir.path().join("no_overwrite_test.txt");
@@ -309,6 +390,7 @@ fn test_remote_copy_without_overwrite_fails() {
 
 #[test]
 fn test_remote_copy_comprehensive() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create a complex directory structure with files and symlinks
     let src_subdir = src_dir.path().join("comprehensive");
@@ -348,6 +430,7 @@ fn test_remote_copy_comprehensive() {
 
 #[test]
 fn test_remote_symlink_chain_dereference() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // Create a chain of symlinks: foo -> bar -> baz (actual file)
     let baz_file = src_dir.path().join("baz_file.txt");
@@ -387,6 +470,7 @@ fn test_remote_symlink_chain_dereference() {
 
 #[test]
 fn test_remote_symlink_chain_no_dereference() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // Create a chain of symlinks: foo -> bar -> baz (actual file)
     let baz_file = src_dir.path().join("baz_file.txt");
@@ -429,6 +513,7 @@ fn test_remote_symlink_chain_no_dereference() {
 
 #[test]
 fn test_remote_dereference_directory_symlink() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // Create a directory with specific permissions and files
     let target_dir = src_dir.path().join("target_directory");
@@ -469,6 +554,7 @@ fn test_remote_dereference_directory_symlink() {
 
 #[test]
 fn test_remote_dereference_file_symlink_permissions() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // Create files with different permissions
     let file1 = src_dir.path().join("file1.txt");
@@ -505,6 +591,7 @@ fn test_remote_dereference_file_symlink_permissions() {
 
 #[test]
 fn test_remote_debug_log_file_creation() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("debug_log_test.txt");
     let dst_file = dst_dir.path().join("debug_log_test.txt");
@@ -564,6 +651,7 @@ fn test_remote_debug_log_file_creation() {
 
 #[test]
 fn test_remote_copy_port_range() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("port_range_test.txt");
     let dst_file = dst_dir.path().join("port_range_test.txt");
@@ -581,6 +669,7 @@ fn test_remote_copy_port_range() {
 
 #[test]
 fn test_remote_overwrite_directory_with_directory() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create source directory structure
     let src_subdir = src_dir.path().join("mydir");
@@ -612,6 +701,7 @@ fn test_remote_overwrite_directory_with_directory() {
 
 #[test]
 fn test_remote_overwrite_file_with_directory() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create source directory
     let src_subdir = src_dir.path().join("mydir");
@@ -640,6 +730,7 @@ fn test_remote_overwrite_file_with_directory() {
 
 #[test]
 fn test_remote_overwrite_directory_with_file() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create source file
     let src_file = src_dir.path().join("myfile.txt");
@@ -665,6 +756,7 @@ fn test_remote_overwrite_directory_with_file() {
 
 #[test]
 fn test_remote_overwrite_symlink_with_symlink_same_target() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create target file
     let target = src_dir.path().join("target.txt");
@@ -690,6 +782,7 @@ fn test_remote_overwrite_symlink_with_symlink_same_target() {
 
 #[test]
 fn test_remote_overwrite_symlink_with_symlink_different_target() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create source symlink
     let src_link = src_dir.path().join("link.txt");
@@ -710,6 +803,7 @@ fn test_remote_overwrite_symlink_with_symlink_different_target() {
 
 #[test]
 fn test_remote_overwrite_file_with_symlink() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create source symlink
     let src_link = src_dir.path().join("item.txt");
@@ -730,6 +824,7 @@ fn test_remote_overwrite_file_with_symlink() {
 
 #[test]
 fn test_remote_overwrite_symlink_with_file() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create source file
     let src_file = src_dir.path().join("item.txt");
@@ -748,6 +843,7 @@ fn test_remote_overwrite_symlink_with_file() {
 
 #[test]
 fn test_remote_overwrite_directory_with_symlink() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create source symlink
     let src_link = src_dir.path().join("item");
@@ -769,6 +865,7 @@ fn test_remote_overwrite_directory_with_symlink() {
 
 #[test]
 fn test_remote_overwrite_symlink_with_directory() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // Create source directory
     let src_subdir = src_dir.path().join("item");
@@ -788,6 +885,7 @@ fn test_remote_overwrite_symlink_with_directory() {
 
 #[test]
 fn test_remote_copy_nonexistent_source() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let nonexistent_src = src_dir.path().join("does_not_exist.txt");
     let dst_file = dst_dir.path().join("destination.txt");
@@ -803,6 +901,7 @@ fn test_remote_copy_nonexistent_source() {
 
 #[test]
 fn test_remote_copy_destination_parent_missing() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("source.txt");
     create_test_file(&src_file, "content", 0o644);
@@ -820,6 +919,7 @@ fn test_remote_copy_destination_parent_missing() {
 
 #[test]
 fn test_remote_copy_unreadable_source() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // test with a single unreadable file case (no permissions)
     let src_file = src_dir.path().join("unreadable.txt");
@@ -834,6 +934,7 @@ fn test_remote_copy_unreadable_source() {
 
 #[test]
 fn test_remote_copy_directory_with_unreadable_files_continue() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create directory structure with some unreadable files
     let src_subdir = src_dir.path().join("mixed_dir");
@@ -880,6 +981,7 @@ fn test_remote_copy_directory_with_unreadable_files_continue() {
 
 #[test]
 fn test_remote_copy_directory_with_unreadable_files_fail_early() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create test with readable file first, then unreadable file
     // this ensures directory gets created before failure
@@ -916,6 +1018,7 @@ fn test_remote_copy_directory_with_unreadable_files_fail_early() {
 
 #[test]
 fn test_remote_copy_nested_directories_with_unreadable_files() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create nested directory structure with some unreadable files
     let src_root = src_dir.path().join("root");
@@ -964,6 +1067,7 @@ fn test_remote_copy_nested_directories_with_unreadable_files() {
 
 #[test]
 fn test_remote_copy_mixed_success_with_symlink_errors() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create directory with files and symlinks, some operations will fail
     let src_subdir = src_dir.path().join("mixed_ops");
@@ -1018,6 +1122,7 @@ fn test_remote_copy_mixed_success_with_symlink_errors() {
 
 #[test]
 fn test_remote_copy_all_operations_fail() {
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create a directory with only unreadable files
     let src_subdir = src_dir.path().join("all_fail");
@@ -1046,6 +1151,7 @@ fn test_remote_copy_all_operations_fail() {
 #[test]
 fn test_remote_copy_unwritable_destination() {
     // this test verifies behavior when destination directory is not writable
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create source file
     let src_file = src_dir.path().join("source.txt");
@@ -1123,6 +1229,7 @@ fn create_large_test_file(path: &std::path::Path, size_mb: usize) {
 fn test_remote_rcpd_exits_when_master_killed() {
     // verify that rcpd processes exit when the master (rcp) is killed
     // the stdin watchdog should detect master death immediately
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create a very large file (200MB) to ensure copy takes ~10 seconds over localhost
     let src_file = src_dir.path().join("large_file.dat");
@@ -1176,6 +1283,7 @@ fn test_remote_rcpd_exits_when_master_killed() {
 fn test_remote_rcpd_exits_when_master_killed_with_throttle() {
     // alternative test that uses throttling to ensure copy is in progress when killed
     // verifies the stdin watchdog works correctly
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create a moderate file (50MB)
     let src_file = src_dir.path().join("throttled_file.dat");
@@ -1239,6 +1347,7 @@ fn test_remote_rcpd_exits_when_master_killed_with_throttle() {
 #[test]
 fn test_remote_rcpd_no_zombie_processes() {
     // verify that rcpd processes don't become zombies after master exits
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create a small file for quick copy
     let src_file = src_dir.path().join("test.txt");
@@ -1328,6 +1437,7 @@ fn test_remote_rcpd_no_zombie_processes() {
 #[test]
 fn test_remote_rcpd_with_custom_quic_timeouts() {
     // verify that custom QUIC timeout values are accepted and work correctly
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("test.txt");
     create_test_file(&src_file, "test content", 0o644);
@@ -1355,6 +1465,7 @@ fn test_remote_rcpd_with_custom_quic_timeouts() {
 #[test]
 fn test_remote_rcpd_aggressive_timeout_configuration() {
     // verify that moderately aggressive timeout values work correctly (for LAN environments)
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("test.txt");
     create_test_file(&src_file, "test content", 0o644);
@@ -1384,6 +1495,9 @@ fn test_remote_rcpd_aggressive_timeout_configuration() {
 fn test_remote_auto_deploy_rcpd() {
     // test automatic deployment of rcpd binary to remote host
     // NOTE: This test temporarily moves rcpd binary to force deployment
+    let home = make_test_home();
+    let override_home = home.path().to_str().unwrap().to_string();
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("auto_deploy_test.txt");
     let dst_file = dst_dir.path().join("auto_deploy_test.txt");
@@ -1402,10 +1516,7 @@ fn test_remote_auto_deploy_rcpd() {
         .as_str()
         .expect("Missing semantic version");
     // clean up any previously deployed rcpd for this version to force deployment
-    let cache_dir = std::path::PathBuf::from(
-        std::env::var("HOME").expect("HOME environment variable not set - required for test"),
-    )
-    .join(".cache/rcp/bin");
+    let cache_dir = cache_bin_dir(home.path());
     let deployed_rcpd = cache_dir.join(format!("rcpd-{}", semantic_version));
     if deployed_rcpd.exists() {
         eprintln!(
@@ -1421,12 +1532,16 @@ fn test_remote_auto_deploy_rcpd() {
         "Testing auto-deployment with version {} (using --rcpd-path=/nonexistent/rcpd)",
         semantic_version
     );
-    let output = run_rcp_with_args(&[
-        "--auto-deploy-rcpd",
-        "--rcpd-path=/nonexistent/rcpd",
-        &src_remote,
-        &dst_remote,
-    ]);
+    let output = run_rcp_with_args_home_and_env(
+        &[
+            "--auto-deploy-rcpd",
+            "--rcpd-path=/nonexistent/rcpd",
+            &src_remote,
+            &dst_remote,
+        ],
+        home.path(),
+        &[("RCP_REMOTE_HOME_OVERRIDE", override_home.as_str())],
+    );
     print_command_output(&output);
     // verify the copy succeeded
     assert!(
@@ -1456,6 +1571,9 @@ fn test_remote_auto_deploy_rcpd() {
 #[test]
 fn test_remote_auto_deploy_reuses_cached_binary() {
     // test that auto-deployment reuses already-deployed binary
+    let home = make_test_home();
+    let override_home = home.path().to_str().unwrap().to_string();
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("cached_deploy_test.txt");
     let dst_file = dst_dir.path().join("cached_deploy_test.txt");
@@ -1465,12 +1583,16 @@ fn test_remote_auto_deploy_reuses_cached_binary() {
     // first run with --auto-deploy-rcpd to ensure binary is deployed
     // use --rcpd-path=/nonexistent to force deployment (discovery will fail)
     eprintln!("First run: ensuring rcpd is deployed");
-    let output1 = run_rcp_with_args(&[
-        "--auto-deploy-rcpd",
-        "--rcpd-path=/nonexistent/rcpd",
-        &src_remote,
-        &dst_remote,
-    ]);
+    let output1 = run_rcp_with_args_home_and_env(
+        &[
+            "--auto-deploy-rcpd",
+            "--rcpd-path=/nonexistent/rcpd",
+            &src_remote,
+            &dst_remote,
+        ],
+        home.path(),
+        &[("RCP_REMOTE_HOME_OVERRIDE", override_home.as_str())],
+    );
     print_command_output(&output1);
     assert!(
         output1.status.success(),
@@ -1486,10 +1608,7 @@ fn test_remote_auto_deploy_reuses_cached_binary() {
     let semantic_version = version_json["semantic"]
         .as_str()
         .expect("Missing semantic version");
-    let cache_dir = std::path::PathBuf::from(
-        std::env::var("HOME").expect("HOME environment variable not set - required for test"),
-    )
-    .join(".cache/rcp/bin");
+    let cache_dir = cache_bin_dir(home.path());
     let deployed_rcpd = cache_dir.join(format!("rcpd-{}", semantic_version));
     let first_mtime = std::fs::metadata(&deployed_rcpd)
         .expect("deployed rcpd should exist")
@@ -1503,7 +1622,11 @@ fn test_remote_auto_deploy_reuses_cached_binary() {
     let src_remote2 = format!("localhost:{}", src_file2.to_str().unwrap());
     let dst_remote2 = format!("localhost:{}", dst_file2.to_str().unwrap());
     eprintln!("Second run: should reuse deployed binary");
-    let output2 = run_rcp_with_args(&["--auto-deploy-rcpd", &src_remote2, &dst_remote2]);
+    let output2 = run_rcp_with_args_home_and_env(
+        &["--auto-deploy-rcpd", &src_remote2, &dst_remote2],
+        home.path(),
+        &[("RCP_REMOTE_HOME_OVERRIDE", override_home.as_str())],
+    );
     print_command_output(&output2);
     assert!(output2.status.success(), "Second copy should also succeed");
     // verify mtime hasn't changed (binary wasn't re-deployed)
@@ -1522,6 +1645,9 @@ fn test_remote_auto_deploy_reuses_cached_binary() {
 #[test]
 fn test_remote_auto_deploy_cleanup_old_versions() {
     // test that auto-deployment cleans up old versions (keeps last 3)
+    let home = make_test_home();
+    let override_home = home.path().to_str().unwrap().to_string();
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("cleanup_test.txt");
     let dst_file = dst_dir.path().join("cleanup_test.txt");
@@ -1529,10 +1655,7 @@ fn test_remote_auto_deploy_cleanup_old_versions() {
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
     // create fake old version binaries in the cache directory
-    let cache_dir = std::path::PathBuf::from(
-        std::env::var("HOME").expect("HOME environment variable not set - required for test"),
-    )
-    .join(".cache/rcp/bin");
+    let cache_dir = cache_bin_dir(home.path());
     std::fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
     // create several fake old version files (simulating old deployments)
     // these should be cleaned up, keeping only the last 3
@@ -1551,12 +1674,16 @@ fn test_remote_auto_deploy_cleanup_old_versions() {
             .expect("Failed to set mtime");
     }
     // run auto-deployment which should deploy current version and clean up old ones
-    let output = run_rcp_with_args(&[
-        "--auto-deploy-rcpd",
-        "--rcpd-path=/nonexistent/rcpd",
-        &src_remote,
-        &dst_remote,
-    ]);
+    let output = run_rcp_with_args_home_and_env(
+        &[
+            "--auto-deploy-rcpd",
+            "--rcpd-path=/nonexistent/rcpd",
+            &src_remote,
+            &dst_remote,
+        ],
+        home.path(),
+        &[("RCP_REMOTE_HOME_OVERRIDE", override_home.as_str())],
+    );
     print_command_output(&output);
     assert!(
         output.status.success(),
@@ -1605,6 +1732,7 @@ fn test_remote_auto_deploy_cleanup_old_versions() {
 #[test]
 fn test_remote_auto_deploy_error_explicit_rcpd_not_found() {
     // test error handling when explicit --rcpd-path points to nonexistent binary
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("test.txt");
     let dst_file = dst_dir.path().join("test.txt");
@@ -1644,6 +1772,9 @@ fn test_remote_auto_deploy_error_explicit_rcpd_not_found() {
 #[test]
 fn test_remote_auto_deploy_error_permission_denied() {
     // test error handling when deployment fails due to permission denied
+    let home = make_test_home();
+    let override_home = home.path().to_str().unwrap().to_string();
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("test.txt");
     let dst_file = dst_dir.path().join("test.txt");
@@ -1651,22 +1782,23 @@ fn test_remote_auto_deploy_error_permission_denied() {
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
     // make ~/.cache/rcp/bin read-only to trigger permission denied
-    let cache_bin_dir = std::path::PathBuf::from(
-        std::env::var("HOME").expect("HOME environment variable not set - required for test"),
-    )
-    .join(".cache/rcp/bin");
+    let cache_bin_dir = cache_bin_dir(home.path());
     // create the directory if it doesn't exist
     std::fs::create_dir_all(&cache_bin_dir).expect("failed to create cache directory");
     // make it read-only (mode 555)
     std::fs::set_permissions(&cache_bin_dir, std::fs::Permissions::from_mode(0o555))
         .expect("failed to set permissions");
     // run auto-deployment which should fail due to permission denied
-    let output = run_rcp_with_args(&[
-        "--auto-deploy-rcpd",
-        "--rcpd-path=/nonexistent/rcpd",
-        &src_remote,
-        &dst_remote,
-    ]);
+    let output = run_rcp_with_args_home_and_env(
+        &[
+            "--auto-deploy-rcpd",
+            "--rcpd-path=/nonexistent/rcpd",
+            &src_remote,
+            &dst_remote,
+        ],
+        home.path(),
+        &[("RCP_REMOTE_HOME_OVERRIDE", override_home.as_str())],
+    );
     // restore write permissions before checking results
     std::fs::set_permissions(&cache_bin_dir, std::fs::Permissions::from_mode(0o755))
         .expect("failed to restore permissions");
@@ -1700,6 +1832,9 @@ fn test_remote_auto_deploy_error_permission_denied() {
 fn test_remote_auto_deploy_error_checksum_mismatch() {
     // test that checksum mismatch is detected and reported.
     // this test verifies the integrity verification works
+    let home = make_test_home();
+    let override_home = home.path().to_str().unwrap().to_string();
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("test.txt");
     let dst_file = dst_dir.path().join("test.txt");
@@ -1707,19 +1842,20 @@ fn test_remote_auto_deploy_error_checksum_mismatch() {
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
     // first, do a successful deployment
-    let output = run_rcp_with_args(&[
-        "--auto-deploy-rcpd",
-        "--rcpd-path=/nonexistent/rcpd",
-        &src_remote,
-        &dst_remote,
-    ]);
+    let output = run_rcp_with_args_home_and_env(
+        &[
+            "--auto-deploy-rcpd",
+            "--rcpd-path=/nonexistent/rcpd",
+            &src_remote,
+            &dst_remote,
+        ],
+        home.path(),
+        &[("RCP_REMOTE_HOME_OVERRIDE", override_home.as_str())],
+    );
     assert!(output.status.success(), "initial deployment should succeed");
     assert!(dst_file.exists(), "copy should succeed");
     // now corrupt the deployed binary in cache
-    let cache_dir = std::path::PathBuf::from(
-        std::env::var("HOME").expect("HOME environment variable not set - required for test"),
-    )
-    .join(".cache/rcp/bin");
+    let cache_dir = cache_bin_dir(home.path());
     // find the deployed rcpd binary (rcpd-0.22.0 or similar)
     let mut deployed_binary = None;
     if let Ok(entries) = std::fs::read_dir(&cache_dir) {
@@ -1782,6 +1918,7 @@ fn test_remote_copy_empty_directory_root() {
     // verifies DirStub{num_entries=0} is handled correctly
     // verifies DirectoryTracker handles zero-entry directory
     // verifies DirectoryComplete sent immediately
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_subdir = src_dir.path().join("empty_dir");
     std::fs::create_dir(&src_subdir).unwrap();
@@ -1804,6 +1941,7 @@ fn test_remote_copy_empty_nested_directories() {
     // test directory tree with multiple empty directories at various levels
     // verifies all directories created
     // verifies DirectoryTracker properly cascades completion
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_root = src_dir.path().join("nested_empty");
     std::fs::create_dir(&src_root).unwrap();
@@ -1837,6 +1975,7 @@ fn test_remote_copy_very_deep_nesting() {
     // verifies no stack overflow in recursive traversal
     // verifies DirectoryTracker handles deep nesting
     // verifies proper completion cascading from deepest to root
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create 100 levels of nesting
     let mut current_path = src_dir.path().join("deep");
@@ -1869,6 +2008,7 @@ fn test_remote_copy_empty_file_root() {
     // test empty file (0 bytes) copied via remote protocol
     // verifies File{is_root=true} with zero-byte file transfer
     // verifies file stream created and closed correctly for zero-byte file
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("empty.txt");
     let dst_file = dst_dir.path().join("empty.txt");
@@ -1889,6 +2029,7 @@ fn test_remote_copy_broken_symlink_root() {
     // test symlink pointing to nonexistent target via remote protocol
     // verifies Symlink{is_root=true} message sent
     // verifies broken symlink created at destination
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let nonexistent = src_dir.path().join("does_not_exist.txt");
     let src_link = src_dir.path().join("broken.txt");
@@ -1910,6 +2051,7 @@ fn test_remote_copy_circular_symlink_root() {
     // test circular symlink reference via remote protocol
     // verifies symlink copied (not dereferenced by default)
     // verifies root symlink handling
+    require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let link1 = src_dir.path().join("link1.txt");
     let link2 = src_dir.path().join("link2.txt");
