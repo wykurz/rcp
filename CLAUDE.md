@@ -151,6 +151,11 @@ tracing::error!("operation failed: {}", &error);   // Only shows outer message!
 - `common/src/link.rs::link_tests::test_link_destination_permission_error_includes_root_cause`
 - `common/src/filegen.rs::tests::test_permission_error_includes_root_cause`
 
+### Comment and Doc Style
+
+- Doc comments (`///` or `//!`) should start with a capitalized sentence and read naturally.
+- Regular code comments (`//`) should start lowercase per repository conventions.
+
 ## Testing
 
 The project uses standard Cargo testing. Each tool has its own `tests/` directory with integration tests.

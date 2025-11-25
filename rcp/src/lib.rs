@@ -1,7 +1,6 @@
 //! Fast file operations tools - `rcp` (copy) and `rcpd` (remote copy daemon)
 //!
-//! This crate provides high-performance file copying tools that are significantly faster than
-//! traditional tools like `cp` when dealing with large numbers of files.
+//! This crate provides high-performance file copying tools that are significantly faster than traditional tools like `cp` when dealing with large numbers of files.
 //!
 //! # Tools
 //!
@@ -109,8 +108,7 @@
 //!
 //! ## Local Copy Architecture
 //!
-//! Local copying uses async I/O with multiple worker threads to maximize throughput
-//! when dealing with large numbers of files.
+//! Local copying uses async I/O with multiple worker threads to maximize throughput when dealing with large numbers of files.
 //!
 //! ## Remote Copy Architecture
 //!
@@ -134,8 +132,7 @@
 //! 5. Destination connects directly to Source
 //! 6. Data flows directly from Source to Destination (not through Master)
 //!
-//! This architecture ensures efficient data transfer while allowing the Master to
-//! coordinate the operation and monitor progress.
+//! This architecture ensures efficient data transfer while allowing the Master to coordinate the operation and monitor progress.
 //!
 //! For detailed network connectivity and troubleshooting information, see the
 //! `docs/network_connectivity.md` file in the repository.
@@ -170,8 +167,8 @@
 //!
 //! # Library Usage
 //!
-//! This crate also provides library functions for integrating remote copy functionality
-//! into other Rust applications. See the module documentation for details.
+//! This crate also provides library functions for integrating remote copy functionality into other Rust applications.
+//! See the module documentation for details.
 
 // Library for shared code between rcp and rcpd binaries
 pub mod destination;

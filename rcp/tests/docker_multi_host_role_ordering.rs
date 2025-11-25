@@ -1,7 +1,6 @@
 //! Tests for role ordering and connection timing scenarios.
 //!
-//! These tests verify the fix for the role-matching bug where source/destination
-//! roles could be swapped if rcpd connections arrived out of order (commit c03db61).
+//! These tests verify the fix for the role-matching bug where source/destination roles could be swapped if rcpd connections arrived out of order (commit c03db61).
 //!
 //! ## Background
 //!

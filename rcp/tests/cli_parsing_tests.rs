@@ -1,12 +1,10 @@
 //! CLI Argument Parsing Compatibility Tests
 //!
-//! These tests verify that command-line arguments are parsed correctly and maintain
-//! backward compatibility. The focus is on ensuring that argument values, aliases,
-//! and formats continue to work as expected across versions.
+//! These tests verify that command-line arguments are parsed correctly and maintain backward compatibility.
+//! The focus is on ensuring that argument values, aliases, and formats continue to work as expected across versions.
 //!
-//! Tests in this file should NOT be modified to match new behavior unless it's
-//! intentional and documented in the changelog. Breaking changes here indicate
-//! potential issues for existing users.
+//! Tests in this file should NOT be modified to match new behavior unless it's intentional and documented in the changelog.
+//! Breaking changes here indicate potential issues for existing users.
 
 use assert_cmd::Command;
 
