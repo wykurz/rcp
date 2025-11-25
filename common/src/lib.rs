@@ -141,7 +141,7 @@ impl std::fmt::Display for RcpdType {
 pub type ProgressSnapshot<T> = enum_map::EnumMap<RcpdType, T>;
 
 /// runtime statistics collected from a process (CPU time, memory usage)
-#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub struct RuntimeStats {
     /// user-mode CPU time in milliseconds
     pub cpu_time_user_ms: u64,
@@ -161,7 +161,7 @@ pub struct RemoteRuntimeStats {
 }
 
 /// checks if a host string refers to the local machine.
-/// returns true for "localhost", "127.0.0.1", "\:\:1", "[\:\:1]", or the actual hostname
+/// returns true for `localhost`, `127.0.0.1`, `::1`, `[::1]`, or the actual hostname
 #[must_use]
 pub fn is_localhost(host: &str) -> bool {
     if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
@@ -614,22 +614,28 @@ fn read_env_or_default<T: std::str::FromStr>(name: &str, default: T) -> T {
 /// collects runtime statistics (CPU time, memory) for the current process
 #[must_use]
 pub fn collect_runtime_stats() -> RuntimeStats {
-    let process = match procfs::process::Process::myself() {
-        Ok(p) => p,
-        Err(_) => return RuntimeStats::default(),
+    collect_runtime_stats_inner(procfs::process::Process::myself().ok())
+}
+
+fn collect_runtime_stats_inner(process: Option<procfs::process::Process>) -> RuntimeStats {
+    let Some(process) = process else {
+        return RuntimeStats::default();
     };
-    let stat = match process.stat() {
-        Ok(s) => s,
-        Err(_) => return RuntimeStats::default(),
-    };
+    collect_runtime_stats_for_process(&process).unwrap_or_default()
+}
+
+fn collect_runtime_stats_for_process(
+    process: &procfs::process::Process,
+) -> anyhow::Result<RuntimeStats> {
+    let stat = process.stat()?;
     let clock_ticks = procfs::ticks_per_second() as f64;
     // vmhwm from /proc/[pid]/status is in kB, convert to bytes
-    let vmhwm_kb = process.status().ok().and_then(|s| s.vmhwm).unwrap_or(0);
-    RuntimeStats {
+    let vmhwm_kb = process.status()?.vmhwm.unwrap_or(0);
+    Ok(RuntimeStats {
         cpu_time_user_ms: ((stat.utime as f64 / clock_ticks) * 1000.0) as u64,
         cpu_time_kernel_ms: ((stat.stime as f64 / clock_ticks) * 1000.0) as u64,
         peak_rss_bytes: vmhwm_kb * 1024,
-    }
+    })
 }
 
 fn print_runtime_stats_for_role(prefix: &str, stats: &RuntimeStats) {
@@ -645,6 +651,33 @@ fn print_runtime_stats_for_role(prefix: &str, stats: &RuntimeStats) {
         "{prefix}peak RSS : {}",
         bytesize::ByteSize(stats.peak_rss_bytes)
     );
+}
+
+#[cfg(test)]
+mod runtime_stats_tests {
+    use super::*;
+    use anyhow::Result;
+
+    #[test]
+    fn collect_runtime_stats_matches_procfs_snapshot() -> Result<()> {
+        let process = procfs::process::Process::myself()?;
+        let expected = collect_runtime_stats_for_process(&process)?;
+        let actual = collect_runtime_stats();
+        assert_eq!(actual.cpu_time_user_ms, expected.cpu_time_user_ms);
+        assert_eq!(actual.cpu_time_kernel_ms, expected.cpu_time_kernel_ms);
+        assert_eq!(actual.peak_rss_bytes, expected.peak_rss_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn collect_runtime_stats_returns_default_on_error() {
+        let stats = collect_runtime_stats_inner(None);
+        assert_eq!(stats, RuntimeStats::default());
+
+        let nonexistent_process = procfs::process::Process::new(i32::MAX).ok();
+        let stats = collect_runtime_stats_inner(nonexistent_process);
+        assert_eq!(stats, RuntimeStats::default());
+    }
 }
 
 #[rustfmt::skip]

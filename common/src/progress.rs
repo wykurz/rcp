@@ -296,6 +296,7 @@ impl<'a> ProgressPrinter<'a> {
 }
 
 pub struct RcpdProgressPrinter {
+    start_time: std::time::Instant,
     last_source_ops: u64,
     last_source_bytes: u64,
     last_source_files: u64,
@@ -307,19 +308,29 @@ pub struct RcpdProgressPrinter {
 impl RcpdProgressPrinter {
     #[must_use]
     pub fn new() -> Self {
+        let now = std::time::Instant::now();
         Self {
+            start_time: now,
             last_source_ops: 0,
             last_source_bytes: 0,
             last_source_files: 0,
             last_dest_ops: 0,
             last_dest_bytes: 0,
-            last_update: std::time::Instant::now(),
+            last_update: now,
         }
     }
 
-    fn calculate_rate(&self, current: u64, last: u64, duration_secs: f64) -> f64 {
+    fn calculate_current_rate(&self, current: u64, last: u64, duration_secs: f64) -> f64 {
         if duration_secs > 0.0 {
             (current - last) as f64 / duration_secs
+        } else {
+            0.0
+        }
+    }
+
+    fn calculate_average_rate(&self, total: u64, total_duration_secs: f64) -> f64 {
+        if total_duration_secs > 0.0 {
+            total as f64 / total_duration_secs
         } else {
             0.0
         }
@@ -331,34 +342,47 @@ impl RcpdProgressPrinter {
         dest_progress: &SerializableProgress,
     ) -> anyhow::Result<String> {
         let time_now = std::time::Instant::now();
+        let total_duration_secs = (time_now - self.start_time).as_secs_f64();
         let curr_duration_secs = (time_now - self.last_update).as_secs_f64();
-        // source metrics (ops, bytes, files)
-        let source_ops_rate = self.calculate_rate(
+        // source current rates
+        let source_ops_rate_curr = self.calculate_current_rate(
             source_progress.ops_finished,
             self.last_source_ops,
             curr_duration_secs,
         );
-        let source_bytes_rate = self.calculate_rate(
+        let source_bytes_rate_curr = self.calculate_current_rate(
             source_progress.bytes_copied,
             self.last_source_bytes,
             curr_duration_secs,
         );
-        let source_files_rate = self.calculate_rate(
+        let source_files_rate_curr = self.calculate_current_rate(
             source_progress.files_copied,
             self.last_source_files,
             curr_duration_secs,
         );
-        // destination metrics (ops, bytes)
-        let dest_ops_rate = self.calculate_rate(
+        // source average rates
+        let source_ops_rate_avg =
+            self.calculate_average_rate(source_progress.ops_finished, total_duration_secs);
+        let source_bytes_rate_avg =
+            self.calculate_average_rate(source_progress.bytes_copied, total_duration_secs);
+        let source_files_rate_avg =
+            self.calculate_average_rate(source_progress.files_copied, total_duration_secs);
+        // destination current rates
+        let dest_ops_rate_curr = self.calculate_current_rate(
             dest_progress.ops_finished,
             self.last_dest_ops,
             curr_duration_secs,
         );
-        let dest_bytes_rate = self.calculate_rate(
+        let dest_bytes_rate_curr = self.calculate_current_rate(
             dest_progress.bytes_copied,
             self.last_dest_bytes,
             curr_duration_secs,
         );
+        // destination average rates
+        let dest_ops_rate_avg =
+            self.calculate_average_rate(dest_progress.ops_finished, total_duration_secs);
+        let dest_bytes_rate_avg =
+            self.calculate_average_rate(dest_progress.bytes_copied, total_duration_secs);
         // update last values
         self.last_source_ops = source_progress.ops_finished;
         self.last_source_bytes = source_progress.bytes_copied;
@@ -367,46 +391,62 @@ impl RcpdProgressPrinter {
         self.last_dest_bytes = dest_progress.bytes_copied;
         self.last_update = time_now;
         Ok(format!(
-            "---------------------\n\
-            SOURCE:\n\
-            ops pending: {:>10}\n\
-            ops rate:    {:>10.2} items/s\n\
-            bytes rate:  {:>10}/s\n\
-            bytes total: {:>10}\n\
-            files rate:  {:>10.2} files/s\n\
-            files total: {:>10}\n\
-            -----------------------\n\
-            DESTINATION:\n\
-            ops pending: {:>10}\n\
-            ops rate:    {:>10.2} items/s\n\
-            bytes rate:  {:>10}/s\n\
-            bytes total: {:>10}\n\
+            "==== SOURCE =======\n\
+            OPS:\n\
+            pending: {:>10}\n\
+            average: {:>10.2} items/s\n\
+            current: {:>10.2} items/s\n\
+            ---------------------\n\
+            COPIED:\n\
+            average: {:>10}/s\n\
+            current: {:>10}/s\n\
+            total:   {:>10}\n\
+            files:       {:>10}\n\
+            ---------------------\n\
+            FILES:\n\
+            average: {:>10.2} files/s\n\
+            current: {:>10.2} files/s\n\
+            ==== DESTINATION ====\n\
+            OPS:\n\
+            pending: {:>10}\n\
+            average: {:>10.2} items/s\n\
+            current: {:>10.2} items/s\n\
+            ---------------------\n\
+            COPIED:\n\
+            average: {:>10}/s\n\
+            current: {:>10}/s\n\
+            total:   {:>10}\n\
             files:       {:>10}\n\
             symlinks:    {:>10}\n\
             directories: {:>10}\n\
             hard-links:  {:>10}\n\
-            -----------------------\n\
+            ---------------------\n\
             UNCHANGED:\n\
             files:       {:>10}\n\
             symlinks:    {:>10}\n\
             directories: {:>10}\n\
             hard-links:  {:>10}\n\
-            -----------------------\n\
+            ---------------------\n\
             REMOVED:\n\
             files:       {:>10}\n\
             symlinks:    {:>10}\n\
             directories: {:>10}",
             // source section
             source_progress.ops_started - source_progress.ops_finished, // pending
-            source_ops_rate,
-            bytesize::ByteSize(source_bytes_rate as u64),
+            source_ops_rate_avg,
+            source_ops_rate_curr,
+            bytesize::ByteSize(source_bytes_rate_avg as u64),
+            bytesize::ByteSize(source_bytes_rate_curr as u64),
             bytesize::ByteSize(source_progress.bytes_copied),
-            source_files_rate,
             source_progress.files_copied,
+            source_files_rate_avg,
+            source_files_rate_curr,
             // destination section
             dest_progress.ops_started - dest_progress.ops_finished, // pending
-            dest_ops_rate,
-            bytesize::ByteSize(dest_bytes_rate as u64),
+            dest_ops_rate_avg,
+            dest_ops_rate_curr,
+            bytesize::ByteSize(dest_bytes_rate_avg as u64),
+            bytesize::ByteSize(dest_bytes_rate_curr as u64),
             bytesize::ByteSize(dest_progress.bytes_copied),
             // destination detailed stats
             dest_progress.files_copied,
@@ -510,7 +550,7 @@ mod tests {
             ops_started: 80,
             ops_finished: 70,
             bytes_copied: 1024,
-            files_copied: 5,
+            files_copied: 8,
             symlinks_created: 2,
             directories_created: 1,
             ..Default::default()
@@ -518,11 +558,27 @@ mod tests {
 
         // Test that print returns a formatted string
         let output = printer.print(&source_progress, &dest_progress)?;
-        assert!(output.contains("SOURCE:"));
-        assert!(output.contains("DESTINATION:"));
-        assert!(output.contains("ops pending"));
+        assert!(output.contains("SOURCE"));
+        assert!(output.contains("DESTINATION"));
+        assert!(output.contains("OPS:"));
+        assert!(output.contains("pending:"));
         assert!(output.contains("20")); // source pending ops (100-80)
         assert!(output.contains("10")); // dest pending ops (80-70)
+        let mut sections = output.split("==== DESTINATION ====");
+        let source_section = sections.next().unwrap();
+        let dest_section = sections.next().unwrap_or("");
+        let source_files_line = source_section
+            .lines()
+            .find(|line| line.trim_start().starts_with("files:"))
+            .expect("source files line missing");
+        assert!(source_files_line.trim_start().ends_with("5"));
+        assert!(!source_files_line.contains('.'));
+        let dest_files_line = dest_section
+            .lines()
+            .find(|line| line.trim_start().starts_with("files:"))
+            .expect("dest files line missing");
+        assert!(dest_files_line.trim_start().ends_with("8"));
+        assert!(!dest_files_line.contains('.'));
 
         Ok(())
     }
