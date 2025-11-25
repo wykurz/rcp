@@ -1,8 +1,7 @@
 //! Common utilities and types for RCP file operation tools
 //!
 //! This crate provides shared functionality used across all RCP tools (`rcp`, `rrm`, `rlink`, `rcmp`).
-//! It includes core operations (copy, remove, link, compare), progress reporting, metadata preservation,
-//! and runtime configuration.
+//! It includes core operations (copy, remove, link, compare), progress reporting, metadata preservation, and runtime configuration.
 //!
 //! # Core Modules
 //!
@@ -35,8 +34,7 @@
 //! The crate provides a global progress tracking system accessible via [`get_progress()`].
 //! Progress can be displayed in different formats depending on the execution context.
 //!
-//! Progress output goes to stderr, while logs go to stdout, allowing users to redirect
-//! logs to a file while still viewing interactive progress.
+//! Progress output goes to stderr, while logs go to stdout, allowing users to redirect logs to a file while still viewing interactive progress.
 //!
 //! # Runtime Configuration
 //!

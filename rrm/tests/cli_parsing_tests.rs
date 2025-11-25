@@ -1,8 +1,7 @@
 //! CLI Argument Parsing Compatibility Tests for rrm
 //!
 //! These tests verify that command-line arguments are parsed correctly and maintain
-//! backward compatibility. The focus is on ensuring that argument values, aliases,
-//! and formats continue to work as expected across versions.
+//! Backward compatibility. The focus is on ensuring that argument values, aliases, and formats continue to work as expected across versions.
 
 use assert_cmd::Command;
 

@@ -1,13 +1,11 @@
 //! Binary deployment for rcpd
 //!
 //! This module handles automatic deployment of rcpd binaries to remote hosts.
-//! It transfers static rcpd binaries via SSH using base64 encoding, verifies
-//! integrity with SHA-256 checksums, and manages cached versions.
+//! It transfers static rcpd binaries via SSH using base64 encoding, verifies integrity with SHA-256 checksums, and manages cached versions.
 //!
 //! ## Atomicity and Concurrent Deployment Safety
 //!
-//! The deployment mechanism is designed to handle concurrent deployments from
-//! multiple rcp instances safely:
+//! The deployment mechanism is designed to handle concurrent deployments from multiple rcp instances safely:
 //!
 //! ### Atomic Operations
 //!

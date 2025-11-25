@@ -1,7 +1,6 @@
 //! Docker test environment helpers for multi-host integration tests.
 //!
-//! This module provides utilities for running RCP tests across multiple Docker containers
-//! that simulate separate hosts with SSH connectivity.
+//! This module provides utilities for running RCP tests across multiple Docker containers that simulate separate hosts with SSH connectivity.
 
 use std::process::{Command, Output};
 

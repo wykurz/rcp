@@ -1,8 +1,7 @@
 //! Remote copy protocol and networking for distributed file operations
 //!
-//! This crate provides the networking layer and protocol definitions for remote file copying
-//! in the RCP tools suite. It enables efficient distributed copying between remote hosts using
-//! SSH for orchestration and QUIC for high-performance data transfer.
+//! This crate provides the networking layer and protocol definitions for remote file copying in the RCP tools suite.
+//! It enables efficient distributed copying between remote hosts using SSH for orchestration and QUIC for high-performance data transfer.
 //!
 //! # Overview
 //!
@@ -27,8 +26,7 @@
 //! 4. **Direct Connection**: Master forwards address to Destination, which connects to Source
 //! 5. **Data Transfer**: Files flow directly from Source to Destination (not through Master)
 //!
-//! This design ensures efficient data transfer while allowing the Master to coordinate
-//! operations and monitor progress.
+//! This design ensures efficient data transfer while allowing the Master to coordinate operations and monitor progress.
 //!
 //! # Key Components
 //!
@@ -52,8 +50,7 @@
 //!
 //! ## Port Range Configuration
 //!
-//! The [`port_ranges`] module allows restricting QUIC to specific port ranges, useful for
-//! firewall-restricted environments:
+//! The [`port_ranges`] module allows restricting QUIC to specific port ranges, useful for firewall-restricted environments:
 //!
 //! ```rust,no_run
 //! # use remote::get_server_with_port_ranges;
@@ -91,9 +88,8 @@
 //!
 //! # Security Model
 //!
-//! The remote copy system implements a defense-in-depth security model using SSH for authentication
-//! and certificate pinning for QUIC connection integrity. This provides protection against
-//! man-in-the-middle (MITM) attacks while maintaining ease of deployment.
+//! The remote copy system implements a defense-in-depth security model using SSH for authentication and certificate pinning for QUIC connection integrity.
+//! This provides protection against man-in-the-middle (MITM) attacks while maintaining ease of deployment.
 //!
 //! ## Authentication & Authorization
 //!

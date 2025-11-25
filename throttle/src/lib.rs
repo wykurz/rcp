@@ -1,8 +1,7 @@
 //! Resource throttling and rate limiting for file operations
 //!
 //! This crate provides throttling mechanisms to control resource usage during file operations.
-//! It helps prevent system overload and allows for controlled resource consumption when working
-//! with large filesets or in resource-constrained environments.
+//! It helps prevent system overload and allows for controlled resource consumption when working with large filesets or in resource-constrained environments.
 //!
 //! # Overview
 //!
@@ -12,8 +11,7 @@
 //! 2. **Operations Throttle** - Limits the number of operations per second
 //! 3. **I/O Operations Throttle** - Limits the number of I/O operations per second based on chunk size
 //!
-//! All throttling is implemented using token-bucket semaphores that are automatically replenished
-//! at configured intervals.
+//! All throttling is implemented using token-bucket semaphores that are automatically replenished at configured intervals.
 //!
 //! # Usage Patterns
 //!
@@ -104,13 +102,11 @@
 //! - Option 1: 100 tokens every 100ms
 //! - Option 2: 10 tokens every 10ms
 //!
-//! The implementation automatically scales down to prevent excessive granularity while
-//! maintaining the target rate.
+//! The implementation automatically scales down to prevent excessive granularity while maintaining the target rate.
 //!
 //! # Thread Safety
 //!
-//! All throttling mechanisms are thread-safe and can be used across multiple async tasks
-//! and threads. The semaphores use efficient `parking_lot` mutexes internally.
+//! All throttling mechanisms are thread-safe and can be used across multiple async tasks and threads. The semaphores use efficient `parking_lot` mutexes internally.
 //!
 //! # Performance Considerations
 //!

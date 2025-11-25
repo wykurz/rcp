@@ -1,7 +1,6 @@
 //! Multi-host integration tests using Docker containers.
 //!
-//! These tests use Docker containers to simulate multiple hosts with SSH connectivity,
-//! testing RCP's remote copy functionality across separate machines.
+//! These tests use Docker containers to simulate multiple hosts with SSH connectivity, testing RCP's remote copy functionality across separate machines.
 //!
 //! ## Prerequisites
 //!
