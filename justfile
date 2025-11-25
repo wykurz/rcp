@@ -62,7 +62,7 @@ doc:
     RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" cargo doc --no-deps --workspace
 
 # Run all CI checks locally before pushing (matches GitHub Actions)
-ci: lint doc test-all
+ci: lint doc test-all-with-docker
     @echo "✅ All CI checks passed! Safe to push."
 
 # Clean build artifacts
