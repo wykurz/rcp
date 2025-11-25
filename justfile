@@ -10,7 +10,7 @@ lint:
     @echo "🔍 Checking formatting..."
     cargo fmt --check
     @echo "🔍 Running clippy..."
-    cargo clippy --workspace -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
     @echo "🔍 Checking error logging format..."
     ./scripts/check-error-logging.sh
     @echo "🔍 Checking anyhow::Error::msg usage..."

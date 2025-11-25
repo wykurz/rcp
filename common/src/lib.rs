@@ -653,53 +653,6 @@ fn print_runtime_stats_for_role(prefix: &str, stats: &RuntimeStats) {
     );
 }
 
-#[cfg(test)]
-mod runtime_stats_tests {
-    use super::*;
-    use anyhow::Result;
-
-    #[test]
-    fn collect_runtime_stats_matches_procfs_snapshot() -> Result<()> {
-        let process = procfs::process::Process::myself()?;
-        let expected = collect_runtime_stats_for_process(&process)?;
-        let actual = collect_runtime_stats();
-        let cpu_tolerance_ms = 50;
-        let rss_tolerance_bytes = 1_000_000;
-        assert!(
-            expected.cpu_time_user_ms.abs_diff(actual.cpu_time_user_ms) <= cpu_tolerance_ms,
-            "user CPU deviated by more than {cpu_tolerance_ms}ms: expected {}, got {}",
-            expected.cpu_time_user_ms,
-            actual.cpu_time_user_ms
-        );
-        assert!(
-            expected
-                .cpu_time_kernel_ms
-                .abs_diff(actual.cpu_time_kernel_ms)
-                <= cpu_tolerance_ms,
-            "kernel CPU deviated by more than {cpu_tolerance_ms}ms: expected {}, got {}",
-            expected.cpu_time_kernel_ms,
-            actual.cpu_time_kernel_ms
-        );
-        assert!(
-            expected.peak_rss_bytes.abs_diff(actual.peak_rss_bytes) <= rss_tolerance_bytes,
-            "peak RSS deviated by more than {rss_tolerance_bytes} bytes: expected {}, got {}",
-            expected.peak_rss_bytes,
-            actual.peak_rss_bytes
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn collect_runtime_stats_returns_default_on_error() {
-        let stats = collect_runtime_stats_inner(None);
-        assert_eq!(stats, RuntimeStats::default());
-
-        let nonexistent_process = procfs::process::Process::new(i32::MAX).ok();
-        let stats = collect_runtime_stats_inner(nonexistent_process);
-        assert_eq!(stats, RuntimeStats::default());
-    }
-}
-
 #[rustfmt::skip]
 fn print_runtime_stats() -> Result<(), anyhow::Error> {
     // check if we have remote runtime stats (from a remote copy operation)
@@ -1002,4 +955,51 @@ where
         }
     }
     res.ok()
+}
+
+#[cfg(test)]
+mod runtime_stats_tests {
+    use super::*;
+    use anyhow::Result;
+
+    #[test]
+    fn collect_runtime_stats_matches_procfs_snapshot() -> Result<()> {
+        let process = procfs::process::Process::myself()?;
+        let expected = collect_runtime_stats_for_process(&process)?;
+        let actual = collect_runtime_stats();
+        let cpu_tolerance_ms = 50;
+        let rss_tolerance_bytes = 1_000_000;
+        assert!(
+            expected.cpu_time_user_ms.abs_diff(actual.cpu_time_user_ms) <= cpu_tolerance_ms,
+            "user CPU deviated by more than {cpu_tolerance_ms}ms: expected {}, got {}",
+            expected.cpu_time_user_ms,
+            actual.cpu_time_user_ms
+        );
+        assert!(
+            expected
+                .cpu_time_kernel_ms
+                .abs_diff(actual.cpu_time_kernel_ms)
+                <= cpu_tolerance_ms,
+            "kernel CPU deviated by more than {cpu_tolerance_ms}ms: expected {}, got {}",
+            expected.cpu_time_kernel_ms,
+            actual.cpu_time_kernel_ms
+        );
+        assert!(
+            expected.peak_rss_bytes.abs_diff(actual.peak_rss_bytes) <= rss_tolerance_bytes,
+            "peak RSS deviated by more than {rss_tolerance_bytes} bytes: expected {}, got {}",
+            expected.peak_rss_bytes,
+            actual.peak_rss_bytes
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn collect_runtime_stats_returns_default_on_error() {
+        let stats = collect_runtime_stats_inner(None);
+        assert_eq!(stats, RuntimeStats::default());
+
+        let nonexistent_process = procfs::process::Process::new(i32::MAX).ok();
+        let stats = collect_runtime_stats_inner(nonexistent_process);
+        assert_eq!(stats, RuntimeStats::default());
+    }
 }
