@@ -347,7 +347,7 @@ impl QuicConfig {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub struct SshSession {
     pub user: Option<String>,
     pub host: String,
@@ -384,6 +384,15 @@ async fn setup_ssh_session(
             .context("Failed to establish SSH connection")?,
     );
     Ok(session)
+}
+
+#[instrument]
+pub async fn get_remote_home_for_session(
+    session: &SshSession,
+) -> anyhow::Result<std::path::PathBuf> {
+    let ssh_session = setup_ssh_session(session).await?;
+    let home = get_remote_home(&ssh_session).await?;
+    Ok(std::path::PathBuf::from(home))
 }
 
 #[instrument]
@@ -445,9 +454,7 @@ pub(crate) fn shell_escape(s: &str) -> String {
 /// # Errors
 ///
 /// Returns an error if HOME is not set or is empty
-pub(crate) async fn get_remote_home(
-    session: &std::sync::Arc<openssh::Session>,
-) -> anyhow::Result<String> {
+pub async fn get_remote_home(session: &std::sync::Arc<openssh::Session>) -> anyhow::Result<String> {
     if let Ok(home_override) = std::env::var("RCP_REMOTE_HOME_OVERRIDE") {
         if !home_override.is_empty() {
             return Ok(home_override);
