@@ -623,11 +623,12 @@ pub fn collect_runtime_stats() -> RuntimeStats {
         Err(_) => return RuntimeStats::default(),
     };
     let clock_ticks = procfs::ticks_per_second() as f64;
-    let vmhwm = process.status().ok().and_then(|s| s.vmhwm).unwrap_or(0);
+    // vmhwm from /proc/[pid]/status is in kB, convert to bytes
+    let vmhwm_kb = process.status().ok().and_then(|s| s.vmhwm).unwrap_or(0);
     RuntimeStats {
         cpu_time_user_ms: ((stat.utime as f64 / clock_ticks) * 1000.0) as u64,
         cpu_time_kernel_ms: ((stat.stime as f64 / clock_ticks) * 1000.0) as u64,
-        peak_rss_bytes: vmhwm,
+        peak_rss_bytes: vmhwm_kb * 1024,
     }
 }
 
@@ -702,10 +703,11 @@ fn print_runtime_stats() -> Result<(), anyhow::Error> {
     let ticks_to_duration = |ticks: u64| {
         std::time::Duration::from_secs_f64(ticks as f64 / clock_ticks_per_second as f64)
     };
-    let vmhwm = process.status()?.vmhwm.unwrap_or(0);
+    // vmhwm from /proc/[pid]/status is in kB, convert to bytes
+    let vmhwm_kb = process.status()?.vmhwm.unwrap_or(0);
     println!("walltime : {:.2?}", &PROGRESS.get_duration(),);
     println!("cpu time : {:.2?} | k: {:.2?} | u: {:.2?}", ticks_to_duration(stat.utime + stat.stime), ticks_to_duration(stat.stime), ticks_to_duration(stat.utime));
-    println!("peak RSS : {:.2?}", bytesize::ByteSize(vmhwm));
+    println!("peak RSS : {:.2?}", bytesize::ByteSize(vmhwm_kb * 1024));
     Ok(())
 }
 
