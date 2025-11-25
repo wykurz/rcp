@@ -10,7 +10,11 @@ fn test_remote_port_binding_with_ranges() -> Result<()> {
     // Test that we can bind to a specific port range
     // Use a unique range for this test to avoid parallel test conflicts
     let ranges = PortRanges::parse("20000-20999")?;
-    let socket = ranges.bind_udp_socket(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))?;
+    let socket = ranges
+        .bind_udp_socket(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        .map_err(|err| {
+            anyhow::anyhow!("Failed to bind UDP socket in range 20000-20999: {err:#}")
+        })?;
     let addr = socket.local_addr()?;
     // Verify the port is within our specified range
     assert!(
@@ -28,7 +32,8 @@ async fn test_remote_quic_server_creation_with_port_ranges() -> Result<()> {
         Some("21000-21999"),
         DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
         DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
-    )?;
+    )
+    .map_err(|err| anyhow::anyhow!("Failed to bind QUIC server in range 21000-21999: {err:#}"))?;
     let addr = endpoint.local_addr()?;
     // Verify the port is within our specified range
     assert!(
@@ -49,7 +54,8 @@ async fn test_remote_quic_client_creation_with_port_ranges() -> Result<()> {
         dummy_fingerprint,
         DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
         DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
-    )?;
+    )
+    .map_err(|err| anyhow::anyhow!("Failed to bind QUIC client in range 22000-22999: {err:#}"))?;
     let addr = endpoint.local_addr()?;
     // Verify the port is within our specified range
     assert!(
@@ -64,7 +70,11 @@ async fn test_remote_quic_client_creation_with_port_ranges() -> Result<()> {
 fn test_remote_multiple_port_ranges() -> Result<()> {
     // Test parsing and binding with multiple port ranges
     let ranges = PortRanges::parse("23000-23099,23200-23299,23500")?;
-    let socket = ranges.bind_udp_socket(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))?;
+    let socket = ranges
+        .bind_udp_socket(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        .map_err(|err| {
+            anyhow::anyhow!("Failed to bind UDP socket for multi-range test: {err:#}")
+        })?;
     let addr = socket.local_addr()?;
     // Verify the port is within one of our specified ranges
     let port = addr.port();
@@ -84,7 +94,8 @@ async fn test_remote_full_quic_endpoint_functionality() -> Result<()> {
         Some("16000-16999"),
         DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
         DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
-    )?;
+    )
+    .map_err(|err| anyhow::anyhow!("Failed to bind QUIC server in range 16000-16999: {err:#}"))?;
     let server_addr = remote::get_endpoint_addr(&server)?;
     // Use a dummy fingerprint since we're only testing port binding, not actual connections
     let dummy_fingerprint = vec![0u8; 32];
@@ -93,7 +104,8 @@ async fn test_remote_full_quic_endpoint_functionality() -> Result<()> {
         dummy_fingerprint,
         DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
         DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
-    )?;
+    )
+    .map_err(|err| anyhow::anyhow!("Failed to bind QUIC client in range 17000-17999: {err:#}"))?;
     let client_addr = client.local_addr()?;
     // Verify both are in their respective ranges
     assert!(

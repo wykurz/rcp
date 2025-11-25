@@ -452,6 +452,11 @@ pub(crate) fn shell_escape(s: &str) -> String {
 pub(crate) async fn get_remote_home(
     session: &std::sync::Arc<openssh::Session>,
 ) -> anyhow::Result<String> {
+    if let Ok(home_override) = std::env::var("RCP_REMOTE_HOME_OVERRIDE") {
+        if !home_override.is_empty() {
+            return Ok(home_override);
+        }
+    }
     let output = session
         .command("sh")
         .arg("-c")
@@ -1363,6 +1368,19 @@ mod tests {
         }
     }
 
+    fn endpoint_or_skip() -> (quinn::Endpoint, Vec<u8>) {
+        get_server_with_port_ranges(
+            None,
+            test_defaults::DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
+            test_defaults::DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
+        )
+        .unwrap_or_else(|err| {
+            panic!(
+                "Failed to create QUIC endpoint for test; ensure UDP binding is permitted: {err:#}"
+            )
+        })
+    }
+
     #[tokio::test]
     async fn discover_rcpd_prefers_explicit_path() {
         let mut session = MockDiscoverySession::new();
@@ -1530,12 +1548,7 @@ mod tests {
     async fn test_get_endpoint_addr_returns_ipv4() {
         // verify that get_endpoint_addr also returns IPv4 only
         // create a test endpoint
-        let (endpoint, _fingerprint) = get_server_with_port_ranges(
-            None,
-            test_defaults::DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
-            test_defaults::DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
-        )
-        .expect("should create endpoint");
+        let (endpoint, _fingerprint) = endpoint_or_skip();
         let addr = get_endpoint_addr(&endpoint).expect("should get endpoint address");
         assert!(
             addr.is_ipv4(),
@@ -1626,12 +1639,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_endpoint_addr_with_bind_ip_explicit() {
         // test that get_endpoint_addr_with_bind_ip works with explicit IP
-        let (endpoint, _fingerprint) = get_server_with_port_ranges(
-            None,
-            test_defaults::DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
-            test_defaults::DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
-        )
-        .expect("should create endpoint");
+        let (endpoint, _fingerprint) = endpoint_or_skip();
         let addr = get_endpoint_addr_with_bind_ip(&endpoint, Some("127.0.0.1"))
             .expect("should get endpoint address with bind IP");
         assert_eq!(
@@ -1645,12 +1653,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_endpoint_addr_with_bind_ip_auto() {
         // test that get_endpoint_addr_with_bind_ip works with auto-detection (None)
-        let (endpoint, _fingerprint) = get_server_with_port_ranges(
-            None,
-            test_defaults::DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
-            test_defaults::DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
-        )
-        .expect("should create endpoint");
+        let (endpoint, _fingerprint) = endpoint_or_skip();
         let addr =
             get_endpoint_addr_with_bind_ip(&endpoint, None).expect("should get endpoint address");
         assert!(addr.is_ipv4(), "should return IPv4 address");
