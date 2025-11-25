@@ -368,6 +368,9 @@ impl SshSession {
     }
 }
 
+// re-export is_localhost from common for convenience
+pub use common::is_localhost;
+
 async fn setup_ssh_session(
     session: &SshSession,
 ) -> anyhow::Result<std::sync::Arc<openssh::Session>> {

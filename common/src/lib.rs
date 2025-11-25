@@ -140,14 +140,64 @@ impl std::fmt::Display for RcpdType {
 // Type alias for progress snapshots
 pub type ProgressSnapshot<T> = enum_map::EnumMap<RcpdType, T>;
 
+/// runtime statistics collected from a process (CPU time, memory usage)
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+pub struct RuntimeStats {
+    /// user-mode CPU time in milliseconds
+    pub cpu_time_user_ms: u64,
+    /// kernel-mode CPU time in milliseconds
+    pub cpu_time_kernel_ms: u64,
+    /// peak resident set size in bytes
+    pub peak_rss_bytes: u64,
+}
+
+/// runtime stats collected from remote rcpd processes for display at the end of a remote copy
+#[derive(Debug, Default)]
+pub struct RemoteRuntimeStats {
+    pub source_host: String,
+    pub source_stats: RuntimeStats,
+    pub dest_host: String,
+    pub dest_stats: RuntimeStats,
+}
+
+/// checks if a host string refers to the local machine.
+/// returns true for "localhost", "127.0.0.1", "\:\:1", "[\:\:1]", or the actual hostname
+#[must_use]
+pub fn is_localhost(host: &str) -> bool {
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
+        return true;
+    }
+    // check against actual hostname using gethostname
+    let mut buf = [0u8; 256];
+    // Safety: gethostname writes to buf and returns 0 on success
+    let result = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if result == 0 {
+        if let Ok(hostname_cstr) = std::ffi::CStr::from_bytes_until_nul(&buf) {
+            if let Ok(hostname) = hostname_cstr.to_str() {
+                if host == hostname {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 lazy_static! {
     static ref PROGRESS: progress::Progress = progress::Progress::new();
     static ref PBAR: indicatif::ProgressBar = indicatif::ProgressBar::new_spinner();
+    static ref REMOTE_RUNTIME_STATS: std::sync::Mutex<Option<RemoteRuntimeStats>> =
+        std::sync::Mutex::new(None);
 }
 
 #[must_use]
 pub fn get_progress() -> &'static progress::Progress {
     &PROGRESS
+}
+
+/// stores remote runtime stats for display at the end of a remote copy operation
+pub fn set_remote_runtime_stats(stats: RemoteRuntimeStats) {
+    *REMOTE_RUNTIME_STATS.lock().unwrap() = Some(stats);
 }
 
 struct LocalTimeFormatter;
@@ -561,8 +611,90 @@ fn read_env_or_default<T: std::str::FromStr>(name: &str, default: T) -> T {
     }
 }
 
+/// collects runtime statistics (CPU time, memory) for the current process
+#[must_use]
+pub fn collect_runtime_stats() -> RuntimeStats {
+    let process = match procfs::process::Process::myself() {
+        Ok(p) => p,
+        Err(_) => return RuntimeStats::default(),
+    };
+    let stat = match process.stat() {
+        Ok(s) => s,
+        Err(_) => return RuntimeStats::default(),
+    };
+    let clock_ticks = procfs::ticks_per_second() as f64;
+    let vmhwm = process.status().ok().and_then(|s| s.vmhwm).unwrap_or(0);
+    RuntimeStats {
+        cpu_time_user_ms: ((stat.utime as f64 / clock_ticks) * 1000.0) as u64,
+        cpu_time_kernel_ms: ((stat.stime as f64 / clock_ticks) * 1000.0) as u64,
+        peak_rss_bytes: vmhwm,
+    }
+}
+
+fn print_runtime_stats_for_role(prefix: &str, stats: &RuntimeStats) {
+    let cpu_total =
+        std::time::Duration::from_millis(stats.cpu_time_user_ms + stats.cpu_time_kernel_ms);
+    let cpu_kernel = std::time::Duration::from_millis(stats.cpu_time_kernel_ms);
+    let cpu_user = std::time::Duration::from_millis(stats.cpu_time_user_ms);
+    println!(
+        "{prefix}cpu time : {:.2?} | k: {:.2?} | u: {:.2?}",
+        cpu_total, cpu_kernel, cpu_user
+    );
+    println!(
+        "{prefix}peak RSS : {}",
+        bytesize::ByteSize(stats.peak_rss_bytes)
+    );
+}
+
 #[rustfmt::skip]
 fn print_runtime_stats() -> Result<(), anyhow::Error> {
+    // check if we have remote runtime stats (from a remote copy operation)
+    let remote_stats = REMOTE_RUNTIME_STATS.lock().unwrap().take();
+    if let Some(remote) = remote_stats {
+        // print global walltime first
+        println!("walltime : {:.2?}", &PROGRESS.get_duration());
+        println!();
+        let source_is_local = is_localhost(&remote.source_host);
+        let dest_is_local = is_localhost(&remote.dest_host);
+        // collect master stats
+        let master_stats = collect_runtime_stats();
+        // print non-localhost roles first
+        if !source_is_local {
+            println!("SOURCE ({}):", remote.source_host);
+            print_runtime_stats_for_role("  ", &remote.source_stats);
+            println!();
+        }
+        if !dest_is_local {
+            println!("DESTINATION ({}):", remote.dest_host);
+            print_runtime_stats_for_role("  ", &remote.dest_stats);
+            println!();
+        }
+        // print combined localhost section
+        match (source_is_local, dest_is_local) {
+            (true, true) => {
+                println!("MASTER + SOURCE + DESTINATION (localhost):");
+                print_runtime_stats_for_role("  master ", &master_stats);
+                print_runtime_stats_for_role("  source ", &remote.source_stats);
+                print_runtime_stats_for_role("  dest   ", &remote.dest_stats);
+            }
+            (true, false) => {
+                println!("MASTER + SOURCE (localhost):");
+                print_runtime_stats_for_role("  master ", &master_stats);
+                print_runtime_stats_for_role("  source ", &remote.source_stats);
+            }
+            (false, true) => {
+                println!("MASTER + DESTINATION (localhost):");
+                print_runtime_stats_for_role("  master ", &master_stats);
+                print_runtime_stats_for_role("  dest   ", &remote.dest_stats);
+            }
+            (false, false) => {
+                println!("MASTER (localhost):");
+                print_runtime_stats_for_role("  ", &master_stats);
+            }
+        }
+        return Ok(());
+    }
+    // local operation - print stats for this process only
     let process = procfs::process::Process::myself()?;
     let stat = process.stat()?;
     // The time is in clock ticks, so we need to convert it to seconds
