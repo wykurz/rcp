@@ -252,6 +252,9 @@
 //!     progress: false,
 //!     progress_delay: None,
 //!     remote_copy_conn_timeout_sec: 15,
+//!     network_profile: remote::NetworkProfile::Lan,
+//!     congestion_control: None, // use profile default (BBR for LAN)
+//!     quic_tuning: remote::QuicTuning::default(),
 //!     master_cert_fingerprint: Vec::new(),
 //! };
 //! let master_addr: SocketAddr = "192.168.1.100:5000".parse()?;
@@ -301,6 +304,111 @@ pub mod protocol;
 pub mod streams;
 pub mod tracelog;
 
+/// Network profile for QUIC configuration tuning
+///
+/// Profiles provide pre-configured settings optimized for different network environments.
+/// The LAN profile is optimized for high-bandwidth, low-latency datacenter networks,
+/// while the WAN profile uses more conservative settings suitable for internet connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum NetworkProfile {
+    /// Optimized for datacenter networks: <1ms RTT, 25-100 Gbps
+    /// Uses BBR congestion control and aggressive window sizes
+    #[default]
+    Lan,
+    /// Conservative settings for internet/WAN connections
+    /// Uses CUBIC congestion control and standard window sizes
+    Wan,
+}
+
+impl std::fmt::Display for NetworkProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lan => write!(f, "lan"),
+            Self::Wan => write!(f, "wan"),
+        }
+    }
+}
+
+impl std::str::FromStr for NetworkProfile {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "lan" => Ok(Self::Lan),
+            "wan" => Ok(Self::Wan),
+            _ => Err(format!(
+                "invalid network profile '{}', expected 'lan' or 'wan'",
+                s
+            )),
+        }
+    }
+}
+
+impl NetworkProfile {
+    /// Returns the default congestion control algorithm for this profile
+    pub fn default_congestion_control(&self) -> CongestionControl {
+        match self {
+            Self::Lan => CongestionControl::Bbr,
+            Self::Wan => CongestionControl::Cubic,
+        }
+    }
+}
+
+/// Congestion control algorithm selection
+///
+/// BBR (default) provides faster ramp-up on dedicated high-bandwidth links.
+/// CUBIC is more conservative and fairer on shared networks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum CongestionControl {
+    /// BBR (Bottleneck Bandwidth and RTT) - model-based, fast ramp-up
+    /// Best for dedicated high-bandwidth links
+    #[default]
+    Bbr,
+    /// CUBIC - loss-based, standard TCP congestion control
+    /// Best for shared networks or WAN connections
+    Cubic,
+}
+
+impl std::fmt::Display for CongestionControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bbr => write!(f, "bbr"),
+            Self::Cubic => write!(f, "cubic"),
+        }
+    }
+}
+
+impl std::str::FromStr for CongestionControl {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "bbr" => Ok(Self::Bbr),
+            "cubic" => Ok(Self::Cubic),
+            _ => Err(format!(
+                "invalid congestion control '{}', expected 'bbr' or 'cubic'",
+                s
+            )),
+        }
+    }
+}
+
+/// Advanced QUIC tuning parameters
+///
+/// All fields are optional overrides. When set, they take precedence over
+/// profile defaults. Use these for fine-tuning in specific environments.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct QuicTuning {
+    /// Connection-level receive window in bytes (default: 128 MB for LAN, 8 MB for WAN)
+    pub receive_window: Option<u64>,
+    /// Per-stream receive window in bytes (default: 16 MB for LAN, 2 MB for WAN)
+    pub stream_receive_window: Option<u64>,
+    /// Send window in bytes (default: 128 MB for LAN, 8 MB for WAN)
+    pub send_window: Option<u64>,
+    /// Initial RTT estimate in milliseconds (default: 0.3ms for LAN, 100ms for WAN)
+    pub initial_rtt_ms: Option<u64>,
+    /// Initial MTU in bytes (default: 1200)
+    pub initial_mtu: Option<u16>,
+}
+
 /// Configuration for QUIC connections
 #[derive(Debug, Clone)]
 pub struct QuicConfig {
@@ -312,6 +420,12 @@ pub struct QuicConfig {
     pub keep_alive_interval_sec: u64,
     /// Connection timeout for remote operations (seconds)
     pub conn_timeout_sec: u64,
+    /// Network profile for tuning (default: LAN)
+    pub network_profile: NetworkProfile,
+    /// Congestion control algorithm override (None = use profile default)
+    pub congestion_control: Option<CongestionControl>,
+    /// Advanced tuning overrides
+    pub tuning: QuicTuning,
 }
 
 impl Default for QuicConfig {
@@ -321,6 +435,9 @@ impl Default for QuicConfig {
             idle_timeout_sec: 10,
             keep_alive_interval_sec: 1,
             conn_timeout_sec: 15,
+            network_profile: NetworkProfile::default(),
+            congestion_control: None, // use profile default
+            tuning: QuicTuning::default(),
         }
     }
 }
@@ -337,6 +454,9 @@ impl QuicConfig {
             idle_timeout_sec,
             keep_alive_interval_sec,
             conn_timeout_sec,
+            network_profile: NetworkProfile::default(),
+            congestion_control: None,
+            tuning: QuicTuning::default(),
         }
     }
 
@@ -344,6 +464,30 @@ impl QuicConfig {
     pub fn with_port_ranges(mut self, ranges: impl Into<String>) -> Self {
         self.port_ranges = Some(ranges.into());
         self
+    }
+
+    /// Set network profile
+    pub fn with_network_profile(mut self, profile: NetworkProfile) -> Self {
+        self.network_profile = profile;
+        self
+    }
+
+    /// Set congestion control algorithm (overrides profile default)
+    pub fn with_congestion_control(mut self, cc: CongestionControl) -> Self {
+        self.congestion_control = Some(cc);
+        self
+    }
+
+    /// Set advanced tuning parameters
+    pub fn with_tuning(mut self, tuning: QuicTuning) -> Self {
+        self.tuning = tuning;
+        self
+    }
+
+    /// Get the effective congestion control algorithm (explicit or profile default)
+    pub fn effective_congestion_control(&self) -> CongestionControl {
+        self.congestion_control
+            .unwrap_or_else(|| self.network_profile.default_congestion_control())
     }
 }
 
@@ -868,6 +1012,82 @@ pub async fn start_rcpd(
     cmd.spawn().await.context("Failed to spawn rcpd command")
 }
 
+/// Apply QUIC configuration to a transport config
+///
+/// This applies network profile settings, congestion control, and any tuning overrides.
+fn apply_quic_tuning(transport_config: &mut quinn::TransportConfig, config: &QuicConfig) {
+    // 1. apply base profile settings
+    let (receive_window, stream_receive_window, send_window, initial_rtt_us) =
+        match config.network_profile {
+            NetworkProfile::Lan => {
+                // LAN profile: optimized for 100 Gbps @ 1ms RTT
+                // BDP = 12.5 MB, use 10x for headroom with multiple streams
+                (
+                    128 * 1024 * 1024_u64, // 128 MB connection receive window
+                    16 * 1024 * 1024_u64,  // 16 MB per-stream receive window
+                    128 * 1024 * 1024_u64, // 128 MB send window
+                    300_u64,               // 0.3ms initial RTT
+                )
+            }
+            NetworkProfile::Wan => {
+                // WAN profile: conservative settings for internet
+                (
+                    8 * 1024 * 1024_u64, // 8 MB connection receive window
+                    2 * 1024 * 1024_u64, // 2 MB per-stream receive window
+                    8 * 1024 * 1024_u64, // 8 MB send window
+                    100_000_u64,         // 100ms initial RTT
+                )
+            }
+        };
+    // apply profile defaults (will be overridden by tuning if specified)
+    transport_config
+        .receive_window(quinn::VarInt::from_u64(receive_window).unwrap_or(quinn::VarInt::MAX));
+    transport_config.stream_receive_window(
+        quinn::VarInt::from_u64(stream_receive_window).unwrap_or(quinn::VarInt::MAX),
+    );
+    transport_config.send_window(send_window);
+    transport_config.initial_rtt(std::time::Duration::from_micros(initial_rtt_us));
+    // 2. apply congestion control (explicit override or profile default)
+    let effective_cc = config.effective_congestion_control();
+    match effective_cc {
+        CongestionControl::Bbr => {
+            transport_config.congestion_controller_factory(std::sync::Arc::new(
+                quinn::congestion::BbrConfig::default(),
+            ));
+        }
+        CongestionControl::Cubic => {
+            transport_config.congestion_controller_factory(std::sync::Arc::new(
+                quinn::congestion::CubicConfig::default(),
+            ));
+        }
+    }
+    // 3. apply tuning overrides (take precedence over profile)
+    if let Some(v) = config.tuning.receive_window {
+        transport_config.receive_window(quinn::VarInt::from_u64(v).unwrap_or(quinn::VarInt::MAX));
+    }
+    if let Some(v) = config.tuning.stream_receive_window {
+        transport_config
+            .stream_receive_window(quinn::VarInt::from_u64(v).unwrap_or(quinn::VarInt::MAX));
+    }
+    if let Some(v) = config.tuning.send_window {
+        transport_config.send_window(v);
+    }
+    if let Some(v) = config.tuning.initial_rtt_ms {
+        transport_config.initial_rtt(std::time::Duration::from_millis(v));
+    }
+    if let Some(v) = config.tuning.initial_mtu {
+        transport_config.initial_mtu(v);
+    }
+    tracing::info!(
+        "Applied QUIC tuning: profile={}, congestion_control={}, receive_window={}, stream_receive_window={}, send_window={}",
+        config.network_profile,
+        effective_cc,
+        config.tuning.receive_window.unwrap_or(receive_window),
+        config.tuning.stream_receive_window.unwrap_or(stream_receive_window),
+        config.tuning.send_window.unwrap_or(send_window),
+    );
+}
+
 /// Compute SHA-256 fingerprint of a DER-encoded certificate
 fn compute_cert_fingerprint(cert_der: &[u8]) -> ring::digest::Digest {
     ring::digest::digest(&ring::digest::SHA256, cert_der)
@@ -875,14 +1095,13 @@ fn compute_cert_fingerprint(cert_der: &[u8]) -> ring::digest::Digest {
 
 /// Configure QUIC server with a self-signed certificate
 /// Returns the server config and the SHA-256 fingerprint of the certificate
-fn configure_server(
-    idle_timeout_sec: u64,
-    keep_alive_interval_sec: u64,
-) -> anyhow::Result<(quinn::ServerConfig, Vec<u8>)> {
+fn configure_server(config: &QuicConfig) -> anyhow::Result<(quinn::ServerConfig, Vec<u8>)> {
     tracing::info!(
-        "Configuring QUIC server (idle_timeout={}s, keep_alive={}s)",
-        idle_timeout_sec,
-        keep_alive_interval_sec
+        "Configuring QUIC server (idle_timeout={}s, keep_alive={}s, profile={}, cc={})",
+        config.idle_timeout_sec,
+        config.keep_alive_interval_sec,
+        config.network_profile,
+        config.effective_congestion_control(),
     );
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let key_der = cert.serialize_private_key_der();
@@ -897,29 +1116,28 @@ fn configure_server(
     let cert = rustls::Certificate(cert_der);
     let mut server_config = quinn::ServerConfig::with_single_cert(vec![cert], key)
         .context("Failed to create server config")?;
-    // configure transport timeouts for connection liveness detection
+    // configure transport
     let mut transport_config = quinn::TransportConfig::default();
+    // apply timeouts
     transport_config.max_idle_timeout(Some(
-        std::time::Duration::from_secs(idle_timeout_sec)
+        std::time::Duration::from_secs(config.idle_timeout_sec)
             .try_into()
             .context("Failed to convert idle timeout to VarInt")?,
     ));
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
-        keep_alive_interval_sec,
+        config.keep_alive_interval_sec,
     )));
+    // apply profile, congestion control, and tuning
+    apply_quic_tuning(&mut transport_config, config);
     server_config.transport_config(std::sync::Arc::new(transport_config));
     Ok((server_config, fingerprint_vec))
 }
 
-#[instrument]
-pub fn get_server_with_port_ranges(
-    port_ranges: Option<&str>,
-    idle_timeout_sec: u64,
-    keep_alive_interval_sec: u64,
-) -> anyhow::Result<(quinn::Endpoint, Vec<u8>)> {
-    let (server_config, cert_fingerprint) =
-        configure_server(idle_timeout_sec, keep_alive_interval_sec)?;
-    let socket = if let Some(ranges_str) = port_ranges {
+/// Create a QUIC server endpoint with the full QuicConfig
+#[instrument(skip(config))]
+pub fn get_server_with_config(config: &QuicConfig) -> anyhow::Result<(quinn::Endpoint, Vec<u8>)> {
+    let (server_config, cert_fingerprint) = configure_server(config)?;
+    let socket = if let Some(ranges_str) = config.port_ranges.as_deref() {
         let ranges = port_ranges::PortRanges::parse(ranges_str)?;
         ranges.bind_udp_socket(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))?
     } else {
@@ -934,6 +1152,24 @@ pub fn get_server_with_port_ranges(
     )
     .context("Failed to create QUIC endpoint")?;
     Ok((endpoint, cert_fingerprint))
+}
+
+/// Create a QUIC server endpoint (legacy API for backwards compatibility)
+#[instrument]
+pub fn get_server_with_port_ranges(
+    port_ranges: Option<&str>,
+    idle_timeout_sec: u64,
+    keep_alive_interval_sec: u64,
+) -> anyhow::Result<(quinn::Endpoint, Vec<u8>)> {
+    let mut config = QuicConfig::with_timeouts(
+        idle_timeout_sec,
+        keep_alive_interval_sec,
+        15, // default conn_timeout
+    );
+    if let Some(ranges) = port_ranges {
+        config.port_ranges = Some(ranges.to_string());
+    }
+    get_server_with_config(&config)
 }
 
 // certificate verifier that validates against a pinned certificate fingerprint
@@ -1208,18 +1444,19 @@ pub fn get_random_server_name() -> String {
         .collect()
 }
 
-#[instrument]
-pub fn get_client_with_port_ranges_and_pinning(
-    port_ranges: Option<&str>,
+/// Create a QUIC client endpoint with the full QuicConfig and certificate pinning
+#[instrument(skip(config))]
+pub fn get_client_with_config_and_pinning(
+    config: &QuicConfig,
     cert_fingerprint: Vec<u8>,
-    idle_timeout_sec: u64,
-    keep_alive_interval_sec: u64,
 ) -> anyhow::Result<quinn::Endpoint> {
     tracing::info!(
-        "Creating QUIC client with certificate pinning (fingerprint: {}, idle_timeout={}s, keep_alive={}s)",
+        "Creating QUIC client (fingerprint: {}, idle_timeout={}s, keep_alive={}s, profile={}, cc={})",
         hex::encode(&cert_fingerprint),
-        idle_timeout_sec,
-        keep_alive_interval_sec
+        config.idle_timeout_sec,
+        config.keep_alive_interval_sec,
+        config.network_profile,
+        config.effective_congestion_control(),
     );
     // create a crypto backend with certificate pinning
     let crypto = rustls::ClientConfig::builder()
@@ -1228,34 +1465,49 @@ pub fn get_client_with_port_ranges_and_pinning(
             cert_fingerprint,
         )))
         .with_no_client_auth();
-    create_client_endpoint(
-        port_ranges,
-        crypto,
-        idle_timeout_sec,
-        keep_alive_interval_sec,
-    )
+    create_client_endpoint_with_config(config, crypto)
 }
 
-// helper function to create client endpoint with given crypto config
-fn create_client_endpoint(
+/// Create a QUIC client endpoint (legacy API for backwards compatibility)
+#[instrument]
+pub fn get_client_with_port_ranges_and_pinning(
     port_ranges: Option<&str>,
-    crypto: rustls::ClientConfig,
+    cert_fingerprint: Vec<u8>,
     idle_timeout_sec: u64,
     keep_alive_interval_sec: u64,
 ) -> anyhow::Result<quinn::Endpoint> {
-    // create QUIC client config with timeouts
+    let mut config = QuicConfig::with_timeouts(
+        idle_timeout_sec,
+        keep_alive_interval_sec,
+        15, // default conn_timeout
+    );
+    if let Some(ranges) = port_ranges {
+        config.port_ranges = Some(ranges.to_string());
+    }
+    get_client_with_config_and_pinning(&config, cert_fingerprint)
+}
+
+// helper function to create client endpoint with given crypto config and QuicConfig
+fn create_client_endpoint_with_config(
+    config: &QuicConfig,
+    crypto: rustls::ClientConfig,
+) -> anyhow::Result<quinn::Endpoint> {
+    // create QUIC client config
     let mut client_config = quinn::ClientConfig::new(std::sync::Arc::new(crypto));
     let mut transport_config = quinn::TransportConfig::default();
+    // apply timeouts
     transport_config.max_idle_timeout(Some(
-        std::time::Duration::from_secs(idle_timeout_sec)
+        std::time::Duration::from_secs(config.idle_timeout_sec)
             .try_into()
             .context("Failed to convert idle timeout to VarInt")?,
     ));
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
-        keep_alive_interval_sec,
+        config.keep_alive_interval_sec,
     )));
+    // apply profile, congestion control, and tuning
+    apply_quic_tuning(&mut transport_config, config);
     client_config.transport_config(std::sync::Arc::new(transport_config));
-    let socket = if let Some(ranges_str) = port_ranges {
+    let socket = if let Some(ranges_str) = config.port_ranges.as_deref() {
         let ranges = port_ranges::PortRanges::parse(ranges_str)?;
         ranges.bind_udp_socket(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))?
     } else {

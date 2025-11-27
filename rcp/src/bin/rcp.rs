@@ -207,6 +207,54 @@ struct Args {
     )]
     remote_copy_conn_timeout_sec: u64,
 
+    /// Network profile for QUIC tuning
+    ///
+    /// 'lan' (default): Optimized for datacenter networks (<1ms RTT, 25-100 Gbps).
+    /// Uses BBR congestion control and aggressive window sizes.
+    /// 'wan': Conservative settings for internet/WAN connections.
+    /// Uses CUBIC congestion control and standard window sizes.
+    #[arg(
+        long,
+        default_value = "lan",
+        value_name = "PROFILE",
+        help_heading = "Remote copy options"
+    )]
+    network_profile: remote::NetworkProfile,
+
+    /// Congestion control algorithm for QUIC (overrides profile default)
+    ///
+    /// 'bbr': Model-based, fast ramp-up. Best for dedicated high-bandwidth links.
+    /// 'cubic': Loss-based, standard TCP congestion control. Best for shared networks.
+    /// Default: 'bbr' for LAN profile, 'cubic' for WAN profile.
+    #[arg(long, value_name = "ALGORITHM", help_heading = "Remote copy options")]
+    congestion_control: Option<remote::CongestionControl>,
+
+    /// QUIC connection-level receive window (overrides profile default)
+    ///
+    /// Accepts byte sizes like "128MiB", "1GiB", or plain numbers in bytes.
+    #[arg(long, value_name = "SIZE", help_heading = "Remote copy options")]
+    quic_receive_window: Option<bytesize::ByteSize>,
+
+    /// QUIC per-stream receive window (overrides profile default)
+    ///
+    /// Accepts byte sizes like "16MiB", "256MiB", or plain numbers in bytes.
+    #[arg(long, value_name = "SIZE", help_heading = "Remote copy options")]
+    quic_stream_receive_window: Option<bytesize::ByteSize>,
+
+    /// QUIC send window (overrides profile default)
+    ///
+    /// Accepts byte sizes like "128MiB", "1GiB", or plain numbers in bytes.
+    #[arg(long, value_name = "SIZE", help_heading = "Remote copy options")]
+    quic_send_window: Option<bytesize::ByteSize>,
+
+    /// Initial RTT estimate in milliseconds (overrides profile default)
+    #[arg(long, value_name = "MS", help_heading = "Remote copy options")]
+    quic_initial_rtt_ms: Option<u64>,
+
+    /// Initial MTU in bytes (default: 1200)
+    #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
+    quic_initial_mtu: Option<u16>,
+
     /// Enable file-based debug logging for rcpd processes
     ///
     /// Example: /tmp/rcpd-log creates /tmp/rcpd-log-YYYY-MM-DDTHH-MM-SS-RANDOM
@@ -257,12 +305,26 @@ async fn run_rcpd_master(
     dst: &path::RemotePath,
 ) -> anyhow::Result<common::copy::Summary> {
     tracing::debug!("running rcpd src/dst");
+    // build QUIC tuning from byte sizes
+    let quic_tuning = remote::QuicTuning {
+        receive_window: args.quic_receive_window.map(|b| b.0),
+        stream_receive_window: args.quic_stream_receive_window.map(|b| b.0),
+        send_window: args.quic_send_window.map(|b| b.0),
+        initial_rtt_ms: args.quic_initial_rtt_ms,
+        initial_mtu: args.quic_initial_mtu,
+    };
+    // build QUIC config with profile and tuning settings
+    let quic_config = remote::QuicConfig {
+        port_ranges: args.quic_port_ranges.clone(),
+        idle_timeout_sec: args.quic_idle_timeout_sec,
+        keep_alive_interval_sec: args.quic_keep_alive_interval_sec,
+        conn_timeout_sec: args.remote_copy_conn_timeout_sec,
+        network_profile: args.network_profile,
+        congestion_control: args.congestion_control,
+        tuning: quic_tuning.clone(),
+    };
     // open a port and wait from server & client hello, respond to client with server port
-    let (server_endpoint, master_cert_fingerprint) = remote::get_server_with_port_ranges(
-        args.quic_port_ranges.as_deref(),
-        args.quic_idle_timeout_sec,
-        args.quic_keep_alive_interval_sec,
-    )?;
+    let (server_endpoint, master_cert_fingerprint) = remote::get_server_with_config(&quic_config)?;
     let server_addr =
         remote::get_endpoint_addr_with_bind_ip(&server_endpoint, args.bind_ip.as_deref())?;
     let server_name = remote::get_random_server_name();
@@ -286,6 +348,9 @@ async fn run_rcpd_master(
         progress: args.progress,
         progress_delay: args.progress_delay.clone(),
         remote_copy_conn_timeout_sec: args.remote_copy_conn_timeout_sec,
+        network_profile: args.network_profile,
+        congestion_control: args.congestion_control,
+        quic_tuning,
         master_cert_fingerprint,
     };
     // deduplicate sessions if src and dst are the same host

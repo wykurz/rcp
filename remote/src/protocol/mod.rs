@@ -181,6 +181,12 @@ pub struct RcpdConfig {
     pub progress: bool,
     pub progress_delay: Option<String>,
     pub remote_copy_conn_timeout_sec: u64,
+    /// Network profile for QUIC tuning
+    pub network_profile: crate::NetworkProfile,
+    /// Congestion control algorithm override (None = use profile default)
+    pub congestion_control: Option<crate::CongestionControl>,
+    /// Advanced QUIC tuning parameters
+    pub quic_tuning: crate::QuicTuning,
     /// SHA-256 fingerprint of the Master's TLS certificate (32 bytes)
     /// Used for certificate pinning when rcpd connects to Master
     pub master_cert_fingerprint: Vec<u8>,
@@ -235,6 +241,27 @@ impl RcpdConfig {
             "--remote-copy-conn-timeout-sec={}",
             self.remote_copy_conn_timeout_sec
         ));
+        // network profile and congestion control
+        args.push(format!("--network-profile={}", self.network_profile));
+        if let Some(cc) = self.congestion_control {
+            args.push(format!("--congestion-control={}", cc));
+        }
+        // quic tuning overrides (only if set)
+        if let Some(v) = self.quic_tuning.receive_window {
+            args.push(format!("--quic-receive-window={v}"));
+        }
+        if let Some(v) = self.quic_tuning.stream_receive_window {
+            args.push(format!("--quic-stream-receive-window={v}"));
+        }
+        if let Some(v) = self.quic_tuning.send_window {
+            args.push(format!("--quic-send-window={v}"));
+        }
+        if let Some(v) = self.quic_tuning.initial_rtt_ms {
+            args.push(format!("--quic-initial-rtt-ms={v}"));
+        }
+        if let Some(v) = self.quic_tuning.initial_mtu {
+            args.push(format!("--quic-initial-mtu={v}"));
+        }
         // pass master cert fingerprint as hex-encoded string
         args.push(format!(
             "--master-cert-fingerprint={}",

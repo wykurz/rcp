@@ -75,14 +75,18 @@ Quinn supports three congestion control algorithms:
   - May be unfair when competing with CUBIC flows on shared links
   - Best suited for dedicated/isolated networks
 
-**Decision**: BBR is the default for rcp. The primary use case is datacenter file transfers on dedicated high-bandwidth links where BBR's characteristics (fast ramp-up, not fooled by shallow buffers) are ideal. Users on shared networks or WAN can switch to CUBIC via `--congestion-control=cubic`.
+**Decision**: The congestion control algorithm is tied to the network profile by default:
+- LAN profile → BBR (fast ramp-up for dedicated links)
+- WAN profile → CUBIC (fairness on shared networks)
+
+Users can override with `--congestion-control=<bbr|cubic>` if needed.
 
 ## 3. Design Decisions
 
 Based on the target environment (25-100 Gbps NICs, <1ms RTT, datacenter):
 
 1. **Default profile**: `lan` - optimized for datacenter use case
-2. **Default congestion control**: `bbr` - fastest ramp-up for dedicated links
+2. **Profile-coupled congestion control**: LAN uses BBR, WAN uses CUBIC (overridable)
 3. **Initial window**: 8 MB - aggressive to saturate high-bandwidth links quickly
 4. **Flow control windows**: Sized for 100 Gbps @ 1ms (12.5 MB BDP)
 
@@ -172,20 +176,22 @@ This allows combinations like:
 For experimentation and edge cases, expose individual parameters:
 
 ```
---quic-receive-window=<bytes>         Connection-level receive window
---quic-stream-receive-window=<bytes>  Per-stream receive window
---quic-send-window=<bytes>            Send window
---quic-initial-rtt-ms=<milliseconds>  Initial RTT estimate
---quic-initial-mtu=<bytes>            Initial MTU (default: 1200)
+--quic-receive-window=<SIZE>         Connection-level receive window
+--quic-stream-receive-window=<SIZE>  Per-stream receive window
+--quic-send-window=<SIZE>            Send window
+--quic-initial-rtt-ms=<milliseconds> Initial RTT estimate
+--quic-initial-mtu=<bytes>           Initial MTU (default: 1200)
 ```
+
+Window sizes accept human-readable byte values like `128MiB`, `1GiB`, or plain numbers in bytes.
 
 These override profile settings when specified.
 
 **Example - Ultra-aggressive for 100 Gbps dedicated link:**
 ```bash
-rcp --quic-receive-window=268435456 \
-    --quic-stream-receive-window=33554432 \
-    --quic-send-window=268435456 \
+rcp --quic-receive-window=256MiB \
+    --quic-stream-receive-window=32MiB \
+    --quic-send-window=256MiB \
     source:/data dest:/data
 ```
 
