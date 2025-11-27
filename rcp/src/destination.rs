@@ -521,12 +521,8 @@ pub async fn run_destination(
     preserve: &common::preserve::Settings,
     quic_config: &remote::QuicConfig,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
-    let client = remote::get_client_with_port_ranges_and_pinning(
-        quic_config.port_ranges.as_deref(),
-        src_cert_fingerprint.to_vec(),
-        quic_config.idle_timeout_sec,
-        quic_config.keep_alive_interval_sec,
-    )?;
+    let client =
+        remote::get_client_with_config_and_pinning(quic_config, src_cert_fingerprint.to_vec())?;
     tracing::info!("Connecting to source at {}", src_endpoint);
     let connection = client
         .connect(*src_endpoint, src_server_name)?

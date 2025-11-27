@@ -178,6 +178,39 @@ struct Args {
     )]
     remote_copy_conn_timeout_sec: u64,
 
+    /// Network profile for QUIC tuning
+    #[arg(
+        long,
+        default_value = "lan",
+        value_name = "PROFILE",
+        help_heading = "Remote copy options"
+    )]
+    network_profile: remote::NetworkProfile,
+
+    /// Congestion control algorithm for QUIC (overrides profile default)
+    #[arg(long, value_name = "ALGORITHM", help_heading = "Remote copy options")]
+    congestion_control: Option<remote::CongestionControl>,
+
+    /// QUIC connection-level receive window in bytes (overrides profile default)
+    #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
+    quic_receive_window: Option<u64>,
+
+    /// QUIC per-stream receive window in bytes (overrides profile default)
+    #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
+    quic_stream_receive_window: Option<u64>,
+
+    /// QUIC send window in bytes (overrides profile default)
+    #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
+    quic_send_window: Option<u64>,
+
+    /// Initial RTT estimate in milliseconds (overrides profile default)
+    #[arg(long, value_name = "MS", help_heading = "Remote copy options")]
+    quic_initial_rtt_ms: Option<u64>,
+
+    /// Initial MTU in bytes (default: 1200)
+    #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
+    quic_initial_mtu: Option<u16>,
+
     /// Enable file-based debug logging
     ///
     /// Example: /tmp/rcpd-log creates /tmp/rcpd-log-YYYY-MM-DDTHH-MM-SS-RANDOM
@@ -257,6 +290,15 @@ async fn run_operation(
         idle_timeout_sec: args.quic_idle_timeout_sec,
         keep_alive_interval_sec: args.quic_keep_alive_interval_sec,
         conn_timeout_sec: args.remote_copy_conn_timeout_sec,
+        network_profile: args.network_profile,
+        congestion_control: args.congestion_control,
+        tuning: remote::QuicTuning {
+            receive_window: args.quic_receive_window,
+            stream_receive_window: args.quic_stream_receive_window,
+            send_window: args.quic_send_window,
+            initial_rtt_ms: args.quic_initial_rtt_ms,
+            initial_mtu: args.quic_initial_mtu,
+        },
     };
     let rcpd_result = match master_hello {
         remote::protocol::MasterHello::Source { src, dst } => {
@@ -354,13 +396,24 @@ async fn async_main(
                 args.master_cert_fingerprint
             )
         })?;
+    // build QUIC config with profile and tuning settings
+    let quic_config = remote::QuicConfig {
+        port_ranges: args.quic_port_ranges.clone(),
+        idle_timeout_sec: args.quic_idle_timeout_sec,
+        keep_alive_interval_sec: args.quic_keep_alive_interval_sec,
+        conn_timeout_sec: args.remote_copy_conn_timeout_sec,
+        network_profile: args.network_profile,
+        congestion_control: args.congestion_control,
+        tuning: remote::QuicTuning {
+            receive_window: args.quic_receive_window,
+            stream_receive_window: args.quic_stream_receive_window,
+            send_window: args.quic_send_window,
+            initial_rtt_ms: args.quic_initial_rtt_ms,
+            initial_mtu: args.quic_initial_mtu,
+        },
+    };
     // use certificate pinning for Master→rcpd connection
-    let client = remote::get_client_with_port_ranges_and_pinning(
-        args.quic_port_ranges.as_deref(),
-        master_cert_fingerprint,
-        args.quic_idle_timeout_sec,
-        args.quic_keep_alive_interval_sec,
-    )?;
+    let client = remote::get_client_with_config_and_pinning(&quic_config, master_cert_fingerprint)?;
     let master_connection = {
         let master_connection = client
             .connect(args.master_addr, &args.server_name)?
