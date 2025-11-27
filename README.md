@@ -41,6 +41,13 @@ API documentation for the command-line tools is available on docs.rs:
 - [rcp-tools-remote](https://docs.rs/rcp-tools-remote) - Remote operation protocol
 - [rcp-tools-throttle](https://docs.rs/rcp-tools-throttle) - Resource throttling
 
+**Design and reference documents** (in the `docs/` directory):
+- [QUIC Performance Tuning](docs/quic_performance_tuning.md) - Network profiles, congestion control, and advanced tuning
+- [Security](docs/security.md) - Threat model and security architecture
+- [Network Connectivity](docs/network_connectivity.md) - Troubleshooting remote connections
+- [Remote Protocol](docs/remote_protocol.md) - Wire protocol specification
+- [rcpd Bootstrap Design](docs/rcpd_bootstrap_design.md) - Auto-deployment architecture
+
 Examples
 ========
 
