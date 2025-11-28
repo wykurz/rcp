@@ -404,7 +404,8 @@ pub struct QuicTuning {
     /// Send window in bytes (default: 128 MB for LAN, 8 MB for WAN)
     pub send_window: Option<u64>,
     /// Initial RTT estimate in milliseconds (default: 0.3ms for LAN, 100ms for WAN)
-    pub initial_rtt_ms: Option<u64>,
+    /// Accepts floating point values for sub-millisecond precision (e.g., 0.3 for 300µs)
+    pub initial_rtt_ms: Option<f64>,
     /// Initial MTU in bytes (default: 1200)
     pub initial_mtu: Option<u16>,
 }
@@ -1073,7 +1074,9 @@ fn apply_quic_tuning(transport_config: &mut quinn::TransportConfig, config: &Qui
         transport_config.send_window(v);
     }
     if let Some(v) = config.tuning.initial_rtt_ms {
-        transport_config.initial_rtt(std::time::Duration::from_millis(v));
+        // convert f64 milliseconds to Duration (supports sub-millisecond precision)
+        let micros = (v * 1000.0) as u64;
+        transport_config.initial_rtt(std::time::Duration::from_micros(micros));
     }
     if let Some(v) = config.tuning.initial_mtu {
         transport_config.initial_mtu(v);
@@ -1967,7 +1970,7 @@ mod quic_tuning_tests {
             receive_window: Some(64 * 1024 * 1024),
             stream_receive_window: Some(8 * 1024 * 1024),
             send_window: Some(32 * 1024 * 1024),
-            initial_rtt_ms: Some(50),
+            initial_rtt_ms: Some(50.0),
             initial_mtu: Some(1400),
         };
         let mut transport = quinn::TransportConfig::default();
@@ -1979,7 +1982,7 @@ mod quic_tuning_tests {
         let mut config = default_quic_config();
         // only override some values
         config.tuning.receive_window = Some(256 * 1024 * 1024);
-        config.tuning.initial_rtt_ms = Some(10);
+        config.tuning.initial_rtt_ms = Some(10.0);
         let mut transport = quinn::TransportConfig::default();
         // should not panic
         apply_quic_tuning(&mut transport, &config);
@@ -2037,6 +2040,26 @@ mod quic_tuning_tests {
         let mut transport = quinn::TransportConfig::default();
         // should not panic - fallback to VarInt::MAX
         apply_quic_tuning(&mut transport, &config);
+    }
+    #[test]
+    fn test_sub_millisecond_rtt_does_not_panic() {
+        let mut config = default_quic_config();
+        // test sub-millisecond RTT (0.3ms = 300 microseconds, typical for LAN)
+        config.tuning.initial_rtt_ms = Some(0.3);
+        let mut transport = quinn::TransportConfig::default();
+        // should not panic
+        apply_quic_tuning(&mut transport, &config);
+    }
+    #[test]
+    fn test_fractional_rtt_precision_does_not_panic() {
+        let mut config = default_quic_config();
+        // test various fractional millisecond values
+        for rtt in [0.1, 0.25, 0.5, 1.5, 10.75, 100.0] {
+            config.tuning.initial_rtt_ms = Some(rtt);
+            let mut transport = quinn::TransportConfig::default();
+            // should not panic
+            apply_quic_tuning(&mut transport, &config);
+        }
     }
     #[test]
     fn test_lan_profile_uses_bbr_by_default() {
