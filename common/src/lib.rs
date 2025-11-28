@@ -747,17 +747,10 @@ impl std::io::Write for ProgWriter {
 }
 
 fn get_hostname() -> String {
-    let mut buf = [0u8; 256];
-    // Safety: gethostname writes to buf and returns 0 on success
-    let result = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if result == 0 {
-        if let Ok(cstr) = std::ffi::CStr::from_bytes_until_nul(&buf) {
-            if let Ok(s) = cstr.to_str() {
-                return s.to_string();
-            }
-        }
-    }
-    "unknown".to_string()
+    nix::unistd::gethostname()
+        .ok()
+        .and_then(|os_str| os_str.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[must_use]
