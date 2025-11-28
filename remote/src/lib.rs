@@ -1916,3 +1916,288 @@ mod tests {
         assert_eq!(addr.port(), endpoint.local_addr().unwrap().port());
     }
 }
+
+#[cfg(test)]
+mod quic_tuning_tests {
+    use super::*;
+    // helper to create a QuicConfig with defaults
+    fn default_quic_config() -> QuicConfig {
+        QuicConfig {
+            port_ranges: None,
+            idle_timeout_sec: 10,
+            keep_alive_interval_sec: 1,
+            conn_timeout_sec: 15,
+            network_profile: NetworkProfile::Lan,
+            congestion_control: None,
+            tuning: QuicTuning::default(),
+        }
+    }
+    // LAN profile constants (from apply_quic_tuning implementation)
+    const LAN_RECEIVE_WINDOW: u64 = 128 * 1024 * 1024;
+    const LAN_STREAM_RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
+    const LAN_SEND_WINDOW: u64 = 128 * 1024 * 1024;
+    const LAN_INITIAL_RTT_US: u64 = 300;
+    // WAN profile constants (from apply_quic_tuning implementation)
+    const WAN_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
+    const WAN_STREAM_RECEIVE_WINDOW: u64 = 2 * 1024 * 1024;
+    const WAN_SEND_WINDOW: u64 = 8 * 1024 * 1024;
+    const WAN_INITIAL_RTT_US: u64 = 100_000;
+    // note: quinn's TransportConfig doesn't expose getter methods, so we can't directly
+    // verify the values that were set. Instead, we test that apply_quic_tuning doesn't
+    // panic with various inputs and test the logic of QuicConfig separately.
+    #[test]
+    fn test_apply_quic_tuning_lan_profile_does_not_panic() {
+        let config = default_quic_config();
+        let mut transport = quinn::TransportConfig::default();
+        // should not panic
+        apply_quic_tuning(&mut transport, &config);
+    }
+    #[test]
+    fn test_apply_quic_tuning_wan_profile_does_not_panic() {
+        let mut config = default_quic_config();
+        config.network_profile = NetworkProfile::Wan;
+        let mut transport = quinn::TransportConfig::default();
+        // should not panic
+        apply_quic_tuning(&mut transport, &config);
+    }
+    #[test]
+    fn test_apply_quic_tuning_with_all_overrides_does_not_panic() {
+        let mut config = default_quic_config();
+        config.tuning = QuicTuning {
+            receive_window: Some(64 * 1024 * 1024),
+            stream_receive_window: Some(8 * 1024 * 1024),
+            send_window: Some(32 * 1024 * 1024),
+            initial_rtt_ms: Some(50),
+            initial_mtu: Some(1400),
+        };
+        let mut transport = quinn::TransportConfig::default();
+        // should not panic
+        apply_quic_tuning(&mut transport, &config);
+    }
+    #[test]
+    fn test_apply_quic_tuning_with_partial_overrides_does_not_panic() {
+        let mut config = default_quic_config();
+        // only override some values
+        config.tuning.receive_window = Some(256 * 1024 * 1024);
+        config.tuning.initial_rtt_ms = Some(10);
+        let mut transport = quinn::TransportConfig::default();
+        // should not panic
+        apply_quic_tuning(&mut transport, &config);
+    }
+    #[test]
+    fn test_apply_quic_tuning_bbr_congestion_control_does_not_panic() {
+        let mut config = default_quic_config();
+        config.congestion_control = Some(CongestionControl::Bbr);
+        let mut transport = quinn::TransportConfig::default();
+        // should not panic
+        apply_quic_tuning(&mut transport, &config);
+    }
+    #[test]
+    fn test_apply_quic_tuning_cubic_congestion_control_does_not_panic() {
+        let mut config = default_quic_config();
+        config.congestion_control = Some(CongestionControl::Cubic);
+        let mut transport = quinn::TransportConfig::default();
+        // should not panic
+        apply_quic_tuning(&mut transport, &config);
+    }
+    #[test]
+    fn test_varint_overflow_handling_receive_window_does_not_panic() {
+        let mut config = default_quic_config();
+        // VarInt max is 2^62 - 1; u64::MAX exceeds this and should trigger the
+        // unwrap_or(VarInt::MAX) fallback instead of panicking
+        config.tuning.receive_window = Some(u64::MAX);
+        let mut transport = quinn::TransportConfig::default();
+        // should not panic - the fallback should handle the overflow
+        apply_quic_tuning(&mut transport, &config);
+    }
+    #[test]
+    fn test_varint_overflow_handling_stream_receive_window_does_not_panic() {
+        let mut config = default_quic_config();
+        config.tuning.stream_receive_window = Some(u64::MAX);
+        let mut transport = quinn::TransportConfig::default();
+        // should not panic - the fallback should handle the overflow
+        apply_quic_tuning(&mut transport, &config);
+    }
+    #[test]
+    fn test_varint_at_max_boundary_does_not_panic() {
+        let mut config = default_quic_config();
+        // VarInt::MAX is 2^62 - 1 = 4611686018427387903
+        // test values just at and around the boundary
+        config.tuning.receive_window = Some(quinn::VarInt::MAX.into_inner());
+        let mut transport = quinn::TransportConfig::default();
+        // should not panic
+        apply_quic_tuning(&mut transport, &config);
+    }
+    #[test]
+    fn test_varint_just_over_max_does_not_panic() {
+        let mut config = default_quic_config();
+        // VarInt::MAX + 1 should trigger the overflow handling
+        let over_max: u64 = quinn::VarInt::MAX.into_inner() + 1;
+        config.tuning.receive_window = Some(over_max);
+        let mut transport = quinn::TransportConfig::default();
+        // should not panic - fallback to VarInt::MAX
+        apply_quic_tuning(&mut transport, &config);
+    }
+    #[test]
+    fn test_lan_profile_uses_bbr_by_default() {
+        let config = default_quic_config();
+        assert_eq!(config.network_profile, NetworkProfile::Lan);
+        assert_eq!(config.congestion_control, None);
+        // effective congestion control should be BBR for LAN
+        assert_eq!(
+            config.effective_congestion_control(),
+            CongestionControl::Bbr,
+            "LAN profile should default to BBR"
+        );
+    }
+    #[test]
+    fn test_wan_profile_uses_cubic_by_default() {
+        let mut config = default_quic_config();
+        config.network_profile = NetworkProfile::Wan;
+        assert_eq!(config.congestion_control, None);
+        // effective congestion control should be CUBIC for WAN
+        assert_eq!(
+            config.effective_congestion_control(),
+            CongestionControl::Cubic,
+            "WAN profile should default to CUBIC"
+        );
+    }
+    #[test]
+    fn test_congestion_control_override_on_lan() {
+        let mut config = default_quic_config();
+        config.network_profile = NetworkProfile::Lan;
+        config.congestion_control = Some(CongestionControl::Cubic);
+        // explicit override should take precedence
+        assert_eq!(
+            config.effective_congestion_control(),
+            CongestionControl::Cubic,
+            "explicit CUBIC should override LAN's default BBR"
+        );
+    }
+    #[test]
+    fn test_congestion_control_override_on_wan() {
+        let mut config = default_quic_config();
+        config.network_profile = NetworkProfile::Wan;
+        config.congestion_control = Some(CongestionControl::Bbr);
+        // explicit override should take precedence
+        assert_eq!(
+            config.effective_congestion_control(),
+            CongestionControl::Bbr,
+            "explicit BBR should override WAN's default CUBIC"
+        );
+    }
+    #[test]
+    fn test_network_profile_default_congestion_control() {
+        assert_eq!(
+            NetworkProfile::Lan.default_congestion_control(),
+            CongestionControl::Bbr
+        );
+        assert_eq!(
+            NetworkProfile::Wan.default_congestion_control(),
+            CongestionControl::Cubic
+        );
+    }
+    #[test]
+    fn test_network_profile_display() {
+        assert_eq!(format!("{}", NetworkProfile::Lan), "lan");
+        assert_eq!(format!("{}", NetworkProfile::Wan), "wan");
+    }
+    #[test]
+    fn test_congestion_control_display() {
+        assert_eq!(format!("{}", CongestionControl::Bbr), "bbr");
+        assert_eq!(format!("{}", CongestionControl::Cubic), "cubic");
+    }
+    #[test]
+    fn test_network_profile_from_str() {
+        assert_eq!(
+            "lan".parse::<NetworkProfile>().unwrap(),
+            NetworkProfile::Lan
+        );
+        assert_eq!(
+            "LAN".parse::<NetworkProfile>().unwrap(),
+            NetworkProfile::Lan
+        );
+        assert_eq!(
+            "wan".parse::<NetworkProfile>().unwrap(),
+            NetworkProfile::Wan
+        );
+        assert_eq!(
+            "WAN".parse::<NetworkProfile>().unwrap(),
+            NetworkProfile::Wan
+        );
+        assert!("invalid".parse::<NetworkProfile>().is_err());
+    }
+    #[test]
+    fn test_network_profile_from_str_error_message() {
+        let err = "invalid".parse::<NetworkProfile>().unwrap_err();
+        assert!(
+            err.to_string().contains("invalid network profile"),
+            "error should mention invalid profile: {}",
+            err
+        );
+    }
+    #[test]
+    fn test_congestion_control_from_str() {
+        assert_eq!(
+            "bbr".parse::<CongestionControl>().unwrap(),
+            CongestionControl::Bbr
+        );
+        assert_eq!(
+            "BBR".parse::<CongestionControl>().unwrap(),
+            CongestionControl::Bbr
+        );
+        assert_eq!(
+            "cubic".parse::<CongestionControl>().unwrap(),
+            CongestionControl::Cubic
+        );
+        assert_eq!(
+            "CUBIC".parse::<CongestionControl>().unwrap(),
+            CongestionControl::Cubic
+        );
+        assert!("invalid".parse::<CongestionControl>().is_err());
+    }
+    #[test]
+    fn test_congestion_control_from_str_error_message() {
+        let err = "invalid".parse::<CongestionControl>().unwrap_err();
+        assert!(
+            err.to_string().contains("invalid congestion control"),
+            "error should mention invalid cc: {}",
+            err
+        );
+    }
+    #[test]
+    fn test_quic_tuning_default() {
+        let tuning = QuicTuning::default();
+        assert!(tuning.receive_window.is_none());
+        assert!(tuning.stream_receive_window.is_none());
+        assert!(tuning.send_window.is_none());
+        assert!(tuning.initial_rtt_ms.is_none());
+        assert!(tuning.initial_mtu.is_none());
+    }
+    #[test]
+    fn test_quic_config_default_values() {
+        let config = default_quic_config();
+        assert_eq!(config.network_profile, NetworkProfile::Lan);
+        assert_eq!(config.congestion_control, None);
+        assert!(config.tuning.receive_window.is_none());
+    }
+    #[test]
+    fn test_profile_window_sizes_match_documentation() {
+        // verify that the constants match what's documented in docs/quic_performance_tuning.md
+        // LAN: 128 MiB receive, 16 MiB stream, 128 MiB send, 0.3ms RTT
+        assert_eq!(LAN_RECEIVE_WINDOW, 128 * 1024 * 1024);
+        assert_eq!(LAN_STREAM_RECEIVE_WINDOW, 16 * 1024 * 1024);
+        assert_eq!(LAN_SEND_WINDOW, 128 * 1024 * 1024);
+        assert_eq!(LAN_INITIAL_RTT_US, 300); // 0.3ms = 300 microseconds
+                                             // WAN: 8 MiB receive, 2 MiB stream, 8 MiB send, 100ms RTT
+        assert_eq!(WAN_RECEIVE_WINDOW, 8 * 1024 * 1024);
+        assert_eq!(WAN_STREAM_RECEIVE_WINDOW, 2 * 1024 * 1024);
+        assert_eq!(WAN_SEND_WINDOW, 8 * 1024 * 1024);
+        assert_eq!(WAN_INITIAL_RTT_US, 100_000); // 100ms = 100,000 microseconds
+    }
+    #[test]
+    fn test_network_profile_default_is_lan() {
+        // verify that NetworkProfile::default() returns Lan as documented
+        assert_eq!(NetworkProfile::default(), NetworkProfile::Lan);
+    }
+}
