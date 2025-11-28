@@ -286,24 +286,84 @@ For detailed security architecture and threat model, see `docs/security.md`.
 
 `rcp` tools will not-overwrite pre-existing data unless used with the `--overwrite` flag.
 
-Tracing and tokio-console
-=========================
+Profiling
+=========
 
-<img src="https://raw.githubusercontent.com/tokio-rs/tracing/master/assets/logo-type.png" height="64" alt="Tracing">
+`rcp` supports several profiling and debugging options.
 
-The `rcp` tools now use the `tracing` crate for logging and support sending data to the `tokio-console` subscriber.
+## Chrome Tracing
 
-## Enabling
+Produces JSON trace files viewable in [Perfetto UI](https://ui.perfetto.dev) or `chrome://tracing`.
 
-To enable the `console-subscriber` you need to set the environment variable `RCP_TOKIO_TRACING_CONSOLE_ENABLED=1` (or `true` with any case).
+```bash
+# Profile a local copy
+rcp --chrome-trace=/tmp/trace /source /dest
 
-## Server port
+# Profile a remote copy (traces produced on all hosts)
+rcp --chrome-trace=/tmp/trace host1:/path host2:/path
+```
 
-By default port `6669` is used (`tokio-console` default) but this can be changed by setting `RCP_TOKIO_TRACING_CONSOLE_SERVER_PORT=1234`.
+Output files are named: `{prefix}-{identifier}-{hostname}-{pid}-{timestamp}.json`
 
-## Retention time
+Example output:
+- `/tmp/trace-rcp-master-myhost-12345-2025-01-15T10:30:45.json`
+- `/tmp/trace-rcpd-source-host1-23456-2025-01-15T10:30:46.json`
+- `/tmp/trace-rcpd-destination-host2-34567-2025-01-15T10:30:46.json`
 
-The trace events are retained for 60s. This can be modified by setting `RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS=120`.
+View traces by opening https://ui.perfetto.dev and dragging the JSON file into the browser.
+
+## Flamegraph
+
+Produces folded stack files convertible to SVG flamegraphs using [inferno](https://github.com/jonhoo/inferno).
+
+```bash
+# Profile and generate flamegraph data
+rcp --flamegraph=/tmp/flame /source /dest
+
+# Convert to SVG (requires: cargo install inferno)
+cat /tmp/flame-*.folded | inferno-flamegraph > flamegraph.svg
+
+# Or use inferno-flamechart to preserve chronological order
+cat /tmp/flame-*.folded | inferno-flamechart > flamechart.svg
+```
+
+Output files are named: `{prefix}-{identifier}-{hostname}-{pid}-{timestamp}.folded`
+
+## Profile Level
+
+Control which spans are captured with `--profile-level` (default: `trace`):
+
+```bash
+# Capture only info-level and above spans
+rcp --chrome-trace=/tmp/trace --profile-level=info /source /dest
+```
+
+Only spans from rcp crates are captured (not tokio/quinn internals).
+
+## Tokio Console
+
+Enable [tokio-console](https://github.com/tokio-rs/console) for real-time async task inspection:
+
+```bash
+# Start rcp with tokio-console enabled
+rcp --tokio-console /source /dest
+
+# Or specify a custom port
+rcp --tokio-console --tokio-console-port=6670 /source /dest
+
+# Connect with tokio-console CLI
+tokio-console http://127.0.0.1:6669
+```
+
+Trace events are retained for 60s by default. This can be modified with `RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS=120`.
+
+## Combined profiling
+
+All profiling options can be used together:
+
+```bash
+rcp --chrome-trace=/tmp/trace --flamegraph=/tmp/flame --tokio-console /source /dest
+```
 
 References
 ==========

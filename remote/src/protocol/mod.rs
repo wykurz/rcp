@@ -190,6 +190,16 @@ pub struct RcpdConfig {
     /// SHA-256 fingerprint of the Master's TLS certificate (32 bytes)
     /// Used for certificate pinning when rcpd connects to Master
     pub master_cert_fingerprint: Vec<u8>,
+    /// Chrome trace output prefix for profiling
+    pub chrome_trace_prefix: Option<String>,
+    /// Flamegraph output prefix for profiling
+    pub flamegraph_prefix: Option<String>,
+    /// Log level for profiling (default: trace when profiling is enabled)
+    pub profile_level: Option<String>,
+    /// Enable tokio-console
+    pub tokio_console: bool,
+    /// Port for tokio-console server
+    pub tokio_console_port: Option<u16>,
 }
 
 impl RcpdConfig {
@@ -267,6 +277,26 @@ impl RcpdConfig {
             "--master-cert-fingerprint={}",
             hex::encode(&self.master_cert_fingerprint)
         ));
+        // profiling options (only add --profile-level when profiling is enabled)
+        let profiling_enabled =
+            self.chrome_trace_prefix.is_some() || self.flamegraph_prefix.is_some();
+        if let Some(ref prefix) = self.chrome_trace_prefix {
+            args.push(format!("--chrome-trace={prefix}"));
+        }
+        if let Some(ref prefix) = self.flamegraph_prefix {
+            args.push(format!("--flamegraph={prefix}"));
+        }
+        if profiling_enabled {
+            if let Some(ref level) = self.profile_level {
+                args.push(format!("--profile-level={level}"));
+            }
+        }
+        if self.tokio_console {
+            args.push("--tokio-console".to_string());
+        }
+        if let Some(port) = self.tokio_console_port {
+            args.push(format!("--tokio-console-port={port}"));
+        }
         args
     }
 }

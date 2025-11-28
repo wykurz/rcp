@@ -43,11 +43,39 @@ pub struct OutputConfig {
     pub print_summary: bool,
 }
 
-/// Tracing configuration for debugging
-#[derive(Debug, Default)]
+/// Tracing configuration for debugging and profiling
+#[derive(Debug)]
 pub struct TracingConfig {
     /// Remote tracing layer for distributed tracing
     pub remote_layer: Option<crate::remote_tracing::RemoteTracingLayer>,
     /// Debug log file path
     pub debug_log_file: Option<String>,
+    /// Chrome trace output prefix (produces JSON viewable in Perfetto UI)
+    pub chrome_trace_prefix: Option<String>,
+    /// Flamegraph output prefix (produces folded stacks for inferno)
+    pub flamegraph_prefix: Option<String>,
+    /// Identifier for trace filenames (e.g., "rcp-master", "rcpd-source", "rcpd-destination")
+    pub trace_identifier: String,
+    /// Log level for profiling layers (chrome trace, flamegraph)
+    /// Defaults to "trace" when profiling is enabled
+    pub profile_level: Option<String>,
+    /// Enable tokio-console for live async debugging
+    pub tokio_console: bool,
+    /// Port for tokio-console server (default: 6669)
+    pub tokio_console_port: Option<u16>,
+}
+
+impl Default for TracingConfig {
+    fn default() -> Self {
+        Self {
+            remote_layer: None,
+            debug_log_file: None,
+            chrome_trace_prefix: None,
+            flamegraph_prefix: None,
+            trace_identifier: "unknown".to_string(),
+            profile_level: None,
+            tokio_console: false,
+            tokio_console_port: None,
+        }
+    }
 }

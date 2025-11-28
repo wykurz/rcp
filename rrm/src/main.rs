@@ -181,6 +181,12 @@ fn main() -> Result<()> {
     let tracing = common::TracingConfig {
         remote_layer: None,
         debug_log_file: None,
+        chrome_trace_prefix: None,
+        flamegraph_prefix: None,
+        trace_identifier: "rrm".to_string(),
+        profile_level: None,
+        tokio_console: false,
+        tokio_console_port: None,
     };
     let res = common::run(
         if args.progress || args.progress_type.is_some() {

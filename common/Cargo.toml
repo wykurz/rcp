@@ -43,5 +43,7 @@ thread_local = "1.1"
 throttle = { workspace = true }
 tokio = { version = "1.38", features = ["full", "parking_lot", "tracing"] }
 tracing = "0.1"
+tracing-chrome = "0.7"
+tracing-flame = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "parking_lot"] }
 tracing-test = "0.2"
