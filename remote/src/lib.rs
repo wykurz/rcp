@@ -397,11 +397,11 @@ impl std::str::FromStr for CongestionControl {
 /// profile defaults. Use these for fine-tuning in specific environments.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct QuicTuning {
-    /// Connection-level receive window in bytes (default: 128 MB for LAN, 8 MB for WAN)
+    /// Connection-level receive window in bytes (default: 128 MiB for LAN, 8 MiB for WAN)
     pub receive_window: Option<u64>,
-    /// Per-stream receive window in bytes (default: 16 MB for LAN, 2 MB for WAN)
+    /// Per-stream receive window in bytes (default: 16 MiB for LAN, 2 MiB for WAN)
     pub stream_receive_window: Option<u64>,
-    /// Send window in bytes (default: 128 MB for LAN, 8 MB for WAN)
+    /// Send window in bytes (default: 128 MiB for LAN, 8 MiB for WAN)
     pub send_window: Option<u64>,
     /// Initial RTT estimate in milliseconds (default: 0.3ms for LAN, 100ms for WAN)
     /// Accepts floating point values for sub-millisecond precision (e.g., 0.3 for 300µs)
@@ -1022,20 +1022,20 @@ fn apply_quic_tuning(transport_config: &mut quinn::TransportConfig, config: &Qui
         match config.network_profile {
             NetworkProfile::Lan => {
                 // LAN profile: optimized for 100 Gbps @ 1ms RTT
-                // BDP = 12.5 MB, use 10x for headroom with multiple streams
+                // BDP ~= 12.5 MB (~11.9 MiB), use ~10x for headroom with multiple streams
                 (
-                    128 * 1024 * 1024_u64, // 128 MB connection receive window
-                    16 * 1024 * 1024_u64,  // 16 MB per-stream receive window
-                    128 * 1024 * 1024_u64, // 128 MB send window
+                    128 * 1024 * 1024_u64, // 128 MiB connection receive window
+                    16 * 1024 * 1024_u64,  // 16 MiB per-stream receive window
+                    128 * 1024 * 1024_u64, // 128 MiB send window
                     300_u64,               // 0.3ms initial RTT
                 )
             }
             NetworkProfile::Wan => {
                 // WAN profile: conservative settings for internet
                 (
-                    8 * 1024 * 1024_u64, // 8 MB connection receive window
-                    2 * 1024 * 1024_u64, // 2 MB per-stream receive window
-                    8 * 1024 * 1024_u64, // 8 MB send window
+                    8 * 1024 * 1024_u64, // 8 MiB connection receive window
+                    2 * 1024 * 1024_u64, // 2 MiB per-stream receive window
+                    8 * 1024 * 1024_u64, // 8 MiB send window
                     100_000_u64,         // 100ms initial RTT
                 )
             }

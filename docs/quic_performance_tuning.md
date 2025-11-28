@@ -114,10 +114,12 @@ BDP = Bandwidth × RTT
 ```
 
 For example:
-- **100 Gbps @ 1ms RTT**: BDP = 12.5 GB/s × 0.001s = 12.5 MiB
-- **1 Gbps @ 100ms RTT**: BDP = 125 MB/s × 0.1s = 12.5 MiB
+- **100 Gbps @ 1ms RTT**: BDP = 12.5 GB/s × 0.001s = 12.5 MB (~11.9 MiB)
+- **1 Gbps @ 100ms RTT**: BDP = 125 MB/s × 0.1s = 12.5 MB (~11.9 MiB)
 
-Windows should be at least as large as the BDP to fully utilize the link. The LAN profile uses 10x the BDP for headroom with multiple concurrent streams.
+Note: Network speeds use decimal units (1 Gbps = 10^9 bits/s), while memory/buffer sizes use binary units (1 MiB = 2^20 bytes). The BDP calculations above use decimal MB for clarity, then we size buffers in MiB.
+
+Windows should be at least as large as the BDP to fully utilize the link. The LAN profile uses ~10x the BDP for headroom with multiple concurrent streams.
 
 ## Memory Considerations
 
