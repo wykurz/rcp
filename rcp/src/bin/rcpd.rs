@@ -219,6 +219,38 @@ struct Args {
     #[arg(long, value_name = "PREFIX", help_heading = "Remote copy options")]
     debug_log_prefix: Option<String>,
 
+    // Profiling options
+    /// Enable Chrome tracing output for profiling (set by rcp master)
+    ///
+    /// Produces JSON file viewable in Perfetto UI (ui.perfetto.dev) or chrome://tracing.
+    #[arg(long, value_name = "PREFIX", help_heading = "Profiling")]
+    chrome_trace: Option<String>,
+
+    /// Enable flamegraph output for profiling (set by rcp master)
+    ///
+    /// Produces folded stack file convertible to SVG with `inferno-flamegraph`.
+    #[arg(long, value_name = "PREFIX", help_heading = "Profiling")]
+    flamegraph: Option<String>,
+
+    /// Log level for profiling (chrome-trace, flamegraph)
+    ///
+    /// Controls which spans are captured. Only spans from rcp crates are recorded.
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        default_value = "trace",
+        help_heading = "Profiling"
+    )]
+    profile_level: String,
+
+    /// Enable tokio-console for live async debugging
+    #[arg(long, help_heading = "Profiling")]
+    tokio_console: bool,
+
+    /// Port for tokio-console server
+    #[arg(long, value_name = "PORT", help_heading = "Profiling")]
+    tokio_console_port: Option<u16>,
+
     /// Print protocol version information as JSON and exit
     ///
     /// Used by rcp to verify version compatibility before launching remote operations
@@ -593,6 +625,12 @@ fn main() -> Result<(), anyhow::Error> {
     let tracing = common::TracingConfig {
         remote_layer: Some(tracing_layer),
         debug_log_file,
+        chrome_trace_prefix: args.chrome_trace.clone(),
+        flamegraph_prefix: args.flamegraph.clone(),
+        trace_identifier: format!("rcpd-{}", args.role),
+        profile_level: Some(args.profile_level.clone()),
+        tokio_console: args.tokio_console,
+        tokio_console_port: args.tokio_console_port,
     };
     let res = common::run(
         if args.progress {

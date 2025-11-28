@@ -746,12 +746,37 @@ impl std::io::Write for ProgWriter {
     }
 }
 
+fn get_hostname() -> String {
+    let mut buf = [0u8; 256];
+    // Safety: gethostname writes to buf and returns 0 on success
+    let result = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if result == 0 {
+        if let Ok(cstr) = std::ffi::CStr::from_bytes_until_nul(&buf) {
+            if let Ok(s) = cstr.to_str() {
+                return s.to_string();
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
 #[must_use]
 pub fn generate_debug_log_filename(prefix: &str) -> String {
     let now = chrono::Utc::now();
     let timestamp = now.format("%Y-%m-%dT%H:%M:%S").to_string();
     let process_id = std::process::id();
     format!("{prefix}-{timestamp}-{process_id}")
+}
+
+/// Generate a trace filename with identifier, hostname, PID, and timestamp.
+///
+/// `identifier` should be "rcp", "rcpd-source", or "rcpd-destination"
+#[must_use]
+pub fn generate_trace_filename(prefix: &str, identifier: &str, extension: &str) -> String {
+    let hostname = get_hostname();
+    let pid = std::process::id();
+    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S");
+    format!("{prefix}-{identifier}-{hostname}-{pid}-{timestamp}.{extension}")
 }
 
 #[instrument(skip(func))] // "func" is not Debug printable
@@ -797,20 +822,32 @@ where
     let TracingConfig {
         remote_layer: remote_tracing_layer,
         debug_log_file,
+        chrome_trace_prefix,
+        flamegraph_prefix,
+        trace_identifier,
+        profile_level,
+        tokio_console,
+        tokio_console_port,
     } = tracing_config;
+    // guards must be kept alive for the duration of the run to ensure traces are flushed
+    let mut _chrome_guard: Option<tracing_chrome::FlushGuard> = None;
+    let mut _flame_guard: Option<tracing_flame::FlushGuard<std::io::BufWriter<std::fs::File>>> =
+        None;
     if quiet {
         assert!(
             verbose == 0,
             "Quiet mode and verbose mode are mutually exclusive"
         );
     } else {
-        let env_filter =
+        // helper to create the verbose-level filter consistently
+        let make_env_filter = || {
             tracing_subscriber::EnvFilter::from_default_env().add_directive(match verbose {
                 0 => "error".parse().unwrap(),
                 1 => "info".parse().unwrap(),
                 2 => "debug".parse().unwrap(),
                 _ => "trace".parse().unwrap(),
-            });
+            })
+        };
         let file_layer = if let Some(ref log_file_path) = debug_log_file {
             let file = std::fs::OpenOptions::new()
                 .create(true)
@@ -826,20 +863,12 @@ where
                 .with_timer(LocalTimeFormatter)
                 .with_ansi(false)
                 .with_writer(file)
-                .with_filter(
-                    tracing_subscriber::EnvFilter::from_default_env().add_directive(
-                        match verbose {
-                            0 => "error".parse().unwrap(),
-                            1 => "info".parse().unwrap(),
-                            2 => "debug".parse().unwrap(),
-                            _ => "trace".parse().unwrap(),
-                        },
-                    ),
-                );
+                .with_filter(make_env_filter());
             Some(file_layer)
         } else {
             None
         };
+        // fmt_layer for local console output (when not using remote tracing)
         let fmt_layer = if remote_tracing_layer.is_some() {
             None
         } else {
@@ -853,18 +882,18 @@ where
                 })
                 .with_timer(LocalTimeFormatter)
                 .pretty()
-                .with_writer(ProgWriter::new);
+                .with_writer(ProgWriter::new)
+                .with_filter(make_env_filter());
             Some(fmt_layer)
         };
-        let is_console_enabled = match std::env::var("RCP_TOKIO_TRACING_CONSOLE_ENABLED") {
-            Ok(val) => matches!(val.to_lowercase().as_str(), "true" | "1"),
-            Err(_) => false,
-        };
-        let console_layer = if is_console_enabled {
-            let console_port: u16 =
-                read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_SERVER_PORT", 6669);
+        // apply env_filter to remote_tracing_layer so it respects verbose level
+        let remote_tracing_layer =
+            remote_tracing_layer.map(|layer| layer.with_filter(make_env_filter()));
+        let console_layer = if tokio_console {
+            let console_port = tokio_console_port.unwrap_or(6669);
             let retention_seconds: u64 =
                 read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS", 60);
+            eprintln!("Tokio console server listening on 127.0.0.1:{console_port}");
             let console_layer = console_subscriber::ConsoleLayer::builder()
                 .retention(std::time::Duration::from_secs(retention_seconds))
                 .server_addr(([127, 0, 0, 1], console_port))
@@ -873,12 +902,69 @@ where
         } else {
             None
         };
+        // build profile filter for chrome/flame layers
+        // uses EnvFilter to capture spans from our crates at the specified level
+        // while excluding noisy dependencies like tokio, quinn, h2, etc.
+        let profiling_enabled = chrome_trace_prefix.is_some() || flamegraph_prefix.is_some();
+        let profile_filter_str = if profiling_enabled {
+            let level_str = profile_level.as_deref().unwrap_or("trace");
+            // validate level is a known tracing level
+            let valid_levels = ["trace", "debug", "info", "warn", "error", "off"];
+            if !valid_levels.contains(&level_str.to_lowercase().as_str()) {
+                eprintln!(
+                    "Invalid --profile-level '{}'. Valid values: trace, debug, info, warn, error, off",
+                    level_str
+                );
+                std::process::exit(1);
+            }
+            // exclude noisy deps, include everything else at the profile level
+            Some(format!(
+                "tokio=off,quinn=off,h2=off,hyper=off,rustls=off,{}",
+                level_str
+            ))
+        } else {
+            None
+        };
+        // helper to create profile filter (already validated above)
+        let make_profile_filter =
+            || tracing_subscriber::EnvFilter::new(profile_filter_str.as_ref().unwrap());
+        // chrome tracing layer (produces JSON viewable in Perfetto UI)
+        let chrome_layer = if let Some(ref prefix) = chrome_trace_prefix {
+            let filename = generate_trace_filename(prefix, &trace_identifier, "json");
+            eprintln!("Chrome trace will be written to: {filename}");
+            let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+                .file(&filename)
+                .include_args(true)
+                .build();
+            _chrome_guard = Some(guard);
+            Some(layer.with_filter(make_profile_filter()))
+        } else {
+            None
+        };
+        // flamegraph layer (produces folded stacks for inferno)
+        let flame_layer = if let Some(ref prefix) = flamegraph_prefix {
+            let filename = generate_trace_filename(prefix, &trace_identifier, "folded");
+            eprintln!("Flamegraph data will be written to: {filename}");
+            match tracing_flame::FlameLayer::with_file(&filename) {
+                Ok((layer, guard)) => {
+                    _flame_guard = Some(guard);
+                    Some(layer.with_filter(make_profile_filter()))
+                }
+                Err(e) => {
+                    eprintln!("Failed to create flamegraph layer: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         tracing_subscriber::registry()
-            .with(env_filter)
             .with(file_layer)
             .with(fmt_layer)
             .with(remote_tracing_layer)
             .with(console_layer)
+            .with(chrome_layer)
+            .with(flame_layer)
             .init();
     }
     let mut builder = tokio::runtime::Builder::new_multi_thread();

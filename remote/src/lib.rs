@@ -256,6 +256,11 @@
 //!     congestion_control: None, // use profile default (BBR for LAN)
 //!     quic_tuning: remote::QuicTuning::default(),
 //!     master_cert_fingerprint: Vec::new(),
+//!     chrome_trace_prefix: None,
+//!     flamegraph_prefix: None,
+//!     profile_level: Some("trace".to_string()),
+//!     tokio_console: false,
+//!     tokio_console_port: None,
 //! };
 //! let master_addr: SocketAddr = "192.168.1.100:5000".parse()?;
 //! let server_name = "master-server";

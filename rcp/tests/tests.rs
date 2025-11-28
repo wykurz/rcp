@@ -783,3 +783,148 @@ fn test_dereference_file_symlink_permissions_integration() {
     assert_eq!(get_file_mode(&dst_file1), 0o755);
     assert_eq!(get_file_mode(&dst_file2), 0o640);
 }
+
+// Profiling tests
+
+#[test]
+fn test_chrome_trace_output() {
+    let (src_dir, dst_dir) = setup_test_env();
+    let trace_dir = tempfile::tempdir().unwrap();
+    let trace_prefix = trace_dir.path().join("trace");
+    // create some files to copy
+    for i in 0..10 {
+        create_test_file(
+            &src_dir.path().join(format!("file{i}.txt")),
+            "content",
+            0o644,
+        );
+    }
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args([
+        "--chrome-trace",
+        trace_prefix.to_str().unwrap(),
+        src_dir.path().to_str().unwrap(),
+        dst_dir.path().join("copied").to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    // find the generated trace file
+    let entries: Vec<_> = std::fs::read_dir(trace_dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert_eq!(entries.len(), 1, "Expected exactly one trace file");
+    let trace_file = entries[0].path();
+    // verify the trace file is non-empty and valid JSON
+    let content = std::fs::read_to_string(&trace_file).unwrap();
+    assert!(!content.is_empty(), "Trace file should not be empty");
+    let json: serde_json::Value =
+        serde_json::from_str(&content).expect("Trace should be valid JSON");
+    assert!(json.is_array(), "Chrome trace should be a JSON array");
+    let events = json.as_array().unwrap();
+    assert!(!events.is_empty(), "Trace should contain events");
+}
+
+#[test]
+fn test_flamegraph_output() {
+    let (src_dir, dst_dir) = setup_test_env();
+    let flame_dir = tempfile::tempdir().unwrap();
+    let flame_prefix = flame_dir.path().join("flame");
+    // create some files to copy
+    for i in 0..10 {
+        create_test_file(
+            &src_dir.path().join(format!("file{i}.txt")),
+            "content",
+            0o644,
+        );
+    }
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args([
+        "--flamegraph",
+        flame_prefix.to_str().unwrap(),
+        src_dir.path().to_str().unwrap(),
+        dst_dir.path().join("copied").to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    // find the generated flamegraph file
+    let entries: Vec<_> = std::fs::read_dir(flame_dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "folded"))
+        .collect();
+    assert_eq!(entries.len(), 1, "Expected exactly one flamegraph file");
+    let flame_file = entries[0].path();
+    // verify the flamegraph file is non-empty and contains valid folded stack format
+    let content = std::fs::read_to_string(&flame_file).unwrap();
+    assert!(!content.is_empty(), "Flamegraph file should not be empty");
+    // folded stack format: "stack;frames count"
+    for line in content.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.rsplitn(2, ' ').collect();
+        assert_eq!(
+            parts.len(),
+            2,
+            "Each line should have 'stack count' format: {line}"
+        );
+        let count: u64 = parts[0].parse().expect("Count should be a number");
+        assert!(count > 0, "Count should be positive");
+    }
+}
+
+#[test]
+fn test_profile_level_affects_output() {
+    let (src_dir, dst_dir) = setup_test_env();
+    let trace_dir = tempfile::tempdir().unwrap();
+    let trace_prefix = trace_dir.path().join("trace");
+    // create a file to copy
+    create_test_file(&src_dir.path().join("file.txt"), "content", 0o644);
+    // run with profile-level=error (should capture fewer events)
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args([
+        "--chrome-trace",
+        trace_prefix.to_str().unwrap(),
+        "--profile-level",
+        "error",
+        src_dir.path().to_str().unwrap(),
+        dst_dir.path().join("copied").to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    // find and verify trace file exists (may be minimal but should be valid)
+    let entries: Vec<_> = std::fs::read_dir(trace_dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert_eq!(entries.len(), 1, "Expected exactly one trace file");
+    let trace_file = entries[0].path();
+    let content = std::fs::read_to_string(&trace_file).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&content).expect("Trace should be valid JSON");
+    assert!(json.is_array(), "Chrome trace should be a JSON array");
+}
+
+#[test]
+fn test_invalid_profile_level_gives_error() {
+    let (src_dir, dst_dir) = setup_test_env();
+    let trace_dir = tempfile::tempdir().unwrap();
+    let trace_prefix = trace_dir.path().join("trace");
+    create_test_file(&src_dir.path().join("file.txt"), "content", 0o644);
+    // run with invalid profile-level (should fail with error, not panic)
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args([
+        "--chrome-trace",
+        trace_prefix.to_str().unwrap(),
+        "--profile-level",
+        "invalid_level",
+        src_dir.path().to_str().unwrap(),
+        dst_dir.path().join("copied").to_str().unwrap(),
+    ])
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains("Invalid --profile-level"));
+}

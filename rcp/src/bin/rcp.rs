@@ -263,6 +263,52 @@ struct Args {
     #[arg(long, value_name = "PREFIX", help_heading = "Remote copy options")]
     rcpd_debug_log_prefix: Option<String>,
 
+    // Profiling options
+    /// Enable Chrome tracing output for profiling
+    ///
+    /// Produces JSON files viewable in Perfetto UI (ui.perfetto.dev) or chrome://tracing.
+    /// Accepts a path prefix; full filename includes tool name, role, hostname, PID, and timestamp.
+    /// For remote operations, tracing is automatically enabled on rcpd processes too.
+    /// Example: --chrome-trace=/tmp/trace produces:
+    ///   /tmp/trace-rcp-myhost-12345-2025-01-15T10:30:45.json
+    ///   /tmp/trace-rcpd-source-host1-23456-2025-01-15T10:30:46.json (remote)
+    ///   /tmp/trace-rcpd-destination-host2-34567-2025-01-15T10:30:46.json (remote)
+    #[arg(long, value_name = "PREFIX", help_heading = "Profiling")]
+    chrome_trace: Option<String>,
+
+    /// Enable flamegraph output for profiling
+    ///
+    /// Produces folded stack files convertible to SVG with `inferno-flamegraph`.
+    /// Accepts a path prefix; full filename includes tool name, role, hostname, PID, and timestamp.
+    /// For remote operations, tracing is automatically enabled on rcpd processes too.
+    /// Example: --flamegraph=/tmp/flame produces .folded files.
+    /// Convert to SVG: cat *.folded | inferno-flamegraph > flamegraph.svg
+    #[arg(long, value_name = "PREFIX", help_heading = "Profiling")]
+    flamegraph: Option<String>,
+
+    /// Log level for profiling (chrome-trace, flamegraph)
+    ///
+    /// Controls which spans are captured. Only spans from rcp crates are recorded.
+    /// Values: trace, debug, info, warn, error (default: trace)
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        default_value = "trace",
+        help_heading = "Profiling"
+    )]
+    profile_level: String,
+
+    /// Enable tokio-console for live async debugging
+    ///
+    /// Starts a tokio-console server for real-time async task inspection.
+    /// Connect with: `tokio-console http://127.0.0.1:PORT`
+    #[arg(long, help_heading = "Profiling")]
+    tokio_console: bool,
+
+    /// Port for tokio-console server (default: 6669)
+    #[arg(long, value_name = "PORT", help_heading = "Profiling")]
+    tokio_console_port: Option<u16>,
+
     /// Print protocol version information as JSON and exit
     ///
     /// Used to verify version compatibility with rcpd
@@ -354,6 +400,11 @@ async fn run_rcpd_master(
         congestion_control: args.congestion_control,
         quic_tuning,
         master_cert_fingerprint,
+        chrome_trace_prefix: args.chrome_trace.clone(),
+        flamegraph_prefix: args.flamegraph.clone(),
+        profile_level: Some(args.profile_level.clone()),
+        tokio_console: args.tokio_console,
+        tokio_console_port: args.tokio_console_port,
     };
     // deduplicate sessions if src and dst are the same host
     // this avoids deploying rcpd twice to the same location
@@ -852,6 +903,12 @@ fn main() -> Result<(), anyhow::Error> {
     let tracing = common::TracingConfig {
         remote_layer: None,
         debug_log_file: None,
+        chrome_trace_prefix: args.chrome_trace.clone(),
+        flamegraph_prefix: args.flamegraph.clone(),
+        trace_identifier: "rcp-master".to_string(),
+        profile_level: Some(args.profile_level.clone()),
+        tokio_console: args.tokio_console,
+        tokio_console_port: args.tokio_console_port,
     };
     let res = common::run(
         if args.progress || args.progress_type.is_some() {
