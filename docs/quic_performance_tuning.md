@@ -100,7 +100,7 @@ rcp --quic-receive-window=16MiB \
 | `--quic-receive-window=<SIZE>` | Connection-level receive window | 128 MiB | 8 MiB |
 | `--quic-stream-receive-window=<SIZE>` | Per-stream receive window | 16 MiB | 2 MiB |
 | `--quic-send-window=<SIZE>` | Send window | 128 MiB | 8 MiB |
-| `--quic-initial-rtt-ms=<MS>` | Initial RTT estimate | 0 (0.3ms) | 100 |
+| `--quic-initial-rtt-ms=<MS>` | Initial RTT estimate (supports decimals, e.g., 0.3) | 0.3 | 100 |
 | `--quic-initial-mtu=<BYTES>` | Initial MTU size | 1200 | 1200 |
 
 Size values accept formats like: `128MiB`, `1GiB`, `16777216` (bytes).

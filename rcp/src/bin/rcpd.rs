@@ -204,8 +204,10 @@ struct Args {
     quic_send_window: Option<u64>,
 
     /// Initial RTT estimate in milliseconds (overrides profile default)
+    ///
+    /// Accepts floating point values for sub-millisecond precision (e.g., 0.3 for 300µs).
     #[arg(long, value_name = "MS", help_heading = "Remote copy options")]
-    quic_initial_rtt_ms: Option<u64>,
+    quic_initial_rtt_ms: Option<f64>,
 
     /// Initial MTU in bytes (default: 1200)
     #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
