@@ -89,10 +89,41 @@ fn get_remote_path_regex() -> &'static regex::Regex {
     use std::sync::OnceLock;
     static REGEX: OnceLock<regex::Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
+        // The regex matches: [user@]host[:port]:path
+        // - user: optional, no @ allowed
+        // - host: either [IPv6] or hostname (no colons, no brackets, no slashes)
+        // - port: optional, digits only
+        // - path: everything after the final colon
+        // Note: we explicitly exclude '/' from hostname to prevent matching paths like
+        // /tmp/file:with:colons as remote paths
         regex::Regex::new(
-            r"^(?:(?P<user>[^@]+)@)?(?P<host>(?:\[[^\]]+\]|[^:\[\]]+))(?::(?P<port>\d+))?:(?P<path>.+)$"
+            r"^(?:(?P<user>[^@]+)@)?(?P<host>(?:\[[^\]]+\]|[^:/\[\]]+))(?::(?P<port>\d+))?:(?P<path>.+)$"
         ).unwrap()
     })
+}
+
+/// Checks if a hostname represents the local machine
+fn is_localhost(host: &str) -> bool {
+    let host_lower = host.to_lowercase();
+    host_lower == "localhost" || host_lower == "127.0.0.1" || host_lower == "[::1]"
+}
+
+/// Checks if a path string has a localhost-like prefix (e.g., "localhost:/path").
+/// This is used to detect when the user explicitly used localhost syntax but the
+/// path was parsed as local due to default behavior.
+#[must_use]
+pub fn has_localhost_prefix(path: &str) -> bool {
+    let re = get_remote_path_regex();
+    if let Some(captures) = re.captures(path) {
+        let host = captures.name("host").unwrap().as_str();
+        let user = captures.name("user");
+        let port = captures.name("port");
+        // only return true if it's a bare localhost (no user/port)
+        // because user@localhost or localhost:22 would be treated as remote anyway
+        is_localhost(host) && user.is_none() && port.is_none()
+    } else {
+        false
+    }
 }
 
 /// Splits a remote path string into (`host_prefix`, `path_part`) using the same logic as `parse_path`
@@ -147,10 +178,11 @@ pub fn expand_local_home(path: &str) -> anyhow::Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from(path))
 }
 
-pub fn parse_path(path: &str) -> anyhow::Result<PathType> {
+/// Internal path parsing with configurable localhost handling
+fn parse_path_internal(path: &str, treat_localhost_as_local: bool) -> anyhow::Result<PathType> {
     let re = get_remote_path_regex();
     if let Some(captures) = re.captures(path) {
-        // It's a remote path
+        // It matched the remote path pattern
         let user = captures.name("user").map(|m| m.as_str().to_string());
         let host = captures.name("host").unwrap().as_str().to_string();
         let port = captures
@@ -160,6 +192,19 @@ pub fn parse_path(path: &str) -> anyhow::Result<PathType> {
             .name("path")
             .expect("Unable to extract file system path from provided remote path")
             .as_str();
+        // if host is localhost (and no user/port), optionally treat as local path
+        // this provides an escape hatch for paths with colons: localhost:/tmp/file:with:colons
+        if treat_localhost_as_local && is_localhost(&host) && user.is_none() && port.is_none() {
+            // expand tilde for local paths
+            let local_path = if path_part == "~" || path_part == "~/" {
+                expand_local_home("~")?
+            } else if path_part.starts_with("~/") {
+                expand_local_home(path_part)?
+            } else {
+                std::path::PathBuf::from(path_part)
+            };
+            return Ok(PathType::Local(local_path));
+        }
         let (remote_path, needs_remote_home) = if path_part == "~" || path_part == "~/" {
             (std::path::PathBuf::new(), true)
         } else if path_part.starts_with("~/") {
@@ -183,6 +228,28 @@ pub fn parse_path(path: &str) -> anyhow::Result<PathType> {
         // It's a local path
         Ok(PathType::Local(expand_local_home(path)?))
     }
+}
+
+/// Parses a path string into either a local or remote path type.
+///
+/// Remote path syntax: `[user@]host[:port]:path`
+///
+/// Special handling:
+/// - Paths starting with `/` are always local (absolute paths)
+/// - `localhost:/path` is treated as local path `/path` (escape hatch for paths with colons)
+/// - `127.0.0.1:/path` and `[::1]:/path` are also treated as local
+pub fn parse_path(path: &str) -> anyhow::Result<PathType> {
+    parse_path_internal(path, true)
+}
+
+/// Parses a path string, treating localhost as a remote host.
+///
+/// This is used with `--force-remote` flag to force remote copy mode
+/// even when both paths use localhost.
+///
+/// Remote path syntax: `[user@]host[:port]:path`
+pub fn parse_path_force_remote(path: &str) -> anyhow::Result<PathType> {
+    parse_path_internal(path, false)
 }
 
 /// Validates that destination path doesn't end with problematic patterns like . or ..
@@ -589,27 +656,25 @@ mod tests {
     #[test]
     fn test_ipv6_edge_cases_consistency() {
         // Test that helper functions and parse_path handle IPv6 consistently
-        let test_cases = [
-            "[::1]:/path/file",
+        // Note: [::1] without user/port is now treated as local (localhost),
+        // while other IPv6 addresses and [::1] with user/port remain remote
+        let remote_test_cases = [
             "[2001:db8::1]:/path/file",
             "[2001:db8::1]:8080:/path/file",
             "user@[::1]:/path/file",
             "user@[2001:db8::1]:22:/path/file",
         ];
-
-        for case in test_cases {
+        for case in remote_test_cases {
             // Test that split_remote_path works correctly
             let (prefix, _path_part) = split_remote_path(case);
             assert!(prefix.is_some(), "Should detect {case} as remote");
-
             // Test that extract_filesystem_path works correctly
             let fs_path = extract_filesystem_path(case);
             assert_eq!(
                 fs_path, "/path/file",
                 "Should extract filesystem path from {case}"
             );
-
-            // Test that parse_path can parse the same string
+            // Test that parse_path treats non-localhost IPv6 as remote
             match parse_path(case).unwrap() {
                 PathType::Remote(remote) => {
                     assert_eq!(
@@ -620,7 +685,6 @@ mod tests {
                 }
                 PathType::Local(_) => panic!("parse_path should detect {case} as remote"),
             }
-
             // Test that join_path_with_filename can reconstruct correctly
             if let (Some(host_prefix), dir_path) = split_remote_path(&case.replace("file", "")) {
                 let reconstructed = join_path_with_filename(Some(host_prefix), dir_path, "file");
@@ -630,5 +694,106 @@ mod tests {
                 );
             }
         }
+        // [::1] without user/port is now local (localhost loopback)
+        match parse_path("[::1]:/path/file").unwrap() {
+            PathType::Local(path) => {
+                assert_eq!(path.to_str().unwrap(), "/path/file");
+            }
+            PathType::Remote(_) => panic!("[::1]:/path should be local"),
+        }
+    }
+
+    #[test]
+    fn test_paths_with_colons_are_local() {
+        // paths with colons in filename should be treated as local when they start with /
+        let test_cases = [
+            "/tmp/test-2024-01-01T12:30:45.txt",
+            "/tmp/file:with:multiple:colons",
+            "/path/to/foo:bar",
+        ];
+        for case in test_cases {
+            match parse_path(case).unwrap() {
+                PathType::Local(path) => {
+                    assert_eq!(
+                        path.to_str().unwrap(),
+                        case,
+                        "Path with colons should be parsed as local: {case}"
+                    );
+                }
+                PathType::Remote(_) => {
+                    panic!("Path with colons should NOT be parsed as remote: {case}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_localhost_prefix_is_local() {
+        // localhost: prefix should be treated as local path (escape hatch for paths with colons)
+        match parse_path("localhost:/tmp/file:with:colons").unwrap() {
+            PathType::Local(path) => {
+                assert_eq!(path.to_str().unwrap(), "/tmp/file:with:colons");
+            }
+            PathType::Remote(_) => {
+                panic!("localhost:/path should be parsed as local");
+            }
+        }
+        // also test 127.0.0.1 and [::1]
+        match parse_path("127.0.0.1:/tmp/test").unwrap() {
+            PathType::Local(path) => assert_eq!(path.to_str().unwrap(), "/tmp/test"),
+            PathType::Remote(_) => panic!("127.0.0.1:/path should be local"),
+        }
+        match parse_path("[::1]:/tmp/test").unwrap() {
+            PathType::Local(path) => assert_eq!(path.to_str().unwrap(), "/tmp/test"),
+            PathType::Remote(_) => panic!("[::1]:/path should be local"),
+        }
+    }
+
+    #[test]
+    fn test_localhost_with_user_or_port_is_remote() {
+        // localhost with user or port should still be remote (explicit SSH config)
+        match parse_path("user@localhost:/tmp/test").unwrap() {
+            PathType::Remote(remote) => {
+                assert_eq!(remote.session().host, "localhost");
+                assert_eq!(remote.session().user, Some("user".to_string()));
+            }
+            PathType::Local(_) => {
+                panic!("user@localhost:/path should be remote");
+            }
+        }
+        match parse_path("localhost:22:/tmp/test").unwrap() {
+            PathType::Remote(remote) => {
+                assert_eq!(remote.session().host, "localhost");
+                assert_eq!(remote.session().port, Some(22));
+            }
+            PathType::Local(_) => {
+                panic!("localhost:22:/path should be remote");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_path_force_remote_localhost() {
+        // parse_path_force_remote should treat localhost as remote
+        match parse_path_force_remote("localhost:/tmp/test").unwrap() {
+            PathType::Remote(remote) => {
+                assert_eq!(remote.session().host, "localhost");
+                assert_eq!(remote.path().to_str().unwrap(), "/tmp/test");
+            }
+            PathType::Local(_) => {
+                panic!("parse_path_force_remote should treat localhost as remote");
+            }
+        }
+    }
+
+    #[test]
+    fn test_is_localhost_variants() {
+        assert!(is_localhost("localhost"));
+        assert!(is_localhost("LOCALHOST"));
+        assert!(is_localhost("Localhost"));
+        assert!(is_localhost("127.0.0.1"));
+        assert!(is_localhost("[::1]"));
+        assert!(!is_localhost("example.com"));
+        assert!(!is_localhost("192.168.1.1"));
     }
 }

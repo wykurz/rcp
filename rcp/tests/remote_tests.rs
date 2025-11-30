@@ -44,7 +44,8 @@ fn run_rcp_with_args_internal(
     // for 2 connections (src + dst) with binary transfer, checksum verification, cleanup,
     // plus QUIC connection establishment and actual copy operations
     cmd.args(["90", rcp_path.to_str().unwrap()]);
-    cmd.arg("-vv"); // Always use maximum verbosity
+    cmd.arg("-vv"); // always use maximum verbosity
+    cmd.arg("--force-remote"); // force remote copy mode for localhost tests
     cmd.args(args);
     if let Some(home) = home {
         cmd.env("HOME", home);
@@ -2128,4 +2129,66 @@ fn test_remote_copy_circular_symlink_root() {
     // verify summary
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.symlinks_created, 1);
+}
+
+/// Helper that runs rcp WITHOUT --force-remote (for testing local copy behavior)
+fn run_rcp_without_force_remote(args: &[&str]) -> std::process::Output {
+    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
+    let mut cmd = std::process::Command::new("timeout");
+    cmd.args(["30", rcp_path.to_str().unwrap()]);
+    cmd.arg("-vv");
+    // note: NOT adding --force-remote here
+    cmd.args(args);
+    cmd.output().expect("Failed to execute rcp command")
+}
+
+#[test]
+fn test_remote_force_remote_flag_uses_rcpd() {
+    // verifies that --force-remote with localhost: actually uses rcpd (SSH)
+    // this test runs with --force-remote (via test helper) and verifies rcpd was invoked
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("test.txt");
+    let dst_file = dst_dir.path().join("test.txt");
+    create_test_file(&src_file, "force remote test", 0o644);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    // run_rcp_and_expect_success uses --force-remote
+    let output = run_rcp_and_expect_success(&[&src_remote, &dst_remote]);
+    // should show rcpd being started (indicates remote mode was used, logs go to stdout)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Starting rcpd"),
+        "Expected 'Starting rcpd' in output when using --force-remote, got: {stdout}"
+    );
+    assert_eq!(get_file_content(&dst_file), "force remote test");
+}
+
+#[test]
+fn test_remote_localhost_without_force_remote_is_local() {
+    // verifies that localhost: WITHOUT --force-remote does a local copy (no rcpd)
+    require_local_ssh(); // still need SSH available for the test environment
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("test.txt");
+    let dst_file = dst_dir.path().join("test.txt");
+    create_test_file(&src_file, "local copy test", 0o644);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    // run WITHOUT --force-remote
+    let output = run_rcp_without_force_remote(&[&src_remote, &dst_remote]);
+    print_command_output(&output);
+    assert!(output.status.success(), "Copy should succeed");
+    // logs go to stdout
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // should show warning about localhost being local
+    assert!(
+        stdout.contains("Paths with 'localhost:' prefix are treated as local"),
+        "Expected localhost warning in output, got: {stdout}"
+    );
+    // should NOT show rcpd being started
+    assert!(
+        !stdout.contains("Starting rcpd"),
+        "Should NOT use rcpd without --force-remote, but got: {stdout}"
+    );
+    assert_eq!(get_file_content(&dst_file), "local copy test");
 }
