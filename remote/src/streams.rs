@@ -36,7 +36,7 @@ impl SendStream {
         obj: &T,
         reader: &mut R,
     ) -> anyhow::Result<u64> {
-        self.send_control_message(obj).await?;
+        self.send_batch_message(obj).await?;
         let mut data_stream = self.framed.get_mut();
         let bytes_copied = tokio::io::copy(reader, &mut data_stream).await?;
         Ok(bytes_copied)
