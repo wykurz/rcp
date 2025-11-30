@@ -1,5 +1,5 @@
 use futures::SinkExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufRead, AsyncWriteExt};
 
 #[derive(Debug)]
 pub struct SendStream {
@@ -31,14 +31,19 @@ impl SendStream {
         Ok(())
     }
 
-    pub async fn send_message_with_data<T: serde::Serialize, R: tokio::io::AsyncRead + Unpin>(
+    /// Sends an object followed by data from a buffered reader.
+    ///
+    /// This method uses `copy_buf` which avoids internal buffer allocation by using
+    /// the reader's existing buffer. Wrap your reader in `BufReader::with_capacity(size, reader)`
+    /// to control the buffer size.
+    pub async fn send_message_with_data_buffered<T: serde::Serialize, R: AsyncBufRead + Unpin>(
         &mut self,
         obj: &T,
         reader: &mut R,
     ) -> anyhow::Result<u64> {
         self.send_batch_message(obj).await?;
-        let mut data_stream = self.framed.get_mut();
-        let bytes_copied = tokio::io::copy(reader, &mut data_stream).await?;
+        let data_stream = self.framed.get_mut();
+        let bytes_copied = tokio::io::copy_buf(reader, data_stream).await?;
         Ok(bytes_copied)
     }
 
@@ -77,6 +82,9 @@ impl RecvStream {
         }
     }
 
+    /// Copies data to a writer using the default buffer size (8 KiB).
+    ///
+    /// For better performance with large files, use [`Self::copy_to_buffered`] instead.
     pub async fn copy_to<W: tokio::io::AsyncWrite + Unpin>(
         &mut self,
         writer: &mut W,
@@ -87,6 +95,26 @@ impl RecvStream {
         let data_stream = self.framed.get_mut();
         let stream_bytes = tokio::io::copy(data_stream, writer).await?;
         Ok(buffer_size + stream_bytes)
+    }
+
+    /// Copies data to a writer using a custom buffer size.
+    ///
+    /// Uses a buffered reader around the QUIC stream with the specified capacity.
+    /// This avoids the default 8 KiB buffer in `tokio::io::copy` and can significantly
+    /// improve throughput on high-bandwidth networks.
+    pub async fn copy_to_buffered<W: tokio::io::AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        buffer_size: usize,
+    ) -> anyhow::Result<u64> {
+        let read_buffer = self.framed.read_buffer();
+        let buffered_bytes = read_buffer.len() as u64;
+        writer.write_all(read_buffer).await?;
+        let data_stream = self.framed.get_mut();
+        // wrap the QUIC recv stream in a BufReader to control the buffer size
+        let mut buffered_stream = tokio::io::BufReader::with_capacity(buffer_size, data_stream);
+        let stream_bytes = tokio::io::copy_buf(&mut buffered_stream, writer).await?;
+        Ok(buffered_bytes + stream_bytes)
     }
 
     pub async fn close(&mut self) {

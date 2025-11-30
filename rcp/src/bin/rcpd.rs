@@ -181,7 +181,7 @@ struct Args {
     /// Network profile for QUIC tuning
     #[arg(
         long,
-        default_value = "lan",
+        default_value = "datacenter",
         value_name = "PROFILE",
         help_heading = "Remote copy options"
     )]
@@ -212,6 +212,15 @@ struct Args {
     /// Initial MTU in bytes (default: 1200)
     #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
     quic_initial_mtu: Option<u16>,
+
+    /// Buffer size for remote copy file transfer operations in bytes.
+    ///
+    /// Controls the buffer used when copying data between files and network streams.
+    /// Larger buffers can improve throughput but use more memory per concurrent transfer.
+    ///
+    /// Default: matches per-stream receive window (16 MiB for datacenter, 2 MiB for internet).
+    #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
+    remote_copy_buffer_size: Option<usize>,
 
     /// Enable file-based debug logging
     ///
@@ -312,13 +321,7 @@ async fn run_operation(
         .context("Failed to receive hello message from master")?
         .unwrap();
     tracing::info!("Received side: {:?}", master_hello);
-    let settings = common::copy::Settings {
-        dereference: args.dereference,
-        fail_early: args.fail_early,
-        overwrite: args.overwrite,
-        overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
-        chunk_size: args.chunk_size,
-    };
+    // build quic_config first so we can use its effective_remote_copy_buffer_size()
     let quic_config = remote::QuicConfig {
         port_ranges: args.quic_port_ranges.clone(),
         idle_timeout_sec: args.quic_idle_timeout_sec,
@@ -332,7 +335,16 @@ async fn run_operation(
             send_window: args.quic_send_window,
             initial_rtt_ms: args.quic_initial_rtt_ms,
             initial_mtu: args.quic_initial_mtu,
+            remote_copy_buffer_size: args.remote_copy_buffer_size,
         },
+    };
+    let settings = common::copy::Settings {
+        dereference: args.dereference,
+        fail_early: args.fail_early,
+        overwrite: args.overwrite,
+        overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
+        chunk_size: args.chunk_size,
+        remote_copy_buffer_size: quic_config.effective_remote_copy_buffer_size(),
     };
     let rcpd_result = match master_hello {
         remote::protocol::MasterHello::Source { src, dst } => {
@@ -444,6 +456,7 @@ async fn async_main(
             send_window: args.quic_send_window,
             initial_rtt_ms: args.quic_initial_rtt_ms,
             initial_mtu: args.quic_initial_mtu,
+            remote_copy_buffer_size: args.remote_copy_buffer_size,
         },
     };
     // use certificate pinning for Master→rcpd connection

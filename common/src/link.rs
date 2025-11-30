@@ -546,6 +546,7 @@ mod link_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             update_compare: filecmp::MetadataCmpSettings {
                 size: true,

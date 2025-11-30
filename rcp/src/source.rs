@@ -272,7 +272,7 @@ async fn send_file(
     tracing::debug!("Sending file content for {:?}", src);
     throttle::get_file_iops_tokens(settings.chunk_size, src_metadata.len()).await;
     // open the file BEFORE opening the stream to avoid leaving destination waiting
-    let mut file = match tokio::fs::File::open(src).await {
+    let file = match tokio::fs::File::open(src).await {
         Ok(f) => f,
         Err(e) => {
             tracing::error!("Failed to open file {src:?}: {e}");
@@ -296,6 +296,12 @@ async fn send_file(
             return Ok(());
         }
     };
+    // wrap file in a buffered reader for better network throughput
+    // buffer size is set by quic_config.effective_remote_copy_buffer_size() based on network profile,
+    // but capped at file size to avoid over-allocation for small files
+    let file_size = src_metadata.len().min(usize::MAX as u64) as usize;
+    let buffer_size = settings.remote_copy_buffer_size.min(file_size).max(1);
+    let mut buffered_file = tokio::io::BufReader::with_capacity(buffer_size, file);
     let metadata = remote::protocol::Metadata::from(src_metadata);
     let file_header = remote::protocol::File {
         src: src.to_path_buf(),
@@ -306,7 +312,7 @@ async fn send_file(
     };
     let mut file_send_stream = connection.open_uni().await?;
     match file_send_stream
-        .send_message_with_data(&file_header, &mut file)
+        .send_message_with_data_buffered(&file_header, &mut buffered_file)
         .await
     {
         Ok(_bytes_sent) => {

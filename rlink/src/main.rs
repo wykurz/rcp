@@ -195,6 +195,7 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
                 overwrite: args.overwrite,
                 overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
                 chunk_size: args.chunk_size,
+                remote_copy_buffer_size: 0, // not used for local operations
             },
             update_compare: common::parse_metadata_cmp_settings(&args.update_compare)?,
             update_exclusive: args.update_exclusive,

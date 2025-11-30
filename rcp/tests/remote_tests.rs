@@ -1525,7 +1525,7 @@ fn test_remote_rcpd_with_custom_quic_timeouts() {
 
 #[test]
 fn test_remote_rcpd_aggressive_timeout_configuration() {
-    // verify that moderately aggressive timeout values work correctly (for LAN environments)
+    // verify that moderately aggressive timeout values work correctly (for datacenter environments)
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("test.txt");
@@ -1533,7 +1533,7 @@ fn test_remote_rcpd_aggressive_timeout_configuration() {
     let dst_file = dst_dir.path().join("test.txt");
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
-    // test with moderately aggressive timeouts suitable for fast LAN environments
+    // test with moderately aggressive timeouts suitable for fast datacenter environments
     // note: very aggressive values (3s-5s) can be too tight even for localhost
     // using 8s idle timeout as a reasonable "aggressive but safe" value
     let output = run_rcp_with_args(&[

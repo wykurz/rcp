@@ -873,7 +873,7 @@ The following improvements and test scenarios are documented for future developm
 **Benefits:**
 - Validates protocol behavior under adverse network conditions
 - Identifies edge cases in error handling and recovery
-- Improves reliability for WAN deployments
+- Improves reliability for internet deployments
 
 ### 9.4 Additional Edge Cases
 

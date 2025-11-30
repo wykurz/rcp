@@ -272,6 +272,9 @@ impl RcpdConfig {
         if let Some(v) = self.quic_tuning.initial_mtu {
             args.push(format!("--quic-initial-mtu={v}"));
         }
+        if let Some(v) = self.quic_tuning.remote_copy_buffer_size {
+            args.push(format!("--remote-copy-buffer-size={v}"));
+        }
         // pass master cert fingerprint as hex-encoded string
         args.push(format!(
             "--master-cert-fingerprint={}",

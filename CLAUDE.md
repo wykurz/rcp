@@ -181,8 +181,8 @@ Both `rcp` and `rcpd` accept CLI arguments to configure QUIC connection behavior
 - `--remote-copy-conn-timeout-sec=N` (default: 15) - Connection timeout for remote operations
 
 These can be tuned for different network environments:
-- **LAN**: More aggressive values (5-8s idle timeout) for faster failure detection
-- **WAN**: Higher values (15-30s idle timeout) to handle network hiccups
+- **Datacenter**: More aggressive values (5-8s idle timeout) for faster failure detection
+- **Internet**: Higher values (15-30s idle timeout) to handle network hiccups
 - **High latency**: Increase all timeouts proportionally
 
 ### rcpd Lifecycle Management
