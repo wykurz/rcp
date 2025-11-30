@@ -134,6 +134,7 @@
                 pkgs.cargo-expand
                 pkgs.cargo-flamegraph
                 pkgs.cargo-generate
+                pkgs.inferno
                 pkgs.cargo-nextest
                 pkgs.cargo-outdated
                 pkgs.cargo-udeps
