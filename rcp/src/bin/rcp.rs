@@ -209,13 +209,13 @@ struct Args {
 
     /// Network profile for QUIC tuning
     ///
-    /// 'lan' (default): Optimized for datacenter networks (<1ms RTT, 25-100 Gbps).
+    /// 'datacenter' (default): Optimized for datacenter networks (<1ms RTT, 25-100 Gbps).
     /// Uses BBR congestion control and aggressive window sizes.
-    /// 'wan': Conservative settings for internet/WAN connections.
+    /// 'internet': Conservative settings for internet connections.
     /// Uses CUBIC congestion control and standard window sizes.
     #[arg(
         long,
-        default_value = "lan",
+        default_value = "datacenter",
         value_name = "PROFILE",
         help_heading = "Remote copy options"
     )]
@@ -225,7 +225,7 @@ struct Args {
     ///
     /// 'bbr': Model-based, fast ramp-up. Best for dedicated high-bandwidth links.
     /// 'cubic': Loss-based, standard TCP congestion control. Best for shared networks.
-    /// Default: 'bbr' for LAN profile, 'cubic' for WAN profile.
+    /// Default: 'bbr' for datacenter profile, 'cubic' for internet profile.
     #[arg(long, value_name = "ALGORITHM", help_heading = "Remote copy options")]
     congestion_control: Option<remote::CongestionControl>,
 
@@ -256,6 +256,16 @@ struct Args {
     /// Initial MTU in bytes (default: 1200)
     #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
     quic_initial_mtu: Option<u16>,
+
+    /// Buffer size for remote copy file transfer operations.
+    ///
+    /// Controls the buffer used when copying data between files and network streams.
+    /// Larger buffers can improve throughput but use more memory per concurrent transfer.
+    /// Accepts byte sizes like "256KiB", "1MiB", or plain numbers in bytes.
+    ///
+    /// Default: matches per-stream receive window (16 MiB for datacenter, 2 MiB for internet).
+    #[arg(long, value_name = "SIZE", help_heading = "Remote copy options")]
+    remote_copy_buffer_size: Option<bytesize::ByteSize>,
 
     /// Enable file-based debug logging for rcpd processes
     ///
@@ -371,6 +381,7 @@ async fn run_rcpd_master(
         send_window: args.quic_send_window.map(|b| b.0),
         initial_rtt_ms: args.quic_initial_rtt_ms,
         initial_mtu: args.quic_initial_mtu,
+        remote_copy_buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
     };
     // build QUIC config with profile and tuning settings
     let quic_config = remote::QuicConfig {
@@ -844,6 +855,8 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)
             .map_err(|err| common::copy::Error::new(err, Default::default()))?,
         chunk_size: args.chunk_size.0,
+        // for local copy, buffer size is not used (bypasses user-mode buffering)
+        remote_copy_buffer_size: 0,
     };
     tracing::debug!("copy settings: {:?}", &settings);
     let mut join_set = tokio::task::JoinSet::new();

@@ -252,8 +252,8 @@
 //!     progress: false,
 //!     progress_delay: None,
 //!     remote_copy_conn_timeout_sec: 15,
-//!     network_profile: remote::NetworkProfile::Lan,
-//!     congestion_control: None, // use profile default (BBR for LAN)
+//!     network_profile: remote::NetworkProfile::Datacenter,
+//!     congestion_control: None, // use profile default (BBR for datacenter)
 //!     quic_tuning: remote::QuicTuning::default(),
 //!     master_cert_fingerprint: Vec::new(),
 //!     chrome_trace_prefix: None,
@@ -312,24 +312,24 @@ pub mod tracelog;
 /// Network profile for QUIC configuration tuning
 ///
 /// Profiles provide pre-configured settings optimized for different network environments.
-/// The LAN profile is optimized for high-bandwidth, low-latency datacenter networks,
-/// while the WAN profile uses more conservative settings suitable for internet connections.
+/// The Datacenter profile is optimized for high-bandwidth, low-latency datacenter networks,
+/// while the Internet profile uses more conservative settings suitable for internet connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum NetworkProfile {
     /// Optimized for datacenter networks: <1ms RTT, 25-100 Gbps
     /// Uses BBR congestion control and aggressive window sizes
     #[default]
-    Lan,
-    /// Conservative settings for internet/WAN connections
+    Datacenter,
+    /// Conservative settings for internet connections
     /// Uses CUBIC congestion control and standard window sizes
-    Wan,
+    Internet,
 }
 
 impl std::fmt::Display for NetworkProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Lan => write!(f, "lan"),
-            Self::Wan => write!(f, "wan"),
+            Self::Datacenter => write!(f, "datacenter"),
+            Self::Internet => write!(f, "internet"),
         }
     }
 }
@@ -338,10 +338,10 @@ impl std::str::FromStr for NetworkProfile {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "lan" => Ok(Self::Lan),
-            "wan" => Ok(Self::Wan),
+            "datacenter" => Ok(Self::Datacenter),
+            "internet" => Ok(Self::Internet),
             _ => Err(format!(
-                "invalid network profile '{}', expected 'lan' or 'wan'",
+                "invalid network profile '{}', expected 'datacenter' or 'internet'",
                 s
             )),
         }
@@ -352,11 +352,58 @@ impl NetworkProfile {
     /// Returns the default congestion control algorithm for this profile
     pub fn default_congestion_control(&self) -> CongestionControl {
         match self {
-            Self::Lan => CongestionControl::Bbr,
-            Self::Wan => CongestionControl::Cubic,
+            Self::Datacenter => CongestionControl::Bbr,
+            Self::Internet => CongestionControl::Cubic,
+        }
+    }
+    /// Returns the default buffer size for remote copy operations for this profile
+    ///
+    /// Datacenter profile uses a large buffer (16 MiB) matching the per-stream receive window
+    /// to maximize throughput on high-bandwidth networks.
+    /// Internet profile uses a smaller buffer (2 MiB) suitable for internet connections.
+    pub fn default_remote_copy_buffer_size(&self) -> usize {
+        match self {
+            Self::Datacenter => DATACENTER_REMOTE_COPY_BUFFER_SIZE,
+            Self::Internet => INTERNET_REMOTE_COPY_BUFFER_SIZE,
         }
     }
 }
+
+// ============================================================================
+// Network profile constants
+//
+// These constants define the default QUIC tuning parameters for each profile.
+// They are used in apply_quic_tuning() and NetworkProfile methods.
+// ============================================================================
+
+/// Datacenter profile: connection-level receive window (128 MiB)
+pub const DATACENTER_RECEIVE_WINDOW: u64 = 128 * 1024 * 1024;
+/// Datacenter profile: per-stream receive window (16 MiB)
+pub const DATACENTER_STREAM_RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
+/// Datacenter profile: send window (128 MiB)
+pub const DATACENTER_SEND_WINDOW: u64 = 128 * 1024 * 1024;
+/// Datacenter profile: initial RTT estimate in microseconds (0.3ms = 300µs)
+pub const DATACENTER_INITIAL_RTT_US: u64 = 300;
+
+/// Internet profile: connection-level receive window (8 MiB)
+pub const INTERNET_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
+/// Internet profile: per-stream receive window (2 MiB)
+pub const INTERNET_STREAM_RECEIVE_WINDOW: u64 = 2 * 1024 * 1024;
+/// Internet profile: send window (8 MiB)
+pub const INTERNET_SEND_WINDOW: u64 = 8 * 1024 * 1024;
+/// Internet profile: initial RTT estimate in microseconds (100ms = 100,000µs)
+pub const INTERNET_INITIAL_RTT_US: u64 = 100_000;
+
+/// Datacenter profile: buffer size for remote copy operations.
+///
+/// Matches the per-stream receive window to maximize throughput on high-bandwidth
+/// datacenter networks.
+pub const DATACENTER_REMOTE_COPY_BUFFER_SIZE: usize = DATACENTER_STREAM_RECEIVE_WINDOW as usize;
+
+/// Internet profile: buffer size for remote copy operations.
+///
+/// Matches the per-stream receive window for consistency with flow control.
+pub const INTERNET_REMOTE_COPY_BUFFER_SIZE: usize = INTERNET_STREAM_RECEIVE_WINDOW as usize;
 
 /// Congestion control algorithm selection
 ///
@@ -369,7 +416,7 @@ pub enum CongestionControl {
     #[default]
     Bbr,
     /// CUBIC - loss-based, standard TCP congestion control
-    /// Best for shared networks or WAN connections
+    /// Best for shared networks or internet connections
     Cubic,
 }
 
@@ -402,17 +449,24 @@ impl std::str::FromStr for CongestionControl {
 /// profile defaults. Use these for fine-tuning in specific environments.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct QuicTuning {
-    /// Connection-level receive window in bytes (default: 128 MiB for LAN, 8 MiB for WAN)
+    /// Connection-level receive window in bytes (default: 128 MiB for datacenter, 8 MiB for internet)
     pub receive_window: Option<u64>,
-    /// Per-stream receive window in bytes (default: 16 MiB for LAN, 2 MiB for WAN)
+    /// Per-stream receive window in bytes (default: 16 MiB for datacenter, 2 MiB for internet)
     pub stream_receive_window: Option<u64>,
-    /// Send window in bytes (default: 128 MiB for LAN, 8 MiB for WAN)
+    /// Send window in bytes (default: 128 MiB for datacenter, 8 MiB for internet)
     pub send_window: Option<u64>,
-    /// Initial RTT estimate in milliseconds (default: 0.3ms for LAN, 100ms for WAN)
+    /// Initial RTT estimate in milliseconds (default: 0.3ms for datacenter, 100ms for internet)
     /// Accepts floating point values for sub-millisecond precision (e.g., 0.3 for 300µs)
     pub initial_rtt_ms: Option<f64>,
     /// Initial MTU in bytes (default: 1200)
     pub initial_mtu: Option<u16>,
+    /// Buffer size for remote copy file transfer operations.
+    ///
+    /// Defaults to per-stream receive window size for each profile (16 MiB for datacenter,
+    /// 2 MiB for internet). This controls the buffer used when copying data between files
+    /// and network streams. Larger buffers can improve throughput but use more memory
+    /// per concurrent transfer.
+    pub remote_copy_buffer_size: Option<usize>,
 }
 
 /// Configuration for QUIC connections
@@ -426,7 +480,7 @@ pub struct QuicConfig {
     pub keep_alive_interval_sec: u64,
     /// Connection timeout for remote operations (seconds)
     pub conn_timeout_sec: u64,
-    /// Network profile for tuning (default: LAN)
+    /// Network profile for tuning (default: Datacenter)
     pub network_profile: NetworkProfile,
     /// Congestion control algorithm override (None = use profile default)
     pub congestion_control: Option<CongestionControl>,
@@ -494,6 +548,15 @@ impl QuicConfig {
     pub fn effective_congestion_control(&self) -> CongestionControl {
         self.congestion_control
             .unwrap_or_else(|| self.network_profile.default_congestion_control())
+    }
+    /// Get the effective remote copy buffer size (explicit or profile default)
+    ///
+    /// Returns the buffer size from tuning if set, otherwise uses the profile default
+    /// (16 MiB for datacenter, 2 MiB for internet).
+    pub fn effective_remote_copy_buffer_size(&self) -> usize {
+        self.tuning
+            .remote_copy_buffer_size
+            .unwrap_or_else(|| self.network_profile.default_remote_copy_buffer_size())
     }
 }
 
@@ -1022,28 +1085,21 @@ pub async fn start_rcpd(
 ///
 /// This applies network profile settings, congestion control, and any tuning overrides.
 fn apply_quic_tuning(transport_config: &mut quinn::TransportConfig, config: &QuicConfig) {
-    // 1. apply base profile settings
+    // 1. apply base profile settings from the module-level constants
     let (receive_window, stream_receive_window, send_window, initial_rtt_us) =
         match config.network_profile {
-            NetworkProfile::Lan => {
-                // LAN profile: optimized for 100 Gbps @ 1ms RTT
-                // BDP ~= 12.5 MB (~11.9 MiB), use ~10x for headroom with multiple streams
-                (
-                    128 * 1024 * 1024_u64, // 128 MiB connection receive window
-                    16 * 1024 * 1024_u64,  // 16 MiB per-stream receive window
-                    128 * 1024 * 1024_u64, // 128 MiB send window
-                    300_u64,               // 0.3ms initial RTT
-                )
-            }
-            NetworkProfile::Wan => {
-                // WAN profile: conservative settings for internet
-                (
-                    8 * 1024 * 1024_u64, // 8 MiB connection receive window
-                    2 * 1024 * 1024_u64, // 2 MiB per-stream receive window
-                    8 * 1024 * 1024_u64, // 8 MiB send window
-                    100_000_u64,         // 100ms initial RTT
-                )
-            }
+            NetworkProfile::Datacenter => (
+                DATACENTER_RECEIVE_WINDOW,
+                DATACENTER_STREAM_RECEIVE_WINDOW,
+                DATACENTER_SEND_WINDOW,
+                DATACENTER_INITIAL_RTT_US,
+            ),
+            NetworkProfile::Internet => (
+                INTERNET_RECEIVE_WINDOW,
+                INTERNET_STREAM_RECEIVE_WINDOW,
+                INTERNET_SEND_WINDOW,
+                INTERNET_INITIAL_RTT_US,
+            ),
         };
     // apply profile defaults (will be overridden by tuning if specified)
     transport_config
@@ -1935,35 +1991,28 @@ mod quic_tuning_tests {
             idle_timeout_sec: 10,
             keep_alive_interval_sec: 1,
             conn_timeout_sec: 15,
-            network_profile: NetworkProfile::Lan,
+            network_profile: NetworkProfile::Datacenter,
             congestion_control: None,
             tuning: QuicTuning::default(),
         }
     }
-    // LAN profile constants (from apply_quic_tuning implementation)
-    const LAN_RECEIVE_WINDOW: u64 = 128 * 1024 * 1024;
-    const LAN_STREAM_RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
-    const LAN_SEND_WINDOW: u64 = 128 * 1024 * 1024;
-    const LAN_INITIAL_RTT_US: u64 = 300;
-    // WAN profile constants (from apply_quic_tuning implementation)
-    const WAN_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
-    const WAN_STREAM_RECEIVE_WINDOW: u64 = 2 * 1024 * 1024;
-    const WAN_SEND_WINDOW: u64 = 8 * 1024 * 1024;
-    const WAN_INITIAL_RTT_US: u64 = 100_000;
-    // note: quinn's TransportConfig doesn't expose getter methods, so we can't directly
+    // Datacenter profile constants (from apply_quic_tuning implementation)
+    // note: network profile constants are now defined at module level (DATACENTER_RECEIVE_WINDOW, etc.)
+    // and used both in apply_quic_tuning() and NetworkProfile methods.
+    // quinn's TransportConfig doesn't expose getter methods, so we can't directly
     // verify the values that were set. Instead, we test that apply_quic_tuning doesn't
     // panic with various inputs and test the logic of QuicConfig separately.
     #[test]
-    fn test_apply_quic_tuning_lan_profile_does_not_panic() {
+    fn test_apply_quic_tuning_datacenter_profile_does_not_panic() {
         let config = default_quic_config();
         let mut transport = quinn::TransportConfig::default();
         // should not panic
         apply_quic_tuning(&mut transport, &config);
     }
     #[test]
-    fn test_apply_quic_tuning_wan_profile_does_not_panic() {
+    fn test_apply_quic_tuning_internet_profile_does_not_panic() {
         let mut config = default_quic_config();
-        config.network_profile = NetworkProfile::Wan;
+        config.network_profile = NetworkProfile::Internet;
         let mut transport = quinn::TransportConfig::default();
         // should not panic
         apply_quic_tuning(&mut transport, &config);
@@ -1977,6 +2026,7 @@ mod quic_tuning_tests {
             send_window: Some(32 * 1024 * 1024),
             initial_rtt_ms: Some(50.0),
             initial_mtu: Some(1400),
+            remote_copy_buffer_size: Some(512 * 1024),
         };
         let mut transport = quinn::TransportConfig::default();
         // should not panic
@@ -2049,7 +2099,7 @@ mod quic_tuning_tests {
     #[test]
     fn test_sub_millisecond_rtt_does_not_panic() {
         let mut config = default_quic_config();
-        // test sub-millisecond RTT (0.3ms = 300 microseconds, typical for LAN)
+        // test sub-millisecond RTT (0.3ms = 300 microseconds, typical for datacenter)
         config.tuning.initial_rtt_ms = Some(0.3);
         let mut transport = quinn::TransportConfig::default();
         // should not panic
@@ -2067,68 +2117,68 @@ mod quic_tuning_tests {
         }
     }
     #[test]
-    fn test_lan_profile_uses_bbr_by_default() {
+    fn test_datacenter_profile_uses_bbr_by_default() {
         let config = default_quic_config();
-        assert_eq!(config.network_profile, NetworkProfile::Lan);
+        assert_eq!(config.network_profile, NetworkProfile::Datacenter);
         assert_eq!(config.congestion_control, None);
-        // effective congestion control should be BBR for LAN
+        // effective congestion control should be BBR for datacenter
         assert_eq!(
             config.effective_congestion_control(),
             CongestionControl::Bbr,
-            "LAN profile should default to BBR"
+            "datacenter profile should default to BBR"
         );
     }
     #[test]
-    fn test_wan_profile_uses_cubic_by_default() {
+    fn test_internet_profile_uses_cubic_by_default() {
         let mut config = default_quic_config();
-        config.network_profile = NetworkProfile::Wan;
+        config.network_profile = NetworkProfile::Internet;
         assert_eq!(config.congestion_control, None);
-        // effective congestion control should be CUBIC for WAN
+        // effective congestion control should be CUBIC for internet
         assert_eq!(
             config.effective_congestion_control(),
             CongestionControl::Cubic,
-            "WAN profile should default to CUBIC"
+            "internet profile should default to CUBIC"
         );
     }
     #[test]
-    fn test_congestion_control_override_on_lan() {
+    fn test_congestion_control_override_on_datacenter() {
         let mut config = default_quic_config();
-        config.network_profile = NetworkProfile::Lan;
+        config.network_profile = NetworkProfile::Datacenter;
         config.congestion_control = Some(CongestionControl::Cubic);
         // explicit override should take precedence
         assert_eq!(
             config.effective_congestion_control(),
             CongestionControl::Cubic,
-            "explicit CUBIC should override LAN's default BBR"
+            "explicit CUBIC should override datacenter's default BBR"
         );
     }
     #[test]
-    fn test_congestion_control_override_on_wan() {
+    fn test_congestion_control_override_on_internet() {
         let mut config = default_quic_config();
-        config.network_profile = NetworkProfile::Wan;
+        config.network_profile = NetworkProfile::Internet;
         config.congestion_control = Some(CongestionControl::Bbr);
         // explicit override should take precedence
         assert_eq!(
             config.effective_congestion_control(),
             CongestionControl::Bbr,
-            "explicit BBR should override WAN's default CUBIC"
+            "explicit BBR should override internet's default CUBIC"
         );
     }
     #[test]
     fn test_network_profile_default_congestion_control() {
         assert_eq!(
-            NetworkProfile::Lan.default_congestion_control(),
+            NetworkProfile::Datacenter.default_congestion_control(),
             CongestionControl::Bbr
         );
         assert_eq!(
-            NetworkProfile::Wan.default_congestion_control(),
+            NetworkProfile::Internet.default_congestion_control(),
             CongestionControl::Cubic
         );
     }
     #[test]
     fn test_network_profile_display() {
-        assert_eq!(format!("{}", NetworkProfile::Lan), "lan");
-        assert_eq!(format!("{}", NetworkProfile::Wan), "wan");
+        assert_eq!(format!("{}", NetworkProfile::Datacenter), "datacenter");
+        assert_eq!(format!("{}", NetworkProfile::Internet), "internet");
     }
     #[test]
     fn test_congestion_control_display() {
@@ -2138,20 +2188,20 @@ mod quic_tuning_tests {
     #[test]
     fn test_network_profile_from_str() {
         assert_eq!(
-            "lan".parse::<NetworkProfile>().unwrap(),
-            NetworkProfile::Lan
+            "datacenter".parse::<NetworkProfile>().unwrap(),
+            NetworkProfile::Datacenter
         );
         assert_eq!(
-            "LAN".parse::<NetworkProfile>().unwrap(),
-            NetworkProfile::Lan
+            "DATACENTER".parse::<NetworkProfile>().unwrap(),
+            NetworkProfile::Datacenter
         );
         assert_eq!(
-            "wan".parse::<NetworkProfile>().unwrap(),
-            NetworkProfile::Wan
+            "internet".parse::<NetworkProfile>().unwrap(),
+            NetworkProfile::Internet
         );
         assert_eq!(
-            "WAN".parse::<NetworkProfile>().unwrap(),
-            NetworkProfile::Wan
+            "INTERNET".parse::<NetworkProfile>().unwrap(),
+            NetworkProfile::Internet
         );
         assert!("invalid".parse::<NetworkProfile>().is_err());
     }
@@ -2205,27 +2255,85 @@ mod quic_tuning_tests {
     #[test]
     fn test_quic_config_default_values() {
         let config = default_quic_config();
-        assert_eq!(config.network_profile, NetworkProfile::Lan);
+        assert_eq!(config.network_profile, NetworkProfile::Datacenter);
         assert_eq!(config.congestion_control, None);
         assert!(config.tuning.receive_window.is_none());
+        assert!(config.tuning.remote_copy_buffer_size.is_none());
     }
     #[test]
     fn test_profile_window_sizes_match_documentation() {
         // verify that the constants match what's documented in docs/quic_performance_tuning.md
-        // LAN: 128 MiB receive, 16 MiB stream, 128 MiB send, 0.3ms RTT
-        assert_eq!(LAN_RECEIVE_WINDOW, 128 * 1024 * 1024);
-        assert_eq!(LAN_STREAM_RECEIVE_WINDOW, 16 * 1024 * 1024);
-        assert_eq!(LAN_SEND_WINDOW, 128 * 1024 * 1024);
-        assert_eq!(LAN_INITIAL_RTT_US, 300); // 0.3ms = 300 microseconds
-                                             // WAN: 8 MiB receive, 2 MiB stream, 8 MiB send, 100ms RTT
-        assert_eq!(WAN_RECEIVE_WINDOW, 8 * 1024 * 1024);
-        assert_eq!(WAN_STREAM_RECEIVE_WINDOW, 2 * 1024 * 1024);
-        assert_eq!(WAN_SEND_WINDOW, 8 * 1024 * 1024);
-        assert_eq!(WAN_INITIAL_RTT_US, 100_000); // 100ms = 100,000 microseconds
+        // datacenter: 128 MiB receive, 16 MiB stream, 128 MiB send, 0.3ms RTT
+        assert_eq!(DATACENTER_RECEIVE_WINDOW, 128 * 1024 * 1024);
+        assert_eq!(DATACENTER_STREAM_RECEIVE_WINDOW, 16 * 1024 * 1024);
+        assert_eq!(DATACENTER_SEND_WINDOW, 128 * 1024 * 1024);
+        assert_eq!(DATACENTER_INITIAL_RTT_US, 300); // 0.3ms = 300 microseconds
+                                                    // internet: 8 MiB receive, 2 MiB stream, 8 MiB send, 100ms RTT
+        assert_eq!(INTERNET_RECEIVE_WINDOW, 8 * 1024 * 1024);
+        assert_eq!(INTERNET_STREAM_RECEIVE_WINDOW, 2 * 1024 * 1024);
+        assert_eq!(INTERNET_SEND_WINDOW, 8 * 1024 * 1024);
+        assert_eq!(INTERNET_INITIAL_RTT_US, 100_000); // 100ms = 100,000 microseconds
     }
     #[test]
-    fn test_network_profile_default_is_lan() {
-        // verify that NetworkProfile::default() returns Lan as documented
-        assert_eq!(NetworkProfile::default(), NetworkProfile::Lan);
+    fn test_network_profile_default_is_datacenter() {
+        // verify that NetworkProfile::default() returns Datacenter as documented
+        assert_eq!(NetworkProfile::default(), NetworkProfile::Datacenter);
+    }
+    #[test]
+    fn test_network_profile_default_remote_copy_buffer_size() {
+        // datacenter profile should use buffer matching per-stream receive window
+        assert_eq!(
+            NetworkProfile::Datacenter.default_remote_copy_buffer_size(),
+            DATACENTER_STREAM_RECEIVE_WINDOW as usize
+        );
+        // internet profile should use buffer matching per-stream receive window
+        assert_eq!(
+            NetworkProfile::Internet.default_remote_copy_buffer_size(),
+            INTERNET_STREAM_RECEIVE_WINDOW as usize
+        );
+    }
+    #[test]
+    fn test_quic_config_effective_remote_copy_buffer_size_uses_profile_default() {
+        // when no override is set, should use profile default
+        let config = default_quic_config();
+        assert_eq!(config.network_profile, NetworkProfile::Datacenter);
+        assert_eq!(
+            config.effective_remote_copy_buffer_size(),
+            DATACENTER_REMOTE_COPY_BUFFER_SIZE
+        );
+        // internet profile should return internet default
+        let mut internet_config = default_quic_config();
+        internet_config.network_profile = NetworkProfile::Internet;
+        assert_eq!(
+            internet_config.effective_remote_copy_buffer_size(),
+            INTERNET_REMOTE_COPY_BUFFER_SIZE
+        );
+    }
+    #[test]
+    fn test_quic_config_effective_remote_copy_buffer_size_uses_override() {
+        // explicit override should take precedence over profile default
+        let mut config = default_quic_config();
+        config.tuning.remote_copy_buffer_size = Some(1024 * 1024); // 1 MiB override
+        assert_eq!(config.effective_remote_copy_buffer_size(), 1024 * 1024);
+        // should work on internet profile too
+        let mut internet_config = default_quic_config();
+        internet_config.network_profile = NetworkProfile::Internet;
+        internet_config.tuning.remote_copy_buffer_size = Some(512 * 1024); // 512 KiB override
+        assert_eq!(
+            internet_config.effective_remote_copy_buffer_size(),
+            512 * 1024
+        );
+    }
+    #[test]
+    fn test_remote_copy_buffer_size_constants() {
+        // verify buffer size constants match stream receive windows
+        assert_eq!(
+            DATACENTER_REMOTE_COPY_BUFFER_SIZE,
+            DATACENTER_STREAM_RECEIVE_WINDOW as usize
+        );
+        assert_eq!(
+            INTERNET_REMOTE_COPY_BUFFER_SIZE,
+            INTERNET_STREAM_RECEIVE_WINDOW as usize
+        );
     }
 }

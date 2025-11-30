@@ -10,7 +10,7 @@ Remote copy operations in `rcp` use the QUIC protocol, which provides reliable, 
 
 `rcp` provides two network profiles that configure QUIC parameters for different environments:
 
-### LAN Profile (Default)
+### Datacenter Profile (Default)
 
 Optimized for datacenter and local network environments with:
 - Low latency (<1ms RTT)
@@ -18,7 +18,7 @@ Optimized for datacenter and local network environments with:
 - Dedicated or lightly-shared links
 
 ```bash
-rcp --network-profile=lan source:/data dest:/data
+rcp --network-profile=datacenter source:/data dest:/data
 ```
 
 **Parameters:**
@@ -30,7 +30,7 @@ rcp --network-profile=lan source:/data dest:/data
 | Initial RTT estimate | 0.3ms | Low-latency assumption for aggressive pacing |
 | Congestion control | BBR | Model-based algorithm for fast ramp-up |
 
-### WAN Profile
+### Internet Profile
 
 Conservative settings for internet and shared network conditions:
 - Variable latency (10-200ms RTT)
@@ -38,7 +38,7 @@ Conservative settings for internet and shared network conditions:
 - Shared infrastructure where fairness matters
 
 ```bash
-rcp --network-profile=wan source:/data dest:/data
+rcp --network-profile=internet source:/data dest:/data
 ```
 
 **Parameters:**
@@ -55,11 +55,11 @@ rcp --network-profile=wan source:/data dest:/data
 Each profile has a default congestion control algorithm, but this can be overridden:
 
 ```bash
-# LAN windows with CUBIC (for shared datacenter networks)
-rcp --network-profile=lan --congestion-control=cubic source:/data dest:/data
+# Datacenter windows with CUBIC (for shared datacenter networks)
+rcp --network-profile=datacenter --congestion-control=cubic source:/data dest:/data
 
-# WAN windows with BBR (for dedicated WAN links)
-rcp --network-profile=wan --congestion-control=bbr source:/data dest:/data
+# Internet windows with BBR (for dedicated internet links)
+rcp --network-profile=internet --congestion-control=bbr source:/data dest:/data
 ```
 
 ### BBR (Bottleneck Bandwidth and RTT)
@@ -95,8 +95,8 @@ rcp --quic-receive-window=16MiB \
 
 ### Available Parameters
 
-| Flag | Description | Default (LAN) | Default (WAN) |
-|------|-------------|---------------|---------------|
+| Flag | Description | Default (Datacenter) | Default (Internet) |
+|------|-------------|----------------------|--------------------|
 | `--quic-receive-window=<SIZE>` | Connection-level receive window | 128 MiB | 8 MiB |
 | `--quic-stream-receive-window=<SIZE>` | Per-stream receive window | 16 MiB | 2 MiB |
 | `--quic-send-window=<SIZE>` | Send window | 128 MiB | 8 MiB |
@@ -119,23 +119,23 @@ For example:
 
 Note: Network speeds use decimal units (1 Gbps = 10^9 bits/s), while memory/buffer sizes use binary units (1 MiB = 2^20 bytes). The BDP calculations above use decimal MB for clarity, then we size buffers in MiB.
 
-Windows should be at least as large as the BDP to fully utilize the link. The LAN profile uses ~10x the BDP for headroom with multiple concurrent streams.
+Windows should be at least as large as the BDP to fully utilize the link. The datacenter profile uses ~10x the BDP for headroom with multiple concurrent streams.
 
 ## Memory Considerations
 
 Larger flow control windows require more memory:
 
-- LAN profile: ~256 MiB per connection (128 MiB receive + 128 MiB send)
-- WAN profile: ~16 MiB per connection
+- Datacenter profile: ~256 MiB per connection (128 MiB receive + 128 MiB send)
+- Internet profile: ~16 MiB per connection
 
 For servers with limited memory or many concurrent connections, consider:
-1. Using the WAN profile
+1. Using the internet profile
 2. Reducing window sizes via advanced tuning flags
 3. Limiting concurrent remote copy operations
 
 ## Troubleshooting
 
-### Slow throughput on LAN
+### Slow throughput in datacenter
 
 1. Verify low RTT: `ping -c 10 destination-host`
 2. Check for packet loss which can trigger congestion control backoff
@@ -148,7 +148,7 @@ For servers with limited memory or many concurrent connections, consider:
 
 ### Memory pressure on remote hosts
 
-1. Use WAN profile or reduce window sizes
+1. Use internet profile or reduce window sizes
 2. Check system memory and adjust `--max-workers` to limit concurrency
 
 ## Configuration on rcpd

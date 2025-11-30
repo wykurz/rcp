@@ -61,6 +61,7 @@
 //!     overwrite: false,
 //!     overwrite_compare: Default::default(),
 //!     chunk_size: 0,
+//!     remote_copy_buffer_size: 0,
 //! };
 //! let preserve = common::preserve::preserve_default();
 //!

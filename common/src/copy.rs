@@ -43,6 +43,12 @@ pub struct Settings {
     pub overwrite: bool,
     pub overwrite_compare: filecmp::MetadataCmpSettings,
     pub chunk_size: u64,
+    /// Buffer size for remote copy file transfer operations in bytes.
+    ///
+    /// This is only used for remote copy operations and controls the buffer size
+    /// when copying data between files and network streams. The actual buffer is
+    /// capped to the file size to avoid over-allocation for small files.
+    pub remote_copy_buffer_size: usize,
 }
 
 #[instrument]
@@ -522,6 +528,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -566,6 +573,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -637,6 +645,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -700,6 +709,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -743,6 +753,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -834,6 +845,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             false,
         )
@@ -856,6 +868,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             true,
         )
@@ -878,6 +891,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             false,
         )
@@ -900,6 +914,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             true,
         )
@@ -924,6 +939,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -981,6 +997,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1050,6 +1067,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1118,6 +1136,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1189,6 +1208,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1231,6 +1251,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &NO_PRESERVE_SETTINGS, // we want timestamps to differ!
             false,
@@ -1273,6 +1294,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1329,6 +1351,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -1395,6 +1418,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1450,6 +1474,7 @@ mod copy_tests {
                 overwrite: false,
                 overwrite_compare: filecmp::MetadataCmpSettings::default(),
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &DO_PRESERVE_SETTINGS, // <- important!
             false,
@@ -1465,6 +1490,7 @@ mod copy_tests {
                 overwrite: false,
                 overwrite_compare: filecmp::MetadataCmpSettings::default(),
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1516,6 +1542,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1567,6 +1594,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     chunk_size: 0,
+                    remote_copy_buffer_size: 0,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -1602,6 +1630,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     chunk_size: 0,
+                    remote_copy_buffer_size: 0,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -1640,6 +1669,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     chunk_size: 0,
+                    remote_copy_buffer_size: 0,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -1684,6 +1714,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     chunk_size: 0,
+                    remote_copy_buffer_size: 0,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,

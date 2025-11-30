@@ -314,6 +314,7 @@ mod cmp_tests {
                     ..Default::default()
                 },
                 chunk_size: 0,
+                remote_copy_buffer_size: 0,
             },
             if preserve {
                 &DO_PRESERVE_SETTINGS
