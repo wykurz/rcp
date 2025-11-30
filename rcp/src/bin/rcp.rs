@@ -329,6 +329,17 @@ struct Args {
     #[arg(long, help_heading = "Remote copy options")]
     auto_deploy_rcpd: bool,
 
+    /// Force remote copy mode even for local-to-local paths
+    ///
+    /// Normally, when both source and destination are local paths (including paths
+    /// with `localhost:` prefix), rcp performs a local copy. This flag forces the
+    /// use of the remote copy protocol (rcpd) instead, which is useful for testing
+    /// or when you want consistent behavior across local and remote operations.
+    ///
+    /// Requires paths to use the `localhost:` prefix (e.g., `localhost:/path/to/file`).
+    #[arg(long, help_heading = "Remote copy options")]
+    force_remote: bool,
+
     // ARGUMENTS
     /// Source path(s) and destination path
     #[arg()]
@@ -670,9 +681,15 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
             );
         }
     }
+    // choose parser based on --force-remote flag
+    let parse_fn = if args.force_remote {
+        path::parse_path_force_remote
+    } else {
+        path::parse_path
+    };
     let parsed_srcs: Vec<path::PathType> = src_strings
         .iter()
-        .map(|src| path::parse_path(src))
+        .map(|src| parse_fn(src))
         .collect::<anyhow::Result<Vec<_>>>()?;
     // pick the path type of the first source in the list and ensure all other sources match
     let first_src_path_type = parsed_srcs[0].clone();
@@ -688,7 +705,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
     let dst_string = args.paths.last().unwrap();
     // validate destination path for problematic patterns (applies to both local and remote)
     path::validate_destination_path(dst_string)?;
-    let dst_parsed = path::parse_path(dst_string)?;
+    let dst_parsed = parse_fn(dst_string)?;
     // check if we have remote paths
     let has_remote_paths = match first_src_path_type {
         path::PathType::Remote(_) => true,
@@ -704,7 +721,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
     let remote_src_dst = if has_remote_paths {
         // resolve destination path with trailing slash logic for remote case
         let resolved_dst_string = path::resolve_destination_path(&src_strings[0], dst_string)?;
-        let resolved_dst_path_type = path::parse_path(&resolved_dst_string)?;
+        let resolved_dst_path_type = parse_fn(&resolved_dst_string)?;
         match (first_src_path_type.clone(), resolved_dst_path_type) {
             (path::PathType::Remote(src_remote), path::PathType::Remote(dst_remote)) => {
                 Some((src_remote, dst_remote))
@@ -768,6 +785,18 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
             }
         };
     }
+    // warn if paths had localhost: prefix but we're doing a local copy
+    // (only check when not using --force-remote, since that's the opt-in for remote behavior)
+    if !args.force_remote {
+        let any_localhost_prefix = src_strings.iter().any(|s| path::has_localhost_prefix(s))
+            || path::has_localhost_prefix(dst_string);
+        if any_localhost_prefix {
+            tracing::warn!(
+                "Paths with 'localhost:' prefix are treated as local. \
+                Use --force-remote to force remote copy via SSH."
+            );
+        }
+    }
     // handle multiple sources only when destination ends with '/'
     if src_strings.len() > 1 && !dst_string.ends_with('/') {
         return Err(anyhow!(
@@ -780,7 +809,15 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         .zip(parsed_srcs.iter())
         .map(|(src_str, parsed_src)| {
             let resolved_dst = path::resolve_destination_path(src_str, dst_string)?;
-            let dst_path = path::expand_local_home(&resolved_dst)?;
+            // parse the resolved destination to handle localhost: prefix correctly
+            let dst_path = match parse_fn(&resolved_dst)? {
+                path::PathType::Local(p) => p,
+                path::PathType::Remote(_) => {
+                    return Err(anyhow!(
+                        "Internal error: unexpected remote path in local copy branch"
+                    ))
+                }
+            };
             let src_path = match parsed_src {
                 path::PathType::Local(p) => p.clone(),
                 path::PathType::Remote(_) => {

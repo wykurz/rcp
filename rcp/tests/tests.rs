@@ -1,3 +1,4 @@
+use predicates::prelude::PredicateBooleanExt;
 use std::os::unix::fs::PermissionsExt;
 
 #[test]
@@ -927,4 +928,60 @@ fn test_invalid_profile_level_gives_error() {
     .assert()
     .failure()
     .stderr(predicates::str::contains("Invalid --profile-level"));
+}
+
+// Tests for localhost: prefix handling and --force-remote flag
+
+#[test]
+fn test_localhost_prefix_performs_local_copy() {
+    // localhost:/path should be treated as a local copy (not using rcpd)
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("test.txt");
+    let dst_file = dst_dir.path().join("test.txt");
+    create_test_file(&src_file, "localhost test content", 0o644);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args(["-v", &src_remote, dst_file.to_str().unwrap()])
+        .assert()
+        .success()
+        // should show warning about localhost being treated as local (logs go to stdout)
+        .stdout(predicates::str::contains(
+            "Paths with 'localhost:' prefix are treated as local",
+        ))
+        // should NOT show "Starting rcpd" which would indicate remote mode
+        .stdout(predicates::str::contains("Starting rcpd").not());
+    assert_eq!(get_file_content(&dst_file), "localhost test content");
+}
+
+#[test]
+fn test_localhost_prefix_with_colons_in_path() {
+    // localhost: prefix should allow paths with colons that would otherwise be ambiguous
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("file:with:colons.txt");
+    let dst_file = dst_dir.path().join("copied.txt");
+    create_test_file(&src_file, "colon path content", 0o644);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args(["-v", &src_remote, dst_file.to_str().unwrap()])
+        .assert()
+        .success();
+    assert_eq!(get_file_content(&dst_file), "colon path content");
+}
+
+#[test]
+fn test_path_with_colons_is_local() {
+    // a path like /tmp/test-2024-01-01T12:30:45.txt should be local (not remote)
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("test-2024-01-01T12:30:45.txt");
+    let dst_file = dst_dir.path().join("copied.txt");
+    create_test_file(&src_file, "timestamp path content", 0o644);
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args(["-v", src_file.to_str().unwrap(), dst_file.to_str().unwrap()])
+        .assert()
+        .success()
+        // should NOT show warning about localhost (it's just a regular local path, logs go to stdout)
+        .stdout(predicates::str::contains("localhost").not())
+        // should NOT try to use rcpd
+        .stdout(predicates::str::contains("Starting rcpd").not());
+    assert_eq!(get_file_content(&dst_file), "timestamp path content");
 }
