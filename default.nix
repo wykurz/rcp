@@ -30,6 +30,8 @@ in
             cargo-flamegraph
             cargo-generate
             cargo-nextest
+            inferno
+            just
             cargo-outdated
             cargo-udeps
             gdb
