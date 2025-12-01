@@ -275,6 +275,9 @@ impl RcpdConfig {
         if let Some(v) = self.quic_tuning.remote_copy_buffer_size {
             args.push(format!("--remote-copy-buffer-size={v}"));
         }
+        if let Some(v) = self.quic_tuning.max_concurrent_streams {
+            args.push(format!("--quic-max-concurrent-streams={v}"));
+        }
         // pass master cert fingerprint as hex-encoded string
         args.push(format!(
             "--master-cert-fingerprint={}",

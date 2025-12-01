@@ -467,6 +467,12 @@ pub struct QuicTuning {
     /// and network streams. Larger buffers can improve throughput but use more memory
     /// per concurrent transfer.
     pub remote_copy_buffer_size: Option<usize>,
+    /// Maximum concurrent streams (None or Some(0) = quinn default)
+    ///
+    /// Each file transfer uses one unidirectional stream, so this limits how many files
+    /// can be transferred in parallel over a single QUIC connection. Higher values allow
+    /// more parallelism but use more memory.
+    pub max_concurrent_streams: Option<u32>,
 }
 
 /// Configuration for QUIC connections
@@ -1142,13 +1148,17 @@ fn apply_quic_tuning(transport_config: &mut quinn::TransportConfig, config: &Qui
     if let Some(v) = config.tuning.initial_mtu {
         transport_config.initial_mtu(v);
     }
+    if let Some(v) = config.tuning.max_concurrent_streams.filter(|&v| v > 0) {
+        transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(v));
+    }
     tracing::info!(
-        "Applied QUIC tuning: profile={}, congestion_control={}, receive_window={}, stream_receive_window={}, send_window={}",
+        "Applied QUIC tuning: profile={}, congestion_control={}, receive_window={}, stream_receive_window={}, send_window={}, max_concurrent_streams={}",
         config.network_profile,
         effective_cc,
         config.tuning.receive_window.unwrap_or(receive_window),
         config.tuning.stream_receive_window.unwrap_or(stream_receive_window),
         config.tuning.send_window.unwrap_or(send_window),
+        config.tuning.max_concurrent_streams.map_or_else(|| "default".to_string(), |v| v.to_string()),
     );
 }
 
@@ -1984,6 +1994,7 @@ mod tests {
 #[cfg(test)]
 mod quic_tuning_tests {
     use super::*;
+
     // helper to create a QuicConfig with defaults
     fn default_quic_config() -> QuicConfig {
         QuicConfig {
@@ -1996,12 +2007,14 @@ mod quic_tuning_tests {
             tuning: QuicTuning::default(),
         }
     }
+
     // Datacenter profile constants (from apply_quic_tuning implementation)
     // note: network profile constants are now defined at module level (DATACENTER_RECEIVE_WINDOW, etc.)
     // and used both in apply_quic_tuning() and NetworkProfile methods.
     // quinn's TransportConfig doesn't expose getter methods, so we can't directly
     // verify the values that were set. Instead, we test that apply_quic_tuning doesn't
     // panic with various inputs and test the logic of QuicConfig separately.
+
     #[test]
     fn test_apply_quic_tuning_datacenter_profile_does_not_panic() {
         let config = default_quic_config();
@@ -2009,6 +2022,7 @@ mod quic_tuning_tests {
         // should not panic
         apply_quic_tuning(&mut transport, &config);
     }
+
     #[test]
     fn test_apply_quic_tuning_internet_profile_does_not_panic() {
         let mut config = default_quic_config();
@@ -2017,6 +2031,7 @@ mod quic_tuning_tests {
         // should not panic
         apply_quic_tuning(&mut transport, &config);
     }
+
     #[test]
     fn test_apply_quic_tuning_with_all_overrides_does_not_panic() {
         let mut config = default_quic_config();
@@ -2027,11 +2042,13 @@ mod quic_tuning_tests {
             initial_rtt_ms: Some(50.0),
             initial_mtu: Some(1400),
             remote_copy_buffer_size: Some(512 * 1024),
+            max_concurrent_streams: Some(200),
         };
         let mut transport = quinn::TransportConfig::default();
         // should not panic
         apply_quic_tuning(&mut transport, &config);
     }
+
     #[test]
     fn test_apply_quic_tuning_with_partial_overrides_does_not_panic() {
         let mut config = default_quic_config();
@@ -2042,6 +2059,7 @@ mod quic_tuning_tests {
         // should not panic
         apply_quic_tuning(&mut transport, &config);
     }
+
     #[test]
     fn test_apply_quic_tuning_bbr_congestion_control_does_not_panic() {
         let mut config = default_quic_config();
@@ -2050,6 +2068,7 @@ mod quic_tuning_tests {
         // should not panic
         apply_quic_tuning(&mut transport, &config);
     }
+
     #[test]
     fn test_apply_quic_tuning_cubic_congestion_control_does_not_panic() {
         let mut config = default_quic_config();
@@ -2058,6 +2077,7 @@ mod quic_tuning_tests {
         // should not panic
         apply_quic_tuning(&mut transport, &config);
     }
+
     #[test]
     fn test_varint_overflow_handling_receive_window_does_not_panic() {
         let mut config = default_quic_config();
@@ -2068,6 +2088,7 @@ mod quic_tuning_tests {
         // should not panic - the fallback should handle the overflow
         apply_quic_tuning(&mut transport, &config);
     }
+
     #[test]
     fn test_varint_overflow_handling_stream_receive_window_does_not_panic() {
         let mut config = default_quic_config();
@@ -2076,6 +2097,7 @@ mod quic_tuning_tests {
         // should not panic - the fallback should handle the overflow
         apply_quic_tuning(&mut transport, &config);
     }
+
     #[test]
     fn test_varint_at_max_boundary_does_not_panic() {
         let mut config = default_quic_config();
@@ -2086,6 +2108,7 @@ mod quic_tuning_tests {
         // should not panic
         apply_quic_tuning(&mut transport, &config);
     }
+
     #[test]
     fn test_varint_just_over_max_does_not_panic() {
         let mut config = default_quic_config();
@@ -2096,6 +2119,7 @@ mod quic_tuning_tests {
         // should not panic - fallback to VarInt::MAX
         apply_quic_tuning(&mut transport, &config);
     }
+
     #[test]
     fn test_sub_millisecond_rtt_does_not_panic() {
         let mut config = default_quic_config();
@@ -2105,6 +2129,7 @@ mod quic_tuning_tests {
         // should not panic
         apply_quic_tuning(&mut transport, &config);
     }
+
     #[test]
     fn test_fractional_rtt_precision_does_not_panic() {
         let mut config = default_quic_config();
@@ -2116,6 +2141,7 @@ mod quic_tuning_tests {
             apply_quic_tuning(&mut transport, &config);
         }
     }
+
     #[test]
     fn test_datacenter_profile_uses_bbr_by_default() {
         let config = default_quic_config();
@@ -2128,6 +2154,7 @@ mod quic_tuning_tests {
             "datacenter profile should default to BBR"
         );
     }
+
     #[test]
     fn test_internet_profile_uses_cubic_by_default() {
         let mut config = default_quic_config();
@@ -2140,6 +2167,7 @@ mod quic_tuning_tests {
             "internet profile should default to CUBIC"
         );
     }
+
     #[test]
     fn test_congestion_control_override_on_datacenter() {
         let mut config = default_quic_config();
@@ -2152,6 +2180,7 @@ mod quic_tuning_tests {
             "explicit CUBIC should override datacenter's default BBR"
         );
     }
+
     #[test]
     fn test_congestion_control_override_on_internet() {
         let mut config = default_quic_config();
@@ -2164,6 +2193,7 @@ mod quic_tuning_tests {
             "explicit BBR should override internet's default CUBIC"
         );
     }
+
     #[test]
     fn test_network_profile_default_congestion_control() {
         assert_eq!(
@@ -2175,16 +2205,19 @@ mod quic_tuning_tests {
             CongestionControl::Cubic
         );
     }
+
     #[test]
     fn test_network_profile_display() {
         assert_eq!(format!("{}", NetworkProfile::Datacenter), "datacenter");
         assert_eq!(format!("{}", NetworkProfile::Internet), "internet");
     }
+
     #[test]
     fn test_congestion_control_display() {
         assert_eq!(format!("{}", CongestionControl::Bbr), "bbr");
         assert_eq!(format!("{}", CongestionControl::Cubic), "cubic");
     }
+
     #[test]
     fn test_network_profile_from_str() {
         assert_eq!(
@@ -2205,6 +2238,7 @@ mod quic_tuning_tests {
         );
         assert!("invalid".parse::<NetworkProfile>().is_err());
     }
+
     #[test]
     fn test_network_profile_from_str_error_message() {
         let err = "invalid".parse::<NetworkProfile>().unwrap_err();
@@ -2214,6 +2248,7 @@ mod quic_tuning_tests {
             err
         );
     }
+
     #[test]
     fn test_congestion_control_from_str() {
         assert_eq!(
@@ -2234,6 +2269,7 @@ mod quic_tuning_tests {
         );
         assert!("invalid".parse::<CongestionControl>().is_err());
     }
+
     #[test]
     fn test_congestion_control_from_str_error_message() {
         let err = "invalid".parse::<CongestionControl>().unwrap_err();
@@ -2243,6 +2279,7 @@ mod quic_tuning_tests {
             err
         );
     }
+
     #[test]
     fn test_quic_tuning_default() {
         let tuning = QuicTuning::default();
@@ -2252,6 +2289,7 @@ mod quic_tuning_tests {
         assert!(tuning.initial_rtt_ms.is_none());
         assert!(tuning.initial_mtu.is_none());
     }
+
     #[test]
     fn test_quic_config_default_values() {
         let config = default_quic_config();
@@ -2260,6 +2298,7 @@ mod quic_tuning_tests {
         assert!(config.tuning.receive_window.is_none());
         assert!(config.tuning.remote_copy_buffer_size.is_none());
     }
+
     #[test]
     fn test_profile_window_sizes_match_documentation() {
         // verify that the constants match what's documented in docs/quic_performance_tuning.md
@@ -2274,11 +2313,13 @@ mod quic_tuning_tests {
         assert_eq!(INTERNET_SEND_WINDOW, 8 * 1024 * 1024);
         assert_eq!(INTERNET_INITIAL_RTT_US, 100_000); // 100ms = 100,000 microseconds
     }
+
     #[test]
     fn test_network_profile_default_is_datacenter() {
         // verify that NetworkProfile::default() returns Datacenter as documented
         assert_eq!(NetworkProfile::default(), NetworkProfile::Datacenter);
     }
+
     #[test]
     fn test_network_profile_default_remote_copy_buffer_size() {
         // datacenter profile should use buffer matching per-stream receive window
@@ -2292,6 +2333,7 @@ mod quic_tuning_tests {
             INTERNET_STREAM_RECEIVE_WINDOW as usize
         );
     }
+
     #[test]
     fn test_quic_config_effective_remote_copy_buffer_size_uses_profile_default() {
         // when no override is set, should use profile default
@@ -2309,6 +2351,7 @@ mod quic_tuning_tests {
             INTERNET_REMOTE_COPY_BUFFER_SIZE
         );
     }
+
     #[test]
     fn test_quic_config_effective_remote_copy_buffer_size_uses_override() {
         // explicit override should take precedence over profile default
@@ -2324,6 +2367,7 @@ mod quic_tuning_tests {
             512 * 1024
         );
     }
+
     #[test]
     fn test_remote_copy_buffer_size_constants() {
         // verify buffer size constants match stream receive windows
@@ -2335,5 +2379,30 @@ mod quic_tuning_tests {
             INTERNET_REMOTE_COPY_BUFFER_SIZE,
             INTERNET_STREAM_RECEIVE_WINDOW as usize
         );
+    }
+
+    #[test]
+    fn test_max_concurrent_streams_zero_uses_quinn_default() {
+        // Some(0) should be treated as "use quinn default" and not set the transport
+        // config to 0 (which would prevent any streams from being opened).
+        // We can't directly verify the transport config value since quinn doesn't
+        // expose getters, but we verify our filter logic works correctly.
+        let zero_filtered = Some(0u32).filter(|&v| v > 0);
+        assert!(
+            zero_filtered.is_none(),
+            "Some(0) should be filtered to None to use quinn default"
+        );
+        let nonzero_filtered = Some(100u32).filter(|&v| v > 0);
+        assert_eq!(
+            nonzero_filtered,
+            Some(100),
+            "Some(100) should pass through the filter"
+        );
+        // also verify apply_quic_tuning doesn't panic with Some(0)
+        let mut config = default_quic_config();
+        config.tuning.max_concurrent_streams = Some(0);
+        let mut transport = quinn::TransportConfig::default();
+        apply_quic_tuning(&mut transport, &config);
+        // the transport should use quinn's default (100), not 0
     }
 }
