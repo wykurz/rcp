@@ -213,6 +213,10 @@ struct Args {
     #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
     quic_initial_mtu: Option<u16>,
 
+    /// Maximum concurrent unidirectional QUIC streams (0 = quinn default)
+    #[arg(long, value_name = "N", help_heading = "Remote copy options")]
+    quic_max_concurrent_streams: Option<u32>,
+
     /// Buffer size for remote copy file transfer operations in bytes.
     ///
     /// Controls the buffer used when copying data between files and network streams.
@@ -336,6 +340,7 @@ async fn run_operation(
             initial_rtt_ms: args.quic_initial_rtt_ms,
             initial_mtu: args.quic_initial_mtu,
             remote_copy_buffer_size: args.remote_copy_buffer_size,
+            max_concurrent_streams: args.quic_max_concurrent_streams.filter(|&v| v > 0),
         },
     };
     let settings = common::copy::Settings {
@@ -457,6 +462,7 @@ async fn async_main(
             initial_rtt_ms: args.quic_initial_rtt_ms,
             initial_mtu: args.quic_initial_mtu,
             remote_copy_buffer_size: args.remote_copy_buffer_size,
+            max_concurrent_streams: args.quic_max_concurrent_streams.filter(|&v| v > 0),
         },
     };
     // use certificate pinning for Master→rcpd connection

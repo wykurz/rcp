@@ -257,6 +257,13 @@ struct Args {
     #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
     quic_initial_mtu: Option<u16>,
 
+    /// Maximum concurrent unidirectional QUIC streams (0 = quinn default)
+    ///
+    /// Each file transfer uses one unidirectional stream. Higher values allow more
+    /// parallel file transfers but use more memory.
+    #[arg(long, value_name = "N", help_heading = "Remote copy options")]
+    quic_max_concurrent_streams: Option<u32>,
+
     /// Buffer size for remote copy file transfer operations.
     ///
     /// Controls the buffer used when copying data between files and network streams.
@@ -382,6 +389,7 @@ async fn run_rcpd_master(
         initial_rtt_ms: args.quic_initial_rtt_ms,
         initial_mtu: args.quic_initial_mtu,
         remote_copy_buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
+        max_concurrent_streams: args.quic_max_concurrent_streams.filter(|&v| v > 0),
     };
     // build QUIC config with profile and tuning settings
     let quic_config = remote::QuicConfig {

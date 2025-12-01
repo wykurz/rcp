@@ -102,8 +102,11 @@ rcp --quic-receive-window=16MiB \
 | `--quic-send-window=<SIZE>` | Send window | 128 MiB | 8 MiB |
 | `--quic-initial-rtt-ms=<MS>` | Initial RTT estimate (supports decimals, e.g., 0.3) | 0.3 | 100 |
 | `--quic-initial-mtu=<BYTES>` | Initial MTU size | 1200 | 1200 |
+| `--quic-max-concurrent-streams=<N>` | Max concurrent unidirectional streams | quinn default | quinn default |
 
 Size values accept formats like: `128MiB`, `1GiB`, `16777216` (bytes).
+
+The `--quic-max-concurrent-streams` parameter controls how many file transfers can happen in parallel over a single QUIC connection. Each file uses one unidirectional stream. The quinn default (currently 100) is suitable for most workloads, but can be increased for directories with many small files or decreased to reduce memory usage. Use 0 to explicitly request the quinn default.
 
 ## Understanding Flow Control
 
