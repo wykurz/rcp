@@ -1,5 +1,6 @@
 use futures::SinkExt;
 use tokio::io::{AsyncBufRead, AsyncWriteExt};
+use tracing::instrument;
 
 #[derive(Debug)]
 pub struct SendStream {
@@ -36,6 +37,7 @@ impl SendStream {
     /// This method uses `copy_buf` which avoids internal buffer allocation by using
     /// the reader's existing buffer. Wrap your reader in `BufReader::with_capacity(size, reader)`
     /// to control the buffer size.
+    #[instrument(level = "trace", skip(self, obj, reader))]
     pub async fn send_message_with_data_buffered<T: serde::Serialize, R: AsyncBufRead + Unpin>(
         &mut self,
         obj: &T,
@@ -85,6 +87,7 @@ impl RecvStream {
     /// Copies data to a writer using the default buffer size (8 KiB).
     ///
     /// For better performance with large files, use [`Self::copy_to_buffered`] instead.
+    #[instrument(level = "trace", skip(self, writer))]
     pub async fn copy_to<W: tokio::io::AsyncWrite + Unpin>(
         &mut self,
         writer: &mut W,
@@ -102,6 +105,7 @@ impl RecvStream {
     /// Uses a buffered reader around the QUIC stream with the specified capacity.
     /// This avoids the default 8 KiB buffer in `tokio::io::copy` and can significantly
     /// improve throughput on high-bandwidth networks.
+    #[instrument(level = "trace", skip(self, writer))]
     pub async fn copy_to_buffered<W: tokio::io::AsyncWrite + Unpin>(
         &mut self,
         writer: &mut W,
@@ -138,6 +142,7 @@ impl Connection {
         Self { inner: conn }
     }
 
+    #[instrument(level = "trace", skip(self))]
     pub async fn open_bi(&self) -> anyhow::Result<(SharedSendStream, RecvStream)> {
         let (send_stream, recv_stream) = self.inner.open_bi().await?;
         let send_stream = SendStream::new(send_stream).await?;
@@ -148,6 +153,7 @@ impl Connection {
         ))
     }
 
+    #[instrument(level = "trace", skip(self))]
     pub async fn open_uni(&self) -> anyhow::Result<SendStream> {
         let send_stream = self.inner.open_uni().await?;
         SendStream::new(send_stream).await
