@@ -1,5 +1,5 @@
 use async_recursion::async_recursion;
-use tracing::instrument;
+use tracing::{instrument, Instrument};
 
 fn progress() -> &'static common::progress::Progress {
     common::get_progress()
@@ -268,11 +268,21 @@ async fn send_file(
 ) -> anyhow::Result<()> {
     let prog = progress();
     let _ops_guard = prog.ops.guard();
-    let _open_file_guard = throttle::open_file_permit().await;
+    let _open_file_guard = throttle::open_file_permit()
+        .instrument(tracing::trace_span!("open_file_permit"))
+        .await;
     tracing::debug!("Sending file content for {:?}", src);
-    throttle::get_file_iops_tokens(settings.chunk_size, src_metadata.len()).await;
+    throttle::get_file_iops_tokens(settings.chunk_size, src_metadata.len())
+        .instrument(tracing::trace_span!(
+            "iops_throttle",
+            size = src_metadata.len()
+        ))
+        .await;
     // open the file BEFORE opening the stream to avoid leaving destination waiting
-    let file = match tokio::fs::File::open(src).await {
+    let file = match tokio::fs::File::open(src)
+        .instrument(tracing::trace_span!("file_open"))
+        .await
+    {
         Ok(f) => f,
         Err(e) => {
             tracing::error!("Failed to open file {src:?}: {e}");
@@ -310,11 +320,19 @@ async fn send_file(
         metadata,
         is_root,
     };
-    let mut file_send_stream = connection.open_uni().await?;
-    match file_send_stream
+    let mut file_send_stream = connection
+        .open_uni()
+        .instrument(tracing::trace_span!("open_uni_stream"))
+        .await?;
+    let send_result = file_send_stream
         .send_message_with_data_buffered(&file_header, &mut buffered_file)
-        .await
-    {
+        .instrument(tracing::trace_span!(
+            "send_data",
+            size = src_metadata.len(),
+            buffer_size
+        ))
+        .await;
+    match send_result {
         Ok(_bytes_sent) => {
             file_send_stream.close().await?;
             prog.files_copied.inc();

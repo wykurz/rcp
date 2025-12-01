@@ -1,5 +1,5 @@
 use anyhow::Context;
-use tracing::instrument;
+use tracing::{instrument, Instrument};
 
 use super::directory_tracker;
 
@@ -93,14 +93,26 @@ async fn handle_file_stream(
                 ));
             }
         }
-        throttle::get_file_iops_tokens(settings.chunk_size, file_header.size).await;
-        let mut file = tokio::fs::File::create(&file_header.dst).await?;
+        throttle::get_file_iops_tokens(settings.chunk_size, file_header.size)
+            .instrument(tracing::trace_span!(
+                "iops_throttle",
+                size = file_header.size
+            ))
+            .await;
+        let mut file = tokio::fs::File::create(&file_header.dst)
+            .instrument(tracing::trace_span!("file_create"))
+            .await?;
         // buffer size is set by quic_config.effective_remote_copy_buffer_size() based on network profile,
         // but capped at file size to avoid over-allocation for small files
         let file_size = file_header.size.min(usize::MAX as u64) as usize;
         let buffer_size = settings.remote_copy_buffer_size.min(file_size).max(1);
         let copied = file_recv_stream
             .copy_to_buffered(&mut file, buffer_size)
+            .instrument(tracing::trace_span!(
+                "recv_data",
+                size = file_header.size,
+                buffer_size
+            ))
             .await?;
         if copied != file_header.size {
             return Err(anyhow::anyhow!(

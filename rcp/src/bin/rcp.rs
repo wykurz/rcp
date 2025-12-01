@@ -453,33 +453,44 @@ async fn run_rcpd_master(
         } else {
             (None, remote::protocol::RcpdRole::Destination)
         };
-        let rcpd = remote::start_rcpd(
-            &rcpd_config,
-            session,
-            &server_addr,
-            &server_name,
-            args.rcpd_path.as_deref(),
-            args.auto_deploy_rcpd,
-            bind_ip.as_deref(),
-            role,
-        )
-        .await?;
+        let rcpd = {
+            let _span = tracing::trace_span!("start_rcpd", host = %session.host, ?role).entered();
+            remote::start_rcpd(
+                &rcpd_config,
+                session,
+                &server_addr,
+                &server_name,
+                args.rcpd_path.as_deref(),
+                args.auto_deploy_rcpd,
+                bind_ip.as_deref(),
+                role,
+            )
+            .await?
+        };
         rcpds.push(rcpd);
     }
     // if src and dst are the same, we need to start rcpd twice even though we only deployed once
     if src.session() == dst.session() && rcpds.len() == 1 {
         let bind_ip = extract_bind_ip_from_host(&src.session().host);
-        let rcpd = remote::start_rcpd(
-            &rcpd_config,
-            src.session(),
-            &server_addr,
-            &server_name,
-            args.rcpd_path.as_deref(),
-            args.auto_deploy_rcpd,
-            bind_ip.as_deref(),
-            remote::protocol::RcpdRole::Destination,
-        )
-        .await?;
+        let rcpd = {
+            let _span = tracing::trace_span!(
+                "start_rcpd",
+                host = %src.session().host,
+                role = ?remote::protocol::RcpdRole::Destination
+            )
+            .entered();
+            remote::start_rcpd(
+                &rcpd_config,
+                src.session(),
+                &server_addr,
+                &server_name,
+                args.rcpd_path.as_deref(),
+                args.auto_deploy_rcpd,
+                bind_ip.as_deref(),
+                remote::protocol::RcpdRole::Destination,
+            )
+            .await?
+        };
         rcpds.push(rcpd);
     }
     tracing::info!("Waiting for connections from rcpd processes...");
@@ -514,13 +525,17 @@ async fn run_rcpd_master(
 
     // accept both connections
     tracing::info!("Waiting for first rcpd connection...");
-    let (conn1, conn1_tracing_stream, conn1_hello) =
-        accept_rcpd_connection(server_endpoint.clone(), rcpd_connect_timeout).await?;
+    let (conn1, conn1_tracing_stream, conn1_hello) = {
+        let _span = tracing::trace_span!("accept_rcpd_connection", connection = 1).entered();
+        accept_rcpd_connection(server_endpoint.clone(), rcpd_connect_timeout).await?
+    };
     tracing::info!("First rcpd connected with role: {}", conn1_hello.role);
 
     tracing::info!("Waiting for second rcpd connection...");
-    let (conn2, conn2_tracing_stream, conn2_hello) =
-        accept_rcpd_connection(server_endpoint.clone(), rcpd_connect_timeout).await?;
+    let (conn2, conn2_tracing_stream, conn2_hello) = {
+        let _span = tracing::trace_span!("accept_rcpd_connection", connection = 2).entered();
+        accept_rcpd_connection(server_endpoint.clone(), rcpd_connect_timeout).await?
+    };
     tracing::info!("Second rcpd connected with role: {}", conn2_hello.role);
 
     // match connections by role
@@ -560,6 +575,7 @@ async fn run_rcpd_master(
         .await
         .context("Failed to open bidirectional stream with source rcpd")?;
     {
+        let _span = tracing::trace_span!("send_master_hello_to_source").entered();
         let mut source_send_stream = source_send_stream.lock().await;
         source_send_stream
             .send_control_message(&remote::protocol::MasterHello::Source {
@@ -570,16 +586,20 @@ async fn run_rcpd_master(
         source_send_stream.close().await?;
     }
     tracing::debug!("Waiting for source rcpd to send hello");
-    let source_hello = source_recv_stream
-        .recv_object::<remote::protocol::SourceMasterHello>()
-        .await?
-        .expect("Failed to receive source hello from source rcpd");
+    let source_hello = {
+        let _span = tracing::trace_span!("recv_source_hello").entered();
+        source_recv_stream
+            .recv_object::<remote::protocol::SourceMasterHello>()
+            .await?
+            .expect("Failed to receive source hello from source rcpd")
+    };
     // send MasterHello to destination rcpd
     let (dest_send_stream, mut dest_recv_stream) = dest_connection
         .open_bi()
         .await
         .context("Failed to open bidirectional stream with destination rcpd")?;
     {
+        let _span = tracing::trace_span!("send_master_hello_to_dest").entered();
         let mut dest_send_stream = dest_send_stream.lock().await;
         dest_send_stream
             .send_control_message(&remote::protocol::MasterHello::Destination {
@@ -592,14 +612,20 @@ async fn run_rcpd_master(
         dest_send_stream.close().await?;
     }
     tracing::info!("Forwarded source connection info to destination");
-    let source_result = source_recv_stream
-        .recv_object::<remote::protocol::RcpdResult>()
-        .await?
-        .expect("Failed to receive RcpdResult from source rcpd");
-    let dest_result = dest_recv_stream
-        .recv_object::<remote::protocol::RcpdResult>()
-        .await?
-        .expect("Failed to receive RcpdResult from destination rcpd");
+    let source_result = {
+        let _span = tracing::trace_span!("wait_for_source_result").entered();
+        source_recv_stream
+            .recv_object::<remote::protocol::RcpdResult>()
+            .await?
+            .expect("Failed to receive RcpdResult from source rcpd")
+    };
+    let dest_result = {
+        let _span = tracing::trace_span!("wait_for_dest_result").entered();
+        dest_recv_stream
+            .recv_object::<remote::protocol::RcpdResult>()
+            .await?
+            .expect("Failed to receive RcpdResult from destination rcpd")
+    };
     tracing::debug!("Received RcpdResult from both source and destination rcpds");
     // check for failures and collect error details + runtime stats
     let mut errors = Vec::new();
