@@ -7,168 +7,282 @@ fn progress() -> &'static common::progress::Progress {
     common::get_progress()
 }
 
-async fn send_root_done(
-    control_send_stream: remote::streams::SharedSendStream,
-) -> anyhow::Result<()> {
-    let mut stream = control_send_stream.lock().await;
-    stream
-        .send_control_message(&remote::protocol::DestinationMessage::DestinationDone)
-        .await?;
-    stream.close().await?;
-    tracing::info!("Sent source done message");
-    // DO NOT close recv stream here - we need to keep it open to receive SourceDone
-    // the stream will be closed after the message loop completes
-    tracing::info!("Sent destination done message");
+/// Stream state after a file processing error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamState {
+    /// No data was read yet - drain `file_header.size` bytes to recover.
+    NeedsDrain,
+    /// All data was consumed successfully (e.g., metadata error after full read).
+    /// Stream is at a clean boundary and can continue with the next file.
+    DataConsumed,
+    /// Stream is corrupted (mid-read error) - position unknown, must close.
+    Corrupted,
+}
+
+/// Error from processing a single file, with stream recovery information.
+struct ProcessFileError {
+    /// The underlying error.
+    source: anyhow::Error,
+    /// Stream state after this error - determines how caller should proceed.
+    stream_state: StreamState,
+}
+
+/// Process a single file from the stream.
+///
+/// On success, all `file_header.size` bytes have been consumed.
+/// On error, check `stream_state`:
+/// - `NeedsDrain`: no data was read yet, drain `file_header.size` bytes to recover
+/// - `DataConsumed`: all data consumed, stream at clean boundary, can continue
+/// - `Corrupted`: mid-read error, stream position unknown, must close
+#[instrument(skip(file_recv_stream))]
+async fn process_single_file(
+    settings: &common::copy::Settings,
+    preserve: &common::preserve::Settings,
+    file_recv_stream: &mut remote::streams::RecvStream,
+    file_header: &remote::protocol::File,
+) -> Result<(), ProcessFileError> {
+    let prog = progress();
+    // errors before we start reading data - stream can be recovered by draining
+    let err_needs_drain = |e: anyhow::Error| ProcessFileError {
+        source: e,
+        stream_state: StreamState::NeedsDrain,
+    };
+    // errors during data transfer - stream position unknown, corrupted
+    let err_corrupted = |e: anyhow::Error| ProcessFileError {
+        source: e,
+        stream_state: StreamState::Corrupted,
+    };
+    // errors after all data consumed (e.g., metadata) - stream at clean boundary
+    let err_data_consumed = |e: anyhow::Error| ProcessFileError {
+        source: e,
+        stream_state: StreamState::DataConsumed,
+    };
+    // check if destination exists and handle overwrite logic
+    let dst_exists = tokio::fs::symlink_metadata(&file_header.dst).await.is_ok();
+    if dst_exists {
+        if settings.overwrite {
+            tracing::debug!("file exists, check if it's identical");
+            let dst_metadata = tokio::fs::symlink_metadata(&file_header.dst)
+                .await
+                .map_err(|e| err_needs_drain(e.into()))?;
+            let is_file = dst_metadata.is_file();
+            if is_file {
+                let src_file_metadata = remote::protocol::FileMetadata {
+                    metadata: &file_header.metadata,
+                    size: file_header.size,
+                };
+                let same_metadata = common::filecmp::metadata_equal(
+                    &settings.overwrite_compare,
+                    &src_file_metadata,
+                    &dst_metadata,
+                );
+                if same_metadata {
+                    tracing::debug!("file is identical, skipping");
+                    prog.files_unchanged.inc();
+                    // drain this file's data without writing - if this fails, stream is corrupted
+                    let mut sink = tokio::io::sink();
+                    file_recv_stream
+                        .copy_exact_to_buffered(&mut sink, file_header.size, 8192)
+                        .await
+                        .map_err(err_corrupted)?;
+                    return Ok(());
+                }
+                tracing::debug!("file exists but is different, removing");
+                tokio::fs::remove_file(&file_header.dst)
+                    .await
+                    .map_err(|e| err_needs_drain(e.into()))?;
+            } else {
+                tracing::info!("destination is not a file, removing");
+                common::rm::rm(
+                    common::get_progress(),
+                    &file_header.dst,
+                    &common::rm::Settings {
+                        fail_early: settings.fail_early,
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    err_needs_drain(anyhow::anyhow!("Failed to remove destination: {err}"))
+                })?;
+            }
+        } else {
+            return Err(err_needs_drain(anyhow::anyhow!(
+                "destination {:?} already exists, did you intend to specify --overwrite?",
+                file_header.dst
+            )));
+        }
+    }
+    throttle::get_file_iops_tokens(settings.chunk_size, file_header.size)
+        .instrument(tracing::trace_span!(
+            "iops_throttle",
+            size = file_header.size
+        ))
+        .await;
+    let mut file = tokio::fs::File::create(&file_header.dst)
+        .instrument(tracing::trace_span!("file_create"))
+        .await
+        .map_err(|e| err_needs_drain(e.into()))?;
+    // buffer size is set by quic_config.effective_remote_copy_buffer_size() based on network profile,
+    // but capped at file size to avoid over-allocation for small files
+    let file_size = file_header.size.min(usize::MAX as u64) as usize;
+    let buffer_size = settings.remote_copy_buffer_size.min(file_size).max(1);
+    // once we start reading from the stream, any error means the stream is corrupted
+    let copied = file_recv_stream
+        .copy_exact_to_buffered(&mut file, file_header.size, buffer_size)
+        .instrument(tracing::trace_span!(
+            "recv_data",
+            size = file_header.size,
+            buffer_size
+        ))
+        .await
+        .map_err(err_corrupted)?;
+    if copied != file_header.size {
+        return Err(err_corrupted(anyhow::anyhow!(
+            "File size mismatch: expected {} bytes, copied {} bytes",
+            file_header.size,
+            copied
+        )));
+    }
+    drop(file);
+    tracing::info!(
+        "File {} -> {} created, size: {} bytes, setting metadata...",
+        file_header.src.display(),
+        file_header.dst.display(),
+        file_header.size
+    );
+    // metadata errors happen after all bytes consumed - stream is at clean boundary
+    common::preserve::set_file_metadata(preserve, &file_header.metadata, &file_header.dst)
+        .await
+        .map_err(err_data_consumed)?;
+    prog.files_copied.inc();
+    prog.bytes_copied.add(file_header.size);
     Ok(())
 }
 
-#[instrument(skip(_open_file_guard, error_occurred))]
+/// Handle a stream that may contain multiple files.
+///
+/// Loops until the stream is closed (EOF on header read).
+#[instrument(skip(error_occurred))]
 async fn handle_file_stream(
-    _open_file_guard: throttle::OpenFileGuard,
     settings: common::copy::Settings,
     preserve: common::preserve::Settings,
-    control_send_stream: remote::streams::SharedSendStream,
     mut file_recv_stream: remote::streams::RecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let prog = progress();
-    let _ops_guard = prog.ops.guard();
-    tracing::info!("Processing file stream");
-    let file_header = file_recv_stream
-        .recv_object::<remote::protocol::File>()
-        .await?
-        .expect("No file data sent over uni-stream?!");
-    tracing::info!(
-        "Received file: {:?} -> {:?}",
-        file_header.src,
-        file_header.dst
-    );
-    // wrap file handling logic to ensure stream is always cleaned up
-    let file_result = async {
-        // check if destination exists and handle overwrite logic
-        let dst_exists = tokio::fs::symlink_metadata(&file_header.dst).await.is_ok();
-        if dst_exists {
-            if settings.overwrite {
-                tracing::debug!("file exists, check if it's identical");
-                let dst_metadata = tokio::fs::symlink_metadata(&file_header.dst).await?;
-                let is_file = dst_metadata.is_file();
-                if is_file {
-                    let src_file_metadata = remote::protocol::FileMetadata {
-                        metadata: &file_header.metadata,
-                        size: file_header.size,
-                    };
-                    let same_metadata = common::filecmp::metadata_equal(
-                        &settings.overwrite_compare,
-                        &src_file_metadata,
-                        &dst_metadata,
-                    );
-                    if same_metadata {
-                        tracing::debug!("file is identical, skipping");
-                        prog.files_unchanged.inc();
-                        // drain the stream without writing
-                        let mut sink = tokio::io::sink();
-                        file_recv_stream.copy_to(&mut sink).await?;
-                        file_recv_stream.close().await;
-                        return Ok(());
-                    }
-                    tracing::debug!("file exists but is different, removing");
-                    tokio::fs::remove_file(&file_header.dst).await?;
-                } else {
-                    tracing::info!("destination is not a file, removing");
-                    common::rm::rm(
-                        common::get_progress(),
-                        &file_header.dst,
-                        &common::rm::Settings {
-                            fail_early: settings.fail_early,
-                        },
-                    )
-                    .await
-                    .map_err(|err| anyhow::anyhow!("Failed to remove destination: {err}"))?;
-                }
-            } else {
-                return Err(anyhow::anyhow!(
-                    "destination {:?} already exists, did you intend to specify --overwrite?",
-                    file_header.dst
-                ));
+    tracing::info!("Processing file stream (may contain multiple files)");
+    // loop until stream closes (EOF on header read)
+    loop {
+        // try to receive next file header
+        let file_header = match file_recv_stream
+            .recv_object::<remote::protocol::File>()
+            .await?
+        {
+            Some(h) => h,
+            None => {
+                // stream closed by source, no more files
+                tracing::debug!("Stream closed, no more files");
+                break;
             }
-        }
-        throttle::get_file_iops_tokens(settings.chunk_size, file_header.size)
-            .instrument(tracing::trace_span!(
-                "iops_throttle",
-                size = file_header.size
-            ))
-            .await;
-        let mut file = tokio::fs::File::create(&file_header.dst)
-            .instrument(tracing::trace_span!("file_create"))
-            .await?;
-        // buffer size is set by quic_config.effective_remote_copy_buffer_size() based on network profile,
-        // but capped at file size to avoid over-allocation for small files
-        let file_size = file_header.size.min(usize::MAX as u64) as usize;
-        let buffer_size = settings.remote_copy_buffer_size.min(file_size).max(1);
-        let copied = file_recv_stream
-            .copy_to_buffered(&mut file, buffer_size)
-            .instrument(tracing::trace_span!(
-                "recv_data",
-                size = file_header.size,
-                buffer_size
-            ))
-            .await?;
-        if copied != file_header.size {
-            return Err(anyhow::anyhow!(
-                "File size mismatch: expected {} bytes, copied {} bytes",
-                file_header.size,
-                copied
-            ));
-        }
-        file_recv_stream.close().await;
-        drop(file);
+        };
         tracing::info!(
-            "File {} -> {} created, size: {} bytes, setting metadata...",
-            file_header.src.display(),
-            file_header.dst.display(),
-            file_header.size
+            "Received file: {:?} -> {:?} (dir_total_files={})",
+            file_header.src,
+            file_header.dst,
+            file_header.dir_total_files
         );
-        common::preserve::set_file_metadata(&preserve, &file_header.metadata, &file_header.dst)
-            .await?;
-        prog.files_copied.inc();
-        prog.bytes_copied.add(file_header.size);
-        Ok(())
-    }
-    .await;
-    // handle result: log error if failed, drain stream if not already drained
-    match file_result {
-        Ok(()) => {}
-        Err(e) => {
+        // acquire throttle permits for this file
+        let _open_file_guard = throttle::open_file_permit()
+            .instrument(tracing::trace_span!("open_file_permit"))
+            .await;
+        throttle::get_ops_token().await;
+        let _ops_guard = prog.ops.guard();
+        // process this file
+        let file_result =
+            process_single_file(&settings, &preserve, &mut file_recv_stream, &file_header).await;
+        // track whether we need to close the stream and exit early
+        let mut stream_corrupted = false;
+        let mut fail_early_error: Option<anyhow::Error> = None;
+        if let Err(e) = file_result {
             tracing::error!(
                 "Failed to handle file {}: {:#}",
                 file_header.dst.display(),
-                e
+                e.source
             );
             error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
-            // ensure stream is drained to avoid blocking source
-            let mut sink = tokio::io::sink();
-            if let Err(drain_err) = file_recv_stream.copy_to(&mut sink).await {
-                tracing::error!("Failed to drain file stream: {:#}", drain_err);
+            match e.stream_state {
+                StreamState::NeedsDrain => {
+                    // no data was read yet, drain the file's data to stay in sync
+                    let mut sink = tokio::io::sink();
+                    if let Err(drain_err) = file_recv_stream
+                        .copy_exact_to_buffered(&mut sink, file_header.size, 8192)
+                        .await
+                    {
+                        tracing::error!("Failed to drain file data: {:#}", drain_err);
+                        // drain failed, stream is now corrupted
+                        stream_corrupted = true;
+                    }
+                }
+                StreamState::DataConsumed => {
+                    // all data consumed successfully (e.g., metadata error after full read)
+                    // stream is at a clean boundary, can continue with next file
+                    tracing::debug!("Error after data consumed, stream still usable");
+                }
+                StreamState::Corrupted => {
+                    // mid-read error, stream position unknown, must close
+                    tracing::debug!("Stream corrupted, will close after tracking update");
+                    stream_corrupted = true;
+                }
             }
-            file_recv_stream.close().await;
             if settings.fail_early {
-                return Err(e);
+                fail_early_error = Some(e.source);
             }
         }
+        // ALWAYS update directory tracker, even on error
+        // this prevents hangs waiting for file counts
+        {
+            let mut tracker = directory_tracker.lock().await;
+            if file_header.is_root {
+                tracing::info!(
+                    "Root file processed (success={})",
+                    fail_early_error.is_none() && !stream_corrupted
+                );
+                tracker.set_root_complete();
+            } else {
+                // get parent directory
+                let parent_dir = file_header.dst.parent().ok_or_else(|| {
+                    anyhow::anyhow!("file {:?} has no parent directory", file_header.dst)
+                })?;
+                tracker
+                    .process_file(parent_dir, file_header.dir_total_files)
+                    .await
+                    .context("Failed to update directory tracker after receiving file")?;
+            }
+            // check if we're done after each file - this may send DestinationDone
+            if tracker.is_done() {
+                tracing::info!(
+                    "All operations complete after file processing, sending DestinationDone"
+                );
+                tracker.send_destination_done().await?;
+            }
+        }
+        // now handle stream corruption or fail-early after tracking is updated
+        if stream_corrupted {
+            file_recv_stream.close().await;
+            // always return error for corrupted stream - protocol is out of sync and
+            // remaining files on this stream are lost without tracker updates.
+            return Err(fail_early_error.unwrap_or_else(|| {
+                anyhow::anyhow!("stream corrupted, remaining files on this stream lost")
+            }));
+        }
+        if let Some(err) = fail_early_error {
+            file_recv_stream.close().await;
+            return Err(err);
+        }
     }
-    // always decrement directory tracker or send root done, even on failure
-    if file_header.is_root {
-        tracing::info!("Root file processed");
-        send_root_done(control_send_stream).await?;
-    } else {
-        directory_tracker
-            .lock()
-            .await
-            .decrement_entry(&file_header.src, &file_header.dst)
-            .await
-            .context("Failed to decrement directory entry count after receiving a file")?;
-    }
+    file_recv_stream.close().await;
+    tracing::info!("File stream processing complete");
     Ok(())
 }
 
@@ -176,28 +290,30 @@ async fn handle_file_stream(
 async fn process_incoming_file_streams(
     settings: common::copy::Settings,
     preserve: common::preserve::Settings,
-    control_send_stream: remote::streams::SharedSendStream,
     connection: remote::streams::Connection,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut join_set = tokio::task::JoinSet::new();
+    // CANCEL SAFETY: both branches are cancel-safe:
+    // - `join_set.join_next()`: cancel-safe per tokio docs (just polls task handles)
+    // - `connection.accept_uni()`: cancel-safe (waiting on QUIC internal channel)
     loop {
         tokio::select! {
             // check if any spawned task completed (potentially with error)
             Some(result) = join_set.join_next() => {
-                tracing::debug!("File handling task completed");
+                tracing::debug!("File stream handling task completed");
                 match result {
                     Ok(Ok(())) => {},
                     Ok(Err(e)) => {
-                        tracing::error!("File handling task failed: {e}");
+                        tracing::error!("File stream handling task failed: {e}");
                         error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                         if settings.fail_early {
                             return Err(e);
                         }
                     }
                     Err(e) => {
-                        tracing::error!("File handling task panicked: {e}");
+                        tracing::error!("File stream handling task panicked: {e}");
                         error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                         if settings.fail_early {
                             return Err(e.into());
@@ -205,20 +321,16 @@ async fn process_incoming_file_streams(
                     }
                 }
             }
-            // accept new file streams
+            // accept new file streams (each stream may contain multiple files)
             stream_result = connection.accept_uni() => {
                 match stream_result {
                     Ok(file_recv_stream) => {
-                        tracing::info!("Received new unidirectional stream for file");
-                        let open_file_guard = throttle::open_file_permit().await;
-                        throttle::get_ops_token().await;
+                        tracing::info!("Received new unidirectional stream (may contain multiple files)");
                         let tracker = directory_tracker.clone();
                         let error_flag = error_occurred.clone();
                         join_set.spawn(handle_file_stream(
-                            open_file_guard,
                             settings,
                             preserve,
-                            control_send_stream.clone(),
                             file_recv_stream,
                             tracker.clone(),
                             error_flag,
@@ -233,20 +345,20 @@ async fn process_incoming_file_streams(
             }
         }
     }
-    tracing::debug!("Waiting for remaining file handling tasks to complete");
+    tracing::debug!("Waiting for remaining file stream handling tasks to complete");
     // handle completion of remaining file streams
     while let Some(result) = join_set.join_next().await {
         match result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                tracing::error!("File handling task failed: {e}");
+                tracing::error!("File stream handling task failed: {e}");
                 error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                 if settings.fail_early {
                     return Err(e);
                 }
             }
             Err(e) => {
-                tracing::error!("File handling task panicked: {e}");
+                tracing::error!("File stream handling task panicked: {e}");
                 error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                 if settings.fail_early {
                     return Err(e.into());
@@ -259,11 +371,135 @@ async fn process_incoming_file_streams(
     Ok(())
 }
 
-#[instrument(skip(error_occurred))]
-async fn create_directory_structure(
+/// Create a directory, handling overwrite logic.
+/// Returns Ok(true) if directory was created/exists, Ok(false) if failed.
+async fn create_directory(
+    settings: &common::copy::Settings,
+    dst: &std::path::Path,
+) -> anyhow::Result<bool> {
+    let prog = progress();
+    match tokio::fs::create_dir(dst).await {
+        Ok(()) => {
+            prog.directories_created.inc();
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // something exists at destination - check what it is
+            let dst_metadata = tokio::fs::symlink_metadata(dst).await?;
+            if dst_metadata.is_dir() {
+                // directory already exists - reuse it (no overwrite needed for directories)
+                tracing::debug!("destination directory already exists, reusing it");
+                prog.directories_unchanged.inc();
+                Ok(true)
+            } else if settings.overwrite {
+                // not a directory but overwrite is enabled - remove and create
+                tracing::info!("destination is not a directory, removing and creating a new one");
+                common::rm::rm(
+                    common::get_progress(),
+                    dst,
+                    &common::rm::Settings {
+                        fail_early: settings.fail_early,
+                    },
+                )
+                .await?;
+                tokio::fs::create_dir(dst).await?;
+                prog.directories_created.inc();
+                Ok(true)
+            } else {
+                // not a directory and overwrite disabled
+                tracing::error!(
+                    "Destination {dst:?} exists and is not a directory, use --overwrite to replace"
+                );
+                Ok(false)
+            }
+        }
+        Err(error) => {
+            tracing::error!("Failed to create directory {dst:?}: {error}");
+            Err(error.into())
+        }
+    }
+}
+
+/// Create a symlink, handling overwrite logic.
+async fn create_symlink(
     settings: &common::copy::Settings,
     preserve: &common::preserve::Settings,
-    control_send_stream: remote::streams::SharedSendStream,
+    dst: &std::path::Path,
+    target: &std::path::Path,
+    metadata: &remote::protocol::Metadata,
+) -> anyhow::Result<()> {
+    let prog = progress();
+    match tokio::fs::symlink(target, dst).await {
+        Ok(()) => {
+            common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
+            prog.symlinks_created.inc();
+            Ok(())
+        }
+        Err(error) if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let dst_metadata = tokio::fs::symlink_metadata(dst)
+                .await
+                .with_context(|| format!("failed reading metadata from dst: {dst:?}"))?;
+            if dst_metadata.is_symlink() {
+                let dst_link = tokio::fs::read_link(dst)
+                    .await
+                    .with_context(|| format!("failed reading dst symlink: {dst:?}"))?;
+                if *target == dst_link {
+                    tracing::debug!(
+                        "destination is a symlink and points to the same location as source"
+                    );
+                    if preserve.symlink.any() {
+                        if common::filecmp::metadata_equal(
+                            &settings.overwrite_compare,
+                            metadata,
+                            &dst_metadata,
+                        ) {
+                            tracing::debug!("destination symlink is identical, skipping");
+                            prog.symlinks_unchanged.inc();
+                        } else {
+                            tracing::debug!("destination metadata is different, updating");
+                            common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
+                            prog.symlinks_removed.inc();
+                            prog.symlinks_created.inc();
+                        }
+                    } else {
+                        tracing::debug!("destination symlink is identical, skipping");
+                        prog.symlinks_unchanged.inc();
+                    }
+                } else {
+                    tracing::info!(
+                        "destination is a symlink but points to a different location, removing"
+                    );
+                    tokio::fs::remove_file(dst).await?;
+                    tokio::fs::symlink(target, dst).await?;
+                    common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
+                    prog.symlinks_removed.inc();
+                    prog.symlinks_created.inc();
+                }
+            } else {
+                tracing::info!("destination is not a symlink, removing");
+                common::rm::rm(
+                    common::get_progress(),
+                    dst,
+                    &common::rm::Settings {
+                        fail_early: settings.fail_early,
+                    },
+                )
+                .await
+                .map_err(|err| anyhow::anyhow!("Failed to remove destination: {err}"))?;
+                tokio::fs::symlink(target, dst).await?;
+                common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
+                prog.symlinks_created.inc();
+            }
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[instrument(skip(error_occurred))]
+async fn process_control_stream(
+    settings: &common::copy::Settings,
+    preserve: &common::preserve::Settings,
     mut control_recv_stream: remote::streams::RecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -271,106 +507,12 @@ async fn create_directory_structure(
     while let Some(source_message) = control_recv_stream
         .recv_object::<remote::protocol::SourceMessage>()
         .await
-        .context("Failed to receive FS object message")?
+        .context("Failed to receive source message")?
     {
         throttle::get_ops_token().await;
         tracing::debug!("Received source message: {:?}", source_message);
         let prog = progress();
         match source_message {
-            remote::protocol::SourceMessage::DirStub {
-                ref src,
-                ref dst,
-                num_entries,
-            } => {
-                let _ops_guard = prog.ops.guard();
-                let dir_failed = match tokio::fs::create_dir(&dst).await {
-                    Ok(()) => {
-                        prog.directories_created.inc();
-                        false
-                    }
-                    Err(error)
-                        if settings.overwrite
-                            && error.kind() == std::io::ErrorKind::AlreadyExists =>
-                    {
-                        // check if the destination is a directory - if so, leave it
-                        // use symlink_metadata to not follow symlinks
-                        match tokio::fs::symlink_metadata(dst).await {
-                            Ok(dst_metadata) if dst_metadata.is_dir() => {
-                                tracing::debug!("destination is a directory, leaving it as is");
-                                prog.directories_unchanged.inc();
-                                false
-                            }
-                            Ok(_) => {
-                                tracing::info!(
-                                    "destination is not a directory, removing and creating a new one"
-                                );
-                                // do NOT hold directory_tracker lock while calling rm::rm() as it might deadlock
-                                // with file streams trying to decrement entries
-                                match common::rm::rm(
-                                    common::get_progress(),
-                                    dst,
-                                    &common::rm::Settings {
-                                        fail_early: settings.fail_early,
-                                    },
-                                )
-                                .await
-                                {
-                                    Ok(_) => match tokio::fs::create_dir(&dst).await {
-                                        Ok(()) => {
-                                            prog.directories_created.inc();
-                                            false
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("Failed to create directory {dst:?} after removing: {e}");
-                                            error_occurred
-                                                .store(true, std::sync::atomic::Ordering::Relaxed);
-                                            if settings.fail_early {
-                                                return Err(e.into());
-                                            }
-                                            true
-                                        }
-                                    },
-                                    Err(err) => {
-                                        tracing::error!(
-                                            "Failed to remove destination {dst:?}: {err}"
-                                        );
-                                        error_occurred
-                                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                                        if settings.fail_early {
-                                            return Err(anyhow::anyhow!(
-                                                "Failed to remove destination: {err}"
-                                            ));
-                                        }
-                                        true
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to read metadata from {dst:?}: {e}");
-                                error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
-                                if settings.fail_early {
-                                    return Err(e.into());
-                                }
-                                true
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        tracing::error!("Failed to create directory {dst:?}: {error}");
-                        error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
-                        if settings.fail_early {
-                            return Err(error.into());
-                        }
-                        true
-                    }
-                };
-                directory_tracker
-                    .lock()
-                    .await
-                    .add_directory(src, dst, num_entries, dir_failed)
-                    .await
-                    .context("Failed to add directory to tracker")?;
-            }
             remote::protocol::SourceMessage::Directory {
                 ref src,
                 ref dst,
@@ -378,21 +520,48 @@ async fn create_directory_structure(
                 is_root,
             } => {
                 let _ops_guard = prog.ops.guard();
-                // apply metadata changes now that directory is complete
-                common::preserve::set_dir_metadata(preserve, metadata, dst).await?;
-                if is_root {
-                    tracing::info!("Root directory processed");
-                    send_root_done(control_send_stream.clone()).await?;
-                    // continue loop to receive SourceDone from source before closing
-                    // skip decrement_entry since root isn't tracked
-                    continue;
+                // check for failed ancestor
+                {
+                    let tracker = directory_tracker.lock().await;
+                    if tracker.has_failed_ancestor(dst) {
+                        tracing::warn!("Skipping directory {:?} - ancestor failed to create", dst);
+                        continue;
+                    }
                 }
-                directory_tracker
-                    .lock()
-                    .await
-                    .decrement_entry(src, dst)
-                    .await
-                    .with_context(|| format!("Failed to decrement directory entry count after receiving directory metadata src: {src:?}, dst: {dst:?}"))?;
+                // try to create directory
+                let created = match create_directory(settings, dst).await {
+                    Ok(created) => created,
+                    Err(e) => {
+                        tracing::error!("Failed to create directory {:?}: {:#}", dst, e);
+                        error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
+                        if settings.fail_early {
+                            return Err(e);
+                        }
+                        false
+                    }
+                };
+                if created {
+                    // add to tracker (sends DirectoryCreated)
+                    // tracker handles root directory tracking internally
+                    directory_tracker
+                        .lock()
+                        .await
+                        .add_directory(src, dst, metadata.clone(), is_root)
+                        .await
+                        .context("Failed to add directory to tracker")?;
+                } else {
+                    // mark as failed - descendants will be skipped
+                    error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let mut tracker = directory_tracker.lock().await;
+                    tracker.mark_directory_failed(dst);
+                    // if root directory failed, mark root as complete to avoid hang
+                    if is_root {
+                        tracker.set_root_complete();
+                    }
+                    if settings.fail_early {
+                        return Err(anyhow::anyhow!("Failed to create directory {:?}", dst));
+                    }
+                }
             }
             remote::protocol::SourceMessage::Symlink {
                 ref src,
@@ -402,131 +571,87 @@ async fn create_directory_structure(
                 is_root,
             } => {
                 let _ops_guard = prog.ops.guard();
-                // wrap entire symlink creation logic to handle errors gracefully
-                let symlink_result = async {
-                    match tokio::fs::symlink(target, dst).await {
-                        Ok(()) => {
-                            common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
-                            prog.symlinks_created.inc();
-                            Ok(())
-                        }
-                        Err(error) if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists => {
-                            let dst_metadata = tokio::fs::symlink_metadata(dst).await.with_context(|| {
-                                format!("failed reading metadata from dst: {dst:?}")
-                            })?;
-                            if dst_metadata.is_symlink() {
-                                let dst_link = tokio::fs::read_link(dst).await.with_context(|| format!("failed reading dst symlink: {dst:?}"))?;
-                                if target == &dst_link {
-                                    tracing::debug!("destination is a symlink and points to the same location as source");
-                                    if preserve.symlink.any() {
-                                        if common::filecmp::metadata_equal(
-                                            &settings.overwrite_compare,
-                                            metadata,
-                                            &dst_metadata,
-                                        ) {
-                                            tracing::debug!("destination symlink is identical, skipping");
-                                            prog.symlinks_unchanged.inc();
-                                        } else {
-                                            tracing::debug!("destination metadata is different, updating");
-                                            common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
-                                            prog.symlinks_removed.inc();
-                                            prog.symlinks_created.inc();
-                                        }
-                                    } else {
-                                        tracing::debug!("destination symlink is identical, skipping");
-                                        prog.symlinks_unchanged.inc();
-                                    }
-                                } else {
-                                    tracing::info!("destination is a symlink but points to a different location, removing");
-                                    tokio::fs::remove_file(dst).await?;
-                                    tokio::fs::symlink(target, dst).await?;
-                                    common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
-                                    prog.symlinks_removed.inc();
-                                    prog.symlinks_created.inc();
-                                }
-                            } else {
-                                tracing::info!("destination is not a symlink, removing");
-                                common::rm::rm(
-                                    common::get_progress(),
-                                    dst,
-                                    &common::rm::Settings {
-                                        fail_early: settings.fail_early,
-                                    },
-                                )
-                                .await
-                                .map_err(|err| anyhow::anyhow!("Failed to remove destination: {err}"))?;
-                                tokio::fs::symlink(target, dst).await?;
-                                common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
-                                prog.symlinks_created.inc();
-                            }
-                            Ok(())
-                        }
-                        Err(error) => Err(error.into()),
+                // check for failed ancestor
+                {
+                    let tracker = directory_tracker.lock().await;
+                    if tracker.has_failed_ancestor(dst) {
+                        tracing::warn!("Skipping symlink {:?} - ancestor failed to create", dst);
+                        continue;
                     }
-                }.await;
-                if let Err(e) = symlink_result {
-                    tracing::error!("Failed to create symlink {src:?} -> {dst:?}: {e}");
+                }
+                // create symlink
+                let result = create_symlink(settings, preserve, dst, target, metadata).await;
+                if let Err(e) = result {
+                    tracing::error!("Failed to create symlink {:?} -> {:?}: {:#}", src, dst, e);
                     error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                     if settings.fail_early {
                         return Err(e);
                     }
                 }
+                // mark root symlink complete
                 if is_root {
-                    tracing::info!("Root symlink processed");
-                    send_root_done(control_send_stream.clone()).await?;
-                    // continue loop to receive SourceDone from source before closing
-                    // skip decrement_entry since root isn't tracked
-                    continue;
+                    directory_tracker.lock().await.set_root_complete();
                 }
-                directory_tracker
-                    .lock()
-                    .await
-                    .decrement_entry(src, dst)
-                    .await
-                    .context(
-                        "Failed to decrement directory entry count after receiving a symlink",
-                    )?;
             }
             remote::protocol::SourceMessage::DirStructureComplete => {
-                tracing::info!("All directories creation completed");
+                tracing::info!("Received DirStructureComplete");
+                directory_tracker.lock().await.set_structure_complete();
             }
-            remote::protocol::SourceMessage::FileSkipped(ref skip_info) => {
-                tracing::info!(
-                    "File was skipped by source: {:?} -> {:?}",
-                    skip_info.src,
-                    skip_info.dst
-                );
-                // decrement directory counter since this file won't be sent
+            remote::protocol::SourceMessage::FileSkipped {
+                ref src,
+                ref dst,
+                dir_total_files,
+            } => {
+                tracing::info!("File was skipped by source: {:?} -> {:?}", src, dst);
+                // get parent directory and update tracker
+                let parent_dir = dst
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("skipped file {:?} has no parent", dst))?;
                 directory_tracker
                     .lock()
                     .await
-                    .decrement_entry(&skip_info.src, &skip_info.dst)
+                    .process_file(parent_dir, dir_total_files)
                     .await
-                    .context("Failed to decrement directory entry for skipped file")?;
+                    .context("Failed to update tracker for skipped file")?;
             }
-            remote::protocol::SourceMessage::SymlinkSkipped(ref skip_info) => {
+            remote::protocol::SourceMessage::SymlinkSkipped {
+                ref src_dst,
+                is_root,
+            } => {
                 tracing::info!(
                     "Symlink was skipped by source: {:?} -> {:?}",
-                    skip_info.src,
-                    skip_info.dst
+                    src_dst.src,
+                    src_dst.dst
                 );
-                // decrement directory counter since this symlink won't be sent
+                // symlinks don't affect file counts - just log
+                // if root symlink failed, mark root as complete to avoid hang
+                if is_root {
+                    directory_tracker.lock().await.set_root_complete();
+                }
+            }
+            remote::protocol::SourceMessage::DirectoryEmpty { ref src, ref dst } => {
+                tracing::info!("Directory is empty: {:?} -> {:?}", src, dst);
+                // mark_directory_empty handles both root and non-root directories
+                // complete_directory is called internally and will set root_complete if needed
                 directory_tracker
                     .lock()
                     .await
-                    .decrement_entry(&skip_info.src, &skip_info.dst)
+                    .mark_directory_empty(dst)
                     .await
-                    .context("Failed to decrement directory entry for skipped symlink")?;
-            }
-            remote::protocol::SourceMessage::SourceDone => {
-                tracing::info!("Received source done message");
-                break;
+                    .context("Failed to mark directory as empty")?;
             }
         }
+        // check if we're done after each message
+        let mut tracker = directory_tracker.lock().await;
+        if tracker.is_done() {
+            tracing::info!("All operations complete, sending DestinationDone");
+            tracker.send_destination_done().await?;
+            break;
+        }
     }
-    tracing::info!("Closing control recv stream");
+    // close recv stream
     control_recv_stream.close().await;
-    tracing::info!("Directory structure creation completed");
+    tracing::info!("Control stream processing completed");
     Ok(())
 }
 
@@ -554,44 +679,38 @@ pub async fn run_destination(
         })?;
     tracing::info!("Connected to Source");
     let connection = remote::streams::Connection::new(connection);
-    // Always accept the directory streams first (even for single files)
+    // accept the control stream
     let (control_send_stream, control_recv_stream) = connection.accept_bi().await?;
-    tracing::info!("Received directory creation streams");
-    let directory_tracker = directory_tracker::make_shared(control_send_stream.clone());
+    tracing::info!("Received control stream");
+    let directory_tracker = directory_tracker::make_shared(control_send_stream, *preserve);
     let error_occurred = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let file_handler_future = process_incoming_file_streams(
         *settings,
         *preserve,
-        control_send_stream.clone(),
         connection.clone(),
         directory_tracker.clone(),
         error_occurred.clone(),
     );
-    let directory_future = create_directory_structure(
+    let control_future = process_control_stream(
         settings,
         preserve,
-        control_send_stream,
         control_recv_stream,
-        directory_tracker,
+        directory_tracker.clone(),
         error_occurred.clone(),
     );
     tokio::pin!(file_handler_future);
-    tokio::pin!(directory_future);
-    // race both futures - if either completes first, handle it and then wait for the other
-    // if either fails, close connection to unblock the other
+    tokio::pin!(control_future);
+    // race both futures - if either completes first, handle it and then wait for the other.
+    // CANCEL SAFETY: the "cancelled" future is NOT dropped - it's awaited after select!
+    // completes. Both futures are pinned and the winning branch awaits the other, ensuring
+    // both run to completion. No work is lost due to cancellation.
     tokio::select! {
         file_result = &mut file_handler_future => {
-            if file_result.is_err() {
-                connection.close();
-            }
             file_result.context("Failed to process incoming file streams")?;
-            directory_future.await.context("Failed to create directory structure")?;
+            control_future.await.context("Failed to process control stream")?;
         }
-        dir_result = &mut directory_future => {
-            if dir_result.is_err() {
-                connection.close();
-            }
-            dir_result.context("Failed to create directory structure")?;
+        control_result = &mut control_future => {
+            control_result.context("Failed to process control stream")?;
             file_handler_future.await.context("Failed to process incoming file streams")?;
         }
     }

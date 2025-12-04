@@ -170,6 +170,8 @@ This ensures doc examples stay in sync with actual function signatures.
 
 The `rcpd` daemon enables distributed copying operations. It connects to a master process (`rcp`) and can run as either source or destination side, using QUIC protocol for communication.
 
+**IMPORTANT**: Before making any changes to remote copy operations, **always read `docs/remote_protocol.md` first**. This document describes the protocol design and must be kept in sync with the implementation. Use it as the source of truth for how the protocol should behave.
+
 **Environment requirements for remote tests:** localhost SSH must be available and usable (running sshd, accessible via `ssh localhost`). Remote integration tests assert this requirement and will **fail fast** if it is not met; they are never skipped based on environment.
 
 ### QUIC Connection Timeouts
@@ -193,3 +195,17 @@ The `rcpd` daemon automatically exits when the master (`rcp`) process dies or di
 2. **QUIC idle timeout** (backup): Detects dead connections if stdin monitoring unavailable
 
 This ensures no orphaned `rcpd` processes remain on remote hosts after the master exits unexpectedly.
+
+## Shell Compatibility
+
+**IMPORTANT**: The user's shell is `fish`, not `bash`. When running shell commands:
+- Use `bash -c '...'` to wrap bash-specific syntax (like `for` loops, `$(...)` command substitution)
+- Or write scripts to `/tmp/*.sh` and execute them
+- Simple commands without bash-specific syntax work directly
+
+Example:
+```bash
+# Instead of: for i in $(seq 1 10); do echo $i; done
+# Use: bash -c 'for i in $(seq 1 10); do echo $i; done'
+# Or write to a script file and execute it
+```
