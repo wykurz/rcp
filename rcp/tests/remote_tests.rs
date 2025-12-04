@@ -2840,3 +2840,85 @@ fn test_remote_root_symlink_inaccessible_no_hang() {
         "Destination should not exist since source was inaccessible"
     );
 }
+
+/// Test that stream continues processing files after a metadata error.
+///
+/// Bug scenario: When file metadata fails to set (e.g., chown fails for root-owned file),
+/// the stream should continue processing subsequent files since all data was consumed.
+/// Previously, metadata errors marked the stream as corrupted, unnecessarily closing it.
+///
+/// This test requires passwordless sudo to create a root-owned file.
+#[test]
+#[ignore = "requires passwordless sudo"]
+fn test_remote_sudo_stream_continues_after_metadata_error() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create source directory with multiple files
+    let src_subdir = src_dir.path().join("metadata_test");
+    std::fs::create_dir(&src_subdir).unwrap();
+    // file1: normal file (will succeed completely)
+    create_test_file(&src_subdir.join("file1.txt"), "content1", 0o644);
+    // file2: root-owned file (metadata will fail when copying as non-root with --preserve)
+    // use sudo -n to avoid password prompt; skip test if passwordless sudo unavailable
+    let root_file = src_subdir.join("root_owned.txt");
+    let status = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            "bash",
+            "-c",
+            &format!(
+                "echo 'root content' > '{}' && chown root:root '{}'",
+                root_file.display(),
+                root_file.display()
+            ),
+        ])
+        .status()
+        .expect("Failed to run sudo");
+    if !status.success() {
+        eprintln!("Skipping test: passwordless sudo not available");
+        return;
+    }
+    // file3: normal file (should still be copied after file2's metadata fails)
+    create_test_file(&src_subdir.join("file3.txt"), "content3", 0o644);
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_subdir = dst_dir.path().join("metadata_test");
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    // run with --preserve to trigger chown (which will fail for root-owned file)
+    let output = run_rcp_with_args(&["--preserve", "--summary", &src_remote, &dst_remote]);
+    print_command_output(&output);
+    // cleanup root-owned file
+    let _ = std::process::Command::new("sudo")
+        .args(["-n", "rm", "-f", &root_file.to_string_lossy()])
+        .status();
+    // verify all files' DATA was transferred (even if metadata failed for some)
+    assert!(
+        dst_subdir.join("file1.txt").exists(),
+        "file1.txt should be copied"
+    );
+    assert_eq!(get_file_content(&dst_subdir.join("file1.txt")), "content1");
+    assert!(
+        dst_subdir.join("root_owned.txt").exists(),
+        "root_owned.txt data should be copied (even if metadata failed)"
+    );
+    assert_eq!(
+        get_file_content(&dst_subdir.join("root_owned.txt")),
+        "root content\n"
+    );
+    // KEY ASSERTION: file3 should be copied, proving stream continued after file2's metadata error
+    assert!(
+        dst_subdir.join("file3.txt").exists(),
+        "file3.txt should be copied - stream should continue after metadata error"
+    );
+    assert_eq!(get_file_content(&dst_subdir.join("file3.txt")), "content3");
+    // command should report failure (due to chown error) but not hang
+    assert!(
+        !output.status.success(),
+        "should fail due to chown permission error"
+    );
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert!(
+        exit_code != 124,
+        "should not timeout - stream should continue after metadata error"
+    );
+    eprintln!("✓ Stream continued processing files after metadata error");
+}

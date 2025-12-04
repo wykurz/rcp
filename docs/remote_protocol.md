@@ -487,6 +487,8 @@ This distinction matters for stream pooling efficiency:
 Previously, `DataConsumed` errors (like metadata failures) were treated as corrupted,
 unnecessarily closing streams that could continue serving files.
 
+**Test coverage:** `test_remote_sudo_stream_continues_after_metadata_error` (requires passwordless sudo)
+
 ### 7.7 Summary Statistics Authority
 
 The destination is the authoritative source for operation statistics:
