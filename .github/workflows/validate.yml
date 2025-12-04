@@ -88,6 +88,13 @@ jobs:
         # Run tests with nextest for better output
         cargo nextest run --no-capture 2>&1 | tee test_output_musl_debug.log
 
+    - name: Test sudo-required tests (musl debug)
+      env:
+        PKG_CONFIG_ALLOW_CROSS: "1"
+      run: |
+        # Run tests that require passwordless sudo (available in CI)
+        cargo nextest run --no-capture --run-ignored only -E 'test(~sudo)' 2>&1 | tee -a test_output_musl_debug.log
+
     - name: Doctests (musl debug)
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
@@ -136,6 +143,13 @@ jobs:
         set -o pipefail
         # Run tests with nextest in release mode
         cargo nextest run --release --no-capture 2>&1 | tee test_output_musl_release.log
+
+    - name: Test sudo-required tests (musl release)
+      env:
+        PKG_CONFIG_ALLOW_CROSS: "1"
+      run: |
+        # Run tests that require passwordless sudo (available in CI)
+        cargo nextest run --release --no-capture --run-ignored only -E 'test(~sudo)' 2>&1 | tee -a test_output_musl_release.log
 
     - name: Doctests (musl release)
       env:

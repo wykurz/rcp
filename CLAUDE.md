@@ -166,6 +166,21 @@ The project uses standard Cargo testing. Each tool has its own `tests/` director
 
 This ensures doc examples stay in sync with actual function signatures.
 
+### Sudo-Required Tests
+
+Some tests require passwordless sudo (e.g., to create root-owned files for testing permission errors). These tests follow a naming convention:
+
+- **Name must contain `sudo`**: e.g., `test_remote_sudo_stream_continues_after_metadata_error`
+- **Must be marked `#[ignore]`**: e.g., `#[ignore = "requires passwordless sudo"]`
+- **CI runs them separately**: using `cargo nextest run --run-ignored only -E 'test(~sudo)'`
+
+The `test(~sudo)` filter matches test names containing "sudo" anywhere. This is different from `test(/sudo/)` which matches path components.
+
+To run sudo tests locally (requires passwordless sudo configured):
+```bash
+cargo nextest run --run-ignored only -E 'test(~sudo)'
+```
+
 ## Remote Operations
 
 The `rcpd` daemon enables distributed copying operations. It connects to a master process (`rcp`) and can run as either source or destination side, using QUIC protocol for communication.
