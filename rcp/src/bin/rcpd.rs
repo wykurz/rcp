@@ -525,6 +525,10 @@ async fn async_main(
     // if stdin closes while running, abort immediately
     let rcpd_result = if let Some(watchdog) = stdin_watchdog {
         // stdin is available - monitor for disconnection
+        // CANCEL SAFETY: both branches are cancel-safe. `run_operation` is a
+        // high-level future that can be dropped safely. When the watchdog
+        // branch wins (stdin closed), we exit(1) immediately so there's no
+        // concern about partial state from the cancelled `run_operation`.
         tokio::select! {
             result = run_operation(args.clone(), master_connection.clone()) => {
                 match result {

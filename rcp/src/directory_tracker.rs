@@ -1,47 +1,123 @@
+//! Tracks directory completion state during remote copy operations.
+//!
+//! # Overview
+//!
+//! The `DirectoryTracker` manages the lifecycle of directory copy operations in the
+//! destination process. It tracks:
+//! - Pending directories waiting for files
+//! - Failed directories whose descendants should be skipped
+//! - Stored metadata to apply when directories complete
+//! - Overall completion state for sending `DestinationDone`
+//!
+//! # Protocol Flow
+//!
+//! 1. Source sends `Directory` messages during traversal (with metadata)
+//! 2. Destination creates directories, stores metadata, sends `DirectoryCreated`
+//! 3. Source sends files with `dir_total_files` count
+//! 4. When all files received, destination applies stored metadata
+//! 5. When all directories complete and structure is done, send `DestinationDone`
+//!
+//! # Failed Directory Handling
+//!
+//! When a directory fails to be created:
+//! - It's added to `failed_directories`
+//! - No `DirectoryCreated` is sent (source won't send files)
+//! - Descendant directories/symlinks are skipped via `has_failed_ancestor()`
+//! - The directory is immediately considered complete (no files expected)
+//!
+//! # File Count Tracking
+//!
+//! The file count is deferred - we don't know how many files to expect until
+//! the first `File`, `FileSkipped`, or `DirectoryEmpty` message arrives for
+//! that directory. This handles cases where directory contents change during copy.
+
 use anyhow::Context;
 
+/// State for a single directory waiting for files.
+#[derive(Debug)]
+struct DirectoryState {
+    /// Total files expected (None until first file-related message)
+    files_expected: Option<usize>,
+    /// Files still remaining
+    files_remaining: usize,
+}
+
+/// Tracks directory entry counts and completion state for remote copy operations.
 #[derive(Debug)]
 pub struct DirectoryTracker {
-    remaining_dir_entries: std::collections::HashMap<std::path::PathBuf, usize>,
+    /// Directories waiting for files (files_expected unknown or files_remaining > 0)
+    pending_directories: std::collections::HashMap<std::path::PathBuf, DirectoryState>,
+    /// Directories that failed to create - their descendants are skipped
+    failed_directories: std::collections::HashSet<std::path::PathBuf>,
+    /// Stored metadata for each directory (applied when complete)
+    metadata: std::collections::HashMap<std::path::PathBuf, remote::protocol::Metadata>,
+    /// Have we received DirStructureComplete?
+    structure_complete: bool,
+    /// Is the root item complete?
+    root_complete: bool,
+    /// Path of the root directory (if root is a directory)
+    root_directory: Option<std::path::PathBuf>,
+    /// Have we already sent DestinationDone?
+    done_sent: bool,
+    /// Control stream for sending DirectoryCreated
     control_send_stream: remote::streams::SharedSendStream,
+    /// Preserve settings for applying metadata
+    preserve: common::preserve::Settings,
 }
 
 impl DirectoryTracker {
-    pub fn new(control_send_stream: remote::streams::SharedSendStream) -> Self {
+    pub fn new(
+        control_send_stream: remote::streams::SharedSendStream,
+        preserve: common::preserve::Settings,
+    ) -> Self {
         Self {
-            remaining_dir_entries: std::collections::HashMap::new(),
+            pending_directories: std::collections::HashMap::new(),
+            failed_directories: std::collections::HashSet::new(),
+            metadata: std::collections::HashMap::new(),
+            structure_complete: false,
+            root_complete: false,
+            root_directory: None,
+            done_sent: false,
             control_send_stream,
+            preserve,
         }
     }
-
+    /// Check if any ancestor of the given path is a failed directory.
+    pub fn has_failed_ancestor(&self, path: &std::path::Path) -> bool {
+        let mut current = path;
+        while let Some(parent) = current.parent() {
+            if self.failed_directories.contains(parent) {
+                return true;
+            }
+            current = parent;
+        }
+        false
+    }
+    /// Add a successfully created directory to tracking.
+    /// Sends `DirectoryCreated` to source.
     pub async fn add_directory(
         &mut self,
         src: &std::path::Path,
         dst: &std::path::Path,
-        num_entries: usize,
-        failed: bool,
+        metadata: remote::protocol::Metadata,
+        is_root: bool,
     ) -> anyhow::Result<()> {
-        if failed {
-            // mark directory as failed, don't send DirectoryCreated message
-            let failure = remote::protocol::SrcDst {
-                src: src.to_path_buf(),
-                dst: dst.to_path_buf(),
-            };
-            let message = remote::protocol::DestinationMessage::DirectoryFailed(failure);
-            let mut stream = self.control_send_stream.lock().await;
-            stream.send_control_message(&message).await?;
-            tracing::info!("Sent directory failure notification: {src:?} -> {dst:?}");
-            return Ok(());
+        // store metadata for later application
+        self.metadata.insert(dst.to_path_buf(), metadata);
+        // track root directory path
+        if is_root {
+            self.root_directory = Some(dst.to_path_buf());
         }
-        if num_entries > 0 {
-            self.remaining_dir_entries
-                .insert(dst.to_path_buf(), num_entries);
-            tracing::debug!(
-                "Added directory tracking: {:?} with {} entries",
-                dst,
-                num_entries
-            );
-        }
+        // add ALL directories to pending (we don't know file count yet)
+        // root directories are also tracked here - when they complete, we set root_complete
+        self.pending_directories.insert(
+            dst.to_path_buf(),
+            DirectoryState {
+                files_expected: None,
+                files_remaining: 0,
+            },
+        );
+        // send DirectoryCreated to trigger file sending
         let confirmation = remote::protocol::SrcDst {
             src: src.to_path_buf(),
             dst: dst.to_path_buf(),
@@ -51,69 +127,132 @@ impl DirectoryTracker {
             let mut stream = self.control_send_stream.lock().await;
             stream.send_control_message(&message).await?;
         }
-        tracing::info!(
-            "Sent directory creation confirmation: {:?} -> {:?}",
-            src,
-            dst
+        tracing::info!("Sent DirectoryCreated: {:?} -> {:?}", src, dst);
+        Ok(())
+    }
+    /// Mark a directory as failed (creation error).
+    /// Does NOT send DirectoryCreated - source won't send files.
+    pub fn mark_directory_failed(&mut self, dst: &std::path::Path) {
+        self.failed_directories.insert(dst.to_path_buf());
+        tracing::info!("Directory marked as failed: {:?}", dst);
+    }
+    /// Update file count for a directory and decrement remaining.
+    /// Called when receiving File or FileSkipped message.
+    /// Returns true if directory is now complete.
+    pub async fn process_file(
+        &mut self,
+        dst_dir: &std::path::Path,
+        dir_total_files: usize,
+    ) -> anyhow::Result<bool> {
+        let state = self
+            .pending_directories
+            .get_mut(dst_dir)
+            .ok_or_else(|| anyhow::anyhow!("directory {:?} not being tracked", dst_dir))?;
+        // set expected count on first file
+        if state.files_expected.is_none() {
+            state.files_expected = Some(dir_total_files);
+            state.files_remaining = dir_total_files;
+            tracing::debug!(
+                "Directory {:?} expecting {} files",
+                dst_dir,
+                dir_total_files
+            );
+        }
+        // sanity check
+        if state.files_expected != Some(dir_total_files) {
+            tracing::warn!(
+                "Directory {:?} file count mismatch: expected {:?}, got {}",
+                dst_dir,
+                state.files_expected,
+                dir_total_files
+            );
+        }
+        // decrement
+        if state.files_remaining == 0 {
+            anyhow::bail!(
+                "directory {:?} already complete, received extra file",
+                dst_dir
+            );
+        }
+        state.files_remaining -= 1;
+        tracing::debug!(
+            "Directory {:?} files remaining: {}",
+            dst_dir,
+            state.files_remaining
         );
-        // if there are no entries, we can immediately send completion
-        if num_entries == 0 {
-            tracing::info!("Directory completed: {:?}", dst);
-            self.send_completion(src, dst).await?;
+        // check completion
+        if state.files_remaining == 0 {
+            self.complete_directory(dst_dir).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+    /// Mark a directory as empty (no files).
+    /// Called when receiving DirectoryEmpty message.
+    pub async fn mark_directory_empty(&mut self, dst: &std::path::Path) -> anyhow::Result<()> {
+        let state = self
+            .pending_directories
+            .get_mut(dst)
+            .ok_or_else(|| anyhow::anyhow!("directory {:?} not being tracked", dst))?;
+        state.files_expected = Some(0);
+        state.files_remaining = 0;
+        tracing::debug!("Directory {:?} is empty", dst);
+        self.complete_directory(dst).await
+    }
+    /// Complete a directory: apply metadata and remove from pending.
+    async fn complete_directory(&mut self, dst: &std::path::Path) -> anyhow::Result<()> {
+        // check if this is the root directory
+        let is_root = self.root_directory.as_deref() == Some(dst);
+        // remove from pending
+        let state = self.pending_directories.remove(dst);
+        if state.is_none() {
+            tracing::warn!("Directory {:?} was not in pending when completing", dst);
+        }
+        // apply stored metadata
+        if let Some(metadata) = self.metadata.remove(dst) {
+            common::preserve::set_dir_metadata(&self.preserve, &metadata, dst)
+                .await
+                .with_context(|| format!("failed to set metadata on directory {:?}", dst))?;
+            tracing::info!("Directory complete, metadata applied: {:?}", dst);
+        } else {
+            tracing::warn!("No stored metadata for directory {:?}", dst);
+        }
+        // if this was the root directory, mark root as complete
+        if is_root {
+            self.set_root_complete();
         }
         Ok(())
     }
-
-    async fn send_completion(
-        &mut self,
-        src: &std::path::Path,
-        dst: &std::path::Path,
-    ) -> anyhow::Result<()> {
-        let completion = remote::protocol::SrcDst {
-            src: src.to_path_buf(),
-            dst: dst.to_path_buf(),
-        };
-        let message = remote::protocol::DestinationMessage::DirectoryComplete(completion);
+    /// Mark the root item as complete.
+    pub fn set_root_complete(&mut self) {
+        self.root_complete = true;
+        tracing::info!("Root item complete");
+    }
+    /// Mark the directory structure as complete (DirStructureComplete received).
+    pub fn set_structure_complete(&mut self) {
+        self.structure_complete = true;
+        tracing::info!("Directory structure complete");
+    }
+    /// Check if we're done and can send DestinationDone.
+    pub fn is_done(&self) -> bool {
+        self.structure_complete && self.pending_directories.is_empty() && self.root_complete
+    }
+    /// Send DestinationDone and close the send stream.
+    /// Returns true if DestinationDone was sent, false if already sent.
+    pub async fn send_destination_done(&mut self) -> anyhow::Result<bool> {
+        if self.done_sent {
+            tracing::debug!("DestinationDone already sent, skipping");
+            return Ok(false);
+        }
+        self.done_sent = true;
         let mut stream = self.control_send_stream.lock().await;
         stream
-            .send_control_message(&message)
-            .await
-            .context("Failed to send directory completion notification")?;
-        tracing::info!(
-            "Sent directory completion notification: {:?} -> {:?}",
-            src,
-            dst
-        );
-        Ok(())
-    }
-
-    pub async fn decrement_entry(
-        &mut self,
-        src: &std::path::Path,
-        dst: &std::path::Path,
-    ) -> anyhow::Result<()> {
-        let dst_parent_dir = dst.parent().unwrap();
-        let remaining = self
-            .remaining_dir_entries
-            .get_mut(dst_parent_dir)
-            .ok_or_else(|| anyhow::anyhow!("Directory {:?} not being tracked", dst_parent_dir))?;
-        assert!(
-            *remaining > 0,
-            "Entry count for {dst_parent_dir:?} is already zero"
-        );
-        *remaining -= 1;
-        tracing::debug!(
-            "Decremented entry count for {:?}, remaining: {}",
-            dst_parent_dir,
-            *remaining
-        );
-        if *remaining == 0 {
-            self.remaining_dir_entries.remove(dst_parent_dir);
-            tracing::info!("Directory completed: {:?}", dst_parent_dir);
-            self.send_completion(src.parent().unwrap(), dst_parent_dir)
-                .await?;
-        }
-        Ok(())
+            .send_control_message(&remote::protocol::DestinationMessage::DestinationDone)
+            .await?;
+        stream.close().await?;
+        tracing::info!("Sent DestinationDone, closed send stream");
+        Ok(true)
     }
 }
 
@@ -121,8 +260,10 @@ pub type SharedDirectoryTracker = std::sync::Arc<tokio::sync::Mutex<DirectoryTra
 
 pub fn make_shared(
     control_send_stream: remote::streams::SharedSendStream,
+    preserve: common::preserve::Settings,
 ) -> SharedDirectoryTracker {
     std::sync::Arc::new(tokio::sync::Mutex::new(DirectoryTracker::new(
         control_send_stream,
+        preserve,
     )))
 }

@@ -33,6 +33,23 @@ fn interpret_exit_code(code: i32) -> String {
     }
 }
 
+/// Exit code 124 indicates the timeout wrapper killed rcp.
+/// This usually means rcp hung and should be treated as a test failure,
+/// not as an "expected failure" in tests that expect rcp to fail.
+const TIMEOUT_EXIT_CODE: i32 = 124;
+
+fn assert_not_timeout(output: &std::process::Output) {
+    if let Some(code) = output.status.code() {
+        if code == TIMEOUT_EXIT_CODE {
+            panic!(
+                "rcp was killed by timeout wrapper (exit code 124). \
+                 This indicates rcp hung and did not complete within the time limit. \
+                 This is NOT the same as an expected failure from rcp."
+            );
+        }
+    }
+}
+
 fn run_rcp_with_args_internal(
     args: &[&str],
     home: Option<&std::path::Path>,
@@ -53,7 +70,13 @@ fn run_rcp_with_args_internal(
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
-    cmd.output().expect("Failed to execute rcp command")
+    let output = cmd.output().expect("Failed to execute rcp command");
+    // CRITICAL: check for timeout immediately. this ensures tests that expect failure
+    // don't incorrectly pass when rcp actually hung (timeout exit code 124).
+    // this check happens before returning to any test, so all tests automatically
+    // detect and fail on timeout.
+    assert_not_timeout(&output);
+    output
 }
 
 fn run_rcp_with_args(args: &[&str]) -> std::process::Output {
@@ -142,6 +165,7 @@ fn print_command_output(output: &std::process::Output) {
 fn run_rcp_and_expect_success(args: &[&str]) -> std::process::Output {
     let output = run_rcp_with_args(args);
     print_command_output(&output);
+    // note: timeout check is already done in run_rcp_with_args_internal
     if !output.status.success() {
         if let Some(code) = output.status.code() {
             panic!(
@@ -159,6 +183,7 @@ fn run_rcp_and_expect_success(args: &[&str]) -> std::process::Output {
 fn run_rcp_and_expect_failure(args: &[&str]) -> std::process::Output {
     let output = run_rcp_with_args(args);
     print_command_output(&output);
+    // note: timeout check is already done in run_rcp_with_args_internal
     assert!(
         !output.status.success(),
         "Command succeeded when failure was expected"
@@ -360,6 +385,56 @@ fn test_remote_copy_directory() {
     assert_eq!(summary.files_copied, 2);
     assert_eq!(summary.directories_created, 1);
     assert_eq!(summary.bytes_copied, 40); // "remote dir content 1" (20) + "remote dir content 2" (20)
+}
+
+/// Test copying many small files to exercise stream pooling.
+///
+/// This test creates 150 small files in a directory and verifies they are all
+/// copied correctly. With stream pooling (default 100 streams), this exercises
+/// stream reuse as multiple files will be sent over the same streams.
+#[test]
+fn test_remote_copy_many_small_files() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_subdir = src_dir.path().join("many_files");
+    let dst_subdir = dst_dir.path().join("many_files");
+    std::fs::create_dir(&src_subdir).unwrap();
+    // create 150 small files (more than default pool size of 100)
+    // this exercises stream reuse without causing pool exhaustion issues
+    let num_files: usize = 150;
+    for i in 0..num_files {
+        let content = format!("content of file {i}");
+        create_test_file(
+            &src_subdir.join(format!("file_{i:04}.txt")),
+            &content,
+            0o644,
+        );
+    }
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&["--summary", &src_remote, &dst_remote]);
+    // verify all files were copied
+    for i in 0..num_files {
+        let dst_file = dst_subdir.join(format!("file_{i:04}.txt"));
+        assert!(dst_file.exists(), "file_{i:04}.txt should exist");
+        let expected_content = format!("content of file {i}");
+        assert_eq!(
+            get_file_content(&dst_file),
+            expected_content,
+            "file_{i:04}.txt content mismatch"
+        );
+    }
+    // verify files were copied by checking stdout for the count
+    // (parse_summary_from_output may fail due to bytes_copied having KB/MB suffix)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("files copied: {num_files}")),
+        "Expected 'files copied: {num_files}' in output"
+    );
+    assert!(
+        stdout.contains("directories created: 1"),
+        "Expected 'directories created: 1' in output"
+    );
 }
 
 #[test]
@@ -1232,6 +1307,242 @@ fn test_remote_copy_unwritable_destination() {
     assert_eq!(summary.files_copied, 0);
     // restore permissions for cleanup
     std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn test_remote_copy_destination_partial_write_failure() {
+    // this test verifies that when some files can't be written to the destination,
+    // other files in the same transfer still get copied (stream recovery works).
+    // this exercises the destination-side error handling with stream pooling.
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create source directory structure:
+    // src/
+    //   good_dir/
+    //     file1.txt
+    //     file2.txt
+    //   bad_dir/
+    //     file3.txt  <- will fail (destination not writable)
+    //     file4.txt  <- will fail
+    //   more_good/
+    //     file5.txt
+    let src_root = src_dir.path().join("mixed");
+    let src_good_dir = src_root.join("good_dir");
+    let src_bad_dir = src_root.join("bad_dir");
+    let src_more_good = src_root.join("more_good");
+    std::fs::create_dir_all(&src_good_dir).unwrap();
+    std::fs::create_dir_all(&src_bad_dir).unwrap();
+    std::fs::create_dir_all(&src_more_good).unwrap();
+    create_test_file(&src_good_dir.join("file1.txt"), "content 1", 0o644);
+    create_test_file(&src_good_dir.join("file2.txt"), "content 2", 0o644);
+    create_test_file(&src_bad_dir.join("file3.txt"), "content 3", 0o644);
+    create_test_file(&src_bad_dir.join("file4.txt"), "content 4", 0o644);
+    create_test_file(&src_more_good.join("file5.txt"), "content 5", 0o644);
+    // create destination with bad_dir being unwritable
+    let dst_root = dst_dir.path().join("mixed");
+    let dst_bad_dir = dst_root.join("bad_dir");
+    std::fs::create_dir_all(&dst_bad_dir).unwrap();
+    std::fs::set_permissions(&dst_bad_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}/", dst_dir.path().to_str().unwrap());
+    // run without --fail-early to continue after errors
+    let output = run_rcp_with_args(&["-vv", "--summary", &src_remote, &dst_remote]);
+    print_command_output(&output);
+    // restore permissions before assertions (for cleanup)
+    std::fs::set_permissions(&dst_bad_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // verify: good files should be copied despite bad_dir failures
+    let dst_good_dir = dst_root.join("good_dir");
+    let dst_more_good = dst_root.join("more_good");
+    assert!(
+        dst_good_dir.join("file1.txt").exists(),
+        "file1.txt should be copied"
+    );
+    assert!(
+        dst_good_dir.join("file2.txt").exists(),
+        "file2.txt should be copied"
+    );
+    assert!(
+        dst_more_good.join("file5.txt").exists(),
+        "file5.txt should be copied"
+    );
+    // verify: bad_dir files should NOT be copied
+    assert!(
+        !dst_bad_dir.join("file3.txt").exists(),
+        "file3.txt should NOT be copied (permission denied)"
+    );
+    assert!(
+        !dst_bad_dir.join("file4.txt").exists(),
+        "file4.txt should NOT be copied (permission denied)"
+    );
+    // verify content of copied files
+    assert_eq!(
+        get_file_content(&dst_good_dir.join("file1.txt")),
+        "content 1"
+    );
+    assert_eq!(
+        get_file_content(&dst_good_dir.join("file2.txt")),
+        "content 2"
+    );
+    assert_eq!(
+        get_file_content(&dst_more_good.join("file5.txt")),
+        "content 5"
+    );
+    // verify non-zero exit code (some files failed)
+    assert!(
+        !output.status.success(),
+        "should have non-zero exit due to permission errors"
+    );
+}
+
+#[test]
+fn test_remote_copy_deeply_nested_directory_failure() {
+    // this test verifies that when a directory fails to be created, all its deeply
+    // nested descendants (3+ levels deep) are handled correctly without
+    // "Directory not being tracked" errors.
+    //
+    // the race condition being tested:
+    // 1. source sends DirStub for bad_dir, then dir2, dir3, dir4 in quick succession
+    // 2. destination tries to create bad_dir but FAILS (already exists as directory)
+    // 3. destination sends DirectoryFailed for bad_dir
+    // 4. meanwhile, dir2/dir3/dir4 DirStubs arrive and directories are created
+    // 5. when dir4 completes and tries to decrement dir3's entry count,
+    //    we must check if ANY ancestor (bad_dir) is in failed_directories
+    //
+    // without the has_failed_ancestor() check, this would crash with:
+    // "Directory dir3 not being tracked" because bad_dir failed and wasn't tracked
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // source structure:
+    //   src/
+    //     good_dir/
+    //       file_good.txt
+    //     bad_dir/           <- will fail (already exists at destination)
+    //       dir2/
+    //         dir3/
+    //           dir4/
+    //             deep_file.txt
+    let src_root = src_dir.path().join("src");
+    let src_good_dir = src_root.join("good_dir");
+    let src_bad_dir = src_root.join("bad_dir");
+    let src_dir2 = src_bad_dir.join("dir2");
+    let src_dir3 = src_dir2.join("dir3");
+    let src_dir4 = src_dir3.join("dir4");
+    std::fs::create_dir_all(&src_good_dir).unwrap();
+    std::fs::create_dir_all(&src_dir4).unwrap();
+    create_test_file(&src_good_dir.join("file_good.txt"), "good content", 0o644);
+    create_test_file(&src_dir4.join("deep_file.txt"), "deep content", 0o644);
+    // destination structure: pre-create src/ as a directory (will be reused with --overwrite)
+    // and create bad_dir as a FILE (not directory) - this will fail even with --overwrite
+    // because rcp cannot replace a file with a directory without explicit removal
+    let dst_root = dst_dir.path().join("src");
+    std::fs::create_dir_all(&dst_root).unwrap();
+    // create bad_dir as a FILE (not directory) to block directory creation
+    let dst_bad_dir_file = dst_root.join("bad_dir");
+    std::fs::write(&dst_bad_dir_file, "i am a file blocking bad_dir").unwrap();
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}/", dst_dir.path().to_str().unwrap());
+    // run WITH --overwrite so src/ can be reused (it already exists as directory)
+    // but bad_dir will still fail because it's a file and --overwrite will try to
+    // replace it - which should work! let's check the behavior...
+    // actually with --overwrite, a file WILL be replaced with directory. so we need
+    // to run WITHOUT --overwrite to get the failure.
+    // BUT then src/ will also fail because it already exists...
+    //
+    // use --overwrite and make bad_dir non-writable (0o555 = r-xr-xr-x) so dir2 can't be created
+    std::fs::remove_file(&dst_bad_dir_file).unwrap();
+    std::fs::create_dir(&dst_bad_dir_file).unwrap();
+    std::fs::set_permissions(&dst_bad_dir_file, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let output = run_rcp_with_args(&["--overwrite", "-vv", "--summary", &src_remote, &dst_remote]);
+    // restore permissions for cleanup BEFORE any assertions
+    std::fs::set_permissions(&dst_bad_dir_file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    print_command_output(&output);
+    // the key assertion: no panic with "Directory not being tracked"
+    // if we get here without panicking, the ancestor check is working
+    // verify the output doesn't contain the error we're trying to prevent
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("not being tracked"),
+        "should not have 'Directory not being tracked' error"
+    );
+    // verify non-zero exit code (directory creation failed)
+    assert!(
+        !output.status.success(),
+        "should have non-zero exit due to directory already exists error"
+    );
+}
+
+#[test]
+fn test_remote_copy_directory_permissions_preserved_despite_file_errors() {
+    // this test verifies that DirectoryComplete messages are sent even when
+    // some files in the directory fail to copy. DirectoryComplete is responsible
+    // for finalizing directory metadata (permissions, mtime). if it's not sent
+    // on error paths, the destination directory won't have the correct metadata.
+    //
+    // we verify this by:
+    // 1. creating a source directory with non-default permissions (0o750)
+    // 2. having some files inside fail to copy (unreadable source files)
+    // 3. using --preserve to copy metadata
+    // 4. verifying the destination directory has the correct permissions
+    //
+    // note: we use unreadable SOURCE files instead of unwritable destination
+    // directories because pre-creating destination directories causes "File exists"
+    // errors that skip all contents.
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create source structure with specific permissions
+    let src_root = src_dir.path().join("preserved");
+    let src_parent = src_root.join("parent_with_perms");
+    std::fs::create_dir_all(&src_parent).unwrap();
+    // create files: one readable (will succeed), one unreadable (will fail)
+    create_test_file(&src_parent.join("good_file.txt"), "this will copy", 0o644);
+    create_test_file(&src_parent.join("bad_file.txt"), "unreadable", 0o000);
+    // set parent directory to non-default permissions (0o750 = rwxr-x---)
+    // do this AFTER creating files so we can still write to the directory
+    std::fs::set_permissions(&src_parent, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}/", dst_dir.path().to_str().unwrap());
+    // run with --preserve to copy permissions
+    let output = run_rcp_with_args(&["--preserve", "--summary", &src_remote, &dst_remote]);
+    print_command_output(&output);
+    // restore source permissions for cleanup
+    std::fs::set_permissions(&src_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(
+        src_parent.join("bad_file.txt"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    // verify destinations
+    let dst_root = dst_dir.path().join("preserved");
+    let dst_parent = dst_root.join("parent_with_perms");
+    // verify the good file was copied
+    assert!(
+        dst_parent.join("good_file.txt").exists(),
+        "good_file.txt should be copied"
+    );
+    assert_eq!(
+        get_file_content(&dst_parent.join("good_file.txt")),
+        "this will copy"
+    );
+    // verify the bad file was NOT copied (unreadable source)
+    assert!(
+        !dst_parent.join("bad_file.txt").exists(),
+        "bad_file.txt should NOT be copied (permission denied on source)"
+    );
+    // KEY ASSERTION: verify parent directory permissions were preserved
+    // this proves DirectoryComplete was sent even though a child file failed
+    let dst_parent_mode = dst_parent.metadata().unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        dst_parent_mode, 0o750,
+        "parent directory should have preserved permissions (0o750), got 0o{:o}. \
+         This indicates DirectoryComplete was not sent after file errors.",
+        dst_parent_mode
+    );
+    // non-zero exit due to failures
+    assert!(
+        !output.status.success(),
+        "should have non-zero exit due to permission errors"
+    );
+    eprintln!("✓ Directory permissions preserved despite file copy errors");
 }
 
 // ============================================================================
@@ -2191,4 +2502,341 @@ fn test_remote_localhost_without_force_remote_is_local() {
         "Should NOT use rcpd without --force-remote, but got: {stdout}"
     );
     assert_eq!(get_file_content(&dst_file), "local copy test");
+}
+
+// ============================================================================
+// Edge Case Tests: Failure Handling with --fail-early
+// These tests verify that the protocol handles failures correctly without hanging.
+// A hang (timeout) indicates a bug where DirectoryTracker wasn't properly updated
+// or send_root_done wasn't called before returning an error.
+// ============================================================================
+
+/// Test that child symlink creation failure with --fail-early doesn't cause a hang.
+///
+/// Bug scenario: When a symlink inside a directory fails to create on the destination
+/// and --fail-early is set, the destination should still call decrement_entry() for
+/// the parent directory before returning the error. Otherwise, the source hangs
+/// waiting for DirectoryComplete.
+#[test]
+fn test_remote_child_symlink_fail_early_no_hang() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+
+    // create source directory with a file and a symlink
+    let src_subdir = src_dir.path().join("symlink_test");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("file.txt"), "content", 0o644);
+    std::os::unix::fs::symlink("target", src_subdir.join("link")).unwrap();
+
+    // create destination directory, then make it read-only so symlink creation fails
+    let dst_subdir = dst_dir.path().join("symlink_test");
+    std::fs::create_dir_all(&dst_subdir).unwrap();
+    // make directory read-only - symlink creation will fail with Permission denied
+    std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+
+    // with --fail-early and --overwrite (to reuse existing directory)
+    // symlink creation will fail due to permission denied
+    let output =
+        run_rcp_and_expect_failure(&["--fail-early", "--overwrite", &src_remote, &dst_remote]);
+
+    // restore permissions for cleanup
+    let _ = std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o755));
+
+    // verify we got an error (not a timeout)
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert!(
+        exit_code != 124,
+        "Command timed out - this indicates a hang bug where decrement_entry wasn't called"
+    );
+}
+
+/// Test that root symlink creation failure with --fail-early doesn't cause a hang.
+///
+/// Bug scenario: When copying a single symlink as root and it fails to create on
+/// the destination with --fail-early, the destination should still call
+/// send_root_done() before returning the error. Otherwise, the source hangs
+/// waiting for DestinationDone.
+#[test]
+fn test_remote_root_symlink_fail_early_no_hang() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+
+    // create a symlink as the root item to copy
+    let src_symlink = src_dir.path().join("root_link");
+    std::os::unix::fs::symlink("target", &src_symlink).unwrap();
+
+    // create destination as a read-only directory to prevent symlink creation
+    // (the symlink destination will be inside this directory)
+    let dst_path = dst_dir.path().join("root_link");
+    std::fs::create_dir(&dst_path).unwrap();
+    std::fs::set_permissions(&dst_path, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let src_remote = format!("localhost:{}", src_symlink.to_str().unwrap());
+    // point to a path inside the read-only directory
+    let dst_remote = format!("localhost:{}", dst_path.join("symlink").to_str().unwrap());
+
+    // with --fail-early, this should fail fast, NOT hang
+    let output = run_rcp_and_expect_failure(&["--fail-early", &src_remote, &dst_remote]);
+
+    // restore permissions for cleanup
+    let _ = std::fs::set_permissions(&dst_path, std::fs::Permissions::from_mode(0o755));
+
+    // verify we got an error (not a timeout)
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert!(
+        exit_code != 124,
+        "Command timed out - this indicates a hang bug where send_root_done wasn't called"
+    );
+}
+
+/// Test that directory metadata failure doesn't cause a hang.
+///
+/// Bug scenario: When set_dir_metadata() fails (e.g., due to permission issues),
+/// the destination should still call decrement_entry() for child directories or
+/// send_root_done() for root directories before returning the error.
+///
+/// This is harder to trigger reliably since metadata setting typically succeeds,
+/// but we can test with a directory that has restrictive permissions.
+#[test]
+fn test_remote_directory_metadata_failure_no_hang() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+
+    // create source directory with a file
+    let src_subdir = src_dir.path().join("meta_test");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("file.txt"), "content", 0o644);
+
+    // create destination parent, but make it read-only after creating the subdir
+    // this may cause metadata operations to fail
+    let dst_subdir = dst_dir.path().join("meta_test");
+    std::fs::create_dir_all(&dst_subdir).unwrap();
+
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+
+    // copy with --preserve to ensure metadata operations are attempted
+    // the test mainly verifies we don't hang - the operation may succeed or fail
+    // depending on permissions, but it should never timeout
+    let output = run_rcp_with_args(&["--preserve", "--overwrite", &src_remote, &dst_remote]);
+    print_command_output(&output);
+
+    // verify we didn't timeout (exit code 124 = timeout)
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert!(
+        exit_code != 124,
+        "Command timed out - this indicates a potential hang bug in metadata error handling"
+    );
+}
+
+/// Test that multiple child symlink failures with --fail-early complete without hanging.
+///
+/// This tests a directory with multiple symlinks where all fail, ensuring the
+/// protocol properly handles multiple failures in sequence.
+#[test]
+fn test_remote_multiple_child_symlinks_fail_early_no_hang() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+
+    // create source directory with multiple symlinks
+    let src_subdir = src_dir.path().join("multi_symlink_test");
+    std::fs::create_dir(&src_subdir).unwrap();
+    std::os::unix::fs::symlink("target1", src_subdir.join("link1")).unwrap();
+    std::os::unix::fs::symlink("target2", src_subdir.join("link2")).unwrap();
+    std::os::unix::fs::symlink("target3", src_subdir.join("link3")).unwrap();
+
+    // create destination as read-only so symlink creation fails
+    let dst_subdir = dst_dir.path().join("multi_symlink_test");
+    std::fs::create_dir_all(&dst_subdir).unwrap();
+    std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+
+    // with --fail-early and --overwrite (to reuse existing directory)
+    // symlink creation will fail due to permission denied
+    let output =
+        run_rcp_and_expect_failure(&["--fail-early", "--overwrite", &src_remote, &dst_remote]);
+
+    // restore permissions for cleanup
+    let _ = std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o755));
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert!(
+        exit_code != 124,
+        "Command timed out - this indicates a hang bug in symlink failure handling"
+    );
+}
+
+/// Test nested directory with symlink failure and --fail-early.
+///
+/// Tests that when a symlink fails in a nested directory structure with --fail-early,
+/// all parent directories properly complete their tracking.
+#[test]
+fn test_remote_nested_directory_symlink_fail_early_no_hang() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+
+    // create nested source structure: parent/child/link
+    let src_parent = src_dir.path().join("parent");
+    let src_child = src_parent.join("child");
+    std::fs::create_dir_all(&src_child).unwrap();
+    create_test_file(&src_child.join("file.txt"), "content", 0o644);
+    std::os::unix::fs::symlink("target", src_child.join("link")).unwrap();
+
+    // create destination directories, make child read-only to fail symlink creation
+    let dst_parent = dst_dir.path().join("parent");
+    let dst_child = dst_parent.join("child");
+    std::fs::create_dir_all(&dst_child).unwrap();
+    std::fs::set_permissions(&dst_child, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let src_remote = format!("localhost:{}", src_parent.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_parent.to_str().unwrap());
+
+    // should fail on symlink but not hang waiting for parent directories to complete
+    // use --overwrite to allow reusing existing directories
+    let output =
+        run_rcp_and_expect_failure(&["--fail-early", "--overwrite", &src_remote, &dst_remote]);
+
+    // restore permissions for cleanup
+    let _ = std::fs::set_permissions(&dst_child, std::fs::Permissions::from_mode(0o755));
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert!(
+        exit_code != 124,
+        "Command timed out - this indicates a hang bug where parent directory tracking failed"
+    );
+}
+
+/// Test that directory metadata is applied when a child file fails WITHOUT --fail-early.
+///
+/// This is a regression test for ensuring that the DirectoryTracker is properly
+/// updated even when errors occur. The test verifies that with --preserve (but
+/// without --fail-early), directory permissions are correctly applied even when
+/// a child file fails to copy (e.g., due to permission errors).
+///
+/// Note: With --fail-early, metadata may NOT be applied because we close the
+/// connection immediately after the error. This is expected behavior - the user
+/// asked for fast failure. This test uses non-fail-early mode to verify the
+/// metadata flow works correctly.
+#[test]
+fn test_remote_file_failure_still_applies_parent_directory_metadata() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+
+    // create source directory with specific permissions (0o700 = rwx------)
+    let src_subdir = src_dir.path().join("metadata_test");
+    std::fs::create_dir(&src_subdir).unwrap();
+    std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    // create an unreadable file (will fail on source side when trying to open)
+    create_test_file(&src_subdir.join("unreadable.txt"), "secret", 0o000);
+
+    // verify source directory has the permissions we set
+    let src_mode = std::fs::metadata(&src_subdir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(src_mode, 0o700, "Source directory should have mode 0o700");
+
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_subdir = dst_dir.path().join("metadata_test");
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+
+    // run with --preserve but WITHOUT --fail-early
+    // the file will fail to open on source, but operation should continue and
+    // directory metadata should be applied
+    let output = run_rcp_and_expect_failure(&["--preserve", &src_remote, &dst_remote]);
+
+    // verify we didn't timeout
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert!(exit_code != 124, "Command timed out");
+
+    // THE KEY ASSERTION: directory permissions should have been updated
+    // Protocol flow:
+    //   1. DirStub{metadata_test, 1} -> Destination creates dir, tracks count=1
+    //   2. DirectoryCreated sent to source
+    //   3. Source tries to open file -> FAILS (Permission denied)
+    //   4. Source sends FileSkipped message
+    //   5. Destination receives FileSkipped, calls decrement_entry() -> count=0
+    //   6. DirectoryComplete sent to source
+    //   7. Source receives DirectoryComplete, sends Directory{metadata_test, metadata}
+    //   8. Destination applies metadata (including permissions 0o700)
+    let dst_mode_after = std::fs::metadata(&dst_subdir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        dst_mode_after, 0o700,
+        "Destination directory permissions should be updated to 0o700 from source, \
+         but got {:o}. This indicates the Directory metadata message was never sent.",
+        dst_mode_after
+    );
+}
+
+/// Test that copying a directory to a path where a file already exists (without --overwrite)
+/// doesn't cause a hang.
+///
+/// Bug scenario: When the root directory can't be created because destination already
+/// exists as a file (and --overwrite is not set), the destination must still set
+/// root_complete to avoid hanging forever waiting for DestinationDone.
+#[test]
+fn test_remote_root_directory_exists_as_file_no_hang() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create source directory with a file
+    let src_subdir = src_dir.path().join("mydir");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("file.txt"), "content", 0o644);
+    // create destination as a FILE (not a directory) - this will cause root creation to fail
+    let dst_path = dst_dir.path().join("mydir");
+    create_test_file(&dst_path, "i am a file", 0o644);
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_path.to_str().unwrap());
+    // without --overwrite, copying a directory to a file path should fail fast, NOT hang
+    let output = run_rcp_and_expect_failure(&[&src_remote, &dst_remote]);
+    // verify we didn't timeout (timeout = 124)
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert!(
+        exit_code != 124,
+        "Command timed out - this indicates a hang bug where root_complete wasn't set"
+    );
+    // verify the file wasn't replaced
+    assert!(dst_path.is_file(), "Destination should still be a file");
+    assert_eq!(get_file_content(&dst_path), "i am a file");
+}
+
+/// Test that copying an inaccessible root symlink doesn't hang.
+///
+/// Bug scenario: When a root symlink's metadata can't be read (e.g., parent directory
+/// has no execute permission), the source must fail cleanly rather than hanging.
+/// Previously, metadata failures for root items would return Ok(()) without sending
+/// any message, causing the destination to wait forever for root completion.
+#[test]
+fn test_remote_root_symlink_inaccessible_no_hang() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create a symlink inside a subdirectory
+    let src_subdir = src_dir.path().join("restricted");
+    std::fs::create_dir(&src_subdir).unwrap();
+    let src_symlink = src_subdir.join("link");
+    std::os::unix::fs::symlink("target", &src_symlink).unwrap();
+    // remove all permissions from the parent directory AFTER creating the symlink
+    // this makes the symlink inaccessible (stat/lstat will fail with EACCES)
+    std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let dst_symlink = dst_dir.path().join("link");
+    let src_remote = format!("localhost:{}", src_symlink.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_symlink.to_str().unwrap());
+    // this should fail (can't access source) but NOT hang
+    let output = run_rcp_and_expect_failure(&[&src_remote, &dst_remote]);
+    // restore permissions for cleanup
+    let _ = std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(0o755));
+    // verify we didn't timeout (timeout = 124)
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert!(
+        exit_code != 124,
+        "Command timed out - this indicates a hang bug where root metadata failure wasn't handled"
+    );
+    // verify the destination symlink was NOT created (source was inaccessible)
+    assert!(
+        !dst_symlink.exists(),
+        "Destination should not exist since source was inaccessible"
+    );
 }

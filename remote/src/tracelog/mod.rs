@@ -13,6 +13,11 @@ pub fn get_latest_progress_snapshot() -> enum_map::EnumMap<RcpdType, common::Ser
     PROGRESS_MAP.lock().unwrap().clone()
 }
 
+/// Sends tracing messages from rcpd to the master process over the QUIC stream.
+///
+/// CANCEL SAFETY: both branches are cancel-safe:
+/// - `receiver.recv()`: tokio mpsc channel recv is cancel-safe
+/// - `cancellation_token.cancelled()`: cancel-safe (just polls a flag)
 pub async fn run_sender(
     mut receiver: tokio::sync::mpsc::UnboundedReceiver<common::remote_tracing::TracingMessage>,
     mut send_stream: crate::streams::SendStream,

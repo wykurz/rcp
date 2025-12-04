@@ -1,8 +1,55 @@
+//! Remote copy protocol definitions for source-destination communication.
+//!
+//! # Protocol Overview
+//!
+//! The remote copy protocol uses QUIC for communication between source and destination.
+//! The source opens a bidirectional control stream, and both sides exchange messages
+//! to coordinate directory creation, file transfers, and completion.
+//!
+//! See `docs/remote_protocol.md` for the full protocol specification.
+//!
+//! # Message Flow
+//!
+//! ```text
+//! Source                              Destination
+//!   |                                      |
+//!   |  ---- Directory(root, meta) -------> |  Create root, store metadata
+//!   |  ---- Directory(child, meta) ------> |  Create child, store metadata
+//!   |  ---- Symlink(...) ----------------> |  Create symlink
+//!   |  ---- DirStructureComplete --------> |  Structure complete
+//!   |                                      |
+//!   |  <--- DirectoryCreated(root) ------- |
+//!   |  <--- DirectoryCreated(child) ------ |
+//!   |                                      |
+//!   |  ~~~~ File(f, total=N) ~~~~~~~~~~~~> |  Write file, track count
+//!   |  ~~~~ File(...) ~~~~~~~~~~~~~~~~~~-> |  ...
+//!   |                                      |  All files done → apply metadata
+//!   |                                      |
+//!   |  <--- DestinationDone -------------- |  Close send side
+//!   |  (close send side)                   |  (detect EOF)
+//!   |  (detect EOF)                        |  Close connection
+//! ```
+//!
+//! # Error Communication
+//!
+//! The protocol uses asymmetric error communication:
+//! - **Source → Destination**: Must communicate failures (FileSkipped, SymlinkSkipped)
+//!   so destination can track file counts correctly
+//! - **Destination → Source**: Does NOT communicate failures. Destination handles
+//!   errors locally and source continues sending the full structure.
+//!
+//! # Shutdown Sequence
+//!
+//! Shutdown is coordinated through QUIC stream closure:
+//! 1. Destination sends `DestinationDone` and closes its send side
+//! 2. Source detects EOF on recv, closes its send side
+//! 3. Destination detects EOF on recv, closes connection
+
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Metadata {
     pub mode: u32,
     pub uid: u32,
@@ -75,7 +122,12 @@ impl From<&std::fs::Metadata> for Metadata {
     }
 }
 
-// implies files contents will be sent immediately after receiving this object
+/// File header sent on unidirectional streams, followed by raw file data.
+///
+/// The `dir_total_files` field tells destination how many files to expect
+/// for this file's parent directory. This is set when source iterates the
+/// directory (after receiving `DirectoryCreated`), ensuring accuracy even
+/// if directory contents change during the copy.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct File {
     pub src: std::path::PathBuf,
@@ -83,9 +135,11 @@ pub struct File {
     pub size: u64,
     pub metadata: Metadata,
     pub is_root: bool,
+    /// Total number of files in the parent directory (for tracking completion)
+    pub dir_total_files: usize,
 }
 
-// wrapper that includes size for comparison purposes
+/// Wrapper that includes size for comparison purposes.
 #[derive(Debug)]
 pub struct FileMetadata<'a> {
     pub metadata: &'a Metadata,
@@ -119,21 +173,18 @@ impl<'a> common::preserve::Metadata for FileMetadata<'a> {
     }
 }
 
+/// Messages sent from source to destination on the control stream.
 #[derive(Debug, Deserialize, Serialize)]
 pub enum SourceMessage {
-    DirStub {
-        src: std::path::PathBuf,
-        dst: std::path::PathBuf,
-        num_entries: usize,
-    },
+    /// Create directory and store metadata for later application.
+    /// Sent during directory tree traversal in depth-first order.
     Directory {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
         metadata: Metadata,
         is_root: bool,
     },
-    // this message is useful to open the control stream when there are no directories
-    DirStructureComplete,
+    /// Create symlink with metadata.
     Symlink {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
@@ -141,9 +192,26 @@ pub enum SourceMessage {
         metadata: Metadata,
         is_root: bool,
     },
-    FileSkipped(SrcDst),    // file failed to send, decrement directory counter
-    SymlinkSkipped(SrcDst), // symlink failed to send, decrement directory counter
-    SourceDone,             // must be the last message sent by the source
+    /// Signal that all directories and symlinks have been sent.
+    /// Required before destination can send `DestinationDone`.
+    DirStructureComplete,
+    /// Notify destination that a file failed to send.
+    /// Includes `dir_total_files` so destination can track file counts.
+    FileSkipped {
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+        dir_total_files: usize,
+    },
+    /// Notify destination that a symlink failed to read.
+    /// For logging purposes only (symlinks don't affect file counts).
+    /// If `is_root` is true, this signals that root processing is complete (even if failed).
+    SymlinkSkipped { src_dst: SrcDst, is_root: bool },
+    /// Notify destination that a directory contains no files.
+    /// Sent after receiving `DirectoryCreated` for an empty directory.
+    DirectoryEmpty {
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -152,12 +220,15 @@ pub struct SrcDst {
     pub dst: std::path::PathBuf,
 }
 
+/// Messages sent from destination to source on the control stream.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum DestinationMessage {
+    /// Confirm directory created, request file transfers.
+    /// Triggers source to send files from this directory.
     DirectoryCreated(SrcDst),
-    DirectoryComplete(SrcDst),
-    DirectoryFailed(SrcDst), // directory creation failed, source should skip its contents
-    DestinationDone,         // must be the last message sent by the destination
+    /// Signal destination has finished all operations.
+    /// Initiates graceful shutdown via stream closure.
+    DestinationDone,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -324,7 +395,6 @@ impl std::fmt::Display for RcpdRole {
 
 impl std::str::FromStr for RcpdRole {
     type Err = anyhow::Error;
-
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "source" => Ok(RcpdRole::Source),

@@ -18,6 +18,7 @@ name = "remote"
 
 [dependencies]
 anyhow = "1.0"
+async-channel = "2.3"
 async-recursion = "1.1"
 base64 = "0.22"
 bincode = "1.3"

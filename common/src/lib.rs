@@ -835,12 +835,21 @@ where
     } else {
         // helper to create the verbose-level filter consistently
         let make_env_filter = || {
-            tracing_subscriber::EnvFilter::from_default_env().add_directive(match verbose {
+            let level_directive = match verbose {
                 0 => "error".parse().unwrap(),
                 1 => "info".parse().unwrap(),
                 2 => "debug".parse().unwrap(),
                 _ => "trace".parse().unwrap(),
-            })
+            };
+            // filter out noisy dependencies - they're extremely verbose at DEBUG/TRACE level
+            // and not useful for debugging rcp
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(level_directive)
+                .add_directive("tokio=info".parse().unwrap())
+                .add_directive("runtime=info".parse().unwrap())
+                .add_directive("quinn=warn".parse().unwrap())
+                .add_directive("rustls=warn".parse().unwrap())
+                .add_directive("h2=warn".parse().unwrap())
         };
         let file_layer = if let Some(ref log_file_path) = debug_log_file {
             let file = std::fs::OpenOptions::new()
