@@ -2,9 +2,10 @@
 //!
 //! # Protocol Overview
 //!
-//! The remote copy protocol uses QUIC for communication between source and destination.
-//! The source opens a bidirectional control stream, and both sides exchange messages
-//! to coordinate directory creation, file transfers, and completion.
+//! The remote copy protocol uses TCP for communication between source and destination.
+//! The source listens on two ports: a control port for bidirectional messages and a
+//! data port for file transfers. Both sides exchange messages to coordinate directory
+//! creation, file transfers, and completion.
 //!
 //! See `docs/remote_protocol.md` for the full protocol specification.
 //!
@@ -40,7 +41,7 @@
 //!
 //! # Shutdown Sequence
 //!
-//! Shutdown is coordinated through QUIC stream closure:
+//! Shutdown is coordinated through TCP connection closure:
 //! 1. Destination sends `DestinationDone` and closes its send side
 //! 2. Source detects EOF on recv, closes its send side
 //! 3. Destination detects EOF on recv, closes connection
@@ -246,21 +247,17 @@ pub struct RcpdConfig {
     pub overwrite: bool,
     pub overwrite_compare: String,
     pub debug_log_prefix: Option<String>,
-    pub quic_port_ranges: Option<String>,
-    pub quic_idle_timeout_sec: u64,
-    pub quic_keep_alive_interval_sec: u64,
+    /// Port ranges for TCP connections (e.g., "8000-8999,9000-9999")
+    pub port_ranges: Option<String>,
     pub progress: bool,
     pub progress_delay: Option<String>,
     pub remote_copy_conn_timeout_sec: u64,
-    /// Network profile for QUIC tuning
+    /// Network profile for buffer sizing
     pub network_profile: crate::NetworkProfile,
-    /// Congestion control algorithm override (None = use profile default)
-    pub congestion_control: Option<crate::CongestionControl>,
-    /// Advanced QUIC tuning parameters
-    pub quic_tuning: crate::QuicTuning,
-    /// SHA-256 fingerprint of the Master's TLS certificate (32 bytes)
-    /// Used for certificate pinning when rcpd connects to Master
-    pub master_cert_fingerprint: Vec<u8>,
+    /// Buffer size for file transfers (defaults to profile-specific value)
+    pub buffer_size: Option<usize>,
+    /// Maximum concurrent connections in the pool
+    pub max_connections: usize,
     /// Chrome trace output prefix for profiling
     pub chrome_trace_prefix: Option<String>,
     /// Flamegraph output prefix for profiling
@@ -301,17 +298,9 @@ impl RcpdConfig {
         if let Some(ref prefix) = self.debug_log_prefix {
             args.push(format!("--debug-log-prefix={prefix}"));
         }
-        if let Some(ref ranges) = self.quic_port_ranges {
-            args.push(format!("--quic-port-ranges={ranges}"));
+        if let Some(ref ranges) = self.port_ranges {
+            args.push(format!("--port-ranges={ranges}"));
         }
-        args.push(format!(
-            "--quic-idle-timeout-sec={}",
-            self.quic_idle_timeout_sec
-        ));
-        args.push(format!(
-            "--quic-keep-alive-interval-sec={}",
-            self.quic_keep_alive_interval_sec
-        ));
         if self.progress {
             args.push("--progress".to_string());
         }
@@ -322,38 +311,13 @@ impl RcpdConfig {
             "--remote-copy-conn-timeout-sec={}",
             self.remote_copy_conn_timeout_sec
         ));
-        // network profile and congestion control
+        // network profile
         args.push(format!("--network-profile={}", self.network_profile));
-        if let Some(cc) = self.congestion_control {
-            args.push(format!("--congestion-control={}", cc));
+        // tcp tuning (only if set)
+        if let Some(v) = self.buffer_size {
+            args.push(format!("--buffer-size={v}"));
         }
-        // quic tuning overrides (only if set)
-        if let Some(v) = self.quic_tuning.receive_window {
-            args.push(format!("--quic-receive-window={v}"));
-        }
-        if let Some(v) = self.quic_tuning.stream_receive_window {
-            args.push(format!("--quic-stream-receive-window={v}"));
-        }
-        if let Some(v) = self.quic_tuning.send_window {
-            args.push(format!("--quic-send-window={v}"));
-        }
-        if let Some(v) = self.quic_tuning.initial_rtt_ms {
-            args.push(format!("--quic-initial-rtt-ms={v}"));
-        }
-        if let Some(v) = self.quic_tuning.initial_mtu {
-            args.push(format!("--quic-initial-mtu={v}"));
-        }
-        if let Some(v) = self.quic_tuning.remote_copy_buffer_size {
-            args.push(format!("--remote-copy-buffer-size={v}"));
-        }
-        if let Some(v) = self.quic_tuning.max_concurrent_streams {
-            args.push(format!("--quic-max-concurrent-streams={v}"));
-        }
-        // pass master cert fingerprint as hex-encoded string
-        args.push(format!(
-            "--master-cert-fingerprint={}",
-            hex::encode(&self.master_cert_fingerprint)
-        ));
+        args.push(format!("--max-connections={}", self.max_connections));
         // profiling options (only add --profile-level when profiling is enabled)
         let profiling_enabled =
             self.chrome_trace_prefix.is_some() || self.flamegraph_prefix.is_some();
@@ -407,6 +371,8 @@ impl std::str::FromStr for RcpdRole {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TracingHello {
     pub role: RcpdRole,
+    /// true for tracing/progress connection, false for control connection
+    pub is_tracing: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -416,22 +382,22 @@ pub enum MasterHello {
         dst: std::path::PathBuf,
     },
     Destination {
-        source_addr: std::net::SocketAddr,
+        /// TCP address for control connection to source
+        source_control_addr: std::net::SocketAddr,
+        /// TCP address for data connections to source
+        source_data_addr: std::net::SocketAddr,
         server_name: String,
-        /// SHA-256 fingerprint of the source's TLS certificate (32 bytes)
-        /// Used for certificate pinning to prevent MITM attacks
-        source_cert_fingerprint: Vec<u8>,
         preserve: common::preserve::Settings,
     },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SourceMasterHello {
-    pub source_addr: std::net::SocketAddr,
+    /// TCP address for control connection (bidirectional messages)
+    pub control_addr: std::net::SocketAddr,
+    /// TCP address for data connections (file transfers)
+    pub data_addr: std::net::SocketAddr,
     pub server_name: String,
-    /// SHA-256 fingerprint of this source's TLS certificate (32 bytes)
-    /// Used for certificate pinning to prevent MITM attacks
-    pub cert_fingerprint: Vec<u8>,
 }
 
 // re-export RuntimeStats from common for convenience

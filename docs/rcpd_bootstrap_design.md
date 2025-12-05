@@ -192,7 +192,7 @@ When starting a remote copy operation:
    - Compare semantic versions
    - Error if mismatch
 4. **Launch rcpd** with discovered path
-5. **Establish QUIC connection** for data transfer
+5. **Establish TCP connections** for data transfer
 
 ### Performance Considerations
 
@@ -229,7 +229,7 @@ When starting a remote copy operation:
 **SSH is the security perimeter**:
 - All operations start with SSH authentication
 - Version checking happens after SSH auth succeeds
-- QUIC connections use certificate pinning for integrity
+- Data transfers are currently unencrypted (use trusted networks)
 
 ## Automatic Deployment
 

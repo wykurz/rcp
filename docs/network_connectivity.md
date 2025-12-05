@@ -9,11 +9,11 @@ rcp uses a three-node architecture for remote copying:
 ```
 Master (rcp)
 ├── SSH → Source Host (rcpd in source mode)
-│   └── QUIC → Master
-│   └── QUIC Server (waits for Destination)
+│   └── TCP → Master (control)
+│   └── TCP Server (control + data ports, waits for Destination)
 └── SSH → Destination Host (rcpd in destination mode)
-    └── QUIC → Master
-    └── QUIC Client → Source
+    └── TCP → Master (control)
+    └── TCP Client → Source (control + data)
 ```
 
 ## Connection Flow
@@ -22,19 +22,20 @@ Master (rcp)
    - Master SSHs to source host and starts rcpd
    - Master SSHs to destination host and starts rcpd
 
-2. **rcpd processes connect back to Master via QUIC**
+2. **rcpd processes connect back to Master via TCP**
    - Source rcpd connects to Master
    - Destination rcpd connects to Master
 
 3. **Source waits for Destination connection**
-   - Source rcpd starts QUIC server
-   - Source sends its address to Master
-   - Master forwards address to Destination
-   - Destination connects to Source via QUIC
+   - Source rcpd starts TCP listeners (control + data ports)
+   - Source sends its addresses to Master
+   - Master forwards addresses to Destination
+   - Destination connects to Source's control port
+   - Destination opens connections to Source's data port as needed
 
 4. **Data transfer**
-   - Source sends files to Destination
-   - Destination acknowledges completion
+   - Source sends files to Destination over pooled data connections
+   - Destination acknowledges completion via control channel
 
 ## Failure Scenarios and Handling
 
@@ -66,10 +67,10 @@ Check if source/destination host is reachable and rcpd can be executed.
 
 ### 3. rcpd Cannot Connect to Master
 
-**Scenario**: QUIC connection from rcpd to Master fails (firewall, network issue)
+**Scenario**: TCP connection from rcpd to Master fails (firewall, network issue)
 
 **Handling**:
-- rcpd connection attempt times out (QUIC default timeout)
+- rcpd connection attempt times out
 - rcpd exits with error
 - Master waits for connection (timeout: configurable, default 15s)
 - Master returns timeout error
@@ -89,11 +90,11 @@ Check if source/destination host is reachable and rcpd can be executed.
 
 ### 4. Destination Cannot Connect to Source (**Most Common**)
 
-**Scenario**: Destination rcpd cannot reach Source rcpd's QUIC server (firewall, routing issue)
+**Scenario**: Destination rcpd cannot reach Source rcpd's TCP server (firewall, routing issue)
 
 **Handling**:
 - Source waits for Destination connection (timeout: configurable, default 15s)
-- Destination connection attempt times out (QUIC default timeout)
+- Destination connection attempt times out
 - Both return errors
 
 **Error Message** (in Source):
@@ -113,7 +114,7 @@ Check network connectivity and firewall rules.
 ## Timeout Values
 
 - **SSH connection**: ~30s (openssh default, configurable via SSH config)
-- **QUIC connection attempt**: ~10s (quinn library default)
+- **TCP connection attempt**: System default (usually 30-120s)
 - **Waiting for rcpd to connect to Master**: 15s (default, configurable via `--remote-copy-conn-timeout-sec`)
 - **Waiting for Destination to connect to Source**: 15s (default, configurable via `--remote-copy-conn-timeout-sec`)
 
@@ -127,8 +128,21 @@ rcp --remote-copy-conn-timeout-sec 20 source:/path dest:/path
 
 ### Connection Times Out
 
-1. **Check firewall rules**: Ensure QUIC ports (especially `--quic-port-ranges`) are open
+1. **Check firewall rules**: Ensure TCP ports are open (use `--port-ranges` to restrict to specific ports)
 2. **Check routing**: Ensure hosts can reach each other (use `ping`, `traceroute`)
 3. **Check rcpd binary**: Ensure rcpd exists and is executable on remote hosts
 4. **Check NAT**: If hosts are behind NAT, ensure proper port forwarding
 5. **Use verbose logging**: Run with `-vv` to see detailed connection attempts
+
+### Port Configuration
+
+Use `--port-ranges` to restrict which ports rcp uses for TCP connections:
+
+```bash
+rcp --port-ranges 8000-8100 source:/path dest:/path
+```
+
+This is useful when:
+- Firewalls only allow specific port ranges
+- You need to avoid conflicts with other services
+- Security policies require specific port usage

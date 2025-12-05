@@ -15,10 +15,10 @@ The remote copy system consists of three distinct components:
 **Spawning Sequence:**
 
 1. User invokes `rcp user@host1:/src user@host2:/dst`
-2. Master creates a QUIC server endpoint and waits for connections
+2. Master creates a TCP listener and waits for connections
 3. Master spawns source rcpd via SSH: `ssh user@host1 rcpd --master-addr=... --role=source ...`
 4. Master spawns destination rcpd via SSH: `ssh user@host2 rcpd --master-addr=... --role=destination ...`
-5. Both rcpd processes connect to master via QUIC
+5. Both rcpd processes connect to master via TCP
 6. Master identifies them by their declared role (sent via `TracingHello`)
 
 **Special Case - Same Host Copies:**
@@ -29,46 +29,60 @@ When source and destination are on the same host, the master:
 
 ### 1.3 Connection Topology
 
-The system uses a **triangle topology** with three QUIC connections:
+The system uses a **triangle topology** with TCP connections:
 
 ```
          Master (rcp)
            /    \
           /      \
-    (QUIC)      (QUIC)
+     (TCP)      (TCP)
         /          \
        /            \
-Source (rcpd)-----(QUIC)----Destination (rcpd)
+Source (rcpd)-----(TCP)----Destination (rcpd)
+                control + data ports
 ```
 
 **Connection Details:**
 
-1. **Source → Master**: Bidirectional, used for handshake and result reporting
-2. **Destination → Master**: Bidirectional, used for handshake and result reporting
-3. **Destination → Source**: Bidirectional + multiple unidirectional
-   - Control stream (bidirectional): Directory metadata and coordination
-   - File streams (unidirectional): One per file transfer
+1. **Source → Master**: Bidirectional TCP, used for handshake and result reporting
+2. **Destination → Master**: Bidirectional TCP, used for handshake and result reporting
+3. **Source ↔ Destination**: Two TCP ports on source:
+   - **Control port**: Bidirectional TCP for directory metadata and coordination
+   - **Data port**: Multiple TCP connections for file transfers (one connection per file)
 
 **Connection Establishment Order:**
 
 1. Both rcpd processes connect to master (order undefined)
 2. Master sends `MasterHello::Source` to source rcpd with src/dst paths
-3. Source rcpd starts QUIC server, sends `SourceMasterHello` back to master with address and certificate fingerprint
-4. Master sends `MasterHello::Destination` to destination rcpd with source address and certificate
-5. Destination rcpd connects to source rcpd
+3. Source rcpd starts TCP listeners (control + data), sends `SourceMasterHello` back to master with both addresses
+4. Master sends `MasterHello::Destination` to destination rcpd with source addresses
+5. Destination rcpd connects to source's control port
+6. For each file, destination opens a new connection to source's data port
 
-### 1.4 Certificate Pinning
+### 1.4 Security Model
 
-All connections use certificate pinning to prevent MITM attacks:
+> **⚠️ SECURITY WARNING**: The current implementation uses **unencrypted TCP** for data transfer between source and destination. This is a known limitation being addressed in a future release.
 
-- **Master → rcpd**: rcpd validates master's certificate using `master_cert_fingerprint`
-- **Destination → Source**: Destination validates source's certificate using `source_cert_fingerprint` provided by master
+**Current State:**
+- SSH is used for authentication and rcpd deployment
+- Master↔rcpd connections are plain TCP (typically on trusted networks)
+- Source↔Destination data transfer is plain TCP (no encryption)
+
+**Security Implications:**
+- Data in transit can be observed by network attackers (no confidentiality)
+- MITM attacks are possible on the source↔destination connection
+- Use on trusted networks only, or tunnel through SSH for sensitive data
+
+**Mitigations:**
+- For sensitive data, use SSH port forwarding or VPN
+- Ensure source and destination are on trusted network segments
+- Future versions will add TLS encryption for data connections
 
 ## 2. Protocol Messages
 
 ### 2.1 Handshake Messages
 
-**`TracingHello`** (rcpd → Master, unidirectional stream)
+**`TracingHello`** (rcpd → Master, first message on control connection)
 - **Purpose**: Identify the role of the connecting rcpd
 - **Fields**: `role: RcpdRole` (Source or Destination)
 - **Timing**: First message sent after connecting to master
@@ -77,11 +91,11 @@ All connections use certificate pinning to prevent MITM attacks:
 - **Purpose**: Provide configuration and connection details
 - **Variants**:
   - `Source { src, dst }`: Tells source rcpd what to copy
-  - `Destination { source_addr, server_name, source_cert_fingerprint, preserve }`: Tells destination where to connect
+  - `Destination { source_control_addr, source_data_addr, server_name, preserve }`: Tells destination where to connect (both control and data addresses)
 
 **`SourceMasterHello`** (Source → Master, bidirectional stream)
-- **Purpose**: Provide source's QUIC server details for destination to connect
-- **Fields**: `source_addr`, `server_name`, `cert_fingerprint`
+- **Purpose**: Provide source's TCP server details for destination to connect
+- **Fields**: `control_addr`, `data_addr`, `server_name`
 
 **`RcpdResult`** (rcpd → Master, bidirectional stream)
 - **Purpose**: Report final success/failure status and statistics
@@ -108,7 +122,7 @@ All connections use certificate pinning to prevent MITM attacks:
 **`FileSkipped`**
 - **Purpose**: Notify destination that a file failed to send
 - **Fields**: `src`, `dst`, `dir_total_files`
-- **Usage**: Sent when file open/read fails. Allows destination to track file counts correctly.
+- **Usage**: Sent when file open fails (before any data connection is used). Allows destination to track file counts correctly. Transport failures after connection is established are fatal.
 
 **`SymlinkSkipped`**
 - **Purpose**: Notify destination that a symlink failed to read
@@ -131,13 +145,13 @@ All connections use certificate pinning to prevent MITM attacks:
 - **Purpose**: Signal destination has finished all operations
 - **Usage**: Final message sent by destination. Initiates graceful shutdown.
 
-### 2.4 File Transfer Messages (Unidirectional Streams)
+### 2.4 File Transfer Messages (Data Connections)
 
-**`File`** (Source → Destination)
+**`File`** (Source → Destination, on data connections)
 - **Purpose**: File header followed by raw file data
 - **Fields**: `src`, `dst`, `size`, `metadata`, `is_root`, `dir_total_files`
-- **Format**: Serialized header, then raw bytes (exactly `size` bytes)
-- **Stream**: Multiple files share pooled streams; the `size` field delimits file boundaries
+- **Format**: Length-delimited serialized header, then raw bytes (exactly `size` bytes)
+- **Connection model**: Connections are pooled and reused for multiple files. The `size` field delimits file boundaries within a connection. Destination reads headers in a loop until EOF.
 
 The `dir_total_files` field tells destination how many files to expect for this file's parent directory. This count is set when source iterates the directory contents (after receiving `DirectoryCreated`), ensuring accuracy even if directory contents change during the copy.
 
@@ -151,6 +165,7 @@ The protocol uses asymmetric error communication between source and destination:
 - Source must notify destination of skipped files (`FileSkipped`) so destination can track file counts correctly
 - Source must notify destination of skipped symlinks (`SymlinkSkipped`) for logging purposes
 - Without these notifications, destination would hang waiting for items that will never arrive
+- **Note**: `FileSkipped` is only sent for file open failures. Transport failures (send errors after connection established) are fatal and abort the entire transfer
 
 **Destination → Source: Does NOT communicate failures**
 - Destination handles its own failures locally (logging, error flags)
@@ -201,7 +216,7 @@ Source                              Destination
   |  <--- DirectoryCreated(child2) ----- |
   |                                      |
   |  (iterate root, find 2 files)        |
-  |  ~~~~ File(root/f1, total=2) ~~~~~~> |  Write file, track: 2 expected, 1 remaining
+  |  ~~~~ File(root/f1, total=2) ~~~~~~> |  (dest opens data conn, receives file)
   |  ~~~~ File(root/f2, total=2) ~~~~~~> |  Write file, 0 remaining
   |                                      |  root complete → apply metadata
   |                                      |
@@ -227,7 +242,7 @@ Source                              Destination
   |                                      |
   |  ---- DirStructureComplete --------> |  (no directories)
   |                                      |
-  |  ~~~~ File(f, is_root=true) ~~~~~~-> |  Write file
+  |  ~~~~ File(f, is_root=true) ~~~~~~-> |  (dest opens data conn, receives file)
   |                                      |  Root file complete
   |                                      |
   |  <--- DestinationDone -------------- |  Close send side
@@ -360,7 +375,7 @@ whether non-directory items can be replaced.
 
 ### 6.1 Shutdown Sequence
 
-The shutdown is coordinated through QUIC stream closure:
+The shutdown is coordinated through TCP connection closure:
 
 ```
 Destination                          Source
@@ -374,10 +389,10 @@ Destination                          Source
   |                                      |
   | (detect send stream EOF)             |
   | Close control recv stream            |
-  | Close QUIC connection                |
+  | Close TCP connection                 |
   |                                      |
   |                   (detect connection close)
-  |                   Close QUIC endpoint
+  |                   Close TCP listeners
 ```
 
 **Key Points:**
@@ -386,33 +401,31 @@ Destination                          Source
 - Destination detects source's send side closed, closes connection
 - Both sides close cleanly without needing explicit `SourceDone` message
 
-### 6.2 Stream Types and Ownership
+### 6.2 Connection Types and Ownership
 
-**Control Stream (Bidirectional)**
-- **Owner**: Source opens, destination accepts
+**Control Connection (Bidirectional TCP)**
+- **Owner**: Destination connects to source's control port
 - **Lifetime**: Entire copy operation
 - **Usage**:
   - Source → Destination: Directory/symlink metadata, skip notifications, structure complete
   - Destination → Source: Directory confirmations, done signal
 
-**File Streams (Unidirectional, Pooled)**
-- **Owner**: Source creates a pool of streams at connection establishment
-- **Lifetime**: Pool lifetime matches the connection; streams are reused for multiple files
-- **Usage**: File header + raw data (size from header determines bytes to read)
-- **Pool behavior**: Tasks borrow streams from the pool, send files, and return them automatically
+**Data Connections (Pooled TCP)**
+- **Model**: Destination opens pool of connections to source's data port; source accepts and sends multiple files per connection
+- **Lifetime**: Entire copy operation (reused for multiple files)
+- **Usage**: Length-prefixed file headers + raw data (size from header determines bytes to read per file)
+- **Pool size**: Controlled by `--max-connections` (default: 100)
 
 ### 6.3 Process Termination
 
 **Master Orchestrates Shutdown:**
 1. Receives `RcpdResult` from both source and destination
-2. Closes QUIC connections to both rcpd processes
-3. Waits for QUIC endpoint to idle (with 500ms timeout)
-4. Waits for rcpd SSH processes to exit
-5. Reports combined results to user
+2. Closes TCP connections to both rcpd processes
+3. Waits for rcpd SSH processes to exit
+4. Reports combined results to user
 
 **rcpd Lifecycle Management:**
 - **stdin watchdog**: Monitors stdin for EOF to detect master disconnection
-- **QUIC idle timeout**: Secondary mechanism if stdin unavailable
 - If master dies unexpectedly, rcpd detects EOF and exits immediately
 - No orphaned processes remain on remote hosts
 
@@ -460,34 +473,42 @@ The protocol uses two sending primitives:
 - Used for: `DirStructureComplete`, `DestinationDone`, `DirectoryCreated`
 - Critical for correctness at synchronization points
 
-### 7.5 Stream Pooling
+### 7.5 Data Connection Pooling
 
-File streams are pooled for efficiency:
-- Pool size defaults to 100 streams (configurable via `--quic-max-concurrent-streams`)
-- Tasks borrow streams, send files, return them via RAII
-- `size` field in headers delimits file boundaries within a stream
-- Avoids stream creation overhead per file
+Data connections are pooled for efficiency:
+- Pool size defaults to 100 connections (configurable via `--max-connections`)
+- Destination opens connections to source's data port up to pool size
+- Source accepts connections and assigns files to them round-robin
+- Tasks borrow connections, send files, return them via RAII
+- `size` field in headers delimits file boundaries within a connection
+- Avoids connection creation overhead per file
+
+**Connection lifecycle:**
+1. Destination opens N connections to source's data port
+2. Each connection handles multiple files (loop reading headers + data)
+3. Source sends file header (length-prefixed) + raw data (`size` bytes)
+4. After all files sent, source closes connections (destination sees EOF)
+
+**Trade-offs:**
+- Efficient reuse avoids TCP handshake per file
+- Natural backpressure via pool size limiting
+- Slightly more complex error recovery (need to track stream state)
 
 ### 7.6 Stream Error Recovery
 
-When processing a file fails, the destination must determine if the stream can continue
-receiving more files. There are three possible states:
+When processing a file fails, the destination must determine if the connection can continue
+receiving more files:
 
-| State | Cause | Stream Position | Recovery |
-|-------|-------|-----------------|----------|
-| **NeedsDrain** | Error before reading data (e.g., can't create file) | At start of file data | Drain `size` bytes, continue |
-| **DataConsumed** | Error after reading all data (e.g., metadata failure) | At next file header | Continue immediately |
-| **Corrupted** | Error during data transfer | Unknown | Close stream |
+| State | Cause | Recovery |
+|-------|-------|----------|
+| **NeedsDrain** | Error before reading data (e.g., can't create file) | Drain `size` bytes, continue with next file |
+| **DataConsumed** | Error after reading all data (e.g., metadata failure) | Stream at clean boundary, continue immediately |
+| **Corrupted** | Error during data transfer | Close connection (other pooled connections unaffected) |
 
-This distinction matters for stream pooling efficiency:
-- `NeedsDrain`: Stream recoverable by draining, pool benefits preserved
-- `DataConsumed`: Stream already at clean boundary, can read next header immediately
-- `Corrupted`: Stream unusable, must close (other pooled streams unaffected)
-
-Previously, `DataConsumed` errors (like metadata failures) were treated as corrupted,
-unnecessarily closing streams that could continue serving files.
-
-**Test coverage:** `test_remote_sudo_stream_continues_after_metadata_error` (requires passwordless sudo)
+This distinction matters for pool efficiency:
+- `NeedsDrain`: Connection recoverable by draining, pool benefits preserved
+- `DataConsumed`: Connection already at clean boundary, can read next header immediately
+- `Corrupted`: Connection unusable, must close (source will accept new connection if needed)
 
 ### 7.7 Summary Statistics Authority
 
@@ -524,7 +545,7 @@ The destination is the authoritative source for operation statistics:
 **Lifecycle management:**
 - ✅ rcpd exit when master killed
 - ✅ No zombie processes
-- ✅ Custom QUIC timeouts
+- ✅ Custom connection timeouts
 
 ### 8.2 Multi-Host Tests (`docker_multi_host*.rs`)
 
@@ -541,18 +562,29 @@ The destination is the authoritative source for operation statistics:
 - ✅ Broken symlinks
 - ✅ Circular symlinks
 
-## 9. QUIC Configuration
+## 9. TCP Configuration
 
-### 9.1 Timeout Configuration
+### 9.1 Connection Settings
 
-Both `rcp` and `rcpd` accept CLI arguments for QUIC connection behavior:
+Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
 
-- `--quic-idle-timeout-sec=N` (default: 10) - Maximum idle time before closing connection
-- `--quic-keep-alive-interval-sec=N` (default: 1) - Interval for keep-alive packets
 - `--remote-copy-conn-timeout-sec=N` (default: 15) - Connection timeout for remote operations
+- `--port-ranges=RANGES` (optional) - Restrict TCP to specific port ranges (e.g., "8000-8999")
+- `--max-connections=N` (default: 100) - Maximum concurrent data connections
+- `--network-profile=PROFILE` (default: datacenter) - Buffer sizing profile
 
-### 9.2 Tuning Guidelines
+### 9.2 Network Profiles
 
-- **Datacenter**: More aggressive values (5-8s idle timeout) for faster failure detection
-- **Internet**: Higher values (15-30s idle timeout) to handle network hiccups
-- **High latency**: Increase all timeouts proportionally
+**Datacenter Profile (default):**
+- Larger TCP buffer sizes (16 MiB)
+- Optimized for low-latency, high-bandwidth networks
+
+**Internet Profile:**
+- Smaller TCP buffer sizes (2 MiB)
+- More conservative settings for higher-latency networks
+
+### 9.3 Tuning Guidelines
+
+- **Datacenter**: Use default settings for best performance
+- **Internet/WAN**: Use `--network-profile=internet` for better behavior on higher-latency links
+- **Firewall-restricted**: Use `--port-ranges` to specify allowed ports

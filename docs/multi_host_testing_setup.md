@@ -132,7 +132,7 @@ just docker-down
 **Why Docker over alternatives?**:
 - **vs. Network namespaces**: More portable, works on macOS/Windows
 - **vs. VMs**: Faster startup, easier to manage, better CI integration
-- **vs. Mock transport**: More realistic, tests actual SSH/QUIC stack
+- **vs. Mock transport**: More realistic, tests actual SSH/TCP stack
 
 **Why Alpine Linux?**:
 - Small image size (~50MB vs ~150MB for Debian/Ubuntu)

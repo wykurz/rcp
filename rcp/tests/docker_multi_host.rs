@@ -215,3 +215,81 @@ fn test_nonexistent_source_file() -> Result<()> {
     );
     Ok(())
 }
+
+/// Test that progress reporting works correctly in multi-host copies.
+///
+/// This verifies that:
+/// - Progress updates are received from rcpd processes on remote hosts
+/// - The tracing TCP connections work correctly across network boundaries
+/// - Progress output shows non-zero file counts
+#[test]
+#[ignore = "requires Docker containers (run: cd tests/docker && ./test-helpers.sh start)"]
+fn test_progress_reporting_multi_host() -> Result<()> {
+    let env = DockerEnv::new()?;
+    // cleanup any existing directories from previous runs first (as root for permissions)
+    env.exec("host-a", None, &["rm", "-rf", "/tmp/progress_test"])?;
+    env.exec("host-b", None, &["rm", "-rf", "/tmp/progress_test_dst"])?;
+    // create many small files on host-a (1000 x 1KB) using shell loop
+    // this ensures copy takes long enough for progress updates to be captured
+    let setup_output = env.exec(
+        "host-a",
+        Some("testuser"),
+        &[
+            "sh",
+            "-c",
+            "mkdir -p /tmp/progress_test && cd /tmp/progress_test && for i in $(seq 1 1000); do dd if=/dev/zero of=file_$i.bin bs=1024 count=1 2>/dev/null; done",
+        ],
+    )?;
+    assert!(
+        setup_output.status.success(),
+        "file creation should succeed: {}",
+        String::from_utf8_lossy(&setup_output.stderr)
+    );
+    // create destination directory on host-b (as testuser to match rcp permissions)
+    env.exec(
+        "host-b",
+        Some("testuser"),
+        &["mkdir", "-p", "/tmp/progress_test_dst"],
+    )?;
+    // copy with progress enabled
+    let output = env.exec_rcp(&[
+        "--progress",
+        "--progress-type=text-updates",
+        "--progress-delay=100ms",
+        "host-a:/tmp/progress_test/",
+        "host-b:/tmp/progress_test_dst/",
+    ])?;
+    // check command succeeded
+    if !output.status.success() {
+        eprintln!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+        eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+        panic!("rcp command failed");
+    }
+    // check stderr for progress output - should contain progress updates with file counts
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // progress output should contain the separator lines
+    assert!(
+        stderr.contains("======================="),
+        "Progress output should contain separator lines. stderr:\n{}",
+        stderr
+    );
+    // progress should show that files were copied (files: followed by non-zero count)
+    let has_files_progress = stderr.lines().any(|line| {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("files:") {
+            rest.trim().parse::<u64>().map(|n| n > 0).unwrap_or(false)
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_files_progress,
+        "Progress output should show files being copied (files: N where N > 0). stderr:\n{}",
+        stderr
+    );
+    // cleanup
+    let _ = env.exec("host-a", None, &["rm", "-rf", "/tmp/progress_test"]);
+    let _ = env.exec("host-b", None, &["rm", "-rf", "/tmp/progress_test_dst"]);
+    eprintln!("✓ Progress reporting works correctly in multi-host setup");
+    Ok(())
+}

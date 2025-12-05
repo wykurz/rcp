@@ -72,9 +72,6 @@ impl DockerEnv {
         ]);
         // always use verbose output for better debugging in CI
         cmd.arg("-vv");
-        // use longer QUIC timeout for Docker tests to handle very slow CI runners
-        // tests that copy directories or do multiple operations can take 30-60s on loaded systems
-        cmd.arg("--quic-idle-timeout-sec=60");
         cmd.args(args);
         let output = cmd.output()?;
         // print output if command failed (for debugging in CI)

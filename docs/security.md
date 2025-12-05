@@ -1,6 +1,6 @@
 # Security Model
 
-This document describes the security architecture of the rcp (remote copy) tool and its defense mechanisms against common network attacks.
+This document describes the security architecture of the rcp (remote copy) tool.
 
 ## Table of Contents
 
@@ -8,20 +8,18 @@ This document describes the security architecture of the rcp (remote copy) tool 
 - [Architecture](#architecture)
 - [Security Mechanisms](#security-mechanisms)
 - [Trust Model](#trust-model)
-- [Attack Resistance](#attack-resistance)
+- [Current Limitations](#current-limitations)
 - [Security Best Practices](#security-best-practices)
-- [Threat Model](#threat-model)
-- [Insecure Mode](#insecure-mode)
+- [Future Work](#future-work)
 
 ## Overview
 
-The rcp remote copy system implements a **defense-in-depth security model** that combines:
+The rcp remote copy system currently relies on:
 
-1. **SSH** for authentication and authorization
-2. **TLS 1.3 (via QUIC)** for transport encryption
-3. **Certificate Pinning** for connection integrity and MITM prevention
+1. **SSH** for authentication, authorization, and rcpd deployment
+2. **Network trust** for data transfer between source and destination
 
-This layered approach provides strong security guarantees while maintaining ease of deployment and high performance.
+> **⚠️ SECURITY WARNING**: Data transfers between source and destination are currently **unencrypted**. Use only on trusted networks or tunnel through SSH/VPN for sensitive data.
 
 ## Architecture
 
@@ -44,21 +42,20 @@ A remote copy operation involves three participants:
 │   Source    │     │ Destination │
 │   (rcpd)    │────>│   (rcpd)    │
 └─────────────┘     └─────────────┘
-                    Direct QUIC
+                    Direct TCP
                     connection
+                    (unencrypted)
 ```
 
 ### Communication Channels
 
-1. **Master ← Source (rcpd)**: QUIC control connection
-2. **Master ← Destination (rcpd)**: QUIC control connection
-3. **Source → Destination**: QUIC data transfer connection
-
-**All three connections are secured with certificate pinning.**
+1. **Master ↔ Source (rcpd)**: TCP control connection
+2. **Master ↔ Destination (rcpd)**: TCP control connection
+3. **Source → Destination**: TCP data transfer (control + data ports)
 
 ## Security Mechanisms
 
-### 1. SSH Authentication & Authorization
+### SSH Authentication & Authorization
 
 **SSH provides the security perimeter** for remote copy operations.
 
@@ -67,71 +64,11 @@ A remote copy operation involves three participants:
 - **Key-Based Auth Recommended**: SSH key-based authentication is more secure than passwords
 - **Existing Infrastructure**: Leverages existing SSH configuration and security policies
 
-### 2. QUIC with TLS 1.3
+### rcpd Lifecycle Management
 
-All data transfer uses the QUIC protocol, which is built on TLS 1.3:
-
-- **Encryption**: All data encrypted using modern ciphers (ChaCha20-Poly1305, AES-GCM)
-- **Perfect Forward Secrecy**: Session keys are ephemeral and cannot be recovered later
-- **Integrity**: Cryptographic authentication prevents data tampering
-- **Replay Protection**: Built-in mechanisms prevent replay attacks
-- **0-RTT Disabled**: We don't use 0-RTT mode to avoid potential security issues
-
-### 3. Certificate Pinning
-
-Certificate pinning prevents man-in-the-middle (MITM) attacks by validating that QUIC connections are established with the expected peer.
-
-#### How It Works
-
-**For Master ← rcpd connections:**
-
-1. Master generates an ephemeral self-signed certificate at startup
-2. Master computes SHA-256 fingerprint of the certificate
-3. When launching rcpd via SSH, Master passes the fingerprint as a command-line argument
-4. rcpd receives the fingerprint through the secure SSH channel
-5. When rcpd connects to Master via QUIC, it validates the certificate fingerprint
-6. Connection is rejected if fingerprints don't match
-
-**For Source → Destination connections:**
-
-1. Source generates an ephemeral self-signed certificate
-2. Source computes SHA-256 fingerprint and sends it to Master over the already-secured Master←Source connection
-3. Master forwards the fingerprint to Destination over the already-secured Master←Destination connection
-4. Destination validates Source's certificate against the received fingerprint when establishing the direct connection
-5. Connection is rejected if fingerprints don't match
-
-#### Why This Is Secure
-
-The security relies on SSH as a **secure out-of-band channel** for fingerprint exchange:
-
-```text
-┌────────────────────────────────────────────────────────┐
-│  SSH Connection (authenticated & encrypted)            │
-│                                                         │
-│  Master ─────[certificate fingerprint]────> rcpd      │
-│                                                         │
-│  This channel is already secured by SSH authentication │
-└────────────────────────────────────────────────────────┘
-                         │
-                         │ Fingerprint is trustworthy because
-                         │ SSH authenticated the source
-                         ▼
-┌────────────────────────────────────────────────────────┐
-│  QUIC Connection                                       │
-│                                                         │
-│  rcpd validates certificate matches the fingerprint    │
-│  received via SSH                                      │
-│                                                         │
-│  If valid → Connection is trustworthy                  │
-│  If invalid → MITM attack detected, connection refused │
-└────────────────────────────────────────────────────────┘
-```
-
-**Chain of Trust:**
-1. User trusts SSH (proven by successful authentication)
-2. SSH carries the certificate fingerprint securely
-3. QUIC connection validates against that fingerprint
-4. Therefore, QUIC connection is trustworthy
+- rcpd processes are spawned via SSH and connect back to master
+- stdin watchdog ensures rcpd exits if master dies (no orphaned processes)
+- rcpd only performs operations authorized by the SSH session
 
 ## Trust Model
 
@@ -139,89 +76,44 @@ The security relies on SSH as a **secure out-of-band channel** for fingerprint e
 
 1. **SSH Infrastructure**: SSH must be properly configured and uncompromised
 2. **Master Machine**: The local machine running `rcp` is assumed to be trusted
-3. **Cryptographic Libraries**: rustls, ring, quinn are assumed to implement cryptography correctly
+3. **Network between Source and Destination**: Currently assumed to be trusted (see limitations)
 
 ### Trust Establishment
 
 ```text
-User → SSH → Master → Certificate Fingerprint → QUIC Connection
+User → SSH → Master → rcpd processes
 
 Each arrow represents a trust relationship:
 1. User trusts their SSH client and configuration
 2. SSH authenticates and encrypts communication with remote hosts
-3. Master uses SSH to bootstrap trust for QUIC connections
-4. Certificate fingerprints validate QUIC peer identity
+3. Master spawns rcpd processes via authenticated SSH sessions
 ```
 
-### Ephemeral Certificates
+## Current Limitations
 
-- Certificates are **generated fresh for each session**
-- Private keys never leave the machine that generates them
-- Fingerprints are only valid for the current operation
-- No long-term certificate management or PKI required
+### No Encryption for Data Transfer
 
-## Attack Resistance
+**The data channel between source and destination is currently unencrypted.**
 
-### ✅ Protected Attacks
+| Risk | Description | Mitigation |
+|------|-------------|------------|
+| **Eavesdropping** | Attackers on the network can observe file contents | Use VPN or SSH tunneling |
+| **MITM attacks** | Attackers could potentially intercept/modify data | Use trusted networks only |
+| **Data integrity** | No cryptographic verification of data in transit | TCP checksums provide basic error detection |
 
-| Attack Type | Protection Mechanism |
-|-------------|---------------------|
-| **Man-in-the-Middle (MITM)** | Certificate pinning detects and prevents endpoint impersonation |
-| **Eavesdropping** | TLS 1.3 encryption protects all data in transit |
-| **Data Tampering** | Cryptographic authentication (AEAD) prevents modifications |
-| **Replay Attacks** | TLS 1.3 and QUIC built-in replay protection |
-| **Unauthorized Access** | SSH authentication required before any operations |
-| **Connection Hijacking** | Certificate pinning ensures peer identity throughout connection |
-| **Downgrade Attacks** | TLS 1.3 prevents protocol downgrade |
+### Recommended Mitigations
 
-### Attack Scenarios
+For sensitive data transfers:
 
-#### Scenario 1: Network MITM Attack
+1. **Use SSH port forwarding**:
+   ```bash
+   # Set up tunnel, then use localhost addresses
+   ssh -L 8000:destination:8000 source-host
+   ```
 
-**Attack**: Attacker intercepts network traffic and tries to impersonate Master
+2. **Use VPN**: Ensure source and destination are on a VPN
 
-```text
-Master ─────X─────→ [Attacker] ─────→ rcpd
-             ↑
-         Intercepted
-```
-
-**Defense**:
-- Attacker cannot provide valid certificate matching the fingerprint sent via SSH
-- rcpd computes fingerprint of attacker's certificate
-- Fingerprint mismatch is detected
-- Connection is refused
-- **Result: Attack prevented ✅**
-
-#### Scenario 2: Compromised Network Device
-
-**Attack**: Attacker controls a router or switch and attempts to redirect QUIC traffic
-
-**Defense**:
-- Even with network control, attacker cannot generate a certificate with the expected fingerprint
-- SHA-256 preimage resistance makes it computationally infeasible to forge certificates
-- **Result: Attack prevented ✅**
-
-#### Scenario 3: DNS Spoofing
-
-**Attack**: Attacker modifies DNS to redirect connections
-
-**Defense**:
-- rcp uses SSH for initial connections, which establishes host identity
-- Certificate fingerprints are tied to actual endpoints, not DNS names
-- **Result: Attack prevented ✅**
-
-### ❌ Out of Scope
-
-The following attacks are **not** protected by rcp itself:
-
-| Attack Type | Why Not Protected | Mitigation |
-|-------------|-------------------|------------|
-| **Compromised SSH** | SSH is the root of trust | Use SSH best practices (key-based auth, fail2ban, etc.) |
-| **Compromised Master** | Master is trusted by design | Keep Master machine secure, use separate accounts |
-| **Malicious rcpd Binary** | Binary authenticity not verified | Verify binary integrity, use package managers |
-| **Local Privilege Escalation** | OS-level security issue | Keep systems patched, use proper permissions |
-| **Timing Attacks on Crypto** | Library implementation details | Use up-to-date cryptographic libraries |
+3. **Use trusted networks**: Datacenter networks, private networks, etc.
 
 ## Security Best Practices
 
@@ -235,10 +127,11 @@ The following attacks are **not** protected by rcp itself:
    - Configure proper file permissions on SSH keys
 
 2. **Network Security**
-   - Use firewall rules to restrict QUIC ports if needed (via `--quic-port-ranges`)
+   - Use firewall rules to restrict TCP ports if needed (via `--port-ranges`)
    - Monitor for unusual connection patterns
    - Log SSH and rcp operations for audit trails
    - Use network segmentation for sensitive operations
+   - Consider VPN for cross-datacenter transfers
 
 3. **System Hardening**
    - Keep rcp binaries updated
@@ -253,152 +146,35 @@ The following attacks are **not** protected by rcp itself:
    - Regular access audits
 
 5. **Binary Deployment**
-   - **Auto-deployment** (v0.22.0+): Use `--auto-deploy-rcpd` to automatically deploy rcpd binaries
+   - **Auto-deployment**: Use `--auto-deploy-rcpd` to automatically deploy rcpd binaries
      - Binaries are transferred over SSH (already authenticated)
      - SHA-256 checksums verify integrity after transfer
      - Binaries are cached at `~/.cache/rcp/bin/rcpd-{version}` on remote hosts
-     - Old versions are automatically cleaned up (keeps last 3 by default)
    - **Manual deployment**: Preferred for air-gapped environments or strict change control
-     - Verify binary checksums before deploying
-     - Use package managers when available (nixpkgs, cargo install)
-     - Keep rcpd versions synchronized across environments
-
-### Auto-deployment Security
-
-Starting with v0.22.0, rcp can automatically deploy rcpd binaries to remote hosts using the `--auto-deploy-rcpd` flag. This feature maintains security through:
-
-**Integrity Verification:**
-- Local rcpd binary is read and SHA-256 checksum is computed
-- Binary is transferred via SSH using base64 encoding (already authenticated and encrypted)
-- Remote checksum is computed and compared with the local checksum
-- Transfer fails if checksums don't match (detects corruption or tampering)
-
-**Secure Transfer Channel:**
-- Binary transfer occurs over the existing SSH connection
-- SSH provides authentication, encryption, and integrity protection
-- No separate authentication required (SSH is the root of trust)
-
-**Binary Discovery:**
-- Searches for rcpd in same directory as rcp (development builds)
-- Falls back to PATH (covers cargo install, nixpkgs)
-- Fails safely if no suitable binary found
-
-**Version Management:**
-- Deployed binaries are named `rcpd-{version}` (e.g., `rcpd-0.22.0`)
-- Keeps last 3 versions to allow rollback if needed
-- Automatic cleanup prevents unbounded disk usage
-
-**Security Considerations:**
-
-| Aspect | Auto-deployment | Manual deployment |
-|--------|----------------|-------------------|
-| **Integrity** | SHA-256 verified after transfer | Verify checksums manually |
-| **Authentication** | SSH (same as manual) | SSH (same as auto) |
-| **Binary source** | Local machine (must be trusted) | Package manager or manual build |
-| **Change control** | Automatic on version mismatch | Explicit admin action |
-| **Air-gapped** | Requires SSH access | Works offline |
-| **Audit trail** | Logged in rcp output | Depends on deployment method |
-
-**When to Use Auto-deployment:**
-- Development and testing environments
-- Dynamic or ephemeral infrastructure (containers, cloud VMs)
-- Environments where you control both local and remote machines
-- Situations where rcpd version synchronization is important
-
-**When to Use Manual Deployment:**
-- Production systems with strict change control
-- Air-gapped or restricted network environments
-- Compliance requirements for binary deployment procedures
-- Situations where you want to verify binaries before deployment
-
-**Trust Model:**
-- Auto-deployment relies on the **local machine being trusted**
-- The deployed binary is whatever rcpd is found locally (same directory or PATH)
-- If the local machine is compromised, auto-deployment will deploy the compromised binary
-- This is equivalent to the trust model for the master (rcp) binary itself
 
 ### For Users
 
-1. **Verify Connections**
-   - Check SSH host key fingerprints on first connection
-   - Monitor for certificate validation failures (may indicate MITM)
-   - Review rcp verbose logs (`-vv`) for security diagnostics
-
-2. **Secure Workflows**
+1. **Secure Workflows**
    - Use SSH agent forwarding carefully (or avoid it)
-   - Don't disable certificate verification unless absolutely necessary
    - Keep SSH keys protected (passphrase, key agent timeout)
+   - Use VPN/tunneling for sensitive data
 
-3. **Error Handling**
-   - Investigate certificate mismatch errors immediately
+2. **Error Handling**
    - Don't ignore connection failures
    - Report suspicious connection behavior
 
-## Threat Model
+## Future Work
 
-### Assumptions
+### Planned Security Enhancements
 
-1. **SSH is secure**: The underlying SSH implementation is trustworthy and properly configured
-2. **Cryptography is sound**: TLS 1.3, SHA-256, and cryptographic libraries work as designed
-3. **Master is trusted**: The machine running the Master (rcp) is not compromised
-4. **Physical security**: Attackers don't have physical access to machines
-5. **Side channels**: Timing attacks and other side-channel attacks are out of scope
+1. **TLS encryption for data connections**
+   - Add rustls-based encryption between source and destination
+   - Certificate pinning via SSH-distributed fingerprints
+   - Will restore confidentiality and integrity guarantees
 
-### Trust Boundaries
-
-```text
-┌─────────────────────────────────────┐
-│  Trusted Zone                       │
-│  - Master machine                   │
-│  - SSH authentication               │
-│  - Local user environment           │
-└─────────────────────────────────────┘
-                │
-                │ SSH (authenticated)
-                ▼
-┌─────────────────────────────────────┐
-│  Network (Untrusted)                │
-│  - Can intercept traffic            │
-│  - Can modify packets               │
-│  - Can inject traffic               │
-│  - Cannot forge certificates        │  ← Protected by certificate pinning
-└─────────────────────────────────────┘
-                │
-                │ QUIC (cert pinned)
-                ▼
-┌─────────────────────────────────────┐
-│  Remote Hosts                       │
-│  - Authenticated via SSH            │
-│  - Running authorized rcpd          │
-│  - Bound by file permissions        │
-└─────────────────────────────────────┘
-```
-
-### Known Limitations
-
-1. **Session Secrets Not Persisted**: If Master is compromised during operation, current session could be affected
-2. **No Forward Secrecy Between Sessions**: Each session is independent (this is actually a feature)
-3. **Certificate Validation Only**: We don't validate hostname, expiry, or CA chains (not needed for ephemeral certs)
-4. **No Client Certificates**: rcpd doesn't present certificates to Master (authentication is via fingerprint validation)
-
-## Compliance and Standards
-
-### Standards Compliance
-
-- **TLS 1.3**: RFC 8446
-- **QUIC**: RFC 9000
-- **SSH**: OpenSSH (system SSH implementation)
-- **Cryptography**:
-  - SHA-256 for fingerprints (FIPS 180-4)
-  - AES-GCM, ChaCha20-Poly1305 for encryption
-  - ECDHE for key exchange
-
-### Security Audits
-
-- Regular dependency updates via cargo audit
-- Static analysis via clippy
-- Code review for security-sensitive changes
-- Community security reports via GitHub issues
+2. **Mutual authentication**
+   - Source and destination verify each other's identity
+   - Prevent unauthorized data injection
 
 ## Reporting Security Issues
 
@@ -414,13 +190,14 @@ If you discover a security vulnerability in rcp, please:
 
 We will respond within 48 hours and work with you on a coordinated disclosure.
 
-## Conclusion
+## Summary
 
-The rcp security model provides strong protection against network-based attacks while maintaining ease of use and high performance. By combining SSH authentication, TLS 1.3 encryption, and certificate pinning, rcp ensures that remote file copy operations are:
+The current rcp security model provides:
 
-- ✅ **Authenticated**: Only authorized users can initiate operations
-- ✅ **Encrypted**: All data is protected from eavesdropping
-- ✅ **Integrity-Protected**: Data cannot be modified in transit
-- ✅ **MITM-Resistant**: Certificate pinning prevents endpoint impersonation
+- ✅ **Authentication**: SSH authentication required before any operations
+- ✅ **Authorization**: SSH/filesystem permissions control access
+- ✅ **Process isolation**: rcpd processes are properly lifecycle-managed
+- ⚠️ **Encryption**: Data transfers are currently unencrypted (use trusted networks)
+- ⚠️ **Integrity**: No cryptographic verification (TCP checksums only)
 
-As long as SSH is properly configured and the Master machine is trusted, rcp provides a secure foundation for remote file operations.
+Use rcp on trusted networks or with additional tunneling for sensitive data until TLS support is added.

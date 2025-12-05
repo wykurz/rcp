@@ -42,7 +42,6 @@ API documentation for the command-line tools is available on docs.rs:
 - [rcp-tools-throttle](https://docs.rs/rcp-tools-throttle) - Resource throttling
 
 **Design and reference documents** (in the `docs/` directory):
-- [QUIC Performance Tuning](docs/quic_performance_tuning.md) - Network profiles, congestion control, and advanced tuning
 - [Security](docs/security.md) - Threat model and security architecture
 - [Network Connectivity](docs/network_connectivity.md) - Troubleshooting remote connections
 - [Remote Protocol](docs/remote_protocol.md) - Wire protocol specification
@@ -223,11 +222,11 @@ Manual deployment is still supported and may be preferred for:
 - Situations where you want to verify the binary before deployment
 
 **Configuration options:**
-- `--quic-port-ranges` - restrict QUIC to specific port ranges (e.g., "8000-8999")
+- `--port-ranges` - restrict TCP data ports to specific ranges (e.g., "8000-8999")
 - `--remote-copy-conn-timeout-sec` - connection timeout in seconds (default: 15)
 
 **Architecture:**
-The remote copy uses a three-node architecture with QUIC protocol:
+The remote copy uses a three-node architecture:
 - Master (`rcp`) orchestrates the copy operation
 - Source `rcpd` reads files from source host
 - Destination `rcpd` writes files to destination host
@@ -237,31 +236,21 @@ For detailed network connectivity and troubleshooting information, see `docs/net
 
 ## Security
 
-**Remote copy operations are secured against man-in-the-middle (MITM) attacks** using a combination of SSH authentication and certificate pinning.
+**Remote copy relies on SSH for authentication.**
 
 **Security Model:**
 - **SSH Authentication**: All remote operations require SSH authentication first
-- **TLS 1.3 Encryption**: Data transfer uses QUIC with TLS 1.3 for encryption
-- **Certificate Pinning**: SHA-256 fingerprints prevent endpoint impersonation
-- **No Configuration Required**: Security features work automatically
-
-**How It Works:**
-1. SSH authenticates and launches `rcpd` on remote hosts
-2. Certificate fingerprints are transmitted via the secure SSH channel
-3. QUIC connections validate certificates against these fingerprints
-4. Connections fail if fingerprints don't match (MITM detected)
+- **Network Trust**: Data transfers are currently unencrypted (plain TCP)
+- **Recommended**: Use on trusted networks or tunnel through VPN/SSH
 
 **What's Protected:**
-- ✅ Man-in-the-middle attacks
-- ✅ Eavesdropping (all data encrypted)
-- ✅ Data tampering (cryptographic integrity)
-- ✅ Connection hijacking
 - ✅ Unauthorized access (SSH authentication required)
+- ⚠️ Data encryption: Currently unencrypted (use trusted networks or VPN)
 
-**Trust Model:**
-- SSH is the root of trust (use SSH best practices)
-- Certificate fingerprints are ephemeral (generated per session)
-- No PKI or long-term certificate management needed
+**Best Practices:**
+- Use SSH key-based authentication
+- Run on trusted network segments (datacenter, VPN)
+- For sensitive data over untrusted networks, use SSH tunneling
 
 For detailed security architecture and threat model, see `docs/security.md`.
 
@@ -293,9 +282,9 @@ For maximum throughput, especially with remote copies over high-speed networks, 
 
 ## System-Level Tuning (Linux)
 
-### UDP Socket Buffers
+### TCP Socket Buffers
 
-`rcp` automatically requests larger UDP socket buffers for QUIC connections, but the kernel caps these to system limits. Increase the limits to allow full utilization of high-bandwidth links:
+`rcp` automatically requests larger TCP socket buffers for high-throughput transfers, but the kernel caps these to system limits. Increase the limits to allow full utilization of high-bandwidth links:
 
 ```bash
 # Check current limits
@@ -310,7 +299,7 @@ net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 ```
 
-The default of ~208 KiB is often insufficient for 10+ Gbps links.
+The default is often insufficient for 10+ Gbps links.
 
 ### Open File Limits
 
@@ -355,7 +344,7 @@ rcp --max-workers=4 /source /dest
 
 ### Remote Copy Buffer Size
 
-For remote copies, the `--remote-copy-buffer-size` flag controls the size of data chunks sent over QUIC:
+For remote copies, the `--remote-copy-buffer-size` flag controls the size of data chunks sent over TCP:
 
 ```bash
 # Larger buffers for high-bandwidth links (default: 16 MiB for datacenter)
@@ -365,68 +354,42 @@ rcp --remote-copy-buffer-size=32MiB host1:/data host2:/data
 rcp --remote-copy-buffer-size=4MiB host1:/data host2:/data
 ```
 
-### QUIC Protocol Tuning
+### Network Profile
 
-For detailed QUIC tuning (flow control windows, congestion control, RTT estimates), see [QUIC Performance Tuning](docs/quic_performance_tuning.md).
-
-Quick examples:
+Use `--network-profile` to optimize for your network type:
 
 ```bash
-# Ultra-aggressive for 100 Gbps dedicated datacenter link
-rcp --network-profile=datacenter \
-    --quic-receive-window=256MiB \
-    --quic-send-window=256MiB \
-    host1:/data host2:/data
+# For datacenter/local networks (aggressive settings)
+rcp --network-profile=datacenter host1:/data host2:/data
 
-# Conservative for internet transfers
-rcp --network-profile=internet \
-    --congestion-control=cubic \
-    host1:/data host2:/data
+# For internet transfers (conservative settings)
+rcp --network-profile=internet host1:/data host2:/data
 ```
 
-### Concurrent QUIC Streams
+### Concurrent Connections
 
-For directories with many small files, increase concurrent streams:
+For directories with many small files, increase concurrent data connections:
 
 ```bash
-# Allow more parallel file transfers per connection
-rcp --quic-max-concurrent-streams=200 host1:/many-small-files host2:/dest
+# Allow more parallel file transfers
+rcp --max-data-connections=16 host1:/many-small-files host2:/dest
 ```
 
 ## Diagnosing Performance Issues
 
-### Check UDP Buffer Sizes
+### Check TCP Buffer Sizes
 
-When `rcp` starts, it logs the actual buffer sizes achieved (visible with `-v`):
+When `rcp` starts, it logs the actual buffer sizes achieved (visible with `-v`). If the actual sizes are much smaller than requested, increase your system's `rmem_max`/`wmem_max`.
 
-```
-UDP socket buffer sizes: send=416.0 KiB recv=416.0 KiB (requested 16.0 MiB)
-```
-
-If the actual sizes are much smaller than requested, increase your system's `rmem_max`/`wmem_max`.
-
-### Check for Packet Drops
+### Check for Network Issues
 
 ```bash
-# UDP receive errors (increases indicate dropped packets)
-cat /proc/net/udp | awk 'NR>1 {sum+=$5} END {print "UDP drops:", sum}'
-
 # Network interface drops
 ip -s link show eth0 | grep -A1 RX | grep dropped
+
+# TCP retransmissions (high values indicate network congestion)
+ss -ti | grep retrans
 ```
-
-### GSO (Generic Segmentation Offload)
-
-`rcp` uses QUIC with GSO enabled by default, which dramatically improves throughput by batching UDP packets. Verify GSO is enabled on your network interface:
-
-```bash
-ethtool -k eth0 | grep segmentation
-```
-
-If you see issues, GSO can sometimes be affected by:
-- Virtual network interfaces (VMs, containers)
-- Some VPN software
-- Older kernel versions (GSO for UDP added in Linux 4.18)
 
 ## Quick Checklist
 
@@ -435,9 +398,8 @@ For optimal performance on high-speed networks:
 1. ☐ Increase `rmem_max`/`wmem_max` to 16+ MiB
 2. ☐ Increase `ulimit -n` if copying many files
 3. ☐ Use `--network-profile=datacenter` for local/datacenter networks
-4. ☐ Consider `--quic-receive-window` and `--quic-send-window` for 100+ Gbps
-5. ☐ Use `--progress` to monitor throughput in real-time
-6. ☐ Check `-v` output to verify buffer sizes and connection setup
+4. ☐ Use `--progress` to monitor throughput in real-time
+5. ☐ Check `-v` output to verify buffer sizes and connection setup
 
 Profiling
 =========
@@ -491,7 +453,7 @@ Control which spans are captured with `--profile-level` (default: `trace`):
 rcp --chrome-trace=/tmp/trace --profile-level=info /source /dest
 ```
 
-Only spans from rcp crates are captured (not tokio/quinn internals).
+Only spans from rcp crates are captured (not tokio internals).
 
 ## Tokio Console
 
