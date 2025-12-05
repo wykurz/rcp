@@ -148,6 +148,6 @@ Expand coverage for edge cases not yet tested:
 **Lightweight network simulation** (not chosen):
 - Network namespaces (Linux only, less portable)
 - Virtual interfaces with veth pairs (more complex setup)
-- Mock QUIC transport (less realistic)
+- Mock TCP transport (less realistic)
 
 Current Docker approach provides good balance of realism and simplicity.

@@ -460,8 +460,8 @@ async fn verify_remote_checksum(
 
 /// Compute SHA-256 hash of data
 fn compute_sha256(data: &[u8]) -> Vec<u8> {
-    use ring::digest;
-    digest::digest(&digest::SHA256, data).as_ref().to_vec()
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data).to_vec()
 }
 
 /// Clean up old rcpd versions on remote host

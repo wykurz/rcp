@@ -7,6 +7,58 @@ fn progress() -> &'static common::progress::Progress {
     common::get_progress()
 }
 
+/// Pool of outbound TCP connections to source's data port.
+///
+/// Destination opens connections to source's data port to receive file data.
+/// Each connection receives one file then is closed (no reuse since there's
+/// no framing for multiple files on same connection).
+struct DataConnectionPool {
+    data_addr: std::net::SocketAddr,
+    network_profile: remote::NetworkProfile,
+    /// Semaphore to limit concurrent connections
+    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl DataConnectionPool {
+    fn new(
+        data_addr: std::net::SocketAddr,
+        max_connections: usize,
+        network_profile: remote::NetworkProfile,
+    ) -> Self {
+        Self {
+            data_addr,
+            network_profile,
+            semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections)),
+        }
+    }
+    /// Open a new connection to the source's data port.
+    /// Returns a RecvStream for reading file data.
+    async fn connect(
+        &self,
+    ) -> anyhow::Result<(
+        remote::streams::RecvStream,
+        tokio::sync::OwnedSemaphorePermit,
+    )> {
+        // acquire semaphore permit (limits concurrent connections)
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("data pool closed"))?;
+        // connect to source
+        let stream = tokio::net::TcpStream::connect(self.data_addr).await?;
+        stream.set_nodelay(true)?;
+        remote::configure_tcp_buffers(&stream, self.network_profile);
+        let (read_half, _write_half) = stream.into_split();
+        let recv_stream = remote::streams::RecvStream::new(read_half);
+        Ok((recv_stream, permit))
+    }
+    fn close(&self) {
+        self.semaphore.close();
+    }
+}
+
 /// Stream state after a file processing error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamState {
@@ -122,7 +174,7 @@ async fn process_single_file(
         .instrument(tracing::trace_span!("file_create"))
         .await
         .map_err(|e| err_needs_drain(e.into()))?;
-    // buffer size is set by quic_config.effective_remote_copy_buffer_size() based on network profile,
+    // buffer size is set by tcp_config.effective_remote_copy_buffer_size() based on network profile,
     // but capped at file size to avoid over-allocation for small files
     let file_size = file_header.size.min(usize::MAX as u64) as usize;
     let buffer_size = settings.remote_copy_buffer_size.min(file_size).max(1);
@@ -286,67 +338,58 @@ async fn handle_file_stream(
     Ok(())
 }
 
-#[instrument(skip(error_occurred))]
-async fn process_incoming_file_streams(
+/// Process incoming files over TCP data connections.
+///
+/// Opens connections to source's data port and reads file data.
+/// Each connection handles multiple files until source closes it (EOF).
+#[instrument(skip(error_occurred, data_pool))]
+async fn process_incoming_file_streams_tcp(
     settings: common::copy::Settings,
     preserve: common::preserve::Settings,
-    connection: remote::streams::Connection,
+    data_pool: std::sync::Arc<DataConnectionPool>,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut join_set = tokio::task::JoinSet::new();
-    // CANCEL SAFETY: both branches are cancel-safe:
-    // - `join_set.join_next()`: cancel-safe per tokio docs (just polls task handles)
-    // - `connection.accept_uni()`: cancel-safe (waiting on QUIC internal channel)
-    loop {
-        tokio::select! {
-            // check if any spawned task completed (potentially with error)
-            Some(result) = join_set.join_next() => {
-                tracing::debug!("File stream handling task completed");
-                match result {
-                    Ok(Ok(())) => {},
-                    Ok(Err(e)) => {
-                        tracing::error!("File stream handling task failed: {e}");
-                        error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
-                        if settings.fail_early {
-                            return Err(e);
-                        }
-                    }
+    // spawn worker tasks that open connections and receive files.
+    // we spawn exactly N workers for N permits - all workers can be active simultaneously,
+    // each handling one file at a time. this is intentional: the semaphore limits concurrent
+    // *connections* (and thus concurrent file transfers), not workers. each worker loops:
+    // acquire permit -> connect -> receive files until EOF -> release permit.
+    for _ in 0..data_pool.semaphore.available_permits() {
+        let pool = data_pool.clone();
+        let tracker = directory_tracker.clone();
+        let error_flag = error_occurred.clone();
+        join_set.spawn(async move {
+            loop {
+                // try to connect to source's data port
+                let (recv_stream, _permit) = match pool.connect().await {
+                    Ok(conn) => conn,
                     Err(e) => {
-                        tracing::error!("File stream handling task panicked: {e}");
-                        error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
-                        if settings.fail_early {
-                            return Err(e.into());
-                        }
-                    }
-                }
-            }
-            // accept new file streams (each stream may contain multiple files)
-            stream_result = connection.accept_uni() => {
-                match stream_result {
-                    Ok(file_recv_stream) => {
-                        tracing::info!("Received new unidirectional stream (may contain multiple files)");
-                        let tracker = directory_tracker.clone();
-                        let error_flag = error_occurred.clone();
-                        join_set.spawn(handle_file_stream(
-                            settings,
-                            preserve,
-                            file_recv_stream,
-                            tracker.clone(),
-                            error_flag,
-                        ));
-                    }
-                    Err(e) => {
-                        // connection closed, wait for remaining tasks to complete
-                        tracing::debug!("Connection closed: {e}");
+                        // pool closed or connection failed
+                        tracing::debug!("Data connection ended: {e}");
                         break;
                     }
+                };
+                // handle one file on this connection
+                if let Err(e) = handle_file_stream(
+                    settings,
+                    preserve,
+                    recv_stream,
+                    tracker.clone(),
+                    error_flag.clone(),
+                )
+                .await
+                {
+                    tracing::debug!("File stream handling ended: {e}");
+                    break;
                 }
+                // permit is released when _permit is dropped
             }
-        }
+            Ok::<(), anyhow::Error>(())
+        });
     }
-    tracing::debug!("Waiting for remaining file stream handling tasks to complete");
-    // handle completion of remaining file streams
+    // wait for all workers to complete
     while let Some(result) = join_set.join_next().await {
         match result {
             Ok(Ok(())) => {}
@@ -657,37 +700,39 @@ async fn process_control_stream(
 
 #[instrument]
 pub async fn run_destination(
-    src_endpoint: &std::net::SocketAddr,
-    src_server_name: &str,
-    src_cert_fingerprint: &[u8],
+    src_control_addr: &std::net::SocketAddr,
+    src_data_addr: &std::net::SocketAddr,
+    _src_server_name: &str,
     settings: &common::copy::Settings,
     preserve: &common::preserve::Settings,
-    quic_config: &remote::QuicConfig,
+    tcp_config: &remote::TcpConfig,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
-    let client =
-        remote::get_client_with_config_and_pinning(quic_config, src_cert_fingerprint.to_vec())?;
-    tracing::info!("Connecting to source at {}", src_endpoint);
-    let connection = client
-        .connect(*src_endpoint, src_server_name)?
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to connect to source at {src_endpoint}. \
-                This usually means the source is unreachable from the destination. \
-                Check network connectivity and firewall rules."
-            )
-        })?;
-    tracing::info!("Connected to Source");
-    let connection = remote::streams::Connection::new(connection);
-    // accept the control stream
-    let (control_send_stream, control_recv_stream) = connection.accept_bi().await?;
-    tracing::info!("Received control stream");
+    tracing::info!(
+        "Connecting to source: control={}, data={}",
+        src_control_addr,
+        src_data_addr
+    );
+    // connect to source's control port
+    let control_stream =
+        remote::connect_tcp_control(*src_control_addr, tcp_config.conn_timeout_sec).await?;
+    tracing::info!("Connected to source control port");
+    remote::configure_tcp_buffers(&control_stream, tcp_config.network_profile);
+    // create bidirectional control connection
+    let control_connection = remote::streams::ControlConnection::new(control_stream);
+    let (control_send_stream, control_recv_stream) = control_connection.into_split();
+    tracing::info!("Created control streams");
     let directory_tracker = directory_tracker::make_shared(control_send_stream, *preserve);
     let error_occurred = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let file_handler_future = process_incoming_file_streams(
+    // create a pool of data connections to source
+    let data_pool = std::sync::Arc::new(DataConnectionPool::new(
+        *src_data_addr,
+        tcp_config.max_connections,
+        tcp_config.network_profile,
+    ));
+    let file_handler_future = process_incoming_file_streams_tcp(
         *settings,
         *preserve,
-        connection.clone(),
+        data_pool.clone(),
         directory_tracker.clone(),
         error_occurred.clone(),
     );
@@ -715,8 +760,7 @@ pub async fn run_destination(
         }
     }
     tracing::info!("Destination is done");
-    connection.close();
-    client.wait_idle().await;
+    data_pool.close();
     // build summary from progress counters
     let prog = progress();
     let summary = common::copy::Summary {

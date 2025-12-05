@@ -555,22 +555,22 @@ fn test_preserve_settings_multiple_types() {
 // Remote Copy Argument Tests
 // ============================================================================
 
-/// Test that --quic-port-ranges accepts range format
+/// Test that --port-ranges accepts range format
 #[test]
-fn test_quic_port_ranges_single() {
+fn test_port_ranges_single() {
     Command::cargo_bin("rcp")
         .unwrap()
-        .args(["--quic-port-ranges", "8000-8999", "--help"])
+        .args(["--port-ranges", "8000-8999", "--help"])
         .assert()
         .success();
 }
 
-/// Test that --quic-port-ranges accepts multiple ranges
+/// Test that --port-ranges accepts multiple ranges
 #[test]
-fn test_quic_port_ranges_multiple() {
+fn test_port_ranges_multiple() {
     Command::cargo_bin("rcp")
         .unwrap()
-        .args(["--quic-port-ranges", "8000-8999,10000-10999", "--help"])
+        .args(["--port-ranges", "8000-8999,10000-10999", "--help"])
         .assert()
         .success();
 }

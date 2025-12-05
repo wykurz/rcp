@@ -40,7 +40,6 @@
 //!
 //! When using remote paths, `rcp` automatically:
 //! - Starts `rcpd` daemons on remote hosts via SSH
-//! - Uses QUIC protocol for efficient data transfer
 //! - Transfers data directly between source and destination (not through the master)
 //!
 //! **Requirements for remote copying:**
@@ -62,7 +61,7 @@
 //!
 //! - **Parallel operations**: Uses async I/O and worker threads for maximum throughput
 //! - **Optimized for large filesets**: Much faster than `cp` when dealing with many files
-//! - **QUIC protocol**: Efficient network transport for remote operations
+//! - **Direct transfer**: Data flows directly between source and destination hosts
 //!
 //! ## Copy Semantics
 //!
@@ -101,7 +100,7 @@
 //!
 //! ## Remote Copy Configuration
 //!
-//! - `--quic-port-ranges`: Restrict QUIC to specific port ranges (e.g., "8000-8999")
+//! - `--port-ranges`: Restrict TCP data ports to specific ranges (e.g., "8000-8999")
 //! - `--remote-copy-conn-timeout-sec`: Connection timeout in seconds (default: 15)
 //!
 //! # Architecture
@@ -117,19 +116,19 @@
 //! ```text
 //! Master (rcp)
 //! ├── SSH → Source Host (rcpd in source mode)
-//! │   └── QUIC → Master
-//! │   └── QUIC Server (waits for Destination)
+//! │   └── TCP → Master (control)
+//! │   └── TCP Server (data ports, waits for Destination)
 //! └── SSH → Destination Host (rcpd in destination mode)
-//!     └── QUIC → Master
-//!     └── QUIC Client → Source
+//!     └── TCP → Master (control)
+//!     └── TCP Client → Source (data)
 //! ```
 //!
 //! **Connection flow:**
 //! 1. Master starts `rcpd` processes on both hosts via SSH
-//! 2. Both `rcpd` processes connect back to Master via QUIC
-//! 3. Source `rcpd` starts a QUIC server and sends its address to Master
-//! 4. Master forwards the address to Destination `rcpd`
-//! 5. Destination connects directly to Source
+//! 2. Both `rcpd` processes connect back to Master via TCP (control channel)
+//! 3. Source `rcpd` starts TCP listeners and sends its addresses to Master
+//! 4. Master forwards the addresses to Destination `rcpd`
+//! 5. Destination connects directly to Source's data port
 //! 6. Data flows directly from Source to Destination (not through Master)
 //!
 //! This architecture ensures efficient data transfer while allowing the Master to coordinate the operation and monitor progress.
@@ -162,7 +161,7 @@
 //! rcp /local/data server:/backup/ --progress --summary
 //!
 //! # Copy between remote hosts with custom port ranges
-//! rcp host1:/path1 host2:/path2 --quic-port-ranges "8000-8999" --progress
+//! rcp host1:/path1 host2:/path2 --port-ranges "8000-8999" --progress
 //! ```
 //!
 //! # Library Usage

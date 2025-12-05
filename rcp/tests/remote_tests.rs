@@ -59,7 +59,7 @@ fn run_rcp_with_args_internal(
     let mut cmd = std::process::Command::new("timeout");
     // 90 second timeout - SSH connection setup + auto-deployment can take ~40-50s total
     // for 2 connections (src + dst) with binary transfer, checksum verification, cleanup,
-    // plus QUIC connection establishment and actual copy operations
+    // plus TCP connection establishment and actual copy operations
     cmd.args(["90", rcp_path.to_str().unwrap()]);
     cmd.arg("-vv"); // always use maximum verbosity
     cmd.arg("--force-remote"); // force remote copy mode for localhost tests
@@ -798,7 +798,7 @@ fn test_remote_copy_port_range() {
     // we'll use a high port range to avoid conflicts with system services
     let port_range = "25000-25999";
     eprintln!("Testing remote copy with port range: {port_range}");
-    run_rcp_and_expect_success(&["--quic-port-ranges", port_range, &src_remote, &dst_remote]);
+    run_rcp_and_expect_success(&["--port-ranges", port_range, &src_remote, &dst_remote]);
     // verify the file was copied successfully
     assert_eq!(get_file_content(&dst_file), "port range test content");
 }
@@ -1700,7 +1700,7 @@ fn test_remote_rcpd_exits_when_master_killed_with_throttle() {
     child.kill().expect("Failed to kill master");
     child.wait().expect("Failed to wait for master");
     // stdin watchdog should detect master death immediately
-    // wait up to 3 seconds for rcpd to exit (stdin watchdog should be instant, QUIC timeout is 10s backup)
+    // wait up to 3 seconds for rcpd to exit (stdin watchdog should be instant)
     let start = std::time::Instant::now();
     let exited = wait_for_rcpd_exit(&new_pids, 3);
     let elapsed = start.elapsed();
@@ -1709,10 +1709,10 @@ fn test_remote_rcpd_exits_when_master_killed_with_throttle() {
         "rcpd processes should exit within 3 seconds after master is killed (stdin watchdog)"
     );
     eprintln!("✓ All rcpd processes exited in {elapsed:?} (stdin watchdog worked!)");
-    // verify it was faster than QUIC timeout would be (10 seconds)
+    // verify it was fast (stdin watchdog should be nearly instant)
     assert!(
         elapsed.as_secs() < 5,
-        "rcpd should exit quickly via stdin watchdog, not wait for QUIC timeout (10s)"
+        "rcpd should exit quickly via stdin watchdog"
     );
 }
 
@@ -1807,8 +1807,8 @@ fn test_remote_rcpd_no_zombie_processes() {
 }
 
 #[test]
-fn test_remote_rcpd_with_custom_quic_timeouts() {
-    // verify that custom QUIC timeout values are accepted and work correctly
+fn test_remote_rcpd_with_custom_tcp_timeouts() {
+    // verify that custom TCP timeout values are accepted and work correctly
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_file = src_dir.path().join("test.txt");
@@ -1818,20 +1818,19 @@ fn test_remote_rcpd_with_custom_quic_timeouts() {
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
     // test with custom timeout values
     let output = run_rcp_with_args(&[
-        "--quic-idle-timeout-sec=5",
-        "--quic-keep-alive-interval-sec=2",
+        "--remote-copy-conn-timeout-sec=30",
         &src_remote,
         &dst_remote,
     ]);
     print_command_output(&output);
     assert!(
         output.status.success(),
-        "Copy with custom QUIC timeouts should succeed"
+        "Copy with custom TCP timeouts should succeed"
     );
     assert!(dst_file.exists(), "Destination file should exist");
     let content = get_file_content(&dst_file);
     assert_eq!(content, "test content");
-    eprintln!("✓ Copy with custom QUIC timeouts succeeded");
+    eprintln!("✓ Copy with custom TCP timeouts succeeded");
 }
 
 #[test]
@@ -1845,11 +1844,7 @@ fn test_remote_rcpd_aggressive_timeout_configuration() {
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
     // test with moderately aggressive timeouts suitable for fast datacenter environments
-    // note: very aggressive values (3s-5s) can be too tight even for localhost
-    // using 8s idle timeout as a reasonable "aggressive but safe" value
     let output = run_rcp_with_args(&[
-        "--quic-idle-timeout-sec=8",
-        "--quic-keep-alive-interval-sec=1",
         "--remote-copy-conn-timeout-sec=10",
         &src_remote,
         &dst_remote,
@@ -2921,4 +2916,79 @@ fn test_remote_sudo_stream_continues_after_metadata_error() {
         "should not timeout - stream should continue after metadata error"
     );
     eprintln!("✓ Stream continued processing files after metadata error");
+}
+
+#[test]
+fn test_remote_copy_progress_reporting() {
+    // verify that progress updates are received from rcpd processes during remote copy.
+    // this test ensures the tracing/progress infrastructure is correctly wired up:
+    // - rcpd sends progress updates over the tracing TCP connection
+    // - master receives and aggregates progress from both source and destination
+    // - progress output shows non-zero file counts
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // use filegen to create many small files (10000 x 1KB) to ensure copy takes long enough
+    // for progress updates to be captured
+    let filegen_path = assert_cmd::cargo::cargo_bin("filegen");
+    let filegen_output = std::process::Command::new(&filegen_path)
+        .args([
+            src_dir.path().to_str().unwrap(),
+            "1",     // single directory
+            "10000", // 10000 files
+            "1K",    // 1KB each
+        ])
+        .output()
+        .expect("Failed to run filegen");
+    assert!(
+        filegen_output.status.success(),
+        "filegen should succeed: {}",
+        String::from_utf8_lossy(&filegen_output.stderr)
+    );
+    // filegen creates files in src_dir/filegen/
+    let filegen_dir = src_dir.path().join("filegen");
+    let src_remote = format!("localhost:{}/", filegen_dir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}/", dst_dir.path().to_str().unwrap());
+    // run with --progress and text-updates to get progress output on stderr
+    // use a short progress delay to ensure we get updates quickly
+    let output = run_rcp_with_args(&[
+        "--progress",
+        "--progress-type=text-updates",
+        "--progress-delay=100ms",
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output);
+    assert!(output.status.success(), "Copy should succeed");
+    // verify files were copied - filegen creates in src_dir/filegen/dir0/
+    // with trailing slash on src, rcp copies the directory contents into dst
+    let dst_subdir = dst_dir.path().join("filegen").join("dir0");
+    assert!(
+        dst_subdir.exists(),
+        "Destination subdirectory should exist: {:?}",
+        dst_subdir
+    );
+    // check stderr for progress output - should contain progress updates with file counts
+    // the progress output includes "files:" lines showing copied file counts
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // progress output should contain the separator lines
+    assert!(
+        stderr.contains("======================="),
+        "Progress output should contain separator lines. stderr:\n{stderr}"
+    );
+    // progress should show that files were copied (files: followed by non-zero count)
+    // the format is "files:       N" where N is the count
+    let has_files_progress = stderr.lines().any(|line| {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("files:") {
+            // parse the number after "files:"
+            rest.trim().parse::<u64>().map(|n| n > 0).unwrap_or(false)
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_files_progress,
+        "Progress output should show files being copied (files: N where N > 0). stderr:\n{stderr}"
+    );
+    eprintln!("✓ Progress reporting works correctly");
 }

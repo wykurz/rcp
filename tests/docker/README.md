@@ -197,7 +197,7 @@ rcp -vv host-a:/tmp/src.txt host-b:/tmp/dst.txt
 Look for log lines showing:
 - SSH connections to each host
 - rcpd deployment (if needed)
-- QUIC connection establishment
+- TCP connection establishment
 - File transfer progress
 - Role assignment (source vs destination)
 

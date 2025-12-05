@@ -121,6 +121,80 @@ impl PortRanges {
                 .unwrap_or_else(|| "no ports available".to_string())
         ))
     }
+
+    /// Try to bind to a TCP listener within the specified port ranges
+    pub async fn bind_tcp_listener(
+        &self,
+        ip: std::net::IpAddr,
+    ) -> anyhow::Result<tokio::net::TcpListener> {
+        use rand::seq::SliceRandom;
+        use std::time::{Duration, Instant};
+        // collect all possible ports from all ranges
+        let mut all_ports: Vec<u16> = Vec::new();
+        for range in &self.ranges {
+            all_ports.extend(range.clone());
+        }
+        // randomize the order to avoid always using the same ports
+        let mut rng = rand::thread_rng();
+        all_ports.shuffle(&mut rng);
+        let start_time = Instant::now();
+        // allow overriding the timeout via environment variable
+        let max_duration_secs = match std::env::var("RCP_TCP_BIND_MAX_DURATION_SECONDS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            Some(x) => {
+                tracing::debug!(
+                    "Using custom TCP bind timeout: {x}s (from RCP_TCP_BIND_MAX_DURATION_SECONDS)",
+                );
+                x
+            }
+            None => 5,
+        };
+        let max_duration = Duration::from_secs(max_duration_secs);
+        let mut attempts = 0;
+        let mut last_error = None;
+        for port in all_ports {
+            if start_time.elapsed() > max_duration {
+                tracing::warn!(
+                    "Port binding timeout after {} attempts in {:?}",
+                    attempts,
+                    start_time.elapsed()
+                );
+                break;
+            }
+            attempts += 1;
+            let addr = std::net::SocketAddr::new(ip, port);
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    tracing::info!(
+                        "Successfully bound TCP listener to {}:{} after {} attempts",
+                        ip,
+                        port,
+                        attempts
+                    );
+                    return Ok(listener);
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to bind TCP to {}:{}: {}", ip, port, e);
+                    // add small delay on port collisions to reduce thundering herd
+                    let is_addr_in_use = e.kind() == std::io::ErrorKind::AddrInUse;
+                    last_error = Some(e);
+                    if is_addr_in_use && attempts % 10 == 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }
+            }
+        }
+        Err(anyhow!(
+            "Failed to bind TCP to any port in the specified ranges after {} attempts in {:?}: {}",
+            attempts,
+            start_time.elapsed(),
+            last_error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "no ports available".to_string())
+        ))
+    }
 }
 
 #[cfg(test)]

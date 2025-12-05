@@ -1,7 +1,7 @@
 //! Remote copy protocol and networking for distributed file operations
 //!
 //! This crate provides the networking layer and protocol definitions for remote file copying in the RCP tools suite.
-//! It enables efficient distributed copying between remote hosts using SSH for orchestration and QUIC for high-performance data transfer.
+//! It enables efficient distributed copying between remote hosts using SSH for orchestration and TCP for high-throughput data transfer.
 //!
 //! # Overview
 //!
@@ -10,20 +10,19 @@
 //! ```text
 //! Master (rcp)
 //! ├── SSH → Source Host (rcpd)
-//! │   └── QUIC → Master (control)
-//! │   └── QUIC Server (waits for Destination)
+//! │   └── TCP → Master (control)
+//! │   └── TCP Server (accepts data connections from Destination)
 //! └── SSH → Destination Host (rcpd)
-//!     └── QUIC → Master (control)
-//!     └── QUIC Client → Source (data transfer)
+//!     └── TCP → Master (control)
+//!     └── TCP Client → Source (data transfer)
 //! ```
 //!
-
 //! ## Connection Flow
 //!
 //! 1. **Initialization**: Master starts `rcpd` processes on source and destination via SSH
-//! 2. **Control Connections**: Both `rcpd` processes connect back to Master via QUIC
-//! 3. **Address Exchange**: Source starts QUIC server and sends its address to Master
-//! 4. **Direct Connection**: Master forwards address to Destination, which connects to Source
+//! 2. **Control Connections**: Both `rcpd` processes connect back to Master via TCP
+//! 3. **Address Exchange**: Source starts TCP listeners and sends addresses to Master
+//! 4. **Direct Connection**: Master forwards addresses to Destination, which connects to Source
 //! 5. **Data Transfer**: Files flow directly from Source to Destination (not through Master)
 //!
 //! This design ensures efficient data transfer while allowing the Master to coordinate operations and monitor progress.
@@ -36,32 +35,29 @@
 //! - Launch `rcpd` daemons on remote hosts
 //! - Configure connection parameters (user, host, port)
 //!
-//! ## QUIC Networking
+//! ## TCP Networking
 //!
-//! QUIC protocol provides:
-//! - Multiplexed streams over a single connection
-//! - Built-in encryption and authentication
-//! - Efficient data transfer with congestion control
+//! TCP provides high-throughput bulk data transfer with:
+//! - Connection pooling for parallel file transfers
+//! - Configurable buffer sizes for different network profiles
+//! - Length-delimited message framing for control messages
 //!
 //! Key functions:
-//! - [`get_server_with_port_ranges`] - Create QUIC server endpoint with optional port restrictions
-//! - [`get_client_with_port_ranges_and_pinning`] - Create secure QUIC client with certificate pinning
-//! - [`get_endpoint_addr`] - Get the local address of an endpoint
+//! - [`create_tcp_control_listener`] - Create TCP listener for control connections
+//! - [`create_tcp_data_listener`] - Create TCP listener for data connections
+//! - [`connect_tcp_control`] - Connect to a TCP control server
+//! - [`get_tcp_listener_addr`] - Get externally-routable address of a listener
 //!
 //! ## Port Range Configuration
 //!
-//! The [`port_ranges`] module allows restricting QUIC to specific port ranges, useful for firewall-restricted environments:
+//! The [`port_ranges`] module allows restricting TCP to specific port ranges, useful for firewall-restricted environments:
 //!
 //! ```rust,no_run
-//! # use remote::get_server_with_port_ranges;
-//! // bind to ports in the 8000-8999 range with default timeouts
-//! // idle_timeout: 10 seconds, keep_alive: 1 second
-//! let (endpoint, cert_fingerprint) = get_server_with_port_ranges(
-//!     Some("8000-8999"),
-//!     10,  // idle_timeout_sec
-//!     1,   // keep_alive_interval_sec
-//! )?;
-//! # Ok::<(), anyhow::Error>(())
+//! # async fn example() -> anyhow::Result<()> {
+//! let config = remote::TcpConfig::default().with_port_ranges("8000-8999");
+//! let listener = remote::create_tcp_control_listener(&config, None).await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Protocol Messages
@@ -74,9 +70,9 @@
 //!
 //! ## Stream Communication
 //!
-//! The [`streams`] module provides high-level abstractions over QUIC streams:
-//! - Bidirectional streams for request/response communication
-//! - Unidirectional streams for tracing and logging
+//! The [`streams`] module provides high-level abstractions over TCP streams:
+//! - [`streams::SendStream`] / [`streams::RecvStream`] for framed message passing
+//! - [`streams::ControlConnection`] for bidirectional control channels
 //! - Object serialization/deserialization using bincode
 //!
 //! ## Remote Tracing
@@ -88,219 +84,36 @@
 //!
 //! # Security Model
 //!
-//! The remote copy system implements a defense-in-depth security model using SSH for authentication and certificate pinning for QUIC connection integrity.
-//! This provides protection against man-in-the-middle (MITM) attacks while maintaining ease of deployment.
+//! The remote copy system relies on SSH for authentication. Data transfers are currently unencrypted (plain TCP) but are protected by:
 //!
-//! ## Authentication & Authorization
+//! - **SSH Authentication**: All remote operations require SSH authentication
+//! - **Network Trust**: Assumes trusted network between source and destination
+//! - **Future TLS**: TLS encryption for data transfers can be added as a future enhancement
 //!
-//! **SSH is the security perimeter**: All remote operations begin with SSH authentication.
-//! - Initial access control is handled entirely by SSH
-//! - Users must be authenticated and authorized via SSH before any QUIC connections are established
-//! - SSH configuration (keys, permissions, etc.) determines who can initiate remote copies
-//!
-//! ## Transport Encryption & Integrity
-//!
-//! **QUIC with TLS 1.3**: All data transfer uses QUIC protocol built on TLS 1.3
-//! - Provides encryption for data confidentiality
-//! - Ensures data integrity through cryptographic authentication
-//! - Built-in protection against replay attacks
-//!
-//! ## Trust Bootstrap via Certificate Pinning
-//!
-//! **Two secured QUIC connections** in every remote copy operation:
-//!
-//! ### 1. Master ← rcpd (Control Connection)
-//! ```text
-//! Master (rcp)                    Remote Host (rcpd)
-//!    |                                   |
-//!    | 1. SSH connection established     |
-//!    |<--------------------------------->|
-//!    | 2. Master generates self-signed   |
-//!    |    cert, computes SHA-256         |
-//!    |    fingerprint                    |
-//!    |                                   |
-//!    | 3. Launch rcpd via SSH with       |
-//!    |    fingerprint as argument        |
-//!    |---------------------------------->|
-//!    |                                   |
-//!    | 4. rcpd validates Master's cert   |
-//!    |    against received fingerprint   |
-//!    |<---(QUIC + cert pinning)----------|
-//! ```
-//!
-//! - Master generates ephemeral self-signed certificate at startup
-//! - Certificate fingerprint (SHA-256) is passed to rcpd via SSH command-line arguments
-//! - rcpd validates Master's certificate by computing its fingerprint and comparing
-//! - Connection fails if fingerprints don't match (MITM protection)
-//!
-//! ### 2. Source → Destination (Data Transfer Connection)
-//! ```text
-//! Source (rcpd)                   Destination (rcpd)
-//!    |                                   |
-//!    | 1. Source generates self-signed   |
-//!    |    cert, computes SHA-256         |
-//!    |    fingerprint                    |
-//!    |                                   |
-//!    | 2. Send fingerprint + address     |
-//!    |    to Master via secure channel   |
-//!    |---------------------------------->|
-//!    |                    Master         |
-//!    |                      |            |
-//!    | 3. Master forwards   |            |
-//!    |    to Destination    |            |
-//!    |                      |----------->|
-//!    |                                   |
-//!    | 4. Destination validates Source's |
-//!    |    cert against received          |
-//!    |    fingerprint                    |
-//!    |<---(QUIC + cert pinning)----------|
-//! ```
-//!
-//! - Source generates ephemeral self-signed certificate
-//! - Fingerprint is sent to Master over already-secured Master←Source connection
-//! - Master forwards fingerprint to Destination over already-secured Master←Destination connection
-//! - Destination validates Source's certificate against fingerprint
-//! - Direct Source→Destination connection established only after successful validation
-//!
-//! ## SSH as Secure Out-of-Band Channel
-//!
-//! **Key insight**: SSH provides a secure, authenticated channel for bootstrapping QUIC trust
-//!
-//! - Certificate fingerprints are transmitted through SSH (Master→rcpd command-line arguments)
-//! - SSH connection is already authenticated and encrypted
-//! - This creates a "chain of trust":
-//!   1. User trusts SSH (proven by successful authentication)
-//!   2. SSH carries the certificate fingerprint securely
-//!   3. QUIC connection validates against that fingerprint
-//!   4. Therefore, QUIC connection is trustworthy
-//!
-//! ## Attack Resistance
-//!
-//! ### ✅ Protected Against
-//!
-//! - **Man-in-the-Middle (MITM)**: Certificate pinning prevents attackers from impersonating endpoints
-//! - **Replay Attacks**: TLS 1.3 in QUIC provides built-in replay protection
-//! - **Eavesdropping**: All data encrypted with TLS 1.3
-//! - **Tampering**: Cryptographic integrity checks prevent data modification
-//! - **Unauthorized Access**: SSH authentication is required before any operations
-//!
-//! ### ⚠️ Threat Model Assumptions
-//!
-//! - **SSH is secure**: The security model depends on SSH being properly configured and uncompromised
-//! - **Certificate fingerprints are short-lived**: Ephemeral certificates are generated per-session
-//! - **Trusted network for Master**: The machine running Master (rcp) should be trusted
-//!
-//! ## Best Practices
-//!
-//! 1. **Secure SSH Configuration**: Use key-based authentication, disable password auth
-//! 2. **Keep Systems Updated**: Ensure SSH, TLS libraries, and QUIC implementations are current
-//! 3. **Network Segmentation**: Run remote copies on trusted network segments when possible
-//! 4. **Monitor Logs**: Certificate validation failures indicate potential security issues
+//! **Best Practices**:
+//! 1. **Secure SSH Configuration**: Use key-based authentication
+//! 2. **Network Segmentation**: Run remote copies on trusted network segments
+//! 3. **Consider SSH Tunneling**: For sensitive data over untrusted networks
 //!
 //! # Network Troubleshooting
 //!
-//! Common failure scenarios and their handling:
+//! Common failure scenarios:
 //!
-//! ## SSH Connection Fails
-//! - **Cause**: Host unreachable, authentication failure
-//! - **Timeout**: ~30s (SSH default)
-//! - **Error**: Standard SSH error messages
-//!
-//! ## rcpd Cannot Connect to Master
-//! - **Cause**: Firewall blocks QUIC, network routing issue
-//! - **Timeout**: Configurable via `--remote-copy-conn-timeout-sec` (default: 15s)
-//! - **Solution**: Check firewall rules for QUIC ports
-//!
-//! ## Destination Cannot Connect to Source
-//! - **Cause**: Firewall blocks direct connection between hosts
-//! - **Timeout**: Configurable (default: 15s)
-//! - **Solution**: Use `--quic-port-ranges` to specify allowed ports, configure firewall
-//!
-//! For detailed troubleshooting, see the repository's `docs/network_connectivity.md`.
-//!
-//! # Examples
-//!
-//! ## Starting a Remote Copy Daemon
-//!
-//! ```rust,no_run
-//! use remote::{SshSession, protocol::RcpdConfig, start_rcpd};
-//! use std::net::SocketAddr;
-//!
-//! # async fn example() -> anyhow::Result<()> {
-//! let session = SshSession {
-//!     user: Some("user".to_string()),
-//!     host: "example.com".to_string(),
-//!     port: None,
-//! };
-//!
-//! let config = RcpdConfig {
-//!     verbose: 0,
-//!     fail_early: false,
-//!     max_workers: 4,
-//!     max_blocking_threads: 512,
-//!     max_open_files: None,
-//!     ops_throttle: 0,
-//!     iops_throttle: 0,
-//!     chunk_size: 1024 * 1024,
-//!     dereference: false,
-//!     overwrite: false,
-//!     overwrite_compare: String::new(),
-//!     debug_log_prefix: None,
-//!     quic_port_ranges: None,
-//!     quic_idle_timeout_sec: 10,
-//!     quic_keep_alive_interval_sec: 1,
-//!     progress: false,
-//!     progress_delay: None,
-//!     remote_copy_conn_timeout_sec: 15,
-//!     network_profile: remote::NetworkProfile::Datacenter,
-//!     congestion_control: None, // use profile default (BBR for datacenter)
-//!     quic_tuning: remote::QuicTuning::default(),
-//!     master_cert_fingerprint: Vec::new(),
-//!     chrome_trace_prefix: None,
-//!     flamegraph_prefix: None,
-//!     profile_level: Some("trace".to_string()),
-//!     tokio_console: false,
-//!     tokio_console_port: None,
-//! };
-//! let master_addr: SocketAddr = "192.168.1.100:5000".parse()?;
-//! let server_name = "master-server";
-//!
-//! let process = start_rcpd(&config, &session, &master_addr, server_name, None, false, None, remote::protocol::RcpdRole::Source).await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## Creating a QUIC Server with Port Ranges
-//!
-//! ```rust,no_run
-//! use remote::{get_server_with_port_ranges, get_endpoint_addr};
-//!
-//! # fn example() -> anyhow::Result<()> {
-//! // create server restricted to ports 8000-8999
-//! // timeouts: 10s idle, 1s keep-alive (CLI defaults)
-//! let (endpoint, _cert_fingerprint) = get_server_with_port_ranges(
-//!     Some("8000-8999"),
-//!     10,  // idle_timeout_sec
-//!     1,   // keep_alive_interval_sec
-//! )?;
-//! let addr = get_endpoint_addr(&endpoint)?;
-//! println!("Server listening on: {}", addr);
-//! # Ok(())
-//! # }
-//! ```
+//! - **SSH Connection Fails**: Host unreachable or authentication failure
+//! - **rcpd Cannot Connect to Master**: Firewall blocks TCP ports
+//! - **Destination Cannot Connect to Source**: Use `--port-ranges` to specify allowed ports
 //!
 //! # Module Organization
 //!
-//! - [`port_ranges`] - Port range parsing and UDP socket binding
+//! - [`port_ranges`] - Port range parsing and socket binding
 //! - [`protocol`] - Protocol message definitions and serialization
-//! - [`streams`] - QUIC stream wrappers with typed message passing
+//! - [`streams`] - TCP stream wrappers with typed message passing
 //! - [`tracelog`] - Remote tracing and progress aggregation
 
 #[cfg(not(tokio_unstable))]
 compile_error!("tokio_unstable cfg must be enabled; see .cargo/config.toml");
 
 use anyhow::{anyhow, Context};
-use rand::Rng;
 use tracing::instrument;
 
 pub mod deploy;
@@ -309,7 +122,7 @@ pub mod protocol;
 pub mod streams;
 pub mod tracelog;
 
-/// Network profile for QUIC configuration tuning
+/// Network profile for TCP configuration tuning
 ///
 /// Profiles provide pre-configured settings optimized for different network environments.
 /// The Datacenter profile is optimized for high-bandwidth, low-latency datacenter networks,
@@ -317,11 +130,11 @@ pub mod tracelog;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum NetworkProfile {
     /// Optimized for datacenter networks: <1ms RTT, 25-100 Gbps
-    /// Uses BBR congestion control and aggressive window sizes
+    /// Uses aggressive buffer sizes
     #[default]
     Datacenter,
     /// Conservative settings for internet connections
-    /// Uses CUBIC congestion control and standard window sizes
+    /// Uses standard buffer sizes
     Internet,
 }
 
@@ -348,14 +161,13 @@ impl std::str::FromStr for NetworkProfile {
     }
 }
 
+/// Datacenter profile: buffer size for remote copy operations (16 MiB)
+pub const DATACENTER_REMOTE_COPY_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+
+/// Internet profile: buffer size for remote copy operations (2 MiB)
+pub const INTERNET_REMOTE_COPY_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+
 impl NetworkProfile {
-    /// Returns the default congestion control algorithm for this profile
-    pub fn default_congestion_control(&self) -> CongestionControl {
-        match self {
-            Self::Datacenter => CongestionControl::Bbr,
-            Self::Internet => CongestionControl::Cubic,
-        }
-    }
     /// Returns the default buffer size for remote copy operations for this profile
     ///
     /// Datacenter profile uses a large buffer (16 MiB) matching the per-stream receive window
@@ -369,199 +181,69 @@ impl NetworkProfile {
     }
 }
 
-// ============================================================================
-// Network profile constants
-//
-// These constants define the default QUIC tuning parameters for each profile.
-// They are used in apply_quic_tuning() and NetworkProfile methods.
-// ============================================================================
-
-/// Datacenter profile: connection-level receive window (128 MiB)
-pub const DATACENTER_RECEIVE_WINDOW: u64 = 128 * 1024 * 1024;
-/// Datacenter profile: per-stream receive window (16 MiB)
-pub const DATACENTER_STREAM_RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
-/// Datacenter profile: send window (128 MiB)
-pub const DATACENTER_SEND_WINDOW: u64 = 128 * 1024 * 1024;
-/// Datacenter profile: initial RTT estimate in microseconds (0.3ms = 300µs)
-pub const DATACENTER_INITIAL_RTT_US: u64 = 300;
-
-/// Internet profile: connection-level receive window (8 MiB)
-pub const INTERNET_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
-/// Internet profile: per-stream receive window (2 MiB)
-pub const INTERNET_STREAM_RECEIVE_WINDOW: u64 = 2 * 1024 * 1024;
-/// Internet profile: send window (8 MiB)
-pub const INTERNET_SEND_WINDOW: u64 = 8 * 1024 * 1024;
-/// Internet profile: initial RTT estimate in microseconds (100ms = 100,000µs)
-pub const INTERNET_INITIAL_RTT_US: u64 = 100_000;
-
-/// Datacenter profile: buffer size for remote copy operations.
+/// Configuration for TCP connections
 ///
-/// Matches the per-stream receive window to maximize throughput on high-bandwidth
-/// datacenter networks.
-pub const DATACENTER_REMOTE_COPY_BUFFER_SIZE: usize = DATACENTER_STREAM_RECEIVE_WINDOW as usize;
-
-/// Internet profile: buffer size for remote copy operations.
-///
-/// Matches the per-stream receive window for consistency with flow control.
-pub const INTERNET_REMOTE_COPY_BUFFER_SIZE: usize = INTERNET_STREAM_RECEIVE_WINDOW as usize;
-
-/// Congestion control algorithm selection
-///
-/// BBR (default) provides faster ramp-up on dedicated high-bandwidth links.
-/// CUBIC is more conservative and fairer on shared networks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum CongestionControl {
-    /// BBR (Bottleneck Bandwidth and RTT) - model-based, fast ramp-up
-    /// Best for dedicated high-bandwidth links
-    #[default]
-    Bbr,
-    /// CUBIC - loss-based, standard TCP congestion control
-    /// Best for shared networks or internet connections
-    Cubic,
-}
-
-impl std::fmt::Display for CongestionControl {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Bbr => write!(f, "bbr"),
-            Self::Cubic => write!(f, "cubic"),
-        }
-    }
-}
-
-impl std::str::FromStr for CongestionControl {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "bbr" => Ok(Self::Bbr),
-            "cubic" => Ok(Self::Cubic),
-            _ => Err(format!(
-                "invalid congestion control '{}', expected 'bbr' or 'cubic'",
-                s
-            )),
-        }
-    }
-}
-
-/// Advanced QUIC tuning parameters
-///
-/// All fields are optional overrides. When set, they take precedence over
-/// profile defaults. Use these for fine-tuning in specific environments.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct QuicTuning {
-    /// Connection-level receive window in bytes (default: 128 MiB for datacenter, 8 MiB for internet)
-    pub receive_window: Option<u64>,
-    /// Per-stream receive window in bytes (default: 16 MiB for datacenter, 2 MiB for internet)
-    pub stream_receive_window: Option<u64>,
-    /// Send window in bytes (default: 128 MiB for datacenter, 8 MiB for internet)
-    pub send_window: Option<u64>,
-    /// Initial RTT estimate in milliseconds (default: 0.3ms for datacenter, 100ms for internet)
-    /// Accepts floating point values for sub-millisecond precision (e.g., 0.3 for 300µs)
-    pub initial_rtt_ms: Option<f64>,
-    /// Initial MTU in bytes (default: 1200)
-    pub initial_mtu: Option<u16>,
-    /// Buffer size for remote copy file transfer operations.
-    ///
-    /// Defaults to per-stream receive window size for each profile (16 MiB for datacenter,
-    /// 2 MiB for internet). This controls the buffer used when copying data between files
-    /// and network streams. Larger buffers can improve throughput but use more memory
-    /// per concurrent transfer.
-    pub remote_copy_buffer_size: Option<usize>,
-    /// Maximum concurrent streams (None or Some(0) = quinn default)
-    ///
-    /// Each file transfer uses one unidirectional stream, so this limits how many files
-    /// can be transferred in parallel over a single QUIC connection. Higher values allow
-    /// more parallelism but use more memory.
-    pub max_concurrent_streams: Option<u32>,
-}
-
-/// Configuration for QUIC connections
+/// Used to configure TCP listeners and clients for file transfers.
 #[derive(Debug, Clone)]
-pub struct QuicConfig {
-    /// Port ranges to use for QUIC connections (e.g., "8000-8999,9000-9999")
+pub struct TcpConfig {
+    /// Port ranges to use for TCP connections (e.g., "8000-8999,9000-9999")
     pub port_ranges: Option<String>,
-    /// Maximum idle time before closing connection (seconds)
-    pub idle_timeout_sec: u64,
-    /// Interval for keep-alive packets (seconds)
-    pub keep_alive_interval_sec: u64,
     /// Connection timeout for remote operations (seconds)
     pub conn_timeout_sec: u64,
     /// Network profile for tuning (default: Datacenter)
     pub network_profile: NetworkProfile,
-    /// Congestion control algorithm override (None = use profile default)
-    pub congestion_control: Option<CongestionControl>,
-    /// Advanced tuning overrides
-    pub tuning: QuicTuning,
+    /// Buffer size for file transfers (defaults to profile-specific value)
+    pub buffer_size: Option<usize>,
+    /// Maximum concurrent connections in the pool
+    pub max_connections: usize,
 }
 
-impl Default for QuicConfig {
+impl Default for TcpConfig {
     fn default() -> Self {
         Self {
             port_ranges: None,
-            idle_timeout_sec: 10,
-            keep_alive_interval_sec: 1,
             conn_timeout_sec: 15,
             network_profile: NetworkProfile::default(),
-            congestion_control: None, // use profile default
-            tuning: QuicTuning::default(),
+            buffer_size: None,
+            max_connections: 100,
         }
     }
 }
 
-impl QuicConfig {
-    /// Create QuicConfig with custom timeout values
-    pub fn with_timeouts(
-        idle_timeout_sec: u64,
-        keep_alive_interval_sec: u64,
-        conn_timeout_sec: u64,
-    ) -> Self {
+impl TcpConfig {
+    /// Create TcpConfig with custom timeout values
+    pub fn with_timeout(conn_timeout_sec: u64) -> Self {
         Self {
             port_ranges: None,
-            idle_timeout_sec,
-            keep_alive_interval_sec,
             conn_timeout_sec,
             network_profile: NetworkProfile::default(),
-            congestion_control: None,
-            tuning: QuicTuning::default(),
+            buffer_size: None,
+            max_connections: 100,
         }
     }
-
     /// Set port ranges
     pub fn with_port_ranges(mut self, ranges: impl Into<String>) -> Self {
         self.port_ranges = Some(ranges.into());
         self
     }
-
     /// Set network profile
     pub fn with_network_profile(mut self, profile: NetworkProfile) -> Self {
         self.network_profile = profile;
         self
     }
-
-    /// Set congestion control algorithm (overrides profile default)
-    pub fn with_congestion_control(mut self, cc: CongestionControl) -> Self {
-        self.congestion_control = Some(cc);
+    /// Set buffer size for file transfers
+    pub fn with_buffer_size(mut self, size: usize) -> Self {
+        self.buffer_size = Some(size);
         self
     }
-
-    /// Set advanced tuning parameters
-    pub fn with_tuning(mut self, tuning: QuicTuning) -> Self {
-        self.tuning = tuning;
+    /// Set maximum concurrent connections
+    pub fn with_max_connections(mut self, max: usize) -> Self {
+        self.max_connections = max;
         self
     }
-
-    /// Get the effective congestion control algorithm (explicit or profile default)
-    pub fn effective_congestion_control(&self) -> CongestionControl {
-        self.congestion_control
-            .unwrap_or_else(|| self.network_profile.default_congestion_control())
-    }
-    /// Get the effective remote copy buffer size (explicit or profile default)
-    ///
-    /// Returns the buffer size from tuning if set, otherwise uses the profile default
-    /// (16 MiB for datacenter, 2 MiB for internet).
-    pub fn effective_remote_copy_buffer_size(&self) -> usize {
-        self.tuning
-            .remote_copy_buffer_size
+    /// Get the effective buffer size (explicit or profile default)
+    pub fn effective_buffer_size(&self) -> usize {
+        self.buffer_size
             .unwrap_or_else(|| self.network_profile.default_remote_copy_buffer_size())
     }
 }
@@ -1087,255 +769,9 @@ pub async fn start_rcpd(
     cmd.spawn().await.context("Failed to spawn rcpd command")
 }
 
-/// Apply QUIC configuration to a transport config
-///
-/// This applies network profile settings, congestion control, and any tuning overrides.
-fn apply_quic_tuning(transport_config: &mut quinn::TransportConfig, config: &QuicConfig) {
-    // 1. apply base profile settings from the module-level constants
-    let (receive_window, stream_receive_window, send_window, initial_rtt_us) =
-        match config.network_profile {
-            NetworkProfile::Datacenter => (
-                DATACENTER_RECEIVE_WINDOW,
-                DATACENTER_STREAM_RECEIVE_WINDOW,
-                DATACENTER_SEND_WINDOW,
-                DATACENTER_INITIAL_RTT_US,
-            ),
-            NetworkProfile::Internet => (
-                INTERNET_RECEIVE_WINDOW,
-                INTERNET_STREAM_RECEIVE_WINDOW,
-                INTERNET_SEND_WINDOW,
-                INTERNET_INITIAL_RTT_US,
-            ),
-        };
-    // apply profile defaults (will be overridden by tuning if specified)
-    transport_config
-        .receive_window(quinn::VarInt::from_u64(receive_window).unwrap_or(quinn::VarInt::MAX));
-    transport_config.stream_receive_window(
-        quinn::VarInt::from_u64(stream_receive_window).unwrap_or(quinn::VarInt::MAX),
-    );
-    transport_config.send_window(send_window);
-    transport_config.initial_rtt(std::time::Duration::from_micros(initial_rtt_us));
-    // 2. apply congestion control (explicit override or profile default)
-    let effective_cc = config.effective_congestion_control();
-    match effective_cc {
-        CongestionControl::Bbr => {
-            transport_config.congestion_controller_factory(std::sync::Arc::new(
-                quinn::congestion::BbrConfig::default(),
-            ));
-        }
-        CongestionControl::Cubic => {
-            transport_config.congestion_controller_factory(std::sync::Arc::new(
-                quinn::congestion::CubicConfig::default(),
-            ));
-        }
-    }
-    // 3. apply tuning overrides (take precedence over profile)
-    if let Some(v) = config.tuning.receive_window {
-        transport_config.receive_window(quinn::VarInt::from_u64(v).unwrap_or(quinn::VarInt::MAX));
-    }
-    if let Some(v) = config.tuning.stream_receive_window {
-        transport_config
-            .stream_receive_window(quinn::VarInt::from_u64(v).unwrap_or(quinn::VarInt::MAX));
-    }
-    if let Some(v) = config.tuning.send_window {
-        transport_config.send_window(v);
-    }
-    if let Some(v) = config.tuning.initial_rtt_ms {
-        // convert f64 milliseconds to Duration (supports sub-millisecond precision)
-        let micros = (v * 1000.0) as u64;
-        transport_config.initial_rtt(std::time::Duration::from_micros(micros));
-    }
-    if let Some(v) = config.tuning.initial_mtu {
-        transport_config.initial_mtu(v);
-    }
-    if let Some(v) = config.tuning.max_concurrent_streams.filter(|&v| v > 0) {
-        transport_config.max_concurrent_uni_streams(quinn::VarInt::from_u32(v));
-    }
-    tracing::info!(
-        "Applied QUIC tuning: profile={}, congestion_control={}, receive_window={}, stream_receive_window={}, send_window={}, max_concurrent_streams={}",
-        config.network_profile,
-        effective_cc,
-        config.tuning.receive_window.unwrap_or(receive_window),
-        config.tuning.stream_receive_window.unwrap_or(stream_receive_window),
-        config.tuning.send_window.unwrap_or(send_window),
-        config.tuning.max_concurrent_streams.map_or_else(|| "default".to_string(), |v| v.to_string()),
-    );
-}
-
-/// Maximize UDP socket buffer sizes up to the system-allowed limit.
-///
-/// Unprivileged processes can request buffer sizes up to `rmem_max`/`wmem_max`.
-/// The kernel silently caps the request to these limits without erroring.
-/// This function requests large buffers (16 MiB) to improve QUIC throughput.
-///
-/// See: <https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes>
-fn maximize_socket_buffers(socket: &std::net::UdpSocket) {
-    use socket2::SockRef;
-    const TARGET_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
-    let sock_ref = SockRef::from(socket);
-    // try to set send buffer - kernel will cap to wmem_max
-    if let Err(err) = sock_ref.set_send_buffer_size(TARGET_BUFFER_SIZE) {
-        tracing::warn!("failed to set UDP send buffer size: {err:#}");
-    }
-    // try to set receive buffer - kernel will cap to rmem_max
-    if let Err(err) = sock_ref.set_recv_buffer_size(TARGET_BUFFER_SIZE) {
-        tracing::warn!("failed to set UDP receive buffer size: {err:#}");
-    }
-    // log the actual buffer sizes (kernel doubles the requested value for bookkeeping)
-    match (sock_ref.send_buffer_size(), sock_ref.recv_buffer_size()) {
-        (Ok(send), Ok(recv)) => {
-            tracing::info!(
-                "UDP socket buffer sizes: send={} recv={} (requested {})",
-                bytesize::ByteSize(send as u64),
-                bytesize::ByteSize(recv as u64),
-                bytesize::ByteSize(TARGET_BUFFER_SIZE as u64),
-            );
-        }
-        (send_result, recv_result) => {
-            tracing::debug!(
-                "could not query socket buffer sizes: send={:?} recv={:?}",
-                send_result,
-                recv_result,
-            );
-        }
-    }
-}
-
-/// Compute SHA-256 fingerprint of a DER-encoded certificate
-fn compute_cert_fingerprint(cert_der: &[u8]) -> ring::digest::Digest {
-    ring::digest::digest(&ring::digest::SHA256, cert_der)
-}
-
-/// Configure QUIC server with a self-signed certificate
-/// Returns the server config and the SHA-256 fingerprint of the certificate
-fn configure_server(config: &QuicConfig) -> anyhow::Result<(quinn::ServerConfig, Vec<u8>)> {
-    tracing::info!(
-        "Configuring QUIC server (idle_timeout={}s, keep_alive={}s, profile={}, cc={})",
-        config.idle_timeout_sec,
-        config.keep_alive_interval_sec,
-        config.network_profile,
-        config.effective_congestion_control(),
-    );
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-    let key_der = cert.serialize_private_key_der();
-    let cert_der = cert.serialize_der()?;
-    let fingerprint = compute_cert_fingerprint(&cert_der);
-    let fingerprint_vec = fingerprint.as_ref().to_vec();
-    tracing::debug!(
-        "Generated certificate with fingerprint: {}",
-        hex::encode(&fingerprint_vec)
-    );
-    let key = rustls::PrivateKey(key_der);
-    let cert = rustls::Certificate(cert_der);
-    let mut server_config = quinn::ServerConfig::with_single_cert(vec![cert], key)
-        .context("Failed to create server config")?;
-    // configure transport
-    let mut transport_config = quinn::TransportConfig::default();
-    // apply timeouts
-    transport_config.max_idle_timeout(Some(
-        std::time::Duration::from_secs(config.idle_timeout_sec)
-            .try_into()
-            .context("Failed to convert idle timeout to VarInt")?,
-    ));
-    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
-        config.keep_alive_interval_sec,
-    )));
-    // apply profile, congestion control, and tuning
-    apply_quic_tuning(&mut transport_config, config);
-    server_config.transport_config(std::sync::Arc::new(transport_config));
-    Ok((server_config, fingerprint_vec))
-}
-
-/// Create a QUIC server endpoint with the full QuicConfig
-#[instrument(skip(config))]
-pub fn get_server_with_config(config: &QuicConfig) -> anyhow::Result<(quinn::Endpoint, Vec<u8>)> {
-    let (server_config, cert_fingerprint) = configure_server(config)?;
-    let socket = if let Some(ranges_str) = config.port_ranges.as_deref() {
-        let ranges = port_ranges::PortRanges::parse(ranges_str)?;
-        ranges.bind_udp_socket(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))?
-    } else {
-        // default behavior: bind to any available port
-        std::net::UdpSocket::bind("0.0.0.0:0")?
-    };
-    maximize_socket_buffers(&socket);
-    let endpoint = quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
-        Some(server_config),
-        socket,
-        std::sync::Arc::new(quinn::TokioRuntime),
-    )
-    .context("Failed to create QUIC endpoint")?;
-    Ok((endpoint, cert_fingerprint))
-}
-
-/// Create a QUIC server endpoint (legacy API for backwards compatibility)
-#[instrument]
-pub fn get_server_with_port_ranges(
-    port_ranges: Option<&str>,
-    idle_timeout_sec: u64,
-    keep_alive_interval_sec: u64,
-) -> anyhow::Result<(quinn::Endpoint, Vec<u8>)> {
-    let mut config = QuicConfig::with_timeouts(
-        idle_timeout_sec,
-        keep_alive_interval_sec,
-        15, // default conn_timeout
-    );
-    if let Some(ranges) = port_ranges {
-        config.port_ranges = Some(ranges.to_string());
-    }
-    get_server_with_config(&config)
-}
-
-// certificate verifier that validates against a pinned certificate fingerprint
-// This prevents MITM attacks by ensuring we're connecting to the expected server
-struct PinnedCertVerifier {
-    expected_fingerprint: Vec<u8>,
-}
-
-impl PinnedCertVerifier {
-    fn new(expected_fingerprint: Vec<u8>) -> Self {
-        Self {
-            expected_fingerprint,
-        }
-    }
-}
-
-impl rustls::client::ServerCertVerifier for PinnedCertVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        let received_fingerprint = compute_cert_fingerprint(&end_entity.0);
-        if received_fingerprint.as_ref() == self.expected_fingerprint.as_slice() {
-            tracing::debug!(
-                "Certificate fingerprint validated successfully: {}",
-                hex::encode(&self.expected_fingerprint)
-            );
-            Ok(rustls::client::ServerCertVerified::assertion())
-        } else {
-            tracing::error!(
-                "Certificate fingerprint mismatch! Expected: {}, Got: {}",
-                hex::encode(&self.expected_fingerprint),
-                hex::encode(received_fingerprint)
-            );
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::Other(std::sync::Arc::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "Certificate fingerprint mismatch (expected {}, got {})",
-                        hex::encode(&self.expected_fingerprint),
-                        hex::encode(received_fingerprint)
-                    ),
-                ))),
-            ))
-        }
-    }
-}
+// ============================================================================
+// IP address detection
+// ============================================================================
 
 fn get_local_ip(explicit_bind_ip: Option<&str>) -> anyhow::Result<std::net::IpAddr> {
     // if explicit IP provided, validate and use it
@@ -1351,18 +787,16 @@ fn get_local_ip(explicit_bind_ip: Option<&str>) -> anyhow::Result<std::net::IpAd
             std::net::IpAddr::V6(_) => {
                 anyhow::bail!(
                     "IPv6 address not supported for binding (got {}). \
-                     QUIC endpoint binds to 0.0.0.0 (IPv4 only)",
+                     TCP endpoints bind to 0.0.0.0 (IPv4 only)",
                     ip
                 );
             }
         }
     }
-
     // auto-detection: try kernel routing first
     if let Some(ipv4) = try_ipv4_via_kernel_routing()? {
         return Ok(std::net::IpAddr::V4(ipv4));
     }
-
     // fallback to interface enumeration
     tracing::debug!("routing-based detection failed, falling back to interface enumeration");
     let interfaces = collect_ipv4_interfaces().context("Failed to enumerate network interfaces")?;
@@ -1370,19 +804,13 @@ fn get_local_ip(explicit_bind_ip: Option<&str>) -> anyhow::Result<std::net::IpAd
         tracing::debug!("using IPv4 address from interface scan: {}", ipv4);
         return Ok(std::net::IpAddr::V4(ipv4));
     }
-
-    anyhow::bail!("No IPv4 interfaces found (QUIC endpoint requires IPv4 as it binds to 0.0.0.0)")
+    anyhow::bail!("No IPv4 interfaces found (TCP endpoints require IPv4 as they bind to 0.0.0.0)")
 }
 
 fn try_ipv4_via_kernel_routing() -> anyhow::Result<Option<std::net::Ipv4Addr>> {
-    // important: our QUIC endpoints bind to 0.0.0.0 (IPv4-only), so we must return IPv4
     // strategy: ask the kernel which interface it would use by connecting to RFC1918 targets.
     // these addresses never leave the local network but still exercise the routing table.
-    let private_ips = [
-        "10.0.0.1:80",    // class a private
-        "172.16.0.1:80",  // class b private
-        "192.168.1.1:80", // class c private
-    ];
+    let private_ips = ["10.0.0.1:80", "172.16.0.1:80", "192.168.1.1:80"];
     for addr_str in &private_ips {
         let addr = addr_str
             .parse::<std::net::SocketAddr>()
@@ -1473,7 +901,6 @@ fn classify_interface(name: &str, addr: &std::net::Ipv4Addr) -> InterfaceCategor
     if addr.is_loopback() {
         return InterfaceCategory::Loopback;
     }
-
     let normalized = normalize_interface_name(name);
     if is_virtual_interface(&normalized) {
         return InterfaceCategory::Virtual;
@@ -1521,36 +948,17 @@ fn is_virtual_interface(name: &str) -> bool {
 
 fn is_preferred_physical_interface(name: &str) -> bool {
     const PHYSICAL_PREFIXES: &[&str] = &[
-        "en",  // linux + macos ethernet (en0, enp3s0, eno1, etc.)
-        "eth", // legacy ethernet naming
-        "em",  // embedded NICs (em1, etc.)
-        "eno", "ens", "enp", "wl", // wi-fi
-        "ww", // wwan
-        "wlan", "ethernet", // windows
-        "lan", "wifi",
+        "en", "eth", "em", "eno", "ens", "enp", "wl", "ww", "wlan", "ethernet", "lan", "wifi",
     ];
     PHYSICAL_PREFIXES
         .iter()
         .any(|prefix| name.starts_with(prefix))
 }
 
-#[instrument]
-pub fn get_endpoint_addr(endpoint: &quinn::Endpoint) -> anyhow::Result<std::net::SocketAddr> {
-    get_endpoint_addr_with_bind_ip(endpoint, None)
-}
-
-pub fn get_endpoint_addr_with_bind_ip(
-    endpoint: &quinn::Endpoint,
-    bind_ip: Option<&str>,
-) -> anyhow::Result<std::net::SocketAddr> {
-    // endpoint is bound to 0.0.0.0 so we need to get the local IP address
-    let local_ip = get_local_ip(bind_ip).context("Failed to get local IP address")?;
-    let endpoint_addr = endpoint.local_addr()?;
-    Ok(std::net::SocketAddr::new(local_ip, endpoint_addr.port()))
-}
-
+/// Generate a random server name for identifying connections
 #[instrument]
 pub fn get_random_server_name() -> String {
+    use rand::Rng;
     rand::thread_rng()
         .sample_iter(&rand::distributions::Alphanumeric)
         .take(20)
@@ -1558,100 +966,121 @@ pub fn get_random_server_name() -> String {
         .collect()
 }
 
-/// Create a QUIC client endpoint with the full QuicConfig and certificate pinning
+// ============================================================================
+// TCP server and client functions
+// ============================================================================
+
+/// Create a TCP listener for control connections
+///
+/// Returns a listener bound to the specified port range (or any available port).
 #[instrument(skip(config))]
-pub fn get_client_with_config_and_pinning(
-    config: &QuicConfig,
-    cert_fingerprint: Vec<u8>,
-) -> anyhow::Result<quinn::Endpoint> {
-    tracing::info!(
-        "Creating QUIC client (fingerprint: {}, idle_timeout={}s, keep_alive={}s, profile={}, cc={})",
-        hex::encode(&cert_fingerprint),
-        config.idle_timeout_sec,
-        config.keep_alive_interval_sec,
-        config.network_profile,
-        config.effective_congestion_control(),
-    );
-    // create a crypto backend with certificate pinning
-    let crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_custom_certificate_verifier(std::sync::Arc::new(PinnedCertVerifier::new(
-            cert_fingerprint,
-        )))
-        .with_no_client_auth();
-    create_client_endpoint_with_config(config, crypto)
-}
-
-/// Create a QUIC client endpoint (legacy API for backwards compatibility)
-#[instrument]
-pub fn get_client_with_port_ranges_and_pinning(
-    port_ranges: Option<&str>,
-    cert_fingerprint: Vec<u8>,
-    idle_timeout_sec: u64,
-    keep_alive_interval_sec: u64,
-) -> anyhow::Result<quinn::Endpoint> {
-    let mut config = QuicConfig::with_timeouts(
-        idle_timeout_sec,
-        keep_alive_interval_sec,
-        15, // default conn_timeout
-    );
-    if let Some(ranges) = port_ranges {
-        config.port_ranges = Some(ranges.to_string());
-    }
-    get_client_with_config_and_pinning(&config, cert_fingerprint)
-}
-
-// helper function to create client endpoint with given crypto config and QuicConfig
-fn create_client_endpoint_with_config(
-    config: &QuicConfig,
-    crypto: rustls::ClientConfig,
-) -> anyhow::Result<quinn::Endpoint> {
-    // create QUIC client config
-    let mut client_config = quinn::ClientConfig::new(std::sync::Arc::new(crypto));
-    let mut transport_config = quinn::TransportConfig::default();
-    // apply timeouts
-    transport_config.max_idle_timeout(Some(
-        std::time::Duration::from_secs(config.idle_timeout_sec)
-            .try_into()
-            .context("Failed to convert idle timeout to VarInt")?,
-    ));
-    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
-        config.keep_alive_interval_sec,
-    )));
-    // apply profile, congestion control, and tuning
-    apply_quic_tuning(&mut transport_config, config);
-    client_config.transport_config(std::sync::Arc::new(transport_config));
-    let socket = if let Some(ranges_str) = config.port_ranges.as_deref() {
-        let ranges = port_ranges::PortRanges::parse(ranges_str)?;
-        ranges.bind_udp_socket(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))?
+pub async fn create_tcp_control_listener(
+    config: &TcpConfig,
+    bind_ip: Option<&str>,
+) -> anyhow::Result<tokio::net::TcpListener> {
+    let bind_addr = if let Some(ip_str) = bind_ip {
+        let ip = ip_str
+            .parse::<std::net::IpAddr>()
+            .with_context(|| format!("invalid IP address: {}", ip_str))?;
+        std::net::SocketAddr::new(ip, 0)
     } else {
-        // default behavior: bind to any available port
-        std::net::UdpSocket::bind("0.0.0.0:0")?
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
     };
-    maximize_socket_buffers(&socket);
-    // create and configure endpoint
-    let mut endpoint = quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
-        None, // No server config for client
-        socket,
-        std::sync::Arc::new(quinn::TokioRuntime),
-    )
-    .context("Failed to create QUIC endpoint")?;
-    endpoint.set_default_client_config(client_config);
-    Ok(endpoint)
+    let listener = if let Some(ranges_str) = config.port_ranges.as_deref() {
+        let ranges = port_ranges::PortRanges::parse(ranges_str)?;
+        ranges.bind_tcp_listener(bind_addr.ip()).await?
+    } else {
+        tokio::net::TcpListener::bind(bind_addr).await?
+    };
+    let local_addr = listener.local_addr()?;
+    tracing::info!("TCP control listener bound to {}", local_addr);
+    Ok(listener)
 }
 
-#[cfg(test)]
-pub mod test_defaults {
-    //! Test-only constants for QUIC timeout defaults
-    //! These should not be used in production code - all production code should
-    //! receive timeout values from CLI arguments
+/// Create a TCP listener for data connections (file transfers)
+///
+/// Returns a listener bound to the specified port range (or any available port).
+#[instrument(skip(config))]
+pub async fn create_tcp_data_listener(
+    config: &TcpConfig,
+    bind_ip: Option<&str>,
+) -> anyhow::Result<tokio::net::TcpListener> {
+    let bind_addr = if let Some(ip_str) = bind_ip {
+        let ip = ip_str
+            .parse::<std::net::IpAddr>()
+            .with_context(|| format!("invalid IP address: {}", ip_str))?;
+        std::net::SocketAddr::new(ip, 0)
+    } else {
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+    };
+    let listener = if let Some(ranges_str) = config.port_ranges.as_deref() {
+        let ranges = port_ranges::PortRanges::parse(ranges_str)?;
+        ranges.bind_tcp_listener(bind_addr.ip()).await?
+    } else {
+        tokio::net::TcpListener::bind(bind_addr).await?
+    };
+    let local_addr = listener.local_addr()?;
+    tracing::info!("TCP data listener bound to {}", local_addr);
+    Ok(listener)
+}
 
-    /// Default QUIC idle timeout in seconds for tests
-    pub const DEFAULT_QUIC_IDLE_TIMEOUT_SEC: u64 = 10;
+/// Get the external address of a TCP listener
+///
+/// Similar to `get_endpoint_addr_with_bind_ip`, replaces 0.0.0.0 with the local IP.
+pub fn get_tcp_listener_addr(
+    listener: &tokio::net::TcpListener,
+    bind_ip: Option<&str>,
+) -> anyhow::Result<std::net::SocketAddr> {
+    let local_addr = listener.local_addr()?;
+    if local_addr.ip().is_unspecified() {
+        let local_ip = get_local_ip(bind_ip).context("failed to get local IP address")?;
+        Ok(std::net::SocketAddr::new(local_ip, local_addr.port()))
+    } else {
+        Ok(local_addr)
+    }
+}
 
-    /// Default QUIC keep-alive interval in seconds for tests
-    pub const DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC: u64 = 1;
+/// Connect to a TCP control server with timeout
+#[instrument]
+pub async fn connect_tcp_control(
+    addr: std::net::SocketAddr,
+    timeout_sec: u64,
+) -> anyhow::Result<tokio::net::TcpStream> {
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_sec),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .with_context(|| format!("connection to {} timed out after {}s", addr, timeout_sec))?
+    .with_context(|| format!("failed to connect to {}", addr))?;
+    stream.set_nodelay(true)?;
+    tracing::debug!("connected to TCP control server at {}", addr);
+    Ok(stream)
+}
+
+/// Configure TCP socket buffer sizes for high throughput
+///
+/// Similar to `maximize_socket_buffers` for UDP, but for TCP sockets.
+pub fn configure_tcp_buffers(stream: &tokio::net::TcpStream, profile: NetworkProfile) {
+    use socket2::SockRef;
+    let (send_buf, recv_buf) = match profile {
+        NetworkProfile::Datacenter => (16 * 1024 * 1024, 16 * 1024 * 1024),
+        NetworkProfile::Internet => (2 * 1024 * 1024, 2 * 1024 * 1024),
+    };
+    let sock_ref = SockRef::from(stream);
+    if let Err(err) = sock_ref.set_send_buffer_size(send_buf) {
+        tracing::warn!("failed to set TCP send buffer size: {err:#}");
+    }
+    if let Err(err) = sock_ref.set_recv_buffer_size(recv_buf) {
+        tracing::warn!("failed to set TCP receive buffer size: {err:#}");
+    }
+    if let (Ok(send), Ok(recv)) = (sock_ref.send_buffer_size(), sock_ref.recv_buffer_size()) {
+        tracing::debug!(
+            "TCP socket buffer sizes: send={} recv={}",
+            bytesize::ByteSize(send as u64),
+            bytesize::ByteSize(recv as u64),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1736,19 +1165,6 @@ mod tests {
                 }
             })
         }
-    }
-
-    fn endpoint_or_skip() -> (quinn::Endpoint, Vec<u8>) {
-        get_server_with_port_ranges(
-            None,
-            test_defaults::DEFAULT_QUIC_IDLE_TIMEOUT_SEC,
-            test_defaults::DEFAULT_QUIC_KEEP_ALIVE_INTERVAL_SEC,
-        )
-        .unwrap_or_else(|err| {
-            panic!(
-                "Failed to create QUIC endpoint for test; ensure UDP binding is permitted: {err:#}"
-            )
-        })
     }
 
     #[tokio::test]
@@ -1914,18 +1330,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_get_endpoint_addr_returns_ipv4() {
-        // verify that get_endpoint_addr also returns IPv4 only
-        // create a test endpoint
-        let (endpoint, _fingerprint) = endpoint_or_skip();
-        let addr = get_endpoint_addr(&endpoint).expect("should get endpoint address");
-        assert!(
-            addr.is_ipv4(),
-            "get_endpoint_addr must return IPv4 address (got {addr})"
-        );
-    }
-
     #[test]
     fn test_get_local_ip_with_explicit_ipv4() {
         // test that providing a valid IPv4 address works
@@ -2003,478 +1407,6 @@ mod tests {
         assert!(
             err_msg.contains("invalid IP address"),
             "error should mention invalid IP address, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_endpoint_addr_with_bind_ip_explicit() {
-        // test that get_endpoint_addr_with_bind_ip works with explicit IP
-        let (endpoint, _fingerprint) = endpoint_or_skip();
-        let addr = get_endpoint_addr_with_bind_ip(&endpoint, Some("127.0.0.1"))
-            .expect("should get endpoint address with bind IP");
-        assert_eq!(
-            addr.ip(),
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
-        );
-        // port should come from the endpoint
-        assert_eq!(addr.port(), endpoint.local_addr().unwrap().port());
-    }
-
-    #[tokio::test]
-    async fn test_get_endpoint_addr_with_bind_ip_auto() {
-        // test that get_endpoint_addr_with_bind_ip works with auto-detection (None)
-        let (endpoint, _fingerprint) = endpoint_or_skip();
-        let addr =
-            get_endpoint_addr_with_bind_ip(&endpoint, None).expect("should get endpoint address");
-        assert!(addr.is_ipv4(), "should return IPv4 address");
-        // port should come from the endpoint
-        assert_eq!(addr.port(), endpoint.local_addr().unwrap().port());
-    }
-}
-
-#[cfg(test)]
-mod quic_tuning_tests {
-    use super::*;
-
-    // helper to create a QuicConfig with defaults
-    fn default_quic_config() -> QuicConfig {
-        QuicConfig {
-            port_ranges: None,
-            idle_timeout_sec: 10,
-            keep_alive_interval_sec: 1,
-            conn_timeout_sec: 15,
-            network_profile: NetworkProfile::Datacenter,
-            congestion_control: None,
-            tuning: QuicTuning::default(),
-        }
-    }
-
-    // Datacenter profile constants (from apply_quic_tuning implementation)
-    // note: network profile constants are now defined at module level (DATACENTER_RECEIVE_WINDOW, etc.)
-    // and used both in apply_quic_tuning() and NetworkProfile methods.
-    // quinn's TransportConfig doesn't expose getter methods, so we can't directly
-    // verify the values that were set. Instead, we test that apply_quic_tuning doesn't
-    // panic with various inputs and test the logic of QuicConfig separately.
-
-    #[test]
-    fn test_apply_quic_tuning_datacenter_profile_does_not_panic() {
-        let config = default_quic_config();
-        let mut transport = quinn::TransportConfig::default();
-        // should not panic
-        apply_quic_tuning(&mut transport, &config);
-    }
-
-    #[test]
-    fn test_apply_quic_tuning_internet_profile_does_not_panic() {
-        let mut config = default_quic_config();
-        config.network_profile = NetworkProfile::Internet;
-        let mut transport = quinn::TransportConfig::default();
-        // should not panic
-        apply_quic_tuning(&mut transport, &config);
-    }
-
-    #[test]
-    fn test_apply_quic_tuning_with_all_overrides_does_not_panic() {
-        let mut config = default_quic_config();
-        config.tuning = QuicTuning {
-            receive_window: Some(64 * 1024 * 1024),
-            stream_receive_window: Some(8 * 1024 * 1024),
-            send_window: Some(32 * 1024 * 1024),
-            initial_rtt_ms: Some(50.0),
-            initial_mtu: Some(1400),
-            remote_copy_buffer_size: Some(512 * 1024),
-            max_concurrent_streams: Some(200),
-        };
-        let mut transport = quinn::TransportConfig::default();
-        // should not panic
-        apply_quic_tuning(&mut transport, &config);
-    }
-
-    #[test]
-    fn test_apply_quic_tuning_with_partial_overrides_does_not_panic() {
-        let mut config = default_quic_config();
-        // only override some values
-        config.tuning.receive_window = Some(256 * 1024 * 1024);
-        config.tuning.initial_rtt_ms = Some(10.0);
-        let mut transport = quinn::TransportConfig::default();
-        // should not panic
-        apply_quic_tuning(&mut transport, &config);
-    }
-
-    #[test]
-    fn test_apply_quic_tuning_bbr_congestion_control_does_not_panic() {
-        let mut config = default_quic_config();
-        config.congestion_control = Some(CongestionControl::Bbr);
-        let mut transport = quinn::TransportConfig::default();
-        // should not panic
-        apply_quic_tuning(&mut transport, &config);
-    }
-
-    #[test]
-    fn test_apply_quic_tuning_cubic_congestion_control_does_not_panic() {
-        let mut config = default_quic_config();
-        config.congestion_control = Some(CongestionControl::Cubic);
-        let mut transport = quinn::TransportConfig::default();
-        // should not panic
-        apply_quic_tuning(&mut transport, &config);
-    }
-
-    #[test]
-    fn test_varint_overflow_handling_receive_window_does_not_panic() {
-        let mut config = default_quic_config();
-        // VarInt max is 2^62 - 1; u64::MAX exceeds this and should trigger the
-        // unwrap_or(VarInt::MAX) fallback instead of panicking
-        config.tuning.receive_window = Some(u64::MAX);
-        let mut transport = quinn::TransportConfig::default();
-        // should not panic - the fallback should handle the overflow
-        apply_quic_tuning(&mut transport, &config);
-    }
-
-    #[test]
-    fn test_varint_overflow_handling_stream_receive_window_does_not_panic() {
-        let mut config = default_quic_config();
-        config.tuning.stream_receive_window = Some(u64::MAX);
-        let mut transport = quinn::TransportConfig::default();
-        // should not panic - the fallback should handle the overflow
-        apply_quic_tuning(&mut transport, &config);
-    }
-
-    #[test]
-    fn test_varint_at_max_boundary_does_not_panic() {
-        let mut config = default_quic_config();
-        // VarInt::MAX is 2^62 - 1 = 4611686018427387903
-        // test values just at and around the boundary
-        config.tuning.receive_window = Some(quinn::VarInt::MAX.into_inner());
-        let mut transport = quinn::TransportConfig::default();
-        // should not panic
-        apply_quic_tuning(&mut transport, &config);
-    }
-
-    #[test]
-    fn test_varint_just_over_max_does_not_panic() {
-        let mut config = default_quic_config();
-        // VarInt::MAX + 1 should trigger the overflow handling
-        let over_max: u64 = quinn::VarInt::MAX.into_inner() + 1;
-        config.tuning.receive_window = Some(over_max);
-        let mut transport = quinn::TransportConfig::default();
-        // should not panic - fallback to VarInt::MAX
-        apply_quic_tuning(&mut transport, &config);
-    }
-
-    #[test]
-    fn test_sub_millisecond_rtt_does_not_panic() {
-        let mut config = default_quic_config();
-        // test sub-millisecond RTT (0.3ms = 300 microseconds, typical for datacenter)
-        config.tuning.initial_rtt_ms = Some(0.3);
-        let mut transport = quinn::TransportConfig::default();
-        // should not panic
-        apply_quic_tuning(&mut transport, &config);
-    }
-
-    #[test]
-    fn test_fractional_rtt_precision_does_not_panic() {
-        let mut config = default_quic_config();
-        // test various fractional millisecond values
-        for rtt in [0.1, 0.25, 0.5, 1.5, 10.75, 100.0] {
-            config.tuning.initial_rtt_ms = Some(rtt);
-            let mut transport = quinn::TransportConfig::default();
-            // should not panic
-            apply_quic_tuning(&mut transport, &config);
-        }
-    }
-
-    #[test]
-    fn test_datacenter_profile_uses_bbr_by_default() {
-        let config = default_quic_config();
-        assert_eq!(config.network_profile, NetworkProfile::Datacenter);
-        assert_eq!(config.congestion_control, None);
-        // effective congestion control should be BBR for datacenter
-        assert_eq!(
-            config.effective_congestion_control(),
-            CongestionControl::Bbr,
-            "datacenter profile should default to BBR"
-        );
-    }
-
-    #[test]
-    fn test_internet_profile_uses_cubic_by_default() {
-        let mut config = default_quic_config();
-        config.network_profile = NetworkProfile::Internet;
-        assert_eq!(config.congestion_control, None);
-        // effective congestion control should be CUBIC for internet
-        assert_eq!(
-            config.effective_congestion_control(),
-            CongestionControl::Cubic,
-            "internet profile should default to CUBIC"
-        );
-    }
-
-    #[test]
-    fn test_congestion_control_override_on_datacenter() {
-        let mut config = default_quic_config();
-        config.network_profile = NetworkProfile::Datacenter;
-        config.congestion_control = Some(CongestionControl::Cubic);
-        // explicit override should take precedence
-        assert_eq!(
-            config.effective_congestion_control(),
-            CongestionControl::Cubic,
-            "explicit CUBIC should override datacenter's default BBR"
-        );
-    }
-
-    #[test]
-    fn test_congestion_control_override_on_internet() {
-        let mut config = default_quic_config();
-        config.network_profile = NetworkProfile::Internet;
-        config.congestion_control = Some(CongestionControl::Bbr);
-        // explicit override should take precedence
-        assert_eq!(
-            config.effective_congestion_control(),
-            CongestionControl::Bbr,
-            "explicit BBR should override internet's default CUBIC"
-        );
-    }
-
-    #[test]
-    fn test_network_profile_default_congestion_control() {
-        assert_eq!(
-            NetworkProfile::Datacenter.default_congestion_control(),
-            CongestionControl::Bbr
-        );
-        assert_eq!(
-            NetworkProfile::Internet.default_congestion_control(),
-            CongestionControl::Cubic
-        );
-    }
-
-    #[test]
-    fn test_network_profile_display() {
-        assert_eq!(format!("{}", NetworkProfile::Datacenter), "datacenter");
-        assert_eq!(format!("{}", NetworkProfile::Internet), "internet");
-    }
-
-    #[test]
-    fn test_congestion_control_display() {
-        assert_eq!(format!("{}", CongestionControl::Bbr), "bbr");
-        assert_eq!(format!("{}", CongestionControl::Cubic), "cubic");
-    }
-
-    #[test]
-    fn test_network_profile_from_str() {
-        assert_eq!(
-            "datacenter".parse::<NetworkProfile>().unwrap(),
-            NetworkProfile::Datacenter
-        );
-        assert_eq!(
-            "DATACENTER".parse::<NetworkProfile>().unwrap(),
-            NetworkProfile::Datacenter
-        );
-        assert_eq!(
-            "internet".parse::<NetworkProfile>().unwrap(),
-            NetworkProfile::Internet
-        );
-        assert_eq!(
-            "INTERNET".parse::<NetworkProfile>().unwrap(),
-            NetworkProfile::Internet
-        );
-        assert!("invalid".parse::<NetworkProfile>().is_err());
-    }
-
-    #[test]
-    fn test_network_profile_from_str_error_message() {
-        let err = "invalid".parse::<NetworkProfile>().unwrap_err();
-        assert!(
-            err.to_string().contains("invalid network profile"),
-            "error should mention invalid profile: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_congestion_control_from_str() {
-        assert_eq!(
-            "bbr".parse::<CongestionControl>().unwrap(),
-            CongestionControl::Bbr
-        );
-        assert_eq!(
-            "BBR".parse::<CongestionControl>().unwrap(),
-            CongestionControl::Bbr
-        );
-        assert_eq!(
-            "cubic".parse::<CongestionControl>().unwrap(),
-            CongestionControl::Cubic
-        );
-        assert_eq!(
-            "CUBIC".parse::<CongestionControl>().unwrap(),
-            CongestionControl::Cubic
-        );
-        assert!("invalid".parse::<CongestionControl>().is_err());
-    }
-
-    #[test]
-    fn test_congestion_control_from_str_error_message() {
-        let err = "invalid".parse::<CongestionControl>().unwrap_err();
-        assert!(
-            err.to_string().contains("invalid congestion control"),
-            "error should mention invalid cc: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_quic_tuning_default() {
-        let tuning = QuicTuning::default();
-        assert!(tuning.receive_window.is_none());
-        assert!(tuning.stream_receive_window.is_none());
-        assert!(tuning.send_window.is_none());
-        assert!(tuning.initial_rtt_ms.is_none());
-        assert!(tuning.initial_mtu.is_none());
-    }
-
-    #[test]
-    fn test_quic_config_default_values() {
-        let config = default_quic_config();
-        assert_eq!(config.network_profile, NetworkProfile::Datacenter);
-        assert_eq!(config.congestion_control, None);
-        assert!(config.tuning.receive_window.is_none());
-        assert!(config.tuning.remote_copy_buffer_size.is_none());
-    }
-
-    #[test]
-    fn test_profile_window_sizes_match_documentation() {
-        // verify that the constants match what's documented in docs/quic_performance_tuning.md
-        // datacenter: 128 MiB receive, 16 MiB stream, 128 MiB send, 0.3ms RTT
-        assert_eq!(DATACENTER_RECEIVE_WINDOW, 128 * 1024 * 1024);
-        assert_eq!(DATACENTER_STREAM_RECEIVE_WINDOW, 16 * 1024 * 1024);
-        assert_eq!(DATACENTER_SEND_WINDOW, 128 * 1024 * 1024);
-        assert_eq!(DATACENTER_INITIAL_RTT_US, 300); // 0.3ms = 300 microseconds
-                                                    // internet: 8 MiB receive, 2 MiB stream, 8 MiB send, 100ms RTT
-        assert_eq!(INTERNET_RECEIVE_WINDOW, 8 * 1024 * 1024);
-        assert_eq!(INTERNET_STREAM_RECEIVE_WINDOW, 2 * 1024 * 1024);
-        assert_eq!(INTERNET_SEND_WINDOW, 8 * 1024 * 1024);
-        assert_eq!(INTERNET_INITIAL_RTT_US, 100_000); // 100ms = 100,000 microseconds
-    }
-
-    #[test]
-    fn test_network_profile_default_is_datacenter() {
-        // verify that NetworkProfile::default() returns Datacenter as documented
-        assert_eq!(NetworkProfile::default(), NetworkProfile::Datacenter);
-    }
-
-    #[test]
-    fn test_network_profile_default_remote_copy_buffer_size() {
-        // datacenter profile should use buffer matching per-stream receive window
-        assert_eq!(
-            NetworkProfile::Datacenter.default_remote_copy_buffer_size(),
-            DATACENTER_STREAM_RECEIVE_WINDOW as usize
-        );
-        // internet profile should use buffer matching per-stream receive window
-        assert_eq!(
-            NetworkProfile::Internet.default_remote_copy_buffer_size(),
-            INTERNET_STREAM_RECEIVE_WINDOW as usize
-        );
-    }
-
-    #[test]
-    fn test_quic_config_effective_remote_copy_buffer_size_uses_profile_default() {
-        // when no override is set, should use profile default
-        let config = default_quic_config();
-        assert_eq!(config.network_profile, NetworkProfile::Datacenter);
-        assert_eq!(
-            config.effective_remote_copy_buffer_size(),
-            DATACENTER_REMOTE_COPY_BUFFER_SIZE
-        );
-        // internet profile should return internet default
-        let mut internet_config = default_quic_config();
-        internet_config.network_profile = NetworkProfile::Internet;
-        assert_eq!(
-            internet_config.effective_remote_copy_buffer_size(),
-            INTERNET_REMOTE_COPY_BUFFER_SIZE
-        );
-    }
-
-    #[test]
-    fn test_quic_config_effective_remote_copy_buffer_size_uses_override() {
-        // explicit override should take precedence over profile default
-        let mut config = default_quic_config();
-        config.tuning.remote_copy_buffer_size = Some(1024 * 1024); // 1 MiB override
-        assert_eq!(config.effective_remote_copy_buffer_size(), 1024 * 1024);
-        // should work on internet profile too
-        let mut internet_config = default_quic_config();
-        internet_config.network_profile = NetworkProfile::Internet;
-        internet_config.tuning.remote_copy_buffer_size = Some(512 * 1024); // 512 KiB override
-        assert_eq!(
-            internet_config.effective_remote_copy_buffer_size(),
-            512 * 1024
-        );
-    }
-
-    #[test]
-    fn test_remote_copy_buffer_size_constants() {
-        // verify buffer size constants match stream receive windows
-        assert_eq!(
-            DATACENTER_REMOTE_COPY_BUFFER_SIZE,
-            DATACENTER_STREAM_RECEIVE_WINDOW as usize
-        );
-        assert_eq!(
-            INTERNET_REMOTE_COPY_BUFFER_SIZE,
-            INTERNET_STREAM_RECEIVE_WINDOW as usize
-        );
-    }
-
-    #[test]
-    fn test_max_concurrent_streams_zero_uses_quinn_default() {
-        // Some(0) should be treated as "use quinn default" and not set the transport
-        // config to 0 (which would prevent any streams from being opened).
-        // We can't directly verify the transport config value since quinn doesn't
-        // expose getters, but we verify our filter logic works correctly.
-        let zero_filtered = Some(0u32).filter(|&v| v > 0);
-        assert!(
-            zero_filtered.is_none(),
-            "Some(0) should be filtered to None to use quinn default"
-        );
-        let nonzero_filtered = Some(100u32).filter(|&v| v > 0);
-        assert_eq!(
-            nonzero_filtered,
-            Some(100),
-            "Some(100) should pass through the filter"
-        );
-        // also verify apply_quic_tuning doesn't panic with Some(0)
-        let mut config = default_quic_config();
-        config.tuning.max_concurrent_streams = Some(0);
-        let mut transport = quinn::TransportConfig::default();
-        apply_quic_tuning(&mut transport, &config);
-        // the transport should use quinn's default (100), not 0
-    }
-
-    #[test]
-    fn test_maximize_socket_buffers_increases_buffer_sizes() {
-        use socket2::SockRef;
-        // create a UDP socket
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
-        // get the default buffer sizes before maximizing
-        let sock_ref = SockRef::from(&socket);
-        let send_before = sock_ref.send_buffer_size().unwrap_or(0);
-        let recv_before = sock_ref.recv_buffer_size().unwrap_or(0);
-        // maximize the buffers
-        maximize_socket_buffers(&socket);
-        // get the buffer sizes after maximizing
-        let send_after = sock_ref.send_buffer_size().unwrap_or(0);
-        let recv_after = sock_ref.recv_buffer_size().unwrap_or(0);
-        // buffers should be at least as large as before (kernel may cap, but shouldn't reduce)
-        assert!(
-            send_after >= send_before,
-            "send buffer should not decrease: before={send_before}, after={send_after}"
-        );
-        assert!(
-            recv_after >= recv_before,
-            "recv buffer should not decrease: before={recv_before}, after={recv_after}"
-        );
-        // on most systems, the buffers should have increased (unless already at max)
-        // we don't assert this strictly since it depends on system configuration
-        println!(
-            "Buffer sizes: send {}->{}, recv {}->{}",
-            send_before, send_after, recv_before, recv_after
         );
     }
 }

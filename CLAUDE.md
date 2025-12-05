@@ -183,31 +183,24 @@ cargo nextest run --run-ignored only -E 'test(~sudo)'
 
 ## Remote Operations
 
-The `rcpd` daemon enables distributed copying operations. It connects to a master process (`rcp`) and can run as either source or destination side, using QUIC protocol for communication.
+The `rcpd` daemon enables distributed copying operations. It connects to a master process (`rcp`) and can run as either source or destination side, using TCP for data transfer.
 
 **IMPORTANT**: Before making any changes to remote copy operations, **always read `docs/remote_protocol.md` first**. This document describes the protocol design and must be kept in sync with the implementation. Use it as the source of truth for how the protocol should behave.
 
 **Environment requirements for remote tests:** localhost SSH must be available and usable (running sshd, accessible via `ssh localhost`). Remote integration tests assert this requirement and will **fail fast** if it is not met; they are never skipped based on environment.
 
-### QUIC Connection Timeouts
+### Connection Timeouts
 
-Both `rcp` and `rcpd` accept CLI arguments to configure QUIC connection behavior:
+Both `rcp` and `rcpd` accept CLI arguments to configure connection behavior:
 
-- `--quic-idle-timeout-sec=N` (default: 10) - Maximum idle time before closing connection
-- `--quic-keep-alive-interval-sec=N` (default: 1) - Interval for keep-alive packets
 - `--remote-copy-conn-timeout-sec=N` (default: 15) - Connection timeout for remote operations
-
-These can be tuned for different network environments:
-- **Datacenter**: More aggressive values (5-8s idle timeout) for faster failure detection
-- **Internet**: Higher values (15-30s idle timeout) to handle network hiccups
-- **High latency**: Increase all timeouts proportionally
 
 ### rcpd Lifecycle Management
 
 The `rcpd` daemon automatically exits when the master (`rcp`) process dies or disconnects:
 
 1. **stdin watchdog** (primary): Monitors stdin EOF to detect master disconnection immediately
-2. **QUIC idle timeout** (backup): Detects dead connections if stdin monitoring unavailable
+2. **TCP connection close** (backup): Detects dead connections when master's TCP connection closes
 
 This ensures no orphaned `rcpd` processes remain on remote hosts after the master exits unexpectedly.
 

@@ -7,13 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING**: Remote copy now uses TCP instead of QUIC for data transfer
+  - Removed `--quic-idle-timeout-sec` and `--quic-keep-alive-interval-sec` CLI arguments
+  - Retained `--remote-copy-conn-timeout-sec` for connection timeout configuration
+  - Data transfers are currently unencrypted (use on trusted networks or with VPN/SSH tunneling)
+
 ## [0.21.0] - 2025-10-24
 
 ### Added
-- Configurable QUIC connection timeouts for remote operations via CLI arguments:
-  - `--quic-idle-timeout-sec` (default: 10s) - maximum idle time before closing QUIC connection
-  - `--quic-keep-alive-interval-sec` (default: 1s) - interval for sending keep-alive packets
-  - `--remote-copy-conn-timeout-sec` (default: 15s) - connection timeout for remote operations
+- Configurable connection timeout for remote operations via `--remote-copy-conn-timeout-sec` (default: 15s)
 - stdin watchdog in `rcpd` to detect master process disconnection immediately
 - Automatic cleanup of `rcpd` processes when master (`rcp`) dies or disconnects
 - Comprehensive lifecycle management tests for remote copy operations
@@ -24,8 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `test_permission_error_includes_root_cause` - verifies permission errors in filegen and link operations
 
 ### Changed
-- `rcpd` now automatically exits when master process dies (via stdin monitoring + QUIC timeouts)
-- QUIC connections now have explicit idle timeout and keep-alive configuration
+- `rcpd` now automatically exits when master process dies (via stdin monitoring + connection close detection)
 - Error types (`copy::Error`, `link::Error`, `rm::Error`, `filegen::Error`) now use `#[error("{source:#}")]` to automatically display full error chains
 - All error logging now uses `{:#}` format consistently for better error chain visibility
 - Multi-operation failures now preserve the first error with context instead of generic failure messages

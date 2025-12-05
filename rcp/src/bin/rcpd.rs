@@ -19,15 +19,9 @@ struct Args {
     #[arg(long)]
     master_addr: std::net::SocketAddr,
 
-    /// The server name to use for the QUIC connection
+    /// The server name to use for the connection
     #[arg(long)]
     server_name: String,
-
-    /// SHA-256 fingerprint of the Master's TLS certificate (hex-encoded)
-    ///
-    /// Used for certificate pinning to prevent MITM attacks
-    #[arg(long)]
-    master_cert_fingerprint: String,
 
     /// Role of this rcpd instance (source or destination)
     ///
@@ -135,37 +129,15 @@ struct Args {
     max_blocking_threads: usize,
 
     // Remote copy options
-    /// IP address to bind QUIC server to (set by master, internal use only)
+    /// IP address to bind TCP server to (set by master, internal use only)
     #[arg(long, value_name = "IP", help_heading = "Remote copy options")]
     bind_ip: Option<String>,
 
-    /// Restrict QUIC to specific port ranges (e.g., "8000-8999,10000-10999")
+    /// Restrict TCP to specific port ranges (e.g., "8000-8999,10000-10999")
     ///
     /// Defaults to dynamic port allocation if not specified
     #[arg(long, value_name = "RANGES", help_heading = "Remote copy options")]
-    quic_port_ranges: Option<String>,
-
-    /// QUIC idle timeout in seconds
-    ///
-    /// Maximum time a QUIC connection can be idle before being closed
-    #[arg(
-        long,
-        default_value = "10",
-        value_name = "N",
-        help_heading = "Remote copy options"
-    )]
-    quic_idle_timeout_sec: u64,
-
-    /// QUIC keep-alive interval in seconds
-    ///
-    /// Interval for sending QUIC keep-alive packets to detect dead connections
-    #[arg(
-        long,
-        default_value = "1",
-        value_name = "N",
-        help_heading = "Remote copy options"
-    )]
-    quic_keep_alive_interval_sec: u64,
+    port_ranges: Option<String>,
 
     /// Connection timeout for remote copy operations in seconds
     ///
@@ -178,7 +150,7 @@ struct Args {
     )]
     remote_copy_conn_timeout_sec: u64,
 
-    /// Network profile for QUIC tuning
+    /// Network profile for TCP tuning
     #[arg(
         long,
         default_value = "datacenter",
@@ -187,44 +159,23 @@ struct Args {
     )]
     network_profile: remote::NetworkProfile,
 
-    /// Congestion control algorithm for QUIC (overrides profile default)
-    #[arg(long, value_name = "ALGORITHM", help_heading = "Remote copy options")]
-    congestion_control: Option<remote::CongestionControl>,
-
-    /// QUIC connection-level receive window in bytes (overrides profile default)
-    #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
-    quic_receive_window: Option<u64>,
-
-    /// QUIC per-stream receive window in bytes (overrides profile default)
-    #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
-    quic_stream_receive_window: Option<u64>,
-
-    /// QUIC send window in bytes (overrides profile default)
-    #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
-    quic_send_window: Option<u64>,
-
-    /// Initial RTT estimate in milliseconds (overrides profile default)
-    ///
-    /// Accepts floating point values for sub-millisecond precision (e.g., 0.3 for 300µs).
-    #[arg(long, value_name = "MS", help_heading = "Remote copy options")]
-    quic_initial_rtt_ms: Option<f64>,
-
-    /// Initial MTU in bytes (default: 1200)
-    #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
-    quic_initial_mtu: Option<u16>,
-
-    /// Maximum concurrent unidirectional QUIC streams (0 = quinn default)
-    #[arg(long, value_name = "N", help_heading = "Remote copy options")]
-    quic_max_concurrent_streams: Option<u32>,
-
     /// Buffer size for remote copy file transfer operations in bytes.
     ///
     /// Controls the buffer used when copying data between files and network streams.
     /// Larger buffers can improve throughput but use more memory per concurrent transfer.
     ///
-    /// Default: matches per-stream receive window (16 MiB for datacenter, 2 MiB for internet).
+    /// Default: 16 MiB for datacenter, 2 MiB for internet profile.
     #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
-    remote_copy_buffer_size: Option<usize>,
+    buffer_size: Option<usize>,
+
+    /// Maximum concurrent TCP connections for file transfers (default: 100)
+    #[arg(
+        long,
+        default_value = "100",
+        value_name = "N",
+        help_heading = "Remote copy options"
+    )]
+    max_connections: usize,
 
     /// Enable file-based debug logging
     ///
@@ -315,33 +266,23 @@ async fn stdin_monitor() {
 /// async operation for rcpd - runs the actual source or destination logic
 async fn run_operation(
     args: Args,
-    master_connection: remote::streams::Connection,
+    mut master_send_stream: remote::streams::SendStream,
+    mut master_recv_stream: remote::streams::RecvStream,
 ) -> anyhow::Result<remote::protocol::RcpdResult> {
     // run source or destination
-    let (master_send_stream, mut master_recv_stream) = master_connection.accept_bi().await?;
     let master_hello = master_recv_stream
         .recv_object::<remote::protocol::MasterHello>()
         .await
         .context("Failed to receive hello message from master")?
         .unwrap();
     tracing::info!("Received side: {:?}", master_hello);
-    // build quic_config first so we can use its effective_remote_copy_buffer_size()
-    let quic_config = remote::QuicConfig {
-        port_ranges: args.quic_port_ranges.clone(),
-        idle_timeout_sec: args.quic_idle_timeout_sec,
-        keep_alive_interval_sec: args.quic_keep_alive_interval_sec,
+    // build tcp_config first so we can use its effective_buffer_size()
+    let tcp_config = remote::TcpConfig {
+        port_ranges: args.port_ranges.clone(),
         conn_timeout_sec: args.remote_copy_conn_timeout_sec,
         network_profile: args.network_profile,
-        congestion_control: args.congestion_control,
-        tuning: remote::QuicTuning {
-            receive_window: args.quic_receive_window,
-            stream_receive_window: args.quic_stream_receive_window,
-            send_window: args.quic_send_window,
-            initial_rtt_ms: args.quic_initial_rtt_ms,
-            initial_mtu: args.quic_initial_mtu,
-            remote_copy_buffer_size: args.remote_copy_buffer_size,
-            max_concurrent_streams: args.quic_max_concurrent_streams.filter(|&v| v > 0),
-        },
+        buffer_size: args.buffer_size,
+        max_connections: args.max_connections,
     };
     let settings = common::copy::Settings {
         dereference: args.dereference,
@@ -349,17 +290,18 @@ async fn run_operation(
         overwrite: args.overwrite,
         overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
         chunk_size: args.chunk_size,
-        remote_copy_buffer_size: quic_config.effective_remote_copy_buffer_size(),
+        remote_copy_buffer_size: tcp_config.effective_buffer_size(),
     };
     let rcpd_result = match master_hello {
         remote::protocol::MasterHello::Source { src, dst } => {
             tracing::info!("Starting source");
-            match source::run_source(
-                master_send_stream.clone(),
+            let shared_send = std::sync::Arc::new(tokio::sync::Mutex::new(master_send_stream));
+            let result = match source::run_source(
+                shared_send.clone(),
                 &src,
                 &dst,
                 &settings,
-                &quic_config,
+                &tcp_config,
                 args.bind_ip.as_deref(),
             )
             .await
@@ -380,26 +322,42 @@ async fn run_operation(
                         runtime_stats,
                     }
                 }
+            };
+            // send result back to master
+            {
+                let mut send = shared_send.lock().await;
+                send.send_control_message(&result).await?;
+                send.close().await?;
             }
+            result
         }
         remote::protocol::MasterHello::Destination {
-            source_addr,
+            source_control_addr,
+            source_data_addr,
             server_name,
-            source_cert_fingerprint,
             preserve,
         } => {
             tracing::info!("Starting destination");
             match destination::run_destination(
-                &source_addr,
+                &source_control_addr,
+                &source_data_addr,
                 &server_name,
-                &source_cert_fingerprint,
                 &settings,
                 &preserve,
-                &quic_config,
+                &tcp_config,
             )
             .await
             {
                 Ok((message, summary)) => {
+                    // send result to master
+                    master_send_stream
+                        .send_control_message(&remote::protocol::RcpdResult::Success {
+                            message: message.clone(),
+                            summary,
+                            runtime_stats: common::collect_runtime_stats(),
+                        })
+                        .await?;
+                    master_send_stream.close().await?;
                     let runtime_stats = common::collect_runtime_stats();
                     remote::protocol::RcpdResult::Success {
                         message,
@@ -409,23 +367,18 @@ async fn run_operation(
                 }
                 Err(error) => {
                     let runtime_stats = common::collect_runtime_stats();
-                    remote::protocol::RcpdResult::Failure {
+                    let result = remote::protocol::RcpdResult::Failure {
                         error: format!("{error:#}"),
                         summary: common::copy::Summary::default(),
                         runtime_stats,
-                    }
+                    };
+                    master_send_stream.send_control_message(&result).await?;
+                    master_send_stream.close().await?;
+                    result
                 }
             }
         }
     };
-    tracing::debug!("Closing master send stream");
-    {
-        let mut master_send_stream = master_send_stream.lock().await;
-        master_send_stream
-            .send_control_message(&rcpd_result)
-            .await?;
-        master_send_stream.close().await?;
-    }
     Ok(rcpd_result)
 }
 
@@ -439,49 +392,62 @@ async fn async_main(
         args.master_addr,
         args.server_name
     );
-    // decode hex-encoded master cert fingerprint
-    let master_cert_fingerprint =
-        hex::decode(&args.master_cert_fingerprint).with_context(|| {
-            format!(
-                "Failed to decode master cert fingerprint: {}",
-                args.master_cert_fingerprint
-            )
-        })?;
-    // build QUIC config with profile and tuning settings
-    let quic_config = remote::QuicConfig {
-        port_ranges: args.quic_port_ranges.clone(),
-        idle_timeout_sec: args.quic_idle_timeout_sec,
-        keep_alive_interval_sec: args.quic_keep_alive_interval_sec,
-        conn_timeout_sec: args.remote_copy_conn_timeout_sec,
-        network_profile: args.network_profile,
-        congestion_control: args.congestion_control,
-        tuning: remote::QuicTuning {
-            receive_window: args.quic_receive_window,
-            stream_receive_window: args.quic_stream_receive_window,
-            send_window: args.quic_send_window,
-            initial_rtt_ms: args.quic_initial_rtt_ms,
-            initial_mtu: args.quic_initial_mtu,
-            remote_copy_buffer_size: args.remote_copy_buffer_size,
-            max_concurrent_streams: args.quic_max_concurrent_streams.filter(|&v| v > 0),
-        },
-    };
-    // use certificate pinning for Master→rcpd connection
-    let client = remote::get_client_with_config_and_pinning(&quic_config, master_cert_fingerprint)?;
-    let master_connection = {
-        let master_connection = client
-            .connect(args.master_addr, &args.server_name)?
+    // connect to master via TCP (control connection)
+    let master_stream =
+        remote::connect_tcp_control(args.master_addr, args.remote_copy_conn_timeout_sec)
             .await
             .with_context(|| {
                 format!(
                     "Failed to connect to master at {}. \
-                    This usually means the master is unreachable from this host. \
-                    Check network connectivity and firewall rules.",
+                This usually means the master is unreachable from this host. \
+                Check network connectivity and firewall rules.",
                     args.master_addr
                 )
             })?;
-        remote::streams::Connection::new(master_connection)
+    tracing::info!("Connected to master (control)");
+    // split the stream into read/write halves
+    let (read_half, write_half) = master_stream.into_split();
+    let mut master_send_stream = remote::streams::SendStream::new(write_half);
+    let master_recv_stream = remote::streams::RecvStream::new(read_half);
+    // send hello to identify our role (control connection)
+    master_send_stream
+        .send_control_message(&remote::protocol::TracingHello {
+            role: args.role,
+            is_tracing: false,
+        })
+        .await?;
+    // connect second TCP connection for tracing/progress updates
+    let tracing_stream =
+        remote::connect_tcp_control(args.master_addr, args.remote_copy_conn_timeout_sec)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to connect tracing stream to master at {}.",
+                    args.master_addr
+                )
+            })?;
+    tracing::info!("Connected to master (tracing)");
+    let (_tracing_read, tracing_write) = tracing_stream.into_split();
+    let mut tracing_send_stream = remote::streams::SendStream::new(tracing_write);
+    // send hello on tracing connection to identify this as a tracing stream
+    tracing_send_stream
+        .send_control_message(&remote::protocol::TracingHello {
+            role: args.role,
+            is_tracing: true,
+        })
+        .await?;
+    // spawn tracing sender task to forward progress/logs to master
+    let tracing_cancel = tokio_util::sync::CancellationToken::new();
+    let tracing_task = {
+        let cancel = tracing_cancel.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                remote::tracelog::run_sender(tracing_receiver, tracing_send_stream, cancel).await
+            {
+                tracing::warn!("Tracing sender failed: {e}");
+            }
+        })
     };
-    tracing::info!("Connected to master");
     // check if stdin is available for monitoring
     // SSH with -T closes stdin immediately, so we only monitor if it's actually open
     let stdin_available = {
@@ -510,17 +476,6 @@ async fn async_main(
     } else {
         None
     };
-    let mut tracing_stream = master_connection.open_uni().await?;
-    tracing_stream
-        .send_control_message(&remote::protocol::TracingHello { role: args.role })
-        .await?;
-    // setup tracing
-    let cancellation_token = tokio_util::sync::CancellationToken::new();
-    let tracing_sender_task = tokio::spawn(remote::tracelog::run_sender(
-        tracing_receiver,
-        tracing_stream,
-        cancellation_token.clone(),
-    ));
     // run operation with stdin monitoring (if available)
     // if stdin closes while running, abort immediately
     let rcpd_result = if let Some(watchdog) = stdin_watchdog {
@@ -530,7 +485,7 @@ async fn async_main(
         // branch wins (stdin closed), we exit(1) immediately so there's no
         // concern about partial state from the cancelled `run_operation`.
         tokio::select! {
-            result = run_operation(args.clone(), master_connection.clone()) => {
+            result = run_operation(args.clone(), master_send_stream, master_recv_stream) => {
                 match result {
                     Ok(r) => r,
                     Err(e) => {
@@ -555,8 +510,8 @@ async fn async_main(
             }
         }
     } else {
-        // stdin not available - rely on QUIC timeouts only
-        match run_operation(args.clone(), master_connection.clone()).await {
+        // stdin not available - rely on TCP timeouts only
+        match run_operation(args.clone(), master_send_stream, master_recv_stream).await {
             Ok(r) => r,
             Err(e) => {
                 let runtime_stats = common::collect_runtime_stats();
@@ -568,21 +523,9 @@ async fn async_main(
             }
         }
     };
-    // shutdown tracing sender with timeout to handle dead connections
-    cancellation_token.cancel();
-    tracing::debug!("Cancelling tracing sender");
-    match tokio::time::timeout(std::time::Duration::from_secs(2), tracing_sender_task).await {
-        Ok(Ok(Ok(_))) => tracing::debug!("Tracing sender shut down cleanly"),
-        Ok(Ok(Err(e))) => tracing::warn!("Tracing sender task failed: {e}"),
-        Ok(Err(e)) => tracing::warn!("Tracing sender task panicked: {e}"),
-        Err(_) => tracing::warn!("Tracing sender shutdown timed out (master likely disconnected)"),
-    }
-    master_connection.close();
-    // wait for client to become idle with timeout
-    match tokio::time::timeout(std::time::Duration::from_secs(2), client.wait_idle()).await {
-        Ok(_) => tracing::debug!("QUIC client became idle"),
-        Err(_) => tracing::warn!("QUIC client idle timeout (master likely disconnected)"),
-    }
+    // cancel tracing task and wait for it to finish
+    tracing_cancel.cancel();
+    let _ = tracing_task.await;
     match rcpd_result {
         remote::protocol::RcpdResult::Success {
             message,

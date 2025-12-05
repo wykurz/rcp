@@ -156,45 +156,23 @@ struct Args {
     max_blocking_threads: usize,
 
     // Remote copy options
-    /// IP address to bind the master QUIC server to
+    /// IP address to bind the master TCP server to
     ///
     /// By default, the best available network interface is automatically selected.
     /// Use this option to explicitly bind to a specific IP address (e.g., "192.168.1.5").
     /// This is useful for multi-homed hosts or when you want to control which network
-    /// is used for QUIC traffic. Only IPv4 addresses are supported.
+    /// is used for TCP traffic. Only IPv4 addresses are supported.
     ///
     /// When the source path uses an IP address (e.g., "192.168.1.100:/path"), that IP
     /// is automatically passed to the source rcpd so it binds explicitly to that address.
     #[arg(long, value_name = "IP", help_heading = "Remote copy options")]
     bind_ip: Option<String>,
 
-    /// Restrict QUIC to specific port ranges (e.g., "8000-8999,10000-10999")
+    /// Restrict TCP to specific port ranges (e.g., "8000-8999,10000-10999")
     ///
     /// Defaults to dynamic port allocation if not specified
     #[arg(long, value_name = "RANGES", help_heading = "Remote copy options")]
-    quic_port_ranges: Option<String>,
-
-    /// QUIC idle timeout in seconds
-    ///
-    /// Maximum time a QUIC connection can be idle before being closed
-    #[arg(
-        long,
-        default_value = "10",
-        value_name = "N",
-        help_heading = "Remote copy options"
-    )]
-    quic_idle_timeout_sec: u64,
-
-    /// QUIC keep-alive interval in seconds
-    ///
-    /// Interval for sending QUIC keep-alive packets to detect dead connections
-    #[arg(
-        long,
-        default_value = "1",
-        value_name = "N",
-        help_heading = "Remote copy options"
-    )]
-    quic_keep_alive_interval_sec: u64,
+    port_ranges: Option<String>,
 
     /// Connection timeout for remote copy operations in seconds
     ///
@@ -207,12 +185,12 @@ struct Args {
     )]
     remote_copy_conn_timeout_sec: u64,
 
-    /// Network profile for QUIC tuning
+    /// Network profile for TCP tuning
     ///
     /// 'datacenter' (default): Optimized for datacenter networks (<1ms RTT, 25-100 Gbps).
-    /// Uses BBR congestion control and aggressive window sizes.
+    /// Uses larger buffer sizes for high-bandwidth links.
     /// 'internet': Conservative settings for internet connections.
-    /// Uses CUBIC congestion control and standard window sizes.
+    /// Uses smaller buffer sizes suitable for shared networks.
     #[arg(
         long,
         default_value = "datacenter",
@@ -221,58 +199,27 @@ struct Args {
     )]
     network_profile: remote::NetworkProfile,
 
-    /// Congestion control algorithm for QUIC (overrides profile default)
-    ///
-    /// 'bbr': Model-based, fast ramp-up. Best for dedicated high-bandwidth links.
-    /// 'cubic': Loss-based, standard TCP congestion control. Best for shared networks.
-    /// Default: 'bbr' for datacenter profile, 'cubic' for internet profile.
-    #[arg(long, value_name = "ALGORITHM", help_heading = "Remote copy options")]
-    congestion_control: Option<remote::CongestionControl>,
-
-    /// QUIC connection-level receive window (overrides profile default)
-    ///
-    /// Accepts byte sizes like "128MiB", "1GiB", or plain numbers in bytes.
-    #[arg(long, value_name = "SIZE", help_heading = "Remote copy options")]
-    quic_receive_window: Option<bytesize::ByteSize>,
-
-    /// QUIC per-stream receive window (overrides profile default)
-    ///
-    /// Accepts byte sizes like "16MiB", "256MiB", or plain numbers in bytes.
-    #[arg(long, value_name = "SIZE", help_heading = "Remote copy options")]
-    quic_stream_receive_window: Option<bytesize::ByteSize>,
-
-    /// QUIC send window (overrides profile default)
-    ///
-    /// Accepts byte sizes like "128MiB", "1GiB", or plain numbers in bytes.
-    #[arg(long, value_name = "SIZE", help_heading = "Remote copy options")]
-    quic_send_window: Option<bytesize::ByteSize>,
-
-    /// Initial RTT estimate in milliseconds (overrides profile default)
-    ///
-    /// Accepts floating point values for sub-millisecond precision (e.g., 0.3 for 300µs).
-    #[arg(long, value_name = "MS", help_heading = "Remote copy options")]
-    quic_initial_rtt_ms: Option<f64>,
-
-    /// Initial MTU in bytes (default: 1200)
-    #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
-    quic_initial_mtu: Option<u16>,
-
-    /// Maximum concurrent unidirectional QUIC streams (0 = quinn default)
-    ///
-    /// Each file transfer uses one unidirectional stream. Higher values allow more
-    /// parallel file transfers but use more memory.
-    #[arg(long, value_name = "N", help_heading = "Remote copy options")]
-    quic_max_concurrent_streams: Option<u32>,
-
     /// Buffer size for remote copy file transfer operations.
     ///
     /// Controls the buffer used when copying data between files and network streams.
     /// Larger buffers can improve throughput but use more memory per concurrent transfer.
     /// Accepts byte sizes like "256KiB", "1MiB", or plain numbers in bytes.
     ///
-    /// Default: matches per-stream receive window (16 MiB for datacenter, 2 MiB for internet).
+    /// Default: 16 MiB for datacenter, 2 MiB for internet profile.
     #[arg(long, value_name = "SIZE", help_heading = "Remote copy options")]
     remote_copy_buffer_size: Option<bytesize::ByteSize>,
+
+    /// Maximum concurrent TCP connections for file transfers (default: 100)
+    ///
+    /// Each file transfer uses one TCP connection. Higher values allow more
+    /// parallel file transfers but use more resources.
+    #[arg(
+        long,
+        default_value = "100",
+        value_name = "N",
+        help_heading = "Remote copy options"
+    )]
+    max_connections: usize,
 
     /// Enable file-based debug logging for rcpd processes
     ///
@@ -381,30 +328,18 @@ async fn run_rcpd_master(
     dst: &path::RemotePath,
 ) -> anyhow::Result<common::copy::Summary> {
     tracing::debug!("running rcpd src/dst");
-    // build QUIC tuning from byte sizes
-    let quic_tuning = remote::QuicTuning {
-        receive_window: args.quic_receive_window.map(|b| b.0),
-        stream_receive_window: args.quic_stream_receive_window.map(|b| b.0),
-        send_window: args.quic_send_window.map(|b| b.0),
-        initial_rtt_ms: args.quic_initial_rtt_ms,
-        initial_mtu: args.quic_initial_mtu,
-        remote_copy_buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
-        max_concurrent_streams: args.quic_max_concurrent_streams.filter(|&v| v > 0),
-    };
-    // build QUIC config with profile and tuning settings
-    let quic_config = remote::QuicConfig {
-        port_ranges: args.quic_port_ranges.clone(),
-        idle_timeout_sec: args.quic_idle_timeout_sec,
-        keep_alive_interval_sec: args.quic_keep_alive_interval_sec,
+    // build TCP config
+    let tcp_config = remote::TcpConfig {
+        port_ranges: args.port_ranges.clone(),
         conn_timeout_sec: args.remote_copy_conn_timeout_sec,
         network_profile: args.network_profile,
-        congestion_control: args.congestion_control,
-        tuning: quic_tuning.clone(),
+        buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
+        max_connections: args.max_connections,
     };
-    // open a port and wait from server & client hello, respond to client with server port
-    let (server_endpoint, master_cert_fingerprint) = remote::get_server_with_config(&quic_config)?;
-    let server_addr =
-        remote::get_endpoint_addr_with_bind_ip(&server_endpoint, args.bind_ip.as_deref())?;
+    // create TCP listener for master
+    let master_listener =
+        remote::create_tcp_control_listener(&tcp_config, args.bind_ip.as_deref()).await?;
+    let server_addr = remote::get_tcp_listener_addr(&master_listener, args.bind_ip.as_deref())?;
     let server_name = remote::get_random_server_name();
     let mut rcpds = vec![];
     let rcpd_config = remote::protocol::RcpdConfig {
@@ -420,16 +355,13 @@ async fn run_rcpd_master(
         overwrite: args.overwrite,
         overwrite_compare: args.overwrite_compare.clone(),
         debug_log_prefix: args.rcpd_debug_log_prefix.clone(),
-        quic_port_ranges: args.quic_port_ranges.clone(),
-        quic_idle_timeout_sec: args.quic_idle_timeout_sec,
-        quic_keep_alive_interval_sec: args.quic_keep_alive_interval_sec,
+        port_ranges: args.port_ranges.clone(),
         progress: args.progress,
         progress_delay: args.progress_delay.clone(),
         remote_copy_conn_timeout_sec: args.remote_copy_conn_timeout_sec,
         network_profile: args.network_profile,
-        congestion_control: args.congestion_control,
-        quic_tuning,
-        master_cert_fingerprint,
+        buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
+        max_connections: args.max_connections,
         chrome_trace_prefix: args.chrome_trace.clone(),
         flamegraph_prefix: args.flamegraph.clone(),
         profile_level: Some(args.profile_level.clone()),
@@ -495,95 +427,113 @@ async fn run_rcpd_master(
     }
     tracing::info!("Waiting for connections from rcpd processes...");
     let rcpd_connect_timeout = std::time::Duration::from_secs(args.remote_copy_conn_timeout_sec);
-    // helper to accept a connection and read its role
-    let accept_rcpd_connection = |endpoint: quinn::Endpoint, timeout: std::time::Duration| async move {
-        let conn = {
-            let connecting = match tokio::time::timeout(timeout, endpoint.accept()).await {
-                Ok(Some(conn)) => conn,
-                Ok(None) => return Err(anyhow!("Server endpoint closed before rcpd connected")),
-                Err(_) => {
-                    return Err(anyhow!(
-                        "Timed out waiting for rcpd to connect after {:?}. \
-                            Check if hosts are reachable and rcpd can be executed.",
-                        timeout
-                    ))
-                }
-            };
-            remote::streams::Connection::new(connecting.await?)
+    // helper to accept a single connection
+    async fn accept_connection(
+        listener: &tokio::net::TcpListener,
+        timeout: std::time::Duration,
+        conn_num: usize,
+    ) -> anyhow::Result<(
+        remote::streams::SendStream,
+        remote::streams::RecvStream,
+        remote::protocol::TracingHello,
+    )> {
+        let _span = tracing::trace_span!("accept_rcpd_connection", connection = conn_num).entered();
+        let (stream, peer_addr) = match tokio::time::timeout(timeout, listener.accept()).await {
+            Ok(Ok((stream, addr))) => (stream, addr),
+            Ok(Err(e)) => return Err(anyhow!("Failed to accept connection: {:#}", e)),
+            Err(_) => {
+                return Err(anyhow!(
+                    "Timed out waiting for rcpd to connect after {:?}. \
+                    Check if hosts are reachable and rcpd can be executed.",
+                    timeout
+                ))
+            }
         };
-        let mut tracing_stream = conn
-            .accept_uni()
-            .await
-            .context("Failed to open unidirectional stream with rcpd")?;
-        let hello = tracing_stream
+        tracing::debug!("Accepted TCP connection {} from {}", conn_num, peer_addr);
+        stream.set_nodelay(true)?;
+        let (read_half, write_half) = stream.into_split();
+        let mut recv_stream = remote::streams::RecvStream::new(read_half);
+        let send_stream = remote::streams::SendStream::new(write_half);
+        let hello = recv_stream
             .recv_object::<remote::protocol::TracingHello>()
             .await
             .context("Failed to receive tracing hello from rcpd")?
             .context("Expected TracingHello from rcpd")?;
-        Ok::<_, anyhow::Error>((conn, tracing_stream, hello))
-    };
-
-    // accept both connections
-    tracing::info!("Waiting for first rcpd connection...");
-    let (conn1, conn1_tracing_stream, conn1_hello) = {
-        let _span = tracing::trace_span!("accept_rcpd_connection", connection = 1).entered();
-        accept_rcpd_connection(server_endpoint.clone(), rcpd_connect_timeout).await?
-    };
-    tracing::info!("First rcpd connected with role: {}", conn1_hello.role);
-
-    tracing::info!("Waiting for second rcpd connection...");
-    let (conn2, conn2_tracing_stream, conn2_hello) = {
-        let _span = tracing::trace_span!("accept_rcpd_connection", connection = 2).entered();
-        accept_rcpd_connection(server_endpoint.clone(), rcpd_connect_timeout).await?
-    };
-    tracing::info!("Second rcpd connected with role: {}", conn2_hello.role);
-
-    // match connections by role
-    let (source_connection, source_tracing_stream, dest_connection, dest_tracing_stream) =
-        if conn1_hello.role == remote::protocol::RcpdRole::Source {
-            (conn1, conn1_tracing_stream, conn2, conn2_tracing_stream)
-        } else {
-            (conn2, conn2_tracing_stream, conn1, conn1_tracing_stream)
-        };
-    let source_tracing_task = {
-        tokio::spawn(async move {
-            if let Err(e) = remote::tracelog::run_receiver(
-                source_tracing_stream,
-                remote::tracelog::RcpdType::Source,
-            )
-            .await
-            {
-                tracing::warn!("Source remote tracing receiver failed: {}", e);
+        Ok((send_stream, recv_stream, hello))
+    }
+    // accept 4 connections: 2 control (one per rcpd) + 2 tracing (one per rcpd)
+    // connections can arrive in any order, so we use is_tracing field to distinguish
+    tracing::info!("Waiting for rcpd connections (expecting 4: 2 control + 2 tracing)...");
+    let mut source_control: Option<(remote::streams::SendStream, remote::streams::RecvStream)> =
+        None;
+    let mut dest_control: Option<(remote::streams::SendStream, remote::streams::RecvStream)> = None;
+    let mut source_tracing: Option<remote::streams::RecvStream> = None;
+    let mut dest_tracing: Option<remote::streams::RecvStream> = None;
+    for i in 1..=4 {
+        let (send, recv, hello) =
+            accept_connection(&master_listener, rcpd_connect_timeout, i).await?;
+        tracing::info!(
+            "Connection {} from {} rcpd ({})",
+            i,
+            hello.role,
+            if hello.is_tracing {
+                "tracing"
+            } else {
+                "control"
             }
-        })
-    };
-    let dest_tracing_task = {
-        tokio::spawn(async move {
-            if let Err(e) = remote::tracelog::run_receiver(
-                dest_tracing_stream,
-                remote::tracelog::RcpdType::Destination,
-            )
-            .await
-            {
-                tracing::warn!("Destination remote tracing receiver failed: {}", e);
+        );
+        // assign to appropriate slot based on role and connection type
+        match (hello.role, hello.is_tracing) {
+            (remote::protocol::RcpdRole::Source, false) => {
+                source_control = Some((send, recv));
             }
-        })
-    };
-    // send MasterHello to source rcpd
-    let (source_send_stream, mut source_recv_stream) = source_connection
-        .open_bi()
+            (remote::protocol::RcpdRole::Source, true) => {
+                source_tracing = Some(recv);
+            }
+            (remote::protocol::RcpdRole::Destination, false) => {
+                dest_control = Some((send, recv));
+            }
+            (remote::protocol::RcpdRole::Destination, true) => {
+                dest_tracing = Some(recv);
+            }
+        }
+    }
+    let (mut source_send_stream, mut source_recv_stream) =
+        source_control.ok_or_else(|| anyhow!("Missing source control connection"))?;
+    let (mut dest_send_stream, mut dest_recv_stream) =
+        dest_control.ok_or_else(|| anyhow!("Missing destination control connection"))?;
+    let source_tracing_recv =
+        source_tracing.ok_or_else(|| anyhow!("Missing source tracing connection"))?;
+    let dest_tracing_recv =
+        dest_tracing.ok_or_else(|| anyhow!("Missing destination tracing connection"))?;
+    // spawn tracing receiver tasks to process progress/log messages from rcpd
+    let source_tracing_task = tokio::spawn(async move {
+        if let Err(e) =
+            remote::tracelog::run_receiver(source_tracing_recv, remote::tracelog::RcpdType::Source)
+                .await
+        {
+            tracing::debug!("Source tracing receiver ended: {e}");
+        }
+    });
+    let dest_tracing_task = tokio::spawn(async move {
+        if let Err(e) = remote::tracelog::run_receiver(
+            dest_tracing_recv,
+            remote::tracelog::RcpdType::Destination,
+        )
         .await
-        .context("Failed to open bidirectional stream with source rcpd")?;
+        {
+            tracing::debug!("Destination tracing receiver ended: {e}");
+        }
+    });
+    // send MasterHello to source rcpd
     {
         let _span = tracing::trace_span!("send_master_hello_to_source").entered();
-        let mut source_send_stream = source_send_stream.lock().await;
         source_send_stream
             .send_control_message(&remote::protocol::MasterHello::Source {
                 src: src.path().to_path_buf(),
                 dst: dst.path().to_path_buf(),
             })
             .await?;
-        source_send_stream.close().await?;
     }
     tracing::debug!("Waiting for source rcpd to send hello");
     let source_hello = {
@@ -594,22 +544,16 @@ async fn run_rcpd_master(
             .expect("Failed to receive source hello from source rcpd")
     };
     // send MasterHello to destination rcpd
-    let (dest_send_stream, mut dest_recv_stream) = dest_connection
-        .open_bi()
-        .await
-        .context("Failed to open bidirectional stream with destination rcpd")?;
     {
         let _span = tracing::trace_span!("send_master_hello_to_dest").entered();
-        let mut dest_send_stream = dest_send_stream.lock().await;
         dest_send_stream
             .send_control_message(&remote::protocol::MasterHello::Destination {
-                source_addr: source_hello.source_addr,
+                source_control_addr: source_hello.control_addr,
+                source_data_addr: source_hello.data_addr,
                 server_name: source_hello.server_name.clone(),
-                source_cert_fingerprint: source_hello.cert_fingerprint.clone(),
                 preserve: *preserve,
             })
             .await?;
-        dest_send_stream.close().await?;
     }
     tracing::info!("Forwarded source connection info to destination");
     let source_result = {
@@ -674,26 +618,18 @@ async fn run_rcpd_master(
         dest_host: dst.session().host.clone(),
         dest_stats: dest_runtime_stats,
     });
-    // close connections which will cause rcpd processes to exit and tracing tasks to finish
-    source_connection.close();
-    dest_connection.close();
-    // wait for endpoint to become idle with a timeout to avoid blocking too long
-    tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        server_endpoint.wait_idle(),
-    )
-    .await
-    .ok();
+    // close streams
+    source_send_stream.close().await.ok();
+    dest_send_stream.close().await.ok();
+    // abort tracing tasks - they'll end when the rcpd processes close their connections
+    source_tracing_task.abort();
+    dest_tracing_task.abort();
     // wait for rcpd processes to fully exit and capture any error output
     for rcpd in rcpds {
         if let Err(e) = remote::wait_for_rcpd_process(rcpd).await {
             tracing::error!("Failed to wait for rcpd process: {e}");
         }
     }
-    // wait for tracing tasks to complete (they should finish when streams close)
-    // we ignore errors here since connection loss is expected during shutdown
-    let _ = source_tracing_task.await;
-    let _ = dest_tracing_task.await;
     tracing::info!("All rcpd processes finished");
     // propagate any errors from rcpd processes
     if !errors.is_empty() {
@@ -937,8 +873,14 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
 }
 
 fn has_remote_paths(args: &Args) -> bool {
+    // use the same path parser that async_main uses, respecting --force-remote
+    let parse_fn = if args.force_remote {
+        path::parse_path_force_remote
+    } else {
+        path::parse_path
+    };
     for path in &args.paths {
-        if matches!(path::parse_path(path), Ok(path::PathType::Remote(_))) {
+        if matches!(parse_fn(path), Ok(path::PathType::Remote(_))) {
             return true;
         }
     }
