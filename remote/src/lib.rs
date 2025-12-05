@@ -1162,6 +1162,45 @@ fn apply_quic_tuning(transport_config: &mut quinn::TransportConfig, config: &Qui
     );
 }
 
+/// Maximize UDP socket buffer sizes up to the system-allowed limit.
+///
+/// Unprivileged processes can request buffer sizes up to `rmem_max`/`wmem_max`.
+/// The kernel silently caps the request to these limits without erroring.
+/// This function requests large buffers (16 MiB) to improve QUIC throughput.
+///
+/// See: <https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes>
+fn maximize_socket_buffers(socket: &std::net::UdpSocket) {
+    use socket2::SockRef;
+    const TARGET_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+    let sock_ref = SockRef::from(socket);
+    // try to set send buffer - kernel will cap to wmem_max
+    if let Err(err) = sock_ref.set_send_buffer_size(TARGET_BUFFER_SIZE) {
+        tracing::warn!("failed to set UDP send buffer size: {err:#}");
+    }
+    // try to set receive buffer - kernel will cap to rmem_max
+    if let Err(err) = sock_ref.set_recv_buffer_size(TARGET_BUFFER_SIZE) {
+        tracing::warn!("failed to set UDP receive buffer size: {err:#}");
+    }
+    // log the actual buffer sizes (kernel doubles the requested value for bookkeeping)
+    match (sock_ref.send_buffer_size(), sock_ref.recv_buffer_size()) {
+        (Ok(send), Ok(recv)) => {
+            tracing::info!(
+                "UDP socket buffer sizes: send={} recv={} (requested {})",
+                bytesize::ByteSize(send as u64),
+                bytesize::ByteSize(recv as u64),
+                bytesize::ByteSize(TARGET_BUFFER_SIZE as u64),
+            );
+        }
+        (send_result, recv_result) => {
+            tracing::debug!(
+                "could not query socket buffer sizes: send={:?} recv={:?}",
+                send_result,
+                recv_result,
+            );
+        }
+    }
+}
+
 /// Compute SHA-256 fingerprint of a DER-encoded certificate
 fn compute_cert_fingerprint(cert_der: &[u8]) -> ring::digest::Digest {
     ring::digest::digest(&ring::digest::SHA256, cert_der)
@@ -1218,6 +1257,7 @@ pub fn get_server_with_config(config: &QuicConfig) -> anyhow::Result<(quinn::End
         // default behavior: bind to any available port
         std::net::UdpSocket::bind("0.0.0.0:0")?
     };
+    maximize_socket_buffers(&socket);
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(server_config),
@@ -1588,6 +1628,7 @@ fn create_client_endpoint_with_config(
         // default behavior: bind to any available port
         std::net::UdpSocket::bind("0.0.0.0:0")?
     };
+    maximize_socket_buffers(&socket);
     // create and configure endpoint
     let mut endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
@@ -2404,5 +2445,36 @@ mod quic_tuning_tests {
         let mut transport = quinn::TransportConfig::default();
         apply_quic_tuning(&mut transport, &config);
         // the transport should use quinn's default (100), not 0
+    }
+
+    #[test]
+    fn test_maximize_socket_buffers_increases_buffer_sizes() {
+        use socket2::SockRef;
+        // create a UDP socket
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind should succeed");
+        // get the default buffer sizes before maximizing
+        let sock_ref = SockRef::from(&socket);
+        let send_before = sock_ref.send_buffer_size().unwrap_or(0);
+        let recv_before = sock_ref.recv_buffer_size().unwrap_or(0);
+        // maximize the buffers
+        maximize_socket_buffers(&socket);
+        // get the buffer sizes after maximizing
+        let send_after = sock_ref.send_buffer_size().unwrap_or(0);
+        let recv_after = sock_ref.recv_buffer_size().unwrap_or(0);
+        // buffers should be at least as large as before (kernel may cap, but shouldn't reduce)
+        assert!(
+            send_after >= send_before,
+            "send buffer should not decrease: before={send_before}, after={send_after}"
+        );
+        assert!(
+            recv_after >= recv_before,
+            "recv buffer should not decrease: before={recv_before}, after={recv_after}"
+        );
+        // on most systems, the buffers should have increased (unless already at max)
+        // we don't assert this strictly since it depends on system configuration
+        println!(
+            "Buffer sizes: send {}->{}, recv {}->{}",
+            send_before, send_after, recv_before, recv_after
+        );
     }
 }

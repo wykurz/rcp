@@ -286,6 +286,159 @@ For detailed security architecture and threat model, see `docs/security.md`.
 
 `rcp` tools will not-overwrite pre-existing data unless used with the `--overwrite` flag.
 
+Performance Tuning
+==================
+
+For maximum throughput, especially with remote copies over high-speed networks, consider these optimizations.
+
+## System-Level Tuning (Linux)
+
+### UDP Socket Buffers
+
+`rcp` automatically requests larger UDP socket buffers for QUIC connections, but the kernel caps these to system limits. Increase the limits to allow full utilization of high-bandwidth links:
+
+```bash
+# Check current limits
+sysctl net.core.rmem_max net.core.wmem_max
+
+# Increase to 16 MiB (requires root, temporary until reboot)
+sudo sysctl -w net.core.rmem_max=16777216
+sudo sysctl -w net.core.wmem_max=16777216
+
+# Make permanent (add to /etc/sysctl.d/99-rcp-perf.conf)
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+```
+
+The default of ~208 KiB is often insufficient for 10+ Gbps links.
+
+### Open File Limits
+
+When copying large filesets with many concurrent operations, you may hit the open file limit:
+
+```bash
+# Check current limit
+ulimit -n
+
+# Increase for current session
+ulimit -n 65536
+
+# Make permanent (add to /etc/security/limits.conf)
+* soft nofile 65536
+* hard nofile 65536
+```
+
+`rcp` automatically queries the system limit and uses `--max-open-files` to self-throttle, but higher limits allow more parallelism.
+
+### Network Backlog (10+ Gbps)
+
+For very high-speed networks, increase the kernel's packet processing capacity:
+
+```bash
+sudo sysctl -w net.core.netdev_max_backlog=16384
+sudo sysctl -w net.core.netdev_budget=600
+```
+
+## Application-Level Tuning
+
+### Worker Threads
+
+Control parallelism with `--max-workers`:
+
+```bash
+# Use all CPU cores (default)
+rcp --max-workers=0 /source /dest
+
+# Limit to 4 workers (reduce I/O contention)
+rcp --max-workers=4 /source /dest
+```
+
+### Remote Copy Buffer Size
+
+For remote copies, the `--remote-copy-buffer-size` flag controls the size of data chunks sent over QUIC:
+
+```bash
+# Larger buffers for high-bandwidth links (default: 16 MiB for datacenter)
+rcp --remote-copy-buffer-size=32MiB host1:/data host2:/data
+
+# Smaller buffers for constrained memory
+rcp --remote-copy-buffer-size=4MiB host1:/data host2:/data
+```
+
+### QUIC Protocol Tuning
+
+For detailed QUIC tuning (flow control windows, congestion control, RTT estimates), see [QUIC Performance Tuning](docs/quic_performance_tuning.md).
+
+Quick examples:
+
+```bash
+# Ultra-aggressive for 100 Gbps dedicated datacenter link
+rcp --network-profile=datacenter \
+    --quic-receive-window=256MiB \
+    --quic-send-window=256MiB \
+    host1:/data host2:/data
+
+# Conservative for internet transfers
+rcp --network-profile=internet \
+    --congestion-control=cubic \
+    host1:/data host2:/data
+```
+
+### Concurrent QUIC Streams
+
+For directories with many small files, increase concurrent streams:
+
+```bash
+# Allow more parallel file transfers per connection
+rcp --quic-max-concurrent-streams=200 host1:/many-small-files host2:/dest
+```
+
+## Diagnosing Performance Issues
+
+### Check UDP Buffer Sizes
+
+When `rcp` starts, it logs the actual buffer sizes achieved (visible with `-v`):
+
+```
+UDP socket buffer sizes: send=416.0 KiB recv=416.0 KiB (requested 16.0 MiB)
+```
+
+If the actual sizes are much smaller than requested, increase your system's `rmem_max`/`wmem_max`.
+
+### Check for Packet Drops
+
+```bash
+# UDP receive errors (increases indicate dropped packets)
+cat /proc/net/udp | awk 'NR>1 {sum+=$5} END {print "UDP drops:", sum}'
+
+# Network interface drops
+ip -s link show eth0 | grep -A1 RX | grep dropped
+```
+
+### GSO (Generic Segmentation Offload)
+
+`rcp` uses QUIC with GSO enabled by default, which dramatically improves throughput by batching UDP packets. Verify GSO is enabled on your network interface:
+
+```bash
+ethtool -k eth0 | grep segmentation
+```
+
+If you see issues, GSO can sometimes be affected by:
+- Virtual network interfaces (VMs, containers)
+- Some VPN software
+- Older kernel versions (GSO for UDP added in Linux 4.18)
+
+## Quick Checklist
+
+For optimal performance on high-speed networks:
+
+1. ☐ Increase `rmem_max`/`wmem_max` to 16+ MiB
+2. ☐ Increase `ulimit -n` if copying many files
+3. ☐ Use `--network-profile=datacenter` for local/datacenter networks
+4. ☐ Consider `--quic-receive-window` and `--quic-send-window` for 100+ Gbps
+5. ☐ Use `--progress` to monitor throughput in real-time
+6. ☐ Check `-v` output to verify buffer sizes and connection setup
+
 Profiling
 =========
 
