@@ -1,4 +1,5 @@
 use anyhow::Context;
+use tokio::io::AsyncWriteExt;
 use tracing::{instrument, Instrument};
 
 use super::directory_tracker;
@@ -195,6 +196,12 @@ async fn process_single_file(
             copied
         )));
     }
+    // flush before drop to ensure all data reaches the kernel before we set metadata.
+    // tokio::fs::File hands writes to a threadpool - without flush, the threadpool
+    // may complete after we set mtime, causing the file to appear modified.
+    file.flush()
+        .await
+        .map_err(|e| err_data_consumed(e.into()))?;
     drop(file);
     tracing::info!(
         "File {} -> {} created, size: {} bytes, setting metadata...",
