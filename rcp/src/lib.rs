@@ -134,7 +134,7 @@
 //! This architecture ensures efficient data transfer while allowing the Master to coordinate the operation and monitor progress.
 //!
 //! For detailed network connectivity and troubleshooting information, see the
-//! `docs/network_connectivity.md` file in the repository.
+//! `docs/remote_copy.md` file in the repository.
 //!
 //! # Examples
 //!
