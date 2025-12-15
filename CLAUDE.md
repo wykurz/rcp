@@ -33,7 +33,7 @@ cargo install cargo-nextest  # Optional but recommended for testing
 - **Build all**: `just build`
 - **Build release**: `just build-release`
 - **Check docs**: `just doc`
-- **Run all CI checks**: `just ci` (lint + doc + test-all)
+- **Run all CI checks**: `just ci` (lint + doc + test-all + Docker tests)
 
 **IMPORTANT**: Always run `just ci` before committing changes to ensure:
 - ✅ Code formatting is correct (`cargo fmt --check`)

@@ -43,9 +43,9 @@ API documentation for the command-line tools is available on docs.rs:
 
 **Design and reference documents** (in the `docs/` directory):
 - [Security](docs/security.md) - Threat model and security architecture
-- [Network Connectivity](docs/network_connectivity.md) - Troubleshooting remote connections
+- [Remote Copy](docs/remote_copy.md) - rcpd deployment, version checking, troubleshooting
 - [Remote Protocol](docs/remote_protocol.md) - Wire protocol specification
-- [rcpd Bootstrap Design](docs/rcpd_bootstrap_design.md) - Auto-deployment architecture
+- [Testing](docs/testing.md) - Test infrastructure and Docker multi-host testing
 
 Examples
 ========
@@ -232,7 +232,7 @@ The remote copy uses a three-node architecture:
 - Destination `rcpd` writes files to destination host
 - Data flows directly from source to destination (not through master)
 
-For detailed network connectivity and troubleshooting information, see `docs/network_connectivity.md`.
+For detailed network connectivity and troubleshooting information, see `docs/remote_copy.md`.
 
 ## Security
 

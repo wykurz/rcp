@@ -15,7 +15,7 @@
 //! - Role ordering tests: Connection timing and role assignment
 //! - Error handling tests: Permission errors, network issues
 //!
-//! See `docs/testing_strategy.md` for overall approach.
+//! See `docs/testing.md` for overall approach.
 
 mod support;
 
