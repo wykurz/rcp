@@ -18,9 +18,9 @@ pub fn get_latest_progress_snapshot() -> enum_map::EnumMap<RcpdType, common::Ser
 /// CANCEL SAFETY: both branches are cancel-safe:
 /// - `receiver.recv()`: tokio mpsc channel recv is cancel-safe
 /// - `cancellation_token.cancelled()`: cancel-safe (just polls a flag)
-pub async fn run_sender(
+pub async fn run_sender<W: tokio::io::AsyncWrite + Unpin + Send>(
     mut receiver: tokio::sync::mpsc::UnboundedReceiver<common::remote_tracing::TracingMessage>,
-    mut send_stream: crate::streams::SendStream,
+    mut send_stream: crate::streams::SendStream<W>,
     cancellation_token: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     while let Some(msg) = tokio::select! {
@@ -38,8 +38,8 @@ pub async fn run_sender(
     Ok(())
 }
 
-pub async fn run_receiver(
-    mut recv_stream: crate::streams::RecvStream,
+pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin + Send>(
+    mut recv_stream: crate::streams::RecvStream<R>,
     rcpd_type: RcpdType,
 ) -> anyhow::Result<()> {
     while let Some(tracing_message) = recv_stream

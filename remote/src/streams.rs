@@ -1,17 +1,20 @@
 use bytes::Buf;
 use futures::SinkExt;
-use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tracing::instrument;
 
+/// Framed send stream for length-delimited messages.
+///
+/// Generic over the underlying writer type - works with TCP, TLS, or any AsyncWrite.
 #[derive(Debug)]
-pub struct SendStream {
-    framed: tokio_util::codec::FramedWrite<OwnedWriteHalf, tokio_util::codec::LengthDelimitedCodec>,
+pub struct SendStream<W = OwnedWriteHalf> {
+    framed: tokio_util::codec::FramedWrite<W, tokio_util::codec::LengthDelimitedCodec>,
 }
 
-impl SendStream {
-    pub fn new(stream: OwnedWriteHalf) -> Self {
+impl<W: AsyncWrite + Unpin> SendStream<W> {
+    pub fn new(stream: W) -> Self {
         let framed = tokio_util::codec::FramedWrite::new(
             stream,
             tokio_util::codec::LengthDelimitedCodec::new(),
@@ -57,15 +60,29 @@ impl SendStream {
     }
 }
 
-pub type SharedSendStream = std::sync::Arc<tokio::sync::Mutex<SendStream>>;
+pub type SharedSendStream<W = OwnedWriteHalf> = std::sync::Arc<tokio::sync::Mutex<SendStream<W>>>;
 
+/// Type alias for boxed write stream (supports both TLS and plain TCP)
+pub type BoxedWrite = Box<dyn AsyncWrite + Unpin + Send>;
+/// Type alias for boxed read stream (supports both TLS and plain TCP)
+pub type BoxedRead = Box<dyn AsyncRead + Unpin + Send>;
+/// Send stream over boxed writer
+pub type BoxedSendStream = SendStream<BoxedWrite>;
+/// Recv stream over boxed reader
+pub type BoxedRecvStream = RecvStream<BoxedRead>;
+/// Shared send stream over boxed writer
+pub type BoxedSharedSendStream = SharedSendStream<BoxedWrite>;
+
+/// Framed receive stream for length-delimited messages.
+///
+/// Generic over the underlying reader type - works with TCP, TLS, or any AsyncRead.
 #[derive(Debug)]
-pub struct RecvStream {
-    framed: tokio_util::codec::FramedRead<OwnedReadHalf, tokio_util::codec::LengthDelimitedCodec>,
+pub struct RecvStream<R = OwnedReadHalf> {
+    framed: tokio_util::codec::FramedRead<R, tokio_util::codec::LengthDelimitedCodec>,
 }
 
-impl RecvStream {
-    pub fn new(stream: OwnedReadHalf) -> Self {
+impl<R: AsyncRead + Unpin> RecvStream<R> {
+    pub fn new(stream: R) -> Self {
         let framed = tokio_util::codec::FramedRead::new(
             stream,
             tokio_util::codec::LengthDelimitedCodec::new(),

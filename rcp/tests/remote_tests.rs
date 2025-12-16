@@ -246,6 +246,20 @@ fn test_remote_copy_basic() {
     run_rcp_and_expect_success(&[&src_remote, &dst_remote]);
 }
 
+/// Test remote copy with --no-encryption flag (plain TCP, no TLS)
+#[test]
+fn test_remote_copy_no_encryption() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("test.txt");
+    let dst_file = dst_dir.path().join("test.txt");
+    create_test_file(&src_file, "no encryption test content", 0o644);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    run_rcp_and_expect_success(&["--no-encryption", &src_remote, &dst_remote]);
+    assert_eq!(get_file_content(&dst_file), "no encryption test content");
+}
+
 #[test]
 fn test_remote_copy_localhost() {
     require_local_ssh();
@@ -2536,6 +2550,49 @@ fn test_remote_child_symlink_fail_early_no_hang() {
     // symlink creation will fail due to permission denied
     let output =
         run_rcp_and_expect_failure(&["--fail-early", "--overwrite", &src_remote, &dst_remote]);
+
+    // restore permissions for cleanup
+    let _ = std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o755));
+
+    // verify we got an error (not a timeout)
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert!(
+        exit_code != 124,
+        "Command timed out - this indicates a hang bug where decrement_entry wasn't called"
+    );
+}
+
+/// Same as test_remote_child_symlink_fail_early_no_hang but with --no-encryption.
+/// Used to isolate TLS-related issues from protocol issues.
+#[test]
+fn test_remote_child_symlink_fail_early_no_hang_no_encryption() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+
+    // create source directory with a file and a symlink
+    let src_subdir = src_dir.path().join("symlink_test");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("file.txt"), "content", 0o644);
+    std::os::unix::fs::symlink("target", src_subdir.join("link")).unwrap();
+
+    // create destination directory, then make it read-only so symlink creation fails
+    let dst_subdir = dst_dir.path().join("symlink_test");
+    std::fs::create_dir_all(&dst_subdir).unwrap();
+    // make directory read-only - symlink creation will fail with Permission denied
+    std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+
+    // with --fail-early and --overwrite (to reuse existing directory) and --no-encryption
+    // symlink creation will fail due to permission denied
+    let output = run_rcp_and_expect_failure(&[
+        "--fail-early",
+        "--overwrite",
+        "--no-encryption",
+        &src_remote,
+        &dst_remote,
+    ]);
 
     // restore permissions for cleanup
     let _ = std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o755));

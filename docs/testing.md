@@ -118,7 +118,7 @@ Three Alpine Linux containers simulate separate hosts:
 
 **Container configuration**:
 - Based on Alpine Linux 3.19
-- OpenSSH server configured with pre-shared keys
+- OpenSSH server configured with pre-installed SSH keys
 - rcp/rcpd binaries mounted from `target/x86_64-unknown-linux-musl/debug/`
 - All containers run as `testuser`
 - Containers can SSH to each other by hostname

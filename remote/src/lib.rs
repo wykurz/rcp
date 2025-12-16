@@ -84,16 +84,20 @@
 //!
 //! # Security Model
 //!
-//! The remote copy system relies on SSH for authentication. Data transfers are currently unencrypted (plain TCP) but are protected by:
+//! The remote copy system provides multiple security layers:
 //!
-//! - **SSH Authentication**: All remote operations require SSH authentication
-//! - **Network Trust**: Assumes trusted network between source and destination
-//! - **Future TLS**: TLS encryption for data transfers can be added as a future enhancement
+//! - **SSH Authentication**: All remote operations require SSH authentication to spawn rcpd
+//! - **TLS Encryption**: All TCP connections encrypted with TLS 1.3 by default
+//! - **Certificate Pinning**: Self-signed certificates with fingerprint verification
+//! - **Mutual Authentication**: Source↔Destination connections use mutual TLS
 //!
-//! **Best Practices**:
-//! 1. **Secure SSH Configuration**: Use key-based authentication
-//! 2. **Network Segmentation**: Run remote copies on trusted network segments
-//! 3. **Consider SSH Tunneling**: For sensitive data over untrusted networks
+//! **How it works**:
+//! 1. Each rcpd generates an ephemeral self-signed certificate
+//! 2. rcpd outputs its certificate fingerprint to SSH stdout (trusted channel)
+//! 3. Master connects to rcpd as TLS client, verifies fingerprint
+//! 4. Master distributes fingerprints to enable Source↔Destination mutual auth
+//!
+//! Use `--no-encryption` to disable TLS for trusted networks where performance is critical.
 //!
 //! # Network Troubleshooting
 //!
@@ -108,6 +112,7 @@
 //! - [`port_ranges`] - Port range parsing and socket binding
 //! - [`protocol`] - Protocol message definitions and serialization
 //! - [`streams`] - TCP stream wrappers with typed message passing
+//! - [`tls`] - TLS certificate generation and configuration
 //! - [`tracelog`] - Remote tracing and progress aggregation
 
 #[cfg(not(tokio_unstable))]
@@ -120,6 +125,7 @@ pub mod deploy;
 pub mod port_ranges;
 pub mod protocol;
 pub mod streams;
+pub mod tls;
 pub mod tracelog;
 
 /// Network profile for TCP configuration tuning
@@ -689,18 +695,37 @@ async fn check_rcpd_version(
     Ok(())
 }
 
+/// Connection info received from rcpd after it starts listening.
+#[derive(Debug, Clone)]
+pub struct RcpdConnectionInfo {
+    /// Address rcpd is listening on
+    pub addr: std::net::SocketAddr,
+    /// TLS certificate fingerprint (None if encryption disabled)
+    pub fingerprint: Option<tls::Fingerprint>,
+}
+
+/// Result of starting an rcpd process.
+pub struct RcpdProcess {
+    /// SSH child process handle
+    pub child: openssh::Child<std::sync::Arc<openssh::Session>>,
+    /// Connection info (address and optional fingerprint)
+    pub conn_info: RcpdConnectionInfo,
+    /// Handle for stderr drain task (keeps pipe alive and captures diagnostics)
+    _stderr_drain: tokio::task::JoinHandle<()>,
+    /// Handle for stdout drain task (keeps pipe alive and captures diagnostics)
+    _stdout_drain: Option<tokio::task::JoinHandle<()>>,
+}
+
 #[allow(clippy::too_many_arguments)]
 #[instrument]
 pub async fn start_rcpd(
     rcpd_config: &protocol::RcpdConfig,
     session: &SshSession,
-    master_addr: &std::net::SocketAddr,
-    master_server_name: &str,
     explicit_rcpd_path: Option<&str>,
     auto_deploy_rcpd: bool,
     bind_ip: Option<&str>,
     role: protocol::RcpdRole,
-) -> anyhow::Result<openssh::Child<std::sync::Arc<openssh::Session>>> {
+) -> anyhow::Result<RcpdProcess> {
     tracing::info!("Starting rcpd server on: {:?}", session);
     let remote_host = &session.host;
     let ssh_session = setup_ssh_session(session).await?;
@@ -748,13 +773,7 @@ pub async fn start_rcpd(
     let rcpd_args = rcpd_config.to_args();
     tracing::debug!("rcpd arguments: {:?}", rcpd_args);
     let mut cmd = ssh_session.arc_command(&rcpd_path);
-    cmd.arg("--master-addr")
-        .arg(master_addr.to_string())
-        .arg("--server-name")
-        .arg(master_server_name)
-        .arg("--role")
-        .arg(role.to_string())
-        .args(rcpd_args);
+    cmd.arg("--role").arg(role.to_string()).args(rcpd_args);
     // add bind-ip if explicitly provided
     if let Some(ip) = bind_ip {
         tracing::debug!("passing --bind-ip {} to rcpd", ip);
@@ -766,7 +785,112 @@ pub async fn start_rcpd(
     cmd.stdout(openssh::Stdio::piped());
     cmd.stderr(openssh::Stdio::piped());
     tracing::info!("Will run remotely: {cmd:?}");
-    cmd.spawn().await.context("Failed to spawn rcpd command")
+    let mut child = cmd.spawn().await.context("Failed to spawn rcpd command")?;
+    // read connection info from rcpd's stderr
+    // (rcpd uses stderr for the protocol line because stdout is reserved for logs per convention;
+    // rcpd doesn't display progress bars locally - it sends progress data over the network)
+    // format: "RCP_TLS <addr> <fingerprint>" or "RCP_TCP <addr>"
+    let stderr = child.stderr().take().context("rcpd stderr not available")?;
+    let mut stderr_reader = tokio::io::BufReader::new(stderr);
+    let mut line = String::new();
+    use tokio::io::AsyncBufReadExt;
+    stderr_reader
+        .read_line(&mut line)
+        .await
+        .context("failed to read connection info from rcpd")?;
+    let line = line.trim();
+    // spawn background task to drain remaining stderr to prevent SIGPIPE and capture diagnostics
+    // we store the JoinHandle to keep the task alive for the lifetime of RcpdProcess
+    let host_stderr = session.host.clone();
+    let stderr_drain = tokio::spawn(async move {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stderr_reader.read_line(&mut line).await {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        tracing::debug!(host = %host_stderr, "rcpd stderr: {}", trimmed);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(host = %host_stderr, "rcpd stderr read error: {:#}", e);
+                    break;
+                }
+            }
+        }
+    });
+    // spawn background task to drain stdout (rcpd logs go here)
+    // we store the JoinHandle to keep the task alive for the lifetime of RcpdProcess
+    let stdout_drain = if let Some(stdout) = child.stdout().take() {
+        let host_stdout = session.host.clone();
+        let mut stdout_reader = tokio::io::BufReader::new(stdout);
+        Some(tokio::spawn(async move {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match stdout_reader.read_line(&mut line).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            tracing::debug!(host = %host_stdout, "rcpd stdout: {}", trimmed);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(host = %host_stdout, "rcpd stdout read error: {:#}", e);
+                        break;
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+    tracing::debug!("rcpd connection line: {}", line);
+    let conn_info = if let Some(rest) = line.strip_prefix("RCP_TLS ") {
+        // format: "RCP_TLS <addr> <fingerprint>"
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.len() != 2 {
+            anyhow::bail!("invalid RCP_TLS line from rcpd: {}", line);
+        }
+        let addr = parts[0]
+            .parse()
+            .with_context(|| format!("invalid address in RCP_TLS line: {}", parts[0]))?;
+        let fingerprint = tls::fingerprint_from_hex(parts[1])
+            .with_context(|| format!("invalid fingerprint in RCP_TLS line: {}", parts[1]))?;
+        RcpdConnectionInfo {
+            addr,
+            fingerprint: Some(fingerprint),
+        }
+    } else if let Some(rest) = line.strip_prefix("RCP_TCP ") {
+        // format: "RCP_TCP <addr>"
+        let addr = rest
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid address in RCP_TCP line: {}", rest))?;
+        RcpdConnectionInfo {
+            addr,
+            fingerprint: None,
+        }
+    } else {
+        anyhow::bail!(
+            "unexpected output from rcpd (expected RCP_TLS or RCP_TCP): {}",
+            line
+        );
+    };
+    tracing::info!(
+        "rcpd listening on {} (encryption={})",
+        conn_info.addr,
+        conn_info.fingerprint.is_some()
+    );
+    Ok(RcpdProcess {
+        child,
+        conn_info,
+        _stderr_drain: stderr_drain,
+        _stdout_drain: stdout_drain,
+    })
 }
 
 // ============================================================================

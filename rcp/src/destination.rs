@@ -18,6 +18,8 @@ struct DataConnectionPool {
     network_profile: remote::NetworkProfile,
     /// Semaphore to limit concurrent connections
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Optional TLS connector for encrypted connections
+    tls_connector: Option<std::sync::Arc<tokio_rustls::TlsConnector>>,
 }
 
 impl DataConnectionPool {
@@ -25,11 +27,13 @@ impl DataConnectionPool {
         data_addr: std::net::SocketAddr,
         max_connections: usize,
         network_profile: remote::NetworkProfile,
+        tls_connector: Option<std::sync::Arc<tokio_rustls::TlsConnector>>,
     ) -> Self {
         Self {
             data_addr,
             network_profile,
             semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections)),
+            tls_connector,
         }
     }
     /// Open a new connection to the source's data port.
@@ -37,7 +41,7 @@ impl DataConnectionPool {
     async fn connect(
         &self,
     ) -> anyhow::Result<(
-        remote::streams::RecvStream,
+        remote::streams::BoxedRecvStream,
         tokio::sync::OwnedSemaphorePermit,
     )> {
         // acquire semaphore permit (limits concurrent connections)
@@ -51,8 +55,20 @@ impl DataConnectionPool {
         let stream = tokio::net::TcpStream::connect(self.data_addr).await?;
         stream.set_nodelay(true)?;
         remote::configure_tcp_buffers(&stream, self.network_profile);
-        let (read_half, _write_half) = stream.into_split();
-        let recv_stream = remote::streams::RecvStream::new(read_half);
+        // wrap with TLS if configured
+        let recv_stream = if let Some(ref connector) = self.tls_connector {
+            let server_name =
+                rustls::pki_types::ServerName::try_from("rcp").expect("'rcp' is a valid DNS name");
+            let tls_stream = connector
+                .connect(server_name, stream)
+                .await
+                .context("TLS handshake failed for data connection")?;
+            let (read_half, _write_half) = tokio::io::split(tls_stream);
+            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead)
+        } else {
+            let (read_half, _write_half) = stream.into_split();
+            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead)
+        };
         Ok((recv_stream, permit))
     }
     fn close(&self) {
@@ -91,7 +107,7 @@ struct ProcessFileError {
 async fn process_single_file(
     settings: &common::copy::Settings,
     preserve: &common::preserve::Settings,
-    file_recv_stream: &mut remote::streams::RecvStream,
+    file_recv_stream: &mut remote::streams::BoxedRecvStream,
     file_header: &remote::protocol::File,
 ) -> Result<(), ProcessFileError> {
     let prog = progress();
@@ -221,11 +237,11 @@ async fn process_single_file(
 /// Handle a stream that may contain multiple files.
 ///
 /// Loops until the stream is closed (EOF on header read).
-#[instrument(skip(error_occurred))]
+#[instrument(skip(error_occurred, file_recv_stream, directory_tracker))]
 async fn handle_file_stream(
     settings: common::copy::Settings,
     preserve: common::preserve::Settings,
-    mut file_recv_stream: remote::streams::RecvStream,
+    mut file_recv_stream: remote::streams::BoxedRecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
@@ -349,7 +365,7 @@ async fn handle_file_stream(
 ///
 /// Opens connections to source's data port and reads file data.
 /// Each connection handles multiple files until source closes it (EOF).
-#[instrument(skip(error_occurred, data_pool))]
+#[instrument(skip(error_occurred, data_pool, directory_tracker))]
 async fn process_incoming_file_streams_tcp(
     settings: common::copy::Settings,
     preserve: common::preserve::Settings,
@@ -546,11 +562,11 @@ async fn create_symlink(
     }
 }
 
-#[instrument(skip(error_occurred))]
+#[instrument(skip(error_occurred, control_recv_stream, directory_tracker))]
 async fn process_control_stream(
     settings: &common::copy::Settings,
     preserve: &common::preserve::Settings,
-    mut control_recv_stream: remote::streams::RecvStream,
+    mut control_recv_stream: remote::streams::BoxedRecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
@@ -705,7 +721,8 @@ async fn process_control_stream(
     Ok(())
 }
 
-#[instrument]
+#[instrument(skip(cert_key))]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_destination(
     src_control_addr: &std::net::SocketAddr,
     src_data_addr: &std::net::SocketAddr,
@@ -713,7 +730,29 @@ pub async fn run_destination(
     settings: &common::copy::Settings,
     preserve: &common::preserve::Settings,
     tcp_config: &remote::TcpConfig,
+    cert_key: Option<&remote::tls::CertifiedKey>,
+    source_cert_fingerprint: Option<remote::protocol::CertFingerprint>,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
+    // create TLS connector if encryption is enabled (requires both cert and source fingerprint)
+    let tls_connector = match (cert_key, source_cert_fingerprint) {
+        (Some(cert), Some(source_fp)) => {
+            // create client config with client certificate for mutual TLS
+            let client_config = remote::tls::create_client_config_with_cert(cert, source_fp)
+                .context("failed to create TLS client config")?;
+            Some(std::sync::Arc::new(tokio_rustls::TlsConnector::from(
+                client_config,
+            )))
+        }
+        _ => None,
+    };
+    tracing::info!(
+        "Destination TLS encryption: {}",
+        if tls_connector.is_some() {
+            "enabled (mutual TLS)"
+        } else {
+            "disabled"
+        }
+    );
     tracing::info!(
         "Connecting to source: control={}, data={}",
         src_control_addr,
@@ -724,9 +763,31 @@ pub async fn run_destination(
         remote::connect_tcp_control(*src_control_addr, tcp_config.conn_timeout_sec).await?;
     tracing::info!("Connected to source control port");
     remote::configure_tcp_buffers(&control_stream, tcp_config.network_profile);
-    // create bidirectional control connection
-    let control_connection = remote::streams::ControlConnection::new(control_stream);
-    let (control_send_stream, control_recv_stream) = control_connection.into_split();
+    // wrap control connection with TLS if configured
+    let (control_send_stream, control_recv_stream) = if let Some(ref connector) = tls_connector {
+        // use a dummy server name - we verify via fingerprint, not hostname
+        let server_name =
+            rustls::pki_types::ServerName::try_from("rcp").expect("'rcp' is a valid DNS name");
+        let tls_stream = connector
+            .connect(server_name, control_stream)
+            .await
+            .context("TLS handshake failed for control connection")?;
+        let (read_half, write_half) = tokio::io::split(tls_stream);
+        let recv_stream =
+            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead);
+        let send_stream =
+            remote::streams::SendStream::new(Box::new(write_half) as remote::streams::BoxedWrite);
+        (send_stream, recv_stream)
+    } else {
+        let (read_half, write_half) = control_stream.into_split();
+        let recv_stream =
+            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead);
+        let send_stream =
+            remote::streams::SendStream::new(Box::new(write_half) as remote::streams::BoxedWrite);
+        (send_stream, recv_stream)
+    };
+    // wrap in Arc<Mutex<>> for shared access
+    let control_send_stream = std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
     tracing::info!("Created control streams");
     let directory_tracker = directory_tracker::make_shared(control_send_stream, *preserve);
     let error_occurred = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -735,6 +796,7 @@ pub async fn run_destination(
         *src_data_addr,
         tcp_config.max_connections,
         tcp_config.network_profile,
+        tls_connector,
     ));
     let file_handler_future = process_incoming_file_streams_tcp(
         *settings,
@@ -756,15 +818,27 @@ pub async fn run_destination(
     // CANCEL SAFETY: the "cancelled" future is NOT dropped - it's awaited after select!
     // completes. Both futures are pinned and the winning branch awaits the other, ensuring
     // both run to completion. No work is lost due to cancellation.
-    tokio::select! {
-        file_result = &mut file_handler_future => {
-            file_result.context("Failed to process incoming file streams")?;
-            control_future.await.context("Failed to process control stream")?;
+    let select_result: anyhow::Result<()> = async {
+        tokio::select! {
+            file_result = &mut file_handler_future => {
+                file_result.context("Failed to process incoming file streams")?;
+                control_future.await.context("Failed to process control stream")?;
+            }
+            control_result = &mut control_future => {
+                control_result.context("Failed to process control stream")?;
+                file_handler_future.await.context("Failed to process incoming file streams")?;
+            }
         }
-        control_result = &mut control_future => {
-            control_result.context("Failed to process control stream")?;
-            file_handler_future.await.context("Failed to process incoming file streams")?;
-        }
+        Ok(())
+    }
+    .await;
+    // if there was an error, close the control stream properly before returning.
+    // this is important for TLS streams which need explicit shutdown to send close_notify.
+    if let Err(e) = select_result {
+        tracing::info!("Error during operation, closing streams for cleanup");
+        directory_tracker.lock().await.close_stream().await;
+        data_pool.close();
+        return Err(e);
     }
     tracing::info!("Destination is done");
     data_pool.close();

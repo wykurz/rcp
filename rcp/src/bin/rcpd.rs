@@ -15,14 +15,6 @@ use rcp_tools_rcp::{destination, source};
 This daemon is automatically started by `rcp` on remote hosts via SSH and should not typically be invoked manually. Please see `rcp --help` for more information about remote copy operations."
 )]
 struct Args {
-    /// The master (rcp) address to connect to
-    #[arg(long)]
-    master_addr: std::net::SocketAddr,
-
-    /// The server name to use for the connection
-    #[arg(long)]
-    server_name: String,
-
     /// Role of this rcpd instance (source or destination)
     ///
     /// This is set by the master (rcp) to distinguish between source and destination
@@ -138,6 +130,19 @@ struct Args {
     /// Defaults to dynamic port allocation if not specified
     #[arg(long, value_name = "RANGES", help_heading = "Remote copy options")]
     port_ranges: Option<String>,
+
+    /// Disable TLS encryption for all connections
+    ///
+    /// WARNING: Only use on trusted networks. All data will be transmitted in plaintext.
+    #[arg(long, help_heading = "Remote copy options")]
+    no_encryption: bool,
+
+    /// Master's certificate fingerprint for client authentication (internal use)
+    ///
+    /// When TLS is enabled, rcpd will verify that connecting clients present a certificate
+    /// with this fingerprint. This prevents unauthorized connections to the rcpd port.
+    #[arg(long, value_name = "FINGERPRINT", help_heading = "Remote copy options")]
+    master_cert_fp: Option<String>,
 
     /// Connection timeout for remote copy operations in seconds
     ///
@@ -264,11 +269,16 @@ async fn stdin_monitor() {
 }
 
 /// async operation for rcpd - runs the actual source or destination logic
-async fn run_operation(
+async fn run_operation<W, R>(
     args: Args,
-    mut master_send_stream: remote::streams::SendStream,
-    mut master_recv_stream: remote::streams::RecvStream,
-) -> anyhow::Result<remote::protocol::RcpdResult> {
+    mut master_send_stream: remote::streams::SendStream<W>,
+    mut master_recv_stream: remote::streams::RecvStream<R>,
+    cert_key: Option<remote::tls::CertifiedKey>,
+) -> anyhow::Result<remote::protocol::RcpdResult>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     // run source or destination
     let master_hello = master_recv_stream
         .recv_object::<remote::protocol::MasterHello>()
@@ -293,7 +303,11 @@ async fn run_operation(
         remote_copy_buffer_size: tcp_config.effective_buffer_size(),
     };
     let rcpd_result = match master_hello {
-        remote::protocol::MasterHello::Source { src, dst } => {
+        remote::protocol::MasterHello::Source {
+            src,
+            dst,
+            dest_cert_fingerprint,
+        } => {
             tracing::info!("Starting source");
             let shared_send = std::sync::Arc::new(tokio::sync::Mutex::new(master_send_stream));
             let result = match source::run_source(
@@ -303,6 +317,8 @@ async fn run_operation(
                 &settings,
                 &tcp_config,
                 args.bind_ip.as_deref(),
+                cert_key.as_ref(),
+                dest_cert_fingerprint,
             )
             .await
             {
@@ -336,6 +352,7 @@ async fn run_operation(
             source_data_addr,
             server_name,
             preserve,
+            source_cert_fingerprint,
         } => {
             tracing::info!("Starting destination");
             match destination::run_destination(
@@ -345,6 +362,8 @@ async fn run_operation(
                 &settings,
                 &preserve,
                 &tcp_config,
+                cert_key.as_ref(),
+                source_cert_fingerprint,
             )
             .await
             {
@@ -387,55 +406,112 @@ async fn async_main(
     args: Args,
     tracing_receiver: tokio::sync::mpsc::UnboundedReceiver<common::remote_tracing::TracingMessage>,
 ) -> anyhow::Result<String> {
+    // install rustls crypto provider (ring) before any TLS operations
+    if !args.no_encryption {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok(); // ignore if already installed
+    }
+    // build TCP config for listener creation
+    let tcp_config = remote::TcpConfig {
+        port_ranges: args.port_ranges.clone(),
+        conn_timeout_sec: args.remote_copy_conn_timeout_sec,
+        network_profile: args.network_profile,
+        buffer_size: args.buffer_size,
+        max_connections: args.max_connections,
+    };
+    // generate TLS certificate and create server config (if encryption enabled)
+    let (cert_key, tls_acceptor) = if !args.no_encryption {
+        let cert_key = remote::tls::generate_self_signed_cert()
+            .context("failed to generate TLS certificate")?;
+        // if master fingerprint provided, require client authentication
+        let server_config = if let Some(ref fp_hex) = args.master_cert_fp {
+            let master_fingerprint = remote::tls::fingerprint_from_hex(fp_hex)
+                .context("invalid master certificate fingerprint")?;
+            remote::tls::create_server_config_with_client_auth(&cert_key, master_fingerprint)
+                .context("failed to create TLS server config with client auth")?
+        } else {
+            // encryption enabled but no master fingerprint - this is a security risk
+            anyhow::bail!(
+                "TLS encryption is enabled but --master-cert-fp was not provided. \
+                 This would allow any client to connect. Either provide --master-cert-fp \
+                 or use --no-encryption for trusted networks."
+            );
+        };
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        (Some(cert_key), Some(acceptor))
+    } else {
+        (None, None)
+    };
+    // create TCP listener for master connections
+    let listener =
+        remote::create_tcp_control_listener(&tcp_config, args.bind_ip.as_deref()).await?;
+    let listen_addr = remote::get_tcp_listener_addr(&listener, args.bind_ip.as_deref())?;
+    // output connection info to stderr (read by master via SSH)
+    // we use stderr because stdout is reserved for logs per project convention
+    // (rcpd doesn't display progress bars locally - it sends progress data over the network)
+    // format: "RCP_TLS <addr> <fingerprint>" or "RCP_TCP <addr>"
+    if let Some(ref cert) = cert_key {
+        let fingerprint_hex = remote::tls::fingerprint_to_hex(&cert.fingerprint);
+        eprintln!("RCP_TLS {} {}", listen_addr, fingerprint_hex);
+    } else {
+        eprintln!("RCP_TCP {}", listen_addr);
+    }
+    // flush stderr to ensure master receives the line immediately
+    use std::io::Write;
+    std::io::stderr()
+        .flush()
+        .context("failed to flush stderr")?;
+    tracing::info!("Listening for master connections on {}", listen_addr);
+    let conn_timeout = std::time::Duration::from_secs(args.remote_copy_conn_timeout_sec);
+    // helper to accept a connection and optionally wrap with TLS
+    async fn accept_connection(
+        listener: &tokio::net::TcpListener,
+        tls_acceptor: Option<&tokio_rustls::TlsAcceptor>,
+        timeout: std::time::Duration,
+        purpose: &str,
+    ) -> anyhow::Result<(
+        remote::streams::BoxedSendStream,
+        remote::streams::BoxedRecvStream,
+    )> {
+        let (stream, addr) = tokio::time::timeout(timeout, listener.accept())
+            .await
+            .with_context(|| format!("timeout waiting for master {} connection", purpose))?
+            .with_context(|| format!("failed to accept {} connection", purpose))?;
+        tracing::info!("Accepted {} connection from {}", purpose, addr);
+        stream.set_nodelay(true)?;
+        if let Some(acceptor) = tls_acceptor {
+            let tls_stream = acceptor
+                .accept(stream)
+                .await
+                .with_context(|| format!("TLS handshake failed for {} connection", purpose))?;
+            let (read_half, write_half) = tokio::io::split(tls_stream);
+            let recv_stream =
+                remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead);
+            let send_stream = remote::streams::SendStream::new(
+                Box::new(write_half) as remote::streams::BoxedWrite
+            );
+            Ok((send_stream, recv_stream))
+        } else {
+            let (read_half, write_half) = stream.into_split();
+            let recv_stream =
+                remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead);
+            let send_stream = remote::streams::SendStream::new(
+                Box::new(write_half) as remote::streams::BoxedWrite
+            );
+            Ok((send_stream, recv_stream))
+        }
+    }
+    // accept control connection (TCP + TLS handshake immediately)
+    let (master_send_stream, master_recv_stream) =
+        accept_connection(&listener, tls_acceptor.as_ref(), conn_timeout, "control").await?;
+    // accept tracing connection (TCP + TLS handshake immediately)
+    let (tracing_send_stream, _tracing_recv_stream) =
+        accept_connection(&listener, tls_acceptor.as_ref(), conn_timeout, "tracing").await?;
     tracing::info!(
-        "Connecting to master {} (server name: {})",
-        args.master_addr,
-        args.server_name
+        "Master connections established (encryption={})",
+        !args.no_encryption
     );
-    // connect to master via TCP (control connection)
-    let master_stream =
-        remote::connect_tcp_control(args.master_addr, args.remote_copy_conn_timeout_sec)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to connect to master at {}. \
-                This usually means the master is unreachable from this host. \
-                Check network connectivity and firewall rules.",
-                    args.master_addr
-                )
-            })?;
-    tracing::info!("Connected to master (control)");
-    // split the stream into read/write halves
-    let (read_half, write_half) = master_stream.into_split();
-    let mut master_send_stream = remote::streams::SendStream::new(write_half);
-    let master_recv_stream = remote::streams::RecvStream::new(read_half);
-    // send hello to identify our role (control connection)
-    master_send_stream
-        .send_control_message(&remote::protocol::TracingHello {
-            role: args.role,
-            is_tracing: false,
-        })
-        .await?;
-    // connect second TCP connection for tracing/progress updates
-    let tracing_stream =
-        remote::connect_tcp_control(args.master_addr, args.remote_copy_conn_timeout_sec)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to connect tracing stream to master at {}.",
-                    args.master_addr
-                )
-            })?;
-    tracing::info!("Connected to master (tracing)");
-    let (_tracing_read, tracing_write) = tracing_stream.into_split();
-    let mut tracing_send_stream = remote::streams::SendStream::new(tracing_write);
-    // send hello on tracing connection to identify this as a tracing stream
-    tracing_send_stream
-        .send_control_message(&remote::protocol::TracingHello {
-            role: args.role,
-            is_tracing: true,
-        })
-        .await?;
     // spawn tracing sender task to forward progress/logs to master
     let tracing_cancel = tokio_util::sync::CancellationToken::new();
     let tracing_task = {
@@ -485,7 +561,7 @@ async fn async_main(
         // branch wins (stdin closed), we exit(1) immediately so there's no
         // concern about partial state from the cancelled `run_operation`.
         tokio::select! {
-            result = run_operation(args.clone(), master_send_stream, master_recv_stream) => {
+            result = run_operation(args.clone(), master_send_stream, master_recv_stream, cert_key.clone()) => {
                 match result {
                     Ok(r) => r,
                     Err(e) => {
@@ -511,7 +587,14 @@ async fn async_main(
         }
     } else {
         // stdin not available - rely on TCP timeouts only
-        match run_operation(args.clone(), master_send_stream, master_recv_stream).await {
+        match run_operation(
+            args.clone(),
+            master_send_stream,
+            master_recv_stream,
+            cert_key.clone(),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 let runtime_stats = common::collect_runtime_stats();

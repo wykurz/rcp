@@ -227,6 +227,14 @@ struct Args {
     #[arg(long, value_name = "PREFIX", help_heading = "Remote copy options")]
     rcpd_debug_log_prefix: Option<String>,
 
+    /// Disable TLS encryption for remote copy operations
+    ///
+    /// By default, remote copy connections use TLS for authentication and encryption.
+    /// Use this flag to disable encryption for performance on trusted networks.
+    /// WARNING: This exposes all data and credentials in plain text over the network.
+    #[arg(long, help_heading = "Remote copy options")]
+    no_encryption: bool,
+
     // Profiling options
     /// Enable Chrome tracing output for profiling
     ///
@@ -328,20 +336,28 @@ async fn run_rcpd_master(
     dst: &path::RemotePath,
 ) -> anyhow::Result<common::copy::Summary> {
     tracing::debug!("running rcpd src/dst");
-    // build TCP config
-    let tcp_config = remote::TcpConfig {
+    // install rustls crypto provider (ring) before any TLS operations
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok(); // ignore if already installed
+               // build TCP config (will be used for source↔dest connections later)
+    let _tcp_config = remote::TcpConfig {
         port_ranges: args.port_ranges.clone(),
         conn_timeout_sec: args.remote_copy_conn_timeout_sec,
         network_profile: args.network_profile,
         buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
         max_connections: args.max_connections,
     };
-    // create TCP listener for master
-    let master_listener =
-        remote::create_tcp_control_listener(&tcp_config, args.bind_ip.as_deref()).await?;
-    let server_addr = remote::get_tcp_listener_addr(&master_listener, args.bind_ip.as_deref())?;
-    let server_name = remote::get_random_server_name();
-    let mut rcpds = vec![];
+    let mut rcpd_processes: Vec<remote::RcpdProcess> = vec![];
+    // generate master's TLS certificate for authenticating to rcpd (when encryption enabled)
+    let master_cert = if !args.no_encryption {
+        Some(
+            remote::tls::generate_self_signed_cert()
+                .context("failed to generate master TLS certificate")?,
+        )
+    } else {
+        None
+    };
     let rcpd_config = remote::protocol::RcpdConfig {
         verbose: args.verbose,
         fail_early: args.fail_early,
@@ -367,6 +383,8 @@ async fn run_rcpd_master(
         profile_level: Some(args.profile_level.clone()),
         tokio_console: args.tokio_console,
         tokio_console_port: args.tokio_console_port,
+        encryption: !args.no_encryption,
+        master_cert_fingerprint: master_cert.as_ref().map(|c| c.fingerprint),
     };
     // deduplicate sessions if src and dst are the same host
     // this avoids deploying rcpd twice to the same location
@@ -390,8 +408,6 @@ async fn run_rcpd_master(
             remote::start_rcpd(
                 &rcpd_config,
                 session,
-                &server_addr,
-                &server_name,
                 args.rcpd_path.as_deref(),
                 args.auto_deploy_rcpd,
                 bind_ip.as_deref(),
@@ -399,10 +415,10 @@ async fn run_rcpd_master(
             )
             .await?
         };
-        rcpds.push(rcpd);
+        rcpd_processes.push(rcpd);
     }
     // if src and dst are the same, we need to start rcpd twice even though we only deployed once
-    if src.session() == dst.session() && rcpds.len() == 1 {
+    if src.session() == dst.session() && rcpd_processes.len() == 1 {
         let bind_ip = extract_bind_ip_from_host(&src.session().host);
         let rcpd = {
             let _span = tracing::trace_span!(
@@ -414,8 +430,6 @@ async fn run_rcpd_master(
             remote::start_rcpd(
                 &rcpd_config,
                 src.session(),
-                &server_addr,
-                &server_name,
                 args.rcpd_path.as_deref(),
                 args.auto_deploy_rcpd,
                 bind_ip.as_deref(),
@@ -423,89 +437,126 @@ async fn run_rcpd_master(
             )
             .await?
         };
-        rcpds.push(rcpd);
+        rcpd_processes.push(rcpd);
     }
-    tracing::info!("Waiting for connections from rcpd processes...");
+    // identify source and destination rcpd processes
+    // rcpd_processes[0] is always source, rcpd_processes[1] is destination (or same-host case)
+    let source_rcpd = &rcpd_processes[0];
+    let dest_rcpd = if rcpd_processes.len() > 1 {
+        &rcpd_processes[1]
+    } else {
+        // same-host case: there's only one rcpd process serving both roles
+        &rcpd_processes[0]
+    };
+    tracing::info!(
+        "Source rcpd at {} (encryption={})",
+        source_rcpd.conn_info.addr,
+        source_rcpd.conn_info.fingerprint.is_some()
+    );
+    tracing::info!(
+        "Destination rcpd at {} (encryption={})",
+        dest_rcpd.conn_info.addr,
+        dest_rcpd.conn_info.fingerprint.is_some()
+    );
     let rcpd_connect_timeout = std::time::Duration::from_secs(args.remote_copy_conn_timeout_sec);
-    // helper to accept a single connection
-    async fn accept_connection(
-        listener: &tokio::net::TcpListener,
+    // helper to connect to an rcpd and wrap with TLS if needed
+    async fn connect_to_rcpd(
+        conn_info: &remote::RcpdConnectionInfo,
+        master_cert: Option<&remote::tls::CertifiedKey>,
         timeout: std::time::Duration,
-        conn_num: usize,
+        purpose: &str,
     ) -> anyhow::Result<(
-        remote::streams::SendStream,
-        remote::streams::RecvStream,
-        remote::protocol::TracingHello,
+        remote::streams::BoxedSendStream,
+        remote::streams::BoxedRecvStream,
     )> {
-        let _span = tracing::trace_span!("accept_rcpd_connection", connection = conn_num).entered();
-        let (stream, peer_addr) = match tokio::time::timeout(timeout, listener.accept()).await {
-            Ok(Ok((stream, addr))) => (stream, addr),
-            Ok(Err(e)) => return Err(anyhow!("Failed to accept connection: {:#}", e)),
-            Err(_) => {
-                return Err(anyhow!(
-                    "Timed out waiting for rcpd to connect after {:?}. \
-                    Check if hosts are reachable and rcpd can be executed.",
-                    timeout
-                ))
-            }
-        };
-        tracing::debug!("Accepted TCP connection {} from {}", conn_num, peer_addr);
-        stream.set_nodelay(true)?;
-        let (read_half, write_half) = stream.into_split();
-        let mut recv_stream = remote::streams::RecvStream::new(read_half);
-        let send_stream = remote::streams::SendStream::new(write_half);
-        let hello = recv_stream
-            .recv_object::<remote::protocol::TracingHello>()
+        let stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(conn_info.addr))
             .await
-            .context("Failed to receive tracing hello from rcpd")?
-            .context("Expected TracingHello from rcpd")?;
-        Ok((send_stream, recv_stream, hello))
-    }
-    // accept 4 connections: 2 control (one per rcpd) + 2 tracing (one per rcpd)
-    // connections can arrive in any order, so we use is_tracing field to distinguish
-    tracing::info!("Waiting for rcpd connections (expecting 4: 2 control + 2 tracing)...");
-    let mut source_control: Option<(remote::streams::SendStream, remote::streams::RecvStream)> =
-        None;
-    let mut dest_control: Option<(remote::streams::SendStream, remote::streams::RecvStream)> = None;
-    let mut source_tracing: Option<remote::streams::RecvStream> = None;
-    let mut dest_tracing: Option<remote::streams::RecvStream> = None;
-    for i in 1..=4 {
-        let (send, recv, hello) =
-            accept_connection(&master_listener, rcpd_connect_timeout, i).await?;
-        tracing::info!(
-            "Connection {} from {} rcpd ({})",
-            i,
-            hello.role,
-            if hello.is_tracing {
-                "tracing"
-            } else {
-                "control"
+            .with_context(|| format!("timeout connecting to rcpd for {}", purpose))?
+            .with_context(|| {
+                format!(
+                    "failed to connect to rcpd at {} for {}",
+                    conn_info.addr, purpose
+                )
+            })?;
+        stream.set_nodelay(true)?;
+        tracing::debug!("Connected to rcpd at {} for {}", conn_info.addr, purpose);
+        match (conn_info.fingerprint, master_cert) {
+            (Some(rcpd_fingerprint), Some(cert)) => {
+                // mutual TLS: master presents cert, verifies rcpd fingerprint
+                let tls_config =
+                    remote::tls::create_client_config_with_cert(cert, rcpd_fingerprint)
+                        .context("failed to create TLS client config with certificate")?;
+                let connector = tokio_rustls::TlsConnector::from(tls_config);
+                let server_name = rustls::pki_types::ServerName::try_from("rcpd")
+                    .map_err(|e| anyhow!("invalid server name: {}", e))?;
+                // wrap TLS handshake in timeout to prevent hanging on stalled peers
+                let tls_stream =
+                    tokio::time::timeout(timeout, connector.connect(server_name, stream))
+                        .await
+                        .with_context(|| format!("TLS handshake timeout for {}", purpose))?
+                        .context("TLS handshake with rcpd failed")?;
+                let (read_half, write_half) = tokio::io::split(tls_stream);
+                let recv_stream = remote::streams::RecvStream::new(
+                    Box::new(read_half) as remote::streams::BoxedRead
+                );
+                let send_stream = remote::streams::SendStream::new(
+                    Box::new(write_half) as remote::streams::BoxedWrite
+                );
+                Ok((send_stream, recv_stream))
             }
-        );
-        // assign to appropriate slot based on role and connection type
-        match (hello.role, hello.is_tracing) {
-            (remote::protocol::RcpdRole::Source, false) => {
-                source_control = Some((send, recv));
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!(
+                    "TLS configuration mismatch: rcpd and master must both use encryption or both disable it"
+                );
             }
-            (remote::protocol::RcpdRole::Source, true) => {
-                source_tracing = Some(recv);
-            }
-            (remote::protocol::RcpdRole::Destination, false) => {
-                dest_control = Some((send, recv));
-            }
-            (remote::protocol::RcpdRole::Destination, true) => {
-                dest_tracing = Some(recv);
+            (None, None) => {
+                // plain TCP (no encryption)
+                let (read_half, write_half) = stream.into_split();
+                let recv_stream = remote::streams::RecvStream::new(
+                    Box::new(read_half) as remote::streams::BoxedRead
+                );
+                let send_stream = remote::streams::SendStream::new(
+                    Box::new(write_half) as remote::streams::BoxedWrite
+                );
+                Ok((send_stream, recv_stream))
             }
         }
     }
-    let (mut source_send_stream, mut source_recv_stream) =
-        source_control.ok_or_else(|| anyhow!("Missing source control connection"))?;
-    let (mut dest_send_stream, mut dest_recv_stream) =
-        dest_control.ok_or_else(|| anyhow!("Missing destination control connection"))?;
-    let source_tracing_recv =
-        source_tracing.ok_or_else(|| anyhow!("Missing source tracing connection"))?;
-    let dest_tracing_recv =
-        dest_tracing.ok_or_else(|| anyhow!("Missing destination tracing connection"))?;
+    // connect to source rcpd (control + tracing)
+    tracing::info!("Connecting to source rcpd...");
+    let (mut source_send_stream, mut source_recv_stream) = connect_to_rcpd(
+        &source_rcpd.conn_info,
+        master_cert.as_ref(),
+        rcpd_connect_timeout,
+        "source control",
+    )
+    .await?;
+    let (source_tracing_send, source_tracing_recv) = connect_to_rcpd(
+        &source_rcpd.conn_info,
+        master_cert.as_ref(),
+        rcpd_connect_timeout,
+        "source tracing",
+    )
+    .await?;
+    drop(source_tracing_send); // we only receive on tracing connection
+                               // connect to destination rcpd (control + tracing)
+    tracing::info!("Connecting to destination rcpd...");
+    let (mut dest_send_stream, mut dest_recv_stream) = connect_to_rcpd(
+        &dest_rcpd.conn_info,
+        master_cert.as_ref(),
+        rcpd_connect_timeout,
+        "dest control",
+    )
+    .await?;
+    let (dest_tracing_send, dest_tracing_recv) = connect_to_rcpd(
+        &dest_rcpd.conn_info,
+        master_cert.as_ref(),
+        rcpd_connect_timeout,
+        "dest tracing",
+    )
+    .await?;
+    drop(dest_tracing_send); // we only receive on tracing connection
+    tracing::info!("Connected to all rcpd processes");
     // spawn tracing receiver tasks to process progress/log messages from rcpd
     let source_tracing_task = tokio::spawn(async move {
         if let Err(e) =
@@ -525,13 +576,14 @@ async fn run_rcpd_master(
             tracing::debug!("Destination tracing receiver ended: {e}");
         }
     });
-    // send MasterHello to source rcpd
+    // send MasterHello to source rcpd (include dest fingerprint for mutual TLS)
     {
         let _span = tracing::trace_span!("send_master_hello_to_source").entered();
         source_send_stream
             .send_control_message(&remote::protocol::MasterHello::Source {
                 src: src.path().to_path_buf(),
                 dst: dst.path().to_path_buf(),
+                dest_cert_fingerprint: dest_rcpd.conn_info.fingerprint,
             })
             .await?;
     }
@@ -543,7 +595,7 @@ async fn run_rcpd_master(
             .await?
             .expect("Failed to receive source hello from source rcpd")
     };
-    // send MasterHello to destination rcpd
+    // send MasterHello to destination rcpd (include source fingerprint for mutual TLS)
     {
         let _span = tracing::trace_span!("send_master_hello_to_dest").entered();
         dest_send_stream
@@ -552,6 +604,7 @@ async fn run_rcpd_master(
                 source_data_addr: source_hello.data_addr,
                 server_name: source_hello.server_name.clone(),
                 preserve: *preserve,
+                source_cert_fingerprint: source_rcpd.conn_info.fingerprint,
             })
             .await?;
     }
@@ -625,8 +678,8 @@ async fn run_rcpd_master(
     source_tracing_task.abort();
     dest_tracing_task.abort();
     // wait for rcpd processes to fully exit and capture any error output
-    for rcpd in rcpds {
-        if let Err(e) = remote::wait_for_rcpd_process(rcpd).await {
+    for rcpd in rcpd_processes {
+        if let Err(e) = remote::wait_for_rcpd_process(rcpd.child).await {
             tracing::error!("Failed to wait for rcpd process: {e}");
         }
     }
