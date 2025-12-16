@@ -47,10 +47,12 @@ hex = "0.4"
 rand = "0.8"
 regex = "1.11"
 remote = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 throttle = { workspace = true }
 tokio = { version = "1.38", features = ["full", "parking_lot", "tracing"] }
+tokio-rustls = "0.26"
 tokio-util = "0.7"
 tracing = "0.1"
 

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use async_recursion::async_recursion;
 use tracing::{instrument, Instrument};
 
@@ -5,14 +6,14 @@ fn progress() -> &'static common::progress::Progress {
     common::get_progress()
 }
 
-#[instrument(skip(error_occurred))]
+#[instrument(skip(error_occurred, control_send_stream))]
 #[async_recursion]
 async fn send_directories_and_symlinks(
     settings: &common::copy::Settings,
     src: &std::path::Path,
     dst: &std::path::Path,
     is_root: bool,
-    control_send_stream: &remote::streams::SharedSendStream,
+    control_send_stream: &remote::streams::BoxedSharedSendStream,
     error_occurred: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     tracing::debug!("Sending data from {:?} to {:?}", &src, dst);
@@ -144,13 +145,13 @@ async fn send_directories_and_symlinks(
     Ok(())
 }
 
-#[instrument(skip(error_occurred, stream_pool))]
+#[instrument(skip(error_occurred, stream_pool, control_send_stream))]
 #[async_recursion]
 async fn send_fs_objects_tcp(
     settings: &common::copy::Settings,
     src: &std::path::Path,
     dst: &std::path::Path,
-    control_send_stream: remote::streams::SharedSendStream,
+    control_send_stream: remote::streams::BoxedSharedSendStream,
     stream_pool: std::sync::Arc<AcceptingSendStreamPool>,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
@@ -227,7 +228,7 @@ async fn send_file_tcp(
     dir_total_files: usize,
     stream_pool: std::sync::Arc<AcceptingSendStreamPool>,
     error_occurred: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    control_send_stream: remote::streams::SharedSendStream,
+    control_send_stream: remote::streams::BoxedSharedSendStream,
 ) -> anyhow::Result<()> {
     let prog = progress();
     let _ops_guard = prog.ops.guard();
@@ -332,7 +333,7 @@ async fn send_files_in_directory_tcp(
     dst: std::path::PathBuf,
     stream_pool: std::sync::Arc<AcceptingSendStreamPool>,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    control_send_stream: remote::streams::SharedSendStream,
+    control_send_stream: remote::streams::BoxedSharedSendStream,
 ) -> anyhow::Result<()> {
     tracing::info!("Sending files from {src:?}");
     // first pass: count files and collect their paths
@@ -453,13 +454,52 @@ enum RecvResult {
     Error(anyhow::Error),
 }
 
-#[instrument(skip(error_occurred, stream_pool))]
+/// Dispatches control messages from destination and coordinates file sending.
+///
+/// # Shutdown Flow
+///
+/// This function must signal pool shutdown before draining tasks to prevent deadlock.
+/// The flow differs between graceful and unexpected shutdown:
+///
+/// ## Graceful Shutdown (DestinationDone received)
+/// 1. Receive `DestinationDone` message from destination
+/// 2. Set `shutdown_initiated = true`, break main loop
+/// 3. Signal pool shutdown via `pool_shutdown.cancel()` - this closes the pool's
+///    send channel, causing any `borrow()` calls to return error
+/// 4. Drain remaining tasks in `join_set` - they complete quickly since pool is closed
+/// 5. Close control stream, return Ok
+///
+/// ## Unexpected Shutdown (StreamClosed without DestinationDone)
+/// This happens when destination fails (e.g., fail-early error) and closes connections
+/// without sending DestinationDone:
+/// 1. Receive `StreamClosed` from control stream
+/// 2. Break main loop with Ok (stream closed is not an error)
+/// 3. **Critical**: Signal pool shutdown via `pool_shutdown.cancel()` BEFORE draining
+/// 4. Drain remaining tasks - they now return error from `borrow()` instead of hanging
+/// 5. Return Ok (errors during unexpected shutdown are logged but not propagated)
+///
+/// ## Deadlock Prevention
+/// Without step 3 in unexpected shutdown, tasks waiting on `stream_pool.borrow()` would
+/// hang forever because:
+/// - The pool's recv channel waits for streams from accept loop
+/// - Accept loop waits for connections from destination
+/// - Destination has already closed and won't connect
+/// - Pool shutdown only happens AFTER this function returns (in handle_connection)
+/// - Deadlock: this function waits for tasks, tasks wait for pool, pool waits for shutdown
+#[instrument(skip(
+    error_occurred,
+    stream_pool,
+    control_recv_stream,
+    control_send_stream,
+    pool_shutdown
+))]
 async fn dispatch_control_messages_tcp(
     settings: common::copy::Settings,
-    mut control_recv_stream: remote::streams::RecvStream,
-    control_send_stream: remote::streams::SharedSendStream,
+    mut control_recv_stream: remote::streams::BoxedRecvStream,
+    control_send_stream: remote::streams::BoxedSharedSendStream,
     stream_pool: std::sync::Arc<AcceptingSendStreamPool>,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pool_shutdown: PoolShutdownToken,
 ) -> anyhow::Result<()> {
     let mut join_set = tokio::task::JoinSet::new();
     // flag to track when graceful shutdown has been initiated (DestinationDone received).
@@ -558,36 +598,45 @@ async fn dispatch_control_messages_tcp(
     if result.is_err() {
         recv_task.abort();
     }
+    // CRITICAL: Signal pool shutdown BEFORE draining tasks to prevent deadlock.
+    // Without this, tasks waiting on `stream_pool.borrow()` would hang forever because:
+    // - borrow() waits on the pool's recv channel
+    // - recv channel waits for streams from accept loop
+    // - accept loop waits for connections from destination
+    // - destination has already closed (or will never connect)
+    // Cancelling the token signals the accept loop to close and close the channel,
+    // causing borrow() to return an error immediately.
+    pool_shutdown.cancel();
     // drain remaining tasks.
-    // if shutdown was initiated (DestinationDone received), ignore task errors -
-    // these are expected when the connection is closing (e.g., "unknown stream").
-    // otherwise, transport errors are always fatal regardless of fail_early.
+    // since we called pool_shutdown.cancel() above, any tasks waiting on borrow()
+    // will get "pool closed" errors. these are expected and should be logged but
+    // not propagated, unless the main loop already returned an error (result.is_err()).
+    //
+    // error handling during drain:
+    // - shutdown_initiated=true (DestinationDone received): all errors expected, log debug
+    // - shutdown_initiated=false, result=Ok (unexpected close): pool errors expected, log debug
+    // - result=Err: we already have an error, just log additional errors
+    let pool_shutdown_errors_expected = result.is_ok(); // pool was just cancelled
     while let Some(task_result) = join_set.join_next().await {
         match task_result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                if shutdown_initiated {
+                if shutdown_initiated || pool_shutdown_errors_expected {
                     tracing::debug!("Task failed during shutdown (expected): {e}");
                 } else {
                     // transport errors are always fatal - we can't recover
                     tracing::error!("Transport failure in file send task: {e:#}");
                     error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
-                    if result.is_ok() {
-                        recv_task.abort();
-                        return Err(e);
-                    }
+                    // don't return error here - result already has an error
                 }
             }
             Err(e) => {
-                if shutdown_initiated {
+                if shutdown_initiated || pool_shutdown_errors_expected {
                     tracing::debug!("Task panicked during shutdown: {e}");
                 } else {
                     tracing::error!("Task panicked: {e}");
                     error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
-                    if result.is_ok() {
-                        recv_task.abort();
-                        return Err(e.into());
-                    }
+                    // don't return error here - result already has an error
                 }
             }
         }
@@ -606,17 +655,13 @@ async fn dispatch_control_messages_tcp(
     result
 }
 
-/// Separate handle to signal pool shutdown without needing ownership of the pool.
-struct PoolShutdownHandle {
-    shutdown_tx: tokio::sync::oneshot::Sender<()>,
-}
-
-impl PoolShutdownHandle {
-    /// Signal the pool to shut down and close all streams.
-    fn shutdown(self) {
-        let _ = self.shutdown_tx.send(());
-    }
-}
+/// Cancellation token alias for pool shutdown signaling.
+///
+/// Uses `CancellationToken` instead of oneshot because:
+/// - Clonable: Multiple places can hold a reference (dispatch task, handle_connection)
+/// - Idempotent: Can call `cancel()` multiple times safely
+/// - Check-able: Can check `is_cancelled()` without consuming
+type PoolShutdownToken = tokio_util::sync::CancellationToken;
 
 /// Accepts data connections and provides SendStreams for file transfer.
 ///
@@ -625,22 +670,27 @@ impl PoolShutdownHandle {
 /// Connections are reused for multiple files - the `size` field in file headers delimits
 /// file boundaries within a connection.
 struct AcceptingSendStreamPool {
-    recv: async_channel::Receiver<remote::streams::SendStream>,
-    return_tx: async_channel::Sender<remote::streams::SendStream>,
+    recv: async_channel::Receiver<remote::streams::BoxedSendStream>,
+    return_tx: async_channel::Sender<remote::streams::BoxedSendStream>,
 }
 
 impl AcceptingSendStreamPool {
     /// Create a new pool that accepts connections from the given listener.
-    /// Returns the pool, a shutdown handle, and the accept task handle.
+    /// Returns the pool, a shutdown token, and the accept task handle.
+    ///
+    /// The shutdown token should be cancelled to signal the pool to close. It can be
+    /// cloned and shared between multiple tasks - any clone can trigger shutdown.
     fn new(
         data_listener: tokio::net::TcpListener,
         pool_size: usize,
         profile: remote::NetworkProfile,
-    ) -> (Self, PoolShutdownHandle, tokio::task::JoinHandle<()>) {
+        tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
+    ) -> (Self, PoolShutdownToken, tokio::task::JoinHandle<()>) {
         let (send_tx, recv) = async_channel::bounded(pool_size);
         let (return_tx, return_rx) =
-            async_channel::bounded::<remote::streams::SendStream>(pool_size);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            async_channel::bounded::<remote::streams::BoxedSendStream>(pool_size);
+        let shutdown_token = PoolShutdownToken::new();
+        let shutdown_token_clone = shutdown_token.clone();
         // spawn task to accept data connections and manage pool
         let accept_task = tokio::spawn(async move {
             // wrap the main loop so we can handle shutdown
@@ -655,8 +705,26 @@ impl AcceptingSendStreamPool {
                                         tracing::debug!("Accepted data connection from {}", addr);
                                         stream.set_nodelay(true).ok();
                                         remote::configure_tcp_buffers(&stream, profile);
-                                        let (_read_half, write_half) = stream.into_split();
-                                        let send_stream = remote::streams::SendStream::new(write_half);
+                                        // wrap with TLS if configured
+                                        let send_stream = if let Some(ref acceptor) = tls_acceptor {
+                                            match acceptor.accept(stream).await {
+                                                Ok(tls_stream) => {
+                                                    let (_read_half, write_half) = tokio::io::split(tls_stream);
+                                                    remote::streams::SendStream::new(
+                                                        Box::new(write_half) as remote::streams::BoxedWrite
+                                                    )
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("TLS handshake failed for data connection: {}", e);
+                                                    continue;
+                                                }
+                                            }
+                                        } else {
+                                            let (_read_half, write_half) = stream.into_split();
+                                            remote::streams::SendStream::new(
+                                                Box::new(write_half) as remote::streams::BoxedWrite
+                                            )
+                                        };
                                         if send_tx.send(send_stream).await.is_err() {
                                             tracing::debug!("Pool closed, stopping accept loop");
                                             break;
@@ -687,7 +755,7 @@ impl AcceptingSendStreamPool {
                     }
                 } => {}
                 // shutdown signal received - close all streams
-                _ = shutdown_rx => {
+                _ = shutdown_token_clone.cancelled() => {
                     tracing::debug!("Pool shutdown signal received");
                 }
             }
@@ -701,11 +769,7 @@ impl AcceptingSendStreamPool {
             return_rx.close();
             tracing::debug!("Pool accept task completed, all streams closed");
         });
-        (
-            Self { recv, return_tx },
-            PoolShutdownHandle { shutdown_tx },
-            accept_task,
-        )
+        (Self { recv, return_tx }, shutdown_token, accept_task)
     }
 
     /// Borrow a SendStream from the pool (waits for a connection from destination).
@@ -725,16 +789,16 @@ impl AcceptingSendStreamPool {
 /// RAII guard that returns the connection to the pool on drop.
 /// Connections are reused for multiple files via length-prefixed framing.
 struct PooledAcceptedSendStream {
-    stream: Option<remote::streams::SendStream>,
-    return_tx: async_channel::Sender<remote::streams::SendStream>,
+    stream: Option<remote::streams::BoxedSendStream>,
+    return_tx: async_channel::Sender<remote::streams::BoxedSendStream>,
 }
 
 impl PooledAcceptedSendStream {
-    fn stream_mut(&mut self) -> &mut remote::streams::SendStream {
+    fn stream_mut(&mut self) -> &mut remote::streams::BoxedSendStream {
         self.stream.as_mut().expect("stream already taken")
     }
 
-    fn take_and_discard(&mut self) -> Option<remote::streams::SendStream> {
+    fn take_and_discard(&mut self) -> Option<remote::streams::BoxedSendStream> {
         self.stream.take()
     }
 }
@@ -758,28 +822,52 @@ async fn handle_connection(
     pool_size: usize,
     network_profile: remote::NetworkProfile,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Destination control connection established");
     // configure TCP buffers for high throughput
     remote::configure_tcp_buffers(&control_stream, network_profile);
-    // create bidirectional control connection from TCP stream
-    let control_connection = remote::streams::ControlConnection::new(control_stream);
-    let (control_send_stream, control_recv_stream) = control_connection.into_split();
+    // wrap control connection with TLS if configured
+    let (control_send_stream, control_recv_stream) = if let Some(ref acceptor) = tls_acceptor {
+        let tls_stream = acceptor
+            .accept(control_stream)
+            .await
+            .context("TLS handshake failed for control connection")?;
+        let (read_half, write_half) = tokio::io::split(tls_stream);
+        let recv_stream =
+            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead);
+        let send_stream =
+            remote::streams::SendStream::new(Box::new(write_half) as remote::streams::BoxedWrite);
+        (send_stream, recv_stream)
+    } else {
+        let (read_half, write_half) = control_stream.into_split();
+        let recv_stream =
+            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead);
+        let send_stream =
+            remote::streams::SendStream::new(Box::new(write_half) as remote::streams::BoxedWrite);
+        (send_stream, recv_stream)
+    };
+    // wrap in Arc<Mutex<>> for shared access
+    let control_send_stream = std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
     tracing::info!("Created control streams for directory transfer");
     // create a pool that accepts data connections from destination and provides SendStreams
     let (stream_pool, pool_shutdown, accept_task) =
-        AcceptingSendStreamPool::new(data_listener, pool_size, network_profile);
+        AcceptingSendStreamPool::new(data_listener, pool_size, network_profile, tls_acceptor);
     let stream_pool = std::sync::Arc::new(stream_pool);
     tracing::info!(
         "Created accepting send stream pool with {} slots",
         pool_size
     );
+    // pass a clone of the shutdown token to dispatch - it will signal shutdown before
+    // draining its tasks to prevent deadlock when destination closes unexpectedly.
+    // see dispatch_control_messages_tcp doc comment for detailed shutdown flow.
     let dispatch_task = tokio::spawn(dispatch_control_messages_tcp(
         *settings,
         control_recv_stream,
         control_send_stream.clone(),
         stream_pool.clone(),
         error_occurred.clone(),
+        pool_shutdown.clone(),
     ));
     // send files to destination. returns Err only for fatal errors (e.g., root file failure).
     // individual file failures with fail_early=false return Ok but set error_occurred flag,
@@ -799,7 +887,8 @@ async fn handle_connection(
     if send_result.is_err() {
         tracing::info!("Send failed, shutting down data pool to unblock destination");
         // signal pool to shutdown (closes all streams so destination sees EOF)
-        pool_shutdown.shutdown();
+        // note: cancel() is idempotent, safe to call even if dispatch already called it
+        pool_shutdown.cancel();
         // abort dispatch task since we're not going to get a clean shutdown
         dispatch_task.abort();
         // wait for accept task to finish closing all streams
@@ -807,11 +896,10 @@ async fn handle_connection(
         return send_result;
     }
     // send succeeded - wait for dispatch task to complete (handles destination responses).
-    // note: send_result is Ok here, so there's no send error to propagate.
+    // note: dispatch_control_messages_tcp always calls pool_shutdown.cancel() before
+    // returning, so the pool will be shut down when dispatch_task completes.
     let dispatch_result = dispatch_task.await;
-    // shutdown the pool - this signals accept_task to close all streams
-    pool_shutdown.shutdown();
-    // wait for accept task to finish
+    // wait for accept task to finish (pool shutdown was signaled by dispatch)
     let _ = accept_task.await;
     // propagate dispatch errors after cleanup
     dispatch_result??;
@@ -819,15 +907,38 @@ async fn handle_connection(
     Ok(())
 }
 
-#[instrument]
-pub async fn run_source(
-    master_send_stream: remote::streams::SharedSendStream,
+#[instrument(skip(master_send_stream, cert_key))]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
+    master_send_stream: remote::streams::SharedSendStream<W>,
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &common::copy::Settings,
     tcp_config: &remote::TcpConfig,
     bind_ip: Option<&str>,
+    cert_key: Option<&remote::tls::CertifiedKey>,
+    dest_cert_fingerprint: Option<remote::protocol::CertFingerprint>,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
+    // create TLS acceptor if encryption is enabled (requires both cert and dest fingerprint)
+    let tls_acceptor = match (cert_key, dest_cert_fingerprint) {
+        (Some(cert), Some(dest_fp)) => {
+            // create server config with client certificate verification
+            let server_config = remote::tls::create_server_config_with_client_auth(cert, dest_fp)
+                .context("failed to create TLS server config with client auth")?;
+            Some(std::sync::Arc::new(tokio_rustls::TlsAcceptor::from(
+                server_config,
+            )))
+        }
+        _ => None,
+    };
+    tracing::info!(
+        "Source TLS encryption: {}",
+        if tls_acceptor.is_some() {
+            "enabled (mutual TLS)"
+        } else {
+            "disabled"
+        }
+    );
     // create TCP listeners for control and data connections
     let control_listener = remote::create_tcp_control_listener(tcp_config, bind_ip).await?;
     let data_listener = remote::create_tcp_data_listener(tcp_config, bind_ip).await?;
@@ -867,6 +978,7 @@ pub async fn run_source(
                 pool_size,
                 tcp_config.network_profile,
                 error_occurred.clone(),
+                tls_acceptor,
             )
             .await?;
         }

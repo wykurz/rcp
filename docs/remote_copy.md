@@ -12,10 +12,11 @@ The rcp remote copy system uses a three-node architecture:
          Master (rcp)
            /    \
           /      \
-      SSH+TCP   SSH+TCP
-        /          \
-       /            \
-Source (rcpd)----TCP----Destination (rcpd)
+       SSH      SSH
+        |        |
+       TLS      TLS
+        |        |
+Source (rcpd)--TLS--Destination (rcpd)
               control + data
 ```
 
@@ -24,7 +25,44 @@ Source (rcpd)----TCP----Destination (rcpd)
 - **Source (rcpd)**: Reads and sends files
 - **Destination (rcpd)**: Receives and writes files
 
-The master connects to remote hosts via SSH, spawns rcpd processes, and coordinates the transfer. Source and destination communicate directly via TCP.
+The master connects to remote hosts via SSH, spawns rcpd processes, and coordinates the transfer. All TCP connections (Master↔rcpd and Source↔Destination) are encrypted with TLS by default.
+
+## TLS Encryption
+
+By default, all TCP connections are encrypted using TLS 1.3 with self-signed certificates and fingerprint pinning.
+
+### Security Properties
+
+| Connection | Authentication | Encryption |
+|------------|---------------|------------|
+| Master → rcpd | Certificate fingerprint (via SSH stdout) | TLS 1.3 |
+| Source ↔ Destination | Certificate fingerprint (via Master) | TLS 1.3 |
+
+**Key features**:
+- **Forward secrecy**: Ephemeral keys per session
+- **Mutual authentication**: Both parties verify each other's certificates
+- **No trust anchor**: Self-signed certificates with fingerprint pinning (no CA)
+- **Transparent**: No configuration needed (enabled by default)
+
+### Connection Flow
+
+1. **Master spawns rcpd via SSH**: `ssh host "rcpd --role source"`
+2. **rcpd generates ephemeral certificate** and outputs fingerprint to stdout
+3. **Master reads fingerprint** before connecting (trusted via SSH channel)
+4. **Master connects with TLS**, verifying rcpd's certificate fingerprint
+5. **Master distributes fingerprints** to source and destination for mutual TLS
+
+### Disabling Encryption
+
+For performance on fully trusted networks, encryption can be disabled:
+
+```bash
+rcp --no-encryption source:/path dest:/path
+```
+
+**WARNING**: This exposes all data in plain text over the network. Only use on trusted, isolated networks.
+
+For more details on the security model, see [security.md](security.md).
 
 ## rcpd Binary Discovery
 
@@ -393,9 +431,10 @@ cargo build --target x86_64-unknown-linux-gnu
 
 ### Trust Model
 
-- SSH is the security perimeter
+- SSH is the security perimeter for initial authentication
 - All operations require SSH authentication first
-- Data transfers are currently unencrypted (use trusted networks)
+- Data transfers are encrypted with TLS 1.3 by default (certificate fingerprint pinning)
+- Use `--no-encryption` only on trusted networks where encryption overhead is undesirable
 
 For comprehensive security analysis, see **[security.md](security.md)**.
 

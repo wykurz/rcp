@@ -268,6 +268,10 @@ pub struct RcpdConfig {
     pub tokio_console: bool,
     /// Port for tokio-console server
     pub tokio_console_port: Option<u16>,
+    /// Enable TLS encryption (default: true)
+    pub encryption: bool,
+    /// Master's certificate fingerprint for client authentication (when encryption enabled)
+    pub master_cert_fingerprint: Option<CertFingerprint>,
 }
 
 impl RcpdConfig {
@@ -338,6 +342,15 @@ impl RcpdConfig {
         if let Some(port) = self.tokio_console_port {
             args.push(format!("--tokio-console-port={port}"));
         }
+        if !self.encryption {
+            args.push("--no-encryption".to_string());
+        }
+        if let Some(fp) = self.master_cert_fingerprint {
+            args.push(format!(
+                "--master-cert-fp={}",
+                crate::tls::fingerprint_to_hex(&fp)
+            ));
+        }
         args
     }
 }
@@ -375,11 +388,16 @@ pub struct TracingHello {
     pub is_tracing: bool,
 }
 
+/// TLS certificate fingerprint (SHA-256 of DER-encoded certificate).
+pub type CertFingerprint = [u8; 32];
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum MasterHello {
     Source {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
+        /// Destination's TLS certificate fingerprint (None if encryption disabled)
+        dest_cert_fingerprint: Option<CertFingerprint>,
     },
     Destination {
         /// TCP address for control connection to source
@@ -388,6 +406,8 @@ pub enum MasterHello {
         source_data_addr: std::net::SocketAddr,
         server_name: String,
         preserve: common::preserve::Settings,
+        /// Source's TLS certificate fingerprint (None if encryption disabled)
+        source_cert_fingerprint: Option<CertFingerprint>,
     },
 }
 

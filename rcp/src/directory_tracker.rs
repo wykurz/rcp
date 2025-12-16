@@ -43,7 +43,6 @@ struct DirectoryState {
 }
 
 /// Tracks directory entry counts and completion state for remote copy operations.
-#[derive(Debug)]
 pub struct DirectoryTracker {
     /// Directories waiting for files (files_expected unknown or files_remaining > 0)
     pending_directories: std::collections::HashMap<std::path::PathBuf, DirectoryState>,
@@ -60,14 +59,14 @@ pub struct DirectoryTracker {
     /// Have we already sent DestinationDone?
     done_sent: bool,
     /// Control stream for sending DirectoryCreated
-    control_send_stream: remote::streams::SharedSendStream,
+    control_send_stream: remote::streams::BoxedSharedSendStream,
     /// Preserve settings for applying metadata
     preserve: common::preserve::Settings,
 }
 
 impl DirectoryTracker {
     pub fn new(
-        control_send_stream: remote::streams::SharedSendStream,
+        control_send_stream: remote::streams::BoxedSharedSendStream,
         preserve: common::preserve::Settings,
     ) -> Self {
         Self {
@@ -254,12 +253,21 @@ impl DirectoryTracker {
         tracing::info!("Sent DestinationDone, closed send stream");
         Ok(true)
     }
+    /// Close the send stream without sending DestinationDone.
+    /// Used for error cleanup to ensure TLS streams are properly shut down.
+    pub async fn close_stream(&mut self) {
+        let mut stream = self.control_send_stream.lock().await;
+        if let Err(e) = stream.close().await {
+            tracing::debug!("Error closing stream during cleanup: {:#}", e);
+        }
+        tracing::debug!("Control send stream closed for cleanup");
+    }
 }
 
 pub type SharedDirectoryTracker = std::sync::Arc<tokio::sync::Mutex<DirectoryTracker>>;
 
 pub fn make_shared(
-    control_send_stream: remote::streams::SharedSendStream,
+    control_send_stream: remote::streams::BoxedSharedSendStream,
     preserve: common::preserve::Settings,
 ) -> SharedDirectoryTracker {
     std::sync::Arc::new(tokio::sync::Mutex::new(DirectoryTracker::new(

@@ -61,22 +61,24 @@ Source (rcpd)-----(TCP)----Destination (rcpd)
 
 ### 1.4 Security Model
 
-> **⚠️ SECURITY WARNING**: The current implementation uses **unencrypted TCP** for data transfer between source and destination. This is a known limitation being addressed in a future release.
+All TCP connections are encrypted and authenticated using TLS 1.3 with self-signed certificates and fingerprint pinning.
 
-**Current State:**
+**Security Architecture:**
 - SSH is used for authentication and rcpd deployment
-- Master↔rcpd connections are plain TCP (typically on trusted networks)
-- Source↔Destination data transfer is plain TCP (no encryption)
+- Each party generates an ephemeral self-signed certificate
+- rcpd outputs its certificate fingerprint to stdout (read by master via SSH)
+- Master distributes fingerprints to source/destination for mutual TLS authentication
+- All TCP connections use TLS with certificate fingerprint verification
 
-**Security Implications:**
-- Data in transit can be observed by network attackers (no confidentiality)
-- MITM attacks are possible on the source↔destination connection
-- Use on trusted networks only, or tunnel through SSH for sensitive data
+**Security Properties:**
+- **Confidentiality**: All data encrypted with AES-256-GCM or ChaCha20-Poly1305
+- **Authentication**: Certificate fingerprint verification prevents unauthorized connections
+- **Forward secrecy**: TLS 1.3 ephemeral key exchange
+- **Integrity**: AEAD ensures data cannot be tampered with
 
-**Mitigations:**
-- For sensitive data, use SSH port forwarding or VPN
-- Ensure source and destination are on trusted network segments
-- Future versions will add TLS encryption for data connections
+**Opt-out:**
+- Use `--no-encryption` flag for trusted networks where performance is critical
+- See [security.md](security.md) for detailed threat model and best practices
 
 ## 2. Protocol Messages
 
