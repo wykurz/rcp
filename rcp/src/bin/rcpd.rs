@@ -131,9 +131,10 @@ struct Args {
     #[arg(long, value_name = "RANGES", help_heading = "Remote copy options")]
     port_ranges: Option<String>,
 
-    /// Disable TLS encryption for all connections
+    /// Disable TLS encryption and authentication for all connections
     ///
-    /// WARNING: Only use on trusted networks. All data will be transmitted in plaintext.
+    /// WARNING: Disables both encryption and authentication. Data is sent in plaintext
+    /// and connections are accepted from anyone. Only use on isolated, trusted networks.
     #[arg(long, help_heading = "Remote copy options")]
     no_encryption: bool,
 

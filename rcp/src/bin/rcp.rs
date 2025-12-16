@@ -227,11 +227,12 @@ struct Args {
     #[arg(long, value_name = "PREFIX", help_heading = "Remote copy options")]
     rcpd_debug_log_prefix: Option<String>,
 
-    /// Disable TLS encryption for remote copy operations
+    /// Disable TLS encryption and authentication for remote copy operations
     ///
-    /// By default, remote copy connections use TLS for authentication and encryption.
-    /// Use this flag to disable encryption for performance on trusted networks.
-    /// WARNING: This exposes all data and credentials in plain text over the network.
+    /// By default, remote copy connections use mutual TLS for authentication and encryption.
+    /// This flag disables BOTH encryption AND authentication on the data path.
+    /// WARNING: Data is sent in plaintext and source accepts connections from anyone.
+    /// Only use on isolated, trusted networks.
     #[arg(long, help_heading = "Remote copy options")]
     no_encryption: bool,
 
