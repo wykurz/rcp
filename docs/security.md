@@ -216,15 +216,25 @@ For trusted networks where encryption overhead is undesirable, use `--no-encrypt
 rcp --no-encryption source:/path dest:/path
 ```
 
+**Important**: `--no-encryption` disables **both encryption AND authentication** on the
+Source↔Destination data path. With this flag:
+
+- Data is transmitted in plaintext (no confidentiality)
+- Source accepts connections from anyone who can reach its port (no authentication)
+- Only SSH authentication protects rcpd startup, not the data transfer itself
+
+The security model with `--no-encryption` relies entirely on network isolation.
+
 **When to use `--no-encryption`:**
 - Isolated datacenter networks with no untrusted traffic
 - Performance-critical transfers on physically secured networks
 - Testing and debugging
 
 **When NOT to use `--no-encryption`:**
-- Any network with potential eavesdroppers
+- Any network with potential eavesdroppers or MITM attackers
 - Cross-datacenter transfers over public internet
 - Transfers containing sensitive data
+- Networks where other users could connect to ephemeral ports
 
 ## Security Best Practices
 
