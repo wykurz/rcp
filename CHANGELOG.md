@@ -7,11 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2025-12-16
+
+### Added
+- **TLS encryption and authentication** for remote copy operations (enabled by default)
+  - Mutual TLS with self-signed certificates and fingerprint pinning
+  - Master distributes certificate fingerprints via SSH for secure key exchange
+  - Use `--no-encryption` to disable for trusted networks (disables both encryption AND authentication)
+- **Automatic rcpd deployment** (`--auto-deploy-rcpd` flag)
+  - Automatically deploys rcpd binary to remote hosts via SSH
+  - SHA-256 checksum verification for transfer integrity
+  - Atomic deployment using temp files for concurrent safety
+  - Version-based caching to `~/.cache/rcp/bin/rcpd-{version}`
+  - Automatic cleanup of old versions (keeps last 3)
+- **Protocol version checking** between rcp and rcpd to detect version mismatches
+- **Docker-based multi-host integration tests** for testing actual remote scenarios
+- **Support for `~` in remote paths** (e.g., `host:~/path/to/file`)
+- **Connection pooling** for data streams with configurable pool size (`--max-connections`)
+- **Performance tracing instrumentation** for profiling critical paths
+- **Profiling support** via `--chrome-trace` and `--flamegraph` options
+- **Configurable buffer sizes** for remote file copies (`--remote-copy-buffer-size`)
+- **`--bind-ip` option** to specify local IP address for remote connections
+
 ### Changed
 - **BREAKING**: Remote copy now uses TCP instead of QUIC for data transfer
-  - Removed `--quic-idle-timeout-sec` and `--quic-keep-alive-interval-sec` CLI arguments
-  - Retained `--remote-copy-conn-timeout-sec` for connection timeout configuration
-  - Data transfers are currently unencrypted (use on trusted networks or with VPN/SSH tunneling)
+  - Removed `--quic-idle-timeout-sec`, `--quic-keep-alive-interval-sec`, and other QUIC-specific options
+  - Simplified protocol with better performance characteristics
+- **BREAKING**: Static musl builds are now the default configuration
+  - Enables automatic deployment to hosts without matching glibc versions
+- Simplified remote copy protocol with stream pooling for better throughput
+- Socket buffers are now maximized for high bandwidth transfers
+- Improved error messages to guide users toward `--auto-deploy-rcpd` when rcpd is not found
+
+### Fixed
+- Fixed file mtime preservation - file contents are now flushed before setting mtime
+- Fixed parsing of paths containing colons (e.g., `C:\path` on Windows paths in arguments)
+- Fixed deadlock in source when destination fails with `--fail-early` and closes connections
+- Fixed resource usage stats display showing invalid walltime values
+- Fixed rcpd path discovery order
+- Various test stability improvements
+
+### Removed
+- QUIC transport layer and all related configuration options
+- `docs/quic_performance_tuning.md` (no longer applicable)
 
 ## [0.21.0] - 2025-10-24
 
@@ -59,5 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See git history for changes in previous versions.
 
+[Unreleased]: https://github.com/wykurz/rcp/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/wykurz/rcp/compare/v0.21.1...v0.22.0
 [0.21.0]: https://github.com/wykurz/rcp/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/wykurz/rcp/compare/v0.19.0...v0.20.0
