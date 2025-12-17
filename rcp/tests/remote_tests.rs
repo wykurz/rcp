@@ -2041,13 +2041,20 @@ fn test_remote_auto_deploy_cleanup_old_versions() {
     // dynamically generate old versions based on the current version
     // this avoids having to update the test every time we bump the version
     let current_version = env!("CARGO_PKG_VERSION");
-    let version_parts: Vec<u32> = current_version
+    // strip prerelease suffix (e.g., "0.23.0-alpha.1" -> "0.23.0")
+    let base_version = current_version.split('-').next().unwrap();
+    let version_parts: Vec<u32> = base_version
         .split('.')
         .map(|s| s.parse().expect("valid version number"))
         .collect();
     let (major, minor, patch) = (version_parts[0], version_parts[1], version_parts[2]);
     // create 4 old versions by decrementing the minor version
-    // e.g., for 0.23.0: create 0.19.0, 0.20.0, 0.21.0, 0.22.0
+    // combined with the current version, that's 5 total; cleanup keeps 3, deletes 2 oldest
+    assert!(
+        minor >= 4,
+        "Test requires minor version >= 4 to generate enough old versions for cleanup testing, \
+         current version is {current_version}"
+    );
     let old_versions: Vec<String> = (1..=4)
         .map(|i| format!("{}.{}.{}", major, minor - i, patch))
         .rev()
