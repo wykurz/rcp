@@ -2038,19 +2038,26 @@ fn test_remote_auto_deploy_cleanup_old_versions() {
     // create fake old version binaries in the cache directory
     let cache_dir = cache_bin_dir(home.path());
     std::fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
-    // create several fake old version files (simulating old deployments)
-    // these should be cleaned up, keeping only the last 3
-    let old_versions = vec!["0.18.0", "0.19.0", "0.20.0", "0.21.0"];
-    for version in &old_versions {
+    // dynamically generate old versions based on the current version
+    // this avoids having to update the test every time we bump the version
+    let current_version = env!("CARGO_PKG_VERSION");
+    let version_parts: Vec<u32> = current_version
+        .split('.')
+        .map(|s| s.parse().expect("valid version number"))
+        .collect();
+    let (major, minor, patch) = (version_parts[0], version_parts[1], version_parts[2]);
+    // create 4 old versions by decrementing the minor version
+    // e.g., for 0.23.0: create 0.19.0, 0.20.0, 0.21.0, 0.22.0
+    let old_versions: Vec<String> = (1..=4)
+        .map(|i| format!("{}.{}.{}", major, minor - i, patch))
+        .rev()
+        .collect();
+    for (idx, version) in old_versions.iter().enumerate() {
         let fake_binary = cache_dir.join(format!("rcpd-{}", version));
         std::fs::write(&fake_binary, "fake old binary").expect("Failed to create fake binary");
-        // set mtime to make them old (1 second apart)
+        // set mtime to make them old (10 seconds apart, oldest first)
         let mtime = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(
-                (old_versions.len() - old_versions.iter().position(|&v| v == *version).unwrap())
-                    as u64
-                    * 10,
-            );
+            - std::time::Duration::from_secs((old_versions.len() - idx) as u64 * 10);
         filetime::set_file_mtime(&fake_binary, filetime::FileTime::from_system_time(mtime))
             .expect("Failed to set mtime");
     }
@@ -2074,37 +2081,55 @@ fn test_remote_auto_deploy_cleanup_old_versions() {
     assert!(dst_file.exists(), "Destination file should exist");
     // verify cleanup: should keep only the 3 newest versions (current + 2 older)
     // with 5 total versions (4 old fake + 1 current), the 2 oldest should be deleted
-    let version_0_18 = cache_dir.join("rcpd-0.18.0");
-    let version_0_19 = cache_dir.join("rcpd-0.19.0");
-    let version_0_20 = cache_dir.join("rcpd-0.20.0");
-    let version_0_21 = cache_dir.join("rcpd-0.21.0");
-    let version_0_22 = cache_dir.join("rcpd-0.22.0");
+    // old_versions are in ascending order: [minor-4, minor-3, minor-2, minor-1]
+    // indices:                              [0,       1,       2,       3      ]
+    // should delete:                        [oldest,  old                      ]
+    // should keep:                          [                 newer,   newest  ] + current
+    let oldest_version = cache_dir.join(format!("rcpd-{}", &old_versions[0]));
+    let old_version = cache_dir.join(format!("rcpd-{}", &old_versions[1]));
+    let newer_version = cache_dir.join(format!("rcpd-{}", &old_versions[2]));
+    let newest_old_version = cache_dir.join(format!("rcpd-{}", &old_versions[3]));
+    let current_version_path = cache_dir.join(format!("rcpd-{}", current_version));
     // check which versions remain
-    let v18_exists = version_0_18.exists();
-    let v19_exists = version_0_19.exists();
-    let v20_exists = version_0_20.exists();
-    let v21_exists = version_0_21.exists();
-    let v22_exists = version_0_22.exists();
+    let oldest_exists = oldest_version.exists();
+    let old_exists = old_version.exists();
+    let newer_exists = newer_version.exists();
+    let newest_old_exists = newest_old_version.exists();
+    let current_exists = current_version_path.exists();
     eprintln!("After cleanup:");
-    eprintln!("  0.18.0 exists: {}", v18_exists);
-    eprintln!("  0.19.0 exists: {}", v19_exists);
-    eprintln!("  0.20.0 exists: {}", v20_exists);
-    eprintln!("  0.21.0 exists: {}", v21_exists);
-    eprintln!("  0.22.0 exists: {}", v22_exists);
+    eprintln!("  {} exists: {}", &old_versions[0], oldest_exists);
+    eprintln!("  {} exists: {}", &old_versions[1], old_exists);
+    eprintln!("  {} exists: {}", &old_versions[2], newer_exists);
+    eprintln!("  {} exists: {}", &old_versions[3], newest_old_exists);
+    eprintln!("  {} exists: {}", current_version, current_exists);
     // verify cleanup worked: oldest 2 should be deleted, newest 3 kept
-    assert!(!v18_exists, "Oldest version 0.18.0 should be deleted");
-    assert!(!v19_exists, "Old version 0.19.0 should be deleted");
     assert!(
-        v20_exists,
-        "Version 0.20.0 should be kept (one of newest 3)"
+        !oldest_exists,
+        "Oldest version {} should be deleted",
+        &old_versions[0]
     );
     assert!(
-        v21_exists,
-        "Version 0.21.0 should be kept (one of newest 3)"
+        !old_exists,
+        "Old version {} should be deleted",
+        &old_versions[1]
     );
-    assert!(v22_exists, "Current version 0.22.0 should be kept");
-    // cleanup our fake binaries
-    for version in &["0.20.0", "0.21.0"] {
+    assert!(
+        newer_exists,
+        "Version {} should be kept (one of newest 3)",
+        &old_versions[2]
+    );
+    assert!(
+        newest_old_exists,
+        "Version {} should be kept (one of newest 3)",
+        &old_versions[3]
+    );
+    assert!(
+        current_exists,
+        "Current version {} should be kept",
+        current_version
+    );
+    // cleanup our fake binaries that were kept
+    for version in &old_versions[2..] {
         std::fs::remove_file(cache_dir.join(format!("rcpd-{}", version))).ok();
     }
     eprintln!("✓ Cleanup of old versions works correctly");
