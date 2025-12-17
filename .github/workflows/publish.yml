@@ -61,9 +61,14 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
+          # --no-verify skips the verification build step which would fail because
+          # .cargo/config.toml sets musl as the default target and the musl linker
+          # isn't available in this environment. The validate job already verified
+          # the build, so this is safe.
           cargo workspaces publish \
             --publish-as-is \
             --yes \
+            --no-verify \
             ${{ env.DRY_RUN }}
 
       - name: Summary
