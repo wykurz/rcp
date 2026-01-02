@@ -176,11 +176,14 @@ struct Args {
 
     /// Connection timeout for remote copy operations in seconds
     ///
-    /// Applies to: rcpd→master connection, destination→source connection
+    /// Applies to: rcpd→master connection, destination→source connection.
+    /// Default: 15s normally, 60s when --auto-deploy-rcpd is enabled (to account
+    /// for sequential binary deployment to multiple hosts).
     #[arg(
         long,
-        default_value = "15",
         value_name = "N",
+        default_value = "15",
+        default_value_if("auto_deploy_rcpd", "true", "60"),
         help_heading = "Remote copy options"
     )]
     remote_copy_conn_timeout_sec: u64,
@@ -340,8 +343,8 @@ async fn run_rcpd_master(
     // install rustls crypto provider (ring) before any TLS operations
     rustls::crypto::ring::default_provider()
         .install_default()
-        .ok(); // ignore if already installed
-               // build TCP config (will be used for source↔dest connections later)
+        .ok();
+    // build TCP config (will be used for source↔dest connections later)
     let _tcp_config = remote::TcpConfig {
         port_ranges: args.port_ranges.clone(),
         conn_timeout_sec: args.remote_copy_conn_timeout_sec,
