@@ -1601,7 +1601,6 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "thiserror 1.0.55",
- "thread_local",
  "tokio",
  "tracing",
  "tracing-chrome",

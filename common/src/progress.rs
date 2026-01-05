@@ -1,23 +1,57 @@
 use tracing::instrument;
 
-#[derive(Debug)]
+/// Number of shards for the counter. More shards reduce contention but increase memory.
+/// 64 shards × 128 bytes = 8KB per counter, which virtually eliminates contention.
+const NUM_SHARDS: usize = 64;
+
+/// Atomic counter padded to cache line size to prevent false sharing.
+/// Each shard lives on its own cache line so concurrent updates from different
+/// threads don't cause cache invalidation.
+/// Uses 128B alignment to support both x86-64 (64B) and ARM (128B) cache lines.
+#[repr(align(128))]
+struct PaddedAtomicU64(std::sync::atomic::AtomicU64);
+
+/// Global counter for assigning shard indices to threads.
+/// Each thread gets a unique index (mod NUM_SHARDS) on first access.
+static NEXT_SHARD_INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    /// Per-thread shard index, assigned once on first access.
+    /// Uses modulo to wrap around when more threads than shards.
+    static MY_SHARD: usize =
+        NEXT_SHARD_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % NUM_SHARDS;
+}
+
+/// Sharded atomic counter optimized for concurrent access from multiple threads.
+///
+/// Uses cache-line-padded shards to prevent false sharing. Each thread is assigned
+/// a shard index, so updates from different threads typically hit different cache lines.
+///
+/// This design handles interleaved access to multiple counters efficiently - unlike
+/// a single-slot cache approach, there's no "cache thrashing" when alternating between
+/// counters.
+///
+/// # Memory
+///
+/// Each counter uses NUM_SHARDS × 128 bytes = 8KB (with 64 shards).
+/// This is larger than a simple AtomicU64 but virtually eliminates contention.
 pub struct TlsCounter {
-    // mutex is used primarily from one thread, so it's not a bottleneck
-    count: thread_local::ThreadLocal<std::sync::Mutex<u64>>,
+    shards: [PaddedAtomicU64; NUM_SHARDS],
 }
 
 impl TlsCounter {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            count: thread_local::ThreadLocal::new(),
+            shards: std::array::from_fn(|_| PaddedAtomicU64(std::sync::atomic::AtomicU64::new(0))),
         }
     }
 
     pub fn add(&self, value: u64) {
-        let mutex = self.count.get_or(|| std::sync::Mutex::new(0));
-        let mut guard = mutex.lock().unwrap();
-        *guard += value;
+        let shard = MY_SHARD.with(|&s| s);
+        self.shards[shard]
+            .0
+            .fetch_add(value, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn inc(&self) {
@@ -25,7 +59,18 @@ impl TlsCounter {
     }
 
     pub fn get(&self) -> u64 {
-        self.count.iter().fold(0, |x, y| x + *y.lock().unwrap())
+        self.shards
+            .iter()
+            .map(|s| s.0.load(std::sync::atomic::Ordering::Relaxed))
+            .sum()
+    }
+}
+
+impl std::fmt::Debug for TlsCounter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsCounter")
+            .field("value", &self.get())
+            .finish()
     }
 }
 
@@ -580,6 +625,130 @@ mod tests {
         assert!(dest_files_line.trim_start().ends_with("8"));
         assert!(!dest_files_line.contains('.'));
 
+        Ok(())
+    }
+
+    #[test]
+    fn interleaved_counter_access() -> Result<()> {
+        // test that interleaved access to multiple counters works correctly
+        // (this was problematic with the old single-slot cache design)
+        let counter_a = TlsCounter::new();
+        let counter_b = TlsCounter::new();
+        let counter_c = TlsCounter::new();
+        for i in 0..100 {
+            counter_a.add(1);
+            counter_b.add(2);
+            counter_c.add(3);
+            // verify intermediate values are correct
+            if i % 10 == 0 {
+                assert_eq!(counter_a.get(), i + 1);
+                assert_eq!(counter_b.get(), (i + 1) * 2);
+                assert_eq!(counter_c.get(), (i + 1) * 3);
+            }
+        }
+        // verify final counts
+        assert_eq!(counter_a.get(), 100);
+        assert_eq!(counter_b.get(), 200);
+        assert_eq!(counter_c.get(), 300);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_multi_counter_access() -> Result<()> {
+        // test concurrent access with multiple threads each using multiple counters
+        let counter_a = std::sync::Arc::new(TlsCounter::new());
+        let counter_b = std::sync::Arc::new(TlsCounter::new());
+        const THREADS: usize = 4;
+        const ITERATIONS: u64 = 1000;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let ca = counter_a.clone();
+                let cb = counter_b.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..ITERATIONS {
+                        ca.add(1);
+                        cb.add(2);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // verify totals are correct (no lost increments)
+        assert_eq!(counter_a.get(), THREADS as u64 * ITERATIONS);
+        assert_eq!(counter_b.get(), THREADS as u64 * ITERATIONS * 2);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_counter_access() -> Result<()> {
+        // test that repeated access to the same counter works correctly
+        let counter = TlsCounter::new();
+        for i in 1..=1000 {
+            counter.add(1);
+            assert_eq!(counter.get(), i);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sharding_distributes_across_threads() -> Result<()> {
+        // test that different threads get assigned to different shards
+        // and that all increments are correctly counted
+        let counter = std::sync::Arc::new(TlsCounter::new());
+        const THREADS: usize = 16;
+        const ITERATIONS: u64 = 100;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let c = counter.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..ITERATIONS {
+                        c.inc();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(counter.get(), THREADS as u64 * ITERATIONS);
+        Ok(())
+    }
+
+    #[test]
+    fn sharding_handles_more_threads_than_shards() -> Result<()> {
+        // test that shard assignment wraps correctly when threads > NUM_SHARDS
+        let counter = std::sync::Arc::new(TlsCounter::new());
+        const THREADS: usize = 128; // 2x NUM_SHARDS to force wrap-around
+        const ITERATIONS: u64 = 100;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let c = counter.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..ITERATIONS {
+                        c.inc();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(counter.get(), THREADS as u64 * ITERATIONS);
+        Ok(())
+    }
+
+    #[test]
+    fn counter_independence() -> Result<()> {
+        // test that multiple counters are completely independent
+        let counters: Vec<_> = (0..10).map(|_| TlsCounter::new()).collect();
+        for (i, counter) in counters.iter().enumerate() {
+            counter.add((i + 1) as u64 * 100);
+        }
+        for (i, counter) in counters.iter().enumerate() {
+            assert_eq!(counter.get(), (i + 1) as u64 * 100);
+        }
         Ok(())
     }
 }
