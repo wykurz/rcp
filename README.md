@@ -368,11 +368,14 @@ rcp --network-profile=internet host1:/data host2:/data
 
 ### Concurrent Connections
 
-For directories with many small files, increase concurrent data connections:
+Control concurrent TCP connections for file transfers (default: 100):
 
 ```bash
-# Allow more parallel file transfers
-rcp --max-data-connections=16 host1:/many-small-files host2:/dest
+# Increase for many small files on high-bandwidth links
+rcp --max-connections=200 host1:/many-small-files host2:/dest
+
+# Decrease to reduce resource usage
+rcp --max-connections=16 host1:/data host2:/dest
 ```
 
 ## Diagnosing Performance Issues
