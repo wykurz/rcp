@@ -175,6 +175,8 @@ User
 - **Compromised local machine**: Master machine is fully trusted
 - **Compromised remote hosts**: If host is compromised, attacker controls rcpd
 - **Side-channel attacks**: No specific mitigations for timing attacks, etc.
+- **Local TOCTTOU attacks**: See [TOCTTOU Vulnerabilities](tocttou.md) for details on
+  race condition attacks when rcp runs with elevated privileges
 
 ## Threat Model
 
@@ -308,5 +310,10 @@ The rcp security model provides:
 - ✅ **Integrity**: AEAD ensures data cannot be tampered with
 - ✅ **Forward Secrecy**: TLS 1.3 ephemeral key exchange
 - ✅ **Process isolation**: rcpd processes are properly lifecycle-managed
+
+**Limitations**:
+
+- ⚠️ **TOCTTOU**: No protection against local race conditions when running with elevated
+  privileges. See [TOCTTOU Vulnerabilities](tocttou.md) for details and mitigations.
 
 Use `--no-encryption` only on trusted networks where performance is critical.
