@@ -236,21 +236,29 @@ For detailed network connectivity and troubleshooting information, see `docs/rem
 
 ## Security
 
-**Remote copy relies on SSH for authentication.**
+**Remote copy uses SSH for authentication and TLS 1.3 for encrypted data transfer.**
 
 **Security Model:**
 - **SSH Authentication**: All remote operations require SSH authentication first
-- **Network Trust**: Data transfers are currently unencrypted (plain TCP)
-- **Recommended**: Use on trusted networks or tunnel through VPN/SSH
+- **TLS Encryption**: Data transfers are encrypted by default using TLS 1.3 with certificate pinning
+- **Mutual Authentication**: Both source and destination verify each other's certificates
 
 **What's Protected:**
 - ✅ Unauthorized access (SSH authentication required)
-- ⚠️ Data encryption: Currently unencrypted (use trusted networks or VPN)
+- ✅ Data encryption (TLS 1.3 with AES-256-GCM)
+- ✅ Man-in-the-middle attacks (certificate fingerprint verification)
+
+**Performance Option:**
+For trusted networks where encryption overhead is undesirable, use `--no-encryption`:
+```fish
+> rcp --no-encryption source:/path dest:/path
+```
+Warning: This disables both encryption and authentication on the data path.
 
 **Best Practices:**
 - Use SSH key-based authentication
-- Run on trusted network segments (datacenter, VPN)
-- For sensitive data over untrusted networks, use SSH tunneling
+- Keep encryption enabled (default) for sensitive data
+- Only use `--no-encryption` on isolated, trusted networks
 
 For detailed security architecture and threat model, see `docs/security.md`.
 
