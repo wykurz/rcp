@@ -5,6 +5,14 @@ use tracing::instrument;
 
 use rcp_tools_rcp::{destination, source};
 
+fn parse_nonzero_usize(s: &str) -> Result<usize, String> {
+    let val: usize = s.parse().map_err(|e| format!("{e}"))?;
+    if val == 0 {
+        return Err("value must be at least 1".to_string());
+    }
+    Ok(val)
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "rcpd",
@@ -183,6 +191,19 @@ struct Args {
     )]
     max_connections: usize,
 
+    /// Multiplier for pending file writes (default: 4)
+    ///
+    /// Controls backpressure by limiting pending file transfers to
+    /// max_connections × multiplier.
+    #[arg(
+        long,
+        default_value = "4",
+        value_name = "N",
+        value_parser = parse_nonzero_usize,
+        help_heading = "Remote copy options"
+    )]
+    pending_writes_multiplier: usize,
+
     /// Enable file-based debug logging
     ///
     /// Example: /tmp/rcpd-log creates /tmp/rcpd-log-YYYY-MM-DDTHH-MM-SS-RANDOM
@@ -294,6 +315,7 @@ where
         network_profile: args.network_profile,
         buffer_size: args.buffer_size,
         max_connections: args.max_connections,
+        pending_writes_multiplier: args.pending_writes_multiplier,
     };
     let settings = common::copy::Settings {
         dereference: args.dereference,
@@ -420,6 +442,7 @@ async fn async_main(
         network_profile: args.network_profile,
         buffer_size: args.buffer_size,
         max_connections: args.max_connections,
+        pending_writes_multiplier: args.pending_writes_multiplier,
     };
     // generate TLS certificate and create server config (if encryption enabled)
     let (cert_key, tls_acceptor) = if !args.no_encryption {

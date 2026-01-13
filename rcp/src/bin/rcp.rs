@@ -4,6 +4,14 @@ use tracing::instrument;
 
 use rcp_tools_rcp::path;
 
+fn parse_nonzero_usize(s: &str) -> Result<usize, String> {
+    let val: usize = s.parse().map_err(|e| format!("{e}"))?;
+    if val == 0 {
+        return Err("value must be at least 1".to_string());
+    }
+    Ok(val)
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "rcp",
@@ -224,6 +232,20 @@ struct Args {
     )]
     max_connections: usize,
 
+    /// Multiplier for pending file writes (default: 4)
+    ///
+    /// Controls backpressure by limiting pending file transfers to
+    /// max_connections × multiplier. Higher values allow more files to be
+    /// queued but use more memory when the destination is slow.
+    #[arg(
+        long,
+        default_value = "4",
+        value_name = "N",
+        value_parser = parse_nonzero_usize,
+        help_heading = "Remote copy options"
+    )]
+    pending_writes_multiplier: usize,
+
     /// Enable file-based debug logging for rcpd processes
     ///
     /// Example: /tmp/rcpd-log creates /tmp/rcpd-log-YYYY-MM-DDTHH-MM-SS-RANDOM
@@ -351,6 +373,7 @@ async fn run_rcpd_master(
         network_profile: args.network_profile,
         buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
         max_connections: args.max_connections,
+        pending_writes_multiplier: args.pending_writes_multiplier,
     };
     let mut rcpd_processes: Vec<remote::RcpdProcess> = vec![];
     // generate master's TLS certificate for authenticating to rcpd (when encryption enabled)
@@ -382,6 +405,7 @@ async fn run_rcpd_master(
         network_profile: args.network_profile,
         buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
         max_connections: args.max_connections,
+        pending_writes_multiplier: args.pending_writes_multiplier,
         chrome_trace_prefix: args.chrome_trace.clone(),
         flamegraph_prefix: args.flamegraph.clone(),
         profile_level: Some(args.profile_level.clone()),
