@@ -232,25 +232,33 @@ async fn send_file_tcp(
 ) -> anyhow::Result<()> {
     let prog = progress();
     let _ops_guard = prog.ops.guard();
+    tracing::debug!("Sending file content for {:?}", src);
+    // borrow a stream FIRST to provide backpressure. files are only opened after we have
+    // a stream available, which limits memory usage when destination is slow.
+    let mut pooled_stream = stream_pool
+        .borrow()
+        .instrument(tracing::trace_span!("borrow_stream"))
+        .await?;
+    // now that we have a stream, acquire file-related resources
     let _open_file_guard = throttle::open_file_permit()
         .instrument(tracing::trace_span!("open_file_permit"))
         .await;
-    tracing::debug!("Sending file content for {:?}", src);
     throttle::get_file_iops_tokens(settings.chunk_size, src_metadata.len())
         .instrument(tracing::trace_span!(
             "iops_throttle",
             size = src_metadata.len()
         ))
         .await;
-    // open the file BEFORE borrowing a stream to avoid leaving destination waiting
+    // open the file AFTER borrowing a stream for backpressure
     let file = match tokio::fs::File::open(src)
         .instrument(tracing::trace_span!("file_open"))
         .await
     {
         Ok(f) => f,
         Err(e) => {
-            tracing::error!("Failed to open file {src:?}: {e}");
+            tracing::error!("Failed to open file {src:?}: {e:#}");
             error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
+            // stream is returned to pool via Drop when pooled_stream goes out of scope
             // for root file copies, failing to open the file is a fatal error -
             // there's nothing else to transfer and the protocol would hang
             if is_root {
@@ -288,11 +296,6 @@ async fn send_file_tcp(
         is_root,
         dir_total_files,
     };
-    // borrow a stream from the pool instead of opening a new one
-    let mut pooled_stream = stream_pool
-        .borrow()
-        .instrument(tracing::trace_span!("borrow_stream"))
-        .await?;
     let send_result = pooled_stream
         .stream_mut()
         .send_message_with_data_buffered(&file_header, &mut buffered_file)
@@ -326,12 +329,13 @@ async fn send_file_tcp(
     }
 }
 
-#[instrument(skip(error_occurred, control_send_stream, stream_pool))]
+#[instrument(skip(error_occurred, control_send_stream, stream_pool, pending_limit))]
 async fn send_files_in_directory_tcp(
     settings: common::copy::Settings,
     src: std::path::PathBuf,
     dst: std::path::PathBuf,
     stream_pool: std::sync::Arc<AcceptingSendStreamPool>,
+    pending_limit: std::sync::Arc<tokio::sync::Semaphore>,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
     control_send_stream: remote::streams::BoxedSharedSendStream,
 ) -> anyhow::Result<()> {
@@ -404,15 +408,22 @@ async fn send_files_in_directory_tcp(
         return Ok(());
     }
     // second pass: send files with the known total count
+    // acquire permit from pending_limit before spawning to provide backpressure
     let mut join_set = tokio::task::JoinSet::new();
     for (entry_path, dst_path, entry_metadata) in file_entries {
         throttle::get_ops_token().await;
+        // wait for a pending slot - this is the main backpressure point
+        let permit = pending_limit
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("pending limit semaphore closed"))?;
         let pool = stream_pool.clone();
         let error_flag = error_occurred.clone();
         let control_stream = control_send_stream.clone();
         let total = dir_total_files;
         join_set.spawn(async move {
-            send_file_tcp(
+            let result = send_file_tcp(
                 &settings,
                 &entry_path,
                 &dst_path,
@@ -423,7 +434,9 @@ async fn send_files_in_directory_tcp(
                 &error_flag,
                 control_stream,
             )
-            .await
+            .await;
+            drop(permit); // release permit when file is done
+            result
         });
     }
     while let Some(res) = join_set.join_next().await {
@@ -498,9 +511,16 @@ async fn dispatch_control_messages_tcp(
     mut control_recv_stream: remote::streams::BoxedRecvStream,
     control_send_stream: remote::streams::BoxedSharedSendStream,
     stream_pool: std::sync::Arc<AcceptingSendStreamPool>,
+    max_pending_files: usize,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pool_shutdown: PoolShutdownToken,
 ) -> anyhow::Result<()> {
+    // create semaphore to limit pending file tasks for backpressure
+    let pending_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_pending_files));
+    tracing::info!(
+        "Created pending file limiter with {} permits",
+        max_pending_files
+    );
     let mut join_set = tokio::task::JoinSet::new();
     // flag to track when graceful shutdown has been initiated (DestinationDone received).
     // after this, task errors (like "unknown stream") are expected and should be ignored.
@@ -578,6 +598,7 @@ async fn dispatch_control_messages_tcp(
                             confirmation.src.clone(),
                             confirmation.dst.clone(),
                             stream_pool.clone(),
+                            pending_limit.clone(),
                             error_flag,
                             control_send_stream.clone(),
                         ));
@@ -820,6 +841,7 @@ async fn handle_connection(
     src: &std::path::Path,
     dst: &std::path::Path,
     pool_size: usize,
+    max_pending_files: usize,
     network_profile: remote::NetworkProfile,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
     tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
@@ -866,6 +888,7 @@ async fn handle_connection(
         control_recv_stream,
         control_send_stream.clone(),
         stream_pool.clone(),
+        max_pending_files,
         error_occurred.clone(),
         pool_shutdown.clone(),
     ));
@@ -965,6 +988,7 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
     let error_occurred = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let accept_timeout = std::time::Duration::from_secs(tcp_config.conn_timeout_sec);
     let pool_size = tcp_config.max_connections;
+    let max_pending_files = pool_size * tcp_config.pending_writes_multiplier;
     match tokio::time::timeout(accept_timeout, control_listener.accept()).await {
         Ok(Ok((stream, addr))) => {
             tracing::info!("Destination control connection from {}", addr);
@@ -976,6 +1000,7 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
                 src,
                 dst,
                 pool_size,
+                max_pending_files,
                 tcp_config.network_profile,
                 error_occurred.clone(),
                 tls_acceptor,

@@ -202,7 +202,12 @@ pub struct TcpConfig {
     pub buffer_size: Option<usize>,
     /// Maximum concurrent connections in the pool
     pub max_connections: usize,
+    /// Multiplier for pending file writes (max pending = max_connections × multiplier)
+    pub pending_writes_multiplier: usize,
 }
+
+/// Default multiplier for pending writes (4× max_connections)
+pub const DEFAULT_PENDING_WRITES_MULTIPLIER: usize = 4;
 
 impl Default for TcpConfig {
     fn default() -> Self {
@@ -212,6 +217,7 @@ impl Default for TcpConfig {
             network_profile: NetworkProfile::default(),
             buffer_size: None,
             max_connections: 100,
+            pending_writes_multiplier: DEFAULT_PENDING_WRITES_MULTIPLIER,
         }
     }
 }
@@ -225,6 +231,7 @@ impl TcpConfig {
             network_profile: NetworkProfile::default(),
             buffer_size: None,
             max_connections: 100,
+            pending_writes_multiplier: DEFAULT_PENDING_WRITES_MULTIPLIER,
         }
     }
     /// Set port ranges
@@ -245,6 +252,11 @@ impl TcpConfig {
     /// Set maximum concurrent connections
     pub fn with_max_connections(mut self, max: usize) -> Self {
         self.max_connections = max;
+        self
+    }
+    /// Set pending writes multiplier
+    pub fn with_pending_writes_multiplier(mut self, multiplier: usize) -> Self {
+        self.pending_writes_multiplier = multiplier;
         self
     }
     /// Get the effective buffer size (explicit or profile default)

@@ -258,6 +258,8 @@ pub struct RcpdConfig {
     pub buffer_size: Option<usize>,
     /// Maximum concurrent connections in the pool
     pub max_connections: usize,
+    /// Multiplier for pending file writes (max pending = max_connections × multiplier)
+    pub pending_writes_multiplier: usize,
     /// Chrome trace output prefix for profiling
     pub chrome_trace_prefix: Option<String>,
     /// Flamegraph output prefix for profiling
@@ -322,6 +324,10 @@ impl RcpdConfig {
             args.push(format!("--buffer-size={v}"));
         }
         args.push(format!("--max-connections={}", self.max_connections));
+        args.push(format!(
+            "--pending-writes-multiplier={}",
+            self.pending_writes_multiplier
+        ));
         // profiling options (only add --profile-level when profiling is enabled)
         let profiling_enabled =
             self.chrome_trace_prefix.is_some() || self.flamegraph_prefix.is_some();

@@ -519,6 +519,50 @@ The destination is the authoritative source for operation statistics:
 - Source may send files that destination skips or fails to write
 - Master uses only destination's summary for user reporting
 
+### 7.8 Backpressure
+
+The source implements backpressure to prevent unbounded resource usage when the destination
+is slower than the source (slow disk, congested network, etc.).
+
+**Problem without backpressure:**
+- Source spawns file-sending tasks for all files in a directory
+- Each task opens files and allocates buffers while waiting for a connection
+- With large directories, this leads to unbounded memory and file descriptor usage
+
+**Solution:**
+
+Two mechanisms work together:
+
+1. **Pending task limit**: A semaphore limits the total number of file-sending tasks that
+   can be active at once. Default is `max_connections × 4` (configurable via
+   `--pending-writes-multiplier`). Tasks wait on this semaphore before being spawned.
+
+2. **Deferred resource acquisition**: Files are opened and buffers allocated only *after*
+   borrowing a connection from the pool. This ensures resources are only held when data
+   can actually flow.
+
+**Resource acquisition order:**
+```
+1. Acquire pending task permit     ← Blocks if too many tasks queued
+2. Borrow connection from pool     ← Blocks if all connections busy
+3. Open file                       ← Only after connection available
+4. Allocate buffer                 ← Only after file opened
+5. Send data
+6. Release connection + permit
+```
+
+**Effect with defaults (100 connections, 4× multiplier):**
+- Maximum 400 pending tasks at any time
+- Maximum 100 open files (only tasks with connections)
+- Maximum ~1.6 GiB buffer memory (100 × 16 MiB)
+
+**Configuration:**
+- `--max-connections=N`: Maximum concurrent data connections (default: 100)
+- `--pending-writes-multiplier=N`: Multiplier for pending tasks (default: 4)
+
+The multiplier ensures work is always queued when connections become available, avoiding
+idle time between file transfers.
+
 ## 8. Test Coverage
 
 ### 8.1 Core Functionality Tests (`remote_tests.rs`)
@@ -573,6 +617,7 @@ Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
 - `--remote-copy-conn-timeout-sec=N` (default: 15) - Connection timeout for remote operations
 - `--port-ranges=RANGES` (optional) - Restrict TCP to specific port ranges (e.g., "8000-8999")
 - `--max-connections=N` (default: 100) - Maximum concurrent data connections
+- `--pending-writes-multiplier=N` (default: 4) - Multiplier for pending file tasks (backpressure)
 - `--network-profile=PROFILE` (default: datacenter) - Buffer sizing profile
 
 ### 9.2 Network Profiles
