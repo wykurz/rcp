@@ -114,3 +114,23 @@ docker-test-keep: docker-up docker-test-only
 # Run all tests including Docker integration tests
 test-all-with-docker: test-all docker-test
     @echo "✅ All tests (including Docker) passed!"
+
+# Chaos testing (network simulation, failure injection)
+# =====================================================
+
+# Run chaos tests only (requires containers already running)
+docker-chaos-test-only:
+    @echo "🌪️  Running chaos tests..."
+    cargo nextest run --profile docker --run-ignored only -E 'test(~chaos)'
+
+# Run chaos tests with full lifecycle
+docker-chaos-test: docker-up docker-chaos-test-only docker-down
+    @echo "✅ Chaos tests completed!"
+
+# Run chaos tests but keep containers running (useful for development)
+docker-chaos-test-keep: docker-up docker-chaos-test-only
+    @echo "✅ Chaos tests completed (containers still running)"
+    @echo "💡 Run 'just docker-down' when finished"
+
+# Shorthand for chaos tests (equivalent to GitHub Actions chaos-tests.yml workflow)
+chaos: docker-chaos-test

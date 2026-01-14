@@ -284,23 +284,58 @@ just ci  # Runs: lint + doc + test-all
 
 This replicates the CI checks locally before pushing.
 
+## Chaos Testing
+
+Chaos tests verify rcp's behavior under adverse conditions. They use `tc` (traffic control)
+to simulate network issues and are designed to be reproducible in CI.
+
+### Running Chaos Tests
+
+```bash
+# Start containers (includes iproute2 for tc)
+just docker-up
+
+# Run only chaos tests
+cargo nextest run --profile docker --run-ignored only -E 'test(~chaos)'
+
+# Or run all Docker tests including chaos
+cargo nextest run --profile docker --run-ignored only
+```
+
+### Test Categories
+
+**Network condition tests** (`docker_chaos_network.rs`):
+- High latency (200ms) - verifies timeouts and protocol resilience
+- Bandwidth limits (1 Mbit/s) - verifies throttled transfer completion
+- Directory copy under latency - verifies multi-RTT protocol handling
+
+**Note**: Packet loss tests are disabled because `tc netem loss` affects all traffic
+including SSH, causing hangs. See `docs/chaos_testing_plan.md` for details.
+
+### Implementation Details
+
+Network simulation uses Linux `tc` (traffic control) with `netem` and `tbf` qdiscs.
+Containers require `CAP_NET_ADMIN` capability (configured in docker-compose.yml).
+
+See `docs/chaos_testing_plan.md` for the full implementation plan and future phases.
+
+---
+
 ## Future Improvements
 
-### Network Simulation
+### Process Chaos Testing
 
-Add realistic network conditions using `tc` (traffic control) in Docker containers:
+Test rcp's behavior when rcpd processes die or hang unexpectedly:
+- Kill/pause rcpd at various stages (handshake, mid-transfer)
+- Verify no orphaned processes
+- Verify clean error messages
 
-**Potential test scenarios**:
-- High latency (50-500ms)
-- Packet loss (1-10%)
-- Variable jitter
-- Bandwidth constraints
-- Connection drops during transfer
+### I/O Error Simulation
 
-**Implementation approach**:
-1. Update Dockerfile to include `iproute2` package
-2. Add test helpers to configure `tc qdisc` rules
-3. Write tests that verify rcp behavior under adverse conditions
+Test behavior when filesystem operations fail:
+- Disk full (ENOSPC) via small tmpfs
+- Permission errors mid-transfer
+- Verify error chain preservation
 
 ### Additional Test Scenarios
 

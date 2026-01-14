@@ -19,10 +19,10 @@ jobs:
     permissions: write-all
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
     - name: Setup Rust
-      uses: actions-rust-lang/setup-rust-toolchain@v1
+      uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
       with:
         targets: x86_64-unknown-linux-musl
 
@@ -48,7 +48,7 @@ jobs:
         echo $(pwd)/rcp-deb-amd64-${{ github.event.release.tag_name }}
         ls -ld $(pwd)/rcp-deb-amd64-${{ github.event.release.tag_name }}*
     - name: Upload to GitHub Release
-      uses: actions/upload-release-asset@v1
+      uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1
       env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
@@ -63,9 +63,9 @@ jobs:
     permissions: write-all
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
     - name: Setup Rust
-      uses: actions-rust-lang/setup-rust-toolchain@v1
+      uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
       with:
         targets: x86_64-unknown-linux-musl
 
@@ -92,7 +92,7 @@ jobs:
         echo $(pwd)/rcp-rpm-amd64-${{ github.event.release.tag_name }}
         ls -ld $(pwd)/rcp-rpm-amd64-${{ github.event.release.tag_name }}*
     - name: Upload to GitHub Release
-      uses: actions/upload-release-asset@v1
+      uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1
       env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:

@@ -14,12 +14,14 @@ serial = { max-threads = 1 }
 filter = 'test(remote)'
 test-group = 'serial'
 
-# docker tests must run serially to avoid port/connection conflicts
+# docker tests must run serially to avoid port/connection conflicts.
+# binary(~docker) uses regex matching: ~ means "contains", so this matches any
+# test binary with "docker" in its name (e.g., docker_multi_host, docker_chaos_network).
 [[profile.default.overrides]]
-filter = 'binary(docker_multi_host)'
+filter = 'binary(~docker)'
 test-group = 'serial'
 
 [profile.docker]
-# docker profile runs only the Docker multi-host integration tests
+# docker profile runs Docker integration tests (multi-host and chaos tests)
 # these tests are normally ignored and require Docker containers
-default-filter = 'binary(~docker_multi_host)'
+default-filter = 'binary(~docker)'
