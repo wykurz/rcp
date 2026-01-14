@@ -429,7 +429,7 @@ pub async fn copy(
         }
     };
     let mut join_set = tokio::task::JoinSet::new();
-    let mut success = true;
+    let mut all_children_succeeded = true;
     while let Some(entry) = entries
         .next_entry()
         .await
@@ -471,7 +471,7 @@ pub async fn copy(
                     if settings.fail_early {
                         return Err(Error::new(error.source, copy_summary));
                     }
-                    success = false;
+                    all_children_succeeded = false;
                 }
             },
             Err(error) => {
@@ -481,16 +481,28 @@ pub async fn copy(
             }
         }
     }
-    if !success {
+    // apply directory metadata regardless of whether all children copied successfully.
+    // the directory itself was created earlier in this function (we would have returned
+    // early if create_dir failed), so we should preserve the source metadata.
+    tracing::debug!("set 'dst' directory metadata");
+    let metadata_result = preserve::set_dir_metadata(preserve, &src_metadata, dst).await;
+    if !all_children_succeeded {
+        // child failures take precedence - log metadata error if it also failed
+        if let Err(metadata_err) = metadata_result {
+            tracing::error!(
+                "copy: {:?} -> {:?} failed to set directory metadata: {:#}",
+                src,
+                dst,
+                &metadata_err
+            );
+        }
         return Err(Error::new(
             anyhow!("copy: {:?} -> {:?} failed!", src, dst),
             copy_summary,
         ))?;
     }
-    tracing::debug!("set 'dst' directory metadata");
-    preserve::set_dir_metadata(preserve, &src_metadata, dst)
-        .await
-        .map_err(|err| Error::new(err, copy_summary))?;
+    // no child failures, so metadata error is the primary error
+    metadata_result.map_err(|err| Error::new(err, copy_summary))?;
     Ok(copy_summary)
 }
 
@@ -1735,5 +1747,63 @@ mod copy_tests {
             );
             Ok(())
         }
+    }
+
+    /// Verify that directory metadata is applied even when child operations fail.
+    /// This is a regression test for a bug where directory permissions were not preserved
+    /// when copying with fail_early=false and some children failed to copy.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_directory_metadata_applied_on_child_error() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let test_path = tmp_dir.as_path();
+        // create source directory with specific permissions
+        let src_dir = test_path.join("src");
+        tokio::fs::create_dir(&src_dir).await?;
+        tokio::fs::set_permissions(&src_dir, std::fs::Permissions::from_mode(0o750)).await?;
+        // create a readable file and an unreadable file inside
+        let readable_file = src_dir.join("readable.txt");
+        tokio::fs::write(&readable_file, "content").await?;
+        let unreadable_file = src_dir.join("unreadable.txt");
+        tokio::fs::write(&unreadable_file, "secret").await?;
+        tokio::fs::set_permissions(&unreadable_file, std::fs::Permissions::from_mode(0o000))
+            .await?;
+        let dst_dir = test_path.join("dst");
+        // copy with fail_early=false and preserve=all
+        let result = copy(
+            &PROGRESS,
+            &src_dir,
+            &dst_dir,
+            &Settings {
+                dereference: false,
+                fail_early: false,
+                overwrite: false,
+                overwrite_compare: Default::default(),
+                chunk_size: 0,
+                remote_copy_buffer_size: 0,
+            },
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await;
+        // restore permissions so cleanup can succeed
+        tokio::fs::set_permissions(&unreadable_file, std::fs::Permissions::from_mode(0o644))
+            .await?;
+        // verify the operation returned an error (unreadable file should fail)
+        assert!(result.is_err(), "copy should fail due to unreadable file");
+        let error = result.unwrap_err();
+        // verify some files were copied (the readable one)
+        assert_eq!(error.summary.files_copied, 1);
+        assert_eq!(error.summary.directories_created, 1);
+        // verify the destination directory exists and has the correct permissions
+        let dst_metadata = tokio::fs::metadata(&dst_dir).await?;
+        assert!(dst_metadata.is_dir());
+        let actual_mode = dst_metadata.permissions().mode() & 0o7777;
+        assert_eq!(
+            actual_mode, 0o750,
+            "directory should have preserved source permissions (0o750), got {:o}",
+            actual_mode
+        );
+        Ok(())
     }
 }

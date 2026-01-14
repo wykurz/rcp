@@ -391,7 +391,7 @@ pub async fn link(
         ..Default::default()
     };
     let mut join_set = tokio::task::JoinSet::new();
-    let mut success = true;
+    let mut all_children_succeeded = true;
     // create a set of all the files we already processed
     let mut processed_files = std::collections::HashSet::new();
     // iterate through src entries and recursively call "link" on each one
@@ -494,7 +494,7 @@ pub async fn link(
                     if settings.copy_settings.fail_early {
                         return Err(error);
                     }
-                    success = false;
+                    all_children_succeeded = false;
                 }
             },
             Err(error) => {
@@ -504,21 +504,35 @@ pub async fn link(
             }
         }
     }
-    if !success {
-        return Err(Error::new(
-            anyhow!("link: {:?} {:?} -> {:?} failed!", src, update, dst),
-            link_summary,
-        ))?;
-    }
+    // apply directory metadata regardless of whether all children linked successfully.
+    // the directory itself was created earlier in this function (we would have returned
+    // early if create_dir failed), so we should preserve the source metadata.
     tracing::debug!("set 'dst' directory metadata");
     let preserve_metadata = if let Some(update_metadata) = update_metadata_opt.as_ref() {
         update_metadata
     } else {
         &src_metadata
     };
-    preserve::set_dir_metadata(&RLINK_PRESERVE_SETTINGS, preserve_metadata, dst)
-        .await
-        .map_err(|err| Error::new(err, link_summary))?;
+    let metadata_result =
+        preserve::set_dir_metadata(&RLINK_PRESERVE_SETTINGS, preserve_metadata, dst).await;
+    if !all_children_succeeded {
+        // child failures take precedence - log metadata error if it also failed
+        if let Err(metadata_err) = metadata_result {
+            tracing::error!(
+                "link: {:?} {:?} -> {:?} failed to set directory metadata: {:#}",
+                src,
+                update,
+                dst,
+                &metadata_err
+            );
+        }
+        return Err(Error::new(
+            anyhow!("link: {:?} {:?} -> {:?} failed!", src, update, dst),
+            link_summary,
+        ))?;
+    }
+    // no child failures, so metadata error is the primary error
+    metadata_result.map_err(|err| Error::new(err, link_summary))?;
     Ok(link_summary)
 }
 
@@ -1089,6 +1103,62 @@ mod link_tests {
                 assert_eq!(error.summary.copy_summary.rm_summary.symlinks_removed, 1);
             }
         }
+        Ok(())
+    }
+
+    /// Verify that directory metadata is applied even when child link operations fail.
+    /// This is a regression test for a bug where directory permissions were not preserved
+    /// when linking with fail_early=false and some children failed to link.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_link_directory_metadata_applied_on_child_error() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let test_path = tmp_dir.as_path();
+        // create source directory with specific permissions
+        let src_dir = test_path.join("src");
+        tokio::fs::create_dir(&src_dir).await?;
+        tokio::fs::set_permissions(&src_dir, std::fs::Permissions::from_mode(0o750)).await?;
+        // create a readable file (will be linked successfully)
+        tokio::fs::write(src_dir.join("readable.txt"), "content").await?;
+        // create a subdirectory with a file, then make the subdirectory unreadable
+        // this will cause the recursive walk to fail when trying to read subdirectory contents
+        let unreadable_subdir = src_dir.join("unreadable_subdir");
+        tokio::fs::create_dir(&unreadable_subdir).await?;
+        tokio::fs::write(unreadable_subdir.join("hidden.txt"), "secret").await?;
+        tokio::fs::set_permissions(&unreadable_subdir, std::fs::Permissions::from_mode(0o000))
+            .await?;
+        let dst_dir = test_path.join("dst");
+        // link with fail_early=false
+        let result = link(
+            &PROGRESS,
+            test_path,
+            &src_dir,
+            &dst_dir,
+            &None,
+            &common_settings(false, false),
+            false,
+        )
+        .await;
+        // restore permissions so cleanup can succeed
+        tokio::fs::set_permissions(&unreadable_subdir, std::fs::Permissions::from_mode(0o755))
+            .await?;
+        // verify the operation returned an error (unreadable subdirectory should fail)
+        assert!(
+            result.is_err(),
+            "link should fail due to unreadable subdirectory"
+        );
+        let error = result.unwrap_err();
+        // verify the readable file was linked successfully
+        assert_eq!(error.summary.hard_links_created, 1);
+        // verify the destination directory exists and has the correct permissions
+        let dst_metadata = tokio::fs::metadata(&dst_dir).await?;
+        assert!(dst_metadata.is_dir());
+        let actual_mode = dst_metadata.permissions().mode() & 0o7777;
+        assert_eq!(
+            actual_mode, 0o750,
+            "directory should have preserved source permissions (0o750), got {:o}",
+            actual_mode
+        );
         Ok(())
     }
 }
