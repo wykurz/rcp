@@ -73,23 +73,25 @@ tc qdisc del dev eth0 root
 
 ## Phase 2: Process Chaos (Kill/Pause)
 
-**Status**: Not started
+**Status**: Complete
 
 Test rcp's behavior when rcpd processes die or hang unexpectedly.
 
 ### Tasks
 
-- [ ] Add helper functions to `docker_env.rs`:
-  - [ ] `kill_rcpd(container)` - kill rcpd process by name
-  - [ ] `pause_rcpd(container)` - SIGSTOP the process
-  - [ ] `resume_rcpd(container)` - SIGCONT the process
-- [ ] Write tests for:
-  - [ ] Kill source rcpd during handshake
-  - [ ] Kill destination rcpd during handshake
-  - [ ] Kill source rcpd mid-transfer
-  - [ ] Kill destination rcpd mid-transfer
-  - [ ] Pause rcpd (simulates hang) - verify timeout behavior
-  - [ ] Master (rcp) killed - verify rcpd cleanup via stdin watchdog
+- [x] Add helper functions to `docker_env.rs`:
+  - [x] `kill_rcpd(container)` - kill rcpd process by name
+  - [x] `pause_rcpd(container)` - SIGSTOP the process
+  - [x] `resume_rcpd(container)` - SIGCONT the process
+  - [x] `is_rcpd_running(container)` - check if rcpd is running
+  - [x] `get_rcpd_pids(container)` - get PIDs of rcpd processes
+  - [x] `spawn_rcp(args)` - spawn rcp in background for async testing
+- [x] Write tests for:
+  - [x] Kill rcpd early (before connections established) - tests "connection refused" path
+  - [x] Kill rcpd mid-transfer (after connections established) - tests TCP failure detection
+  - [x] Pause rcpd (simulates hang) - verify timeout behavior (~15s with default timeout)
+  - [x] Master (rcp) killed - verify rcpd cleanup via stdin watchdog
+  - [x] Process helpers meta-test
 
 ### Implementation Notes
 
@@ -193,6 +195,8 @@ This allows running them separately: `cargo nextest run -E 'test(~chaos)'`
 | 2026-01-13 | 1 | Add iproute2 to Dockerfile, CAP_NET_ADMIN to docker-compose | - |
 | 2026-01-13 | 1 | Add network simulation helpers to docker_env.rs | - |
 | 2026-01-13 | 1 | Add chaos network tests (docker_chaos_network.rs) | - |
+| 2026-01-14 | 2 | Add process chaos helpers (kill/pause/resume rcpd) | - |
+| 2026-01-14 | 2 | Add chaos process tests (docker_chaos_process.rs) | - |
 
 ---
 
@@ -200,6 +204,7 @@ This allows running them separately: `cargo nextest run -E 'test(~chaos)'`
 
 - `docs/testing.md` - Overall testing documentation
 - `docs/remote_protocol.md` - Protocol design (for understanding failure points)
-- `rcp/tests/support/docker_env.rs` - Docker test helpers (includes network simulation)
+- `rcp/tests/support/docker_env.rs` - Docker test helpers (network + process chaos)
 - `rcp/tests/docker_multi_host*.rs` - Existing Docker tests
-- `rcp/tests/docker_chaos_network.rs` - Network chaos tests
+- `rcp/tests/docker_chaos_network.rs` - Network chaos tests (Phase 1)
+- `rcp/tests/docker_chaos_process.rs` - Process chaos tests (Phase 2)

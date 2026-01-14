@@ -81,6 +81,30 @@ impl DockerEnv {
         Ok(output)
     }
 
+    /// Spawn rcp command in the background, returning a Child handle.
+    ///
+    /// This allows killing rcpd or the master process while rcp is running.
+    /// The caller is responsible for waiting on the child and handling output.
+    /// Output is sent to null to avoid pipe buffer blocking issues.
+    #[allow(dead_code)]
+    pub fn spawn_rcp(&self, args: &[&str]) -> Result<std::process::Child> {
+        let mut cmd = Command::new("docker");
+        cmd.args([
+            "exec",
+            "-u",
+            "testuser",
+            "rcp-test-master",
+            &self.rcp_binary,
+        ]);
+        cmd.arg("-vv");
+        cmd.args(args);
+        // don't pipe - avoids blocking if output buffer fills
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let child = cmd.spawn()?;
+        Ok(child)
+    }
+
     /// Execute arbitrary command in a container
     #[allow(dead_code)]
     pub fn exec(&self, container: &str, user: Option<&str>, args: &[&str]) -> Result<Output> {
@@ -534,6 +558,97 @@ impl DockerEnv {
             }
         }
         Ok(())
+    }
+}
+
+/// Process chaos helpers for testing failure scenarios.
+///
+/// These functions allow killing, pausing, and resuming rcpd processes
+/// to test rcp's behavior when remote processes fail unexpectedly.
+impl DockerEnv {
+    /// Kill all rcpd processes in a container.
+    ///
+    /// Uses pkill to send SIGKILL to all processes named "rcpd".
+    /// Returns Ok even if no rcpd process was running.
+    #[allow(dead_code)]
+    pub fn kill_rcpd(&self, container: &str) -> Result<()> {
+        let container_name = format!("rcp-test-{}", container);
+        let output = Command::new("docker")
+            .args(["exec", &container_name, "pkill", "-9", "rcpd"])
+            .output()?;
+        // pkill returns 1 if no process matched, which is fine
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(format!(
+                "failed to kill rcpd: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Pause all rcpd processes in a container (SIGSTOP).
+    ///
+    /// The process will be frozen until resumed with `resume_rcpd`.
+    /// This simulates a hung process.
+    #[allow(dead_code)]
+    pub fn pause_rcpd(&self, container: &str) -> Result<()> {
+        let container_name = format!("rcp-test-{}", container);
+        let output = Command::new("docker")
+            .args(["exec", &container_name, "pkill", "-STOP", "rcpd"])
+            .output()?;
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(format!(
+                "failed to pause rcpd: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Resume all paused rcpd processes in a container (SIGCONT).
+    #[allow(dead_code)]
+    pub fn resume_rcpd(&self, container: &str) -> Result<()> {
+        let container_name = format!("rcp-test-{}", container);
+        let output = Command::new("docker")
+            .args(["exec", &container_name, "pkill", "-CONT", "rcpd"])
+            .output()?;
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(format!(
+                "failed to resume rcpd: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Check if any rcpd process is running in a container.
+    #[allow(dead_code)]
+    pub fn is_rcpd_running(&self, container: &str) -> Result<bool> {
+        let container_name = format!("rcp-test-{}", container);
+        let output = Command::new("docker")
+            .args(["exec", &container_name, "pgrep", "rcpd"])
+            .output()?;
+        Ok(output.status.success())
+    }
+
+    /// Get PIDs of all rcpd processes in a container.
+    #[allow(dead_code)]
+    pub fn get_rcpd_pids(&self, container: &str) -> Result<Vec<u32>> {
+        let container_name = format!("rcp-test-{}", container);
+        let output = Command::new("docker")
+            .args(["exec", &container_name, "pgrep", "rcpd"])
+            .output()?;
+        if !output.status.success() {
+            return Ok(vec![]);
+        }
+        let pids = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect();
+        Ok(pids)
     }
 }
 
