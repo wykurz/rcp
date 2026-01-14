@@ -6,6 +6,7 @@ RCP TOOLS
 This repo contains tools to efficiently copy, remove and link large filesets, both locally and across remote hosts.
 
 [![Build status](https://github.com/wykurz/rcp/actions/workflows/rust.yml/badge.svg)](https://github.com/wykurz/rcp/actions)
+[![Chaos Tests](https://github.com/wykurz/rcp/actions/workflows/chaos-tests.yml/badge.svg)](https://github.com/wykurz/rcp/actions/workflows/chaos-tests.yml)
 [![Crates.io](https://img.shields.io/crates/v/rcp-tools-rcp.svg)](https://crates.io/crates/rcp-tools-rcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Documentation](https://docs.rs/rcp-tools-rcp/badge.svg)](https://docs.rs/rcp-tools-rcp)

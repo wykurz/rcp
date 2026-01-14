@@ -2,12 +2,14 @@
 FROM alpine:3.19
 
 # Install OpenSSH server and required utilities
+# iproute2 provides 'tc' for network condition simulation (chaos testing)
 RUN apk add --no-cache \
     openssh-server \
     openssh-client \
     bash \
     coreutils \
     findutils \
+    iproute2 \
     && mkdir -p /var/run/sshd
 
 # Create test user with home directory

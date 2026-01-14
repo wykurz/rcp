@@ -1,0 +1,111 @@
+name: Chaos Tests
+
+# Chaos/stress tests run after merges to main.
+# These tests simulate adverse network conditions and may occasionally fail
+# due to timing-dependent behavior. Failures here don't block merges.
+
+on:
+  push:
+    branches: [ "main" ]
+  # Allow manual triggering for debugging
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: --cfg tokio_unstable
+
+jobs:
+  chaos-network-tests:
+    name: "🌪️ Network Chaos"
+    runs-on: ubuntu-latest
+    # Continue even if this job fails - these are stress tests
+    continue-on-error: true
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
+      with:
+        targets: x86_64-unknown-linux-musl
+
+    - name: Install musl toolchain deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools pkg-config
+        sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
+
+    - name: Install just
+      uses: taiki-e/install-action@90558ad1e179036f31467972b00dec6cb80701fa # v2
+      with:
+        tool: just
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@90558ad1e179036f31467972b00dec6cb80701fa # v2
+      with:
+        tool: cargo-nextest
+
+    - name: Build binaries for Docker
+      # debug build is sufficient for chaos tests since we're testing network behavior,
+      # not performance. debug builds also provide better error messages on failure.
+      env:
+        PKG_CONFIG_ALLOW_CROSS: "1"
+      run: cargo build --workspace
+
+    - name: Start Docker containers
+      run: |
+        cd tests/docker
+        docker compose up -d
+
+        # Wait for containers to be healthy and SSH to be ready
+        echo "Waiting for containers to start..."
+        sleep 3
+
+        # Check if SSH daemon is running in containers
+        echo "Checking SSH daemon status..."
+        docker exec rcp-test-master pgrep sshd || echo "SSH not running in master"
+        docker exec rcp-test-host-a pgrep sshd || echo "SSH not running in host-a"
+        docker exec rcp-test-host-b pgrep sshd || echo "SSH not running in host-b"
+
+        # Wait for SSH connectivity (with timeout)
+        echo "Testing SSH connectivity from master to host-a..."
+        TIMEOUT=60
+        ELAPSED=0
+        until docker exec -u testuser rcp-test-master ssh -o ConnectTimeout=5 host-a hostname &> /dev/null; do
+          if [ $ELAPSED -ge $TIMEOUT ]; then
+            echo "ERROR: SSH connectivity timeout after ${TIMEOUT}s"
+            docker exec -u testuser rcp-test-master ssh -v host-a hostname 2>&1 || true
+            docker compose logs
+            exit 1
+          fi
+          echo "Waiting for SSH... (${ELAPSED}s/${TIMEOUT}s)"
+          sleep 2
+          ELAPSED=$((ELAPSED + 2))
+        done
+        echo "SSH connectivity confirmed"
+
+    - name: Run chaos tests
+      run: |
+        set -o pipefail
+        echo "🌪️ Running network chaos tests..."
+        echo "These tests simulate latency and bandwidth constraints."
+        echo ""
+        cargo nextest run --profile docker --run-ignored only -E 'test(~chaos)' 2>&1 | tee chaos_test_output.log
+
+    - name: Show Docker logs on failure
+      if: failure()
+      run: |
+        cd tests/docker
+        docker compose logs
+
+    - name: Upload test logs
+      if: always()
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      with:
+        name: chaos-test-logs
+        path: chaos_test_output.log
+
+    - name: Stop Docker containers
+      if: always()
+      run: |
+        cd tests/docker
+        docker compose down

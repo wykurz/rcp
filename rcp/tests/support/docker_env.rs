@@ -156,6 +156,61 @@ impl DockerEnv {
         Ok(())
     }
 
+    /// Create a file of specified size filled with a pattern.
+    ///
+    /// This uses `dd` to create files, which is more efficient for larger files
+    /// than `write_file` (which uses printf and has shell argument limits).
+    ///
+    /// # Arguments
+    /// * `container` - Container name (e.g., "host-a")
+    /// * `path` - Path to create the file at
+    /// * `size_kb` - Size in kilobytes
+    #[allow(dead_code)]
+    pub fn create_file_with_size(&self, container: &str, path: &str, size_kb: u32) -> Result<()> {
+        let container_name = format!("rcp-test-{}", container);
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                &container_name,
+                "dd",
+                "if=/dev/zero",
+                &format!("of={}", path),
+                "bs=1024",
+                &format!("count={}", size_kb),
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to create file: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Get the size of a file in a container.
+    #[allow(dead_code)]
+    pub fn file_size(&self, container: &str, path: &str) -> Result<u64> {
+        let container_name = format!("rcp-test-{}", container);
+        let output = Command::new("docker")
+            .args(["exec", &container_name, "stat", "-c", "%s", path])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to get file size: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        let size_str = String::from_utf8_lossy(&output.stdout);
+        let size = size_str
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| format!("failed to parse file size: {}", e))?;
+        Ok(size)
+    }
+
     /// Create a delayed rcpd wrapper script on a host
     ///
     /// This creates a wrapper that delays before executing the real rcpd,
@@ -263,6 +318,224 @@ chmod +x {}"#,
 // Note: Drop cleanup removed to avoid interference with concurrent tests.
 // Each test is responsible for cleaning up its own files.
 // For manual cleanup between test runs, use: cd tests/docker && ./test-helpers.sh cleanup
+
+/// Network condition simulation for chaos testing.
+///
+/// These functions use Linux `tc` (traffic control) to simulate adverse network
+/// conditions like latency, packet loss, and bandwidth limits.
+///
+/// Requirements:
+/// - Containers must have `iproute2` package installed
+/// - Containers must have `CAP_NET_ADMIN` capability
+impl DockerEnv {
+    /// Add latency to a container's network interface.
+    ///
+    /// This adds a fixed delay to all outgoing packets on the specified interface.
+    /// Use `clear_network_conditions` to remove the latency.
+    ///
+    /// # Arguments
+    /// * `container` - Container name (e.g., "host-a")
+    /// * `delay_ms` - Delay in milliseconds to add to each packet
+    /// * `jitter_ms` - Optional jitter (variation) in milliseconds
+    #[allow(dead_code)]
+    pub fn add_latency(
+        &self,
+        container: &str,
+        delay_ms: u32,
+        jitter_ms: Option<u32>,
+    ) -> Result<()> {
+        let container_name = format!("rcp-test-{}", container);
+        let delay_spec = match jitter_ms {
+            Some(jitter) => format!("{}ms {}ms", delay_ms, jitter),
+            None => format!("{}ms", delay_ms),
+        };
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                &container_name,
+                "tc",
+                "qdisc",
+                "add",
+                "dev",
+                "eth0",
+                "root",
+                "netem",
+                "delay",
+                &delay_spec,
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to add latency: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Add packet loss to a container's network interface.
+    ///
+    /// This causes a percentage of outgoing packets to be dropped randomly.
+    /// Use `clear_network_conditions` to remove the packet loss.
+    ///
+    /// # Arguments
+    /// * `container` - Container name (e.g., "host-a")
+    /// * `loss_percent` - Percentage of packets to drop (0.0 to 100.0)
+    #[allow(dead_code)]
+    pub fn add_packet_loss(&self, container: &str, loss_percent: f32) -> Result<()> {
+        let container_name = format!("rcp-test-{}", container);
+        let loss_spec = format!("{}%", loss_percent);
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                &container_name,
+                "tc",
+                "qdisc",
+                "add",
+                "dev",
+                "eth0",
+                "root",
+                "netem",
+                "loss",
+                &loss_spec,
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to add packet loss: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Add bandwidth limit to a container's network interface.
+    ///
+    /// This limits the outgoing bandwidth using a token bucket filter.
+    /// Use `clear_network_conditions` to remove the limit.
+    ///
+    /// # Arguments
+    /// * `container` - Container name (e.g., "host-a")
+    /// * `rate_kbit` - Maximum rate in kilobits per second
+    #[allow(dead_code)]
+    pub fn add_bandwidth_limit(&self, container: &str, rate_kbit: u32) -> Result<()> {
+        let container_name = format!("rcp-test-{}", container);
+        let rate_spec = format!("{}kbit", rate_kbit);
+        // tbf requires burst and latency parameters.
+        // burst must be at least rate/HZ where HZ is the kernel timer frequency (typically 250-1000).
+        // using rate/8 provides a safe margin that works across different kernel configs while
+        // keeping burst small enough for effective rate limiting. minimum 32kbit ensures the
+        // bucket can hold at least a few packets.
+        let burst = std::cmp::max(rate_kbit / 8, 32);
+        let burst_spec = format!("{}kbit", burst);
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                &container_name,
+                "tc",
+                "qdisc",
+                "add",
+                "dev",
+                "eth0",
+                "root",
+                "tbf",
+                "rate",
+                &rate_spec,
+                "burst",
+                &burst_spec,
+                "latency",
+                "400ms",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to add bandwidth limit: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Add combined network conditions (latency + packet loss).
+    ///
+    /// This is useful for simulating realistic degraded network conditions
+    /// where multiple issues occur simultaneously.
+    ///
+    /// # Arguments
+    /// * `container` - Container name (e.g., "host-a")
+    /// * `delay_ms` - Delay in milliseconds
+    /// * `loss_percent` - Percentage of packets to drop
+    #[allow(dead_code)]
+    pub fn add_network_conditions(
+        &self,
+        container: &str,
+        delay_ms: u32,
+        loss_percent: f32,
+    ) -> Result<()> {
+        let container_name = format!("rcp-test-{}", container);
+        let delay_spec = format!("{}ms", delay_ms);
+        let loss_spec = format!("{}%", loss_percent);
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                &container_name,
+                "tc",
+                "qdisc",
+                "add",
+                "dev",
+                "eth0",
+                "root",
+                "netem",
+                "delay",
+                &delay_spec,
+                "loss",
+                &loss_spec,
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to add network conditions: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Clear all network conditions from a container's interface.
+    ///
+    /// This removes any tc qdisc rules, returning the interface to normal operation.
+    /// Safe to call even if no conditions were previously set (ignores "not found" errors).
+    #[allow(dead_code)]
+    pub fn clear_network_conditions(&self, container: &str) -> Result<()> {
+        let container_name = format!("rcp-test-{}", container);
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                &container_name,
+                "tc",
+                "qdisc",
+                "del",
+                "dev",
+                "eth0",
+                "root",
+            ])
+            .output()?;
+        // ignore "RTNETLINK answers: No such file or directory" which means no qdisc was set
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("No such file or directory")
+                && !stderr.contains("Cannot delete qdisc")
+            {
+                return Err(format!("failed to clear network conditions: {}", stderr).into());
+            }
+        }
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {

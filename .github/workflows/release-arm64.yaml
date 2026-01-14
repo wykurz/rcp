@@ -15,9 +15,9 @@ jobs:
     permissions: write-all
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
     - name: Set up Rust
-      uses: actions-rs/toolchain@v1
+      uses: actions-rs/toolchain@63eb9591781c46a70274cb3ebdf190fce92702e8 # v1
       with:
         toolchain: stable
     - name: Add target
@@ -25,7 +25,7 @@ jobs:
     - name: Install builders
       run: cargo install cargo-deb
     - name: Build
-      uses: actions-rs/cargo@v1
+      uses: actions-rs/cargo@e7f754b8e09f70ad8eb2c5aebf61e58e8403b210 # v1
       with:
         use-cross: true
         command: build
@@ -41,7 +41,7 @@ jobs:
         echo $(pwd)/rcp-deb-arm64-${{ github.event.release.tag_name }}
         ls -ld $(pwd)/rcp-deb-arm64-${{ github.event.release.tag_name }}*
     - name: Upload to GitHub Release
-      uses: actions/upload-release-asset@v1
+      uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1
       env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
@@ -55,9 +55,9 @@ jobs:
     permissions: write-all
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
     - name: Set up Rust
-      uses: actions-rs/toolchain@v1
+      uses: actions-rs/toolchain@63eb9591781c46a70274cb3ebdf190fce92702e8 # v1
       with:
         toolchain: stable
     - name: Add target
@@ -65,7 +65,7 @@ jobs:
     - name: Install builders
       run: cargo install cargo-generate-rpm
     - name: Build
-      uses: actions-rs/cargo@v1
+      uses: actions-rs/cargo@e7f754b8e09f70ad8eb2c5aebf61e58e8403b210 # v1
       with:
         use-cross: true
         command: build
@@ -81,7 +81,7 @@ jobs:
         echo $(pwd)/rcp-rpm-arm64-${{ github.event.release.tag_name }}
         ls -ld $(pwd)/rcp-rpm-arm64-${{ github.event.release.tag_name }}*
     - name: Upload to GitHub Release
-      uses: actions/upload-release-asset@v1
+      uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1
       env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:

@@ -6,6 +6,9 @@ services:
       dockerfile: Dockerfile.ssh-host
     container_name: rcp-test-master
     hostname: master
+    # CAP_NET_ADMIN required for tc (traffic control) commands in chaos tests
+    cap_add:
+      - NET_ADMIN
     networks:
       - rcp-test-net
     volumes:
@@ -30,6 +33,8 @@ services:
       dockerfile: Dockerfile.ssh-host
     container_name: rcp-test-host-a
     hostname: host-a
+    cap_add:
+      - NET_ADMIN
     networks:
       - rcp-test-net
     volumes:
@@ -51,6 +56,8 @@ services:
       dockerfile: Dockerfile.ssh-host
     container_name: rcp-test-host-b
     hostname: host-b
+    cap_add:
+      - NET_ADMIN
     networks:
       - rcp-test-net
     volumes:
