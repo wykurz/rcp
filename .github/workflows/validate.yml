@@ -17,7 +17,7 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
       with:
         components: rustfmt, clippy
-        targets: x86_64-unknown-linux-musl
+        target: x86_64-unknown-linux-musl
 
     - name: Install musl toolchain deps
       run: |
@@ -60,7 +60,7 @@ jobs:
     - name: Setup Rust
       uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
       with:
-        targets: x86_64-unknown-linux-musl
+        target: x86_64-unknown-linux-musl
 
     - name: Install musl toolchain deps
       run: |
@@ -116,7 +116,7 @@ jobs:
     - name: Setup Rust
       uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
       with:
-        targets: x86_64-unknown-linux-musl
+        target: x86_64-unknown-linux-musl
 
     - name: Install musl toolchain deps
       run: |
@@ -172,7 +172,7 @@ jobs:
     - name: Setup Rust
       uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
       with:
-        targets: x86_64-unknown-linux-musl
+        target: x86_64-unknown-linux-musl
 
     - name: Install musl toolchain deps
       run: |
