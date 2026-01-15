@@ -1,8 +1,8 @@
 name: Chaos Tests
 
 # Chaos/stress tests run after merges to main.
-# These tests simulate adverse network conditions and may occasionally fail
-# due to timing-dependent behavior. Failures here don't block merges.
+# These tests simulate adverse conditions (network, process, I/O) and may
+# occasionally fail due to timing-dependent behavior. Failures don't block merges.
 
 on:
   push:
@@ -15,8 +15,8 @@ env:
   RUSTFLAGS: --cfg tokio_unstable
 
 jobs:
-  chaos-network-tests:
-    name: "🌪️ Network Chaos"
+  chaos-tests:
+    name: "🌪️ Chaos Tests"
     runs-on: ubuntu-latest
     # Continue even if this job fails - these are stress tests
     continue-on-error: true
@@ -86,8 +86,7 @@ jobs:
     - name: Run chaos tests
       run: |
         set -o pipefail
-        echo "🌪️ Running network chaos tests..."
-        echo "These tests simulate latency and bandwidth constraints."
+        echo "🌪️ Running chaos tests (network, process, I/O)..."
         echo ""
         cargo nextest run --profile docker --run-ignored only -E 'test(~chaos)' 2>&1 | tee chaos_test_output.log
 

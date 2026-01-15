@@ -228,7 +228,8 @@ jobs:
         echo "SSH connectivity confirmed"
 
     - name: Run Docker multi-host tests
-      run: cargo nextest run --profile docker --run-ignored only
+      # exclude chaos tests - they require SYS_ADMIN capability and run separately in chaos-tests.yml
+      run: cargo nextest run --profile docker --run-ignored only -E 'not test(~chaos)'
 
     - name: Show Docker logs on failure
       if: failure()
