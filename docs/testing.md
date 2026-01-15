@@ -286,21 +286,22 @@ This replicates the CI checks locally before pushing.
 
 ## Chaos Testing
 
-Chaos tests verify rcp's behavior under adverse conditions. They use `tc` (traffic control)
-to simulate network issues and are designed to be reproducible in CI.
+Chaos tests verify rcp's behavior under adverse conditions. They run in Docker containers
+with special capabilities and are designed to be reproducible in CI.
 
 ### Running Chaos Tests
 
 ```bash
-# Start containers (includes iproute2 for tc)
+# Full lifecycle
+just docker-chaos-test
+
+# Development workflow
 just docker-up
-
-# Run only chaos tests
 cargo nextest run --profile docker --run-ignored only -E 'test(~chaos)'
-
-# Or run all Docker tests including chaos
-cargo nextest run --profile docker --run-ignored only
+just docker-down
 ```
+
+Chaos tests run separately from regular Docker tests in CI (see `.github/workflows/chaos-tests.yml`).
 
 ### Test Categories
 
@@ -309,40 +310,47 @@ cargo nextest run --profile docker --run-ignored only
 - Bandwidth limits (1 Mbit/s) - verifies throttled transfer completion
 - Directory copy under latency - verifies multi-RTT protocol handling
 
+**Process chaos tests** (`docker_chaos_process.rs`):
+- Kill rcpd early (before connections established)
+- Kill rcpd mid-transfer (tests TCP failure detection)
+- Pause rcpd (SIGSTOP) to simulate hangs - verifies timeout behavior
+- Master killed - verifies rcpd cleanup via stdin watchdog
+
+**I/O chaos tests** (`docker_chaos_io.rs`):
+- Disk full (ENOSPC) via small tmpfs mount
+- Permission denied on destination directory
+- Permission denied on source file
+- Verifies error chain preservation (root cause visible in stderr)
+
+**Protocol stress tests** (`docker_chaos_protocol.rs`):
+- Backpressure with slow destination/source (64 kbit/s bandwidth limit)
+- Many files (150 files to stress connection pool)
+- Limited connections (`--max-connections=10`)
+- Large file transfer (10MB to test chunking)
+- Combined stress (files + bandwidth + limited connections)
+
 **Note**: Packet loss tests are disabled because `tc netem loss` affects all traffic
-including SSH, causing hangs. See `docs/chaos_testing_plan.md` for details.
+including SSH, causing hangs before the copy starts.
 
 ### Implementation Details
 
-Network simulation uses Linux `tc` (traffic control) with `netem` and `tbf` qdiscs.
-Containers require `CAP_NET_ADMIN` capability (configured in docker-compose.yml).
-
-See `docs/chaos_testing_plan.md` for the full implementation plan and future phases.
+- **Network simulation**: Linux `tc` (traffic control) with `netem` and `tbf` qdiscs
+- **Process control**: `pkill` with SIGKILL, SIGSTOP, SIGCONT signals
+- **I/O simulation**: tmpfs mounts for disk full, chmod for permission errors
+- **Required capabilities**: `CAP_NET_ADMIN` (tc), `CAP_SYS_ADMIN` (mount)
 
 ---
 
-## Future Improvements
+## Future Test Improvements
 
-### Process Chaos Testing
-
-Test rcp's behavior when rcpd processes die or hang unexpectedly:
-- Kill/pause rcpd at various stages (handshake, mid-transfer)
-- Verify no orphaned processes
-- Verify clean error messages
-
-### I/O Error Simulation
-
-Test behavior when filesystem operations fail:
-- Disk full (ENOSPC) via small tmpfs
-- Permission errors mid-transfer
-- Verify error chain preservation
-
-### Additional Test Scenarios
+Potential additional test scenarios:
 
 - Three-way copies (A→B→C chain operations)
 - Simultaneous bidirectional transfers (A↔B)
-- Large file transfers (multi-GB stress testing)
-- Graceful handling of container restarts mid-transfer
+- Very large file transfers (multi-GB stress testing)
+- Container restart mid-transfer
+- Connection drops at specific protocol stages (requires protocol hooks)
+- Packet loss testing (requires iptables rules targeting specific ports)
 
 ## Design Decisions
 
