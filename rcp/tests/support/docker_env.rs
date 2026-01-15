@@ -652,6 +652,153 @@ impl DockerEnv {
     }
 }
 
+/// I/O chaos helpers for testing filesystem error scenarios.
+///
+/// These functions allow simulating disk full conditions, permission errors,
+/// and other I/O failures.
+impl DockerEnv {
+    /// Mount a tmpfs filesystem at a specified path with a size limit.
+    ///
+    /// This is useful for simulating disk full (ENOSPC) conditions by creating
+    /// a small filesystem that fills up quickly.
+    ///
+    /// Note: Runs as root since mount requires elevated privileges.
+    ///
+    /// # Arguments
+    /// * `container` - Container name (e.g., "host-b")
+    /// * `path` - Mount point path (will be created if it doesn't exist)
+    /// * `size_kb` - Size limit in kilobytes
+    #[allow(dead_code)]
+    pub fn mount_tmpfs(&self, container: &str, path: &str, size_kb: u32) -> Result<()> {
+        let container_name = format!("rcp-test-{}", container);
+        // create mount point if it doesn't exist (as root)
+        let mkdir_output = Command::new("docker")
+            .args(["exec", &container_name, "mkdir", "-p", path])
+            .output()?;
+        if !mkdir_output.status.success() {
+            return Err(format!(
+                "failed to create mount point: {}",
+                String::from_utf8_lossy(&mkdir_output.stderr)
+            )
+            .into());
+        }
+        // mount tmpfs with size limit (as root - mount requires elevated privileges)
+        let size_spec = format!("size={}k", size_kb);
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                &container_name,
+                "mount",
+                "-t",
+                "tmpfs",
+                "-o",
+                &size_spec,
+                "tmpfs",
+                path,
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to mount tmpfs: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        // make it writable by testuser
+        let chown_output = Command::new("docker")
+            .args(["exec", &container_name, "chown", "testuser:testuser", path])
+            .output()?;
+        if !chown_output.status.success() {
+            return Err(format!(
+                "failed to chown tmpfs: {}",
+                String::from_utf8_lossy(&chown_output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Unmount a tmpfs filesystem.
+    ///
+    /// Safe to call even if nothing is mounted (ignores "not mounted" errors).
+    #[allow(dead_code)]
+    pub fn unmount_tmpfs(&self, container: &str, path: &str) -> Result<()> {
+        let container_name = format!("rcp-test-{}", container);
+        let output = Command::new("docker")
+            .args(["exec", &container_name, "umount", path])
+            .output()?;
+        // ignore "not mounted" errors
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("not mounted") && !stderr.contains("no mount point") {
+                return Err(format!("failed to unmount tmpfs: {}", stderr).into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Get available space in bytes at a path in a container.
+    #[allow(dead_code)]
+    pub fn available_space(&self, container: &str, path: &str) -> Result<u64> {
+        let container_name = format!("rcp-test-{}", container);
+        // use df to get available space in bytes
+        let output = Command::new("docker")
+            .args(["exec", &container_name, "df", "--output=avail", "-B1", path])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to get available space: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        // parse output (skip header line)
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        let avail = output_str
+            .lines()
+            .nth(1)
+            .ok_or("no output from df")?
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| format!("failed to parse df output: {}", e))?;
+        Ok(avail)
+    }
+
+    /// Change file permissions in a container.
+    #[allow(dead_code)]
+    pub fn chmod(&self, container: &str, path: &str, mode: &str) -> Result<()> {
+        let container_name = format!("rcp-test-{}", container);
+        let output = Command::new("docker")
+            .args(["exec", &container_name, "chmod", mode, path])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to chmod: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Change file ownership in a container (requires root).
+    #[allow(dead_code)]
+    pub fn chown(&self, container: &str, path: &str, owner: &str) -> Result<()> {
+        let container_name = format!("rcp-test-{}", container);
+        let output = Command::new("docker")
+            .args(["exec", &container_name, "chown", owner, path])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to chown: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

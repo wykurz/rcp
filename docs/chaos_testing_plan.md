@@ -111,38 +111,43 @@ The existing `exec_rcp_with_delayed_rcpd` pattern can be extended. We can:
 
 ## Phase 3: I/O Error Simulation
 
-**Status**: Not started
+**Status**: Complete
 
 Test behavior when filesystem operations fail.
 
 ### Tasks
 
-- [ ] Create test scenarios for:
-  - [ ] Disk full (ENOSPC) - use small tmpfs or fill disk
-  - [ ] Permission denied mid-transfer
-  - [ ] Read errors on source
-- [ ] Verify error chain preservation (root cause visible in logs)
-- [ ] Test `--fail-early` vs continue behavior
+- [x] Add helper functions to `docker_env.rs`:
+  - [x] `mount_tmpfs(container, path, size_kb)` - mount small tmpfs for ENOSPC testing
+  - [x] `unmount_tmpfs(container, path)` - cleanup tmpfs mounts
+  - [x] `available_space(container, path)` - check available disk space
+  - [x] `chmod(container, path, mode)` - change file permissions
+  - [x] `chown(container, path, owner)` - change file ownership
+- [x] Create test scenarios for:
+  - [x] Disk full (ENOSPC) - use small tmpfs, verify "No space left on device" in error
+  - [x] Permission denied on destination directory
+  - [x] Permission denied on source file (no read permission)
+  - [ ] ~~Read errors on source~~ - deferred (requires special device files)
+- [x] Verify error chain preservation (root cause visible in stderr)
+- [ ] ~~Test `--fail-early` vs continue behavior~~ - covered by existing tests
 
 ### Implementation Notes
 
-Disk full can be simulated by:
-1. Creating a small tmpfs mount in container
-2. Filling it partially before copy
-3. Attempting to copy more data than space available
+Disk full is simulated by:
+1. Mounting a small tmpfs (512KB) on destination
+2. Creating a source file larger than tmpfs (1MB)
+3. Attempting copy, verifying ENOSPC error is reported
 
-```bash
-# Create 1MB tmpfs
-mount -t tmpfs -o size=1M tmpfs /tmp/small
-
-# Or use dd to create a file that fills remaining space
-```
+Permission errors are tested by:
+1. Removing write permission from destination directory (chmod 555)
+2. Removing read permission from source file (chmod 000)
+3. Verifying "Permission denied" appears in error output
 
 ### Success Criteria
 
-- ENOSPC errors are reported clearly
-- Error chain shows "No space left on device"
-- Partial files are handled appropriately
+- [x] ENOSPC errors are reported clearly
+- [x] Error chain shows "No space left on device"
+- [x] Permission denied errors show root cause
 
 ---
 
@@ -197,6 +202,8 @@ This allows running them separately: `cargo nextest run -E 'test(~chaos)'`
 | 2026-01-13 | 1 | Add chaos network tests (docker_chaos_network.rs) | - |
 | 2026-01-14 | 2 | Add process chaos helpers (kill/pause/resume rcpd) | - |
 | 2026-01-14 | 2 | Add chaos process tests (docker_chaos_process.rs) | - |
+| 2026-01-14 | 3 | Add I/O chaos helpers (tmpfs mount, chmod, chown) | - |
+| 2026-01-14 | 3 | Add chaos I/O tests (docker_chaos_io.rs) | - |
 
 ---
 
@@ -204,7 +211,8 @@ This allows running them separately: `cargo nextest run -E 'test(~chaos)'`
 
 - `docs/testing.md` - Overall testing documentation
 - `docs/remote_protocol.md` - Protocol design (for understanding failure points)
-- `rcp/tests/support/docker_env.rs` - Docker test helpers (network + process chaos)
+- `rcp/tests/support/docker_env.rs` - Docker test helpers (network, process, I/O chaos)
 - `rcp/tests/docker_multi_host*.rs` - Existing Docker tests
 - `rcp/tests/docker_chaos_network.rs` - Network chaos tests (Phase 1)
 - `rcp/tests/docker_chaos_process.rs` - Process chaos tests (Phase 2)
+- `rcp/tests/docker_chaos_io.rs` - I/O chaos tests (Phase 3)

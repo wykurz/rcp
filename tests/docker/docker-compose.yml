@@ -7,8 +7,10 @@ services:
     container_name: rcp-test-master
     hostname: master
     # CAP_NET_ADMIN required for tc (traffic control) commands in chaos tests
+    # CAP_SYS_ADMIN required for mount commands in I/O chaos tests
     cap_add:
       - NET_ADMIN
+      - SYS_ADMIN
     networks:
       - rcp-test-net
     volumes:
@@ -35,6 +37,7 @@ services:
     hostname: host-a
     cap_add:
       - NET_ADMIN
+      - SYS_ADMIN
     networks:
       - rcp-test-net
     volumes:
@@ -58,6 +61,7 @@ services:
     hostname: host-b
     cap_add:
       - NET_ADMIN
+      - SYS_ADMIN
     networks:
       - rcp-test-net
     volumes:
