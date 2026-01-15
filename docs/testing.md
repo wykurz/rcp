@@ -341,17 +341,6 @@ including SSH, causing hangs before the copy starts.
 
 ---
 
-## Future Test Improvements
-
-Potential additional test scenarios:
-
-- Three-way copies (A→B→C chain operations)
-- Simultaneous bidirectional transfers (A↔B)
-- Very large file transfers (multi-GB stress testing)
-- Container restart mid-transfer
-- Connection drops at specific protocol stages (requires protocol hooks)
-- Packet loss testing (requires iptables rules targeting specific ports)
-
 ## Design Decisions
 
 **Why Docker over alternatives?**
