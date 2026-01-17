@@ -135,9 +135,9 @@ pub async fn write_file(
             .with_context(|| format!("Error writing to {:?}", &path))
             .map_err(|err| Error::new(err, Default::default()))?;
         filesize -= writesize;
+        prog_track.bytes_copied.add(writesize as u64);
     }
     prog_track.files_copied.inc();
-    prog_track.bytes_copied.add(original_filesize as u64);
     Ok(Summary {
         files_created: 1,
         bytes_written: original_filesize as u64,
