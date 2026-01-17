@@ -121,7 +121,13 @@ struct Args {
     quiet: bool,
 
     // Performance & throttling
-    /// Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system limit
+    /// Maximum number of open files (concurrent file writes)
+    ///
+    /// Since filegen's random data generation is CPU-intensive, the default is set to the number
+    /// of physical CPU cores. This optimizes performance by matching concurrency to compute
+    /// capacity rather than allowing excessive parallelism that would cause CPU contention.
+    ///
+    /// Set to 0 for no limit. Increase if using slow storage where I/O latency dominates.
     #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
     max_open_files: Option<usize>,
 
@@ -226,8 +232,20 @@ fn main() -> Result<(), anyhow::Error> {
         max_workers: args.max_workers,
         max_blocking_threads: args.max_blocking_threads,
     };
+    // filegen's random data generation is CPU-intensive, so we default to
+    // physical cores rather than 80% of RLIMIT_NOFILE used by other tools.
+    // fallback to logical cores if physical returns 0 (can happen in containers),
+    // and use 1 as absolute minimum to avoid accidentally disabling limits.
+    let max_open_files = args.max_open_files.unwrap_or_else(|| {
+        let physical = num_cpus::get_physical();
+        if physical > 0 {
+            physical
+        } else {
+            num_cpus::get().max(1)
+        }
+    });
     let throttle = common::ThrottleConfig {
-        max_open_files: args.max_open_files,
+        max_open_files: Some(max_open_files),
         ops_throttle: args.ops_throttle,
         iops_throttle: args.iops_throttle,
         chunk_size: args.chunk_size,

@@ -415,6 +415,25 @@ For optimal performance on high-speed networks:
 4. ☐ Use `--progress` to monitor throughput in real-time
 5. ☐ Check `-v` output to verify buffer sizes and connection setup
 
+## filegen Performance
+
+The `filegen` tool generates random test data, which is CPU-intensive. Unlike other rcp tools that are typically I/O-bound, filegen's bottleneck is often the CPU generating random bytes.
+
+**Default behavior**: `filegen` defaults `--max-open-files` to the number of physical CPU cores, rather than 80% of the system's open file limit used by other tools. This matches concurrency to compute capacity, avoiding excessive parallelism that would cause CPU contention.
+
+**Tuning for your workload**:
+
+```bash
+# Use default (physical cores) - optimal for fast storage
+filegen /tmp 3,2 10 1M --progress
+
+# Increase for slow storage where I/O latency dominates
+filegen /tmp 3,2 10 1M --max-open-files=64 --progress
+
+# No limit (unlimited concurrency)
+filegen /tmp 3,2 10 1M --max-open-files=0 --progress
+```
+
 Profiling
 =========
 

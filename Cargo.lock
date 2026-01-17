@@ -1618,6 +1618,7 @@ dependencies = [
  "async-recursion",
  "bytesize",
  "clap",
+ "num_cpus",
  "rand",
  "rcp-tools-common",
  "rcp-tools-throttle",
