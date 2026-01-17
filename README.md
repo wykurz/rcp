@@ -12,6 +12,8 @@ This repo contains tools to efficiently copy, remove and link large filesets, bo
 [![Documentation](https://docs.rs/rcp-tools-rcp/badge.svg)](https://docs.rs/rcp-tools-rcp)
 [![Radicle](https://img.shields.io/badge/Radicle-Repository-7B4CDB?logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiIHN0cm9rZT0id2hpdGUiIHN0cm9rZS13aWR0aD0iMiIvPgo8L3N2Zz4K)](https://app.radicle.xyz/nodes/seed.radicle.garden/rad:z2EHT1VHYdjQfftzpYrmrAVEwL3Lp)
 
+![Demo](assets/demo.gif)
+
 - `rcp` is for copying files; similar to `cp` but generally MUCH faster when dealing with large filesets.
 
     Supports both local and remote copying using `host:/path` syntax (similar to `scp`).
