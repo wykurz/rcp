@@ -79,7 +79,8 @@
 //! let src = Path::new("/path1");
 //! let dst = Path::new("/path2");
 //!
-//! let log = common::cmp::LogWriter::new(None).await?;
+//! // output differences to stdout (use false for quiet mode)
+//! let log = common::cmp::LogWriter::new(None, true).await?;
 //! let settings = common::cmp::Settings {
 //!     fail_early: false,
 //!     exit_early: false,

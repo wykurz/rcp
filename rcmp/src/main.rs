@@ -10,14 +10,23 @@ use clap::Parser;
 
 Currently supports metadata comparison only (no content checking).
 
+By default, differences are printed to stdout. Use --log to write them to a file
+instead, or --quiet to suppress stdout output.
+
 EXIT CODES:
     0 - No differences found
     1 - Differences found
     2 - Errors occurred during comparison
 
-EXAMPLE:
-    # Compare two directories and log differences
-    rcmp /foo /bar --progress --summary --log compare.log"
+EXAMPLES:
+    # Compare two directories (differences printed to stdout)
+    rcmp /foo /bar --progress --summary
+
+    # Compare and log differences to a file
+    rcmp /foo /bar --progress --summary --log compare.log
+
+    # Compare silently (only exit code)
+    rcmp /foo /bar --quiet"
 )]
 struct Args {
     // Comparison options
@@ -48,7 +57,7 @@ struct Args {
     #[arg(long, help_heading = "Comparison options")]
     no_check: bool,
 
-    /// File name where to store comparison mismatch output
+    /// File to store comparison output (instead of stdout)
     #[arg(long, value_name = "PATH", help_heading = "Comparison options")]
     log: Option<std::path::PathBuf>,
 
@@ -82,7 +91,10 @@ struct Args {
     #[arg(long, help_heading = "Progress & output")]
     summary: bool,
 
-    /// Quiet mode, don't report errors
+    /// Quiet mode, suppress stdout output (errors and differences)
+    ///
+    /// Without --log, differences are printed to stdout. This flag suppresses that.
+    /// When used with --log, differences are still written to the log file.
     #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
     quiet: bool,
 
@@ -153,7 +165,9 @@ struct Args {
 }
 
 async fn async_main(args: Args) -> Result<common::cmp::Summary> {
-    let log_handle = common::cmp::LogWriter::new(args.log.as_deref()).await?;
+    // output to stdout if no log file and not quiet
+    let use_stdout = args.log.is_none() && !args.quiet;
+    let log_handle = common::cmp::LogWriter::new(args.log.as_deref(), use_stdout).await?;
     let summary = common::cmp(
         &args.src,
         &args.dst,

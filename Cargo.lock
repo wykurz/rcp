@@ -1638,6 +1638,7 @@ dependencies = [
  "clap",
  "predicates",
  "rcp-tools-common",
+ "tempfile",
  "thiserror 1.0.55",
  "tokio",
  "tracing",
