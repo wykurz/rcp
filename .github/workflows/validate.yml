@@ -181,12 +181,12 @@ jobs:
         sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
 
     - name: Install just
-      uses: taiki-e/install-action@2e9d707ef49c9b094d45955b60c7e5c0dfedeb14 # v2
+      uses: taiki-e/install-action@542cebaaed782771e619bd5609d97659d109c492 # v2
       with:
         tool: just
 
     - name: Install cargo-nextest
-      uses: taiki-e/install-action@2e9d707ef49c9b094d45955b60c7e5c0dfedeb14 # v2
+      uses: taiki-e/install-action@542cebaaed782771e619bd5609d97659d109c492 # v2
       with:
         tool: cargo-nextest
 
