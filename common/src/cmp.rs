@@ -64,13 +64,28 @@ impl std::fmt::Display for Summary {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LogWriter {
-    log_opt: Option<std::sync::Arc<tokio::sync::Mutex<tokio::io::BufWriter<tokio::fs::File>>>>,
+    file: Option<std::sync::Arc<tokio::sync::Mutex<tokio::io::BufWriter<tokio::fs::File>>>>,
+    stdout: Option<std::sync::Arc<tokio::sync::Mutex<tokio::io::BufWriter<tokio::io::Stdout>>>>,
+}
+
+impl std::fmt::Debug for LogWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogWriter")
+            .field("file", &self.file.is_some())
+            .field("stdout", &self.stdout.is_some())
+            .finish()
+    }
 }
 
 impl LogWriter {
-    pub async fn new(log_path_opt: Option<&std::path::Path>) -> Result<Self> {
+    /// Creates a new LogWriter.
+    ///
+    /// If `log_path_opt` is provided, output goes to that file.
+    /// Otherwise, if `use_stdout` is true, output goes to stdout.
+    /// If both are false/None, no output is produced.
+    pub async fn new(log_path_opt: Option<&std::path::Path>, use_stdout: bool) -> Result<Self> {
         if let Some(log_path) = log_path_opt {
             let log_file = tokio::fs::OpenOptions::new()
                 .write(true)
@@ -80,9 +95,22 @@ impl LogWriter {
                 .with_context(|| format!("Failed to open log file: {log_path:?}"))?;
             let log =
                 std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::BufWriter::new(log_file)));
-            Ok(Self { log_opt: Some(log) })
+            Ok(Self {
+                file: Some(log),
+                stdout: None,
+            })
+        } else if use_stdout {
+            Ok(Self {
+                file: None,
+                stdout: Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+                    tokio::io::BufWriter::new(tokio::io::stdout()),
+                ))),
+            })
         } else {
-            Ok(Self { log_opt: None })
+            Ok(Self {
+                file: None,
+                stdout: None,
+            })
         }
     }
 
@@ -101,19 +129,30 @@ impl LogWriter {
     }
 
     async fn write(&self, msg: &str) -> Result<()> {
-        if let Some(log) = &self.log_opt {
+        if let Some(log) = &self.file {
             let mut log = log.lock().await;
             log.write_all(msg.as_bytes())
                 .await
                 .context("Failed to write to log file")?;
         }
+        if let Some(stdout) = &self.stdout {
+            let mut stdout = stdout.lock().await;
+            stdout
+                .write_all(msg.as_bytes())
+                .await
+                .context("Failed to write to stdout")?;
+        }
         Ok(())
     }
 
     pub async fn flush(&self) -> Result<()> {
-        if let Some(log) = &self.log_opt {
+        if let Some(log) = &self.file {
             let mut log = log.lock().await;
             log.flush().await.context("Failed to flush log file")?;
+        }
+        if let Some(stdout) = &self.stdout {
+            let mut stdout = stdout.lock().await;
+            stdout.flush().await.context("Failed to flush stdout")?;
         }
         Ok(())
     }
@@ -382,7 +421,7 @@ mod cmp_tests {
             &PROGRESS,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &LogWriter::new(Some(tmp_dir.join("cmp.log").as_path())).await?,
+            &LogWriter::new(Some(tmp_dir.join("cmp.log").as_path()), false).await?,
             &compare_settings,
         )
         .await?;

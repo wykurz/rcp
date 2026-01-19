@@ -118,7 +118,17 @@ Roughly equivalent to: `rsync -a --link-dest=<foo> <bar> <baz>`.
 
 Compare `<foo>` vs. `<bar>`:
 ```fish
+# differences are printed to stdout by default
+> rcmp <foo> <bar> --progress --summary
+
+# use --log to write differences to a file instead
 > rcmp <foo> <bar> --progress --summary --log compare.log
+
+# use --quiet to suppress stdout output (exit code only)
+> rcmp <foo> <bar> --quiet
+
+# --quiet with --log: silent stdout but differences still written to file
+> rcmp <foo> <bar> --quiet --log compare.log
 ```
 
 Installation
