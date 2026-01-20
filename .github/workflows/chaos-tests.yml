@@ -83,27 +83,24 @@ jobs:
         done
         echo "SSH connectivity confirmed"
 
-        # Wait for container capabilities to be available (needed for chaos tests)
-        # Check both host-a and host-b since different tests use different hosts
+        # Verify container capabilities (needed for chaos tests)
+        # CAP_SYS_ADMIN is required for mount commands in I/O chaos tests
         echo "Verifying container capabilities..."
         for HOST in rcp-test-host-a rcp-test-host-b; do
           echo "Checking SYS_ADMIN capability on ${HOST}..."
-          TIMEOUT=30
-          ELAPSED=0
-          until docker exec $HOST mount -t tmpfs -o size=1k tmpfs /tmp/cap-test 2>/dev/null; do
-            if [ $ELAPSED -ge $TIMEOUT ]; then
-              echo "ERROR: SYS_ADMIN capability not available on ${HOST} after ${TIMEOUT}s"
-              docker compose logs
-              exit 1
-            fi
-            echo "Waiting for SYS_ADMIN capability on ${HOST}... (${ELAPSED}s/${TIMEOUT}s)"
-            sleep 1
-            ELAPSED=$((ELAPSED + 1))
-          done
-          docker exec $HOST umount /tmp/cap-test 2>/dev/null || true
-          docker exec $HOST rmdir /tmp/cap-test 2>/dev/null || true
+          # create mount point, test mount, then cleanup
+          docker exec $HOST mkdir -p /tmp/cap-test
+          if docker exec $HOST mount -t tmpfs -o size=1k tmpfs /tmp/cap-test; then
+            docker exec $HOST umount /tmp/cap-test || true
+            docker exec $HOST rmdir /tmp/cap-test || true
+            echo "SYS_ADMIN capability confirmed on ${HOST}"
+          else
+            echo "ERROR: SYS_ADMIN capability not available on ${HOST}"
+            docker exec $HOST rmdir /tmp/cap-test || true
+            docker compose logs
+            exit 1
+          fi
         done
-        echo "Container capabilities confirmed"
 
     - name: Run chaos tests
       run: |
