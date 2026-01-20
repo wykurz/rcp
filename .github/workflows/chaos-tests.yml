@@ -1,8 +1,7 @@
 name: Chaos Tests
 
 # Chaos/stress tests run after merges to main.
-# These tests simulate adverse conditions (network, process, I/O) and may
-# occasionally fail due to timing-dependent behavior. Failures don't block merges.
+# These tests simulate adverse conditions (network, process, I/O).
 
 on:
   push:
@@ -18,8 +17,6 @@ jobs:
   chaos-tests:
     name: "🌪️ Chaos Tests"
     runs-on: ubuntu-latest
-    # Continue even if this job fails - these are stress tests
-    continue-on-error: true
     steps:
     - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
