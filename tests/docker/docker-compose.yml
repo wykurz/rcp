@@ -11,6 +11,9 @@ services:
     cap_add:
       - NET_ADMIN
       - SYS_ADMIN
+    # disable seccomp to allow mount syscall (blocked by default profile even with CAP_SYS_ADMIN)
+    security_opt:
+      - seccomp:unconfined
     networks:
       - rcp-test-net
     volumes:
@@ -35,9 +38,14 @@ services:
       dockerfile: Dockerfile.ssh-host
     container_name: rcp-test-host-a
     hostname: host-a
+    # CAP_NET_ADMIN required for tc (traffic control) commands in chaos tests
+    # CAP_SYS_ADMIN required for mount commands in I/O chaos tests
     cap_add:
       - NET_ADMIN
       - SYS_ADMIN
+    # disable seccomp to allow mount syscall (blocked by default profile even with CAP_SYS_ADMIN)
+    security_opt:
+      - seccomp:unconfined
     networks:
       - rcp-test-net
     volumes:
@@ -59,9 +67,14 @@ services:
       dockerfile: Dockerfile.ssh-host
     container_name: rcp-test-host-b
     hostname: host-b
+    # CAP_NET_ADMIN required for tc (traffic control) commands in chaos tests
+    # CAP_SYS_ADMIN required for mount commands in I/O chaos tests
     cap_add:
       - NET_ADMIN
       - SYS_ADMIN
+    # disable seccomp to allow mount syscall (blocked by default profile even with CAP_SYS_ADMIN)
+    security_opt:
+      - seccomp:unconfined
     networks:
       - rcp-test-net
     volumes:
