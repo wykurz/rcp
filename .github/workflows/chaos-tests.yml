@@ -80,31 +80,11 @@ jobs:
         done
         echo "SSH connectivity confirmed"
 
-        # Verify container capabilities (needed for chaos tests)
-        # CAP_SYS_ADMIN is required for mount commands in I/O chaos tests
-        echo "Verifying container capabilities..."
-        for HOST in rcp-test-host-a rcp-test-host-b; do
-          echo "Checking SYS_ADMIN capability on ${HOST}..."
-          # create mount point, test mount, then cleanup
-          docker exec $HOST mkdir -p /tmp/cap-test
-          if docker exec $HOST mount -t tmpfs -o size=1k tmpfs /tmp/cap-test; then
-            docker exec $HOST umount /tmp/cap-test || true
-            docker exec $HOST rmdir /tmp/cap-test || true
-            echo "SYS_ADMIN capability confirmed on ${HOST}"
-          else
-            echo "ERROR: SYS_ADMIN capability not available on ${HOST}"
-            docker exec $HOST rmdir /tmp/cap-test || true
-            docker compose logs
-            exit 1
-          fi
-        done
-
     - name: Run chaos tests
       run: |
         set -o pipefail
-        echo "🌪️ Running chaos tests (network, process, I/O)..."
-        echo ""
-        cargo nextest run --profile docker --run-ignored only -E 'test(~chaos)' 2>&1 | tee chaos_test_output.log
+        # docker-chaos-test-only verifies capabilities before running tests
+        just docker-chaos-test-only 2>&1 | tee chaos_test_output.log
 
     - name: Show Docker logs on failure
       if: failure()

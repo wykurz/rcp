@@ -118,8 +118,21 @@ test-all-with-docker: test-all docker-test
 # Chaos testing (network simulation, failure injection)
 # =====================================================
 
+# Verify container capabilities (mount, tc) are available
+docker-verify-caps:
+    @echo "🔍 Verifying container capabilities..."
+    @bash -c 'for host in rcp-test-host-a rcp-test-host-b; do \
+        echo "Checking SYS_ADMIN (mount) on $host..."; \
+        docker exec $host mkdir -p /tmp/cap-test && \
+        docker exec $host mount -t tmpfs -o size=1k tmpfs /tmp/cap-test && \
+        docker exec $host umount /tmp/cap-test && \
+        docker exec $host rmdir /tmp/cap-test && \
+        echo "  ✅ SYS_ADMIN verified on $host"; \
+    done'
+    @echo "✅ All container capabilities verified!"
+
 # Run chaos tests only (requires containers already running)
-docker-chaos-test-only:
+docker-chaos-test-only: docker-verify-caps
     @echo "🌪️  Running chaos tests..."
     cargo nextest run --profile docker --run-ignored only -E 'test(~chaos)'
 
