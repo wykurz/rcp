@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-01-21
+
+### Added
+- Backpressure mechanism for remote copy sender to prevent overwhelming slow receivers
+- Chaos testing infrastructure for protocol and I/O fault injection
+
+### Changed
+- `rcmp` now outputs differences to stdout when no log file is provided
+- Reduce default number of parallel file writes in `filegen`
+- Increase default connection timeout to 60s when `--auto-deploy-rcpd` is enabled
+- Optimize TLS counters using sharded atomics with cache line padding
+
+### Fixed
+- Fix bug where directory metadata would be skipped if any child failed to copy
+- Fix `filegen` progress tracking to update on all file writes, not just on completion
+- Fix Debian and RHEL package builds to properly find musl toolchain
+- Fix cargo publish to work with musl
+
 ## [0.22.0] - 2025-12-16
 
 ### Added
@@ -97,7 +115,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See git history for changes in previous versions.
 
-[Unreleased]: https://github.com/wykurz/rcp/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/wykurz/rcp/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/wykurz/rcp/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/wykurz/rcp/compare/v0.21.1...v0.22.0
 [0.21.0]: https://github.com/wykurz/rcp/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/wykurz/rcp/compare/v0.19.0...v0.20.0
