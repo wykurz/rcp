@@ -63,8 +63,9 @@ echo "════════════════════════�
 echo -e "${NC}"
 
 # Fetch tags to ensure we have the latest release info
+# use --force to update local tags that may differ from remote
 echo -e "Fetching tags from origin..."
-git fetch --tags --quiet
+git fetch --tags --force --quiet
 echo ""
 
 CURRENT_VERSION=$(get_current_version)
@@ -119,6 +120,21 @@ if ! changelog_has_version "$CURRENT_VERSION"; then
     claude "$PROMPT"
 
     echo ""
+
+    # verify only CHANGELOG.md was modified
+    CHANGED_FILES=$(git diff --name-only)
+    if [[ -z "$CHANGED_FILES" ]]; then
+        echo -e "${YELLOW}No changes were made to CHANGELOG.md${NC}"
+        echo "You may need to update it manually."
+        exit 0
+    elif [[ "$CHANGED_FILES" != "CHANGELOG.md" ]]; then
+        echo -e "${RED}Error: unexpected files were modified:${NC}"
+        echo "$CHANGED_FILES"
+        echo ""
+        echo "Only CHANGELOG.md should be modified. Please review and reset unwanted changes."
+        exit 1
+    fi
+
     echo -e "${GREEN}CHANGELOG updated.${NC}"
     echo ""
 
@@ -140,8 +156,8 @@ if ! changelog_has_version "$CURRENT_VERSION"; then
     echo ""
     echo -e "${BOLD}Next steps:${NC}"
     echo "  1. Review the commit: git show"
-    echo "  2. Push to create PR: git push"
-    echo "  3. After PR merges, create GitHub release for ${TAG}"
+    echo "  2. Push to main: git push"
+    echo "  3. Create GitHub release for ${TAG}"
     echo "  4. Run 'just release' again to bump version"
 
 elif ! tag_exists "$TAG"; then
