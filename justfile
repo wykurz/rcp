@@ -147,3 +147,10 @@ docker-chaos-test-keep: docker-up docker-chaos-test-only
 
 # Shorthand for chaos tests (equivalent to GitHub Actions chaos-tests.yml workflow)
 chaos: docker-chaos-test
+
+# Release management
+# ==================
+
+# Interactive release helper - detects state and guides through release process
+release:
+    @./scripts/release.sh
