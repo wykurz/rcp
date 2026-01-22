@@ -40,12 +40,12 @@ if [[ -z "$GITHUB_REPO" ]]; then
     exit 1
 fi
 
-# Check for required tools
+# Check that gh CLI is installed (required for release status checks)
 if ! command -v gh &> /dev/null; then
-    echo -e "${RED}Error: 'gh' command not found${NC}"
+    echo -e "${RED}Error: 'gh' command not found.${NC}"
     echo ""
-    echo "Install GitHub CLI: https://cli.github.com/"
-    echo "Or use nix develop to get all required tools"
+    echo "Please install the GitHub CLI:"
+    echo "  https://cli.github.com/"
     exit 1
 fi
 
@@ -66,12 +66,12 @@ remote_tag_exists() {
     git ls-remote --tags origin "$tag" 2>/dev/null | grep -q "refs/tags/${tag}$"
 }
 
-# Check if GitHub release is published (not draft)
+# Check if GitHub release exists and is published (not draft)
 release_is_published() {
     local tag="$1"
-    local draft
-    draft=$(gh release view "$tag" --repo "$GITHUB_REPO" --json isDraft --jq '.isDraft' 2>/dev/null) || return 1
-    [[ "$draft" == "false" ]]
+    local is_draft
+    is_draft=$(gh release view "$tag" --repo "$GITHUB_REPO" --json isDraft --jq '.isDraft' 2>/dev/null) || return 1
+    [[ "$is_draft" == "false" ]]
 }
 
 # Get the last release tag
@@ -227,10 +227,12 @@ elif ! remote_tag_exists "$TAG"; then
     echo "This will trigger the release workflow which:"
     echo "  - Creates a draft GitHub release"
     echo "  - Builds and attaches deb/rpm packages (amd64 + arm64)"
-    echo "  - Publishes the release"
-    echo "  - Triggers crates.io publication"
+    echo "  - Publishes the release (triggers crates.io publication)"
     echo ""
-    echo "After the release completes, run 'just release' again to bump version."
+    echo "Check workflow status at:"
+    echo "  https://github.com/${GITHUB_REPO}/actions/workflows/release.yml"
+    echo ""
+    echo "After the release is published, run 'just release' again to bump version."
     exit 0
 
 elif ! release_is_published "$TAG"; then
@@ -240,13 +242,10 @@ elif ! release_is_published "$TAG"; then
     echo -e "${YELLOW}${BOLD}State: Release in progress${NC}"
     echo ""
     echo "Tag ${TAG} has been pushed, but the release is not yet published."
-    echo "The release workflow may still be running."
+    echo "The release workflow may still be running or may have failed."
     echo ""
-    echo "Check the workflow status:"
+    echo "Check workflow status at:"
     echo "  https://github.com/${GITHUB_REPO}/actions/workflows/release.yml"
-    echo ""
-    echo "Or view the release:"
-    echo "  gh release view ${TAG}"
     echo ""
     echo "Once the release is published, run 'just release' again to bump version."
     exit 0

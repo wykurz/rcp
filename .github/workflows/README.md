@@ -20,8 +20,8 @@ Builds and publishes binary packages when a tag is pushed. Triggered by `v*` tag
 3. Builds packages in parallel:
    - Debian packages (amd64 + arm64)
    - RPM packages (amd64 + arm64)
-4. Uploads all packages to the draft release
-5. Publishes the release (triggers publish.yml)
+4. Each build job uploads its package to the draft release
+5. Publishes the release only if all builds succeed (triggers publish.yml for crates.io)
 
 **Usage:**
 ```bash

@@ -144,8 +144,8 @@
                 pkgs.tokio-console
 
                 # Additional useful tools
-                pkgs.pkg-config
                 pkgs.gh
+                pkgs.pkg-config
               ]
               ++ buildInputs
               ++ pkgs.lib.optionals (muslTools != null) [
