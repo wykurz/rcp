@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "rcp-tools-common"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -1611,7 +1611,7 @@ dependencies = [
 
 [[package]]
 name = "rcp-tools-filegen"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1630,7 +1630,7 @@ dependencies = [
 
 [[package]]
 name = "rcp-tools-rcmp"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1646,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "rcp-tools-rcp"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1679,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "rcp-tools-remote"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -1711,7 +1711,7 @@ dependencies = [
 
 [[package]]
 name = "rcp-tools-rlink"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1727,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "rcp-tools-rrm"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1742,7 +1742,7 @@ dependencies = [
 
 [[package]]
 name = "rcp-tools-throttle"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "tokio",
  "tracing",
