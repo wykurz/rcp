@@ -18,7 +18,7 @@ jobs:
   validate:
     uses: ./.github/workflows/validate.yml
 
-  create-draft-release:
+  create-release:
     runs-on: ubuntu-latest
     needs: validate
     permissions:
@@ -33,7 +33,7 @@ jobs:
 
   build-deb-amd64:
     runs-on: ubuntu-latest
-    needs: create-draft-release
+    needs: create-release
     permissions:
       contents: write
     steps:
@@ -74,7 +74,7 @@ jobs:
 
   build-rpm-amd64:
     runs-on: ubuntu-latest
-    needs: create-draft-release
+    needs: create-release
     permissions:
       contents: write
     steps:
@@ -116,7 +116,7 @@ jobs:
 
   build-deb-arm64:
     runs-on: ubuntu-latest
-    needs: create-draft-release
+    needs: create-release
     permissions:
       contents: write
     steps:
@@ -156,7 +156,7 @@ jobs:
 
   build-rpm-arm64:
     runs-on: ubuntu-latest
-    needs: create-draft-release
+    needs: create-release
     permissions:
       contents: write
     steps:
