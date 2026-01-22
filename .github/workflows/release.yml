@@ -68,6 +68,7 @@ jobs:
       - name: Build Debian packages
         env:
           PKG_CONFIG_ALLOW_CROSS: "1"
+          RUSTFLAGS: "--cfg tokio_unstable -C target-feature=+crt-static"
         run: |
           cargo deb --target=x86_64-unknown-linux-musl -p rcp-tools-rcp
           cargo deb --target=x86_64-unknown-linux-musl -p rcp-tools-rlink
@@ -111,6 +112,7 @@ jobs:
       - name: Build RPM packages
         env:
           PKG_CONFIG_ALLOW_CROSS: "1"
+          RUSTFLAGS: "--cfg tokio_unstable -C target-feature=+crt-static"
         run: |
           cargo build --release --target=x86_64-unknown-linux-musl
           cargo generate-rpm --target=x86_64-unknown-linux-musl -p rcp
@@ -151,6 +153,8 @@ jobs:
         run: cargo install cargo-deb
 
       - name: Build with cross
+        env:
+          RUSTFLAGS: "--cfg tokio_unstable -C target-feature=+crt-static"
         run: cross build --release --target=aarch64-unknown-linux-musl
 
       - name: Build Debian packages
@@ -193,6 +197,8 @@ jobs:
         run: cargo install cargo-generate-rpm
 
       - name: Build with cross
+        env:
+          RUSTFLAGS: "--cfg tokio_unstable -C target-feature=+crt-static"
         run: cross build --release --target=aarch64-unknown-linux-musl
 
       - name: Build RPM packages
