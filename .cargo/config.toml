@@ -11,3 +11,8 @@ rustdocflags = ["--cfg", "tokio_unstable"]
 linker = "x86_64-unknown-linux-musl-gcc"
 rustflags = ["--cfg", "tokio_unstable", "-C", "target-feature=+crt-static"]
 rustdocflags = ["--cfg", "tokio_unstable"]
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-unknown-linux-musl-gcc"
+rustflags = ["--cfg", "tokio_unstable", "-C", "target-feature=+crt-static"]
+rustdocflags = ["--cfg", "tokio_unstable"]
