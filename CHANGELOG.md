@@ -7,12 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.25.0] - 2026-01-22 (not released)
-
-Note: This version was never published due to build failures in the release workflow.
+## [0.26.0] - 2026-01-22
 
 ### Changed
 - Simplify release process configuration
+
+### Fixed
+- Fix Debian and RPM package builds
 
 ## [0.24.0] - 2026-01-21
 
@@ -127,8 +128,8 @@ Note: This version was never published due to build failures in the release work
 
 See git history for changes in previous versions.
 
-[Unreleased]: https://github.com/wykurz/rcp/compare/v0.25.0...HEAD
-[0.25.0]: https://github.com/wykurz/rcp/compare/v0.24.0...v0.25.0
+[Unreleased]: https://github.com/wykurz/rcp/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/wykurz/rcp/compare/v0.24.0...v0.26.0
 [0.24.0]: https://github.com/wykurz/rcp/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/wykurz/rcp/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/wykurz/rcp/compare/v0.21.1...v0.22.0
