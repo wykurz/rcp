@@ -145,6 +145,7 @@
 
                 # Additional useful tools
                 pkgs.pkg-config
+                pkgs.gh
               ]
               ++ buildInputs
               ++ pkgs.lib.optionals (muslTools != null) [

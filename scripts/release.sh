@@ -16,6 +16,39 @@ BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
+# Get GitHub repo (owner/name) from origin remote or GITHUB_REPO env var
+get_github_repo() {
+    if [[ -n "${GITHUB_REPO:-}" ]]; then
+        echo "$GITHUB_REPO"
+        return
+    fi
+    local url
+    url=$(git remote get-url origin 2>/dev/null) || return 1
+    # only process github.com URLs
+    if [[ "$url" != *"github.com"* ]]; then
+        return 1
+    fi
+    # handle SSH format: git@github.com:owner/repo.git
+    # handle HTTPS format: https://github.com/owner/repo.git
+    echo "$url" | sed -E 's#(git@github\.com:|https://github\.com/)##; s#\.git$##'
+}
+
+GITHUB_REPO=$(get_github_repo)
+if [[ -z "$GITHUB_REPO" ]]; then
+    echo -e "${RED}Error: could not determine GitHub repository${NC}"
+    echo "Origin remote must be a github.com URL, or set GITHUB_REPO=owner/repo"
+    exit 1
+fi
+
+# Check for required tools
+if ! command -v gh &> /dev/null; then
+    echo -e "${RED}Error: 'gh' command not found${NC}"
+    echo ""
+    echo "Install GitHub CLI: https://cli.github.com/"
+    echo "Or use nix develop to get all required tools"
+    exit 1
+fi
+
 # Get current version from Cargo.toml [workspace.package] section
 get_current_version() {
     awk '/^\[workspace\.package\]/{found=1} found && /^version = /{gsub(/.*= "|"/, ""); print; exit}' Cargo.toml
@@ -27,10 +60,18 @@ changelog_has_version() {
     grep -q "^## \[${version}\]" CHANGELOG.md
 }
 
-# Check if git tag exists
-tag_exists() {
+# Check if git tag exists on remote
+remote_tag_exists() {
     local tag="$1"
-    git tag -l "$tag" | grep -q "^${tag}$"
+    git ls-remote --tags origin "$tag" 2>/dev/null | grep -q "refs/tags/${tag}$"
+}
+
+# Check if GitHub release is published (not draft)
+release_is_published() {
+    local tag="$1"
+    local draft
+    draft=$(gh release view "$tag" --repo "$GITHUB_REPO" --json isDraft --jq '.isDraft' 2>/dev/null) || return 1
+    [[ "$draft" == "false" ]]
 }
 
 # Get the last release tag
@@ -61,6 +102,16 @@ echo "════════════════════════�
 echo "  RCP Release Helper"
 echo "═══════════════════════════════════════"
 echo -e "${NC}"
+
+# Verify we're on main branch
+CURRENT_BRANCH=$(git branch --show-current)
+if [[ "$CURRENT_BRANCH" != "main" ]]; then
+    echo -e "${RED}Error: must be on 'main' branch to release${NC}"
+    echo "Current branch: $CURRENT_BRANCH"
+    echo ""
+    echo "Switch to main: git checkout main"
+    exit 1
+fi
 
 # Fetch tags to ensure we have the latest release info
 # use --force to update local tags that may differ from remote
@@ -157,30 +208,47 @@ if ! changelog_has_version "$CURRENT_VERSION"; then
     echo -e "${BOLD}Next steps:${NC}"
     echo "  1. Review the commit: git show"
     echo "  2. Push to main: git push"
-    echo "  3. Create GitHub release for ${TAG}"
+    echo "  3. Push tag to trigger release: git tag ${TAG} && git push origin ${TAG}"
     echo "  4. Run 'just release' again to bump version"
 
-elif ! tag_exists "$TAG"; then
+elif ! remote_tag_exists "$TAG"; then
     # ═══════════════════════════════════════════════════════════════════
-    # State 2: CHANGELOG updated, waiting for GitHub release
+    # State 2: CHANGELOG updated, waiting for tag push
     # ═══════════════════════════════════════════════════════════════════
-    echo -e "${YELLOW}${BOLD}State: Awaiting GitHub release${NC}"
+    echo -e "${YELLOW}${BOLD}State: Ready to release${NC}"
     echo ""
     echo "CHANGELOG has been updated for [${CURRENT_VERSION}],"
-    echo "but git tag ${TAG} doesn't exist yet."
+    echo "but git tag ${TAG} hasn't been pushed to origin yet."
     echo ""
-    echo -e "${RED}${BOLD}Action required:${NC} Create a GitHub release"
+    echo -e "${BOLD}Action required:${NC} Push the release tag"
     echo ""
-    echo "  1. Go to: https://github.com/wykurz/rcp/releases/new"
-    echo "  2. Tag: ${TAG}"
-    echo "  3. Title: ${TAG}"
-    echo "  4. Copy release notes from CHANGELOG.md"
+    echo "  git tag ${TAG} && git push origin ${TAG}"
     echo ""
-    echo "This will trigger:"
-    echo "  - Build and attach deb/rpm packages"
-    echo "  - Publish to crates.io"
+    echo "This will trigger the release workflow which:"
+    echo "  - Creates a draft GitHub release"
+    echo "  - Builds and attaches deb/rpm packages (amd64 + arm64)"
+    echo "  - Publishes the release"
+    echo "  - Triggers crates.io publication"
     echo ""
-    echo "After the release is created, run 'just release' again to bump version."
+    echo "After the release completes, run 'just release' again to bump version."
+    exit 0
+
+elif ! release_is_published "$TAG"; then
+    # ═══════════════════════════════════════════════════════════════════
+    # State 2.5: Tag pushed, waiting for release workflow to complete
+    # ═══════════════════════════════════════════════════════════════════
+    echo -e "${YELLOW}${BOLD}State: Release in progress${NC}"
+    echo ""
+    echo "Tag ${TAG} has been pushed, but the release is not yet published."
+    echo "The release workflow may still be running."
+    echo ""
+    echo "Check the workflow status:"
+    echo "  https://github.com/${GITHUB_REPO}/actions/workflows/release.yml"
+    echo ""
+    echo "Or view the release:"
+    echo "  gh release view ${TAG}"
+    echo ""
+    echo "Once the release is published, run 'just release' again to bump version."
     exit 0
 
 else
@@ -189,8 +257,25 @@ else
     # ═══════════════════════════════════════════════════════════════════
     echo -e "${GREEN}${BOLD}State: Release ${TAG} complete!${NC}"
     echo ""
-    echo "The git tag ${TAG} exists. Time to bump version for next development cycle."
+    echo "The release ${TAG} is published. Time to bump version for next development cycle."
     echo ""
+
+    # Push to Radicle if rad is available
+    if command -v rad &> /dev/null; then
+        echo -e "${BOLD}Pushing to Radicle...${NC}"
+        # ensure rad node is running
+        if ! rad node status &> /dev/null; then
+            echo "Starting rad node..."
+            rad node start
+            sleep 2
+        fi
+        if git push rad; then
+            echo -e "${GREEN}Pushed to Radicle.${NC}"
+        else
+            echo -e "${YELLOW}Warning: failed to push to Radicle (continuing anyway)${NC}"
+        fi
+        echo ""
+    fi
 
     # validate version format before parsing
     if ! [[ "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
