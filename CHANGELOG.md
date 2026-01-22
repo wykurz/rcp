@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-01-21
+
+### Changed
+- Improve release process with automated package builds via GitHub Actions on tag push
+
 ## [0.23.0] - 2026-01-21
 
 ### Added
@@ -115,7 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See git history for changes in previous versions.
 
-[Unreleased]: https://github.com/wykurz/rcp/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/wykurz/rcp/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/wykurz/rcp/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/wykurz/rcp/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/wykurz/rcp/compare/v0.21.1...v0.22.0
 [0.21.0]: https://github.com/wykurz/rcp/compare/v0.20.0...v0.21.0
