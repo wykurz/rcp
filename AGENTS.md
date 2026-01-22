@@ -22,7 +22,7 @@ cargo install cargo-nextest  # Optional but recommended for testing
 ### Common Commands
 
 - **List all commands**: `just --list` or just `just`
-- **Run lints**: `just lint` (fmt, clippy, error logging)
+- **Run lints**: `just lint` (fmt, clippy, error logging, package metadata)
 - **Format code**: `just fmt`
 - **Run tests (debug)**: `just test` (uses nextest)
 - **Run tests (release)**: `just test-release` (uses nextest --release)
@@ -39,6 +39,7 @@ cargo install cargo-nextest  # Optional but recommended for testing
 - ✅ Code formatting is correct (`cargo fmt --check`)
 - ✅ Clippy lints pass (`cargo clippy`)
 - ✅ Error logging format is correct (custom script checks)
+- ✅ Package metadata is consistent across workspace (docs.rs settings, lints)
 - ✅ Documentation builds without warnings (`cargo doc --no-deps`)
 - ✅ All tests pass in both debug and release modes (`cargo nextest run`)
 - ✅ All doctests compile and run (`cargo test --doc`)
@@ -150,6 +151,24 @@ tracing::error!("operation failed: {}", &error);   // Only shows outer message!
 - `common/src/copy.rs::copy_tests::error_message_tests::test_destination_permission_error_includes_root_cause`
 - `common/src/link.rs::link_tests::test_link_destination_permission_error_includes_root_cause`
 - `common/src/filegen.rs::tests::test_permission_error_includes_root_cause`
+
+### Package Metadata Consistency
+
+All packages in the workspace must have consistent metadata in their `Cargo.toml`:
+
+1. **Workspace inheritance**: `version.workspace = true`, `edition.workspace = true`, `license.workspace = true`, `repository.workspace = true`
+2. **Lints**: `[lints] workspace = true`
+3. **docs.rs settings**: All packages must have identical `[package.metadata.docs.rs]` configuration:
+
+```toml
+[package.metadata.docs.rs]
+cargo-args = ["--config", "build.rustflags=[\"--cfg\", \"tokio_unstable\"]"]
+rustdoc-args = ["--cfg", "tokio_unstable"]
+```
+
+This ensures docs.rs can build documentation for all crates (since it doesn't use the local `.cargo/config.toml`).
+
+**CI Enforcement**: The `scripts/check-package-metadata.sh` script automatically checks for these patterns.
 
 ### Comment and Doc Style
 

@@ -13,6 +13,10 @@ categories = ["command-line-utilities", "filesystem"]
 [lints]
 workspace = true
 
+[package.metadata.docs.rs]
+cargo-args = ["--config", "build.rustflags=[\"--cfg\", \"tokio_unstable\"]"]
+rustdoc-args = ["--cfg", "tokio_unstable"]
+
 [[bin]]
 name = "rrm"
 path = "src/main.rs"

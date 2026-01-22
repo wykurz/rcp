@@ -56,6 +56,10 @@ tokio-rustls = "0.26"
 tokio-util = "0.7"
 tracing = "0.1"
 
+[package.metadata.docs.rs]
+cargo-args = ["--config", "build.rustflags=[\"--cfg\", \"tokio_unstable\"]"]
+rustdoc-args = ["--cfg", "tokio_unstable"]
+
 [package.metadata.deb]
 maintainer = "Mateusz Wykurz <wykurz@gmail.com>"
 copyright = "2023, Mateusz Wykurz <wykurz@gmail.com>"
