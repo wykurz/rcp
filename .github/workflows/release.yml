@@ -69,12 +69,12 @@ jobs:
         env:
           PKG_CONFIG_ALLOW_CROSS: "1"
         run: |
-          cargo deb -p rcp-tools-rcp
-          cargo deb -p rcp-tools-rlink
-          cargo deb -p rcp-tools-rrm
-          cargo deb -p rcp-tools-rcmp
-          cargo deb -p rcp-tools-filegen
-          zip rcp-deb-amd64-${{ env.RELEASE_TAG }}.zip target/debian/*.deb
+          cargo deb --target=x86_64-unknown-linux-musl -p rcp-tools-rcp
+          cargo deb --target=x86_64-unknown-linux-musl -p rcp-tools-rlink
+          cargo deb --target=x86_64-unknown-linux-musl -p rcp-tools-rrm
+          cargo deb --target=x86_64-unknown-linux-musl -p rcp-tools-rcmp
+          cargo deb --target=x86_64-unknown-linux-musl -p rcp-tools-filegen
+          zip rcp-deb-amd64-${{ env.RELEASE_TAG }}.zip target/x86_64-unknown-linux-musl/debian/*.deb
           ls -la rcp-deb-amd64-${{ env.RELEASE_TAG }}.zip
 
       - name: Upload to GitHub Release
