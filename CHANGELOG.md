@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.25.0] - 2026-01-22
+## [0.25.0] - 2026-01-22 (not released)
+
+Note: This version was never published due to build failures in the release workflow.
 
 ### Changed
 - Simplify release process configuration
