@@ -11,8 +11,28 @@ Runs on every push and pull request to `main`:
 - **documentation**: Builds documentation with strict warnings
 - **test**: Runs the full test suite using cargo-nextest
 
+### release.yml
+Builds and publishes binary packages when a tag is pushed. Triggered by `v*` tag pushes.
+
+**Flow:**
+1. Runs validation (format, lint, tests)
+2. Creates a draft GitHub release
+3. Builds packages in parallel:
+   - Debian packages (amd64 + arm64)
+   - RPM packages (amd64 + arm64)
+4. Uploads all packages to the draft release
+5. Publishes the release (triggers publish.yml)
+
+**Usage:**
+```bash
+git tag v0.24.0
+git push origin v0.24.0
+```
+
+Or use `just release` which guides you through the process.
+
 ### publish.yml
-Publishes all crates to crates.io when a new release is created.
+Publishes all crates to crates.io when a release is published.
 
 #### Setup Instructions
 
@@ -34,9 +54,9 @@ Publishes all crates to crates.io when a new release is created.
 3. **Usage**:
 
    **Automatic publishing on release**:
-   - Create a new release on GitHub (via UI or `gh release create`)
-   - Tag format: `vX.Y.Z` (e.g., `v0.20.0`)
-   - The workflow will automatically:
+   - Push a version tag: `git tag v0.24.0 && git push origin v0.24.0`
+   - The release.yml workflow creates the GitHub release
+   - When the release is published, this workflow will automatically:
      - Verify the tag matches the version in Cargo.toml
      - Check formatting, run clippy, and build documentation
      - Run the full test suite
@@ -85,5 +105,6 @@ This approach is much simpler than manually listing crates and eliminates the ne
 - cargo-workspaces automatically waits for crates.io to update between dependent crates
 - If issues persist, wait a few minutes and re-run the workflow
 
-### release-amd64.yml / release-arm64.yml
-Build binary releases for different architectures.
+### validate.yml
+Reusable workflow that runs all validation checks (format, lint, tests, documentation).
+Called by other workflows to ensure quality gates pass before proceeding.
