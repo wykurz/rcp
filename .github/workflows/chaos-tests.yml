@@ -39,7 +39,7 @@ jobs:
     - name: Install cargo-nextest
       uses: taiki-e/install-action@542cebaaed782771e619bd5609d97659d109c492 # v2
       with:
-        tool: cargo-nextest
+        tool: cargo-nextest@0.9.85
 
     - name: Build binaries for Docker
       # debug build is sufficient for chaos tests since we're testing network behavior,

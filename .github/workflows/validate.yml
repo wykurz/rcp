@@ -78,7 +78,7 @@ jobs:
         ssh-keyscan -H localhost >> ~/.ssh/known_hosts
 
     - name: Install cargo-nextest
-      run: cargo install cargo-nextest
+      run: cargo install cargo-nextest --version 0.9.85 --locked
 
     - name: Test (musl debug)
       env:
@@ -134,7 +134,7 @@ jobs:
         ssh-keyscan -H localhost >> ~/.ssh/known_hosts
 
     - name: Install cargo-nextest
-      run: cargo install cargo-nextest
+      run: cargo install cargo-nextest --version 0.9.85 --locked
 
     - name: Test (musl release)
       env:
@@ -188,7 +188,7 @@ jobs:
     - name: Install cargo-nextest
       uses: taiki-e/install-action@542cebaaed782771e619bd5609d97659d109c492 # v2
       with:
-        tool: cargo-nextest
+        tool: cargo-nextest@0.9.85
 
     - name: Build binaries for Docker
       env:
