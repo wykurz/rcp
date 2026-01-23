@@ -113,10 +113,10 @@ if [[ "$CURRENT_BRANCH" != "main" ]]; then
     exit 1
 fi
 
-# Fetch tags to ensure we have the latest release info
+# Fetch tags and main branch to ensure we have the latest release info
 # use --force to update local tags that may differ from remote
-echo -e "Fetching tags from origin..."
-git fetch --tags --force --quiet
+echo -e "Fetching from origin..."
+git fetch --tags --force --quiet origin main
 echo ""
 
 CURRENT_VERSION=$(get_current_version)
@@ -213,21 +213,84 @@ if ! changelog_has_version "$CURRENT_VERSION"; then
 
 elif ! remote_tag_exists "$TAG"; then
     # ═══════════════════════════════════════════════════════════════════
-    # State 2: CHANGELOG updated, waiting for tag push
+    # State 2: CHANGELOG updated, ready to tag and release
     # ═══════════════════════════════════════════════════════════════════
     echo -e "${YELLOW}${BOLD}State: Ready to release${NC}"
     echo ""
+
+    # verify working directory is clean
+    if [[ -n "$(git status --porcelain)" ]]; then
+        echo -e "${RED}Error: working directory has uncommitted changes${NC}"
+        echo ""
+        git status --short
+        echo ""
+        echo "Commit or stash your changes before releasing."
+        exit 1
+    fi
+
+    # verify current commit is on origin/main before tagging
+    LOCAL_HEAD=$(git rev-parse HEAD)
+    REMOTE_HEAD=$(git rev-parse origin/main 2>/dev/null || echo "")
+    if [[ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]]; then
+        echo -e "${RED}Error: local HEAD is not pushed to origin/main${NC}"
+        echo ""
+        echo "Local HEAD:  $LOCAL_HEAD"
+        echo "origin/main: ${REMOTE_HEAD:-<not fetched>}"
+        echo ""
+        echo "Push your changes first: git push"
+        exit 1
+    fi
+
+    # check if local tag already exists (from a previous failed push attempt)
+    if git rev-parse "$TAG" >/dev/null 2>&1; then
+        echo -e "${YELLOW}Warning: local tag ${TAG} already exists${NC}"
+        echo ""
+        echo "This may be from a previous failed push attempt."
+        read -p "Delete local tag and recreate? [Y/n] " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Nn]$ ]]; then
+            echo "Aborted. You can manually delete the tag with: git tag -d ${TAG}"
+            exit 0
+        fi
+        git tag -d "$TAG"
+        echo ""
+    fi
+
     echo "CHANGELOG has been updated for [${CURRENT_VERSION}],"
     echo "but git tag ${TAG} hasn't been pushed to origin yet."
     echo ""
-    echo -e "${BOLD}Action required:${NC} Push the release tag"
-    echo ""
-    echo "  git tag ${TAG} && git push origin ${TAG}"
+    echo -e "${BOLD}Proposed action:${NC}"
+    echo "  1. Create git tag ${TAG}"
+    echo "  2. Push tag to origin (triggers release workflow)"
     echo ""
     echo "This will trigger the release workflow which:"
-    echo "  - Creates a draft GitHub release"
+    echo "  - Creates a draft GitHub release with notes from CHANGELOG"
     echo "  - Builds and attaches deb/rpm packages (amd64 + arm64)"
     echo "  - Publishes the release (triggers crates.io publication)"
+    echo ""
+    read -p "Create and push tag ${TAG}? [Y/n] " -n 1 -r
+    echo
+
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+
+    echo ""
+    echo -e "${GREEN}Creating tag ${TAG}...${NC}"
+    git tag "$TAG"
+
+    echo -e "${GREEN}Pushing tag to origin...${NC}"
+    if ! git push origin "$TAG"; then
+        echo ""
+        echo -e "${RED}Error: failed to push tag to origin${NC}"
+        echo "Deleting local tag to allow retry..."
+        git tag -d "$TAG"
+        exit 1
+    fi
+
+    echo ""
+    echo -e "${GREEN}${BOLD}Tag ${TAG} pushed!${NC}"
     echo ""
     echo "Check workflow status at:"
     echo "  https://github.com/${GITHUB_REPO}/actions/workflows/release.yml"
