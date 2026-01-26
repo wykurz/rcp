@@ -167,6 +167,8 @@ async fn process_single_file(
                     &file_header.dst,
                     &common::rm::Settings {
                         fail_early: settings.fail_early,
+                        filter: None,
+                        dry_run: None,
                     },
                 )
                 .await
@@ -379,10 +381,15 @@ async fn process_incoming_file_streams_tcp(
     // each handling one file at a time. this is intentional: the semaphore limits concurrent
     // *connections* (and thus concurrent file transfers), not workers. each worker loops:
     // acquire permit -> connect -> receive files until EOF -> release permit.
+    let fail_early = settings.fail_early;
+    let settings = std::sync::Arc::new(settings);
+    let preserve = std::sync::Arc::new(preserve);
     for _ in 0..data_pool.semaphore.available_permits() {
         let pool = data_pool.clone();
         let tracker = directory_tracker.clone();
         let error_flag = error_occurred.clone();
+        let settings = settings.clone();
+        let preserve = preserve.clone();
         join_set.spawn(async move {
             loop {
                 // try to connect to source's data port
@@ -396,8 +403,8 @@ async fn process_incoming_file_streams_tcp(
                 };
                 // handle one file on this connection
                 if let Err(e) = handle_file_stream(
-                    settings,
-                    preserve,
+                    (*settings).clone(),
+                    *preserve,
                     recv_stream,
                     tracker.clone(),
                     error_flag.clone(),
@@ -419,14 +426,14 @@ async fn process_incoming_file_streams_tcp(
             Ok(Err(e)) => {
                 tracing::error!("File stream handling task failed: {e}");
                 error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
-                if settings.fail_early {
+                if fail_early {
                     return Err(e);
                 }
             }
             Err(e) => {
                 tracing::error!("File stream handling task panicked: {e}");
                 error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
-                if settings.fail_early {
+                if fail_early {
                     return Err(e.into());
                 }
             }
@@ -465,6 +472,8 @@ async fn create_directory(
                     dst,
                     &common::rm::Settings {
                         fail_early: settings.fail_early,
+                        filter: None,
+                        dry_run: None,
                     },
                 )
                 .await?;
@@ -548,6 +557,8 @@ async fn create_symlink(
                     dst,
                     &common::rm::Settings {
                         fail_early: settings.fail_early,
+                        filter: None,
+                        dry_run: None,
                     },
                 )
                 .await
@@ -659,9 +670,15 @@ async fn process_control_stream(
                     directory_tracker.lock().await.set_root_complete();
                 }
             }
-            remote::protocol::SourceMessage::DirStructureComplete => {
-                tracing::info!("Received DirStructureComplete");
-                directory_tracker.lock().await.set_structure_complete();
+            remote::protocol::SourceMessage::DirStructureComplete { has_root_item } => {
+                tracing::info!(
+                    "Received DirStructureComplete (has_root_item={})",
+                    has_root_item
+                );
+                directory_tracker
+                    .lock()
+                    .await
+                    .set_structure_complete(has_root_item);
             }
             remote::protocol::SourceMessage::FileSkipped {
                 ref src,
@@ -799,7 +816,7 @@ pub async fn run_destination(
         tls_connector,
     ));
     let file_handler_future = process_incoming_file_streams_tcp(
-        *settings,
+        settings.clone(),
         *preserve,
         data_pool.clone(),
         directory_tracker.clone(),
@@ -852,10 +869,18 @@ pub async fn run_destination(
         files_unchanged: prog.files_unchanged.get() as usize,
         symlinks_unchanged: prog.symlinks_unchanged.get() as usize,
         directories_unchanged: prog.directories_unchanged.get() as usize,
+        // filtering is applied on the source side, so destination skipped counts are always 0
+        files_skipped: 0,
+        symlinks_skipped: 0,
+        directories_skipped: 0,
         rm_summary: common::rm::Summary {
             files_removed: prog.files_removed.get() as usize,
             symlinks_removed: prog.symlinks_removed.get() as usize,
             directories_removed: prog.directories_removed.get() as usize,
+            // filtering is applied on the source side, so destination skipped counts are always 0
+            files_skipped: 0,
+            symlinks_skipped: 0,
+            directories_skipped: 0,
         },
     };
     if error_occurred.load(std::sync::atomic::Ordering::Relaxed) {

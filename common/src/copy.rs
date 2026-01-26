@@ -5,7 +5,9 @@ use async_recursion::async_recursion;
 use throttle::get_file_iops_tokens;
 use tracing::instrument;
 
+use crate::config::DryRunMode;
 use crate::filecmp;
+use crate::filter::{FilterResult, FilterSettings};
 use crate::preserve;
 use crate::progress;
 use crate::rm;
@@ -36,7 +38,7 @@ impl Error {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct Settings {
     pub dereference: bool,
     pub fail_early: bool,
@@ -49,6 +51,59 @@ pub struct Settings {
     /// when copying data between files and network streams. The actual buffer is
     /// capped to the file size to avoid over-allocation for small files.
     pub remote_copy_buffer_size: usize,
+    /// filter settings for include/exclude patterns
+    pub filter: Option<crate::filter::FilterSettings>,
+    /// dry-run mode for previewing operations
+    pub dry_run: Option<crate::config::DryRunMode>,
+}
+
+/// Reports a dry-run action for copy operations
+fn report_dry_run_copy(src: &std::path::Path, dst: &std::path::Path, entry_type: &str) {
+    println!("would copy {} {:?} -> {:?}", entry_type, src, dst);
+}
+
+/// Reports a skipped entry during dry-run
+fn report_dry_run_skip(
+    path: &std::path::Path,
+    result: &FilterResult,
+    mode: DryRunMode,
+    entry_type: &str,
+) {
+    match mode {
+        DryRunMode::Brief => { /* brief mode doesn't show skipped files */ }
+        DryRunMode::All => {
+            println!("skip {} {:?}", entry_type, path);
+        }
+        DryRunMode::Explain => match result {
+            FilterResult::ExcludedByDefault => {
+                println!(
+                    "skip {} {:?} (no include pattern matched)",
+                    entry_type, path
+                );
+            }
+            FilterResult::ExcludedByPattern(pattern) => {
+                println!("skip {} {:?} (excluded by '{}')", entry_type, path, pattern);
+            }
+            FilterResult::Included => { /* shouldn't happen */ }
+        },
+    }
+}
+
+/// Check if a path should be filtered out
+fn should_skip_entry(
+    filter: &Option<FilterSettings>,
+    relative_path: &std::path::Path,
+    is_dir: bool,
+) -> Option<FilterResult> {
+    if let Some(ref f) = filter {
+        let result = f.should_include(relative_path, is_dir);
+        match result {
+            FilterResult::Included => None,
+            _ => Some(result),
+        }
+    } else {
+        None
+    }
 }
 
 #[instrument]
@@ -69,6 +124,19 @@ pub async fn copy_file(
     preserve: &preserve::Settings,
     is_fresh: bool,
 ) -> Result<Summary, Error> {
+    // handle dry-run mode for files - still read metadata to report accurate size
+    if settings.dry_run.is_some() {
+        let src_metadata = tokio::fs::symlink_metadata(src)
+            .await
+            .with_context(|| format!("failed reading metadata from {:?}", &src))
+            .map_err(|err| Error::new(err, Default::default()))?;
+        report_dry_run_copy(src, dst, "file");
+        return Ok(Summary {
+            files_copied: 1,
+            bytes_copied: src_metadata.len(),
+            ..Default::default()
+        });
+    }
     let _open_file_guard = throttle::open_file_permit().await;
     tracing::debug!("opening 'src' for reading and 'dst' for writing");
     let src_metadata = tokio::fs::symlink_metadata(src)
@@ -105,6 +173,8 @@ pub async fn copy_file(
                 dst,
                 &RmSettings {
                     fail_early: settings.fail_early,
+                    filter: None,
+                    dry_run: None,
                 },
             )
             .await
@@ -156,6 +226,9 @@ pub struct Summary {
     pub files_unchanged: usize,
     pub symlinks_unchanged: usize,
     pub directories_unchanged: usize,
+    pub files_skipped: usize,
+    pub symlinks_skipped: usize,
+    pub directories_skipped: usize,
     pub rm_summary: RmSummary,
 }
 
@@ -170,6 +243,9 @@ impl std::ops::Add for Summary {
             files_unchanged: self.files_unchanged + other.files_unchanged,
             symlinks_unchanged: self.symlinks_unchanged + other.symlinks_unchanged,
             directories_unchanged: self.directories_unchanged + other.directories_unchanged,
+            files_skipped: self.files_skipped + other.files_skipped,
+            symlinks_skipped: self.symlinks_skipped + other.symlinks_skipped,
+            directories_skipped: self.directories_skipped + other.directories_skipped,
             rm_summary: self.rm_summary + other.rm_summary,
         }
     }
@@ -186,6 +262,9 @@ impl std::fmt::Display for Summary {
             files unchanged: {}\n\
             symlinks unchanged: {}\n\
             directories unchanged: {}\n\
+            files skipped: {}\n\
+            symlinks skipped: {}\n\
+            directories skipped: {}\n\
             {}",
             bytesize::ByteSize(self.bytes_copied),
             self.files_copied,
@@ -194,17 +273,79 @@ impl std::fmt::Display for Summary {
             self.files_unchanged,
             self.symlinks_unchanged,
             self.directories_unchanged,
+            self.files_skipped,
+            self.symlinks_skipped,
+            self.directories_skipped,
             &self.rm_summary,
         )
     }
 }
 
+/// Public entry point for copy operations.
+/// Internally delegates to copy_internal with source_root tracking for proper filter matching.
 #[instrument(skip(prog_track))]
-#[async_recursion]
 pub async fn copy(
     prog_track: &'static progress::Progress,
     src: &std::path::Path,
     dst: &std::path::Path,
+    settings: &Settings,
+    preserve: &preserve::Settings,
+    is_fresh: bool,
+) -> Result<Summary, Error> {
+    // check filter for top-level source (files, directories, and symlinks)
+    if let Some(ref filter) = settings.filter {
+        let src_name = src.file_name().map(std::path::Path::new);
+        if let Some(name) = src_name {
+            let src_metadata = tokio::fs::symlink_metadata(src)
+                .await
+                .with_context(|| format!("failed reading metadata from src: {:?}", &src))
+                .map_err(|err| Error::new(err, Default::default()))?;
+            let is_dir = src_metadata.is_dir();
+            let result = filter.should_include_root_item(name, is_dir);
+            match result {
+                crate::filter::FilterResult::Included => {}
+                result => {
+                    if let Some(mode) = settings.dry_run {
+                        let entry_type = if src_metadata.is_dir() {
+                            "directory"
+                        } else if src_metadata.is_symlink() {
+                            "symlink"
+                        } else {
+                            "file"
+                        };
+                        report_dry_run_skip(src, &result, mode, entry_type);
+                    }
+                    // return summary with skipped count
+                    let skipped_summary = if src_metadata.is_dir() {
+                        Summary {
+                            directories_skipped: 1,
+                            ..Default::default()
+                        }
+                    } else if src_metadata.is_symlink() {
+                        Summary {
+                            symlinks_skipped: 1,
+                            ..Default::default()
+                        }
+                    } else {
+                        Summary {
+                            files_skipped: 1,
+                            ..Default::default()
+                        }
+                    };
+                    return Ok(skipped_summary);
+                }
+            }
+        }
+    }
+    copy_internal(prog_track, src, dst, src, settings, preserve, is_fresh).await
+}
+#[instrument(skip(prog_track))]
+#[async_recursion]
+async fn copy_internal(
+    prog_track: &'static progress::Progress,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    source_root: &std::path::Path,
     settings: &Settings,
     preserve: &preserve::Settings,
     mut is_fresh: bool,
@@ -226,6 +367,14 @@ pub async fn copy(
         return copy_file(prog_track, src, dst, settings, preserve, is_fresh).await;
     }
     if src_metadata.is_symlink() {
+        // handle dry-run mode for symlinks
+        if settings.dry_run.is_some() {
+            report_dry_run_copy(src, dst, "symlink");
+            return Ok(Summary {
+                symlinks_created: 1,
+                ..Default::default()
+            });
+        }
         let mut rm_summary = RmSummary::default();
         let link = tokio::fs::read_link(src)
             .await
@@ -292,6 +441,8 @@ pub async fn copy(
                     dst,
                     &RmSettings {
                         fail_early: settings.fail_early,
+                        filter: None,
+                        dry_run: None,
                     },
                 )
                 .await
@@ -347,85 +498,96 @@ pub async fn copy(
             Default::default(),
         ));
     }
+    // handle dry-run mode for directories at the top level
+    if settings.dry_run.is_some() {
+        report_dry_run_copy(src, dst, "dir");
+        // still need to recurse to show contents
+    }
     tracing::debug!("process contents of 'src' directory");
     let mut entries = tokio::fs::read_dir(src)
         .await
         .with_context(|| format!("cannot open directory {src:?} for reading"))
         .map_err(|err| Error::new(err, Default::default()))?;
-    let mut copy_summary = {
-        if let Err(error) = tokio::fs::create_dir(dst).await {
-            assert!(
-                !is_fresh,
-                "unexpected error creating directory: {dst:?}: {error}"
-            );
-            if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
-                // check if the destination is a directory - if so, leave it
-                //
-                // N.B. the permissions may prevent us from writing to it but the alternative is to open up the directory
-                // while we're writing to it which isn't safe
-                let dst_metadata = tokio::fs::metadata(dst)
-                    .await
-                    .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))
-                    .map_err(|err| Error::new(err, Default::default()))?;
-                if dst_metadata.is_dir() {
-                    tracing::debug!("'dst' is a directory, leaving it as is");
-                    prog_track.directories_unchanged.inc();
-                    Summary {
-                        directories_unchanged: 1,
+    // in dry-run mode, skip directory creation but still traverse contents
+    let mut copy_summary = if settings.dry_run.is_some() {
+        Summary {
+            directories_created: 1, // report as would be created
+            ..Default::default()
+        }
+    } else if let Err(error) = tokio::fs::create_dir(dst).await {
+        assert!(
+            !is_fresh,
+            "unexpected error creating directory: {dst:?}: {error}"
+        );
+        if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
+            // check if the destination is a directory - if so, leave it
+            //
+            // N.B. the permissions may prevent us from writing to it but the alternative is to open up the directory
+            // while we're writing to it which isn't safe
+            let dst_metadata = tokio::fs::metadata(dst)
+                .await
+                .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))
+                .map_err(|err| Error::new(err, Default::default()))?;
+            if dst_metadata.is_dir() {
+                tracing::debug!("'dst' is a directory, leaving it as is");
+                prog_track.directories_unchanged.inc();
+                Summary {
+                    directories_unchanged: 1,
+                    ..Default::default()
+                }
+            } else {
+                tracing::info!("'dst' is not a directory, removing and creating a new one");
+                let rm_summary = rm::rm(
+                    prog_track,
+                    dst,
+                    &RmSettings {
+                        fail_early: settings.fail_early,
+                        filter: None,
+                        dry_run: None,
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    let rm_summary = err.summary;
+                    let copy_summary = Summary {
+                        rm_summary,
                         ..Default::default()
-                    }
-                } else {
-                    tracing::info!("'dst' is not a directory, removing and creating a new one");
-                    let rm_summary = rm::rm(
-                        prog_track,
-                        dst,
-                        &RmSettings {
-                            fail_early: settings.fail_early,
-                        },
-                    )
+                    };
+                    Error::new(err.source, copy_summary)
+                })?;
+                tokio::fs::create_dir(dst)
                     .await
+                    .with_context(|| format!("cannot create directory {dst:?}"))
                     .map_err(|err| {
-                        let rm_summary = err.summary;
                         let copy_summary = Summary {
                             rm_summary,
                             ..Default::default()
                         };
-                        Error::new(err.source, copy_summary)
+                        Error::new(err, copy_summary)
                     })?;
-                    tokio::fs::create_dir(dst)
-                        .await
-                        .with_context(|| format!("cannot create directory {dst:?}"))
-                        .map_err(|err| {
-                            let copy_summary = Summary {
-                                rm_summary,
-                                ..Default::default()
-                            };
-                            Error::new(err, copy_summary)
-                        })?;
-                    // anything copied into dst may assume they don't need to check for conflicts
-                    is_fresh = true;
-                    prog_track.directories_created.inc();
-                    Summary {
-                        rm_summary,
-                        directories_created: 1,
-                        ..Default::default()
-                    }
+                // anything copied into dst may assume they don't need to check for conflicts
+                is_fresh = true;
+                prog_track.directories_created.inc();
+                Summary {
+                    rm_summary,
+                    directories_created: 1,
+                    ..Default::default()
                 }
-            } else {
-                let error = Err::<(), std::io::Error>(error)
-                    .with_context(|| format!("cannot create directory {:?}", dst))
-                    .unwrap_err();
-                tracing::error!("{:#}", &error);
-                return Err(Error::new(error, Default::default()));
             }
         } else {
-            // new directory created, anything copied into dst may assume they don't need to check for conflicts
-            is_fresh = true;
-            prog_track.directories_created.inc();
-            Summary {
-                directories_created: 1,
-                ..Default::default()
-            }
+            let error = Err::<(), std::io::Error>(error)
+                .with_context(|| format!("cannot create directory {:?}", dst))
+                .unwrap_err();
+            tracing::error!("{:#}", &error);
+            return Err(Error::new(error, Default::default()));
+        }
+    } else {
+        // new directory created, anything copied into dst may assume they don't need to check for conflicts
+        is_fresh = true;
+        prog_track.directories_created.inc();
+        Summary {
+            directories_created: 1,
+            ..Default::default()
         }
     };
     let mut join_set = tokio::task::JoinSet::new();
@@ -443,13 +605,47 @@ pub async fn copy(
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
-        let settings = *settings;
+        // check entry type for filter matching and skip counting
+        let entry_file_type = entry.file_type().await.ok();
+        let entry_is_dir = entry_file_type.map(|ft| ft.is_dir()).unwrap_or(false);
+        let entry_is_symlink = entry_file_type.map(|ft| ft.is_symlink()).unwrap_or(false);
+        // compute relative path from source_root for filter matching
+        let relative_path = entry_path.strip_prefix(source_root).unwrap_or(&entry_path);
+        // apply filter if configured
+        if let Some(skip_result) = should_skip_entry(&settings.filter, relative_path, entry_is_dir)
+        {
+            if let Some(mode) = settings.dry_run {
+                let entry_type = if entry_is_dir {
+                    "dir"
+                } else if entry_is_symlink {
+                    "symlink"
+                } else {
+                    "file"
+                };
+                report_dry_run_skip(&entry_path, &skip_result, mode, entry_type);
+            }
+            tracing::debug!("skipping {:?} due to filter", &entry_path);
+            // increment skipped counters
+            if entry_is_dir {
+                copy_summary.directories_skipped += 1;
+            } else if entry_is_symlink {
+                copy_summary.symlinks_skipped += 1;
+            } else {
+                copy_summary.files_skipped += 1;
+            }
+            continue;
+        }
+        // spawn recursive call - dry-run reporting is handled by copy_internal
+        // (copy_file, symlink handling, and directory handling all have their own dry-run reporting)
+        let settings = settings.clone();
         let preserve = *preserve;
+        let source_root = source_root.to_owned();
         let do_copy = || async move {
-            copy(
+            copy_internal(
                 prog_track,
                 &entry_path,
                 &dst_path,
+                &source_root,
                 &settings,
                 &preserve,
                 is_fresh,
@@ -484,8 +680,13 @@ pub async fn copy(
     // apply directory metadata regardless of whether all children copied successfully.
     // the directory itself was created earlier in this function (we would have returned
     // early if create_dir failed), so we should preserve the source metadata.
+    // skip metadata setting in dry-run mode since directory wasn't actually created
     tracing::debug!("set 'dst' directory metadata");
-    let metadata_result = preserve::set_dir_metadata(preserve, &src_metadata, dst).await;
+    let metadata_result = if settings.dry_run.is_some() {
+        Ok(()) // skip metadata setting in dry-run mode
+    } else {
+        preserve::set_dir_metadata(preserve, &src_metadata, dst).await
+    };
     if !all_children_succeeded {
         // child failures take precedence - log metadata error if it also failed
         if let Err(metadata_err) = metadata_result {
@@ -541,6 +742,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -586,6 +789,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -658,6 +863,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -722,6 +929,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -766,6 +975,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -858,6 +1069,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             false,
         )
@@ -881,6 +1094,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             true,
         )
@@ -904,6 +1119,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             false,
         )
@@ -927,6 +1144,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             true,
         )
@@ -952,6 +1171,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -982,13 +1203,21 @@ mod copy_tests {
             let summary = rm::rm(
                 &PROGRESS,
                 &output_path.join("bar"),
-                &RmSettings { fail_early: false },
+                &RmSettings {
+                    fail_early: false,
+                    filter: None,
+                    dry_run: None,
+                },
             )
             .await?
                 + rm::rm(
                     &PROGRESS,
                     &output_path.join("baz").join("5.txt"),
-                    &RmSettings { fail_early: false },
+                    &RmSettings {
+                        fail_early: false,
+                        filter: None,
+                        dry_run: None,
+                    },
                 )
                 .await?;
             assert_eq!(summary.files_removed, 3);
@@ -1010,6 +1239,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1046,13 +1277,21 @@ mod copy_tests {
             let summary = rm::rm(
                 &PROGRESS,
                 &output_path.join("bar").join("1.txt"),
-                &RmSettings { fail_early: false },
+                &RmSettings {
+                    fail_early: false,
+                    filter: None,
+                    dry_run: None,
+                },
             )
             .await?
                 + rm::rm(
                     &PROGRESS,
                     &output_path.join("baz"),
-                    &RmSettings { fail_early: false },
+                    &RmSettings {
+                        fail_early: false,
+                        filter: None,
+                        dry_run: None,
+                    },
                 )
                 .await?;
             assert_eq!(summary.files_removed, 2);
@@ -1080,6 +1319,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1115,13 +1356,21 @@ mod copy_tests {
             let summary = rm::rm(
                 &PROGRESS,
                 &output_path.join("baz").join("4.txt"),
-                &RmSettings { fail_early: false },
+                &RmSettings {
+                    fail_early: false,
+                    filter: None,
+                    dry_run: None,
+                },
             )
             .await?
                 + rm::rm(
                     &PROGRESS,
                     &output_path.join("baz").join("5.txt"),
-                    &RmSettings { fail_early: false },
+                    &RmSettings {
+                        fail_early: false,
+                        filter: None,
+                        dry_run: None,
+                    },
                 )
                 .await?;
             assert_eq!(summary.files_removed, 1);
@@ -1149,6 +1398,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1187,13 +1438,21 @@ mod copy_tests {
             let summary = rm::rm(
                 &PROGRESS,
                 &output_path.join("bar"),
-                &RmSettings { fail_early: false },
+                &RmSettings {
+                    fail_early: false,
+                    filter: None,
+                    dry_run: None,
+                },
             )
             .await?
                 + rm::rm(
                     &PROGRESS,
                     &output_path.join("baz").join("5.txt"),
-                    &RmSettings { fail_early: false },
+                    &RmSettings {
+                        fail_early: false,
+                        filter: None,
+                        dry_run: None,
+                    },
                 )
                 .await?;
             assert_eq!(summary.files_removed, 3);
@@ -1221,6 +1480,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1264,6 +1525,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &NO_PRESERVE_SETTINGS, // we want timestamps to differ!
             false,
@@ -1307,6 +1570,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1364,6 +1629,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -1431,6 +1698,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1487,6 +1756,8 @@ mod copy_tests {
                 overwrite_compare: filecmp::MetadataCmpSettings::default(),
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &DO_PRESERVE_SETTINGS, // <- important!
             false,
@@ -1503,6 +1774,8 @@ mod copy_tests {
                 overwrite_compare: filecmp::MetadataCmpSettings::default(),
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1555,6 +1828,8 @@ mod copy_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1607,6 +1882,8 @@ mod copy_tests {
                     overwrite_compare: Default::default(),
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
+                    filter: None,
+                    dry_run: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -1643,6 +1920,8 @@ mod copy_tests {
                     overwrite_compare: Default::default(),
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
+                    filter: None,
+                    dry_run: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -1682,6 +1961,8 @@ mod copy_tests {
                     overwrite_compare: Default::default(),
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
+                    filter: None,
+                    dry_run: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -1727,6 +2008,8 @@ mod copy_tests {
                     overwrite_compare: Default::default(),
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
+                    filter: None,
+                    dry_run: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -1781,6 +2064,8 @@ mod copy_tests {
                 overwrite_compare: Default::default(),
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1805,5 +2090,444 @@ mod copy_tests {
             actual_mode
         );
         Ok(())
+    }
+    mod filter_tests {
+        use super::*;
+        use crate::filter::FilterSettings;
+        /// Test that path-based patterns (with /) work correctly with nested paths.
+        /// This test exposes the bug where only entry_name is passed to the filter
+        /// instead of the relative path.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_path_pattern_matches_nested_files() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::setup_test_dir().await?;
+            let test_path = tmp_dir.as_path();
+            // test directory structure from setup_test_dir:
+            // foo/
+            //   0.txt
+            //   bar/
+            //     1.txt
+            //     2.txt
+            //   baz/
+            //     3.txt -> ../0.txt (symlink)
+            //     4.txt
+            //     5 -> ../bar (symlink)
+            // create filter that should match bar/*.txt (files in bar directory)
+            let mut filter = FilterSettings::new();
+            filter.add_include("bar/*.txt").unwrap();
+            let summary = copy(
+                &PROGRESS,
+                &test_path.join("foo"),
+                &test_path.join("dst"),
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    chunk_size: 0,
+                    remote_copy_buffer_size: 0,
+                    filter: Some(filter),
+                    dry_run: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await?;
+            // should only copy files matching bar/*.txt pattern
+            // bar/1.txt, bar/2.txt, and bar/3.txt should be copied
+            assert_eq!(
+                summary.files_copied, 3,
+                "should copy 3 files matching bar/*.txt"
+            );
+            // verify the right files exist
+            assert!(
+                test_path.join("dst/bar/1.txt").exists(),
+                "bar/1.txt should be copied"
+            );
+            assert!(
+                test_path.join("dst/bar/2.txt").exists(),
+                "bar/2.txt should be copied"
+            );
+            assert!(
+                test_path.join("dst/bar/3.txt").exists(),
+                "bar/3.txt should be copied"
+            );
+            // verify files outside the pattern don't exist
+            assert!(
+                !test_path.join("dst/0.txt").exists(),
+                "0.txt should not be copied"
+            );
+            Ok(())
+        }
+        /// Test that anchored patterns (starting with /) match only at root.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_anchored_pattern_matches_only_at_root() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::setup_test_dir().await?;
+            let test_path = tmp_dir.as_path();
+            // create filter that should match /bar/** (bar directory and all its contents)
+            let mut filter = FilterSettings::new();
+            filter.add_include("/bar/**").unwrap();
+            let summary = copy(
+                &PROGRESS,
+                &test_path.join("foo"),
+                &test_path.join("dst"),
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    chunk_size: 0,
+                    remote_copy_buffer_size: 0,
+                    filter: Some(filter),
+                    dry_run: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await?;
+            // should only copy bar directory and its contents
+            assert!(
+                test_path.join("dst/bar").exists(),
+                "bar directory should be copied"
+            );
+            assert!(
+                !test_path.join("dst/baz").exists(),
+                "baz directory should not be copied"
+            );
+            assert!(
+                !test_path.join("dst/0.txt").exists(),
+                "0.txt should not be copied"
+            );
+            // verify summary counts
+            assert_eq!(
+                summary.files_copied, 3,
+                "should copy 3 files in bar (1.txt, 2.txt, 3.txt)"
+            );
+            assert_eq!(
+                summary.directories_created, 2,
+                "should create 2 directories (root dst + bar)"
+            );
+            // skipped: 0.txt (file) and baz (directory) - baz contents not counted since dir is skipped
+            assert_eq!(summary.files_skipped, 1, "should skip 1 file (0.txt)");
+            assert_eq!(
+                summary.directories_skipped, 1,
+                "should skip 1 directory (baz)"
+            );
+            Ok(())
+        }
+        /// Test that double-star patterns (**) match across directories.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_double_star_pattern_matches_nested() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::setup_test_dir().await?;
+            let test_path = tmp_dir.as_path();
+            // create filter that should match all .txt files at any depth
+            let mut filter = FilterSettings::new();
+            filter.add_include("**/*.txt").unwrap();
+            let summary = copy(
+                &PROGRESS,
+                &test_path.join("foo"),
+                &test_path.join("dst"),
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    chunk_size: 0,
+                    remote_copy_buffer_size: 0,
+                    filter: Some(filter),
+                    dry_run: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await?;
+            // should copy all .txt files: 0.txt, bar/1.txt, bar/2.txt, bar/3.txt, baz/4.txt
+            assert_eq!(
+                summary.files_copied, 5,
+                "should copy all 5 .txt files with **/*.txt pattern"
+            );
+            Ok(())
+        }
+        /// Test that filters are applied to top-level file arguments.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_filter_applies_to_single_file_source() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::setup_test_dir().await?;
+            let test_path = tmp_dir.as_path();
+            // create filter that excludes .txt files
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("*.txt").unwrap();
+            let result = copy(
+                &PROGRESS,
+                &test_path.join("foo/0.txt"), // single file source
+                &test_path.join("dst.txt"),
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    chunk_size: 0,
+                    remote_copy_buffer_size: 0,
+                    filter: Some(filter),
+                    dry_run: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await?;
+            // the file should NOT be copied because it matches the exclude pattern
+            assert_eq!(
+                result.files_copied, 0,
+                "file matching exclude pattern should not be copied"
+            );
+            assert!(
+                !test_path.join("dst.txt").exists(),
+                "excluded file should not exist at destination"
+            );
+            Ok(())
+        }
+        /// Test that filters apply to root directories with simple exclude patterns.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_filter_applies_to_root_directory() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            // create a directory that should be excluded
+            tokio::fs::create_dir_all(test_path.join("excluded_dir")).await?;
+            tokio::fs::write(test_path.join("excluded_dir/file.txt"), "content").await?;
+            // create filter that excludes *_dir/ directories
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("*_dir/").unwrap();
+            let result = copy(
+                &PROGRESS,
+                &test_path.join("excluded_dir"),
+                &test_path.join("dst"),
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    chunk_size: 0,
+                    remote_copy_buffer_size: 0,
+                    filter: Some(filter),
+                    dry_run: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await?;
+            // directory should NOT be copied because it matches exclude pattern
+            assert_eq!(
+                result.directories_created, 0,
+                "root directory matching exclude should not be created"
+            );
+            assert!(
+                !test_path.join("dst").exists(),
+                "excluded root directory should not exist at destination"
+            );
+            Ok(())
+        }
+        /// Test that filters apply to root symlinks with simple exclude patterns.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_filter_applies_to_root_symlink() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            // create a target file and a symlink to it
+            tokio::fs::write(test_path.join("target.txt"), "content").await?;
+            tokio::fs::symlink(
+                test_path.join("target.txt"),
+                test_path.join("excluded_link"),
+            )
+            .await?;
+            // create filter that excludes *_link
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("*_link").unwrap();
+            let result = copy(
+                &PROGRESS,
+                &test_path.join("excluded_link"),
+                &test_path.join("dst"),
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    chunk_size: 0,
+                    remote_copy_buffer_size: 0,
+                    filter: Some(filter),
+                    dry_run: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await?;
+            // symlink should NOT be copied because it matches exclude pattern
+            assert_eq!(
+                result.symlinks_created, 0,
+                "root symlink matching exclude should not be created"
+            );
+            assert!(
+                !test_path.join("dst").exists(),
+                "excluded root symlink should not exist at destination"
+            );
+            Ok(())
+        }
+        /// Test combined include and exclude patterns (exclude takes precedence).
+        #[tokio::test]
+        #[traced_test]
+        async fn test_combined_include_exclude_patterns() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::setup_test_dir().await?;
+            let test_path = tmp_dir.as_path();
+            // test structure from setup_test_dir:
+            // foo/
+            //   0.txt
+            //   bar/ (1.txt, 2.txt, 3.txt)
+            //   baz/ (4.txt, 5.txt symlink, 6.txt symlink)
+            // include all .txt files, but exclude bar/2.txt specifically
+            let mut filter = FilterSettings::new();
+            filter.add_include("**/*.txt").unwrap();
+            filter.add_exclude("bar/2.txt").unwrap();
+            let summary = copy(
+                &PROGRESS,
+                &test_path.join("foo"),
+                &test_path.join("dst"),
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    chunk_size: 0,
+                    remote_copy_buffer_size: 0,
+                    filter: Some(filter),
+                    dry_run: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await?;
+            // should copy: 0.txt, bar/1.txt, bar/3.txt, baz/4.txt = 4 files
+            // should skip: bar/2.txt (excluded by pattern) = 1 file
+            // symlinks 5.txt and 6.txt don't match *.txt include pattern (symlinks, not files)
+            assert_eq!(summary.files_copied, 4, "should copy 4 .txt files");
+            assert_eq!(
+                summary.files_skipped, 1,
+                "should skip 1 file (bar/2.txt excluded)"
+            );
+            // verify specific files
+            assert!(
+                test_path.join("dst/bar/1.txt").exists(),
+                "bar/1.txt should be copied"
+            );
+            assert!(
+                !test_path.join("dst/bar/2.txt").exists(),
+                "bar/2.txt should be excluded"
+            );
+            assert!(
+                test_path.join("dst/bar/3.txt").exists(),
+                "bar/3.txt should be copied"
+            );
+            Ok(())
+        }
+        /// Test that skipped counts accurately reflect what was filtered.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_skipped_counts_comprehensive() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::setup_test_dir().await?;
+            let test_path = tmp_dir.as_path();
+            // test structure from setup_test_dir:
+            // foo/
+            //   0.txt
+            //   bar/ (1.txt, 2.txt, 3.txt)
+            //   baz/ (4.txt, 5.txt symlink, 6.txt symlink)
+            // exclude bar/ directory entirely
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("bar/").unwrap();
+            let summary = copy(
+                &PROGRESS,
+                &test_path.join("foo"),
+                &test_path.join("dst"),
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    chunk_size: 0,
+                    remote_copy_buffer_size: 0,
+                    filter: Some(filter),
+                    dry_run: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await?;
+            // copied: 0.txt (1 file), baz/4.txt (1 file), 5.txt symlink, 6.txt symlink
+            // skipped: bar directory (1 dir) - contents not counted since whole dir skipped
+            // directories: foo (root), baz = 2
+            assert_eq!(summary.files_copied, 2, "should copy 2 files");
+            assert_eq!(summary.symlinks_created, 2, "should copy 2 symlinks");
+            assert_eq!(
+                summary.directories_created, 2,
+                "should create 2 directories"
+            );
+            assert_eq!(
+                summary.directories_skipped, 1,
+                "should skip 1 directory (bar)"
+            );
+            assert_eq!(
+                summary.files_skipped, 0,
+                "no files skipped (bar contents not counted)"
+            );
+            Ok(())
+        }
+    }
+    mod dry_run_tests {
+        use super::*;
+        /// Test that dry-run mode for directories doesn't create the destination
+        /// and doesn't try to set metadata on non-existent directories.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_dry_run_directory_does_not_create_destination() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::setup_test_dir().await?;
+            let test_path = tmp_dir.as_path();
+            let dst_path = test_path.join("nonexistent_dst");
+            // verify destination doesn't exist
+            assert!(
+                !dst_path.exists(),
+                "destination should not exist before dry-run"
+            );
+            let summary = copy(
+                &PROGRESS,
+                &test_path.join("foo"),
+                &dst_path,
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    chunk_size: 0,
+                    remote_copy_buffer_size: 0,
+                    filter: None,
+                    dry_run: Some(crate::config::DryRunMode::Brief),
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await?;
+            // verify destination still doesn't exist
+            assert!(
+                !dst_path.exists(),
+                "dry-run should not create destination directory"
+            );
+            // verify summary reports what would be created
+            assert!(
+                summary.directories_created > 0,
+                "dry-run should report directories that would be created"
+            );
+            assert!(
+                summary.files_copied > 0,
+                "dry-run should report files that would be copied"
+            );
+            Ok(())
+        }
     }
 }

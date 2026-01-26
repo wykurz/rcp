@@ -62,6 +62,8 @@
 //!     overwrite_compare: Default::default(),
 //!     chunk_size: 0,
 //!     remote_copy_buffer_size: 0,
+//!     filter: None,
+//!     dry_run: None,
 //! };
 //! let preserve = common::preserve::preserve_default();
 //!
@@ -85,6 +87,7 @@
 //!     fail_early: false,
 //!     exit_early: false,
 //!     compare: Default::default(),
+//!     filter: None,
 //! };
 //!
 //! let summary = common::cmp(src, dst, &log, &settings).await?;
@@ -108,6 +111,7 @@ pub mod cmp;
 pub mod config;
 pub mod copy;
 pub mod filegen;
+pub mod filter;
 pub mod link;
 pub mod preserve;
 pub mod remote_tracing;
@@ -118,7 +122,7 @@ pub mod filecmp;
 pub mod progress;
 mod testutils;
 
-pub use config::{OutputConfig, RuntimeConfig, ThrottleConfig, TracingConfig};
+pub use config::{DryRunMode, OutputConfig, RuntimeConfig, ThrottleConfig, TracingConfig};
 pub use progress::{RcpdProgressPrinter, SerializableProgress};
 
 // Define RcpdType in common since remote depends on common

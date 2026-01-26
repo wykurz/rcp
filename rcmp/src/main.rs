@@ -61,6 +61,29 @@ struct Args {
     #[arg(long, value_name = "PATH", help_heading = "Comparison options")]
     log: Option<std::path::PathBuf>,
 
+    // Filtering options
+    /// Glob pattern for files to include (can be specified multiple times)
+    ///
+    /// Only files matching at least one include pattern will be compared. Patterns use glob
+    /// syntax: * matches anything except /, ** matches anything including /, ? matches single
+    /// char, [...] for character classes. Leading / anchors to source root, trailing / matches
+    /// only directories. Simple patterns (like *.txt) apply to the source root itself;
+    /// anchored patterns (like /src/**) match paths inside the source.
+    #[arg(long, value_name = "PATTERN", action = clap::ArgAction::Append, help_heading = "Filtering")]
+    include: Vec<String>,
+
+    /// Glob pattern for files to exclude (can be specified multiple times)
+    ///
+    /// Files matching any exclude pattern will be skipped. Excludes are checked before includes.
+    /// Simple patterns (like *.log) can exclude the source root itself; anchored patterns
+    /// (like /build/) only match paths inside the source.
+    #[arg(long, value_name = "PATTERN", action = clap::ArgAction::Append, help_heading = "Filtering")]
+    exclude: Vec<String>,
+
+    /// Read filter patterns from file
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["include", "exclude"], help_heading = "Filtering")]
+    filter_file: Option<std::path::PathBuf>,
+
     // Progress & output
     /// Show progress
     #[arg(long, help_heading = "Progress & output")]
@@ -165,6 +188,21 @@ struct Args {
 }
 
 async fn async_main(args: Args) -> Result<common::cmp::Summary> {
+    // build filter settings from CLI arguments
+    let filter = if let Some(ref path) = args.filter_file {
+        Some(common::filter::FilterSettings::from_file(path)?)
+    } else if !args.include.is_empty() || !args.exclude.is_empty() {
+        let mut filter_settings = common::filter::FilterSettings::new();
+        for p in &args.include {
+            filter_settings.add_include(p)?;
+        }
+        for p in &args.exclude {
+            filter_settings.add_exclude(p)?;
+        }
+        Some(filter_settings)
+    } else {
+        None
+    };
     // output to stdout if no log file and not quiet
     let use_stdout = args.log.is_none() && !args.quiet;
     let log_handle = common::cmp::LogWriter::new(args.log.as_deref(), use_stdout).await?;
@@ -176,6 +214,7 @@ async fn async_main(args: Args) -> Result<common::cmp::Summary> {
             fail_early: args.fail_early,
             exit_early: args.exit_early,
             compare: common::parse_compare_settings(&args.metadata_compare)?,
+            filter,
         },
     )
     .await?;

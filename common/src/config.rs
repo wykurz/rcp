@@ -1,5 +1,21 @@
 //! Configuration types for runtime and execution settings
 
+use serde::{Deserialize, Serialize};
+
+/// Dry-run mode for previewing operations without executing them
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+pub enum DryRunMode {
+    /// show only what would be copied/linked/removed
+    #[value(name = "brief")]
+    Brief,
+    /// also show skipped files
+    #[value(name = "all")]
+    All,
+    /// show skipped files with the pattern that caused the skip
+    #[value(name = "explain")]
+    Explain,
+}
+
 /// Runtime configuration for tokio and thread pools
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RuntimeConfig {

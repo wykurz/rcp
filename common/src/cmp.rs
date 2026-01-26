@@ -26,18 +26,23 @@ pub enum ObjType {
 
 pub type ObjSettings = EnumMap<ObjType, filecmp::MetadataCmpSettings>;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 pub struct Settings {
     pub compare: ObjSettings,
     pub fail_early: bool,
     pub exit_early: bool,
+    pub filter: Option<crate::filter::FilterSettings>,
 }
 
 pub type Mismatch = EnumMap<ObjType, EnumMap<CompareResult, u64>>;
 
+/// Count of skipped items per object type
+pub type Skipped = EnumMap<ObjType, u64>;
+
 #[derive(Default)]
 pub struct Summary {
     pub mismatch: Mismatch,
+    pub skipped: Skipped,
 }
 
 impl std::ops::Add for Summary {
@@ -49,7 +54,11 @@ impl std::ops::Add for Summary {
                 mismatch[obj_type][cmp_res] += count;
             }
         }
-        Self { mismatch }
+        let mut skipped = self.skipped;
+        for (obj_type, &count) in &other.skipped {
+            skipped[obj_type] += count;
+        }
+        Self { mismatch, skipped }
     }
 }
 
@@ -58,6 +67,11 @@ impl std::fmt::Display for Summary {
         for (obj_type, &cmp_res_map) in &self.mismatch {
             for (cmp_res, &count) in &cmp_res_map {
                 writeln!(f, "{obj_type:?} {cmp_res:?}: {count}")?;
+            }
+        }
+        for (obj_type, &count) in &self.skipped {
+            if count > 0 {
+                writeln!(f, "{obj_type:?} Skipped: {count}")?;
             }
         }
         Ok(())
@@ -171,12 +185,27 @@ fn obj_type(metadata: &std::fs::Metadata) -> ObjType {
     }
 }
 
+/// Public entry point for compare operations.
+/// Internally delegates to cmp_internal with source_root/dest_root tracking for proper filter matching.
 #[instrument(skip(prog_track))]
-#[async_recursion]
 pub async fn cmp(
     prog_track: &'static progress::Progress,
     src: &std::path::Path,
     dst: &std::path::Path,
+    log: &LogWriter,
+    settings: &Settings,
+) -> Result<Summary> {
+    cmp_internal(prog_track, src, dst, src, dst, log, settings).await
+}
+
+#[instrument(skip(prog_track))]
+#[async_recursion]
+async fn cmp_internal(
+    prog_track: &'static progress::Progress,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    source_root: &std::path::Path,
+    dest_root: &std::path::Path,
     log: &LogWriter,
     settings: &Settings,
 ) -> Result<Summary> {
@@ -186,6 +215,24 @@ pub async fn cmp(
     let src_metadata = tokio::fs::symlink_metadata(src)
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))?;
+    // apply filter to root item (when src == source_root, this is the initial call)
+    if src == source_root {
+        if let Some(ref filter) = settings.filter {
+            if let Some(name) = src.file_name() {
+                let is_dir = src_metadata.is_dir();
+                if !matches!(
+                    filter.should_include_root_item(name.as_ref(), is_dir),
+                    crate::filter::FilterResult::Included
+                ) {
+                    // root item filtered out, return summary with skipped count
+                    let src_obj_type = obj_type(&src_metadata);
+                    let mut summary = Summary::default();
+                    summary.skipped[src_obj_type] += 1;
+                    return Ok(summary);
+                }
+            }
+        }
+    }
     let mut cmp_summary = Summary::default();
     let src_obj_type = obj_type(&src_metadata);
     let dst_metadata = {
@@ -256,12 +303,46 @@ pub async fn cmp(
         throttle::get_ops_token().await;
         let entry_path = src_entry.path();
         let entry_name = entry_path.file_name().unwrap();
+        // apply filter if configured
+        if let Some(ref filter) = settings.filter {
+            // compute relative path from source_root for filter matching
+            let relative_path = entry_path.strip_prefix(source_root).unwrap_or(&entry_path);
+            let entry_file_type = src_entry.file_type().await.ok();
+            let is_dir = entry_file_type.map(|ft| ft.is_dir()).unwrap_or(false);
+            if !matches!(
+                filter.should_include(relative_path, is_dir),
+                crate::filter::FilterResult::Included
+            ) {
+                // increment skipped counter based on entry type
+                let entry_obj_type = if is_dir {
+                    ObjType::Dir
+                } else if entry_file_type.map(|ft| ft.is_symlink()).unwrap_or(false) {
+                    ObjType::Symlink
+                } else {
+                    ObjType::File
+                };
+                cmp_summary.skipped[entry_obj_type] += 1;
+                continue;
+            }
+        }
         processed_files.insert(entry_name.to_owned());
         let dst_path = dst.join(entry_name);
         let log = log.clone();
-        let settings = *settings;
-        let do_cmp =
-            || async move { cmp(prog_track, &entry_path, &dst_path, &log, &settings).await };
+        let settings = settings.clone();
+        let source_root = source_root.to_owned();
+        let dest_root = dest_root.to_owned();
+        let do_cmp = || async move {
+            cmp_internal(
+                prog_track,
+                &entry_path,
+                &dst_path,
+                &source_root,
+                &dest_root,
+                &log,
+                &settings,
+            )
+            .await
+        };
         join_set.spawn(do_cmp());
     }
     // unfortunately ReadDir is opening file-descriptors and there's not a good way to limit this,
@@ -282,6 +363,28 @@ pub async fn cmp(
         if processed_files.contains(entry_name) {
             // we already must have considered this file, skip it
             continue;
+        }
+        // apply filter if configured - if this entry would be filtered, don't report as missing
+        if let Some(ref filter) = settings.filter {
+            // compute relative path from dest_root for filter matching
+            let relative_path = entry_path.strip_prefix(dest_root).unwrap_or(&entry_path);
+            let entry_file_type = dst_entry.file_type().await.ok();
+            let is_dir = entry_file_type.map(|ft| ft.is_dir()).unwrap_or(false);
+            if !matches!(
+                filter.should_include(relative_path, is_dir),
+                crate::filter::FilterResult::Included
+            ) {
+                // increment skipped counter based on entry type
+                let entry_obj_type = if is_dir {
+                    ObjType::Dir
+                } else if entry_file_type.map(|ft| ft.is_symlink()).unwrap_or(false) {
+                    ObjType::Symlink
+                } else {
+                    ObjType::File
+                };
+                cmp_summary.skipped[entry_obj_type] += 1;
+                continue;
+            }
         }
         tracing::debug!("found a new entry in the 'dst' directory");
         let dst_path = dst.join(entry_name);
@@ -354,6 +457,8 @@ mod cmp_tests {
                 },
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
             },
             if preserve {
                 &DO_PRESERVE_SETTINGS
@@ -416,6 +521,7 @@ mod cmp_tests {
                     ..Default::default()
                 },
             },
+            filter: None,
         };
         let summary = cmp(
             &PROGRESS,
@@ -452,6 +558,340 @@ mod cmp_tests {
             },
         };
         assert_eq!(summary.mismatch, mismatch);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn cmp_with_filter_excludes_files() -> Result<()> {
+        let tmp_dir = setup_test_dirs(true).await?;
+        // setup: src=foo, dst=bar (identical at this point)
+        // add a file to dst that would be reported as SrcMissing
+        tokio::fs::write(&tmp_dir.join("bar").join("extra.txt"), "extra").await?;
+        // without filter, should report extra.txt as SrcMissing
+        let compare_settings_no_filter = Settings {
+            fail_early: false,
+            exit_early: false,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: None,
+        };
+        let summary = cmp(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &tmp_dir.join("bar"),
+            &LogWriter::new(None, false).await?,
+            &compare_settings_no_filter,
+        )
+        .await?;
+        assert_eq!(
+            summary.mismatch[ObjType::File][CompareResult::SrcMissing],
+            1
+        );
+        // with filter excluding extra.txt, should not report it
+        let mut filter = crate::filter::FilterSettings::new();
+        filter.add_exclude("extra.txt")?;
+        let compare_settings_with_filter = Settings {
+            fail_early: false,
+            exit_early: false,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: Some(filter),
+        };
+        let summary = cmp(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &tmp_dir.join("bar"),
+            &LogWriter::new(None, false).await?,
+            &compare_settings_with_filter,
+        )
+        .await?;
+        assert_eq!(
+            summary.mismatch[ObjType::File][CompareResult::SrcMissing],
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn cmp_with_include_only_compares_matching() -> Result<()> {
+        let tmp_dir = setup_test_dirs(true).await?;
+        // setup: src=foo, dst=bar (identical at this point)
+        // modify a file that won't be included
+        tokio::fs::write(&tmp_dir.join("bar").join("bar").join("1.txt"), "modified").await?;
+        // with include pattern for only *.rs files, the .txt modification shouldn't appear
+        let mut filter = crate::filter::FilterSettings::new();
+        filter.add_include("*.rs")?;
+        let compare_settings = Settings {
+            fail_early: false,
+            exit_early: false,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings {
+                    size: true,
+                    mtime: true,
+                    ..Default::default()
+                },
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: Some(filter),
+        };
+        let summary = cmp(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &tmp_dir.join("bar"),
+            &LogWriter::new(None, false).await?,
+            &compare_settings,
+        )
+        .await?;
+        // no differences should be reported since all .txt files are excluded
+        assert_eq!(summary.mismatch[ObjType::File][CompareResult::Different], 0);
+        assert_eq!(summary.mismatch[ObjType::File][CompareResult::Same], 0);
+        assert_eq!(
+            summary.mismatch[ObjType::File][CompareResult::SrcMissing],
+            0
+        );
+        assert_eq!(
+            summary.mismatch[ObjType::File][CompareResult::DstMissing],
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn cmp_with_path_pattern_filters_nested() -> Result<()> {
+        // test that path-based patterns like "bar/*.txt" work correctly when recursing
+        // this verifies source_root tracking is working properly
+        let tmp_dir = setup_test_dirs(true).await?;
+        // test structure:
+        // foo/bar/1.txt, foo/bar/2.txt, foo/bar/3.txt
+        // foo/baz/4.txt, foo/baz/5.txt (symlink), foo/baz/6.txt (symlink)
+        // filter: only include bar/*.txt
+        let mut filter = crate::filter::FilterSettings::new();
+        filter.add_include("bar/*.txt")?;
+        let compare_settings = Settings {
+            fail_early: false,
+            exit_early: false,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings {
+                    size: true,
+                    ..Default::default()
+                },
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: Some(filter),
+        };
+        let summary = cmp(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &tmp_dir.join("bar"),
+            &LogWriter::new(None, false).await?,
+            &compare_settings,
+        )
+        .await?;
+        // should only compare files in bar/ subdirectory (3 files: 1.txt, 2.txt, 3.txt)
+        // all should be "Same" since we copied foo to bar earlier
+        assert_eq!(
+            summary.mismatch[ObjType::File][CompareResult::Same],
+            3,
+            "should have 3 same files from bar/*.txt pattern"
+        );
+        // files in baz/ should not be compared (filtered out)
+        // 0.txt at root should not be compared
+        assert_eq!(summary.mismatch[ObjType::File][CompareResult::Different], 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn cmp_filter_applies_to_root_file() -> Result<()> {
+        // test that filters apply to the root item itself
+        let tmp_dir = testutils::create_temp_dir().await?;
+        // create two different files
+        tokio::fs::write(tmp_dir.join("test.txt"), "content1").await?;
+        tokio::fs::write(tmp_dir.join("test2.txt"), "content2").await?;
+        // filter: only include *.rs files
+        let mut filter = crate::filter::FilterSettings::new();
+        filter.add_include("*.rs")?;
+        let compare_settings = Settings {
+            fail_early: false,
+            exit_early: false,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings {
+                    size: true,
+                    ..Default::default()
+                },
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: Some(filter),
+        };
+        // compare test.txt vs test2.txt - should be filtered out (not *.rs)
+        let summary = cmp(
+            &PROGRESS,
+            &tmp_dir.join("test.txt"),
+            &tmp_dir.join("test2.txt"),
+            &LogWriter::new(None, false).await?,
+            &compare_settings,
+        )
+        .await?;
+        // should return empty summary since root file is filtered
+        assert_eq!(summary.mismatch[ObjType::File][CompareResult::Same], 0);
+        assert_eq!(summary.mismatch[ObjType::File][CompareResult::Different], 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn cmp_filter_excludes_root_directory() -> Result<()> {
+        // test that filters apply to root directories
+        let tmp_dir = testutils::setup_test_dir().await?;
+        // filter: exclude directories named "foo"
+        let mut filter = crate::filter::FilterSettings::new();
+        filter.add_exclude("foo")?;
+        let compare_settings = Settings {
+            fail_early: false,
+            exit_early: false,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings::default(),
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: Some(filter),
+        };
+        // compare foo vs bar - foo should be filtered out
+        let summary = cmp(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &tmp_dir.join("bar"),
+            &LogWriter::new(None, false).await?,
+            &compare_settings,
+        )
+        .await?;
+        // should return empty summary since root dir is excluded
+        assert_eq!(summary.mismatch[ObjType::Dir][CompareResult::Same], 0);
+        assert_eq!(summary.mismatch[ObjType::Dir][CompareResult::Different], 0);
+        assert_eq!(summary.mismatch[ObjType::File][CompareResult::Same], 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn cmp_combined_include_exclude_patterns() -> Result<()> {
+        let tmp_dir = setup_test_dirs(true).await?;
+        // include all .txt files, but exclude bar/2.txt specifically
+        let mut filter = crate::filter::FilterSettings::new();
+        filter.add_include("**/*.txt")?;
+        filter.add_exclude("bar/2.txt")?;
+        let compare_settings = Settings {
+            fail_early: false,
+            exit_early: false,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings {
+                    size: true,
+                    ..Default::default()
+                },
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: Some(filter),
+        };
+        let summary = cmp(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &tmp_dir.join("bar"),
+            &LogWriter::new(None, false).await?,
+            &compare_settings,
+        )
+        .await?;
+        // should compare: 0.txt, bar/1.txt, bar/3.txt, baz/4.txt = 4 files (same)
+        // should skip: bar/2.txt (excluded by pattern), 5.txt and 6.txt (symlinks, no match for *.txt in src dir) = 1 file + 2 symlinks
+        // note: the pattern **/*.txt only matches files with .txt extension, but 5.txt and 6.txt in baz are symlinks
+        assert_eq!(
+            summary.mismatch[ObjType::File][CompareResult::Same],
+            4,
+            "should compare 4 .txt files as same"
+        );
+        // bar/2.txt is skipped for both src and dst traversal = 2 skipped
+        assert_eq!(
+            summary.skipped[ObjType::File],
+            2,
+            "should skip 2 files (bar/2.txt on src and dst)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn cmp_skipped_counts_comprehensive() -> Result<()> {
+        let tmp_dir = setup_test_dirs(true).await?;
+        // exclude bar/ directory entirely
+        let mut filter = crate::filter::FilterSettings::new();
+        filter.add_exclude("bar/")?;
+        let compare_settings = Settings {
+            fail_early: false,
+            exit_early: false,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings {
+                    size: true,
+                    ..Default::default()
+                },
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: Some(filter),
+        };
+        let summary = cmp(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &tmp_dir.join("bar"),
+            &LogWriter::new(None, false).await?,
+            &compare_settings,
+        )
+        .await?;
+        // compared: 0.txt (same), baz/4.txt (same) = 2 files
+        // compared: baz/5.txt symlink (same), baz/6.txt symlink (same) = 2 symlinks
+        // skipped: bar directory in src and dst = 2 dirs (cmp traverses both)
+        assert_eq!(
+            summary.mismatch[ObjType::File][CompareResult::Same],
+            2,
+            "should compare 2 files as same"
+        );
+        assert_eq!(
+            summary.mismatch[ObjType::Symlink][CompareResult::Same],
+            2,
+            "should compare 2 symlinks as same"
+        );
+        assert_eq!(
+            summary.skipped[ObjType::Dir],
+            2,
+            "should skip 2 directories (bar in src + bar in dst)"
+        );
         Ok(())
     }
 }

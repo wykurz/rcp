@@ -229,8 +229,17 @@ impl DirectoryTracker {
         tracing::info!("Root item complete");
     }
     /// Mark the directory structure as complete (DirStructureComplete received).
-    pub fn set_structure_complete(&mut self) {
+    ///
+    /// If `has_root_item` is false (dry-run mode or filtered root), this also
+    /// sets root_complete to allow graceful shutdown since no root messages will follow.
+    pub fn set_structure_complete(&mut self, has_root_item: bool) {
         self.structure_complete = true;
+        // if source indicates no root item will be sent, mark root as complete
+        // this happens in dry-run mode or when the root item is filtered out
+        if !has_root_item {
+            tracing::info!("No root item to receive, marking root as complete");
+            self.root_complete = true;
+        }
         tracing::info!("Directory structure complete");
     }
     /// Check if we're done and can send DestinationDone.

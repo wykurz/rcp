@@ -57,6 +57,36 @@ struct Args {
     )]
     update_compare: String,
 
+    // Filtering options
+    /// Glob pattern for files to include (can be specified multiple times)
+    ///
+    /// Only files matching at least one include pattern will be linked. Patterns use glob
+    /// syntax: * matches anything except /, ** matches anything including /, ? matches single
+    /// char, [...] for character classes. Leading / anchors to source root, trailing / matches
+    /// only directories. Simple patterns (like *.txt) apply to the source root itself;
+    /// anchored patterns (like /src/**) match paths inside the source.
+    #[arg(long, value_name = "PATTERN", action = clap::ArgAction::Append, help_heading = "Filtering")]
+    include: Vec<String>,
+
+    /// Glob pattern for files to exclude (can be specified multiple times)
+    ///
+    /// Files matching any exclude pattern will be skipped. Excludes are checked before includes.
+    /// Simple patterns (like *.log) can exclude the source root itself; anchored patterns
+    /// (like /build/) only match paths inside the source.
+    #[arg(long, value_name = "PATTERN", action = clap::ArgAction::Append, help_heading = "Filtering")]
+    exclude: Vec<String>,
+
+    /// Read filter patterns from file
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["include", "exclude"], help_heading = "Filtering")]
+    filter_file: Option<std::path::PathBuf>,
+
+    /// Preview mode - show what would be linked without actually linking
+    ///
+    /// Note: dry-run bypasses --overwrite checks and shows all files that would be
+    /// attempted, regardless of whether the destination already exists.
+    #[arg(long, value_name = "MODE", help_heading = "Filtering")]
+    dry_run: Option<common::DryRunMode>,
+
     // Progress & output
     /// Show progress
     #[arg(long, help_heading = "Progress & output")]
@@ -184,10 +214,22 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
         }
         dst_path
     };
-    let result = common::link(
-        &args.src,
-        &dst,
-        &args.update,
+    let result = common::link(&args.src, &dst, &args.update, {
+        // build filter settings from CLI arguments
+        let filter = if let Some(ref path) = args.filter_file {
+            Some(common::filter::FilterSettings::from_file(path)?)
+        } else if !args.include.is_empty() || !args.exclude.is_empty() {
+            let mut filter_settings = common::filter::FilterSettings::new();
+            for p in &args.include {
+                filter_settings.add_include(p)?;
+            }
+            for p in &args.exclude {
+                filter_settings.add_exclude(p)?;
+            }
+            Some(filter_settings)
+        } else {
+            None
+        };
         &common::link::Settings {
             copy_settings: common::copy::Settings {
                 dereference: false, // currently not supported
@@ -196,11 +238,15 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
                 overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
                 chunk_size: args.chunk_size,
                 remote_copy_buffer_size: 0, // not used for local operations
+                filter: filter.clone(),
+                dry_run: args.dry_run,
             },
             update_compare: common::parse_metadata_cmp_settings(&args.update_compare)?,
             update_exclusive: args.update_exclusive,
-        },
-    )
+            filter,
+            dry_run: args.dry_run,
+        }
+    })
     .await;
     match result {
         Ok(summary) => Ok(summary),

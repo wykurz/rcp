@@ -12,6 +12,7 @@ async fn send_directories_and_symlinks(
     settings: &common::copy::Settings,
     src: &std::path::Path,
     dst: &std::path::Path,
+    source_root: &std::path::Path,
     is_root: bool,
     control_send_stream: &remote::streams::BoxedSharedSendStream,
     error_occurred: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -24,7 +25,7 @@ async fn send_directories_and_symlinks(
     } {
         Ok(m) => m,
         Err(e) => {
-            tracing::error!("Failed reading metadata from src {src:?}: {e}");
+            tracing::error!("Failed reading metadata from src {src:?}: {e:#}");
             error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             // for root items, failing to read metadata is fatal - we can't proceed
             // and the protocol would hang waiting for root completion
@@ -34,6 +35,27 @@ async fn send_directories_and_symlinks(
             return Ok(());
         }
     };
+    // apply filter if configured (applies to all items including root)
+    if let Some(ref filter) = settings.filter {
+        // for root items, use the file name with should_include_root_item
+        // (anchored patterns match paths inside the source, not the source itself)
+        // for nested items, use relative path with should_include
+        let is_dir = src_metadata.is_dir();
+        let result = if is_root {
+            let file_name = src.file_name().map(std::path::Path::new).unwrap_or(src);
+            filter.should_include_root_item(file_name, is_dir)
+        } else {
+            let relative_path = src.strip_prefix(source_root).unwrap_or(src);
+            filter.should_include(relative_path, is_dir)
+        };
+        match result {
+            common::filter::FilterResult::Included => { /* proceed */ }
+            _ => {
+                tracing::debug!("Filtered out {:?}: {:?}", src, result);
+                return Ok(());
+            }
+        }
+    }
     if src_metadata.is_file() {
         return Ok(());
     }
@@ -41,7 +63,7 @@ async fn send_directories_and_symlinks(
         let target = match tokio::fs::read_link(&src).await {
             Ok(t) => t,
             Err(e) => {
-                tracing::error!("Failed reading symlink {src:?}: {e}");
+                tracing::error!("Failed reading symlink {src:?}: {e:#}");
                 error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                 // notify destination that this symlink was skipped
                 // for root symlinks, this also signals root completion (even if failed)
@@ -100,7 +122,7 @@ async fn send_directories_and_symlinks(
     let mut entries = match tokio::fs::read_dir(&src).await {
         Ok(e) => e,
         Err(e) => {
-            tracing::error!("Cannot open directory {src:?} for reading: {e}");
+            tracing::error!("Cannot open directory {src:?} for reading: {e:#}");
             error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             if settings.fail_early {
                 return Err(e.into());
@@ -118,13 +140,14 @@ async fn send_directories_and_symlinks(
                     settings,
                     &entry_path,
                     &dst_path,
+                    source_root,
                     false,
                     control_send_stream,
                     error_occurred,
                 )
                 .await
                 {
-                    tracing::error!("Failed to send directory/symlink {entry_path:?}: {e}");
+                    tracing::error!("Failed to send directory/symlink {entry_path:?}: {e:#}");
                     error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                     if settings.fail_early {
                         return Err(e);
@@ -133,7 +156,7 @@ async fn send_directories_and_symlinks(
             }
             Ok(None) => break,
             Err(e) => {
-                tracing::error!("Failed traversing src directory {src:?}: {e}");
+                tracing::error!("Failed traversing src directory {src:?}: {e:#}");
                 error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                 if settings.fail_early {
                     return Err(e.into());
@@ -163,23 +186,38 @@ async fn send_fs_objects_tcp(
     } {
         Ok(m) => m,
         Err(e) => {
-            tracing::error!("Failed reading metadata from src {src:?}: {e}");
+            tracing::error!("Failed reading metadata from src {src:?}: {e:#}");
             error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             return Err(e.into());
         }
+    };
+    // determine if we have a root item to send (for DirStructureComplete message)
+    // check filter for all types (files, directories, symlinks)
+    let has_root_item = if let Some(ref filter) = settings.filter {
+        // for root items, use should_include_root_item which skips anchored patterns
+        // (anchored patterns match paths inside the source, not the source itself)
+        let file_name = src.file_name().map(std::path::Path::new).unwrap_or(src);
+        let is_dir = src_metadata.is_dir();
+        matches!(
+            filter.should_include_root_item(file_name, is_dir),
+            common::filter::FilterResult::Included
+        )
+    } else {
+        true
     };
     if !src_metadata.is_file() {
         if let Err(e) = send_directories_and_symlinks(
             settings,
             src,
             dst,
+            src, // source_root is src for the root item
             true,
             &control_send_stream,
             &error_occurred,
         )
         .await
         {
-            tracing::error!("Failed to send directories and symlinks: {e}");
+            tracing::error!("Failed to send directories and symlinks: {e:#}");
             error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             if settings.fail_early {
                 return Err(e);
@@ -188,10 +226,12 @@ async fn send_fs_objects_tcp(
     }
     let mut stream = control_send_stream.lock().await;
     stream
-        .send_control_message(&remote::protocol::SourceMessage::DirStructureComplete)
+        .send_control_message(&remote::protocol::SourceMessage::DirStructureComplete {
+            has_root_item,
+        })
         .await?;
     drop(stream);
-    if src_metadata.is_file() {
+    if src_metadata.is_file() && has_root_item {
         // root file - send with dir_total_files=1 (itself is the only file)
         if let Err(e) = send_file_tcp(
             settings,
@@ -206,7 +246,7 @@ async fn send_fs_objects_tcp(
         )
         .await
         {
-            tracing::error!("Failed to send root file: {e}");
+            tracing::error!("Failed to send root file: {e:#}");
             error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             // always return error for root file failures -
             // there's nothing else to transfer and the protocol would hang
@@ -314,7 +354,7 @@ async fn send_file_tcp(
             Ok(())
         }
         Err(e) => {
-            tracing::error!("Failed to send file content for {src:?}: {e}");
+            tracing::error!("Failed to send file content for {src:?}: {e:#}");
             error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             // don't return stream to pool on error - it's in a bad state.
             // close it immediately.
@@ -330,10 +370,12 @@ async fn send_file_tcp(
 }
 
 #[instrument(skip(error_occurred, control_send_stream, stream_pool, pending_limit))]
+#[allow(clippy::too_many_arguments)]
 async fn send_files_in_directory_tcp(
     settings: common::copy::Settings,
     src: std::path::PathBuf,
     dst: std::path::PathBuf,
+    source_root: std::path::PathBuf,
     stream_pool: std::sync::Arc<AcceptingSendStreamPool>,
     pending_limit: std::sync::Arc<tokio::sync::Semaphore>,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -346,7 +388,7 @@ async fn send_files_in_directory_tcp(
     let mut entries = match tokio::fs::read_dir(&src).await {
         Ok(e) => e,
         Err(e) => {
-            tracing::error!("Cannot open directory {src:?} for reading: {e}");
+            tracing::error!("Cannot open directory {src:?} for reading: {e:#}");
             error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             if settings.fail_early {
                 return Err(e.into());
@@ -367,7 +409,7 @@ async fn send_files_in_directory_tcp(
                 } {
                     Ok(m) => m,
                     Err(e) => {
-                        tracing::error!("Failed reading metadata from {entry_path:?}: {e}");
+                        tracing::error!("Failed reading metadata from {entry_path:?}: {e:#}");
                         error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                         if settings.fail_early {
                             return Err(e.into());
@@ -376,12 +418,29 @@ async fn send_files_in_directory_tcp(
                     }
                 };
                 if entry_metadata.is_file() {
+                    // apply filter if configured
+                    if let Some(ref filter) = settings.filter {
+                        let relative_path =
+                            entry_path.strip_prefix(&source_root).unwrap_or(&entry_path);
+                        match filter.should_include(relative_path, false) {
+                            common::filter::FilterResult::Included => { /* proceed */ }
+                            result => {
+                                tracing::debug!(
+                                    "Filtered out file {:?} (relative: {:?}): {:?}",
+                                    entry_path,
+                                    relative_path,
+                                    result
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     file_entries.push((entry_path, dst_path, entry_metadata));
                 }
             }
             Ok(None) => break,
             Err(e) => {
-                tracing::error!("Failed traversing src directory {src:?}: {e}");
+                tracing::error!("Failed traversing src directory {src:?}: {e:#}");
                 error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                 if settings.fail_early {
                     return Err(e.into());
@@ -422,6 +481,7 @@ async fn send_files_in_directory_tcp(
         let error_flag = error_occurred.clone();
         let control_stream = control_send_stream.clone();
         let total = dir_total_files;
+        let settings = settings.clone();
         join_set.spawn(async move {
             let result = send_file_tcp(
                 &settings,
@@ -451,7 +511,7 @@ async fn send_files_in_directory_tcp(
                 return Err(e);
             }
             Err(e) => {
-                tracing::error!("Task panicked while sending file from {src:?}: {e}");
+                tracing::error!("Task panicked while sending file from {src:?}: {e:#}");
                 error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                 return Err(e.into());
             }
@@ -506,8 +566,10 @@ enum RecvResult {
     control_send_stream,
     pool_shutdown
 ))]
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_control_messages_tcp(
     settings: common::copy::Settings,
+    source_root: std::path::PathBuf,
     mut control_recv_stream: remote::streams::BoxedRecvStream,
     control_send_stream: remote::streams::BoxedSharedSendStream,
     stream_pool: std::sync::Arc<AcceptingSendStreamPool>,
@@ -571,7 +633,7 @@ async fn dispatch_control_messages_tcp(
                             break Err(e);
                         }
                         Err(e) => {
-                            tracing::error!("Task panicked: {e}");
+                            tracing::error!("Task panicked: {e:#}");
                             error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                             break Err(e.into());
                         }
@@ -593,10 +655,12 @@ async fn dispatch_control_messages_tcp(
                             confirmation.dst
                         );
                         let error_flag = error_occurred.clone();
+                        let settings = settings.clone();
                         join_set.spawn(send_files_in_directory_tcp(
                             settings,
                             confirmation.src.clone(),
                             confirmation.dst.clone(),
+                            source_root.clone(),
                             stream_pool.clone(),
                             pending_limit.clone(),
                             error_flag,
@@ -643,7 +707,7 @@ async fn dispatch_control_messages_tcp(
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 if shutdown_initiated || pool_shutdown_errors_expected {
-                    tracing::debug!("Task failed during shutdown (expected): {e}");
+                    tracing::debug!("Task failed during shutdown (expected): {e:#}");
                 } else {
                     // transport errors are always fatal - we can't recover
                     tracing::error!("Transport failure in file send task: {e:#}");
@@ -653,9 +717,9 @@ async fn dispatch_control_messages_tcp(
             }
             Err(e) => {
                 if shutdown_initiated || pool_shutdown_errors_expected {
-                    tracing::debug!("Task panicked during shutdown: {e}");
+                    tracing::debug!("Task panicked during shutdown: {e:#}");
                 } else {
-                    tracing::error!("Task panicked: {e}");
+                    tracing::error!("Task panicked: {e:#}");
                     error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                     // don't return error here - result already has an error
                 }
@@ -667,7 +731,7 @@ async fn dispatch_control_messages_tcp(
         tracing::info!("All file send tasks completed, closing send stream");
         let mut stream = control_send_stream.lock().await;
         if let Err(e) = stream.close().await {
-            tracing::debug!("Failed to close control stream: {e}");
+            tracing::debug!("Failed to close control stream: {e:#}");
         }
     }
     // wait for recv task to finish (it will close the stream)
@@ -884,7 +948,8 @@ async fn handle_connection(
     // draining its tasks to prevent deadlock when destination closes unexpectedly.
     // see dispatch_control_messages_tcp doc comment for detailed shutdown flow.
     let dispatch_task = tokio::spawn(dispatch_control_messages_tcp(
-        *settings,
+        settings.clone(),
+        src.to_path_buf(),
         control_recv_stream,
         control_send_stream.clone(),
         stream_pool.clone(),
@@ -928,6 +993,289 @@ async fn handle_connection(
     dispatch_result??;
     tracing::info!("Data sent successfully");
     Ok(())
+}
+
+/// Traverse filesystem and report dry-run entries via tracing.
+/// This function outputs what would be copied without actually copying.
+#[async_recursion]
+#[allow(clippy::too_many_arguments)]
+async fn dry_run_traverse(
+    settings: &common::copy::Settings,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    source_root: &std::path::Path,
+    is_root: bool,
+    dry_run_mode: common::config::DryRunMode,
+    summary: &mut common::copy::Summary,
+) -> anyhow::Result<()> {
+    let src_metadata = match if settings.dereference {
+        tokio::fs::metadata(src).await
+    } else {
+        tokio::fs::symlink_metadata(src).await
+    } {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("Failed reading metadata from src {src:?}: {e:#}");
+            if settings.fail_early || is_root {
+                return Err(e.into());
+            }
+            return Ok(());
+        }
+    };
+    let is_dir = src_metadata.is_dir();
+    // apply filter - use should_include_root_item for root items
+    // (anchored patterns match paths inside the source, not the source itself)
+    let filter_result = if let Some(ref filter) = settings.filter {
+        if is_root {
+            let file_name = src.file_name().map(std::path::Path::new).unwrap_or(src);
+            filter.should_include_root_item(file_name, is_dir)
+        } else {
+            let relative_path = src.strip_prefix(source_root).unwrap_or(src);
+            filter.should_include(relative_path, is_dir)
+        }
+    } else {
+        common::filter::FilterResult::Included
+    };
+    let (should_process, skip_reason) = match &filter_result {
+        common::filter::FilterResult::Included => (true, None),
+        common::filter::FilterResult::ExcludedByDefault => {
+            (false, Some("no include pattern matched".to_string()))
+        }
+        common::filter::FilterResult::ExcludedByPattern(p) => {
+            (false, Some(format!("excluded by pattern: {}", p)))
+        }
+    };
+    // determine if we should report this entry based on dry-run mode
+    let should_report = match dry_run_mode {
+        common::config::DryRunMode::Brief => should_process,
+        common::config::DryRunMode::All | common::config::DryRunMode::Explain => true,
+    };
+    // helper to format status for output
+    let format_status = |process: bool, reason: &Option<String>| -> String {
+        if process {
+            "would copy".to_string()
+        } else if matches!(dry_run_mode, common::config::DryRunMode::Explain) {
+            format!("skip ({})", reason.as_deref().unwrap_or("filtered"))
+        } else {
+            "skip".to_string()
+        }
+    };
+    if src_metadata.is_file() {
+        if should_report {
+            let size = src_metadata.len();
+            tracing::info!(
+                target: "dry_run",
+                "{}: {:?} -> {:?} [file ({})]",
+                format_status(should_process, &skip_reason),
+                src,
+                dst,
+                bytesize::ByteSize(size)
+            );
+        }
+        if should_process {
+            summary.files_copied += 1;
+            summary.bytes_copied += src_metadata.len();
+        }
+        return Ok(());
+    }
+    if src_metadata.is_symlink() {
+        let target = match tokio::fs::read_link(src).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("Failed reading symlink {src:?}: {e:#}");
+                if settings.fail_early {
+                    return Err(e.into());
+                }
+                return Ok(());
+            }
+        };
+        if should_report {
+            tracing::info!(
+                target: "dry_run",
+                "{}: {:?} -> {:?} [symlink -> {:?}]",
+                format_status(should_process, &skip_reason),
+                src,
+                dst,
+                target
+            );
+        }
+        if should_process {
+            summary.symlinks_created += 1;
+        }
+        return Ok(());
+    }
+    if !src_metadata.is_dir() {
+        return Ok(());
+    }
+    // directory
+    if should_report {
+        tracing::info!(
+            target: "dry_run",
+            "{}: {:?} -> {:?} [dir]",
+            format_status(should_process, &skip_reason),
+            src,
+            dst
+        );
+    }
+    if should_process {
+        summary.directories_created += 1;
+    }
+    // if filtered out, check whether to stop or still traverse
+    if !should_process {
+        match &filter_result {
+            // explicitly excluded by pattern - never traverse (excludes are absolute)
+            common::filter::FilterResult::ExcludedByPattern(_) => {
+                return Ok(());
+            }
+            // no include pattern matched - traverse only if could contain matches
+            common::filter::FilterResult::ExcludedByDefault => {
+                if let Some(ref filter) = settings.filter {
+                    let relative_path = if is_root {
+                        src.file_name().map(std::path::Path::new).unwrap_or(src)
+                    } else {
+                        src.strip_prefix(source_root).unwrap_or(src)
+                    };
+                    let mut should_traverse = false;
+                    for pattern in &filter.includes {
+                        if filter.could_contain_matches(relative_path, pattern) {
+                            should_traverse = true;
+                            break;
+                        }
+                    }
+                    if !should_traverse {
+                        return Ok(());
+                    }
+                } else {
+                    return Ok(());
+                }
+            }
+            // included - will be processed, continue to recurse
+            common::filter::FilterResult::Included => {}
+        }
+    }
+    // recurse into children
+    let mut entries = match tokio::fs::read_dir(src).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("Cannot open directory {src:?} for reading: {e:#}");
+            if settings.fail_early {
+                return Err(e.into());
+            }
+            return Ok(());
+        }
+    };
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(entry)) => {
+                let entry_path = entry.path();
+                let entry_name = entry_path.file_name().unwrap();
+                let dst_path = dst.join(entry_name);
+                if let Err(e) = dry_run_traverse(
+                    settings,
+                    &entry_path,
+                    &dst_path,
+                    source_root,
+                    false,
+                    dry_run_mode,
+                    summary,
+                )
+                .await
+                {
+                    tracing::error!("Failed to traverse {entry_path:?}: {e:#}");
+                    if settings.fail_early {
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::error!("Failed traversing src directory {src:?}: {e:#}");
+                if settings.fail_early {
+                    return Err(e.into());
+                }
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle a dry-run connection: traverse, log entries, and complete without transferring data.
+/// Destination sees an empty copy and completes immediately.
+async fn handle_dry_run_connection(
+    stream: tokio::net::TcpStream,
+    settings: &common::copy::Settings,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    dry_run_mode: common::config::DryRunMode,
+    tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
+) -> anyhow::Result<(String, common::copy::Summary)> {
+    tracing::info!("Handling dry-run connection");
+    // set up TLS if needed
+    let (control_send_stream, mut control_recv_stream): (
+        remote::streams::BoxedSendStream,
+        remote::streams::BoxedRecvStream,
+    ) = if let Some(acceptor) = tls_acceptor {
+        let tls_stream = acceptor.accept(stream).await.context("TLS accept failed")?;
+        let (read_half, write_half) = tokio::io::split(tls_stream);
+        (
+            remote::streams::SendStream::new(Box::new(write_half) as remote::streams::BoxedWrite),
+            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead),
+        )
+    } else {
+        let (read_half, write_half) = stream.into_split();
+        (
+            remote::streams::SendStream::new(Box::new(write_half) as remote::streams::BoxedWrite),
+            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead),
+        )
+    };
+    let control_send_stream: remote::streams::BoxedSharedSendStream =
+        std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
+    // traverse and log dry-run entries (output goes via tracing)
+    let mut summary = common::copy::Summary::default();
+    dry_run_traverse(settings, src, dst, src, true, dry_run_mode, &mut summary).await?;
+    // tell destination we're done with directory structure (nothing was sent in dry-run)
+    {
+        let mut stream = control_send_stream.lock().await;
+        stream
+            .send_control_message(&remote::protocol::SourceMessage::DirStructureComplete {
+                has_root_item: false,
+            })
+            .await?;
+    }
+    tracing::info!("Sent DirStructureComplete, waiting for DestinationDone");
+    // wait for destination to acknowledge it's done
+    loop {
+        match control_recv_stream
+            .recv_object::<remote::protocol::DestinationMessage>()
+            .await?
+        {
+            Some(remote::protocol::DestinationMessage::DestinationDone) => {
+                tracing::info!("Received DestinationDone");
+                break;
+            }
+            Some(other) => {
+                tracing::debug!("Ignoring message during dry-run: {:?}", other);
+            }
+            None => {
+                tracing::debug!("Control stream closed");
+                break;
+            }
+        }
+    }
+    // close streams
+    control_send_stream.lock().await.close().await.ok();
+    tracing::info!("Dry-run complete");
+    // print summary
+    tracing::info!(
+        target: "dry_run",
+        "Summary: {} files ({} bytes), {} directories, {} symlinks would be copied",
+        summary.files_copied,
+        summary.bytes_copied,
+        summary.directories_created,
+        summary.symlinks_created
+    );
+    Ok(("dry-run complete".to_string(), summary))
 }
 
 #[instrument(skip(master_send_stream, cert_key))]
@@ -993,6 +1341,19 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
         Ok(Ok((stream, addr))) => {
             tracing::info!("Destination control connection from {}", addr);
             stream.set_nodelay(true)?;
+            // in dry-run mode, do simplified flow: traverse, log, and tell destination we're done
+            if let Some(dry_run_mode) = settings.dry_run {
+                return handle_dry_run_connection(
+                    stream,
+                    settings,
+                    src,
+                    dst,
+                    dry_run_mode,
+                    tls_acceptor,
+                )
+                .await;
+            }
+            // normal flow
             handle_connection(
                 stream,
                 data_listener,
