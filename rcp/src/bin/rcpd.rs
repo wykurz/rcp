@@ -317,20 +317,25 @@ where
         max_connections: args.max_connections,
         pending_writes_multiplier: args.pending_writes_multiplier,
     };
-    let settings = common::copy::Settings {
-        dereference: args.dereference,
-        fail_early: args.fail_early,
-        overwrite: args.overwrite,
-        overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
-        chunk_size: args.chunk_size,
-        remote_copy_buffer_size: tcp_config.effective_buffer_size(),
-    };
     let rcpd_result = match master_hello {
         remote::protocol::MasterHello::Source {
             src,
             dst,
             dest_cert_fingerprint,
+            filter,
+            dry_run,
         } => {
+            // build settings with filter from MasterHello
+            let settings = common::copy::Settings {
+                dereference: args.dereference,
+                fail_early: args.fail_early,
+                overwrite: args.overwrite,
+                overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
+                chunk_size: args.chunk_size,
+                remote_copy_buffer_size: tcp_config.effective_buffer_size(),
+                filter,
+                dry_run,
+            };
             tracing::info!("Starting source");
             let shared_send = std::sync::Arc::new(tokio::sync::Mutex::new(master_send_stream));
             let result = match source::run_source(
@@ -377,6 +382,17 @@ where
             preserve,
             source_cert_fingerprint,
         } => {
+            // destination doesn't use filter (filtering happens at source)
+            let settings = common::copy::Settings {
+                dereference: args.dereference,
+                fail_early: args.fail_early,
+                overwrite: args.overwrite,
+                overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
+                chunk_size: args.chunk_size,
+                remote_copy_buffer_size: tcp_config.effective_buffer_size(),
+                filter: None,
+                dry_run: None,
+            };
             tracing::info!("Starting destination");
             match destination::run_destination(
                 &source_control_addr,

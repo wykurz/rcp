@@ -21,6 +21,33 @@ struct Args {
     #[arg(short = 'e', long = "fail-early", help_heading = "Removal options")]
     fail_early: bool,
 
+    // Filtering options
+    /// Glob pattern for files to include (can be specified multiple times)
+    ///
+    /// Only files matching at least one include pattern will be removed. Patterns use glob
+    /// syntax: * matches anything except /, ** matches anything including /, ? matches single
+    /// char, [...] for character classes. Leading / anchors to source root, trailing / matches
+    /// only directories. Simple patterns (like *.txt) apply to the source root itself;
+    /// anchored patterns (like /src/**) match paths inside the source.
+    #[arg(long, value_name = "PATTERN", action = clap::ArgAction::Append, help_heading = "Filtering")]
+    include: Vec<String>,
+
+    /// Glob pattern for files to exclude (can be specified multiple times)
+    ///
+    /// Files matching any exclude pattern will be skipped. Excludes are checked before includes.
+    /// Simple patterns (like *.log) can exclude the source root itself; anchored patterns
+    /// (like /build/) only match paths inside the source.
+    #[arg(long, value_name = "PATTERN", action = clap::ArgAction::Append, help_heading = "Filtering")]
+    exclude: Vec<String>,
+
+    /// Read filter patterns from file
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["include", "exclude"], help_heading = "Filtering")]
+    filter_file: Option<std::path::PathBuf>,
+
+    /// Preview mode - show what would be removed without actually removing
+    #[arg(long, value_name = "MODE", help_heading = "Filtering")]
+    dry_run: Option<common::DryRunMode>,
+
     // Progress & output
     /// Show progress
     #[arg(long, help_heading = "Progress & output")]
@@ -122,10 +149,27 @@ struct Args {
 
 #[instrument]
 async fn async_main(args: Args) -> Result<common::rm::Summary> {
+    // build filter settings once before the loop
+    let filter = if let Some(ref path) = args.filter_file {
+        Some(common::filter::FilterSettings::from_file(path)?)
+    } else if !args.include.is_empty() || !args.exclude.is_empty() {
+        let mut filter_settings = common::filter::FilterSettings::new();
+        for p in &args.include {
+            filter_settings.add_include(p)?;
+        }
+        for p in &args.exclude {
+            filter_settings.add_exclude(p)?;
+        }
+        Some(filter_settings)
+    } else {
+        None
+    };
     let mut join_set = tokio::task::JoinSet::new();
     for path in args.paths {
         let settings = common::rm::Settings {
             fail_early: args.fail_early,
+            filter: filter.clone(),
+            dry_run: args.dry_run,
         };
         let do_rm = || async move { common::rm(&path, &settings).await };
         join_set.spawn(do_rm());

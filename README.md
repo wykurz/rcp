@@ -292,6 +292,86 @@ For detailed security architecture and threat model, see `docs/security.md`.
 - by default disabled
 - enabled using `--summary`
 
+## Filtering
+
+All tools support pattern-based filtering with `--include` and `--exclude` flags.
+
+### Pattern Syntax
+
+- `*` matches anything except `/`
+- `**` matches anything including `/` (crosses directories)
+- `?` matches a single character (except `/`)
+- `[...]` character classes (e.g., `[abc]`, `[0-9]`)
+- Leading `/` anchors the pattern to the source root
+- Trailing `/` matches only directories
+
+### Precedence
+
+- **Only `--exclude`**: include everything except matches
+- **Only `--include`**: include only matches (exclude everything else)
+- **Both**: excludes are checked first, then includes
+
+### Examples
+
+```fish
+# Copy only .rs files
+> rcp --include '*.rs' src/ dst/
+
+# Copy everything except log files and the target directory
+> rcp --exclude '*.log' --exclude 'target/' src/ dst/
+
+# Copy only files in the src directory at root level
+> rcp --include '/src/**' project/ backup/
+
+# Use a filter file for complex patterns
+> rcp --filter-file=filters.txt src/ dst/
+```
+
+Filter file format (`filters.txt`):
+```
+# Comments start with #
+--include *.rs
+--include Cargo.toml
+--exclude target/
+--exclude *.log
+```
+
+### Pattern Semantics
+
+**Simple patterns** (like `*.txt`, `*_dir/`) apply to all files at any level, including the source root itself.
+
+**Anchored patterns** (starting with `/`, like `/src/**` or `/bar/*.txt`) match paths *inside* the source, not the source root itself. This allows you to copy a directory while filtering its contents:
+
+```fish
+# Copy project/ but only include the src subdirectory and its contents
+> rcp --include '/src/**' project/ backup/
+# Results in: backup/src/...
+
+# Exclude the build directory inside the source
+> rcp --exclude '/build/' project/ backup/
+```
+
+Note: `/src` matches only the `src` directory entry itself, while `/src/**` matches the directory and all files inside it.
+
+**Path patterns** (containing `/` but not starting with `/`, like `bar/*.txt`) match relative paths inside the source directory.
+
+### Dry-Run Mode
+
+Preview what would happen without making changes:
+
+```fish
+# Show only what would be copied
+> rcp --dry-run=brief --exclude '*.log' src/ dst/
+
+# Also show skipped files
+> rcp --dry-run=all --exclude '*.log' src/ dst/
+
+# Show skipped files with the pattern that caused the skip
+> rcp --dry-run=explain --exclude '*.log' src/ dst/
+```
+
+**Note:** Dry-run mode bypasses `--overwrite` checks and shows all files that would be attempted, regardless of whether the destination already exists. This lets you preview the full scope of a potential operation.
+
 ## Overwrite
 
 `rcp` tools will not-overwrite pre-existing data unless used with the `--overwrite` flag.

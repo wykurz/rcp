@@ -92,8 +92,10 @@ All TCP connections are encrypted and authenticated using TLS 1.3 with self-sign
 **`MasterHello`** (Master → rcpd, bidirectional stream)
 - **Purpose**: Provide configuration and connection details
 - **Variants**:
-  - `Source { src, dst }`: Tells source rcpd what to copy
-  - `Destination { source_control_addr, source_data_addr, server_name, preserve }`: Tells destination where to connect (both control and data addresses)
+  - `Source { src, dst, dest_cert_fingerprint, filter, dry_run }`: Tells source rcpd what to copy
+    - `filter`: Optional filter settings for include/exclude patterns (source-side filtering reduces network traffic)
+    - `dry_run`: Optional dry-run mode (brief, all, or explain) for previewing operations without transferring files
+  - `Destination { source_control_addr, source_data_addr, server_name, preserve, source_cert_fingerprint }`: Tells destination where to connect (both control and data addresses)
 
 **`SourceMasterHello`** (Source → Master, bidirectional stream)
 - **Purpose**: Provide source's TCP server details for destination to connect
@@ -119,7 +121,8 @@ All TCP connections are encrypted and authenticated using TLS 1.3 with self-sign
 
 **`DirStructureComplete`**
 - **Purpose**: Signal that all directories and symlinks have been sent
-- **Usage**: Sent after recursive directory traversal completes. Required before destination can send `DestinationDone`.
+- **Fields**: `has_root_item` (bool) - whether a root file/directory/symlink will be sent
+- **Usage**: Sent after recursive directory traversal completes. Required before destination can send `DestinationDone`. When `has_root_item` is false (dry-run mode or filtered root), destination marks root as complete immediately.
 
 **`FileSkipped`**
 - **Purpose**: Notify destination that a file failed to send
@@ -193,8 +196,12 @@ Root items require special handling to prevent protocol hangs:
 
 **Source side:** If metadata reading fails for a root item (directory or symlink), source MUST
 return an error rather than silently continuing. Otherwise, no messages would be sent for the
-root item, but `DirStructureComplete` would still be sent, leaving destination waiting forever
-for `root_complete` to be set.
+root item, leaving destination waiting forever for `root_complete` to be set.
+
+**Empty source case:** When no root item will be sent (dry-run mode or filtered root item),
+source sets `DirStructureComplete { has_root_item: false }`. Destination uses this flag to
+immediately mark root as complete, allowing graceful shutdown without waiting for a root message
+that will never arrive.
 
 **Destination side:** If a root item fails to process (directory creation fails, symlink creation
 fails), destination MUST set `root_complete = true` before continuing. This ensures `is_done()`
@@ -369,8 +376,9 @@ whether non-directory items can be replaced.
 - If `is_root`: set `root_complete = true` to avoid hang
 - Otherwise: log only (symlinks don't affect file counts)
 
-**On `DirStructureComplete`:**
+**On `DirStructureComplete { has_root_item }`:**
 - Set `structure_complete = true`
+- If `has_root_item` is false: set `root_complete = true` (no root messages will follow)
 - Check if ready to send `DestinationDone`
 
 ## 6. Connection Lifecycle

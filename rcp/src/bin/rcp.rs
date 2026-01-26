@@ -79,6 +79,42 @@ struct Args {
     #[arg(long, value_name = "SETTINGS", help_heading = "Copy options")]
     preserve_settings: Option<String>,
 
+    // Filtering options
+    /// Glob pattern for files to include (can be specified multiple times)
+    ///
+    /// Only files matching at least one include pattern will be copied.
+    /// Patterns use glob syntax: * matches anything except /, ** matches anything including /,
+    /// ? matches single char, [...] for character classes. Leading / anchors to source root,
+    /// trailing / matches only directories. Simple patterns (like *.txt) apply to the source
+    /// root itself; anchored patterns (like /src/**) match paths inside the source.
+    #[arg(long, value_name = "PATTERN", action = clap::ArgAction::Append, help_heading = "Filtering")]
+    include: Vec<String>,
+
+    /// Glob pattern for files to exclude (can be specified multiple times)
+    ///
+    /// Files matching any exclude pattern will be skipped. Excludes are checked before includes.
+    /// Simple patterns (like *.log) can exclude the source root itself; anchored patterns
+    /// (like /build/) only match paths inside the source.
+    #[arg(long, value_name = "PATTERN", action = clap::ArgAction::Append, help_heading = "Filtering")]
+    exclude: Vec<String>,
+
+    /// Read filter patterns from file
+    ///
+    /// Format: one pattern per line with "--include PATTERN" or "--exclude PATTERN".
+    /// Lines starting with # are comments. Mutually exclusive with --include/--exclude.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["include", "exclude"], help_heading = "Filtering")]
+    filter_file: Option<std::path::PathBuf>,
+
+    /// Preview mode - show what would be copied without actually copying
+    ///
+    /// Modes: brief (show only what would be copied), all (also show skipped files),
+    /// explain (show skipped files with the pattern that caused the skip).
+    ///
+    /// Note: dry-run bypasses --overwrite checks and shows all files that would be
+    /// attempted, regardless of whether the destination already exists.
+    #[arg(long, value_name = "MODE", help_heading = "Filtering")]
+    dry_run: Option<common::DryRunMode>,
+
     // Progress & output
     /// Show progress
     #[arg(long, help_heading = "Progress & output")]
@@ -604,6 +640,21 @@ async fn run_rcpd_master(
             tracing::debug!("Destination tracing receiver ended: {e}");
         }
     });
+    // build filter settings from CLI arguments for source-side filtering
+    let filter = if let Some(ref path) = args.filter_file {
+        Some(common::filter::FilterSettings::from_file(path)?)
+    } else if !args.include.is_empty() || !args.exclude.is_empty() {
+        let mut settings = common::filter::FilterSettings::new();
+        for p in &args.include {
+            settings.add_include(p)?;
+        }
+        for p in &args.exclude {
+            settings.add_exclude(p)?;
+        }
+        Some(settings)
+    } else {
+        None
+    };
     // send MasterHello to source rcpd (include dest fingerprint for mutual TLS)
     {
         let _span = tracing::trace_span!("send_master_hello_to_source").entered();
@@ -612,6 +663,8 @@ async fn run_rcpd_master(
                 src: src.path().to_path_buf(),
                 dst: dst.path().to_path_buf(),
                 dest_cert_fingerprint: dest_rcpd.conn_info.fingerprint,
+                filter,
+                dry_run: args.dry_run,
             })
             .await?;
     }
@@ -654,7 +707,7 @@ async fn run_rcpd_master(
     tracing::debug!("Received RcpdResult from both source and destination rcpds");
     // check for failures and collect error details + runtime stats
     let mut errors = Vec::new();
-    let (_source_summary, source_runtime_stats) = match source_result {
+    let (source_summary, source_runtime_stats) = match source_result {
         remote::protocol::RcpdResult::Success {
             message,
             summary,
@@ -716,14 +769,32 @@ async fn run_rcpd_master(
     if !errors.is_empty() {
         let combined_error = errors.join("; ");
         tracing::error!("rcpd operation(s) failed: {combined_error}");
+        // for errors, use whichever summary has data (source for dry-run, dest for normal)
+        let summary = if source_summary.files_copied > 0
+            || source_summary.directories_created > 0
+            || source_summary.symlinks_created > 0
+        {
+            source_summary
+        } else {
+            dest_summary
+        };
         return Err(common::copy::Error::new(
             anyhow::anyhow!("rcpd operation(s) failed: {combined_error}"),
-            dest_summary,
+            summary,
         )
         .into());
     }
-    // return summary from destination (source summary is empty/unused)
-    Ok(dest_summary)
+    // for dry-run, use source summary (source does all traversal/counting)
+    // for normal copy, use destination summary (destination does actual writes)
+    let summary = if source_summary.files_copied > 0
+        || source_summary.directories_created > 0
+        || source_summary.symlinks_created > 0
+    {
+        source_summary
+    } else {
+        dest_summary
+    };
+    Ok(summary)
 }
 
 #[instrument]
@@ -899,6 +970,28 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
             Ok((src_path, dst_path))
         })
         .collect::<anyhow::Result<Vec<(std::path::PathBuf, std::path::PathBuf)>>>()?;
+    // build filter settings from CLI arguments
+    let filter = if let Some(ref path) = args.filter_file {
+        Some(
+            common::filter::FilterSettings::from_file(path)
+                .map_err(|err| common::copy::Error::new(err, Default::default()))?,
+        )
+    } else if !args.include.is_empty() || !args.exclude.is_empty() {
+        let mut settings = common::filter::FilterSettings::new();
+        for p in &args.include {
+            settings
+                .add_include(p)
+                .map_err(|err| common::copy::Error::new(err, Default::default()))?;
+        }
+        for p in &args.exclude {
+            settings
+                .add_exclude(p)
+                .map_err(|err| common::copy::Error::new(err, Default::default()))?;
+        }
+        Some(settings)
+    } else {
+        None
+    };
     let settings = common::copy::Settings {
         dereference: args.dereference,
         fail_early: args.fail_early,
@@ -908,10 +1001,14 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         chunk_size: args.chunk_size.0,
         // for local copy, buffer size is not used (bypasses user-mode buffering)
         remote_copy_buffer_size: 0,
+        filter,
+        dry_run: args.dry_run,
     };
     tracing::debug!("copy settings: {:?}", &settings);
+    let fail_early = settings.fail_early;
     let mut join_set = tokio::task::JoinSet::new();
     for (src_path, dst_path) in src_dst {
+        let settings = settings.clone();
         let do_copy =
             || async move { common::copy(&src_path, &dst_path, &settings, &preserve).await };
         join_set.spawn(do_copy());
@@ -935,7 +1032,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
                 }
             },
             Err(error) => {
-                if settings.fail_early {
+                if fail_early {
                     if args.summary {
                         return Err(anyhow!("{}\n\n{}", error, &copy_summary));
                     }

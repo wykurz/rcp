@@ -195,7 +195,9 @@ pub enum SourceMessage {
     },
     /// Signal that all directories and symlinks have been sent.
     /// Required before destination can send `DestinationDone`.
-    DirStructureComplete,
+    /// `has_root_item` indicates whether a root file/directory/symlink will be sent.
+    /// When false (dry-run or filtered root), destination can mark root as complete.
+    DirStructureComplete { has_root_item: bool },
     /// Notify destination that a file failed to send.
     /// Includes `dir_total_files` so destination can track file counts.
     FileSkipped {
@@ -404,6 +406,10 @@ pub enum MasterHello {
         dst: std::path::PathBuf,
         /// Destination's TLS certificate fingerprint (None if encryption disabled)
         dest_cert_fingerprint: Option<CertFingerprint>,
+        /// Filter settings for include/exclude patterns (source-side filtering)
+        filter: Option<common::filter::FilterSettings>,
+        /// Dry-run mode for previewing operations
+        dry_run: Option<common::config::DryRunMode>,
     },
     Destination {
         /// TCP address for control connection to source
