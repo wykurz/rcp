@@ -340,22 +340,38 @@ async fn rm_internal(
         return Err(Error::new(anyhow!("rm: {:?} failed!", &path), rm_summary));
     }
     tracing::debug!("finally remove the empty directory");
+    // when filtering is active, only remove directory if:
+    // 1. something was actually removed from it (had matching content), AND
+    // 2. nothing was skipped (would be empty after operation)
+    // this prevents removing empty directories that were only traversed to look for matches
+    let anything_removed = rm_summary.files_removed > 0
+        || rm_summary.symlinks_removed > 0
+        || rm_summary.directories_removed > 0;
+    let anything_skipped = rm_summary.files_skipped > 0
+        || rm_summary.symlinks_skipped > 0
+        || rm_summary.directories_skipped > 0;
     // handle dry-run mode for directories
     if settings.dry_run.is_some() {
-        // when filtering is active and items were skipped, the directory won't actually
-        // be empty after the operation, so we shouldn't report it as removed
-        let would_be_empty = rm_summary.files_skipped == 0
-            && rm_summary.symlinks_skipped == 0
-            && rm_summary.directories_skipped == 0;
-        if settings.filter.is_some() && !would_be_empty {
+        if settings.filter.is_some() && (!anything_removed || anything_skipped) {
             tracing::debug!(
-                "dry-run: directory {:?} would not be empty after filtering, not counting as removed",
-                &path
+                "dry-run: directory {:?} would not be removed (removed={}, skipped={})",
+                &path,
+                anything_removed,
+                anything_skipped
             );
         } else {
             report_dry_run_rm(path, "dir");
             rm_summary.directories_removed += 1;
         }
+        return Ok(rm_summary);
+    }
+    // when using include filters, only attempt to remove directory if something was removed
+    // from it; skip directories that were only traversed to look for matches
+    if settings.filter.is_some() && !anything_removed {
+        tracing::debug!(
+            "directory {:?} had nothing removed, leaving it intact",
+            &path
+        );
         return Ok(rm_summary);
     }
     // when using include filters, directories may not be empty because we only
@@ -706,6 +722,91 @@ mod tests {
                 test_path.join("foo").exists(),
                 "foo directory should still exist (contains bar)"
             );
+            Ok(())
+        }
+        /// Test that empty directories are not removed when they were only traversed to look
+        /// for matches (regression test for bug where --include='foo' would remove empty dir baz).
+        #[tokio::test]
+        #[traced_test]
+        async fn test_empty_dir_not_removed_when_only_traversed() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            // create structure:
+            // test/
+            //   foo (file)
+            //   bar (file)
+            //   baz/ (empty directory)
+            tokio::fs::write(test_path.join("foo"), "content").await?;
+            tokio::fs::write(test_path.join("bar"), "content").await?;
+            tokio::fs::create_dir(test_path.join("baz")).await?;
+            // include only 'foo' file
+            let mut filter = FilterSettings::new();
+            filter.add_include("foo").unwrap();
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: Some(filter),
+                    dry_run: None,
+                },
+            )
+            .await?;
+            // only 'foo' should be removed
+            assert_eq!(summary.files_removed, 1, "should remove only 'foo' file");
+            assert_eq!(
+                summary.directories_removed, 0,
+                "should NOT remove empty 'baz' directory"
+            );
+            // verify foo was removed
+            assert!(!test_path.join("foo").exists(), "foo should be removed");
+            // verify bar still exists (not matching include pattern)
+            assert!(test_path.join("bar").exists(), "bar should still exist");
+            // verify empty baz directory still exists
+            assert!(
+                test_path.join("baz").exists(),
+                "empty baz directory should NOT be removed"
+            );
+            Ok(())
+        }
+        /// Test that empty directories are not removed in dry-run mode when only traversed.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_dry_run_empty_dir_not_reported_as_removed() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            // create structure:
+            // test/
+            //   foo (file)
+            //   bar (file)
+            //   baz/ (empty directory)
+            tokio::fs::write(test_path.join("foo"), "content").await?;
+            tokio::fs::write(test_path.join("bar"), "content").await?;
+            tokio::fs::create_dir(test_path.join("baz")).await?;
+            // include only 'foo' file
+            let mut filter = FilterSettings::new();
+            filter.add_include("foo").unwrap();
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: Some(filter),
+                    dry_run: Some(DryRunMode::Explain),
+                },
+            )
+            .await?;
+            // only 'foo' should be reported as would-be-removed
+            assert_eq!(
+                summary.files_removed, 1,
+                "should report only 'foo' would be removed"
+            );
+            assert_eq!(
+                summary.directories_removed, 0,
+                "should NOT report empty 'baz' would be removed"
+            );
+            // verify nothing was actually removed (dry-run mode)
+            assert!(test_path.join("foo").exists(), "foo should still exist");
+            assert!(test_path.join("bar").exists(), "bar should still exist");
+            assert!(test_path.join("baz").exists(), "baz should still exist");
             Ok(())
         }
     }
