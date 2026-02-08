@@ -5,7 +5,9 @@ use tracing::instrument;
 
 use crate::config::DryRunMode;
 use crate::copy;
-use crate::copy::{Settings as CopySettings, Summary as CopySummary};
+use crate::copy::{
+    check_empty_dir_cleanup, EmptyDirAction, Settings as CopySettings, Summary as CopySummary,
+};
 use crate::filecmp;
 use crate::filter::{FilterResult, FilterSettings};
 use crate::preserve;
@@ -531,6 +533,9 @@ async fn link_internal(
             ..Default::default()
         }
     };
+    // track whether we created this directory (vs it already existing)
+    // this is used later to decide if we should clean up an empty directory
+    let we_created_this_dir = copy_summary.directories_created == 1;
     let mut link_summary = Summary {
         copy_summary,
         ..Default::default()
@@ -714,6 +719,58 @@ async fn link_internal(
             Err(error) => {
                 if settings.copy_settings.fail_early {
                     return Err(Error::new(error.into(), link_summary));
+                }
+            }
+        }
+    }
+    // when filtering is active and we created this directory, check if anything was actually
+    // linked/copied into it. if nothing was linked, we may need to clean up the empty directory.
+    let this_dir_count = usize::from(we_created_this_dir);
+    let child_dirs_created = link_summary
+        .copy_summary
+        .directories_created
+        .saturating_sub(this_dir_count);
+    let anything_linked = link_summary.hard_links_created > 0
+        || link_summary.copy_summary.files_copied > 0
+        || link_summary.copy_summary.symlinks_created > 0
+        || child_dirs_created > 0;
+    let relative_path = src.strip_prefix(source_root).unwrap_or(src);
+    let is_root = src == source_root;
+    match check_empty_dir_cleanup(
+        settings.filter.as_ref(),
+        we_created_this_dir,
+        anything_linked,
+        relative_path,
+        is_root,
+        settings.dry_run.is_some(),
+    ) {
+        EmptyDirAction::Keep => { /* proceed with metadata application */ }
+        EmptyDirAction::DryRunSkip => {
+            tracing::debug!(
+                "dry-run: directory {:?} would not be created (nothing to link inside)",
+                &dst
+            );
+            link_summary.copy_summary.directories_created = 0;
+            return Ok(link_summary);
+        }
+        EmptyDirAction::Remove => {
+            tracing::debug!(
+                "directory {:?} has nothing to link inside, removing empty directory",
+                &dst
+            );
+            match tokio::fs::remove_dir(dst).await {
+                Ok(()) => {
+                    link_summary.copy_summary.directories_created = 0;
+                    return Ok(link_summary);
+                }
+                Err(err) => {
+                    // removal failed (not empty, permission error, etc.) — keep directory
+                    tracing::debug!(
+                        "failed to remove empty directory {:?}: {:#}, keeping",
+                        &dst,
+                        &err
+                    );
+                    // fall through to apply metadata
                 }
             }
         }
@@ -1753,6 +1810,277 @@ mod link_tests {
             assert!(
                 !test_path.join("dst/bar").exists(),
                 "bar directory should not be linked"
+            );
+            Ok(())
+        }
+        /// Test that empty directories are not created when they were only traversed to look
+        /// for matches (regression test for bug where --include='foo' would create empty dir baz).
+        #[tokio::test]
+        #[traced_test]
+        async fn test_empty_dir_not_created_when_only_traversed() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            // create structure:
+            // src/
+            //   foo (file)
+            //   bar (file)
+            //   baz/ (empty directory)
+            let src_path = test_path.join("src");
+            tokio::fs::create_dir(&src_path).await?;
+            tokio::fs::write(src_path.join("foo"), "content").await?;
+            tokio::fs::write(src_path.join("bar"), "content").await?;
+            tokio::fs::create_dir(src_path.join("baz")).await?;
+            // include only 'foo' file
+            let mut filter = FilterSettings::new();
+            filter.add_include("foo").unwrap();
+            let summary = link(
+                &PROGRESS,
+                &test_path,
+                &src_path,
+                &test_path.join("dst"),
+                &None,
+                &Settings {
+                    copy_settings: copy::Settings {
+                        dereference: false,
+                        fail_early: false,
+                        overwrite: false,
+                        overwrite_compare: Default::default(),
+                        chunk_size: 0,
+                        remote_copy_buffer_size: 0,
+                        filter: None,
+                        dry_run: None,
+                    },
+                    update_compare: Default::default(),
+                    update_exclusive: false,
+                    filter: Some(filter),
+                    dry_run: None,
+                },
+                false,
+            )
+            .await?;
+            // only 'foo' should be linked
+            assert_eq!(summary.hard_links_created, 1, "should link only 'foo' file");
+            assert_eq!(
+                summary.copy_summary.directories_created, 1,
+                "should create only root directory (not empty 'baz')"
+            );
+            // verify foo was linked
+            assert!(
+                test_path.join("dst").join("foo").exists(),
+                "foo should be linked"
+            );
+            // verify bar was not linked (not matching include pattern)
+            assert!(
+                !test_path.join("dst").join("bar").exists(),
+                "bar should not be linked"
+            );
+            // verify empty baz directory was NOT created
+            assert!(
+                !test_path.join("dst").join("baz").exists(),
+                "empty baz directory should NOT be created"
+            );
+            Ok(())
+        }
+        /// Test that directories with only non-matching content are not created at destination.
+        /// This is different from empty directories - the source dir has content but none matches.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_dir_with_nonmatching_content_not_created() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            // create structure:
+            // src/
+            //   foo (file)
+            //   baz/
+            //     qux (file - doesn't match 'foo')
+            //     quux (file - doesn't match 'foo')
+            let src_path = test_path.join("src");
+            tokio::fs::create_dir(&src_path).await?;
+            tokio::fs::write(src_path.join("foo"), "content").await?;
+            tokio::fs::create_dir(src_path.join("baz")).await?;
+            tokio::fs::write(src_path.join("baz").join("qux"), "content").await?;
+            tokio::fs::write(src_path.join("baz").join("quux"), "content").await?;
+            // include only 'foo' file
+            let mut filter = FilterSettings::new();
+            filter.add_include("foo").unwrap();
+            let summary = link(
+                &PROGRESS,
+                &test_path,
+                &src_path,
+                &test_path.join("dst"),
+                &None,
+                &Settings {
+                    copy_settings: copy::Settings {
+                        dereference: false,
+                        fail_early: false,
+                        overwrite: false,
+                        overwrite_compare: Default::default(),
+                        chunk_size: 0,
+                        remote_copy_buffer_size: 0,
+                        filter: None,
+                        dry_run: None,
+                    },
+                    update_compare: Default::default(),
+                    update_exclusive: false,
+                    filter: Some(filter),
+                    dry_run: None,
+                },
+                false,
+            )
+            .await?;
+            // only 'foo' should be linked
+            assert_eq!(summary.hard_links_created, 1, "should link only 'foo' file");
+            assert_eq!(
+                summary.copy_summary.files_skipped, 2,
+                "should skip 2 files (qux and quux)"
+            );
+            assert_eq!(
+                summary.copy_summary.directories_created, 1,
+                "should create only root directory (not 'baz' with non-matching content)"
+            );
+            // verify foo was linked
+            assert!(
+                test_path.join("dst").join("foo").exists(),
+                "foo should be linked"
+            );
+            // verify baz directory was NOT created (even though source baz has content)
+            assert!(
+                !test_path.join("dst").join("baz").exists(),
+                "baz directory should NOT be created (no matching content inside)"
+            );
+            Ok(())
+        }
+        /// Test that empty directories are not reported as created in dry-run mode
+        /// when they were only traversed.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_dry_run_empty_dir_not_reported_as_created() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            // create structure:
+            // src/
+            //   foo (file)
+            //   bar (file)
+            //   baz/ (empty directory)
+            let src_path = test_path.join("src");
+            tokio::fs::create_dir(&src_path).await?;
+            tokio::fs::write(src_path.join("foo"), "content").await?;
+            tokio::fs::write(src_path.join("bar"), "content").await?;
+            tokio::fs::create_dir(src_path.join("baz")).await?;
+            // include only 'foo' file
+            let mut filter = FilterSettings::new();
+            filter.add_include("foo").unwrap();
+            let summary = link(
+                &PROGRESS,
+                &test_path,
+                &src_path,
+                &test_path.join("dst"),
+                &None,
+                &Settings {
+                    copy_settings: copy::Settings {
+                        dereference: false,
+                        fail_early: false,
+                        overwrite: false,
+                        overwrite_compare: Default::default(),
+                        chunk_size: 0,
+                        remote_copy_buffer_size: 0,
+                        filter: None,
+                        dry_run: None,
+                    },
+                    update_compare: Default::default(),
+                    update_exclusive: false,
+                    filter: Some(filter),
+                    dry_run: Some(crate::config::DryRunMode::Explain),
+                },
+                false,
+            )
+            .await?;
+            // only 'foo' should be reported as would-be-linked
+            assert_eq!(
+                summary.hard_links_created, 1,
+                "should report only 'foo' would be linked"
+            );
+            assert_eq!(
+                summary.copy_summary.directories_created, 1,
+                "should report only root directory would be created (not empty 'baz')"
+            );
+            // verify nothing was actually created (dry-run mode)
+            assert!(
+                !test_path.join("dst").exists(),
+                "dst should not exist in dry-run"
+            );
+            Ok(())
+        }
+        /// Test that existing directories are NOT removed when using --overwrite,
+        /// even if nothing is linked into them due to filters.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_existing_dir_not_removed_with_overwrite() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            // create source structure:
+            // src/
+            //   foo (file)
+            //   bar (file)
+            //   baz/ (empty directory)
+            let src_path = test_path.join("src");
+            tokio::fs::create_dir(&src_path).await?;
+            tokio::fs::write(src_path.join("foo"), "content").await?;
+            tokio::fs::write(src_path.join("bar"), "content").await?;
+            tokio::fs::create_dir(src_path.join("baz")).await?;
+            // create destination with baz directory already existing
+            let dst_path = test_path.join("dst");
+            tokio::fs::create_dir(&dst_path).await?;
+            tokio::fs::create_dir(dst_path.join("baz")).await?;
+            // add a marker file inside dst/baz to verify we don't touch it
+            tokio::fs::write(dst_path.join("baz").join("marker.txt"), "existing").await?;
+            // include only 'foo' file - baz should not match
+            let mut filter = FilterSettings::new();
+            filter.add_include("foo").unwrap();
+            let summary = link(
+                &PROGRESS,
+                &test_path,
+                &src_path,
+                &dst_path,
+                &None,
+                &Settings {
+                    copy_settings: copy::Settings {
+                        dereference: false,
+                        fail_early: false,
+                        overwrite: true, // enable overwrite mode
+                        overwrite_compare: Default::default(),
+                        chunk_size: 0,
+                        remote_copy_buffer_size: 0,
+                        filter: None,
+                        dry_run: None,
+                    },
+                    update_compare: Default::default(),
+                    update_exclusive: false,
+                    filter: Some(filter),
+                    dry_run: None,
+                },
+                false,
+            )
+            .await?;
+            // foo should be linked
+            assert_eq!(summary.hard_links_created, 1, "should link only 'foo' file");
+            // dst and baz should be unchanged (both already existed)
+            assert_eq!(
+                summary.copy_summary.directories_unchanged, 2,
+                "root dst and baz directories should be unchanged"
+            );
+            assert_eq!(
+                summary.copy_summary.directories_created, 0,
+                "should not create any directories"
+            );
+            // verify foo was linked
+            assert!(dst_path.join("foo").exists(), "foo should be linked");
+            // verify bar was NOT linked
+            assert!(!dst_path.join("bar").exists(), "bar should not be linked");
+            // verify existing baz directory still exists with its content
+            assert!(
+                dst_path.join("baz").exists(),
+                "existing baz directory should still exist"
+            );
+            assert!(
+                dst_path.join("baz").join("marker.txt").exists(),
+                "existing content in baz should still exist"
             );
             Ok(())
         }

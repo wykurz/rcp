@@ -156,6 +156,10 @@ impl FilterSettings {
     pub fn is_empty(&self) -> bool {
         self.includes.is_empty() && self.excludes.is_empty()
     }
+    /// Check if this filter has any include patterns
+    pub fn has_includes(&self) -> bool {
+        !self.includes.is_empty()
+    }
     /// Determine if a root item (the source itself) should be included based on filter patterns.
     ///
     /// This is a specialized version of `should_include` for root items (the source directory
@@ -245,6 +249,26 @@ impl FilterSettings {
         }
         // no includes specified and not excluded = included
         FilterResult::Included
+    }
+    /// Check if a path directly matches any include pattern (not just could_contain_matches).
+    /// Used to determine if an empty directory should be kept.
+    ///
+    /// Returns true if:
+    /// - No include patterns exist (everything is directly included)
+    /// - At least one include pattern directly matches the path
+    ///
+    /// Returns false if:
+    /// - Include patterns exist but none match the path (directory was only traversed)
+    pub fn directly_matches_include(&self, relative_path: &std::path::Path, is_dir: bool) -> bool {
+        if self.includes.is_empty() {
+            return true; // no includes = everything directly included
+        }
+        for pattern in &self.includes {
+            if pattern.matches(relative_path, is_dir) {
+                return true;
+            }
+        }
+        false
     }
     /// Check if a directory could potentially contain files matching the pattern
     pub fn could_contain_matches(&self, dir_path: &Path, pattern: &FilterPattern) -> bool {
@@ -556,6 +580,21 @@ mod tests {
         assert!(!with_exclude.is_empty());
     }
     #[test]
+    fn test_has_includes() {
+        let empty = FilterSettings::new();
+        assert!(!empty.has_includes());
+        let mut with_include = FilterSettings::new();
+        with_include.add_include("*.rs").unwrap();
+        assert!(with_include.has_includes());
+        let mut with_exclude = FilterSettings::new();
+        with_exclude.add_exclude("*.log").unwrap();
+        assert!(!with_exclude.has_includes());
+        let mut with_both = FilterSettings::new();
+        with_both.add_include("*.rs").unwrap();
+        with_both.add_exclude("*.log").unwrap();
+        assert!(with_both.has_includes());
+    }
+    #[test]
     fn test_filename_match_for_simple_patterns() {
         // simple patterns (no /) should match the filename anywhere in the path
         let pattern = FilterPattern::parse("*.rs").unwrap();
@@ -788,5 +827,58 @@ mod tests {
         );
         assert_eq!(FilterSettings::extract_literal_prefix("bar"), "bar");
         assert_eq!(FilterSettings::extract_literal_prefix("src[0-9]/*.rs"), "");
+    }
+    #[test]
+    fn test_directly_matches_include_simple_pattern() {
+        // simple pattern like *.txt matches file
+        let mut settings = FilterSettings::new();
+        settings.add_include("*.txt").unwrap();
+        // should match files with .txt extension
+        assert!(settings.directly_matches_include(Path::new("foo.txt"), false));
+        assert!(settings.directly_matches_include(Path::new("bar/foo.txt"), false));
+        // should not match other files
+        assert!(!settings.directly_matches_include(Path::new("foo.rs"), false));
+        // directories don't match file patterns
+        assert!(!settings.directly_matches_include(Path::new("txt"), true));
+    }
+    #[test]
+    fn test_directly_matches_include_anchored_pattern() {
+        // anchored /foo matches at root only
+        let mut settings = FilterSettings::new();
+        settings.add_include("/foo").unwrap();
+        // should match at root
+        assert!(settings.directly_matches_include(Path::new("foo"), true));
+        assert!(settings.directly_matches_include(Path::new("foo"), false));
+        // should not match nested
+        assert!(!settings.directly_matches_include(Path::new("bar/foo"), true));
+    }
+    #[test]
+    fn test_directly_matches_include_empty_includes() {
+        // returns true when no includes
+        let settings = FilterSettings::new();
+        assert!(settings.directly_matches_include(Path::new("anything"), true));
+        assert!(settings.directly_matches_include(Path::new("foo/bar"), false));
+    }
+    #[test]
+    fn test_directly_matches_include_path_pattern() {
+        // path pattern like src/*.rs
+        let mut settings = FilterSettings::new();
+        settings.add_include("src/*.rs").unwrap();
+        // should match paths in src/
+        assert!(settings.directly_matches_include(Path::new("src/foo.rs"), false));
+        // should not match at root or other paths
+        assert!(!settings.directly_matches_include(Path::new("foo.rs"), false));
+        assert!(!settings.directly_matches_include(Path::new("other/foo.rs"), false));
+    }
+    #[test]
+    fn test_directly_matches_include_dir_only_pattern() {
+        // directory-only pattern target/
+        let mut settings = FilterSettings::new();
+        settings.add_include("target/").unwrap();
+        // should match directories named target
+        assert!(settings.directly_matches_include(Path::new("target"), true));
+        assert!(settings.directly_matches_include(Path::new("foo/target"), true));
+        // should not match files
+        assert!(!settings.directly_matches_include(Path::new("target"), false));
     }
 }

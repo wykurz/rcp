@@ -340,17 +340,37 @@ async fn rm_internal(
         return Err(Error::new(anyhow!("rm: {:?} failed!", &path), rm_summary));
     }
     tracing::debug!("finally remove the empty directory");
-    // handle dry-run mode for directories
+    let anything_removed = rm_summary.files_removed > 0
+        || rm_summary.symlinks_removed > 0
+        || rm_summary.directories_removed > 0;
+    let anything_skipped = rm_summary.files_skipped > 0
+        || rm_summary.symlinks_skipped > 0
+        || rm_summary.directories_skipped > 0;
+    // a directory is "traversed only" when include filters are active, nothing was removed
+    // from it, and the directory itself doesn't directly match an include pattern. such
+    // directories were only entered to search for matching content inside and should be
+    // left intact. directories that directly match an include pattern (e.g. --include target/)
+    // should be removed even if empty. exclude-only filters never produce traversed-only
+    // directories because directly_matches_include returns true when no includes exist.
+    let relative_path = path.strip_prefix(source_root).unwrap_or(path);
+    let traversed_only = !anything_removed
+        && settings
+            .filter
+            .as_ref()
+            .is_some_and(|f| f.has_includes() && !f.directly_matches_include(relative_path, true));
+    // handle dry-run mode for directories.
+    // `traversed_only` catches dirs only entered to search for include pattern matches.
+    // `anything_skipped` catches dirs that would still have content after partial removal
+    // (applies to both include and exclude filters).
+    // the real-mode path below only needs `traversed_only` because the subsequent `remove_dir`
+    // call handles the non-empty case via ENOTEMPTY.
     if settings.dry_run.is_some() {
-        // when filtering is active and items were skipped, the directory won't actually
-        // be empty after the operation, so we shouldn't report it as removed
-        let would_be_empty = rm_summary.files_skipped == 0
-            && rm_summary.symlinks_skipped == 0
-            && rm_summary.directories_skipped == 0;
-        if settings.filter.is_some() && !would_be_empty {
+        if traversed_only || anything_skipped {
             tracing::debug!(
-                "dry-run: directory {:?} would not be empty after filtering, not counting as removed",
-                &path
+                "dry-run: directory {:?} would not be removed (removed={}, skipped={})",
+                &path,
+                anything_removed,
+                anything_skipped
             );
         } else {
             report_dry_run_rm(path, "dir");
@@ -358,16 +378,27 @@ async fn rm_internal(
         }
         return Ok(rm_summary);
     }
-    // when using include filters, directories may not be empty because we only
-    // removed matching files; only remove the directory if it's actually empty
+    // skip directories that were only traversed to look for include matches.
+    // not needed for exclude-only filters or directly-matched directories.
+    // non-empty directories are handled by the ENOTEMPTY check below.
+    if traversed_only {
+        tracing::debug!(
+            "directory {:?} had nothing removed, leaving it intact",
+            &path
+        );
+        return Ok(rm_summary);
+    }
+    // when filtering is active, directories may not be empty because we only removed
+    // matching files (includes) or skipped excluded files; use remove_dir (not remove_dir_all)
+    // so non-empty directories fail gracefully with ENOTEMPTY
     match tokio::fs::remove_dir(path).await {
         Ok(()) => {
             prog_track.directories_removed.inc();
             rm_summary.directories_removed += 1;
         }
         Err(err) if settings.filter.is_some() => {
-            // with include filters, it's expected that directories may not be empty
-            // because we only removed matching files; raw_os_error 39 is ENOTEMPTY on Linux
+            // with filtering, it's expected that directories may not be empty because we only
+            // removed matching files; raw_os_error 39 is ENOTEMPTY on Linux
             if err.kind() == std::io::ErrorKind::DirectoryNotEmpty || err.raw_os_error() == Some(39)
             {
                 tracing::debug!(
@@ -708,6 +739,174 @@ mod tests {
             );
             Ok(())
         }
+        /// Test that empty directories are not removed when they were only traversed to look
+        /// for matches (regression test for bug where --include='foo' would remove empty dir baz).
+        #[tokio::test]
+        #[traced_test]
+        async fn test_empty_dir_not_removed_when_only_traversed() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            // create structure:
+            // test/
+            //   foo (file)
+            //   bar (file)
+            //   baz/ (empty directory)
+            tokio::fs::write(test_path.join("foo"), "content").await?;
+            tokio::fs::write(test_path.join("bar"), "content").await?;
+            tokio::fs::create_dir(test_path.join("baz")).await?;
+            // include only 'foo' file
+            let mut filter = FilterSettings::new();
+            filter.add_include("foo").unwrap();
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: Some(filter),
+                    dry_run: None,
+                },
+            )
+            .await?;
+            // only 'foo' should be removed
+            assert_eq!(summary.files_removed, 1, "should remove only 'foo' file");
+            assert_eq!(
+                summary.directories_removed, 0,
+                "should NOT remove empty 'baz' directory"
+            );
+            // verify foo was removed
+            assert!(!test_path.join("foo").exists(), "foo should be removed");
+            // verify bar still exists (not matching include pattern)
+            assert!(test_path.join("bar").exists(), "bar should still exist");
+            // verify empty baz directory still exists
+            assert!(
+                test_path.join("baz").exists(),
+                "empty baz directory should NOT be removed"
+            );
+            Ok(())
+        }
+        /// Test that empty directories ARE removed with exclude-only filters.
+        /// Unlike include filters (where empty dirs are only traversed for matches),
+        /// exclude-only filters should not prevent removal of empty directories.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_exclude_only_removes_empty_directory() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            // create structure:
+            // test/
+            //   foo (file)
+            //   bar.log (file)
+            //   baz/ (empty directory)
+            tokio::fs::write(test_path.join("foo"), "content").await?;
+            tokio::fs::write(test_path.join("bar.log"), "content").await?;
+            tokio::fs::create_dir(test_path.join("baz")).await?;
+            // exclude only .log files
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("*.log").unwrap();
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: Some(filter),
+                    dry_run: None,
+                },
+            )
+            .await?;
+            // foo should be removed, bar.log should be skipped, baz/ should be removed
+            assert_eq!(summary.files_removed, 1, "should remove 'foo'");
+            assert_eq!(summary.files_skipped, 1, "should skip 'bar.log'");
+            assert_eq!(
+                summary.directories_removed, 1,
+                "should remove empty 'baz' directory"
+            );
+            assert!(!test_path.join("foo").exists(), "foo should be removed");
+            assert!(
+                test_path.join("bar.log").exists(),
+                "bar.log should still exist"
+            );
+            assert!(
+                !test_path.join("baz").exists(),
+                "empty baz directory should be removed"
+            );
+            Ok(())
+        }
+        /// Test that empty directories are not removed in dry-run mode when only traversed.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_dry_run_empty_dir_not_reported_as_removed() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            // create structure:
+            // test/
+            //   foo (file)
+            //   bar (file)
+            //   baz/ (empty directory)
+            tokio::fs::write(test_path.join("foo"), "content").await?;
+            tokio::fs::write(test_path.join("bar"), "content").await?;
+            tokio::fs::create_dir(test_path.join("baz")).await?;
+            // include only 'foo' file
+            let mut filter = FilterSettings::new();
+            filter.add_include("foo").unwrap();
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: Some(filter),
+                    dry_run: Some(DryRunMode::Explain),
+                },
+            )
+            .await?;
+            // only 'foo' should be reported as would-be-removed
+            assert_eq!(
+                summary.files_removed, 1,
+                "should report only 'foo' would be removed"
+            );
+            assert_eq!(
+                summary.directories_removed, 0,
+                "should NOT report empty 'baz' would be removed"
+            );
+            // verify nothing was actually removed (dry-run mode)
+            assert!(test_path.join("foo").exists(), "foo should still exist");
+            assert!(test_path.join("bar").exists(), "bar should still exist");
+            assert!(test_path.join("baz").exists(), "baz should still exist");
+            Ok(())
+        }
+        /// Test that an empty directory directly matching an include pattern IS removed.
+        /// Unlike traversed-only directories, directly matched ones are explicit targets.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_include_directly_matched_empty_dir_is_removed() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            // create structure:
+            // test/
+            //   foo (file)
+            //   baz/ (empty directory)
+            tokio::fs::write(test_path.join("foo"), "content").await?;
+            tokio::fs::create_dir(test_path.join("baz")).await?;
+            // include pattern that directly matches the directory
+            let mut filter = FilterSettings::new();
+            filter.add_include("baz/").unwrap();
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: Some(filter),
+                    dry_run: None,
+                },
+            )
+            .await?;
+            assert_eq!(
+                summary.directories_removed, 1,
+                "should remove directly matched empty 'baz' directory"
+            );
+            assert_eq!(summary.files_removed, 0, "should not remove 'foo'");
+            assert!(test_path.join("foo").exists(), "foo should still exist");
+            assert!(
+                !test_path.join("baz").exists(),
+                "directly matched empty baz directory should be removed"
+            );
+            Ok(())
+        }
     }
     mod dry_run_tests {
         use super::*;
@@ -814,6 +1013,92 @@ mod tests {
                 summary.directories_skipped, 1,
                 "should report bar directory skipped"
             );
+            Ok(())
+        }
+        /// Test that dry-run with exclude-only filter correctly reports empty directories
+        /// as would-be-removed (unlike include filters where empty dirs are only traversed).
+        #[tokio::test]
+        #[traced_test]
+        async fn test_dry_run_exclude_only_reports_empty_dir_removed() -> Result<(), anyhow::Error>
+        {
+            let test_path = testutils::create_temp_dir().await?;
+            // create structure:
+            // test/
+            //   foo (file)
+            //   bar.log (file)
+            //   baz/ (empty directory)
+            tokio::fs::write(test_path.join("foo"), "content").await?;
+            tokio::fs::write(test_path.join("bar.log"), "content").await?;
+            tokio::fs::create_dir(test_path.join("baz")).await?;
+            // exclude only .log files
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("*.log").unwrap();
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: Some(filter),
+                    dry_run: Some(DryRunMode::Explain),
+                },
+            )
+            .await?;
+            // foo should be reported as would-be-removed, bar.log skipped, baz/ removed
+            assert_eq!(
+                summary.files_removed, 1,
+                "should report 'foo' would be removed"
+            );
+            assert_eq!(
+                summary.files_skipped, 1,
+                "should report 'bar.log' would be skipped"
+            );
+            assert_eq!(
+                summary.directories_removed, 1,
+                "should report empty 'baz' directory would be removed"
+            );
+            // verify nothing was actually removed (dry-run mode)
+            assert!(test_path.join("foo").exists(), "foo should still exist");
+            assert!(
+                test_path.join("bar.log").exists(),
+                "bar.log should still exist"
+            );
+            assert!(test_path.join("baz").exists(), "baz should still exist");
+            Ok(())
+        }
+        /// Test that dry-run correctly reports removal of an empty directory that directly
+        /// matches an include pattern (not merely traversed).
+        #[tokio::test]
+        #[traced_test]
+        async fn test_dry_run_include_directly_matched_empty_dir_reported(
+        ) -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            // create structure:
+            // test/
+            //   foo (file)
+            //   baz/ (empty directory)
+            tokio::fs::write(test_path.join("foo"), "content").await?;
+            tokio::fs::create_dir(test_path.join("baz")).await?;
+            // include pattern that directly matches the directory
+            let mut filter = FilterSettings::new();
+            filter.add_include("baz/").unwrap();
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: Some(filter),
+                    dry_run: Some(DryRunMode::Explain),
+                },
+            )
+            .await?;
+            assert_eq!(
+                summary.directories_removed, 1,
+                "should report directly matched empty 'baz' would be removed"
+            );
+            assert_eq!(summary.files_removed, 0, "should not report 'foo'");
+            // verify nothing was actually removed (dry-run mode)
+            assert!(test_path.join("foo").exists(), "foo should still exist");
+            assert!(test_path.join("baz").exists(), "baz should still exist");
             Ok(())
         }
     }

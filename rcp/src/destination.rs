@@ -444,17 +444,31 @@ async fn process_incoming_file_streams_tcp(
     Ok(())
 }
 
+/// Result of directory creation attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryCreateResult {
+    /// directory was created by us (new)
+    Created,
+    /// directory already existed (reused)
+    AlreadyExisted,
+    /// failed to create directory
+    Failed,
+}
+
 /// Create a directory, handling overwrite logic.
-/// Returns Ok(true) if directory was created/exists, Ok(false) if failed.
+/// Returns the result indicating whether directory was created, reused, or failed.
+/// Note: does NOT increment progress counters - caller is responsible for that
+/// (so we can defer the increment until we know whether to keep the directory).
 async fn create_directory(
     settings: &common::copy::Settings,
     dst: &std::path::Path,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<DirectoryCreateResult> {
     let prog = progress();
     match tokio::fs::create_dir(dst).await {
         Ok(()) => {
-            prog.directories_created.inc();
-            Ok(true)
+            // don't increment counter here - will be done in complete_directory
+            // when we know we're keeping this directory
+            Ok(DirectoryCreateResult::Created)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // something exists at destination - check what it is
@@ -463,7 +477,7 @@ async fn create_directory(
                 // directory already exists - reuse it (no overwrite needed for directories)
                 tracing::debug!("destination directory already exists, reusing it");
                 prog.directories_unchanged.inc();
-                Ok(true)
+                Ok(DirectoryCreateResult::AlreadyExisted)
             } else if settings.overwrite {
                 // not a directory but overwrite is enabled - remove and create
                 tracing::info!("destination is not a directory, removing and creating a new one");
@@ -478,14 +492,14 @@ async fn create_directory(
                 )
                 .await?;
                 tokio::fs::create_dir(dst).await?;
-                prog.directories_created.inc();
-                Ok(true)
+                // don't increment counter here - will be done in complete_directory
+                Ok(DirectoryCreateResult::Created)
             } else {
                 // not a directory and overwrite disabled
                 tracing::error!(
                     "Destination {dst:?} exists and is not a directory, use --overwrite to replace"
                 );
-                Ok(false)
+                Ok(DirectoryCreateResult::Failed)
             }
         }
         Err(error) => {
@@ -606,37 +620,41 @@ async fn process_control_stream(
                     }
                 }
                 // try to create directory
-                let created = match create_directory(settings, dst).await {
-                    Ok(created) => created,
+                let create_result = match create_directory(settings, dst).await {
+                    Ok(result) => result,
                     Err(e) => {
                         tracing::error!("Failed to create directory {:?}: {:#}", dst, e);
                         error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                         if settings.fail_early {
                             return Err(e);
                         }
-                        false
+                        DirectoryCreateResult::Failed
                     }
                 };
-                if created {
-                    // add to tracker (sends DirectoryCreated)
-                    // tracker handles root directory tracking internally
-                    directory_tracker
-                        .lock()
-                        .await
-                        .add_directory(src, dst, metadata.clone(), is_root)
-                        .await
-                        .context("Failed to add directory to tracker")?;
-                } else {
-                    // mark as failed - descendants will be skipped
-                    error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let mut tracker = directory_tracker.lock().await;
-                    tracker.mark_directory_failed(dst);
-                    // if root directory failed, mark root as complete to avoid hang
-                    if is_root {
-                        tracker.set_root_complete();
+                match create_result {
+                    DirectoryCreateResult::Created | DirectoryCreateResult::AlreadyExisted => {
+                        // add to tracker (sends DirectoryCreated)
+                        // tracker handles root directory tracking internally
+                        let was_created = create_result == DirectoryCreateResult::Created;
+                        directory_tracker
+                            .lock()
+                            .await
+                            .add_directory(src, dst, metadata.clone(), is_root, was_created)
+                            .await
+                            .context("Failed to add directory to tracker")?;
                     }
-                    if settings.fail_early {
-                        return Err(anyhow::anyhow!("Failed to create directory {:?}", dst));
+                    DirectoryCreateResult::Failed => {
+                        // mark as failed - descendants will be skipped
+                        error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let mut tracker = directory_tracker.lock().await;
+                        tracker.mark_directory_failed(dst);
+                        // if root directory failed, mark root as complete to avoid hang
+                        if is_root {
+                            tracker.set_root_complete();
+                        }
+                        if settings.fail_early {
+                            return Err(anyhow::anyhow!("Failed to create directory {:?}", dst));
+                        }
                     }
                 }
             }
@@ -712,14 +730,23 @@ async fn process_control_stream(
                     directory_tracker.lock().await.set_root_complete();
                 }
             }
-            remote::protocol::SourceMessage::DirectoryEmpty { ref src, ref dst } => {
-                tracing::info!("Directory is empty: {:?} -> {:?}", src, dst);
+            remote::protocol::SourceMessage::DirectoryEmpty {
+                ref src,
+                ref dst,
+                keep_if_empty,
+            } => {
+                tracing::info!(
+                    "Directory is empty: {:?} -> {:?} (keep_if_empty={})",
+                    src,
+                    dst,
+                    keep_if_empty
+                );
                 // mark_directory_empty handles both root and non-root directories
                 // complete_directory is called internally and will set root_complete if needed
                 directory_tracker
                     .lock()
                     .await
-                    .mark_directory_empty(dst)
+                    .mark_directory_empty(dst, keep_if_empty)
                     .await
                     .context("Failed to mark directory as empty")?;
             }
