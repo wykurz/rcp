@@ -3473,3 +3473,363 @@ fn test_remote_dry_run_exclude_is_absolute() {
         "Should copy only 1 file (visible.txt, not hidden.txt in excluded_dir)"
     );
 }
+
+/// Test that remote copy with --include keeps traversed-only directories.
+/// Unlike local copy, remote copy does not clean up empty directories because
+/// directory completion is file-count based and does not wait for child dirs.
+#[test]
+fn test_remote_include_filter_keeps_traversed_dirs() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create structure:
+    // src/
+    //   foo.txt (matches *.txt)
+    //   bar.txt (matches *.txt)
+    //   empty_dir/ (directory with nothing inside)
+    //   other_dir/
+    //     other.log (doesn't match *.txt)
+    let src_root = src_dir.path().join("src");
+    std::fs::create_dir(&src_root).unwrap();
+    create_test_file(&src_root.join("foo.txt"), "foo content", 0o644);
+    create_test_file(&src_root.join("bar.txt"), "bar content", 0o644);
+    std::fs::create_dir(src_root.join("empty_dir")).unwrap();
+    std::fs::create_dir(src_root.join("other_dir")).unwrap();
+    create_test_file(&src_root.join("other_dir/other.log"), "log content", 0o644);
+    let dst_root = dst_dir.path().join("dst");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // include only *.txt - should copy foo.txt and bar.txt
+    let output =
+        run_rcp_and_expect_success(&["--include=*.txt", "--summary", &src_remote, &dst_remote]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    // should have copied 2 files
+    assert_eq!(summary.files_copied, 2, "Should copy 2 .txt files");
+    // txt files should exist
+    assert!(dst_root.join("foo.txt").exists(), "foo.txt should exist");
+    assert!(dst_root.join("bar.txt").exists(), "bar.txt should exist");
+    // empty_dir and other_dir exist because remote copy does not clean up
+    // traversed-only directories (see directory_tracker.rs for details)
+    assert!(
+        dst_root.join("empty_dir").exists(),
+        "empty_dir exists (remote copy does not remove traversed-only dirs)"
+    );
+    assert!(
+        dst_root.join("other_dir").exists(),
+        "other_dir exists (remote copy does not remove traversed-only dirs)"
+    );
+    // directories_created counts all created directories (remote copy keeps them all)
+    assert_eq!(
+        summary.directories_created, 3,
+        "Should create 3 directories (dst root + empty_dir + other_dir)"
+    );
+}
+
+/// Test that remote dry-run with --include doesn't count empty directories
+/// that were only traversed.
+#[test]
+fn test_remote_include_filter_dry_run_no_empty_dirs() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create structure:
+    // src/
+    //   foo.txt (matches *.txt)
+    //   empty_dir/ (directory with nothing inside)
+    //   other_dir/
+    //     other.log (doesn't match *.txt)
+    let src_root = src_dir.path().join("src");
+    std::fs::create_dir(&src_root).unwrap();
+    create_test_file(&src_root.join("foo.txt"), "foo content", 0o644);
+    std::fs::create_dir(src_root.join("empty_dir")).unwrap();
+    std::fs::create_dir(src_root.join("other_dir")).unwrap();
+    create_test_file(&src_root.join("other_dir/other.log"), "log content", 0o644);
+    let dst_root = dst_dir.path().join("dst");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // dry-run with --include=*.txt
+    let output = run_rcp_and_expect_success(&[
+        "--dry-run=brief",
+        "--include=*.txt",
+        "--summary",
+        &src_remote,
+        &dst_remote,
+    ]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    // should report 1 file would be copied
+    assert_eq!(
+        summary.files_copied, 1,
+        "Should report 1 .txt file would be copied"
+    );
+    // directories_created should be 1 (only the root dst directory)
+    assert_eq!(
+        summary.directories_created, 1,
+        "Dry-run should report only 1 directory (dst root), not empty traversed dirs"
+    );
+    // destination should not exist (dry-run)
+    assert!(
+        !dst_root.exists(),
+        "Destination should not exist in dry-run mode"
+    );
+}
+
+/// Test that directories with content matching include patterns are created.
+#[test]
+fn test_remote_include_filter_directory_with_matching_content() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create structure:
+    // src/
+    //   has_txt/
+    //     file.txt (matches *.txt)
+    //   no_txt/
+    //     file.log (doesn't match)
+    let src_root = src_dir.path().join("src");
+    std::fs::create_dir(&src_root).unwrap();
+    std::fs::create_dir(src_root.join("has_txt")).unwrap();
+    create_test_file(&src_root.join("has_txt/file.txt"), "content", 0o644);
+    std::fs::create_dir(src_root.join("no_txt")).unwrap();
+    create_test_file(&src_root.join("no_txt/file.log"), "content", 0o644);
+    let dst_root = dst_dir.path().join("dst");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // include only *.txt files
+    let output =
+        run_rcp_and_expect_success(&["--include=*.txt", "--summary", &src_remote, &dst_remote]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    // has_txt should exist with file.txt inside
+    assert!(
+        dst_root.join("has_txt").exists(),
+        "has_txt/ should exist (contains matching file)"
+    );
+    assert!(
+        dst_root.join("has_txt/file.txt").exists(),
+        "file.txt should exist (matches pattern)"
+    );
+    // no_txt directory exists because remote copy does not clean up traversed-only dirs
+    assert!(
+        dst_root.join("no_txt").exists(),
+        "no_txt/ exists (remote copy does not remove traversed-only dirs)"
+    );
+    // file.log should NOT exist
+    assert!(
+        !dst_root.join("no_txt/file.log").exists(),
+        "file.log should NOT exist (doesn't match pattern)"
+    );
+    // should have copied 1 file
+    assert_eq!(summary.files_copied, 1, "Should copy 1 .txt file");
+    // should have created 3 directories (dst root, has_txt, and no_txt which is kept)
+    assert_eq!(
+        summary.directories_created, 3,
+        "Should create 3 directories (dst root + has_txt + no_txt)"
+    );
+}
+
+/// Test that remote copy with --exclude only (no --include) preserves empty directories.
+/// When only exclude patterns are active, everything not excluded is "directly included",
+/// so empty directories should be kept.
+#[test]
+fn test_remote_exclude_only_keeps_empty_dirs() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create structure:
+    // src/
+    //   subdir/ (empty directory - should be preserved)
+    //   file.txt
+    //   ignored.log (excluded by pattern)
+    let src_root = src_dir.path().join("src");
+    std::fs::create_dir(&src_root).unwrap();
+    std::fs::create_dir(src_root.join("subdir")).unwrap();
+    create_test_file(&src_root.join("file.txt"), "content", 0o644);
+    create_test_file(&src_root.join("ignored.log"), "log content", 0o644);
+    let dst_root = dst_dir.path().join("dst");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // exclude *.log - subdir/ should still be preserved since no include patterns
+    let output =
+        run_rcp_and_expect_success(&["--exclude=*.log", "--summary", &src_remote, &dst_remote]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    // file.txt should exist
+    assert!(dst_root.join("file.txt").exists(), "file.txt should exist");
+    // ignored.log should NOT exist
+    assert!(
+        !dst_root.join("ignored.log").exists(),
+        "ignored.log should be excluded"
+    );
+    // subdir should exist (empty directory preserved with exclude-only filter)
+    assert!(
+        dst_root.join("subdir").exists(),
+        "subdir/ should be preserved with exclude-only filter"
+    );
+    // should have copied 1 file
+    assert_eq!(summary.files_copied, 1, "Should copy 1 file (file.txt)");
+    // should have created 2 directories (dst root + subdir)
+    assert_eq!(
+        summary.directories_created, 2,
+        "Should create 2 directories (dst root + subdir)"
+    );
+}
+
+/// Test that remote copy with --include keeps empty directories that directly
+/// match the include pattern (e.g., --include=emptydir/).
+#[test]
+fn test_remote_include_directly_matched_empty_dir_kept() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create structure:
+    // src/
+    //   keep_me/ (empty directory, directly matches include pattern)
+    //   other_dir/ (empty directory, does NOT match include pattern)
+    //   file.txt
+    let src_root = src_dir.path().join("src");
+    std::fs::create_dir(&src_root).unwrap();
+    std::fs::create_dir(src_root.join("keep_me")).unwrap();
+    std::fs::create_dir(src_root.join("other_dir")).unwrap();
+    create_test_file(&src_root.join("file.txt"), "content", 0o644);
+    let dst_root = dst_dir.path().join("dst");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // include *.txt and keep_me/ - keep_me should be preserved, other_dir should not
+    let output = run_rcp_and_expect_success(&[
+        "--include=*.txt",
+        "--include=keep_me/",
+        "--summary",
+        &src_remote,
+        &dst_remote,
+    ]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    // file.txt should exist
+    assert!(dst_root.join("file.txt").exists(), "file.txt should exist");
+    // keep_me should exist (directly matches include pattern)
+    assert!(
+        dst_root.join("keep_me").exists(),
+        "keep_me/ should be kept (directly matches include pattern)"
+    );
+    // other_dir exists because remote copy does not clean up traversed-only dirs
+    assert!(
+        dst_root.join("other_dir").exists(),
+        "other_dir/ exists (remote copy does not remove traversed-only dirs)"
+    );
+    // should have copied 1 file
+    assert_eq!(summary.files_copied, 1, "Should copy 1 file (file.txt)");
+}
+
+/// Test that remote copy does not remove directories that only contain symlinks.
+/// Even though dir_total_files == 0 (only counts regular files), the directory
+/// has content (symlinks) and should not be removed.
+#[test]
+fn test_remote_dir_with_symlinks_not_removed() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create structure:
+    // src/
+    //   has_symlinks/
+    //     link -> ../target.txt (symlink)
+    //   target.txt
+    let src_root = src_dir.path().join("src");
+    std::fs::create_dir(&src_root).unwrap();
+    std::fs::create_dir(src_root.join("has_symlinks")).unwrap();
+    create_test_file(&src_root.join("target.txt"), "target content", 0o644);
+    std::os::unix::fs::symlink("../target.txt", src_root.join("has_symlinks/link")).unwrap();
+    let dst_root = dst_dir.path().join("dst");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // copy with include filter - even with filter active, dir with symlinks should be kept
+    let output = run_rcp_and_expect_success(&[
+        "--include=*.txt",
+        "--include=has_symlinks/",
+        "--include=has_symlinks/**",
+        "--summary",
+        &src_remote,
+        &dst_remote,
+    ]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    // has_symlinks directory should exist
+    assert!(
+        dst_root.join("has_symlinks").exists(),
+        "has_symlinks/ should exist (contains symlinks)"
+    );
+    // symlink should exist
+    assert!(
+        dst_root.join("has_symlinks/link").exists(),
+        "has_symlinks/link symlink should exist"
+    );
+    // target.txt should exist
+    assert!(
+        dst_root.join("target.txt").exists(),
+        "target.txt should exist"
+    );
+    // should have copied 1 file and created 1 symlink
+    assert_eq!(summary.files_copied, 1, "Should copy 1 file (target.txt)");
+    assert_eq!(
+        summary.symlinks_created, 1,
+        "Should create 1 symlink (link)"
+    );
+}
+
+/// Test that remote copy with --include creates all directories including
+/// traversed-only ones. The root is the user-specified destination and should
+/// never be suppressed; subdirectories are also kept since remote copy does
+/// not clean up empty directories.
+#[test]
+fn test_remote_include_filter_root_preserved_when_nothing_matches() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create structure with no .txt files:
+    // src/
+    //   bar.log (doesn't match *.txt)
+    //   empty_dir/ (empty)
+    let src_root = src_dir.path().join("src");
+    std::fs::create_dir(&src_root).unwrap();
+    create_test_file(&src_root.join("bar.log"), "log content", 0o644);
+    std::fs::create_dir(src_root.join("empty_dir")).unwrap();
+    let dst_root = dst_dir.path().join("dst");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // include only *.txt - nothing matches
+    let output =
+        run_rcp_and_expect_success(&["--include=*.txt", "--summary", &src_remote, &dst_remote]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    // no files should be copied
+    assert_eq!(summary.files_copied, 0, "No files match *.txt");
+    // root directory and subdirectories are all created (remote copy keeps traversed dirs)
+    assert_eq!(
+        summary.directories_created, 2,
+        "Should create 2 directories (dst root + empty_dir)"
+    );
+    assert!(dst_root.exists(), "Root destination directory should exist");
+    // empty_dir exists because remote copy does not clean up traversed-only dirs
+    assert!(
+        dst_root.join("empty_dir").exists(),
+        "empty_dir/ exists (remote copy does not remove traversed-only dirs)"
+    );
+}
+
+/// Test that remote dry-run with --include still counts the root directory
+/// even when nothing matches.
+#[test]
+fn test_remote_include_filter_dry_run_root_counted_when_nothing_matches() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_root = src_dir.path().join("src");
+    std::fs::create_dir(&src_root).unwrap();
+    create_test_file(&src_root.join("bar.log"), "log content", 0o644);
+    let dst_root = dst_dir.path().join("dst");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&[
+        "--dry-run=brief",
+        "--include=*.txt",
+        "--summary",
+        &src_remote,
+        &dst_remote,
+    ]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 0, "No files match *.txt");
+    assert_eq!(
+        summary.directories_created, 1,
+        "Dry-run should count root directory even with no matches"
+    );
+    assert!(
+        !dst_root.exists(),
+        "Destination should not exist in dry-run mode"
+    );
+}

@@ -95,7 +95,7 @@ All TCP connections are encrypted and authenticated using TLS 1.3 with self-sign
   - `Source { src, dst, dest_cert_fingerprint, filter, dry_run }`: Tells source rcpd what to copy
     - `filter`: Optional filter settings for include/exclude patterns (source-side filtering reduces network traffic)
     - `dry_run`: Optional dry-run mode (brief, all, or explain) for previewing operations without transferring files
-  - `Destination { source_control_addr, source_data_addr, server_name, preserve, source_cert_fingerprint }`: Tells destination where to connect (both control and data addresses)
+  - `Destination { source_control_addr, source_data_addr, server_name, preserve, source_cert_fingerprint }`: Tells destination where to connect (both control and data addresses). Note: empty directory cleanup decisions are communicated per-directory via `keep_if_empty` in `DirectoryEmpty` messages rather than a global flag.
 
 **`SourceMasterHello`** (Source → Master, bidirectional stream)
 - **Purpose**: Provide source's TCP server details for destination to connect
@@ -136,8 +136,8 @@ All TCP connections are encrypted and authenticated using TLS 1.3 with self-sign
 
 **`DirectoryEmpty`**
 - **Purpose**: Notify destination that a directory contains no files
-- **Fields**: `src`, `dst`
-- **Usage**: Sent after receiving `DirectoryCreated` for an empty directory. Allows destination to mark directory as complete.
+- **Fields**: `src`, `dst`, `keep_if_empty`
+- **Usage**: Sent after receiving `DirectoryCreated` for an empty directory. Allows destination to mark directory as complete. The `keep_if_empty` flag tells destination whether to keep the directory: `true` when the directory contains non-file entries (e.g., symlinks), when no filter is active, or when the directory directly matches an include pattern; `false` when the directory was only traversed to look for potential matches and should be removed.
 
 ### 2.3 Destination → Source Messages (Control Stream)
 
@@ -363,9 +363,24 @@ whether non-directory items can be replaced.
 - Set `files_expected` from `dir_total_files`, decrement `files_remaining`
 - If `files_remaining == 0`: apply stored metadata, remove from `pending_directories`
 
-**On `DirectoryEmpty` message:**
+**On `DirectoryEmpty { keep_if_empty }` message:**
 - Set `files_expected = Some(0)`, `files_remaining = 0`
 - Apply stored metadata, remove from `pending_directories`
+- Note: `keep_if_empty` is sent by source but currently not acted upon by destination (see below)
+
+**Known limitation — no empty directory cleanup in remote copy**: directory completion is
+file-count based and does not wait for child directories to finish. A parent directory
+with no direct files completes as soon as it receives `DirectoryEmpty`, even if descendants
+are still in progress. Because `DirectoryEmpty` can be sent from a different task than the
+directory traversal (both write to the control stream via a mutex), `DirectoryEmpty(parent)`
+may arrive before `Directory(child)` for a descendant. If the destination removed the parent
+at that point, subsequent creation of `parent/child` would fail with `NotFound`, breaking
+the transfer. For this reason, empty directory cleanup is intentionally disabled in the
+remote path — the destination always keeps directories regardless of `keep_if_empty`. This
+also means metadata (permissions, mtime) may be applied while children are still being added,
+which can cause issues with restrictive source permissions or mtime drift. A future fix
+should defer directory completion until all descendants finish, at which point
+`keep_if_empty` can be respected.
 
 **On `Symlink` message:**
 - If ancestor in `failed_directories`: skip, log warning

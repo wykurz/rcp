@@ -48,6 +48,8 @@ pub struct DirectoryTracker {
     pending_directories: std::collections::HashMap<std::path::PathBuf, DirectoryState>,
     /// Directories that failed to create - their descendants are skipped
     failed_directories: std::collections::HashSet<std::path::PathBuf>,
+    /// Directories that we created (vs reused existing) - used for empty dir cleanup
+    created_directories: std::collections::HashSet<std::path::PathBuf>,
     /// Stored metadata for each directory (applied when complete)
     metadata: std::collections::HashMap<std::path::PathBuf, remote::protocol::Metadata>,
     /// Have we received DirStructureComplete?
@@ -72,6 +74,7 @@ impl DirectoryTracker {
         Self {
             pending_directories: std::collections::HashMap::new(),
             failed_directories: std::collections::HashSet::new(),
+            created_directories: std::collections::HashSet::new(),
             metadata: std::collections::HashMap::new(),
             structure_complete: false,
             root_complete: false,
@@ -94,18 +97,26 @@ impl DirectoryTracker {
     }
     /// Add a successfully created directory to tracking.
     /// Sends `DirectoryCreated` to source.
+    ///
+    /// # Arguments
+    /// * `was_created` - true if we created this directory, false if it already existed
     pub async fn add_directory(
         &mut self,
         src: &std::path::Path,
         dst: &std::path::Path,
         metadata: remote::protocol::Metadata,
         is_root: bool,
+        was_created: bool,
     ) -> anyhow::Result<()> {
         // store metadata for later application
         self.metadata.insert(dst.to_path_buf(), metadata);
         // track root directory path
         if is_root {
             self.root_directory = Some(dst.to_path_buf());
+        }
+        // track whether we created this directory (vs reusing existing)
+        if was_created {
+            self.created_directories.insert(dst.to_path_buf());
         }
         // add ALL directories to pending (we don't know file count yet)
         // root directories are also tracked here - when they complete, we set root_complete
@@ -181,7 +192,8 @@ impl DirectoryTracker {
         );
         // check completion
         if state.files_remaining == 0 {
-            self.complete_directory(dst_dir).await?;
+            // directory has files, so it's not empty - keep_if_empty is irrelevant
+            self.complete_directory(dst_dir, false).await?;
             Ok(true)
         } else {
             Ok(false)
@@ -189,24 +201,54 @@ impl DirectoryTracker {
     }
     /// Mark a directory as empty (no files).
     /// Called when receiving DirectoryEmpty message.
-    pub async fn mark_directory_empty(&mut self, dst: &std::path::Path) -> anyhow::Result<()> {
+    /// `keep_if_empty` indicates whether to keep the directory even though it has no files
+    /// (e.g., because it directly matches an include pattern or contains symlinks).
+    pub async fn mark_directory_empty(
+        &mut self,
+        dst: &std::path::Path,
+        keep_if_empty: bool,
+    ) -> anyhow::Result<()> {
         let state = self
             .pending_directories
             .get_mut(dst)
             .ok_or_else(|| anyhow::anyhow!("directory {:?} not being tracked", dst))?;
         state.files_expected = Some(0);
         state.files_remaining = 0;
-        tracing::debug!("Directory {:?} is empty", dst);
-        self.complete_directory(dst).await
+        tracing::debug!(
+            "Directory {:?} is empty (keep_if_empty={})",
+            dst,
+            keep_if_empty
+        );
+        self.complete_directory(dst, keep_if_empty).await
     }
     /// Complete a directory: apply metadata and remove from pending.
-    async fn complete_directory(&mut self, dst: &std::path::Path) -> anyhow::Result<()> {
+    ///
+    /// Note: `keep_if_empty` is accepted but currently unused. Empty directory cleanup
+    /// is intentionally not performed in the remote path because directory completion
+    /// is file-count based and does not wait for child directories to finish. A parent
+    /// with no direct files completes as soon as it receives `DirectoryEmpty`, even if
+    /// descendants are still in progress. Removing the parent at that point could race
+    /// with the source sending `Directory(child)` for a descendant, causing the child
+    /// creation to fail with `NotFound`. Empty directory cleanup for remote copy will
+    /// be implemented once directory completion is deferred until all descendants finish.
+    /// See `docs/remote_protocol.md` for details.
+    async fn complete_directory(
+        &mut self,
+        dst: &std::path::Path,
+        _keep_if_empty: bool,
+    ) -> anyhow::Result<()> {
         // check if this is the root directory
         let is_root = self.root_directory.as_deref() == Some(dst);
         // remove from pending
         let state = self.pending_directories.remove(dst);
         if state.is_none() {
-            tracing::warn!("Directory {:?} was not in pending when completing", dst);
+            tracing::warn!("directory {:?} was not in pending when completing", dst);
+        }
+        // check if we created this directory (vs reused existing)
+        let was_created = self.created_directories.remove(dst);
+        // increment counter now (if we created it)
+        if was_created {
+            common::get_progress().directories_created.inc();
         }
         // apply stored metadata
         if let Some(metadata) = self.metadata.remove(dst) {
