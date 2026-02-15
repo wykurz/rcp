@@ -211,9 +211,14 @@ pub enum SourceMessage {
     SymlinkSkipped { src_dst: SrcDst, is_root: bool },
     /// Notify destination that a directory contains no files.
     /// Sent after receiving `DirectoryCreated` for an empty directory.
+    /// `keep_if_empty` is computed by the source based on filter settings and directory
+    /// contents (e.g., symlinks) but currently unused by the destination — directories
+    /// are always kept. Empty directory cleanup is deferred until directory completion
+    /// waits for all descendants to finish (see `docs/remote_protocol.md`).
     DirectoryEmpty {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
+        keep_if_empty: bool,
     },
 }
 

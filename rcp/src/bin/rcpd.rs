@@ -382,7 +382,9 @@ where
             preserve,
             source_cert_fingerprint,
         } => {
-            // destination doesn't use filter (filtering happens at source)
+            // destination doesn't use filter (filtering happens at source).
+            // empty directory cleanup decisions are communicated per-directory
+            // via keep_if_empty in the DirectoryEmpty message.
             let settings = common::copy::Settings {
                 dereference: args.dereference,
                 fail_early: args.fail_early,

@@ -385,6 +385,9 @@ async fn send_files_in_directory_tcp(
     // first pass: count files and collect their paths
     let mut file_entries: Vec<(std::path::PathBuf, std::path::PathBuf, std::fs::Metadata)> =
         Vec::new();
+    // track whether any non-file entries exist (e.g., symlinks) to avoid
+    // incorrectly removing directories that only contain symlinks
+    let mut has_non_file_entries = false;
     let mut entries = match tokio::fs::read_dir(&src).await {
         Ok(e) => e,
         Err(e) => {
@@ -436,6 +439,21 @@ async fn send_files_in_directory_tcp(
                         }
                     }
                     file_entries.push((entry_path, dst_path, entry_metadata));
+                } else if entry_metadata.is_symlink() {
+                    // only count symlinks that pass the filter as "content" —
+                    // filtered-out symlinks shouldn't prevent empty dir cleanup
+                    if let Some(ref filter) = settings.filter {
+                        let relative_path =
+                            entry_path.strip_prefix(&source_root).unwrap_or(&entry_path);
+                        if matches!(
+                            filter.should_include(relative_path, false),
+                            common::filter::FilterResult::Included
+                        ) {
+                            has_non_file_entries = true;
+                        }
+                    } else {
+                        has_non_file_entries = true;
+                    }
                 }
             }
             Ok(None) => break,
@@ -452,18 +470,37 @@ async fn send_files_in_directory_tcp(
     drop(entries);
     let dir_total_files = file_entries.len();
     tracing::info!("Directory {:?} has {} files to send", src, dir_total_files);
-    // if directory is empty, send DirectoryEmpty message
+    // if directory is empty, send DirectoryEmpty message with keep_if_empty decision
     if dir_total_files == 0 {
+        // decide whether destination should keep this empty directory:
+        // - has non-file entries (e.g., symlinks): keep (remove_dir would fail anyway)
+        // - no filter active: keep (user explicitly wants this directory)
+        // - filter active and directly matches include: keep
+        // - filter active and doesn't match: remove (only traversed for potential matches)
+        let is_root = src == source_root;
+        let keep_if_empty = if has_non_file_entries || is_root {
+            true
+        } else if let Some(ref filter) = settings.filter {
+            let relative_path = src.strip_prefix(&source_root).unwrap_or(&src);
+            filter.directly_matches_include(relative_path, true)
+        } else {
+            true
+        };
         let empty_msg = remote::protocol::SourceMessage::DirectoryEmpty {
             src: src.clone(),
             dst: dst.clone(),
+            keep_if_empty,
         };
         control_send_stream
             .lock()
             .await
             .send_control_message(&empty_msg)
             .await?;
-        tracing::info!("Sent DirectoryEmpty for {:?}", src);
+        tracing::info!(
+            "Sent DirectoryEmpty for {:?} (keep_if_empty={})",
+            src,
+            keep_if_empty
+        );
         return Ok(());
     }
     // second pass: send files with the known total count
@@ -1117,6 +1154,10 @@ async fn dry_run_traverse(
             dst
         );
     }
+    // save current counts before recursing to detect if anything was added
+    let before_files = summary.files_copied;
+    let before_symlinks = summary.symlinks_created;
+    let before_dirs = summary.directories_created;
     if should_process {
         summary.directories_created += 1;
     }
@@ -1194,6 +1235,24 @@ async fn dry_run_traverse(
                     return Err(e.into());
                 }
                 break;
+            }
+        }
+    }
+    // after recursing, check if anything was added inside this directory.
+    // if nothing was added AND this directory doesn't directly match an include pattern,
+    // we should not count it (it was only traversed to look for potential matches).
+    // the root directory is never uncounted — it's the user-specified source.
+    if should_process && !is_root {
+        let child_content_added = summary.files_copied > before_files
+            || summary.symlinks_created > before_symlinks
+            || summary.directories_created > before_dirs + 1; // +1 for this dir
+        if !child_content_added {
+            if let Some(ref filter) = settings.filter {
+                let relative_path = src.strip_prefix(source_root).unwrap_or(src);
+                if !filter.directly_matches_include(relative_path, true) {
+                    // directory was only traversed, don't count it
+                    summary.directories_created -= 1;
+                }
             }
         }
     }
