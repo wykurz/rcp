@@ -227,6 +227,15 @@ This ensures no orphaned `rcpd` processes remain on remote hosts after the maste
 
 **Security**: Avoid committing SSH config or keys to the repository.
 
+## Agent Team Workflow
+
+For any non-trivial coding task, create an agent team with two members:
+
+1. **coder** — Creates and executes the task plan, writes code, runs tests, and responds to reviewer feedback.
+2. **reviewer** — Reviews all changes made by the coder, checking for correctness, adherence to project conventions, and potential issues.
+
+The coder and reviewer should iterate until both are satisfied with the solution. Only then is the task considered complete.
+
 ## Commit Guidelines
 
 Keep commit subjects concise and imperative, following the existing history style (e.g., "Fix how we manage dependencies", "Bump version ..."). Provide context and issue links in the body when applicable.
