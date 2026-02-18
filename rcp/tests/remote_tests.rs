@@ -3824,3 +3824,313 @@ fn test_remote_include_filter_dry_run_root_counted_when_nothing_matches() {
         "Destination should not exist in dry-run mode"
     );
 }
+
+/// Test that multiple --include patterns correctly include both file globs and
+/// entire subdirectories. Structure: src/ with links_dir/ containing only symlinks,
+/// plus a file.txt. The links_dir/ is explicitly included via pattern matching.
+#[test]
+fn test_remote_filter_include_with_symlinks_only_dir() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create structure:
+    // src/
+    //   file.txt
+    //   links_dir/
+    //     link1 -> ../file.txt (symlink)
+    //     link2 -> ../file.txt (symlink)
+    let src_root = src_dir.path().join("src");
+    std::fs::create_dir(&src_root).unwrap();
+    create_test_file(&src_root.join("file.txt"), "file content", 0o644);
+    std::fs::create_dir(src_root.join("links_dir")).unwrap();
+    std::os::unix::fs::symlink("../file.txt", src_root.join("links_dir/link1")).unwrap();
+    std::os::unix::fs::symlink("../file.txt", src_root.join("links_dir/link2")).unwrap();
+    let dst_root = dst_dir.path().join("dst");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // include .txt files and links_dir with all its contents
+    let output = run_rcp_and_expect_success(&[
+        "--include=*.txt",
+        "--include=links_dir/",
+        "--include=links_dir/**",
+        "--summary",
+        &src_remote,
+        &dst_remote,
+    ]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    // links_dir should exist because it has symlinks
+    assert!(
+        dst_root.join("links_dir").exists(),
+        "links_dir/ should exist (contains symlinks)"
+    );
+    // symlinks should exist
+    assert!(
+        dst_root.join("links_dir/link1").exists(),
+        "links_dir/link1 symlink should exist"
+    );
+    assert!(
+        dst_root.join("links_dir/link2").exists(),
+        "links_dir/link2 symlink should exist"
+    );
+    // file.txt should be copied
+    assert!(dst_root.join("file.txt").exists(), "file.txt should exist");
+    assert_eq!(summary.files_copied, 1, "Should copy 1 file (file.txt)");
+    assert_eq!(
+        summary.symlinks_created, 2,
+        "Should create 2 symlinks (link1, link2)"
+    );
+}
+
+/// Test that --exclude filter keeps directories that contain only symlinks.
+/// Structure: src/ with subdir/ containing file.txt and a symlink. Exclude *.txt
+/// to remove all .txt files but keep the symlink. subdir/ should remain because
+/// it still has the symlink.
+#[test]
+fn test_remote_filter_exclude_with_nested_symlinks() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create structure:
+    // src/
+    //   target.txt
+    //   subdir/
+    //     file.txt
+    //     link -> ../target.txt (symlink)
+    let src_root = src_dir.path().join("src");
+    std::fs::create_dir(&src_root).unwrap();
+    create_test_file(&src_root.join("target.txt"), "target content", 0o644);
+    std::fs::create_dir(src_root.join("subdir")).unwrap();
+    create_test_file(&src_root.join("subdir/file.txt"), "subdir file", 0o644);
+    std::os::unix::fs::symlink("../target.txt", src_root.join("subdir/link")).unwrap();
+    let dst_root = dst_dir.path().join("dst");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // exclude all .txt files - symlinks are not affected by content filters
+    let output =
+        run_rcp_and_expect_success(&["--exclude=*.txt", "--summary", &src_remote, &dst_remote]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    // subdir should exist because it still has the symlink
+    assert!(
+        dst_root.join("subdir").exists(),
+        "subdir/ should exist (contains symlink)"
+    );
+    // symlink should exist (target.txt is excluded so link is broken — use symlink_metadata)
+    assert!(
+        std::fs::symlink_metadata(dst_root.join("subdir/link"))
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false),
+        "subdir/link symlink should exist"
+    );
+    // no .txt files should be copied
+    assert!(
+        !dst_root.join("target.txt").exists(),
+        "target.txt should be excluded"
+    );
+    assert!(
+        !dst_root.join("subdir/file.txt").exists(),
+        "subdir/file.txt should be excluded"
+    );
+    assert_eq!(summary.files_copied, 0, "No .txt files should be copied");
+    assert_eq!(
+        summary.symlinks_created, 1,
+        "Should create 1 symlink (link)"
+    );
+}
+
+/// Test that --include filter with deeply nested directories only keeps paths
+/// leading to matching files. Directories without matching descendants are cleaned up.
+#[test]
+fn test_remote_filter_include_deeply_nested_with_mixed_entries() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create structure:
+    // src/
+    //   root.txt
+    //   level1/
+    //     level1.log (doesn't match *.txt)
+    //     link -> ../root.txt (symlink at level1)
+    //     level2/
+    //       deep.txt (matches *.txt)
+    //   empty_branch/
+    //     leaf/ (no files anywhere)
+    let src_root = src_dir.path().join("src");
+    std::fs::create_dir(&src_root).unwrap();
+    create_test_file(&src_root.join("root.txt"), "root content", 0o644);
+    std::fs::create_dir(src_root.join("level1")).unwrap();
+    create_test_file(&src_root.join("level1/level1.log"), "log content", 0o644);
+    std::os::unix::fs::symlink("../root.txt", src_root.join("level1/link")).unwrap();
+    std::fs::create_dir(src_root.join("level1/level2")).unwrap();
+    create_test_file(
+        &src_root.join("level1/level2/deep.txt"),
+        "deep content",
+        0o644,
+    );
+    std::fs::create_dir(src_root.join("empty_branch")).unwrap();
+    std::fs::create_dir(src_root.join("empty_branch/leaf")).unwrap();
+    let dst_root = dst_dir.path().join("dst");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // include only *.txt - should keep level1/ and level1/level2/ (path to deep.txt)
+    // and root.txt, but clean up empty_branch/ entirely
+    let output =
+        run_rcp_and_expect_success(&["--include=*.txt", "--summary", &src_remote, &dst_remote]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    // root.txt should be copied
+    assert!(dst_root.join("root.txt").exists(), "root.txt should exist");
+    // deep.txt should be copied through the nested path
+    assert!(
+        dst_root.join("level1/level2/deep.txt").exists(),
+        "level1/level2/deep.txt should exist"
+    );
+    // level1.log should NOT exist (excluded by filter)
+    assert!(
+        !dst_root.join("level1/level1.log").exists(),
+        "level1.log should not exist (doesn't match *.txt)"
+    );
+    // symlink at level1 should NOT exist (doesn't match *.txt)
+    assert!(
+        !dst_root.join("level1/link").exists(),
+        "level1/link symlink should not exist (doesn't match *.txt)"
+    );
+    // empty_branch should be cleaned up entirely
+    assert!(
+        !dst_root.join("empty_branch").exists(),
+        "empty_branch/ should be removed (no matching descendants)"
+    );
+    assert_eq!(summary.files_copied, 2, "Should copy 2 .txt files");
+}
+
+/// Test that --include filter cleans up directories with only non-matching children.
+/// parent/ has child1/ (with .txt) and child2/ (with .log only).
+/// child2/ should be cleaned up, child1/ should remain.
+#[test]
+fn test_remote_filter_include_dir_with_only_subdirs_no_files() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create structure:
+    // src/
+    //   parent/
+    //     child1/
+    //       data.txt (matches *.txt)
+    //     child2/
+    //       data.log (doesn't match *.txt)
+    let src_root = src_dir.path().join("src");
+    std::fs::create_dir(&src_root).unwrap();
+    std::fs::create_dir(src_root.join("parent")).unwrap();
+    std::fs::create_dir(src_root.join("parent/child1")).unwrap();
+    create_test_file(
+        &src_root.join("parent/child1/data.txt"),
+        "txt content",
+        0o644,
+    );
+    std::fs::create_dir(src_root.join("parent/child2")).unwrap();
+    create_test_file(
+        &src_root.join("parent/child2/data.log"),
+        "log content",
+        0o644,
+    );
+    let dst_root = dst_dir.path().join("dst");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // include only *.txt
+    let output =
+        run_rcp_and_expect_success(&["--include=*.txt", "--summary", &src_remote, &dst_remote]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    // parent/ should exist (contains child1/ which has matching file)
+    assert!(
+        dst_root.join("parent").exists(),
+        "parent/ should exist (has child with matching file)"
+    );
+    // child1/ should exist with data.txt
+    assert!(
+        dst_root.join("parent/child1/data.txt").exists(),
+        "parent/child1/data.txt should exist"
+    );
+    // child2/ should be cleaned up (no matching files)
+    assert!(
+        !dst_root.join("parent/child2").exists(),
+        "parent/child2/ should be removed (no matching descendants)"
+    );
+    assert_eq!(summary.files_copied, 1, "Should copy 1 .txt file");
+    // directories kept: dst root, parent/, child1/ = 3
+    assert_eq!(
+        summary.directories_created, 3,
+        "Should create 3 directories (root, parent, child1)"
+    );
+}
+
+/// Test that remote copy of a directory with only empty subdirectories and no files
+/// completes without hanging. Verifies correct summary counts.
+#[test]
+fn test_remote_copy_dir_with_only_subdirs_no_files_no_filter() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create structure:
+    // src/
+    //   parent/
+    //     child1/ (empty)
+    //     child2/ (empty)
+    let src_root = src_dir.path().join("src");
+    std::fs::create_dir(&src_root).unwrap();
+    std::fs::create_dir(src_root.join("parent")).unwrap();
+    std::fs::create_dir(src_root.join("parent/child1")).unwrap();
+    std::fs::create_dir(src_root.join("parent/child2")).unwrap();
+    let dst_root = dst_dir.path().join("dst");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // no filter - copy everything
+    let output = run_rcp_and_expect_success(&["--summary", &src_remote, &dst_remote]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    // all directories should be created
+    assert!(dst_root.join("parent").exists(), "parent/ should exist");
+    assert!(
+        dst_root.join("parent/child1").exists(),
+        "parent/child1/ should exist"
+    );
+    assert!(
+        dst_root.join("parent/child2").exists(),
+        "parent/child2/ should exist"
+    );
+    assert_eq!(summary.files_copied, 0, "No files to copy");
+    // directories: dst root, parent/, child1/, child2/ = 4
+    assert_eq!(
+        summary.directories_created, 4,
+        "Should create 4 directories (root, parent, child1, child2)"
+    );
+}
+
+/// Test that remote copy with --fail-early exits with error rather than hanging
+/// when the destination becomes unwritable. This verifies that unified tracking
+/// handles mixed-entry errors correctly.
+#[test]
+fn test_remote_copy_mixed_entries_no_hang() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create source with files, subdirs, and symlinks at multiple levels
+    // src/
+    //   file1.txt
+    //   subdir/
+    //     file2.txt
+    //     link -> ../file1.txt
+    let src_root = src_dir.path().join("src");
+    std::fs::create_dir(&src_root).unwrap();
+    create_test_file(&src_root.join("file1.txt"), "content1", 0o644);
+    std::fs::create_dir(src_root.join("subdir")).unwrap();
+    create_test_file(&src_root.join("subdir/file2.txt"), "content2", 0o644);
+    std::os::unix::fs::symlink("../file1.txt", src_root.join("subdir/link")).unwrap();
+    // create destination and make it read-only to force errors
+    let dst_root = dst_dir.path().join("dst");
+    std::fs::create_dir(&dst_root).unwrap();
+    std::fs::set_permissions(&dst_root, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // use --fail-early so we fail fast on permission errors
+    let output = run_rcp_and_expect_failure(&["--fail-early", &src_remote, &dst_remote]);
+    // the critical assertion: we must NOT have timed out (exit code 124).
+    // this is already checked in run_rcp_with_args_internal, but make it explicit.
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert_ne!(
+        exit_code, 124,
+        "Command timed out (exit code 124) - this indicates a hang bug in unified tracking"
+    );
+    // restore permissions so tempdir cleanup works
+    std::fs::set_permissions(&dst_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
