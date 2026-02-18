@@ -6,6 +6,13 @@ fn progress() -> &'static common::progress::Progress {
     common::get_progress()
 }
 
+/// Collected child entry from a directory pre-read.
+struct ChildEntry {
+    src_path: std::path::PathBuf,
+    dst_path: std::path::PathBuf,
+    metadata: std::fs::Metadata,
+}
+
 #[instrument(skip(error_occurred, control_send_stream))]
 #[async_recursion]
 async fn send_directories_and_symlinks(
@@ -105,20 +112,11 @@ async fn send_directories_and_symlinks(
         );
         return Ok(());
     }
-    // send Directory message with metadata (no entry count - that comes later with files)
-    let dir = remote::protocol::SourceMessage::Directory {
-        src: src.to_path_buf(),
-        dst: dst.to_path_buf(),
-        metadata: remote::protocol::Metadata::from(&src_metadata),
-        is_root,
-    };
-    tracing::debug!("Sending directory: {:?} -> {:?}", &src, dst);
-    control_send_stream
-        .lock()
-        .await
-        .send_batch_message(&dir)
-        .await?;
-    // recurse into children
+    // pre-read directory children to compute entry counts before sending Directory message
+    let mut file_children: Vec<ChildEntry> = Vec::new();
+    let mut dir_children: Vec<ChildEntry> = Vec::new();
+    let mut symlink_children: Vec<ChildEntry> = Vec::new();
+    let mut has_non_file_entries = false;
     let mut entries = match tokio::fs::read_dir(&src).await {
         Ok(e) => e,
         Err(e) => {
@@ -127,6 +125,22 @@ async fn send_directories_and_symlinks(
             if settings.fail_early {
                 return Err(e.into());
             }
+            // directory unreadable but we already committed to sending it -
+            // send with 0 entries so destination can still complete
+            let dir = remote::protocol::SourceMessage::Directory {
+                src: src.to_path_buf(),
+                dst: dst.to_path_buf(),
+                metadata: remote::protocol::Metadata::from(&src_metadata),
+                is_root,
+                entry_count: 0,
+                file_count: 0,
+                keep_if_empty: true,
+            };
+            control_send_stream
+                .lock()
+                .await
+                .send_batch_message(&dir)
+                .await?;
             return Ok(());
         }
     };
@@ -136,22 +150,65 @@ async fn send_directories_and_symlinks(
                 let entry_path = entry.path();
                 let entry_name = entry_path.file_name().unwrap();
                 let dst_path = dst.join(entry_name);
-                if let Err(e) = send_directories_and_symlinks(
-                    settings,
-                    &entry_path,
-                    &dst_path,
-                    source_root,
-                    false,
-                    control_send_stream,
-                    error_occurred,
-                )
-                .await
-                {
-                    tracing::error!("Failed to send directory/symlink {entry_path:?}: {e:#}");
-                    error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
-                    if settings.fail_early {
-                        return Err(e);
+                let entry_metadata = match if settings.dereference {
+                    tokio::fs::metadata(&entry_path).await
+                } else {
+                    tokio::fs::symlink_metadata(&entry_path).await
+                } {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!("Failed reading metadata from {entry_path:?}: {e:#}");
+                        error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
+                        if settings.fail_early {
+                            return Err(e.into());
+                        }
+                        continue;
                     }
+                };
+                // apply filter for child entries
+                if let Some(ref filter) = settings.filter {
+                    let relative_path = entry_path.strip_prefix(source_root).unwrap_or(&entry_path);
+                    let is_dir = entry_metadata.is_dir();
+                    match filter.should_include(relative_path, is_dir) {
+                        common::filter::FilterResult::Included => { /* proceed */ }
+                        common::filter::FilterResult::ExcludedByPattern(_) => {
+                            tracing::debug!("Filtered out {:?}", entry_path);
+                            continue;
+                        }
+                        common::filter::FilterResult::ExcludedByDefault => {
+                            // for directories, check if they could contain matches
+                            if is_dir {
+                                let mut could_match = false;
+                                for pattern in &filter.includes {
+                                    if filter.could_contain_matches(relative_path, pattern) {
+                                        could_match = true;
+                                        break;
+                                    }
+                                }
+                                if !could_match {
+                                    tracing::debug!("Filtered out {:?}", entry_path);
+                                    continue;
+                                }
+                                // directory might contain matches - include it
+                            } else {
+                                tracing::debug!("Filtered out {:?}", entry_path);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let child = ChildEntry {
+                    src_path: entry_path,
+                    dst_path,
+                    metadata: entry_metadata,
+                };
+                if child.metadata.is_file() {
+                    file_children.push(child);
+                } else if child.metadata.is_symlink() {
+                    has_non_file_entries = true;
+                    symlink_children.push(child);
+                } else if child.metadata.is_dir() {
+                    dir_children.push(child);
                 }
             }
             Ok(None) => break,
@@ -162,6 +219,79 @@ async fn send_directories_and_symlinks(
                     return Err(e.into());
                 }
                 break;
+            }
+        }
+    }
+    drop(entries);
+    // compute counts and keep_if_empty
+    let file_count = file_children.len();
+    let entry_count = file_count + dir_children.len() + symlink_children.len();
+    let keep_if_empty = if has_non_file_entries || is_root {
+        true
+    } else if let Some(ref filter) = settings.filter {
+        let relative_path = src.strip_prefix(source_root).unwrap_or(src);
+        filter.directly_matches_include(relative_path, true)
+    } else {
+        true
+    };
+    // send Directory message with pre-computed counts
+    let dir = remote::protocol::SourceMessage::Directory {
+        src: src.to_path_buf(),
+        dst: dst.to_path_buf(),
+        metadata: remote::protocol::Metadata::from(&src_metadata),
+        is_root,
+        entry_count,
+        file_count,
+        keep_if_empty,
+    };
+    tracing::debug!(
+        "Sending directory: {:?} -> {:?} (entries={}, files={})",
+        &src,
+        dst,
+        entry_count,
+        file_count
+    );
+    control_send_stream
+        .lock()
+        .await
+        .send_batch_message(&dir)
+        .await?;
+    // recurse into non-file children (symlinks first, then directories)
+    for child in symlink_children {
+        if let Err(e) = send_directories_and_symlinks(
+            settings,
+            &child.src_path,
+            &child.dst_path,
+            source_root,
+            false,
+            control_send_stream,
+            error_occurred,
+        )
+        .await
+        {
+            tracing::error!("Failed to send symlink {:?}: {e:#}", child.src_path);
+            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
+            if settings.fail_early {
+                return Err(e);
+            }
+        }
+    }
+    for child in dir_children {
+        if let Err(e) = send_directories_and_symlinks(
+            settings,
+            &child.src_path,
+            &child.dst_path,
+            source_root,
+            false,
+            control_send_stream,
+            error_occurred,
+        )
+        .await
+        {
+            tracing::error!("Failed to send directory {:?}: {e:#}", child.src_path);
+            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
+            if settings.fail_early {
+                return Err(e);
             }
         }
     }
@@ -232,14 +362,13 @@ async fn send_fs_objects_tcp(
         .await?;
     drop(stream);
     if src_metadata.is_file() && has_root_item {
-        // root file - send with dir_total_files=1 (itself is the only file)
+        // root file
         if let Err(e) = send_file_tcp(
             settings,
             src,
             dst,
             &src_metadata,
             true,
-            1, // root file is the only file
             stream_pool,
             &error_occurred,
             control_send_stream.clone(),
@@ -265,7 +394,6 @@ async fn send_file_tcp(
     dst: &std::path::Path,
     src_metadata: &std::fs::Metadata,
     is_root: bool,
-    dir_total_files: usize,
     stream_pool: std::sync::Arc<AcceptingSendStreamPool>,
     error_occurred: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     control_send_stream: remote::streams::BoxedSharedSendStream,
@@ -308,7 +436,6 @@ async fn send_file_tcp(
             let skip_msg = remote::protocol::SourceMessage::FileSkipped {
                 src: src.to_path_buf(),
                 dst: dst.to_path_buf(),
-                dir_total_files,
             };
             control_send_stream
                 .lock()
@@ -334,7 +461,6 @@ async fn send_file_tcp(
         size: src_metadata.len(),
         metadata,
         is_root,
-        dir_total_files,
     };
     let send_result = pooled_stream
         .stream_mut()
@@ -376,23 +502,40 @@ async fn send_files_in_directory_tcp(
     src: std::path::PathBuf,
     dst: std::path::PathBuf,
     source_root: std::path::PathBuf,
+    file_count: usize,
     stream_pool: std::sync::Arc<AcceptingSendStreamPool>,
     pending_limit: std::sync::Arc<tokio::sync::Semaphore>,
     error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
     control_send_stream: remote::streams::BoxedSharedSendStream,
 ) -> anyhow::Result<()> {
-    tracing::info!("Sending files from {src:?}");
-    // first pass: count files and collect their paths
+    tracing::info!(
+        "Sending files from {src:?} (expected file_count={})",
+        file_count
+    );
+    // if no files expected, nothing to do
+    if file_count == 0 {
+        return Ok(());
+    }
+    // iterate directory and collect files to send
     let mut file_entries: Vec<(std::path::PathBuf, std::path::PathBuf, std::fs::Metadata)> =
         Vec::new();
-    // track whether any non-file entries exist (e.g., symlinks) to avoid
-    // incorrectly removing directories that only contain symlinks
-    let mut has_non_file_entries = false;
     let mut entries = match tokio::fs::read_dir(&src).await {
         Ok(e) => e,
         Err(e) => {
             tracing::error!("Cannot open directory {src:?} for reading: {e:#}");
             error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
+            // send synthetic FileSkipped for all expected files so destination can complete
+            for i in 0..file_count {
+                let skip_msg = remote::protocol::SourceMessage::FileSkipped {
+                    src: src.join(format!("<missing-{i}>")),
+                    dst: dst.join(format!("<missing-{i}>")),
+                };
+                control_send_stream
+                    .lock()
+                    .await
+                    .send_batch_message(&skip_msg)
+                    .await?;
+            }
             if settings.fail_early {
                 return Err(e.into());
             }
@@ -439,21 +582,6 @@ async fn send_files_in_directory_tcp(
                         }
                     }
                     file_entries.push((entry_path, dst_path, entry_metadata));
-                } else if entry_metadata.is_symlink() {
-                    // only count symlinks that pass the filter as "content" —
-                    // filtered-out symlinks shouldn't prevent empty dir cleanup
-                    if let Some(ref filter) = settings.filter {
-                        let relative_path =
-                            entry_path.strip_prefix(&source_root).unwrap_or(&entry_path);
-                        if matches!(
-                            filter.should_include(relative_path, false),
-                            common::filter::FilterResult::Included
-                        ) {
-                            has_non_file_entries = true;
-                        }
-                    } else {
-                        has_non_file_entries = true;
-                    }
                 }
             }
             Ok(None) => break,
@@ -468,43 +596,33 @@ async fn send_files_in_directory_tcp(
         }
     }
     drop(entries);
-    let dir_total_files = file_entries.len();
-    tracing::info!("Directory {:?} has {} files to send", src, dir_total_files);
-    // if directory is empty, send DirectoryEmpty message with keep_if_empty decision
-    if dir_total_files == 0 {
-        // decide whether destination should keep this empty directory:
-        // - has non-file entries (e.g., symlinks): keep (remove_dir would fail anyway)
-        // - no filter active: keep (user explicitly wants this directory)
-        // - filter active and directly matches include: keep
-        // - filter active and doesn't match: remove (only traversed for potential matches)
-        let is_root = src == source_root;
-        let keep_if_empty = if has_non_file_entries || is_root {
-            true
-        } else if let Some(ref filter) = settings.filter {
-            let relative_path = src.strip_prefix(&source_root).unwrap_or(&src);
-            filter.directly_matches_include(relative_path, true)
-        } else {
-            true
-        };
-        let empty_msg = remote::protocol::SourceMessage::DirectoryEmpty {
-            src: src.clone(),
-            dst: dst.clone(),
-            keep_if_empty,
-        };
-        control_send_stream
-            .lock()
-            .await
-            .send_control_message(&empty_msg)
-            .await?;
-        tracing::info!(
-            "Sent DirectoryEmpty for {:?} (keep_if_empty={})",
+    let files_found = file_entries.len();
+    tracing::info!(
+        "Directory {:?} has {} files to send (expected {})",
+        src,
+        files_found,
+        file_count
+    );
+    // handle discrepancy between expected file_count and actual files found
+    if files_found > file_count {
+        // extra files appeared since traversal - only send up to file_count
+        tracing::warn!(
+            "Directory {:?} has {} extra files since traversal, ignoring extras",
             src,
-            keep_if_empty
+            files_found - file_count
         );
-        return Ok(());
+        if settings.fail_early {
+            return Err(anyhow::anyhow!(
+                "directory {:?} contents changed: expected {} files, found {}",
+                src,
+                file_count,
+                files_found
+            ));
+        }
+        file_entries.truncate(file_count);
     }
-    // second pass: send files with the known total count
-    // acquire permit from pending_limit before spawning to provide backpressure
+    let files_to_send = file_entries.len();
+    // send the files
     let mut join_set = tokio::task::JoinSet::new();
     for (entry_path, dst_path, entry_metadata) in file_entries {
         throttle::get_ops_token().await;
@@ -517,7 +635,6 @@ async fn send_files_in_directory_tcp(
         let pool = stream_pool.clone();
         let error_flag = error_occurred.clone();
         let control_stream = control_send_stream.clone();
-        let total = dir_total_files;
         let settings = settings.clone();
         join_set.spawn(async move {
             let result = send_file_tcp(
@@ -526,7 +643,6 @@ async fn send_files_in_directory_tcp(
                 &dst_path,
                 &entry_metadata,
                 false,
-                total,
                 pool,
                 &error_flag,
                 control_stream,
@@ -552,6 +668,27 @@ async fn send_files_in_directory_tcp(
                 error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                 return Err(e.into());
             }
+        }
+    }
+    // handle deficit: files disappeared since traversal
+    // send synthetic FileSkipped messages so destination's entry count still completes
+    if files_to_send < file_count {
+        let deficit = file_count - files_to_send;
+        tracing::warn!(
+            "Directory {:?} has {} fewer files since traversal, sending synthetic FileSkipped",
+            src,
+            deficit
+        );
+        for i in 0..deficit {
+            let skip_msg = remote::protocol::SourceMessage::FileSkipped {
+                src: src.join(format!("<disappeared-{i}>")),
+                dst: dst.join(format!("<disappeared-{i}>")),
+            };
+            control_send_stream
+                .lock()
+                .await
+                .send_batch_message(&skip_msg)
+                .await?;
         }
     }
     Ok(())
@@ -685,19 +822,25 @@ async fn dispatch_control_messages_tcp(
                     Some(RecvResult::Error(e)) => break Err(e),
                 };
                 match message {
-                    remote::protocol::DestinationMessage::DirectoryCreated(confirmation) => {
+                    remote::protocol::DestinationMessage::DirectoryCreated {
+                        ref src,
+                        ref dst,
+                        file_count,
+                    } => {
                         tracing::info!(
-                            "Received directory creation confirmation for: {:?} -> {:?}",
-                            confirmation.src,
-                            confirmation.dst
+                            "Received directory creation confirmation for: {:?} -> {:?} (file_count={})",
+                            src,
+                            dst,
+                            file_count
                         );
                         let error_flag = error_occurred.clone();
                         let settings = settings.clone();
                         join_set.spawn(send_files_in_directory_tcp(
                             settings,
-                            confirmation.src.clone(),
-                            confirmation.dst.clone(),
+                            src.clone(),
+                            dst.clone(),
                             source_root.clone(),
+                            file_count,
                             stream_pool.clone(),
                             pending_limit.clone(),
                             error_flag,

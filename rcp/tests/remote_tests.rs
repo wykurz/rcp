@@ -3474,11 +3474,11 @@ fn test_remote_dry_run_exclude_is_absolute() {
     );
 }
 
-/// Test that remote copy with --include keeps traversed-only directories.
-/// Unlike local copy, remote copy does not clean up empty directories because
-/// directory completion is file-count based and does not wait for child dirs.
+/// Test that remote copy with --include cleans up traversed-only empty directories.
+/// Directories that don't match include patterns and end up empty after filtering
+/// are removed during directory completion.
 #[test]
-fn test_remote_include_filter_keeps_traversed_dirs() {
+fn test_remote_include_filter_cleans_up_traversed_dirs() {
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     // create structure:
@@ -3507,20 +3507,19 @@ fn test_remote_include_filter_keeps_traversed_dirs() {
     // txt files should exist
     assert!(dst_root.join("foo.txt").exists(), "foo.txt should exist");
     assert!(dst_root.join("bar.txt").exists(), "bar.txt should exist");
-    // empty_dir and other_dir exist because remote copy does not clean up
-    // traversed-only directories (see directory_tracker.rs for details)
+    // traversed-only empty directories should be cleaned up
     assert!(
-        dst_root.join("empty_dir").exists(),
-        "empty_dir exists (remote copy does not remove traversed-only dirs)"
+        !dst_root.join("empty_dir").exists(),
+        "empty_dir should be removed (traversed-only empty dir)"
     );
     assert!(
-        dst_root.join("other_dir").exists(),
-        "other_dir exists (remote copy does not remove traversed-only dirs)"
+        !dst_root.join("other_dir").exists(),
+        "other_dir should be removed (traversed-only, no matching files)"
     );
-    // directories_created counts all created directories (remote copy keeps them all)
+    // only the root directory is kept
     assert_eq!(
-        summary.directories_created, 3,
-        "Should create 3 directories (dst root + empty_dir + other_dir)"
+        summary.directories_created, 1,
+        "Should create 1 directory (dst root only, traversed dirs cleaned up)"
     );
 }
 
@@ -3604,22 +3603,17 @@ fn test_remote_include_filter_directory_with_matching_content() {
         dst_root.join("has_txt/file.txt").exists(),
         "file.txt should exist (matches pattern)"
     );
-    // no_txt directory exists because remote copy does not clean up traversed-only dirs
+    // no_txt directory should NOT exist (traversed-only, no matching content, cleaned up)
     assert!(
-        dst_root.join("no_txt").exists(),
-        "no_txt/ exists (remote copy does not remove traversed-only dirs)"
-    );
-    // file.log should NOT exist
-    assert!(
-        !dst_root.join("no_txt/file.log").exists(),
-        "file.log should NOT exist (doesn't match pattern)"
+        !dst_root.join("no_txt").exists(),
+        "no_txt/ should be removed (traversed-only, no matching files)"
     );
     // should have copied 1 file
     assert_eq!(summary.files_copied, 1, "Should copy 1 .txt file");
-    // should have created 3 directories (dst root, has_txt, and no_txt which is kept)
+    // should have created 2 directories (dst root + has_txt; no_txt cleaned up)
     assert_eq!(
-        summary.directories_created, 3,
-        "Should create 3 directories (dst root + has_txt + no_txt)"
+        summary.directories_created, 2,
+        "Should create 2 directories (dst root + has_txt, no_txt cleaned up)"
     );
 }
 
@@ -3703,18 +3697,17 @@ fn test_remote_include_directly_matched_empty_dir_kept() {
         dst_root.join("keep_me").exists(),
         "keep_me/ should be kept (directly matches include pattern)"
     );
-    // other_dir exists because remote copy does not clean up traversed-only dirs
+    // other_dir should NOT exist (traversed-only empty dir is cleaned up)
     assert!(
-        dst_root.join("other_dir").exists(),
-        "other_dir/ exists (remote copy does not remove traversed-only dirs)"
+        !dst_root.join("other_dir").exists(),
+        "other_dir/ should be removed (traversed-only empty dir)"
     );
     // should have copied 1 file
     assert_eq!(summary.files_copied, 1, "Should copy 1 file (file.txt)");
 }
 
 /// Test that remote copy does not remove directories that only contain symlinks.
-/// Even though dir_total_files == 0 (only counts regular files), the directory
-/// has content (symlinks) and should not be removed.
+/// The directory has content (symlinks) and should not be removed.
 #[test]
 fn test_remote_dir_with_symlinks_not_removed() {
     require_local_ssh();
@@ -3765,10 +3758,8 @@ fn test_remote_dir_with_symlinks_not_removed() {
     );
 }
 
-/// Test that remote copy with --include creates all directories including
-/// traversed-only ones. The root is the user-specified destination and should
-/// never be suppressed; subdirectories are also kept since remote copy does
-/// not clean up empty directories.
+/// Test that remote copy with --include preserves the root directory even when
+/// nothing matches. Traversed-only subdirectories are cleaned up.
 #[test]
 fn test_remote_include_filter_root_preserved_when_nothing_matches() {
     require_local_ssh();
@@ -3790,16 +3781,16 @@ fn test_remote_include_filter_root_preserved_when_nothing_matches() {
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     // no files should be copied
     assert_eq!(summary.files_copied, 0, "No files match *.txt");
-    // root directory and subdirectories are all created (remote copy keeps traversed dirs)
+    // only the root directory is kept; empty_dir is cleaned up as traversed-only
     assert_eq!(
-        summary.directories_created, 2,
-        "Should create 2 directories (dst root + empty_dir)"
+        summary.directories_created, 1,
+        "Should create 1 directory (dst root only, empty_dir cleaned up)"
     );
     assert!(dst_root.exists(), "Root destination directory should exist");
-    // empty_dir exists because remote copy does not clean up traversed-only dirs
+    // empty_dir should NOT exist (traversed-only empty dir is cleaned up)
     assert!(
-        dst_root.join("empty_dir").exists(),
-        "empty_dir/ exists (remote copy does not remove traversed-only dirs)"
+        !dst_root.join("empty_dir").exists(),
+        "empty_dir/ should be removed (traversed-only empty dir)"
     );
 }
 

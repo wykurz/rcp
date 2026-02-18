@@ -124,11 +124,6 @@ impl From<&std::fs::Metadata> for Metadata {
 }
 
 /// File header sent on unidirectional streams, followed by raw file data.
-///
-/// The `dir_total_files` field tells destination how many files to expect
-/// for this file's parent directory. This is set when source iterates the
-/// directory (after receiving `DirectoryCreated`), ensuring accuracy even
-/// if directory contents change during the copy.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct File {
     pub src: std::path::PathBuf,
@@ -136,8 +131,6 @@ pub struct File {
     pub size: u64,
     pub metadata: Metadata,
     pub is_root: bool,
-    /// Total number of files in the parent directory (for tracking completion)
-    pub dir_total_files: usize,
 }
 
 /// Wrapper that includes size for comparison purposes.
@@ -177,13 +170,20 @@ impl<'a> common::preserve::Metadata for FileMetadata<'a> {
 /// Messages sent from source to destination on the control stream.
 #[derive(Debug, Deserialize, Serialize)]
 pub enum SourceMessage {
-    /// Create directory and store metadata for later application.
-    /// Sent during directory tree traversal in depth-first order.
+    /// Create directory, store metadata, and declare entry counts for completion tracking.
+    /// Sent during directory tree traversal in depth-first order. Source pre-reads the
+    /// directory children before sending, so counts are known at send time.
     Directory {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
         metadata: Metadata,
         is_root: bool,
+        /// total child entries (files + directories + symlinks) for completion tracking
+        entry_count: usize,
+        /// number of child files, echoed back via `DirectoryCreated` for file sending
+        file_count: usize,
+        /// whether to keep this directory if it ends up empty after filtering
+        keep_if_empty: bool,
     },
     /// Create symlink with metadata.
     Symlink {
@@ -199,27 +199,15 @@ pub enum SourceMessage {
     /// When false (dry-run or filtered root), destination can mark root as complete.
     DirStructureComplete { has_root_item: bool },
     /// Notify destination that a file failed to send.
-    /// Includes `dir_total_files` so destination can track file counts.
+    /// Counts as a processed entry for the parent directory's completion tracking.
     FileSkipped {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
-        dir_total_files: usize,
     },
     /// Notify destination that a symlink failed to read.
-    /// For logging purposes only (symlinks don't affect file counts).
     /// If `is_root` is true, this signals that root processing is complete (even if failed).
+    /// Non-root skipped symlinks count as a processed entry for the parent directory.
     SymlinkSkipped { src_dst: SrcDst, is_root: bool },
-    /// Notify destination that a directory contains no files.
-    /// Sent after receiving `DirectoryCreated` for an empty directory.
-    /// `keep_if_empty` is computed by the source based on filter settings and directory
-    /// contents (e.g., symlinks) but currently unused by the destination — directories
-    /// are always kept. Empty directory cleanup is deferred until directory completion
-    /// waits for all descendants to finish (see `docs/remote_protocol.md`).
-    DirectoryEmpty {
-        src: std::path::PathBuf,
-        dst: std::path::PathBuf,
-        keep_if_empty: bool,
-    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -232,8 +220,13 @@ pub struct SrcDst {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum DestinationMessage {
     /// Confirm directory created, request file transfers.
-    /// Triggers source to send files from this directory.
-    DirectoryCreated(SrcDst),
+    /// `file_count` is echoed back from the `Directory` message so source knows
+    /// how many files to send from this directory.
+    DirectoryCreated {
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+        file_count: usize,
+    },
     /// Signal destination has finished all operations.
     /// Initiates graceful shutdown via stream closure.
     DestinationDone,

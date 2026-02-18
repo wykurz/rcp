@@ -384,7 +384,7 @@ where
         } => {
             // destination doesn't use filter (filtering happens at source).
             // empty directory cleanup decisions are communicated per-directory
-            // via keep_if_empty in the DirectoryEmpty message.
+            // via keep_if_empty in the Directory message.
             let settings = common::copy::Settings {
                 dereference: args.dereference,
                 fail_early: args.fail_early,
