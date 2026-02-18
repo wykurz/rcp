@@ -95,7 +95,7 @@ All TCP connections are encrypted and authenticated using TLS 1.3 with self-sign
   - `Source { src, dst, dest_cert_fingerprint, filter, dry_run }`: Tells source rcpd what to copy
     - `filter`: Optional filter settings for include/exclude patterns (source-side filtering reduces network traffic)
     - `dry_run`: Optional dry-run mode (brief, all, or explain) for previewing operations without transferring files
-  - `Destination { source_control_addr, source_data_addr, server_name, preserve, source_cert_fingerprint }`: Tells destination where to connect (both control and data addresses). Note: empty directory cleanup decisions are communicated per-directory via `keep_if_empty` in `DirectoryEmpty` messages rather than a global flag.
+  - `Destination { source_control_addr, source_data_addr, server_name, preserve, source_cert_fingerprint }`: Tells destination where to connect (both control and data addresses). Note: empty directory cleanup decisions are communicated per-directory via `keep_if_empty` in `Directory` messages rather than a global flag.
 
 **`SourceMasterHello`** (Source → Master, bidirectional stream)
 - **Purpose**: Provide source's TCP server details for destination to connect
@@ -110,9 +110,12 @@ All TCP connections are encrypted and authenticated using TLS 1.3 with self-sign
 ### 2.2 Source → Destination Messages (Control Stream)
 
 **`Directory`**
-- **Purpose**: Create directory and store metadata for later application
-- **Fields**: `src`, `dst`, `metadata`, `is_root`
-- **Usage**: Sent during directory tree traversal in depth-first order. Destination creates the directory and stores metadata to apply when all files are received.
+- **Purpose**: Create directory, store metadata, and declare entry counts for completion tracking
+- **Fields**: `src`, `dst`, `metadata`, `is_root`, `entry_count`, `file_count`, `keep_if_empty`
+- **Usage**: Sent during directory tree traversal in depth-first order. Source pre-reads the directory children before sending this message, so `entry_count` and `file_count` are known at send time. Destination creates the directory, stores metadata, and uses the entry counts for completion tracking.
+- **`entry_count`**: Total number of child entries (files + directories + symlinks) that will be sent for this directory. Used by DirectoryTracker to know when all children have been processed.
+- **`file_count`**: Number of child files in this directory. Sent back to source via `DirectoryCreated` so source knows how many files to send (round-trip mechanism).
+- **`keep_if_empty`**: Whether to keep the directory if it ends up empty after filtering. `true` when the directory contains non-file entries (symlinks), when no filter is active, when it is the root, or when the directory directly matches an include pattern. `false` when the directory was only traversed to look for potential matches and should be removed.
 
 **`Symlink`**
 - **Purpose**: Create symlink with metadata
@@ -126,25 +129,20 @@ All TCP connections are encrypted and authenticated using TLS 1.3 with self-sign
 
 **`FileSkipped`**
 - **Purpose**: Notify destination that a file failed to send
-- **Fields**: `src`, `dst`, `dir_total_files`
-- **Usage**: Sent when file open fails (before any data connection is used). Allows destination to track file counts correctly. Transport failures after connection is established are fatal.
+- **Fields**: `src`, `dst`
+- **Usage**: Sent when file open fails (before any data connection is used). Counts as a processed entry for the parent directory's completion tracking. Transport failures after connection is established are fatal.
 
 **`SymlinkSkipped`**
 - **Purpose**: Notify destination that a symlink failed to read
 - **Fields**: `src_dst: {src, dst}`, `is_root`
 - **Usage**: Sent when symlink read fails. If `is_root` is true, destination sets `root_complete` to signal root processing is done (even if failed).
 
-**`DirectoryEmpty`**
-- **Purpose**: Notify destination that a directory contains no files
-- **Fields**: `src`, `dst`, `keep_if_empty`
-- **Usage**: Sent after receiving `DirectoryCreated` for an empty directory. Allows destination to mark directory as complete. The `keep_if_empty` flag tells destination whether to keep the directory: `true` when the directory contains non-file entries (e.g., symlinks), when no filter is active, or when the directory directly matches an include pattern; `false` when the directory was only traversed to look for potential matches and should be removed.
-
 ### 2.3 Destination → Source Messages (Control Stream)
 
 **`DirectoryCreated`**
 - **Purpose**: Confirm directory created, request file transfers
-- **Fields**: `src`, `dst`
-- **Usage**: Sent after successfully creating directory. Triggers source to send files from this directory.
+- **Fields**: `src`, `dst`, `file_count`
+- **Usage**: Sent after successfully creating directory. The `file_count` field is echoed back from the `Directory` message so source knows how many files to send from this directory. Triggers source to send files.
 
 **`DestinationDone`**
 - **Purpose**: Signal destination has finished all operations
@@ -154,11 +152,9 @@ All TCP connections are encrypted and authenticated using TLS 1.3 with self-sign
 
 **`File`** (Source → Destination, on data connections)
 - **Purpose**: File header followed by raw file data
-- **Fields**: `src`, `dst`, `size`, `metadata`, `is_root`, `dir_total_files`
+- **Fields**: `src`, `dst`, `size`, `metadata`, `is_root`
 - **Format**: Length-delimited serialized header, then raw bytes (exactly `size` bytes)
 - **Connection model**: Connections are pooled and reused for multiple files. The `size` field delimits file boundaries within a connection. Destination reads headers in a loop until EOF.
-
-The `dir_total_files` field tells destination how many files to expect for this file's parent directory. This count is set when source iterates the directory contents (after receiving `DirectoryCreated`), ensuring accuracy even if directory contents change during the copy.
 
 ## 3. Error Communication Design
 
@@ -167,9 +163,9 @@ The `dir_total_files` field tells destination how many files to expect for this 
 The protocol uses asymmetric error communication between source and destination:
 
 **Source → Destination: MUST communicate failures**
-- Source must notify destination of skipped files (`FileSkipped`) so destination can track file counts correctly
+- Source must notify destination of skipped files (`FileSkipped`) so destination can track entry counts correctly
 - Source must notify destination of skipped symlinks (`SymlinkSkipped`) for logging purposes
-- Without these notifications, destination would hang waiting for items that will never arrive
+- Without these notifications, destination would hang waiting for entries that will never arrive
 - **Note**: `FileSkipped` is only sent for file open failures. Transport failures (send errors after connection established) are fatal and abort the entire transfer
 
 **Destination → Source: Does NOT communicate failures**
@@ -214,28 +210,34 @@ can eventually return true and `DestinationDone` can be sent.
 ```
 Source                              Destination
   |                                      |
-  |  ---- Directory(root, meta) -------> |  Create root, store metadata
-  |  ---- Directory(child1, meta) -----> |  Create child1, store metadata
+  |  (pre-read root: 2 files, 1 symlink, 1 dir = 4 entries)
+  |  ---- Directory(root, entries=4,  -> |  Create root, store metadata
+  |         files=2, meta) ----------->  |  entries_expected=4
+  |  (pre-read child1: 1 file = 1 entry)
+  |  ---- Directory(child1, entries=1,-> |  Create child1, store metadata
+  |         files=1, meta) ----------->  |  entries_expected=1
   |  ---- Symlink(root/link, meta) ----> |  Create symlink
-  |  ---- Directory(child2, meta) -----> |  Create child2, store metadata
+  |                                      |  root: entries_processed++ (1/4)
+  |  (pre-read child2: 0 entries)        |
+  |  ---- Directory(child2, entries=0,-> |  Create child2, entries_expected=0
+  |         files=0, meta) ----------->  |  child2 complete → apply metadata
+  |                                      |  root: entries_processed++ (2/4)
   |  ---- DirStructureComplete --------> |  Structure complete
   |                                      |
-  |  <--- DirectoryCreated(root) ------- |
-  |  <--- DirectoryCreated(child1) ----- |
-  |  <--- DirectoryCreated(child2) ----- |
+  |  <--- DirectoryCreated(root, fc=2) - |
+  |  <--- DirectoryCreated(child1,fc=1)  |
   |                                      |
-  |  (iterate root, find 2 files)        |
-  |  ~~~~ File(root/f1, total=2) ~~~~~~> |  (dest opens data conn, receives file)
-  |  ~~~~ File(root/f2, total=2) ~~~~~~> |  Write file, 0 remaining
+  |  (send 2 files from root)           |
+  |  ~~~~ File(root/f1) ~~~~~~~~~~~~~~~~>|  Write file
+  |                                      |  root: entries_processed++ (3/4)
+  |  ~~~~ File(root/f2) ~~~~~~~~~~~~~~~~>|  Write file
+  |                                      |  root: entries_processed++ (4/4)
   |                                      |  root complete → apply metadata
   |                                      |
-  |  (iterate child1, find 1 file)       |
-  |  ~~~~ File(child1/f1, total=1) ~~~-> |  Write file, 0 remaining
+  |  (send 1 file from child1)          |
+  |  ~~~~ File(child1/f1) ~~~~~~~~~~~~~> |  Write file
+  |                                      |  child1: entries_processed++ (1/1)
   |                                      |  child1 complete → apply metadata
-  |                                      |
-  |  (iterate child2, empty)             |
-  |  ---- DirectoryEmpty(child2) ------> |  0 files expected
-  |                                      |  child2 complete → apply metadata
   |                                      |
   |                                      |  All directories complete, structure complete
   |  <--- DestinationDone -------------- |  Close send side
@@ -276,18 +278,21 @@ Source                              Destination
 
 ### 4.4 Failed Directory Handling
 
-When a directory fails to be created, destination tracks it locally and skips descendants:
+When a directory fails to be created, destination tracks it locally and skips descendants.
+The parent directory's entry count still includes failed children, so `process_child_entry`
+is called even for skipped entries to ensure the parent can complete.
 
 ```
 Source                              Destination
   |                                      |
-  |  ---- Directory(dir1, meta) -------> |  mkdir dir1 → FAILS
-  |                                      |  Add to failed_directories
-  |                                      |  Set files_expected = 0 (no files will come)
+  |  ---- Directory(dir1, entries=2,  -> |  mkdir dir1 → FAILS
+  |         files=1, meta) ----------->  |  Add to failed_directories
   |                                      |  DO NOT send DirectoryCreated
   |                                      |
-  |  ---- Directory(dir1/dir2, meta) --> |  Ancestor failed, skip (log warning)
+  |  ---- Directory(dir1/dir2, ...) ---> |  Ancestor failed, skip (log warning)
+  |                                      |  parent(dir1) process_child_entry (skipped)
   |  ---- Symlink(dir1/link, meta) ----> |  Ancestor failed, skip (log warning)
+  |                                      |  parent(dir1) process_child_entry (skipped)
   |  ---- DirStructureComplete --------> |  Structure complete
   |                                      |
   |  (no DirectoryCreated for dir1)      |
@@ -298,13 +303,15 @@ Source                              Destination
 
 ## 5. DirectoryTracker
 
-The `DirectoryTracker` on the destination side manages completion state with minimal tracking:
+The `DirectoryTracker` on the destination side manages completion state using unified
+entry counting. Every child entry (file, directory, or symlink) counts toward the parent
+directory's completion, ensuring metadata is only applied after all children finish.
 
 ### 5.1 Data Structures
 
 ```rust
 struct DirectoryTracker {
-    /// Directories waiting for files (files_expected unknown or files_remaining > 0)
+    /// Directories waiting for entries (entries_expected known, entries_processed < entries_expected)
     pending_directories: HashMap<PathBuf, DirectoryState>,
 
     /// Directories that failed to create - their descendants are skipped
@@ -321,16 +328,19 @@ struct DirectoryTracker {
 }
 
 struct DirectoryState {
-    files_expected: Option<usize>,  // None until first File/FileSkipped/DirectoryEmpty
-    files_remaining: usize,
+    entries_expected: usize,    // set from Directory message's entry_count
+    entries_processed: usize,   // incremented for each child (file, dir, symlink)
+    keep_if_empty: bool,        // whether to keep directory if it has no content
 }
 ```
 
 ### 5.2 Completion Conditions
 
 **Directory is complete when:**
-- `files_expected.is_some()` (we know how many files to expect)
-- `files_remaining == 0` (all files received)
+- `entries_processed >= entries_expected` (all children processed)
+
+Note: `entries_processed` may exceed `entries_expected` when directory contents change
+during the copy (see Section 7.1 for handling of source modifications).
 
 **Root is complete (`DestinationDone` can be sent) when:**
 - `structure_complete == true` (all directories/symlinks sent)
@@ -340,10 +350,11 @@ struct DirectoryState {
 ### 5.3 Key Operations
 
 **On `Directory` message:**
-- If ancestor in `failed_directories`: skip, log warning
+- If ancestor in `failed_directories`: skip, log warning; call `process_child_entry(parent)` to count this entry
 - Try to create directory (see directory creation semantics below)
-- If success: add to `pending_directories` with `files_expected = None`, store metadata, send `DirectoryCreated`
+- If success: add to `pending_directories` with `entries_expected` from message, `entries_processed = 0`, store metadata, send `DirectoryCreated { file_count }` back to source
 - If failure: add to `failed_directories`; if `is_root`, set `root_complete = true` to avoid hang
+- If not root: call `process_child_entry(parent)` to count this directory as a processed entry of its parent
 
 **Directory creation semantics:**
 - If directory doesn't exist: create it
@@ -356,40 +367,22 @@ whether non-directory items can be replaced.
 
 **On `File` message:**
 - If `is_root`: write file, set `root_complete = true`
-- Otherwise: set `files_expected` from `dir_total_files`, decrement `files_remaining`
-- If `files_remaining == 0`: apply stored metadata, remove from `pending_directories`
+- Otherwise: call `process_file(parent)` which increments `entries_processed`
+- If `entries_processed >= entries_expected`: apply stored metadata, remove from `pending_directories`
 
 **On `FileSkipped` message:**
-- Set `files_expected` from `dir_total_files`, decrement `files_remaining`
-- If `files_remaining == 0`: apply stored metadata, remove from `pending_directories`
-
-**On `DirectoryEmpty { keep_if_empty }` message:**
-- Set `files_expected = Some(0)`, `files_remaining = 0`
-- Apply stored metadata, remove from `pending_directories`
-- Note: `keep_if_empty` is sent by source but currently not acted upon by destination (see below)
-
-**Known limitation — no empty directory cleanup in remote copy**: directory completion is
-file-count based and does not wait for child directories to finish. A parent directory
-with no direct files completes as soon as it receives `DirectoryEmpty`, even if descendants
-are still in progress. Because `DirectoryEmpty` can be sent from a different task than the
-directory traversal (both write to the control stream via a mutex), `DirectoryEmpty(parent)`
-may arrive before `Directory(child)` for a descendant. If the destination removed the parent
-at that point, subsequent creation of `parent/child` would fail with `NotFound`, breaking
-the transfer. For this reason, empty directory cleanup is intentionally disabled in the
-remote path — the destination always keeps directories regardless of `keep_if_empty`. This
-also means metadata (permissions, mtime) may be applied while children are still being added,
-which can cause issues with restrictive source permissions or mtime drift. A future fix
-should defer directory completion until all descendants finish, at which point
-`keep_if_empty` can be respected.
+- Call `process_file(parent)` which increments `entries_processed`
+- If `entries_processed >= entries_expected`: apply stored metadata, remove from `pending_directories`
 
 **On `Symlink` message:**
-- If ancestor in `failed_directories`: skip, log warning
+- If ancestor in `failed_directories`: skip, log warning; call `process_child_entry(parent)` to count this entry
 - Create symlink; if `is_root`, set `root_complete = true` (regardless of success/failure)
-- Non-root symlinks don't affect tracking
+- If not root: call `process_child_entry(parent)` to count this symlink
 
 **On `SymlinkSkipped` message:**
 - If `is_root`: set `root_complete = true` to avoid hang
-- Otherwise: log only (symlinks don't affect file counts)
+- If not root: call `process_child_entry(parent)` to count this entry
+- Log the skip
 
 **On `DirStructureComplete { has_root_item }`:**
 - Set `structure_complete = true`
@@ -456,20 +449,39 @@ Destination                          Source
 
 ## 7. Design Rationale
 
-### 7.1 Deferred File Count
+### 7.1 Unified Entry Counting and Round-Trip File Count
 
-The protocol defers communicating file counts until after the source iterates directory contents:
+The protocol uses a two-layer counting scheme for directory completion:
 
-**Problem:** Directory contents may change between initial traversal and file sending.
+**Entry count (traversal-time, source → destination):**
+The `entry_count` in the `Directory` message counts all child entries (files + directories
++ symlinks) visible during source's pre-read of the directory. This count is set at
+traversal time and used by DirectoryTracker to determine when all children have been
+processed. Since directories, symlinks, and files all count, a parent directory only
+completes after all its children are done — preventing premature metadata application.
 
-**Solution:** The `dir_total_files` field is set when source actually iterates the directory (after receiving `DirectoryCreated`), not during initial traversal.
+**File count (round-trip, source → destination → source):**
+The `file_count` in the `Directory` message tells destination how many files exist in this
+directory. Destination echoes it back in `DirectoryCreated { file_count }` so that source
+knows how many files to send. This round-trip mechanism decouples the traversal from file
+sending — source pre-reads children during traversal but only sends files after receiving
+the `DirectoryCreated` confirmation.
 
-**Handling changes:**
-- If fewer files exist than during iteration: source sends `FileSkipped` for missing files
-- If more files exist than during iteration: source ignores extras, logs warning
+**Handling source modifications during copy:**
+Directory contents may change between the source's pre-read (during traversal) and the
+actual file sending (after receiving `DirectoryCreated`):
+
+- **Files disappeared:** source sends synthetic `FileSkipped` for missing files, so
+  destination's `entries_processed` still reaches `entries_expected`
+- **Extra files appeared:** source ignores them (only sends up to `file_count`), logs warning
+- **Extra directories/symlinks appeared:** source ignores them (already sent during traversal)
+- **Directory unreadable at send time:** source sends `file_count` synthetic `FileSkipped`
+  messages so destination can still complete
 - With `--fail-early`: abort on any discrepancy
 
-This guarantees `dir_total_files` matches exactly what source sends, preventing hangs.
+The destination uses `>=` comparison (`entries_processed >= entries_expected`) rather than
+`==` to handle edge cases gracefully — if extra entries are somehow processed, the
+directory still completes rather than hanging.
 
 ### 7.2 Root Item Handling
 
@@ -481,10 +493,11 @@ Root items (the initial copy target) use the `is_root` flag:
 ### 7.3 Failed Directory Tracking
 
 Failed directories are tracked in a simple set:
-- No complex entry counting needed for failed directories
+- No entry counting needed for failed directories themselves
 - Descendants are detected via ancestor lookup and skipped
-- Since we only count files (not subdirs/symlinks), skipping descendants doesn't affect counts
-- Failed directories immediately have `files_expected = Some(0)` since no `DirectoryCreated` is sent
+- Skipped descendants still call `process_child_entry(parent)` so the parent's entry count
+  is correctly maintained — even when a child directory fails, it counts as a processed entry
+- Failed directories are not added to `pending_directories` since no `DirectoryCreated` is sent
 
 ### 7.4 Message Batching
 

@@ -264,10 +264,9 @@ async fn handle_file_stream(
             }
         };
         tracing::info!(
-            "Received file: {:?} -> {:?} (dir_total_files={})",
+            "Received file: {:?} -> {:?}",
             file_header.src,
-            file_header.dst,
-            file_header.dir_total_files
+            file_header.dst
         );
         // acquire throttle permits for this file
         let _open_file_guard = throttle::open_file_permit()
@@ -332,7 +331,7 @@ async fn handle_file_stream(
                     anyhow::anyhow!("file {:?} has no parent directory", file_header.dst)
                 })?;
                 tracker
-                    .process_file(parent_dir, file_header.dir_total_files)
+                    .process_file(parent_dir)
                     .await
                     .context("Failed to update directory tracker after receiving file")?;
             }
@@ -609,15 +608,30 @@ async fn process_control_stream(
                 ref dst,
                 ref metadata,
                 is_root,
+                entry_count,
+                file_count,
+                keep_if_empty,
             } => {
                 let _ops_guard = prog.ops.guard();
                 // check for failed ancestor
-                {
+                let has_failed_ancestor = {
                     let tracker = directory_tracker.lock().await;
-                    if tracker.has_failed_ancestor(dst) {
-                        tracing::warn!("Skipping directory {:?} - ancestor failed to create", dst);
-                        continue;
+                    tracker.has_failed_ancestor(dst)
+                };
+                if has_failed_ancestor {
+                    tracing::warn!("Skipping directory {:?} - ancestor failed to create", dst);
+                    // still count as a processed child entry for the parent
+                    if !is_root {
+                        if let Some(parent) = dst.parent() {
+                            directory_tracker
+                                .lock()
+                                .await
+                                .process_child_entry(parent)
+                                .await
+                                .context("Failed to update parent tracker for skipped directory")?;
+                        }
                     }
+                    continue;
                 }
                 // try to create directory
                 let create_result = match create_directory(settings, dst).await {
@@ -639,7 +653,16 @@ async fn process_control_stream(
                         directory_tracker
                             .lock()
                             .await
-                            .add_directory(src, dst, metadata.clone(), is_root, was_created)
+                            .add_directory(
+                                src,
+                                dst,
+                                metadata.clone(),
+                                is_root,
+                                was_created,
+                                entry_count,
+                                file_count,
+                                keep_if_empty,
+                            )
                             .await
                             .context("Failed to add directory to tracker")?;
                     }
@@ -657,6 +680,17 @@ async fn process_control_stream(
                         }
                     }
                 }
+                // count this directory as a processed child entry for its parent
+                if !is_root {
+                    if let Some(parent) = dst.parent() {
+                        directory_tracker
+                            .lock()
+                            .await
+                            .process_child_entry(parent)
+                            .await
+                            .context("Failed to update parent tracker for directory")?;
+                    }
+                }
             }
             remote::protocol::SourceMessage::Symlink {
                 ref src,
@@ -667,12 +701,24 @@ async fn process_control_stream(
             } => {
                 let _ops_guard = prog.ops.guard();
                 // check for failed ancestor
-                {
+                let has_failed_ancestor = {
                     let tracker = directory_tracker.lock().await;
-                    if tracker.has_failed_ancestor(dst) {
-                        tracing::warn!("Skipping symlink {:?} - ancestor failed to create", dst);
-                        continue;
+                    tracker.has_failed_ancestor(dst)
+                };
+                if has_failed_ancestor {
+                    tracing::warn!("Skipping symlink {:?} - ancestor failed to create", dst);
+                    // still count as a processed child entry for the parent
+                    if !is_root {
+                        if let Some(parent) = dst.parent() {
+                            directory_tracker
+                                .lock()
+                                .await
+                                .process_child_entry(parent)
+                                .await
+                                .context("Failed to update parent tracker for skipped symlink")?;
+                        }
                     }
+                    continue;
                 }
                 // create symlink
                 let result = create_symlink(settings, preserve, dst, target, metadata).await;
@@ -687,6 +733,17 @@ async fn process_control_stream(
                 if is_root {
                     directory_tracker.lock().await.set_root_complete();
                 }
+                // count this symlink as a processed child entry for its parent
+                if !is_root {
+                    if let Some(parent) = dst.parent() {
+                        directory_tracker
+                            .lock()
+                            .await
+                            .process_child_entry(parent)
+                            .await
+                            .context("Failed to update parent tracker for symlink")?;
+                    }
+                }
             }
             remote::protocol::SourceMessage::DirStructureComplete { has_root_item } => {
                 tracing::info!(
@@ -698,11 +755,7 @@ async fn process_control_stream(
                     .await
                     .set_structure_complete(has_root_item);
             }
-            remote::protocol::SourceMessage::FileSkipped {
-                ref src,
-                ref dst,
-                dir_total_files,
-            } => {
+            remote::protocol::SourceMessage::FileSkipped { ref src, ref dst } => {
                 tracing::info!("File was skipped by source: {:?} -> {:?}", src, dst);
                 // get parent directory and update tracker
                 let parent_dir = dst
@@ -711,7 +764,7 @@ async fn process_control_stream(
                 directory_tracker
                     .lock()
                     .await
-                    .process_file(parent_dir, dir_total_files)
+                    .process_file(parent_dir)
                     .await
                     .context("Failed to update tracker for skipped file")?;
             }
@@ -724,31 +777,21 @@ async fn process_control_stream(
                     src_dst.src,
                     src_dst.dst
                 );
-                // symlinks don't affect file counts - just log
                 // if root symlink failed, mark root as complete to avoid hang
                 if is_root {
                     directory_tracker.lock().await.set_root_complete();
                 }
-            }
-            remote::protocol::SourceMessage::DirectoryEmpty {
-                ref src,
-                ref dst,
-                keep_if_empty,
-            } => {
-                tracing::info!(
-                    "Directory is empty: {:?} -> {:?} (keep_if_empty={})",
-                    src,
-                    dst,
-                    keep_if_empty
-                );
-                // mark_directory_empty handles both root and non-root directories
-                // complete_directory is called internally and will set root_complete if needed
-                directory_tracker
-                    .lock()
-                    .await
-                    .mark_directory_empty(dst, keep_if_empty)
-                    .await
-                    .context("Failed to mark directory as empty")?;
+                // count this skipped symlink as a processed child entry for its parent
+                if !is_root {
+                    if let Some(parent) = src_dst.dst.parent() {
+                        directory_tracker
+                            .lock()
+                            .await
+                            .process_child_entry(parent)
+                            .await
+                            .context("Failed to update parent tracker for skipped symlink")?;
+                    }
+                }
             }
         }
         // check if we're done after each message
