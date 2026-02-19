@@ -876,8 +876,13 @@ pub async fn run_destination(
     // wrap in Arc<Mutex<>> for shared access
     let control_send_stream = std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
     tracing::info!("Created control streams");
-    let directory_tracker = directory_tracker::make_shared(control_send_stream, *preserve);
     let error_occurred = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let directory_tracker = directory_tracker::make_shared(
+        control_send_stream,
+        *preserve,
+        settings.fail_early,
+        error_occurred.clone(),
+    );
     // create a pool of data connections to source
     let data_pool = std::sync::Arc::new(DataConnectionPool::new(
         *src_data_addr,

@@ -173,6 +173,10 @@ The protocol uses asymmetric error communication between source and destination:
 - Source doesn't need to know if destination failed to create a directory, write a file, etc.
 - Source continues sending the complete directory structure regardless of destination failures
 - This simplifies the protocol and reduces round-trips
+- Destination metadata errors (file, directory, symlink) are handled locally: logged with
+  `tracing::error!`, `error_occurred` flag set, and processing continues unless `--fail-early`
+  is set. This applies to both file metadata (via `DataConsumed` stream state) and directory
+  metadata (in `DirectoryTracker::complete_directory_single`)
 
 ### 3.2 Rationale
 
@@ -366,6 +370,12 @@ during the copy (see Section 7.1 for handling of source modifications).
 This means existing directories are always reusable - the `--overwrite` flag only controls
 whether non-directory items can be replaced.
 
+**On directory completion (`complete_directory_single`):**
+- Apply stored metadata (permissions, owner, timestamps)
+- If metadata application fails (e.g., `fchownat` EPERM): log error, set `error_occurred`,
+  return error only if `fail_early`. Otherwise continue — the directory is still marked
+  complete and parent notification still happens.
+
 **On `File` message:**
 - If `is_root`: write file, set `root_complete = true`
 - Otherwise: call `process_file(parent)` which increments `entries_processed`
@@ -549,6 +559,10 @@ This distinction matters for pool efficiency:
 - `DataConsumed`: Connection already at clean boundary, can read next header immediately
 - `Corrupted`: Connection unusable, must close (source will accept new connection if needed)
 
+Directory metadata errors are handled analogously in `DirectoryTracker::complete_directory_single`:
+the error is logged, `error_occurred` is set, and processing continues (unless `--fail-early`).
+The directory is still marked complete and parent notifications still propagate.
+
 ### 7.7 Summary Statistics Authority
 
 The destination is the authoritative source for operation statistics:
@@ -624,6 +638,7 @@ idle time between file transfers.
 - ✅ Unwritable destination
 - ✅ Root directory blocked by existing file (no hang)
 - ✅ Root symlink inaccessible/metadata failure (no hang)
+- ✅ Destination directory metadata errors continue without `--fail-early` (sudo test)
 
 **Lifecycle management:**
 - ✅ rcpd exit when master killed

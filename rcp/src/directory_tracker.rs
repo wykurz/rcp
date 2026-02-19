@@ -33,8 +33,6 @@
 //! - Descendant directories/symlinks are skipped via `has_failed_ancestor()`
 //! - Skipped entries still call `process_child_entry()` on the parent
 
-use anyhow::Context;
-
 /// State for a single directory waiting for child entries.
 #[derive(Debug)]
 struct DirectoryState {
@@ -68,12 +66,18 @@ pub struct DirectoryTracker {
     control_send_stream: remote::streams::BoxedSharedSendStream,
     /// preserve settings for applying metadata
     preserve: common::preserve::Settings,
+    /// whether to fail immediately on errors
+    fail_early: bool,
+    /// shared flag to indicate an error occurred during processing
+    error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DirectoryTracker {
     pub fn new(
         control_send_stream: remote::streams::BoxedSharedSendStream,
         preserve: common::preserve::Settings,
+        fail_early: bool,
+        error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             pending_directories: std::collections::HashMap::new(),
@@ -86,6 +90,8 @@ impl DirectoryTracker {
             done_sent: false,
             control_send_stream,
             preserve,
+            fail_early,
+            error_occurred,
         }
     }
     /// Check if any ancestor of the given path is a failed directory.
@@ -297,10 +303,20 @@ impl DirectoryTracker {
         }
         // apply stored metadata
         if let Some(metadata) = self.metadata.remove(dst) {
-            common::preserve::set_dir_metadata(&self.preserve, &metadata, dst)
-                .await
-                .with_context(|| format!("failed to set metadata on directory {:?}", dst))?;
-            tracing::info!("Directory complete, metadata applied: {:?}", dst);
+            match common::preserve::set_dir_metadata(&self.preserve, &metadata, dst).await {
+                Ok(()) => {
+                    tracing::info!("Directory complete, metadata applied: {:?}", dst);
+                }
+                Err(e) => {
+                    let err = e.context(format!("failed to set metadata on directory {:?}", dst));
+                    tracing::error!("{:#}", err);
+                    self.error_occurred
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    if self.fail_early {
+                        return Err(err);
+                    }
+                }
+            }
         } else {
             tracing::warn!("No stored metadata for directory {:?}", dst);
         }
@@ -365,9 +381,13 @@ pub type SharedDirectoryTracker = std::sync::Arc<tokio::sync::Mutex<DirectoryTra
 pub fn make_shared(
     control_send_stream: remote::streams::BoxedSharedSendStream,
     preserve: common::preserve::Settings,
+    fail_early: bool,
+    error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> SharedDirectoryTracker {
     std::sync::Arc::new(tokio::sync::Mutex::new(DirectoryTracker::new(
         control_send_stream,
         preserve,
+        fail_early,
+        error_occurred,
     )))
 }
