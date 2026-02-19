@@ -427,9 +427,16 @@ where
                 }
                 Err(error) => {
                     let runtime_stats = common::collect_runtime_stats();
+                    // try to extract the real summary from common::copy::Error
+                    let (error_msg, summary) = match error.downcast::<common::copy::Error>() {
+                        Ok(copy_error) => (format!("{:#}", copy_error.source), copy_error.summary),
+                        Err(other_error) => {
+                            (format!("{other_error:#}"), common::copy::Summary::default())
+                        }
+                    };
                     let result = remote::protocol::RcpdResult::Failure {
-                        error: format!("{error:#}"),
-                        summary: common::copy::Summary::default(),
+                        error: error_msg,
+                        summary,
                         runtime_stats,
                     };
                     master_send_stream.send_control_message(&result).await?;

@@ -4197,3 +4197,88 @@ fn test_remote_copy_mixed_entries_no_hang() {
     // restore permissions so tempdir cleanup works
     std::fs::set_permissions(&dst_root, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+/// When copying a directory tree with `--preserve`, destination-side directory metadata
+/// errors (e.g., `fchownat` failing with "Operation not permitted" on root-owned dirs)
+/// should be logged and the copy should continue, not abort the entire operation.
+#[test]
+#[ignore = "requires passwordless sudo"]
+fn test_remote_sudo_destination_dir_metadata_error_continues() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // create a directory tree where the root of the copied tree is owned by root.
+    // when destination tries to chown the directory with --preserve, it will fail
+    // with "Operation not permitted" since we are not running as root.
+    let src_subdir = src_dir.path().join("root_dir");
+    let status = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            "bash",
+            "-c",
+            &format!(
+                "mkdir -p '{dir}' && \
+                 echo 'file1' > '{dir}/file1.txt' && \
+                 echo 'file2' > '{dir}/file2.txt' && \
+                 mkdir -p '{dir}/child' && \
+                 echo 'child_file' > '{dir}/child/child_file.txt' && \
+                 chown -R root:root '{dir}'",
+                dir = src_subdir.display()
+            ),
+        ])
+        .status()
+        .expect("Failed to run sudo");
+    if !status.success() {
+        eprintln!("Skipping test: passwordless sudo not available");
+        return;
+    }
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_subdir = dst_dir.path().join("root_dir");
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    // run with --preserve to trigger chown attempts on directories and files
+    let output = run_rcp_with_args(&["--preserve", "--summary", &src_remote, &dst_remote]);
+    print_command_output(&output);
+    // cleanup root-owned source files
+    let _ = std::process::Command::new("sudo")
+        .args(["-n", "rm", "-rf", &src_subdir.to_string_lossy()])
+        .status();
+    // verify all file DATA was transferred despite directory metadata errors
+    assert!(
+        dst_subdir.join("file1.txt").exists(),
+        "file1.txt should be copied"
+    );
+    assert_eq!(get_file_content(&dst_subdir.join("file1.txt")), "file1\n");
+    assert!(
+        dst_subdir.join("file2.txt").exists(),
+        "file2.txt should be copied"
+    );
+    assert_eq!(get_file_content(&dst_subdir.join("file2.txt")), "file2\n");
+    assert!(
+        dst_subdir.join("child/child_file.txt").exists(),
+        "child/child_file.txt should be copied"
+    );
+    assert_eq!(
+        get_file_content(&dst_subdir.join("child/child_file.txt")),
+        "child_file\n"
+    );
+    // command should fail (due to chown errors) but not hang or timeout
+    assert!(
+        !output.status.success(),
+        "should fail due to chown permission errors on directories"
+    );
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert!(
+        exit_code != 124,
+        "should not timeout - copy should continue after directory metadata errors"
+    );
+    // verify summary shows the files were actually copied
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(
+        summary.files_copied, 3,
+        "all 3 files should be copied despite directory metadata errors"
+    );
+    assert_eq!(
+        summary.directories_created, 2,
+        "both directories should be created (metadata errors happen after creation)"
+    );
+    eprintln!("✓ Copy continued after destination directory metadata errors");
+}
