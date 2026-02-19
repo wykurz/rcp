@@ -370,7 +370,7 @@ Preview what would happen without making changes:
 > rcp --dry-run=explain --exclude '*.log' src/ dst/
 ```
 
-**Note:** Dry-run mode bypasses `--overwrite` checks and shows all files that would be attempted, regardless of whether the destination already exists. This lets you preview the full scope of a potential operation.
+**Note:** Dry-run mode is primarily useful for previewing `--include`/`--exclude` filtering. It bypasses `--overwrite` checks and does not check whether files already exist at the destination. `--progress` and `--summary` are suppressed in dry-run mode (use `-v` to still see summary output).
 
 ## Overwrite
 

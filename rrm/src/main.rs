@@ -45,6 +45,9 @@ struct Args {
     filter_file: Option<std::path::PathBuf>,
 
     /// Preview mode - show what would be removed without actually removing
+    ///
+    /// --progress and --summary are suppressed in dry-run mode (use -v to
+    /// still see summary output).
     #[arg(long, value_name = "MODE", help_heading = "Filtering")]
     dry_run: Option<common::DryRunMode>,
 
@@ -203,6 +206,17 @@ async fn async_main(args: Args) -> Result<common::rm::Summary> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let dry_run_warnings = args.dry_run.map(|_| {
+        common::DryRunWarnings::new(
+            args.progress || args.progress_type.is_some() || args.progress_delay.is_some(),
+            args.summary,
+            args.verbose,
+            false, // rrm has no --overwrite
+            !args.include.is_empty() || !args.exclude.is_empty() || args.filter_file.is_some(),
+            false, // rrm has no destination
+        )
+    });
+    let is_dry_run = dry_run_warnings.is_some();
     let func = {
         let args = args.clone();
         || async_main(args)
@@ -210,7 +224,7 @@ fn main() -> Result<()> {
     let output = common::OutputConfig {
         quiet: args.quiet,
         verbose: args.verbose,
-        print_summary: args.summary,
+        print_summary: if is_dry_run { false } else { args.summary },
     };
     let runtime = common::RuntimeConfig {
         max_workers: args.max_workers,
@@ -233,7 +247,9 @@ fn main() -> Result<()> {
         tokio_console_port: None,
     };
     let res = common::run(
-        if args.progress || args.progress_type.is_some() {
+        if !is_dry_run
+            && (args.progress || args.progress_type.is_some() || args.progress_delay.is_some())
+        {
             Some(common::ProgressSettings {
                 progress_type: common::GeneralProgressType::User(
                     args.progress_type.unwrap_or_default(),
@@ -249,6 +265,9 @@ fn main() -> Result<()> {
         tracing,
         func,
     );
+    if let Some(warnings) = dry_run_warnings {
+        warnings.print();
+    }
     if res.is_none() {
         std::process::exit(1);
     }

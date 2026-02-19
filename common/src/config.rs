@@ -59,6 +59,72 @@ pub struct OutputConfig {
     pub print_summary: bool,
 }
 
+/// Warnings and adjustments for dry-run mode.
+///
+/// When dry-run is active, progress is suppressed (it interferes with stdout
+/// output) and `--summary` is suppressed unless `-v` is also active (verbose
+/// independently enables summary in `common::run()`). This struct collects
+/// warnings about the suppressed flags to print after the operation completes.
+pub struct DryRunWarnings {
+    warnings: Vec<String>,
+}
+impl DryRunWarnings {
+    /// Build dry-run warnings based on which flags were specified.
+    ///
+    /// `has_progress` — whether any progress flags were specified.
+    /// `has_summary` — whether --summary was specified.
+    /// `verbose` — verbosity level; when > 0 summary is printed by `common::run()`
+    ///   regardless of `print_summary`, so we skip the "ignored" warning.
+    /// `has_overwrite` — whether --overwrite was specified (not applicable to rrm).
+    /// `has_filters` — whether --include/--exclude/--filter-file was specified.
+    /// `has_destination` — true for rcp/rlink (copy/link to destination), false for rrm.
+    #[must_use]
+    pub fn new(
+        has_progress: bool,
+        has_summary: bool,
+        verbose: u8,
+        has_overwrite: bool,
+        has_filters: bool,
+        has_destination: bool,
+    ) -> Self {
+        let mut warnings = Vec::new();
+        if has_progress {
+            warnings.push("dry-run: --progress was ignored".to_string());
+        }
+        if has_summary && verbose == 0 {
+            warnings.push("dry-run: --summary was ignored".to_string());
+        }
+        if has_overwrite {
+            warnings.push(
+                "dry-run: --overwrite was ignored; dry-run does not check destination state"
+                    .to_string(),
+            );
+        }
+        if !has_filters {
+            if has_destination {
+                warnings.push(
+                    "dry-run: no filtering specified. dry-run is primarily useful to preview \
+                     --include/--exclude/--filter-file filtering; it does not check whether \
+                     files already exist at the destination."
+                        .to_string(),
+                );
+            } else {
+                warnings.push(
+                    "dry-run: no filtering specified. dry-run is primarily useful to preview \
+                     --include/--exclude/--filter-file filtering."
+                        .to_string(),
+                );
+            }
+        }
+        Self { warnings }
+    }
+    /// Print all collected warnings to stderr.
+    pub fn print(&self) {
+        for warning in &self.warnings {
+            eprintln!("{warning}");
+        }
+    }
+}
 /// Tracing configuration for debugging and profiling
 #[derive(Debug)]
 pub struct TracingConfig {
