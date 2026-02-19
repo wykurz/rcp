@@ -4057,6 +4057,69 @@ fn test_remote_filter_include_dir_with_only_subdirs_no_files() {
     );
 }
 
+/// Test that nested empty directories are cleaned up bottom-up when filtering.
+/// Verifies that child directories notify their parent upon completion (not creation),
+/// so parent directories can correctly decide to clean up when all children are gone.
+///
+/// Structure:
+///   src/
+///     parent/
+///       child_match/
+///         file.txt     (matches *.txt)
+///       child_empty/
+///         subchild/    (no matching files)
+///
+/// With --include=*.txt, child_empty/ and subchild/ should both be removed.
+/// parent/ is kept because child_match/ has matching content.
+#[test]
+fn test_remote_filter_include_nested_empty_dirs_cleaned_up() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_root = src_dir.path().join("src");
+    std::fs::create_dir(&src_root).unwrap();
+    std::fs::create_dir(src_root.join("parent")).unwrap();
+    std::fs::create_dir(src_root.join("parent/child_match")).unwrap();
+    create_test_file(
+        &src_root.join("parent/child_match/file.txt"),
+        "matched",
+        0o644,
+    );
+    std::fs::create_dir(src_root.join("parent/child_empty")).unwrap();
+    std::fs::create_dir(src_root.join("parent/child_empty/subchild")).unwrap();
+    let dst_root = dst_dir.path().join("dst");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    let output =
+        run_rcp_and_expect_success(&["--include=*.txt", "--summary", &src_remote, &dst_remote]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    // parent/ should exist (has child_match/ with matching file)
+    assert!(
+        dst_root.join("parent").exists(),
+        "parent/ should exist (has child with matching file)"
+    );
+    // child_match/ should exist with file.txt
+    assert!(
+        dst_root.join("parent/child_match/file.txt").exists(),
+        "parent/child_match/file.txt should exist"
+    );
+    // child_empty/ should be cleaned up (no matching files anywhere below)
+    assert!(
+        !dst_root.join("parent/child_empty").exists(),
+        "parent/child_empty/ should be removed (no matching descendants)"
+    );
+    // subchild/ inside child_empty should also be gone
+    assert!(
+        !dst_root.join("parent/child_empty/subchild").exists(),
+        "parent/child_empty/subchild/ should be removed"
+    );
+    assert_eq!(summary.files_copied, 1, "Should copy 1 .txt file");
+    // directories kept: dst root, parent/, child_match/ = 3
+    assert_eq!(
+        summary.directories_created, 3,
+        "Should create 3 directories (root, parent, child_match)"
+    );
+}
+
 /// Test that remote copy of a directory with only empty subdirectories and no files
 /// completes without hanging. Verifies correct summary counts.
 #[test]

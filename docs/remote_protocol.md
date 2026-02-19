@@ -115,7 +115,7 @@ All TCP connections are encrypted and authenticated using TLS 1.3 with self-sign
 - **Usage**: Sent during directory tree traversal in depth-first order. Source pre-reads the directory children before sending this message, so `entry_count` and `file_count` are known at send time. Destination creates the directory, stores metadata, and uses the entry counts for completion tracking.
 - **`entry_count`**: Total number of child entries (files + directories + symlinks) that will be sent for this directory. Used by DirectoryTracker to know when all children have been processed.
 - **`file_count`**: Number of child files in this directory. Sent back to source via `DirectoryCreated` so source knows how many files to send (round-trip mechanism).
-- **`keep_if_empty`**: Whether to keep the directory if it ends up empty after filtering. `true` when the directory contains non-file entries (symlinks), when no filter is active, when it is the root, or when the directory directly matches an include pattern. `false` when the directory was only traversed to look for potential matches and should be removed.
+- **`keep_if_empty`**: Whether to keep the directory if it ends up empty after filtering. `true` when no filter is active, when it is the root, or when the directory directly matches an include pattern. `false` when the directory was only traversed to look for potential matches and should be removed if it ends up empty on disk.
 
 **`Symlink`**
 - **Purpose**: Create symlink with metadata
@@ -216,12 +216,13 @@ Source                              Destination
   |  (pre-read child1: 1 file = 1 entry)
   |  ---- Directory(child1, entries=1,-> |  Create child1, store metadata
   |         files=1, meta) ----------->  |  entries_expected=1
+  |                                      |  (child1 does NOT count for root yet)
   |  ---- Symlink(root/link, meta) ----> |  Create symlink
   |                                      |  root: entries_processed++ (1/4)
   |  (pre-read child2: 0 entries)        |
   |  ---- Directory(child2, entries=0,-> |  Create child2, entries_expected=0
   |         files=0, meta) ----------->  |  child2 complete → apply metadata
-  |                                      |  root: entries_processed++ (2/4)
+  |                                      |  child2 notifies root: entries_processed++ (2/4)
   |  ---- DirStructureComplete --------> |  Structure complete
   |                                      |
   |  <--- DirectoryCreated(root, fc=2) - |
@@ -238,6 +239,7 @@ Source                              Destination
   |  ~~~~ File(child1/f1) ~~~~~~~~~~~~~> |  Write file
   |                                      |  child1: entries_processed++ (1/1)
   |                                      |  child1 complete → apply metadata
+  |                                      |  child1 notifies root (already complete, no-op)
   |                                      |
   |                                      |  All directories complete, structure complete
   |  <--- DestinationDone -------------- |  Close send side
@@ -350,11 +352,10 @@ during the copy (see Section 7.1 for handling of source modifications).
 ### 5.3 Key Operations
 
 **On `Directory` message:**
-- If ancestor in `failed_directories`: skip, log warning; call `process_child_entry(parent)` to count this entry
+- If ancestor in `failed_directories`: skip, log warning; call `process_child_entry(parent)` to count this entry (directory won't have children to process)
 - Try to create directory (see directory creation semantics below)
-- If success: add to `pending_directories` with `entries_expected` from message, `entries_processed = 0`, store metadata, send `DirectoryCreated { file_count }` back to source
-- If failure: add to `failed_directories`; if `is_root`, set `root_complete = true` to avoid hang
-- If not root: call `process_child_entry(parent)` to count this directory as a processed entry of its parent
+- If success: add to `pending_directories` with `entries_expected` from message, `entries_processed = 0`, store metadata, send `DirectoryCreated { file_count }` back to source. Do NOT notify parent yet — parent is notified when this directory completes (via `complete_directory`), ensuring bottom-up completion order.
+- If failure: add to `failed_directories`; if `is_root`, set `root_complete = true` to avoid hang; if not root, call `process_child_entry(parent)` (directory won't go through `complete_directory`)
 
 **Directory creation semantics:**
 - If directory doesn't exist: create it

@@ -675,22 +675,22 @@ async fn process_control_stream(
                         if is_root {
                             tracker.set_root_complete();
                         }
+                        // failed directory won't go through complete_directory, so
+                        // notify parent immediately
+                        if !is_root {
+                            if let Some(parent) = dst.parent() {
+                                tracker.process_child_entry(parent).await.context(
+                                    "Failed to update parent tracker for failed directory",
+                                )?;
+                            }
+                        }
                         if settings.fail_early {
                             return Err(anyhow::anyhow!("Failed to create directory {:?}", dst));
                         }
                     }
                 }
-                // count this directory as a processed child entry for its parent
-                if !is_root {
-                    if let Some(parent) = dst.parent() {
-                        directory_tracker
-                            .lock()
-                            .await
-                            .process_child_entry(parent)
-                            .await
-                            .context("Failed to update parent tracker for directory")?;
-                    }
-                }
+                // note: successfully created directories notify their parent when
+                // they complete (in complete_directory), not here at creation time
             }
             remote::protocol::SourceMessage::Symlink {
                 ref src,

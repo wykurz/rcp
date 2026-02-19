@@ -15,7 +15,9 @@
 //! 2. Destination creates directories, stores metadata, sends `DirectoryCreated`
 //! 3. Source sends files; destination also processes child directories and symlinks
 //! 4. When all entries processed, destination applies stored metadata
-//! 5. When all directories complete and structure is done, send `DestinationDone`
+//! 5. Child directories notify their parent upon completion (not creation),
+//!    propagating bottom-up so parents only complete after all children finish
+//! 6. When all directories complete and structure is done, send `DestinationDone`
 //!
 //! # Unified Entry Counting
 //!
@@ -213,12 +215,51 @@ impl DirectoryTracker {
         }
         Ok(())
     }
-    /// Complete a directory: apply metadata and remove from pending.
+    /// Complete a directory and propagate completion upward to parents.
+    ///
+    /// After completing a directory (applying metadata or removing it if empty),
+    /// notifies the parent that this child is done. If the parent's entries are
+    /// now all processed, completes the parent too, and so on up the tree.
+    /// This ensures parent directories only complete after all children finish,
+    /// so empty-directory cleanup decisions are correct.
+    async fn complete_directory(&mut self, dst: &std::path::Path) -> anyhow::Result<()> {
+        let mut current = dst.to_path_buf();
+        loop {
+            let is_root = self.root_directory.as_deref() == Some(&current);
+            self.complete_directory_single(&current, is_root).await?;
+            if is_root {
+                break;
+            }
+            // notify parent that this child directory is complete
+            let Some(parent) = current.parent() else {
+                break;
+            };
+            let Some(state) = self.pending_directories.get_mut(parent) else {
+                break;
+            };
+            state.entries_processed += 1;
+            tracing::debug!(
+                "Directory {:?} entries processed: {}/{} (child directory completed)",
+                parent,
+                state.entries_processed,
+                state.entries_expected
+            );
+            if state.entries_processed < state.entries_expected {
+                break; // parent not complete yet
+            }
+            // parent is now complete, continue loop to complete it
+            current = parent.to_path_buf();
+        }
+        Ok(())
+    }
+    /// Complete a single directory: apply metadata and remove from pending.
     /// Uses `keep_if_empty` from the directory state to decide whether to remove
     /// empty directories that were only created for traversal purposes.
-    async fn complete_directory(&mut self, dst: &std::path::Path) -> anyhow::Result<()> {
-        // check if this is the root directory
-        let is_root = self.root_directory.as_deref() == Some(dst);
+    async fn complete_directory_single(
+        &mut self,
+        dst: &std::path::Path,
+        is_root: bool,
+    ) -> anyhow::Result<()> {
         // remove from pending
         let state = self.pending_directories.remove(dst);
         let keep_if_empty = state.as_ref().is_none_or(|s| s.keep_if_empty);
