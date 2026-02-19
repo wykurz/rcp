@@ -116,7 +116,6 @@ async fn send_directories_and_symlinks(
     let mut file_children: Vec<ChildEntry> = Vec::new();
     let mut dir_children: Vec<ChildEntry> = Vec::new();
     let mut symlink_children: Vec<ChildEntry> = Vec::new();
-    let mut has_non_file_entries = false;
     let mut entries = match tokio::fs::read_dir(&src).await {
         Ok(e) => e,
         Err(e) => {
@@ -205,7 +204,6 @@ async fn send_directories_and_symlinks(
                 if child.metadata.is_file() {
                     file_children.push(child);
                 } else if child.metadata.is_symlink() {
-                    has_non_file_entries = true;
                     symlink_children.push(child);
                 } else if child.metadata.is_dir() {
                     dir_children.push(child);
@@ -226,7 +224,7 @@ async fn send_directories_and_symlinks(
     // compute counts and keep_if_empty
     let file_count = file_children.len();
     let entry_count = file_count + dir_children.len() + symlink_children.len();
-    let keep_if_empty = if has_non_file_entries || is_root {
+    let keep_if_empty = if is_root {
         true
     } else if let Some(ref filter) = settings.filter {
         let relative_path = src.strip_prefix(source_root).unwrap_or(src);
