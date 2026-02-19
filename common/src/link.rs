@@ -230,6 +230,7 @@ pub async fn link(
                     }
                     // return summary with skipped count
                     let skipped_summary = if src_metadata.is_dir() {
+                        prog_track.directories_skipped.inc();
                         Summary {
                             copy_summary: CopySummary {
                                 directories_skipped: 1,
@@ -238,6 +239,7 @@ pub async fn link(
                             ..Default::default()
                         }
                     } else if src_metadata.file_type().is_symlink() {
+                        prog_track.symlinks_skipped.inc();
                         Summary {
                             copy_summary: CopySummary {
                                 symlinks_skipped: 1,
@@ -246,6 +248,7 @@ pub async fn link(
                             ..Default::default()
                         }
                     } else {
+                        prog_track.files_skipped.inc();
                         Summary {
                             copy_summary: CopySummary {
                                 files_skipped: 1,
@@ -585,10 +588,13 @@ async fn link_internal(
             // increment skipped counters
             if entry_is_dir {
                 link_summary.copy_summary.directories_skipped += 1;
+                prog_track.directories_skipped.inc();
             } else if entry_is_symlink {
                 link_summary.copy_summary.symlinks_skipped += 1;
+                prog_track.symlinks_skipped.inc();
             } else {
                 link_summary.copy_summary.files_skipped += 1;
+                prog_track.files_skipped.inc();
             }
             continue;
         }
