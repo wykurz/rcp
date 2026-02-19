@@ -122,7 +122,9 @@ pub mod filecmp;
 pub mod progress;
 mod testutils;
 
-pub use config::{DryRunMode, OutputConfig, RuntimeConfig, ThrottleConfig, TracingConfig};
+pub use config::{
+    DryRunMode, DryRunWarnings, OutputConfig, RuntimeConfig, ThrottleConfig, TracingConfig,
+};
 pub use progress::{RcpdProgressPrinter, SerializableProgress};
 
 // Define RcpdType in common since remote depends on common
