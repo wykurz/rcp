@@ -159,6 +159,9 @@ pub struct Progress {
     pub files_removed: TlsCounter,
     pub symlinks_removed: TlsCounter,
     pub directories_removed: TlsCounter,
+    pub files_skipped: TlsCounter,
+    pub symlinks_skipped: TlsCounter,
+    pub directories_skipped: TlsCounter,
     start_time: std::time::Instant,
 }
 
@@ -179,6 +182,9 @@ impl Progress {
             files_removed: Default::default(),
             symlinks_removed: Default::default(),
             directories_removed: Default::default(),
+            files_skipped: Default::default(),
+            symlinks_skipped: Default::default(),
+            directories_skipped: Default::default(),
             start_time: std::time::Instant::now(),
         }
     }
@@ -210,6 +216,9 @@ pub struct SerializableProgress {
     pub files_removed: u64,
     pub symlinks_removed: u64,
     pub directories_removed: u64,
+    pub files_skipped: u64,
+    pub symlinks_skipped: u64,
+    pub directories_skipped: u64,
     pub current_time: std::time::SystemTime,
 }
 
@@ -230,6 +239,9 @@ impl Default for SerializableProgress {
             files_removed: 0,
             symlinks_removed: 0,
             directories_removed: 0,
+            files_skipped: 0,
+            symlinks_skipped: 0,
+            directories_skipped: 0,
             current_time: std::time::SystemTime::now(),
         }
     }
@@ -253,6 +265,9 @@ impl From<&Progress> for SerializableProgress {
             files_removed: progress.files_removed.get(),
             symlinks_removed: progress.symlinks_removed.get(),
             directories_removed: progress.directories_removed.get(),
+            files_skipped: progress.files_skipped.get(),
+            symlinks_skipped: progress.symlinks_skipped.get(),
+            directories_skipped: progress.directories_skipped.get(),
             current_time: std::time::SystemTime::now(),
         }
     }
@@ -315,6 +330,11 @@ impl<'a> ProgressPrinter<'a> {
             REMOVED:\n\
             files:       {:>10}\n\
             symlinks:    {:>10}\n\
+            directories: {:>10}\n\
+            -----------------------\n\
+            SKIPPED:\n\
+            files:       {:>10}\n\
+            symlinks:    {:>10}\n\
             directories: {:>10}",
             ops.started - ops.finished, // pending
             average_ops_rate,
@@ -336,6 +356,10 @@ impl<'a> ProgressPrinter<'a> {
             self.progress.files_removed.get(),
             self.progress.symlinks_removed.get(),
             self.progress.directories_removed.get(),
+            // skipped
+            self.progress.files_skipped.get(),
+            self.progress.symlinks_skipped.get(),
+            self.progress.directories_skipped.get(),
         ))
     }
 }
@@ -451,6 +475,11 @@ impl RcpdProgressPrinter {
             FILES:\n\
             average: {:>10.2} files/s\n\
             current: {:>10.2} files/s\n\
+            ---------------------\n\
+            SKIPPED:\n\
+            files:       {:>10}\n\
+            symlinks:    {:>10}\n\
+            directories: {:>10}\n\
             ==== DESTINATION ====\n\
             OPS:\n\
             pending: {:>10}\n\
@@ -486,6 +515,10 @@ impl RcpdProgressPrinter {
             source_progress.files_copied,
             source_files_rate_avg,
             source_files_rate_curr,
+            // source skipped
+            source_progress.files_skipped,
+            source_progress.symlinks_skipped,
+            source_progress.directories_skipped,
             // destination section
             dest_progress.ops_started - dest_progress.ops_finished, // pending
             dest_ops_rate_avg,
@@ -588,6 +621,9 @@ mod tests {
             ops_finished: 80,
             bytes_copied: 1024,
             files_copied: 5,
+            files_skipped: 3,
+            symlinks_skipped: 1,
+            directories_skipped: 2,
             ..Default::default()
         };
 
@@ -624,6 +660,28 @@ mod tests {
             .expect("dest files line missing");
         assert!(dest_files_line.trim_start().ends_with("8"));
         assert!(!dest_files_line.contains('.'));
+        // verify SKIPPED section appears in source
+        assert!(source_section.contains("SKIPPED:"));
+        let skipped_section = source_section
+            .split("SKIPPED:")
+            .nth(1)
+            .expect("SKIPPED section missing in source");
+        let skipped_lines: Vec<&str> = skipped_section.lines().collect();
+        let skipped_files_line = skipped_lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("files:"))
+            .expect("skipped files line missing");
+        assert!(skipped_files_line.trim_start().ends_with("3"));
+        let skipped_symlinks_line = skipped_lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("symlinks:"))
+            .expect("skipped symlinks line missing");
+        assert!(skipped_symlinks_line.trim_start().ends_with("1"));
+        let skipped_dirs_line = skipped_lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("directories:"))
+            .expect("skipped directories line missing");
+        assert!(skipped_dirs_line.trim_start().ends_with("2"));
 
         Ok(())
     }

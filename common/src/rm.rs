@@ -166,16 +166,19 @@ pub async fn rm(
                     }
                     // return summary with skipped count
                     let skipped_summary = if path_metadata.is_dir() {
+                        prog_track.directories_skipped.inc();
                         Summary {
                             directories_skipped: 1,
                             ..Default::default()
                         }
                     } else if path_metadata.file_type().is_symlink() {
+                        prog_track.symlinks_skipped.inc();
                         Summary {
                             symlinks_skipped: 1,
                             ..Default::default()
                         }
                     } else {
+                        prog_track.files_skipped.inc();
                         Summary {
                             files_skipped: 1,
                             ..Default::default()
@@ -300,10 +303,13 @@ async fn rm_internal(
             // increment skipped counters - will be added to rm_summary below
             if entry_is_dir {
                 skipped_dirs += 1;
+                prog_track.directories_skipped.inc();
             } else if entry_is_symlink {
                 skipped_symlinks += 1;
+                prog_track.symlinks_skipped.inc();
             } else {
                 skipped_files += 1;
+                prog_track.files_skipped.inc();
             }
             continue;
         }
