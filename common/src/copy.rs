@@ -315,7 +315,9 @@ impl std::fmt::Display for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "bytes copied: {}\n\
+            "copy:\n\
+            -----\n\
+            bytes copied: {}\n\
             files copied: {}\n\
             symlinks created: {}\n\
             directories created: {}\n\
@@ -325,6 +327,9 @@ impl std::fmt::Display for Summary {
             files skipped: {}\n\
             symlinks skipped: {}\n\
             directories skipped: {}\n\
+            \n\
+            delete:\n\
+            -------\n\
             {}",
             bytesize::ByteSize(self.bytes_copied),
             self.files_copied,

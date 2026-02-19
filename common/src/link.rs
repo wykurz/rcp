@@ -125,7 +125,11 @@ impl std::fmt::Display for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "{}hard-links created: {}\nhard links unchanged: {}\n",
+            "{}\n\
+            link:\n\
+            -----\n\
+            hard-links created: {}\n\
+            hard links unchanged: {}\n",
             &self.copy_summary, self.hard_links_created, self.hard_links_unchanged
         )
     }
