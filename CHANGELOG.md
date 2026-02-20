@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-02-19
+
+### Added
+- Add `--include`/`--exclude` glob filters for selective file operations
+- Report skipped (filtered out) entries in progress bar
+
+### Fixed
+- Fix `--include`/`--exclude` filter bugs with empty directory handling
+- Fix remote copy directory completion ordering
+- Fix remote copy bug where a directory could be completed while contents were still being added
+- Fix destination permission errors not allowing continuation without `--fail-early`
+- Fix `--summary` output by separating counts by copy/link/remove and disambiguating 'skipped'
+- Fix `--dry-run` output when used with other flags
+
 ## [0.27.0] - 2026-01-23
 
 ### Fixed
@@ -133,7 +147,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See git history for changes in previous versions.
 
-[Unreleased]: https://github.com/wykurz/rcp/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/wykurz/rcp/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/wykurz/rcp/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/wykurz/rcp/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/wykurz/rcp/compare/v0.24.0...v0.26.0
 [0.24.0]: https://github.com/wykurz/rcp/compare/v0.23.0...v0.24.0
