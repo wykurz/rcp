@@ -224,3 +224,47 @@ fn test_update_compare_flag() {
         .assert()
         .success();
 }
+
+#[test]
+fn test_allow_lossy_update_flag() {
+    Command::cargo_bin("rlink")
+        .unwrap()
+        .args(["--allow-lossy-update", "--help"])
+        .assert()
+        .success();
+}
+
+// ============================================================================
+// Preserve Settings Tests
+// ============================================================================
+
+#[test]
+fn test_preserve_settings_all_preset() {
+    Command::cargo_bin("rlink")
+        .unwrap()
+        .args(["--preserve-settings", "all", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_preserve_settings_none_preset() {
+    Command::cargo_bin("rlink")
+        .unwrap()
+        .args(["--preserve-settings", "none", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_preserve_settings_custom_value() {
+    Command::cargo_bin("rlink")
+        .unwrap()
+        .args([
+            "--preserve-settings",
+            "f:uid,gid,time,0777 d:uid,gid,time,0777 l:uid,gid,time",
+            "--help",
+        ])
+        .assert()
+        .success();
+}

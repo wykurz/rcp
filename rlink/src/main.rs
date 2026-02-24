@@ -57,6 +57,30 @@ struct Args {
     )]
     update_compare: String,
 
+    /// Allow --update even when --preserve-settings does not cover all attributes
+    /// used by --update-compare
+    ///
+    /// This is dangerous: attributes used for comparison (e.g. mtime) may not be preserved
+    /// on copied files, causing incorrect decisions in future --update runs.
+    #[arg(long, help_heading = "Linking options")]
+    allow_lossy_update: bool,
+
+    // Preserve options
+    /// What file attributes to preserve on directories, symlinks, and files copied during --update
+    ///
+    /// Defaults to "all" if not specified. Presets: "all" preserves uid, gid, time, and full
+    /// mode (0o7777); "none" uses minimal defaults (no uid/gid/time, mode mask 0o0777).
+    /// Custom format: "`<type>:<attrs>` ..." where type is f (file), d (directory), l (symlink),
+    /// and attrs is a comma-separated list of uid, gid, time, or a 4-digit octal mode mask.
+    ///
+    /// Hard-linked files always share metadata with their source via the inode - preserve
+    /// settings have no effect on them. Settings apply to directories and symlinks in all
+    /// modes, and additionally to files that are copied (not linked) during --update operations.
+    ///
+    /// Example: "f:uid,gid,time,0777 d:uid,gid,time,0777 l:uid,gid,time"
+    #[arg(long, value_name = "SETTINGS", help_heading = "Preserve options")]
+    preserve_settings: Option<String>,
+
     // Filtering options
     /// Glob pattern for files to include (can be specified multiple times)
     ///
@@ -216,6 +240,23 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
         }
         dst_path
     };
+    // parse preserve settings
+    let preserve = if let Some(ref settings_str) = args.preserve_settings {
+        common::parse_preserve_settings(settings_str)
+            .context(format!("parsing --preserve-settings: {settings_str}"))?
+    } else {
+        common::preserve::preserve_all()
+    };
+    let update_compare = common::parse_metadata_cmp_settings(&args.update_compare)?;
+    // validate --update comparison attributes against preserve settings
+    if args.update.is_some() {
+        if let Err(msg) = common::validate_update_compare_vs_preserve(&update_compare, &preserve) {
+            if !args.allow_lossy_update {
+                return Err(anyhow!("{msg}"));
+            }
+            tracing::warn!("{msg}");
+        }
+    }
     let result = common::link(&args.src, &dst, &args.update, {
         // build filter settings from CLI arguments
         let filter = if let Some(ref path) = args.filter_file {
@@ -243,10 +284,11 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
                 filter: filter.clone(),
                 dry_run: args.dry_run,
             },
-            update_compare: common::parse_metadata_cmp_settings(&args.update_compare)?,
+            update_compare,
             update_exclusive: args.update_exclusive,
             filter,
             dry_run: args.dry_run,
+            preserve,
         }
     })
     .await;

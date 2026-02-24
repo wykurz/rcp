@@ -435,7 +435,7 @@ mod cmp_tests {
 
     lazy_static! {
         static ref PROGRESS: progress::Progress = progress::Progress::new();
-        static ref NO_PRESERVE_SETTINGS: preserve::Settings = preserve::preserve_default();
+        static ref NO_PRESERVE_SETTINGS: preserve::Settings = preserve::preserve_none();
         static ref DO_PRESERVE_SETTINGS: preserve::Settings = preserve::preserve_all();
     }
 

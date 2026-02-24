@@ -28,7 +28,7 @@ EXAMPLES:
     rcp /source /dest --progress --summary
 
     # Copy with metadata preservation and overwrite
-    rcp /source /dest --preserve --overwrite --progress
+    rcp /source /dest --preserve-settings=all --overwrite --progress
 
     # Remote copy from one host to another
     rcp user@host1:/path/to/source user@host2:/path/to/dest --progress
@@ -37,7 +37,7 @@ EXAMPLES:
     rcp host:/remote/path /local/path --progress
 
     # Copy from local to remote
-    rcp /local/path host:/remote/path --preserve --progress
+    rcp /local/path host:/remote/path --preserve-settings=all --progress
 
 1) https://mpifileutils.readthedocs.io/en/v0.11.1/dsync.1.html
 2) https://github.com/wtsi-ssg/pcp"
@@ -67,13 +67,18 @@ struct Args {
     #[arg(short = 'L', long, help_heading = "Copy options")]
     dereference: bool,
 
-    /// Preserve file metadata: file owner, group, setuid, setgid, mtime, atime and mode
+    /// [DEPRECATED: use --preserve-settings=all] Preserve file metadata: file owner, group, setuid, setgid, mtime, atime and mode
     #[arg(short, long, help_heading = "Copy options")]
     preserve: bool,
 
-    /// Specify exactly what attributes to preserve
+    /// Specify what attributes to preserve
     ///
-    /// If specified, the --preserve flag is ignored. Format: "`<type1>:<attributes1> <type2>:<attributes2>` ..." where `<type>` is one of f (file), d (directory), l (symlink), and `<attributes>` is a comma-separated list of uid, gid, time, or a 4-digit octal mode mask.
+    /// Presets: "all" preserves uid, gid, time, and full mode (0o7777);
+    /// "none" uses minimal defaults (no uid/gid/time, mode mask 0o0777).
+    /// Custom format: "`<type1>:<attributes1> <type2>:<attributes2>` ..." where
+    /// `<type>` is one of f (file), d (directory), l (symlink), and `<attributes>` is
+    /// a comma-separated list of uid, gid, time, or a 4-digit octal mode mask.
+    /// If specified, the --preserve flag is ignored.
     ///
     /// Example: "f:uid,gid,time,0777 d:uid,gid,time,0777 l:uid,gid,time"
     #[arg(long, value_name = "SETTINGS", help_heading = "Copy options")]
@@ -879,9 +884,10 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         common::parse_preserve_settings(preserve_settings)
             .map_err(|err| common::copy::Error::new(err, Default::default()))?
     } else if args.preserve {
+        eprintln!("WARNING: --preserve is deprecated, use --preserve-settings=all instead");
         common::preserve::preserve_all()
     } else {
-        common::preserve::preserve_default()
+        common::preserve::preserve_none()
     };
     tracing::debug!("preserve settings: {:?}", &preserve);
     if let Some((mut remote_src, mut remote_dst)) = remote_src_dst {

@@ -60,7 +60,7 @@ Basic local copy with progress-bar and summary at the end:
 
 Copy while preserving metadata, overwrite/update destination if it already exists:
 ```fish
-> rcp <foo> <bar> --preserve --progress --summary --overwrite
+> rcp <foo> <bar> --preserve-settings=all --progress --summary --overwrite
 ```
 
 Remote copy from one host to another:
@@ -76,7 +76,7 @@ Copy from remote host to local machine:
 
 Copy from local machine to remote host and preserve metadata:
 ```fish
-> rcp /local/path host:/remote/path --progress --summary --preserve
+> rcp /local/path host:/remote/path --progress --summary --preserve-settings=all
 ```
 
 Remote copy with automatic rcpd deployment:
@@ -115,6 +115,18 @@ Hard-link contents of `<foo>` to `<baz>` if they are identical to `<bar>`:
 ```
 Using `--update-exclusive` means that if a file is present in `<foo>` but not in `<bar>` it will be ignored.
 Roughly equivalent to: `rsync -a --link-dest=<foo> <bar> <baz>`.
+
+Control which metadata is preserved with `--preserve-settings`:
+```fish
+# preserve nothing (directories get default mode, no uid/gid/time)
+> rlink <foo> <bar> --preserve-settings=none
+
+# custom: preserve uid, gid, and time on files and dirs
+> rlink <foo> <bar> --preserve-settings="f:uid,gid,time,0777 d:uid,gid,time,0777 l:uid,gid,time"
+```
+Hard-linked files always share metadata with their source via the inode -- preserve settings affect directories and symlinks in all modes, and additionally files that are copied (not linked) during `--update` operations. By default `rlink` uses `--preserve-settings=all`.
+
+When using `--update` with `--preserve-settings` that does not cover all compared attributes (e.g. `--preserve-settings=none` while `--update-compare=size,mtime`), `rlink` will error to prevent silent data integrity issues. Use `--allow-lossy-update` to override.
 
 Compare `<foo>` vs. `<bar>`:
 ```fish

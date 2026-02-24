@@ -551,6 +551,26 @@ fn test_preserve_settings_multiple_types() {
         .success();
 }
 
+/// Test that --preserve-settings accepts "all" preset
+#[test]
+fn test_preserve_settings_all_preset() {
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--preserve-settings", "all", "--help"])
+        .assert()
+        .success();
+}
+
+/// Test that --preserve-settings accepts "none" preset
+#[test]
+fn test_preserve_settings_none_preset() {
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--preserve-settings", "none", "--help"])
+        .assert()
+        .success();
+}
+
 // ============================================================================
 // Remote Copy Argument Tests
 // ============================================================================
