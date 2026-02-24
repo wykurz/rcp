@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Add `--preserve-settings` to `rlink` for controlling metadata preservation on directories, symlinks, and copied files. Supports presets (`all`, `none`) and custom per-type format. Defaults to `all` (preserving backward compatibility).
+- Add `--allow-lossy-update` to `rlink` as a safety guard when `--update` comparison attributes are not covered by `--preserve-settings`
+- Add `all` and `none` presets to `--preserve-settings` in `rcp`
+
+### Deprecated
+- Deprecate `--preserve` flag in `rcp` in favor of `--preserve-settings=all`
+
 ## [0.28.0] - 2026-02-19
 
 ### Added

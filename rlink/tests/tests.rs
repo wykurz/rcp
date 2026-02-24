@@ -412,3 +412,113 @@ fn test_edge_case_special_permissions() {
         assert_eq!(get_file_content(&dst_file), description);
     }
 }
+
+// ============================================================================
+// Preserve Settings Tests
+// ============================================================================
+
+#[test]
+fn test_default_preserves_metadata() {
+    // verify backward compat: rlink without --preserve-settings preserves directory metadata
+    let (src_dir, dst_dir, _) = setup_test_env();
+    let src_subdir = src_dir.path().join("mydir");
+    std::fs::create_dir(&src_subdir).unwrap();
+    // use a distinctive mode so the assertion is meaningful
+    std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(0o750)).unwrap();
+    create_test_file(&src_subdir.join("file.txt"), "content", 0o644);
+    let src_meta = std::fs::metadata(&src_subdir).unwrap();
+    let dst_subdir = dst_dir.path().join("mydir");
+    let mut cmd = assert_cmd::Command::cargo_bin("rlink").unwrap();
+    cmd.args([src_subdir.to_str().unwrap(), dst_subdir.to_str().unwrap()])
+        .assert()
+        .success();
+    assert!(dst_subdir.is_dir());
+    assert!(are_files_hardlinked(
+        &src_subdir.join("file.txt"),
+        &dst_subdir.join("file.txt")
+    ));
+    // verify directory metadata was actually preserved
+    let dst_meta = std::fs::metadata(&dst_subdir).unwrap();
+    assert_eq!(
+        get_file_mode(&dst_subdir),
+        get_file_mode(&src_subdir),
+        "directory mode not preserved"
+    );
+    assert_eq!(
+        dst_meta.mtime(),
+        src_meta.mtime(),
+        "directory mtime not preserved"
+    );
+}
+
+#[test]
+fn test_preserve_settings_none_basic_link() {
+    let (src_dir, dst_dir, _) = setup_test_env();
+    let src_subdir = src_dir.path().join("mydir");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("file.txt"), "content", 0o644);
+    let dst_subdir = dst_dir.path().join("mydir");
+    let mut cmd = assert_cmd::Command::cargo_bin("rlink").unwrap();
+    cmd.args([
+        "--preserve-settings",
+        "none",
+        src_subdir.to_str().unwrap(),
+        dst_subdir.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    assert!(dst_subdir.is_dir());
+    assert!(are_files_hardlinked(
+        &src_subdir.join("file.txt"),
+        &dst_subdir.join("file.txt")
+    ));
+}
+
+#[test]
+fn test_update_preserve_none_errors_without_allow_lossy() {
+    let (src_dir, dst_dir, update_dir) = setup_test_env();
+    let src_file = src_dir.path().join("test.txt");
+    let update_file = update_dir.path().join("test.txt");
+    let dst_file = dst_dir.path().join("test.txt");
+    create_test_file(&src_file, "content", 0o644);
+    create_test_file(&update_file, "content", 0o644);
+    // --update with --preserve-settings=none should error because default update_compare
+    // includes mtime which is not preserved by "none"
+    let mut cmd = assert_cmd::Command::cargo_bin("rlink").unwrap();
+    cmd.args([
+        "--update",
+        update_file.to_str().unwrap(),
+        "--preserve-settings",
+        "none",
+        src_file.to_str().unwrap(),
+        dst_file.to_str().unwrap(),
+    ])
+    .assert()
+    .failure()
+    .stdout(predicates::str::contains("--update compares"));
+}
+
+#[test]
+fn test_update_preserve_none_succeeds_with_allow_lossy() {
+    let (src_dir, dst_dir, update_dir) = setup_test_env();
+    let src_file = src_dir.path().join("test.txt");
+    let update_file = update_dir.path().join("test.txt");
+    let dst_file = dst_dir.path().join("test.txt");
+    create_test_file(&src_file, "content", 0o644);
+    create_test_file(&update_file, "content", 0o644);
+    // use default --update-compare (size,mtime) so the mismatch with
+    // --preserve-settings=none is real and only --allow-lossy-update saves it
+    let mut cmd = assert_cmd::Command::cargo_bin("rlink").unwrap();
+    cmd.args([
+        "--update",
+        update_file.to_str().unwrap(),
+        "--preserve-settings",
+        "none",
+        "--allow-lossy-update",
+        src_file.to_str().unwrap(),
+        dst_file.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    assert!(are_files_hardlinked(&src_file, &dst_file));
+}

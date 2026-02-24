@@ -249,6 +249,6 @@ pub fn preserve_all() -> Settings {
 }
 
 #[must_use]
-pub fn preserve_default() -> Settings {
+pub fn preserve_none() -> Settings {
     Settings::default()
 }

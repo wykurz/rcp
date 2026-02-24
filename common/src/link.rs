@@ -14,10 +14,6 @@ use crate::preserve;
 use crate::progress;
 use crate::rm;
 
-lazy_static! {
-    static ref RLINK_PRESERVE_SETTINGS: preserve::Settings = preserve::preserve_all();
-}
-
 /// Error type for link operations that preserves operation summary even on failure.
 ///
 /// # Logging Convention
@@ -52,6 +48,8 @@ pub struct Settings {
     pub filter: Option<crate::filter::FilterSettings>,
     /// dry-run mode for previewing operations
     pub dry_run: Option<crate::config::DryRunMode>,
+    /// metadata preservation settings
+    pub preserve: preserve::Settings,
 }
 
 /// Reports a dry-run action for link operations
@@ -323,7 +321,7 @@ async fn link_internal(
                 update,
                 dst,
                 &settings.copy_settings,
-                &RLINK_PRESERVE_SETTINGS,
+                &settings.preserve,
                 is_fresh,
             )
             .await
@@ -357,7 +355,7 @@ async fn link_internal(
                     update,
                     dst,
                     &settings.copy_settings,
-                    &RLINK_PRESERVE_SETTINGS,
+                    &settings.preserve,
                     is_fresh,
                 )
                 .await
@@ -380,7 +378,7 @@ async fn link_internal(
                 update,
                 dst,
                 &settings.copy_settings,
-                &RLINK_PRESERVE_SETTINGS,
+                &settings.preserve,
                 is_fresh,
             )
             .await
@@ -419,7 +417,7 @@ async fn link_internal(
                 src,
                 dst,
                 &settings.copy_settings,
-                &RLINK_PRESERVE_SETTINGS,
+                &settings.preserve,
                 is_fresh,
             )
             .await
@@ -689,7 +687,7 @@ async fn link_internal(
                     &update_path,
                     &dst_path,
                     &settings.copy_settings,
-                    &RLINK_PRESERVE_SETTINGS,
+                    &settings.preserve,
                     is_fresh,
                 )
                 .await
@@ -798,7 +796,7 @@ async fn link_internal(
         } else {
             &src_metadata
         };
-        preserve::set_dir_metadata(&RLINK_PRESERVE_SETTINGS, preserve_metadata, dst).await
+        preserve::set_dir_metadata(&settings.preserve, preserve_metadata, dst).await
     };
     if !all_children_succeeded {
         // child failures take precedence - log metadata error if it also failed
@@ -857,6 +855,7 @@ mod link_tests {
             update_exclusive: false,
             filter: None,
             dry_run: None,
+            preserve: preserve::preserve_all(),
         }
     }
 
@@ -1531,6 +1530,7 @@ mod link_tests {
                     update_exclusive: false,
                     filter: Some(filter),
                     dry_run: None,
+                    preserve: preserve::preserve_all(),
                 },
                 false,
             )
@@ -1590,6 +1590,7 @@ mod link_tests {
                     update_exclusive: false,
                     filter: Some(filter),
                     dry_run: None,
+                    preserve: preserve::preserve_all(),
                 },
                 false,
             )
@@ -1637,6 +1638,7 @@ mod link_tests {
                     update_exclusive: false,
                     filter: Some(filter),
                     dry_run: None,
+                    preserve: preserve::preserve_all(),
                 },
                 false,
             )
@@ -1688,6 +1690,7 @@ mod link_tests {
                     update_exclusive: false,
                     filter: Some(filter),
                     dry_run: None,
+                    preserve: preserve::preserve_all(),
                 },
                 false,
             )
@@ -1739,6 +1742,7 @@ mod link_tests {
                     update_exclusive: false,
                     filter: Some(filter),
                     dry_run: None,
+                    preserve: preserve::preserve_all(),
                 },
                 false,
             )
@@ -1800,6 +1804,7 @@ mod link_tests {
                     update_exclusive: false,
                     filter: Some(filter),
                     dry_run: None,
+                    preserve: preserve::preserve_all(),
                 },
                 false,
             )
@@ -1863,6 +1868,7 @@ mod link_tests {
                     update_exclusive: false,
                     filter: Some(filter),
                     dry_run: None,
+                    preserve: preserve::preserve_all(),
                 },
                 false,
             )
@@ -1932,6 +1938,7 @@ mod link_tests {
                     update_exclusive: false,
                     filter: Some(filter),
                     dry_run: None,
+                    preserve: preserve::preserve_all(),
                 },
                 false,
             )
@@ -1998,6 +2005,7 @@ mod link_tests {
                     update_exclusive: false,
                     filter: Some(filter),
                     dry_run: Some(crate::config::DryRunMode::Explain),
+                    preserve: preserve::preserve_all(),
                 },
                 false,
             )
@@ -2064,6 +2072,7 @@ mod link_tests {
                     update_exclusive: false,
                     filter: Some(filter),
                     dry_run: None,
+                    preserve: preserve::preserve_all(),
                 },
                 false,
             )
@@ -2131,6 +2140,7 @@ mod link_tests {
                     update_exclusive: false,
                     filter: None,
                     dry_run: Some(crate::config::DryRunMode::Brief),
+                    preserve: preserve::preserve_all(),
                 },
                 false,
             )
@@ -2177,6 +2187,7 @@ mod link_tests {
                     update_exclusive: false,
                     filter: None,
                     dry_run: Some(crate::config::DryRunMode::Brief),
+                    preserve: preserve::preserve_all(),
                 },
                 false,
             )
@@ -2228,6 +2239,7 @@ mod link_tests {
                     update_exclusive: false,
                     filter: None,
                     dry_run: Some(crate::config::DryRunMode::Brief),
+                    preserve: preserve::preserve_all(),
                 },
                 false,
             )
