@@ -434,9 +434,8 @@ mod tests {
     use crate::testutils;
     use tracing_test::traced_test;
 
-    lazy_static! {
-        static ref PROGRESS: progress::Progress = progress::Progress::new();
-    }
+    static PROGRESS: std::sync::LazyLock<progress::Progress> =
+        std::sync::LazyLock::new(progress::Progress::new);
 
     #[tokio::test]
     #[traced_test]

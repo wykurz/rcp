@@ -108,7 +108,6 @@ pub async fn write_file(
     bufsize: usize,
     chunk_size: u64,
 ) -> Result<Summary, Error> {
-    use rand::Rng;
     use tokio::io::AsyncWriteExt;
     let _permit = throttle::open_file_permit().await;
     throttle::get_file_iops_tokens(chunk_size, filesize as u64).await;
@@ -126,8 +125,7 @@ pub async fn write_file(
     while filesize > 0 {
         {
             // make sure rng falls out of scope before await
-            let mut rng = rand::thread_rng();
-            rng.fill(&mut bytes[..]);
+            rand::fill(&mut bytes[..]);
         }
         let writesize = std::cmp::min(filesize, bufsize);
         file.write_all(&bytes[..writesize])
@@ -244,9 +242,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tracing_test::traced_test;
 
-    lazy_static! {
-        static ref PROGRESS: progress::Progress = progress::Progress::new();
-    }
+    static PROGRESS: std::sync::LazyLock<progress::Progress> =
+        std::sync::LazyLock::new(progress::Progress::new);
 
     #[tokio::test]
     #[traced_test]

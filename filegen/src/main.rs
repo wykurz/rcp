@@ -233,16 +233,12 @@ fn main() -> Result<(), anyhow::Error> {
         max_blocking_threads: args.max_blocking_threads,
     };
     // filegen's random data generation is CPU-intensive, so we default to
-    // physical cores rather than 80% of RLIMIT_NOFILE used by other tools.
-    // fallback to logical cores if physical returns 0 (can happen in containers),
-    // and use 1 as absolute minimum to avoid accidentally disabling limits.
+    // available parallelism rather than 80% of RLIMIT_NOFILE used by other tools.
+    // use 1 as absolute minimum to avoid accidentally disabling limits.
     let max_open_files = args.max_open_files.unwrap_or_else(|| {
-        let physical = num_cpus::get_physical();
-        if physical > 0 {
-            physical
-        } else {
-            num_cpus::get().max(1)
-        }
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
     });
     let throttle = common::ThrottleConfig {
         max_open_files: Some(max_open_files),

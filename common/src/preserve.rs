@@ -146,7 +146,7 @@ async fn set_owner_and_time<Meta: Metadata + std::fmt::Debug>(
             let uid_val = if settings.uid { Some(uid.into()) } else { None };
             let gid_val = if settings.gid { Some(gid.into()) } else { None };
             nix::unistd::fchownat(
-                None,
+                nix::fcntl::AT_FDCWD,
                 &dst,
                 uid_val,
                 gid_val,
@@ -165,7 +165,7 @@ async fn set_owner_and_time<Meta: Metadata + std::fmt::Debug>(
             let atime_spec = nix::sys::time::TimeSpec::new(atime, atime_nsec);
             let mtime_spec = nix::sys::time::TimeSpec::new(mtime, mtime_nsec);
             nix::sys::stat::utimensat(
-                None,
+                nix::fcntl::AT_FDCWD,
                 &dst,
                 &atime_spec,
                 &mtime_spec,

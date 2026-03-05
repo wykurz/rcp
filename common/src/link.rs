@@ -827,9 +827,8 @@ mod link_tests {
 
     use super::*;
 
-    lazy_static! {
-        static ref PROGRESS: progress::Progress = progress::Progress::new();
-    }
+    static PROGRESS: std::sync::LazyLock<progress::Progress> =
+        std::sync::LazyLock::new(progress::Progress::new);
 
     fn common_settings(dereference: bool, overwrite: bool) -> Settings {
         Settings {
