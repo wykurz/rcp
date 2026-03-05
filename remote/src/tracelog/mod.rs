@@ -2,11 +2,10 @@
 use chrono::TimeZone;
 pub use common::RcpdType;
 
-lazy_static::lazy_static! {
-    // static storage for the latest progress from each rcpd process
-    static ref PROGRESS_MAP: std::sync::Mutex<enum_map::EnumMap<RcpdType, common::SerializableProgress>> =
-        std::sync::Mutex::new(enum_map::EnumMap::default());
-}
+// static storage for the latest progress from each rcpd process
+static PROGRESS_MAP: std::sync::LazyLock<
+    std::sync::Mutex<enum_map::EnumMap<RcpdType, common::SerializableProgress>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(enum_map::EnumMap::default()));
 
 /// Get the latest progress snapshot from all rcpd processes
 pub fn get_latest_progress_snapshot() -> enum_map::EnumMap<RcpdType, common::SerializableProgress> {

@@ -433,11 +433,12 @@ mod cmp_tests {
 
     use super::*;
 
-    lazy_static! {
-        static ref PROGRESS: progress::Progress = progress::Progress::new();
-        static ref NO_PRESERVE_SETTINGS: preserve::Settings = preserve::preserve_none();
-        static ref DO_PRESERVE_SETTINGS: preserve::Settings = preserve::preserve_all();
-    }
+    static PROGRESS: std::sync::LazyLock<progress::Progress> =
+        std::sync::LazyLock::new(progress::Progress::new);
+    static NO_PRESERVE_SETTINGS: std::sync::LazyLock<preserve::Settings> =
+        std::sync::LazyLock::new(preserve::preserve_none);
+    static DO_PRESERVE_SETTINGS: std::sync::LazyLock<preserve::Settings> =
+        std::sync::LazyLock::new(preserve::preserve_all);
 
     async fn setup_test_dirs(preserve: bool) -> Result<std::path::PathBuf> {
         let tmp_dir = testutils::setup_test_dir().await?;

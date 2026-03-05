@@ -23,7 +23,7 @@ impl<W: AsyncWrite + Unpin> SendStream<W> {
     }
 
     pub async fn send_batch_message<T: serde::Serialize>(&mut self, obj: &T) -> anyhow::Result<()> {
-        let bytes = bincode::serialize(obj)?;
+        let bytes = bitcode::serialize(obj).map_err(anyhow::Error::from)?;
         self.framed.send(bytes::Bytes::from(bytes)).await?;
         Ok(())
     }
@@ -95,7 +95,7 @@ impl<R: AsyncRead + Unpin> RecvStream<R> {
     ) -> anyhow::Result<Option<T>> {
         if let Some(frame) = futures::StreamExt::next(&mut self.framed).await {
             let bytes = frame?;
-            let obj = bincode::deserialize(&bytes)?;
+            let obj = bitcode::deserialize(&bytes).map_err(anyhow::Error::from)?;
             Ok(Some(obj))
         } else {
             Ok(None)

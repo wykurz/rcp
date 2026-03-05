@@ -407,6 +407,7 @@ pub async fn copy(
     }
     copy_internal(prog_track, src, dst, src, settings, preserve, is_fresh).await
 }
+
 #[instrument(skip(prog_track))]
 #[async_recursion]
 async fn copy_internal(
@@ -840,11 +841,12 @@ mod copy_tests {
 
     use super::*;
 
-    lazy_static! {
-        static ref PROGRESS: progress::Progress = progress::Progress::new();
-        static ref NO_PRESERVE_SETTINGS: preserve::Settings = preserve::preserve_none();
-        static ref DO_PRESERVE_SETTINGS: preserve::Settings = preserve::preserve_all();
-    }
+    static PROGRESS: std::sync::LazyLock<progress::Progress> =
+        std::sync::LazyLock::new(progress::Progress::new);
+    static NO_PRESERVE_SETTINGS: std::sync::LazyLock<preserve::Settings> =
+        std::sync::LazyLock::new(preserve::preserve_none);
+    static DO_PRESERVE_SETTINGS: std::sync::LazyLock<preserve::Settings> =
+        std::sync::LazyLock::new(preserve::preserve_all);
 
     #[tokio::test]
     #[traced_test]

@@ -61,8 +61,7 @@ impl PortRanges {
             all_ports.extend(range.clone());
         }
         // randomize the order to avoid always using the same ports
-        let mut rng = rand::thread_rng();
-        all_ports.shuffle(&mut rng);
+        all_ports.shuffle(&mut rand::rng());
         let start_time = Instant::now();
         // allow overriding the timeout via environment variable
         let max_duration_secs = match std::env::var("RCP_UDP_BIND_MAX_DURATION_SECONDS")
@@ -135,8 +134,7 @@ impl PortRanges {
             all_ports.extend(range.clone());
         }
         // randomize the order to avoid always using the same ports
-        let mut rng = rand::thread_rng();
-        all_ports.shuffle(&mut rng);
+        all_ports.shuffle(&mut rand::rng());
         let start_time = Instant::now();
         // allow overriding the timeout via environment variable
         let max_duration_secs = match std::env::var("RCP_TCP_BIND_MAX_DURATION_SECONDS")

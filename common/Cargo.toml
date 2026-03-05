@@ -24,28 +24,26 @@ name = "common"
 [dependencies]
 anyhow = "1.0"
 async-recursion = "1.1"
-bincode = "1.3"
 bytes = "1.11"
-bytesize = "1.3"
+bytesize = "2.3"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
-console-subscriber = "0.2"
+console-subscriber = "0.5"
 enum-map = "2.7"
 futures = "0.3"
 globset = "0.4"
-humantime = "2.1"
-indicatif = "0.17"
-lazy_static = "1.4"
+humantime = "2.3"
+indicatif = "0.18"
 libc = "0.2"
-nix = { version = "0.29", features = ["fs", "hostname", "user"] }
-procfs = "0.16"
-rand = "0.8"
-sysinfo = "0.30"
-thiserror = "1.0"
+nix = { version = "0.31", features = ["fs", "hostname", "user"] }
+procfs = "0.18"
+rand = "0.10"
+sysinfo = "0.38"
+thiserror = "2.0"
 throttle = { workspace = true }
-tokio = { version = "1.38", features = ["full", "parking_lot", "tracing"] }
+tokio = { version = "1.50", features = ["full", "parking_lot", "tracing"] }
 tracing = "0.1"
 tracing-chrome = "0.7"
 tracing-flame = "0.2"

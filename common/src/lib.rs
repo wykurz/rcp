@@ -96,9 +96,6 @@
 //! # }
 //! ```
 
-#[macro_use]
-extern crate lazy_static;
-
 use crate::cmp::ObjType;
 use anyhow::anyhow;
 use anyhow::Context;
@@ -189,12 +186,12 @@ pub fn is_localhost(host: &str) -> bool {
     false
 }
 
-lazy_static! {
-    static ref PROGRESS: progress::Progress = progress::Progress::new();
-    static ref PBAR: indicatif::ProgressBar = indicatif::ProgressBar::new_spinner();
-    static ref REMOTE_RUNTIME_STATS: std::sync::Mutex<Option<RemoteRuntimeStats>> =
-        std::sync::Mutex::new(None);
-}
+static PROGRESS: std::sync::LazyLock<progress::Progress> =
+    std::sync::LazyLock::new(progress::Progress::new);
+static PBAR: std::sync::LazyLock<indicatif::ProgressBar> =
+    std::sync::LazyLock::new(indicatif::ProgressBar::new_spinner);
+static REMOTE_RUNTIME_STATS: std::sync::LazyLock<std::sync::Mutex<Option<RemoteRuntimeStats>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 #[must_use]
 pub fn get_progress() -> &'static progress::Progress {
@@ -1022,7 +1019,7 @@ where
     if max_blocking_threads > 0 {
         builder.max_blocking_threads(max_blocking_threads);
     }
-    if !sysinfo::set_open_files_limit(isize::MAX) {
+    if !sysinfo::set_open_files_limit(usize::MAX) {
         tracing::info!("Failed to update the open files limit (expected on non-linux targets)");
     }
     let set_max_open_files = max_open_files.unwrap_or_else(|| {

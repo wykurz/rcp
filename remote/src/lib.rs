@@ -73,7 +73,7 @@
 //! The [`streams`] module provides high-level abstractions over TCP streams:
 //! - [`streams::SendStream`] / [`streams::RecvStream`] for framed message passing
 //! - [`streams::ControlConnection`] for bidirectional control channels
-//! - Object serialization/deserialization using bincode
+//! - Object serialization/deserialization using bitcode
 //!
 //! ## Remote Tracing
 //!
@@ -1094,9 +1094,8 @@ fn is_preferred_physical_interface(name: &str) -> bool {
 /// Generate a random server name for identifying connections
 #[instrument]
 pub fn get_random_server_name() -> String {
-    use rand::Rng;
-    rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
+    rand::random_iter::<u8>()
+        .filter(|b| b.is_ascii_alphanumeric())
         .take(20)
         .map(char::from)
         .collect()
