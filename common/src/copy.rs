@@ -180,16 +180,13 @@ pub async fn copy_file(
     prog_track: &'static progress::Progress,
     src: &std::path::Path,
     dst: &std::path::Path,
+    src_metadata: &std::fs::Metadata,
     settings: &Settings,
     preserve: &preserve::Settings,
     is_fresh: bool,
 ) -> Result<Summary, Error> {
-    // handle dry-run mode for files - still read metadata to report accurate size
+    // handle dry-run mode for files
     if settings.dry_run.is_some() {
-        let src_metadata = tokio::fs::symlink_metadata(src)
-            .await
-            .with_context(|| format!("failed reading metadata from {:?}", &src))
-            .map_err(|err| Error::new(err, Default::default()))?;
         report_dry_run_copy(src, dst, "file");
         return Ok(Summary {
             files_copied: 1,
@@ -197,12 +194,7 @@ pub async fn copy_file(
             ..Default::default()
         });
     }
-    let _open_file_guard = throttle::open_file_permit().await;
     tracing::debug!("opening 'src' for reading and 'dst' for writing");
-    let src_metadata = tokio::fs::symlink_metadata(src)
-        .await
-        .with_context(|| format!("failed reading metadata from {:?}", &src))
-        .map_err(|err| Error::new(err, Default::default()))?;
     get_file_iops_tokens(settings.chunk_size, src_metadata.size()).await;
     let mut rm_summary = RmSummary::default();
     if !is_fresh && dst.exists() {
@@ -212,12 +204,8 @@ pub async fn copy_file(
                 .await
                 .with_context(|| format!("failed reading metadata from {:?}", &dst))
                 .map_err(|err| Error::new(err, Default::default()))?;
-            if is_file_type_same(&src_metadata, &dst_metadata)
-                && filecmp::metadata_equal(
-                    &settings.overwrite_compare,
-                    &src_metadata,
-                    &dst_metadata,
-                )
+            if is_file_type_same(src_metadata, &dst_metadata)
+                && filecmp::metadata_equal(&settings.overwrite_compare, src_metadata, &dst_metadata)
             {
                 tracing::debug!("file is identical, skipping");
                 prog_track.files_unchanged.inc();
@@ -268,7 +256,7 @@ pub async fn copy_file(
     prog_track.files_copied.inc();
     prog_track.bytes_copied.add(src_metadata.len());
     tracing::debug!("setting permissions");
-    preserve::set_file_metadata(preserve, &src_metadata, dst)
+    preserve::set_file_metadata(preserve, src_metadata, dst)
         .await
         .map_err(|err| Error::new(err, copy_summary))?;
     // we mark files as "copied" only after all metadata is set as well
@@ -405,11 +393,15 @@ pub async fn copy(
             }
         }
     }
-    copy_internal(prog_track, src, dst, src, settings, preserve, is_fresh).await
+    copy_internal(
+        prog_track, src, dst, src, settings, preserve, is_fresh, None,
+    )
+    .await
 }
 
-#[instrument(skip(prog_track))]
+#[instrument(skip(prog_track, open_file_guard))]
 #[async_recursion]
+#[allow(clippy::too_many_arguments)]
 async fn copy_internal(
     prog_track: &'static progress::Progress,
     src: &std::path::Path,
@@ -418,6 +410,7 @@ async fn copy_internal(
     settings: &Settings,
     preserve: &preserve::Settings,
     mut is_fresh: bool,
+    open_file_guard: Option<throttle::OpenFileGuard>,
 ) -> Result<Summary, Error> {
     let _ops_guard = prog_track.ops.guard();
     tracing::debug!("reading source metadata");
@@ -426,6 +419,10 @@ async fn copy_internal(
         .with_context(|| format!("failed reading metadata from src: {:?}", &src))
         .map_err(|err| Error::new(err, Default::default()))?;
     if settings.dereference && src_metadata.is_symlink() {
+        debug_assert!(
+            open_file_guard.is_none(),
+            "open file guard should not be pre-acquired for symlinks"
+        );
         let link = tokio::fs::canonicalize(&src)
             .await
             .with_context(|| format!("failed reading src symlink {:?}", &src))
@@ -433,8 +430,26 @@ async fn copy_internal(
         return copy(prog_track, &link, dst, settings, preserve, is_fresh).await;
     }
     if src_metadata.is_file() {
-        return copy_file(prog_track, src, dst, settings, preserve, is_fresh).await;
+        // acquire permit if not pre-acquired by the caller
+        let _guard = match open_file_guard {
+            Some(g) => g,
+            None => throttle::open_file_permit().await,
+        };
+        return copy_file(
+            prog_track,
+            src,
+            dst,
+            &src_metadata,
+            settings,
+            preserve,
+            is_fresh,
+        )
+        .await;
     }
+    debug_assert!(
+        open_file_guard.is_none(),
+        "open file guard should not be pre-acquired for directories or symlinks"
+    );
     if src_metadata.is_symlink() {
         // handle dry-run mode for symlinks
         if settings.dry_run.is_some() {
@@ -710,6 +725,19 @@ async fn copy_internal(
             }
             continue;
         }
+        // for regular files (not dirs, not symlinks), acquire the open file permit before
+        // spawning the task. this provides backpressure so we don't create unbounded tasks.
+        // it's safe because files are leaf nodes that never recurse, so no deadlock is possible.
+        // we don't acquire for symlinks because with --dereference they could resolve to
+        // directories, which would risk deadlock. when file_type() fails we also skip
+        // pre-acquisition since we can't be sure it's a file — copy_internal will acquire
+        // the permit if needed after reading the actual metadata.
+        let entry_is_regular_file = entry_file_type.as_ref().is_some_and(|ft| ft.is_file());
+        let open_file_guard = if entry_is_regular_file {
+            Some(throttle::open_file_permit().await)
+        } else {
+            None
+        };
         // spawn recursive call - dry-run reporting is handled by copy_internal
         // (copy_file, symlink handling, and directory handling all have their own dry-run reporting)
         let settings = settings.clone();
@@ -724,6 +752,7 @@ async fn copy_internal(
                 &settings,
                 &preserve,
                 is_fresh,
+                open_file_guard,
             )
             .await
         };
@@ -1997,10 +2026,13 @@ mod copy_tests {
             tokio::fs::write(&unreadable, "test").await?;
             tokio::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).await?;
 
+            // symlink_metadata succeeds even without read permission
+            let src_metadata = tokio::fs::symlink_metadata(&unreadable).await?;
             let result = copy_file(
                 &PROGRESS,
                 &unreadable,
                 &tmp_dir.join("dest.txt"),
+                &src_metadata,
                 &Settings {
                     dereference: false,
                     fail_early: false,
@@ -2035,7 +2067,7 @@ mod copy_tests {
         async fn test_nonexistent_source_includes_root_cause() -> Result<(), anyhow::Error> {
             let tmp_dir = testutils::create_temp_dir().await?;
 
-            let result = copy_file(
+            let result = copy(
                 &PROGRESS,
                 &tmp_dir.join("does_not_exist.txt"),
                 &tmp_dir.join("dest.txt"),

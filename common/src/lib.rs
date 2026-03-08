@@ -1026,7 +1026,9 @@ where
         let limit = get_max_open_files().expect(
             "We failed to query rlimit, if this is expected try specifying --max-open-files",
         ) as usize;
-        80 * limit / 100 // ~80% of the max open files limit
+        // use ~80% of the system limit, but cap at 4096 to avoid overwhelming
+        // distributed filesystems
+        std::cmp::min(limit / 10 * 8, 4096)
     });
     if set_max_open_files > 0 {
         tracing::info!("Setting max open files to: {}", set_max_open_files);
