@@ -349,11 +349,13 @@ async fn link_internal(
                 src,
                 update
             );
+            let _open_file_guard = throttle::open_file_permit().await;
             return Ok(Summary {
                 copy_summary: copy::copy_file(
                     prog_track,
                     update,
                     dst,
+                    update_metadata,
                     &settings.copy_settings,
                     &settings.preserve,
                     is_fresh,
