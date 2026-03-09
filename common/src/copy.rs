@@ -175,7 +175,7 @@ pub fn is_file_type_same(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bo
         && ft1.is_symlink() == ft2.is_symlink()
 }
 
-#[instrument(skip(prog_track, settings, preserve))]
+#[instrument(skip(prog_track, src_metadata, settings, preserve))]
 pub async fn copy_file(
     prog_track: &'static progress::Progress,
     src: &std::path::Path,
@@ -3119,6 +3119,114 @@ mod copy_tests {
                 !dst_path.exists(),
                 "nothing should be created in dry-run mode"
             );
+            Ok(())
+        }
+    }
+
+    /// stress tests exercising max-open-files saturation during copy
+    mod max_open_files_tests {
+        use super::*;
+
+        /// wide copy: many files with a very low open-files limit.
+        /// verifies all files are copied correctly under permit saturation.
+        #[tokio::test]
+        #[traced_test]
+        async fn wide_copy_under_open_files_saturation() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+            let src = tmp_dir.join("src");
+            let dst = tmp_dir.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            let file_count = 200;
+            for i in 0..file_count {
+                tokio::fs::write(src.join(format!("{}.txt", i)), format!("content-{}", i)).await?;
+            }
+            // set a very low limit to force permit contention
+            throttle::set_max_open_files(4);
+            let summary = copy(
+                &PROGRESS,
+                &src,
+                &dst,
+                &Settings {
+                    dereference: false,
+                    fail_early: true,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    chunk_size: 0,
+                    remote_copy_buffer_size: 0,
+                    filter: None,
+                    dry_run: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await?;
+            assert_eq!(summary.files_copied, file_count);
+            assert_eq!(summary.directories_created, 1);
+            for i in 0..file_count {
+                let content = tokio::fs::read_to_string(dst.join(format!("{}.txt", i))).await?;
+                assert_eq!(content, format!("content-{}", i));
+            }
+            Ok(())
+        }
+
+        /// deep + wide copy: directory tree deeper than the open-files limit, with files
+        /// at every level. verifies no deadlock occurs (directories don't consume permits).
+        #[tokio::test]
+        #[traced_test]
+        async fn deep_tree_no_deadlock_under_open_files_saturation() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+            let src = tmp_dir.join("src");
+            let dst = tmp_dir.join("dst");
+            let depth = 20;
+            let files_per_level = 5;
+            let limit = 4;
+            // create a directory chain deeper than the permit limit, with files at each level
+            let mut dir = src.clone();
+            for level in 0..depth {
+                tokio::fs::create_dir_all(&dir).await?;
+                for f in 0..files_per_level {
+                    tokio::fs::write(
+                        dir.join(format!("f{}_{}.txt", level, f)),
+                        format!("L{}F{}", level, f),
+                    )
+                    .await?;
+                }
+                dir = dir.join(format!("d{}", level));
+            }
+            throttle::set_max_open_files(limit);
+            let summary = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                copy(
+                    &PROGRESS,
+                    &src,
+                    &dst,
+                    &Settings {
+                        dereference: false,
+                        fail_early: true,
+                        overwrite: false,
+                        overwrite_compare: Default::default(),
+                        chunk_size: 0,
+                        remote_copy_buffer_size: 0,
+                        filter: None,
+                        dry_run: None,
+                    },
+                    &NO_PRESERVE_SETTINGS,
+                    false,
+                ),
+            )
+            .await
+            .context("copy timed out — possible deadlock")?
+            .context("copy failed")?;
+            assert_eq!(summary.files_copied, depth * files_per_level);
+            assert_eq!(summary.directories_created, depth);
+            // spot-check content at a few levels
+            let mut check_dir = dst.clone();
+            for level in 0..depth {
+                let content =
+                    tokio::fs::read_to_string(check_dir.join(format!("f{}_0.txt", level))).await?;
+                assert_eq!(content, format!("L{}F0", level));
+                check_dir = check_dir.join(format!("d{}", level));
+            }
             Ok(())
         }
     }
