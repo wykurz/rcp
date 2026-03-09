@@ -18,6 +18,16 @@ fn create_test_file(path: &std::path::Path, content: &str, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// copy src file times (atime/mtime) to dst
+fn copy_file_times(src: &std::path::Path, dst: &std::path::Path) {
+    let src_meta = std::fs::metadata(src).unwrap();
+    let times = std::fs::FileTimes::new()
+        .set_accessed(src_meta.accessed().unwrap())
+        .set_modified(src_meta.modified().unwrap());
+    let dst_file = std::fs::File::options().write(true).open(dst).unwrap();
+    dst_file.set_times(times).unwrap();
+}
+
 fn get_file_mode(path: &std::path::Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
 }
@@ -506,6 +516,9 @@ fn test_update_preserve_none_succeeds_with_allow_lossy() {
     let dst_file = dst_dir.path().join("test.txt");
     create_test_file(&src_file, "content", 0o644);
     create_test_file(&update_file, "content", 0o644);
+    // default --update-compare is size,mtime — ensure mtimes match so rlink
+    // considers the files unchanged and hard-links instead of copying
+    copy_file_times(&src_file, &update_file);
     // use default --update-compare (size,mtime) so the mismatch with
     // --preserve-settings=none is real and only --allow-lossy-update saves it
     let mut cmd = assert_cmd::Command::cargo_bin("rlink").unwrap();
