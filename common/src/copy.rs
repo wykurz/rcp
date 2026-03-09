@@ -175,7 +175,7 @@ pub fn is_file_type_same(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bo
         && ft1.is_symlink() == ft2.is_symlink()
 }
 
-#[instrument(skip(prog_track))]
+#[instrument(skip(prog_track, settings, preserve))]
 pub async fn copy_file(
     prog_track: &'static progress::Progress,
     src: &std::path::Path,
@@ -336,7 +336,7 @@ impl std::fmt::Display for Summary {
 
 /// Public entry point for copy operations.
 /// Internally delegates to copy_internal with source_root tracking for proper filter matching.
-#[instrument(skip(prog_track))]
+#[instrument(skip(prog_track, settings, preserve))]
 pub async fn copy(
     prog_track: &'static progress::Progress,
     src: &std::path::Path,
@@ -399,7 +399,7 @@ pub async fn copy(
     .await
 }
 
-#[instrument(skip(prog_track, open_file_guard))]
+#[instrument(skip(prog_track, settings, preserve, open_file_guard))]
 #[async_recursion]
 #[allow(clippy::too_many_arguments)]
 async fn copy_internal(
