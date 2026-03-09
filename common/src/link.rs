@@ -139,7 +139,7 @@ fn is_hard_link(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
         && md2.st_ino() == md1.st_ino()
 }
 
-#[instrument(skip(prog_track))]
+#[instrument(skip(prog_track, settings))]
 async fn hard_link_helper(
     prog_track: &'static progress::Progress,
     src: &std::path::Path,
@@ -193,7 +193,7 @@ async fn hard_link_helper(
 
 /// Public entry point for link operations.
 /// Internally delegates to link_internal with source_root tracking for proper filter matching.
-#[instrument(skip(prog_track))]
+#[instrument(skip(prog_track, settings))]
 pub async fn link(
     prog_track: &'static progress::Progress,
     cwd: &std::path::Path,
@@ -262,7 +262,7 @@ pub async fn link(
     }
     link_internal(prog_track, cwd, src, dst, src, update, settings, is_fresh).await
 }
-#[instrument(skip(prog_track))]
+#[instrument(skip(prog_track, settings))]
 #[async_recursion]
 #[allow(clippy::too_many_arguments)]
 async fn link_internal(

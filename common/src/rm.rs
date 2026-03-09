@@ -135,7 +135,7 @@ impl std::fmt::Display for Summary {
 
 /// Public entry point for remove operations.
 /// Internally delegates to rm_internal with source_root tracking for proper filter matching.
-#[instrument(skip(prog_track))]
+#[instrument(skip(prog_track, settings))]
 pub async fn rm(
     prog_track: &'static progress::Progress,
     path: &std::path::Path,
@@ -191,7 +191,7 @@ pub async fn rm(
     }
     rm_internal(prog_track, path, path, settings).await
 }
-#[instrument(skip(prog_track))]
+#[instrument(skip(prog_track, settings))]
 #[async_recursion]
 async fn rm_internal(
     prog_track: &'static progress::Progress,
