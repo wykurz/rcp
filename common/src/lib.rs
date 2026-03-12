@@ -86,6 +86,7 @@
 //! let settings = common::cmp::Settings {
 //!     fail_early: false,
 //!     exit_early: false,
+//!     expand_missing: false,
 //!     compare: Default::default(),
 //!     filter: None,
 //! };
