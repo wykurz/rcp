@@ -91,6 +91,7 @@ fn should_skip_entry(
 
 #[derive(Copy, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Summary {
+    pub bytes_removed: u64,
     pub files_removed: usize,
     pub symlinks_removed: usize,
     pub directories_removed: usize,
@@ -103,6 +104,7 @@ impl std::ops::Add for Summary {
     type Output = Self;
     fn add(self, other: Self) -> Self {
         Self {
+            bytes_removed: self.bytes_removed + other.bytes_removed,
             files_removed: self.files_removed + other.files_removed,
             symlinks_removed: self.symlinks_removed + other.symlinks_removed,
             directories_removed: self.directories_removed + other.directories_removed,
@@ -117,12 +119,14 @@ impl std::fmt::Display for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "files removed: {}\n\
+            "bytes removed: {}\n\
+            files removed: {}\n\
             symlinks removed: {}\n\
             directories removed: {}\n\
             files skipped: {}\n\
             symlinks skipped: {}\n\
             directories skipped: {}\n",
+            bytesize::ByteSize(self.bytes_removed),
             self.files_removed,
             self.symlinks_removed,
             self.directories_removed,
@@ -207,25 +211,16 @@ async fn rm_internal(
         .map_err(|err| Error::new(err, Default::default()))?;
     if !src_metadata.is_dir() {
         tracing::debug!("not a directory, just remove");
+        let is_symlink = src_metadata.file_type().is_symlink();
+        let file_size = if is_symlink { 0 } else { src_metadata.len() };
         // handle dry-run mode for files/symlinks
         if settings.dry_run.is_some() {
-            let entry_type = if src_metadata.file_type().is_symlink() {
-                "symlink"
-            } else {
-                "file"
-            };
+            let entry_type = if is_symlink { "symlink" } else { "file" };
             report_dry_run_rm(path, entry_type);
             return Ok(Summary {
-                files_removed: if src_metadata.file_type().is_symlink() {
-                    0
-                } else {
-                    1
-                },
-                symlinks_removed: if src_metadata.file_type().is_symlink() {
-                    1
-                } else {
-                    0
-                },
+                bytes_removed: file_size,
+                files_removed: if is_symlink { 0 } else { 1 },
+                symlinks_removed: if is_symlink { 1 } else { 0 },
                 ..Default::default()
             });
         }
@@ -233,7 +228,7 @@ async fn rm_internal(
             .await
             .with_context(|| format!("failed removing {:?}", &path))
             .map_err(|err| Error::new(err, Default::default()))?;
-        if src_metadata.file_type().is_symlink() {
+        if is_symlink {
             prog_track.symlinks_removed.inc();
             return Ok(Summary {
                 symlinks_removed: 1,
@@ -241,7 +236,9 @@ async fn rm_internal(
             });
         }
         prog_track.files_removed.inc();
+        prog_track.bytes_removed.add(file_size);
         return Ok(Summary {
+            bytes_removed: file_size,
             files_removed: 1,
             ..Default::default()
         });
@@ -529,6 +526,8 @@ mod tests {
                 summary.files_removed, 3,
                 "should remove 3 files matching bar/*.txt"
             );
+            // each file is 1 byte ("1", "2", "3")
+            assert_eq!(summary.bytes_removed, 3, "should report 3 bytes removed");
             // verify the right files were removed
             assert!(
                 !test_path.join("foo/bar/1.txt").exists(),

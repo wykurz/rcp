@@ -157,9 +157,12 @@ async fn process_single_file(
                     return Ok(());
                 }
                 tracing::debug!("file exists but is different, removing");
+                let removed_file_size = dst_metadata.len();
                 tokio::fs::remove_file(&file_header.dst)
                     .await
                     .map_err(|e| err_needs_drain(e.into()))?;
+                prog.files_removed.inc();
+                prog.bytes_removed.add(removed_file_size);
             } else {
                 tracing::info!("destination is not a file, removing");
                 common::rm::rm(
@@ -949,6 +952,7 @@ pub async fn run_destination(
         symlinks_skipped: 0,
         directories_skipped: 0,
         rm_summary: common::rm::Summary {
+            bytes_removed: prog.bytes_removed.get(),
             files_removed: prog.files_removed.get() as usize,
             symlinks_removed: prog.symlinks_removed.get() as usize,
             directories_removed: prog.directories_removed.get() as usize,

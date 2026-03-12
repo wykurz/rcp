@@ -159,6 +159,7 @@ pub struct Progress {
     pub files_removed: TlsCounter,
     pub symlinks_removed: TlsCounter,
     pub directories_removed: TlsCounter,
+    pub bytes_removed: TlsCounter,
     pub files_skipped: TlsCounter,
     pub symlinks_skipped: TlsCounter,
     pub directories_skipped: TlsCounter,
@@ -182,6 +183,7 @@ impl Progress {
             files_removed: Default::default(),
             symlinks_removed: Default::default(),
             directories_removed: Default::default(),
+            bytes_removed: Default::default(),
             files_skipped: Default::default(),
             symlinks_skipped: Default::default(),
             directories_skipped: Default::default(),
@@ -216,6 +218,7 @@ pub struct SerializableProgress {
     pub files_removed: u64,
     pub symlinks_removed: u64,
     pub directories_removed: u64,
+    pub bytes_removed: u64,
     pub files_skipped: u64,
     pub symlinks_skipped: u64,
     pub directories_skipped: u64,
@@ -239,6 +242,7 @@ impl Default for SerializableProgress {
             files_removed: 0,
             symlinks_removed: 0,
             directories_removed: 0,
+            bytes_removed: 0,
             files_skipped: 0,
             symlinks_skipped: 0,
             directories_skipped: 0,
@@ -265,6 +269,7 @@ impl From<&Progress> for SerializableProgress {
             files_removed: progress.files_removed.get(),
             symlinks_removed: progress.symlinks_removed.get(),
             directories_removed: progress.directories_removed.get(),
+            bytes_removed: progress.bytes_removed.get(),
             files_skipped: progress.files_skipped.get(),
             symlinks_skipped: progress.symlinks_skipped.get(),
             directories_skipped: progress.directories_skipped.get(),
@@ -315,7 +320,7 @@ impl<'a> ProgressPrinter<'a> {
             COPIED:\n\
             average: {:>10}/s\n\
             current: {:>10}/s\n\
-            total:   {:>10}\n\
+            bytes:   {:>10}\n\
             files:       {:>10}\n\
             symlinks:    {:>10}\n\
             directories: {:>10}\n\
@@ -328,6 +333,7 @@ impl<'a> ProgressPrinter<'a> {
             hard-links:  {:>10}\n\
             -----------------------\n\
             REMOVED:\n\
+            bytes:       {:>10}\n\
             files:       {:>10}\n\
             symlinks:    {:>10}\n\
             directories: {:>10}\n\
@@ -353,6 +359,7 @@ impl<'a> ProgressPrinter<'a> {
             self.progress.directories_unchanged.get(),
             self.progress.hard_links_unchanged.get(),
             // remove
+            bytesize::ByteSize(self.progress.bytes_removed.get()),
             self.progress.files_removed.get(),
             self.progress.symlinks_removed.get(),
             self.progress.directories_removed.get(),
@@ -469,7 +476,7 @@ impl RcpdProgressPrinter {
             COPIED:\n\
             average: {:>10}/s\n\
             current: {:>10}/s\n\
-            total:   {:>10}\n\
+            bytes:   {:>10}\n\
             files:       {:>10}\n\
             ---------------------\n\
             FILES:\n\
@@ -489,7 +496,7 @@ impl RcpdProgressPrinter {
             COPIED:\n\
             average: {:>10}/s\n\
             current: {:>10}/s\n\
-            total:   {:>10}\n\
+            bytes:   {:>10}\n\
             files:       {:>10}\n\
             symlinks:    {:>10}\n\
             directories: {:>10}\n\
@@ -502,6 +509,7 @@ impl RcpdProgressPrinter {
             hard-links:  {:>10}\n\
             ---------------------\n\
             REMOVED:\n\
+            bytes:       {:>10}\n\
             files:       {:>10}\n\
             symlinks:    {:>10}\n\
             directories: {:>10}",
@@ -537,6 +545,7 @@ impl RcpdProgressPrinter {
             dest_progress.directories_unchanged,
             dest_progress.hard_links_unchanged,
             // removed
+            bytesize::ByteSize(dest_progress.bytes_removed),
             dest_progress.files_removed,
             dest_progress.symlinks_removed,
             dest_progress.directories_removed,

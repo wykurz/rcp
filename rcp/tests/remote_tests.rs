@@ -225,6 +225,14 @@ fn parse_summary_from_output(output: &std::process::Output) -> Option<common::co
         parse_field!(line, "files removed: ", summary.rm_summary.files_removed, found_any);
         parse_field!(line, "symlinks removed: ", summary.rm_summary.symlinks_removed, found_any);
         parse_field!(line, "directories removed: ", summary.rm_summary.directories_removed, found_any);
+        // special handling for bytes_removed which has a unit suffix (e.g., "40 B")
+        if let Some(value_str) = line.strip_prefix("bytes removed: ") {
+            if let Some(num_str) = value_str.split_whitespace().next() {
+                summary.rm_summary.bytes_removed = num_str.parse().ok()?;
+                found_any = true;
+                continue;
+            }
+        }
         // If no prefix matched, do nothing.
     }
     if found_any {
@@ -513,7 +521,8 @@ fn test_remote_copy_with_overwrite() {
     // verify summary
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.files_copied, 1);
-    assert_eq!(summary.rm_summary.files_removed, 0); // file-to-file overwrite is atomic, no removal counted
+    assert_eq!(summary.rm_summary.files_removed, 1); // file-to-file overwrite removes the old file first
+    assert_eq!(summary.rm_summary.bytes_removed, 11); // "old content"
     assert_eq!(summary.bytes_copied, 26); // "new content that is longer"
 }
 
@@ -844,7 +853,7 @@ fn test_remote_overwrite_directory_with_directory() {
                                                                               // verify summary
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.files_copied, 3); // file1, file2, file3
-    assert_eq!(summary.rm_summary.files_removed, 0); // file1.txt overwrite is atomic, not counted as removal
+    assert_eq!(summary.rm_summary.files_removed, 1); // file1.txt overwrite removes the old file first
     assert_eq!(summary.directories_created, 0); // directory already existed
     assert_eq!(summary.bytes_copied, 24); // "content1" (8) + "content2" (8) + "content3" (8)
 }
