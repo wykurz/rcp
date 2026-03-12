@@ -217,6 +217,15 @@ fn test_metadata_compare_flag() {
 }
 
 #[test]
+fn test_expand_missing_flag() {
+    Command::cargo_bin("rcmp")
+        .unwrap()
+        .args(["--expand-missing", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn test_log_flag() {
     Command::cargo_bin("rcmp")
         .unwrap()

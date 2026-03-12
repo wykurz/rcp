@@ -53,6 +53,10 @@ struct Args {
     #[arg(short = 'm', long = "exit-early", help_heading = "Comparison options")]
     exit_early: bool,
 
+    /// When a directory is missing on one side, list its contents individually
+    #[arg(long, help_heading = "Comparison options")]
+    expand_missing: bool,
+
     /// Return non-zero exit code only if there were errors performing the comparison
     #[arg(long, help_heading = "Comparison options")]
     no_check: bool,
@@ -213,6 +217,7 @@ async fn async_main(args: Args) -> Result<common::cmp::Summary> {
         &common::cmp::Settings {
             fail_early: args.fail_early,
             exit_early: args.exit_early,
+            expand_missing: args.expand_missing,
             compare: common::parse_compare_settings(&args.metadata_compare)?,
             filter,
         },

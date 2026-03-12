@@ -31,6 +31,7 @@ pub struct Settings {
     pub compare: ObjSettings,
     pub fail_early: bool,
     pub exit_early: bool,
+    pub expand_missing: bool,
     pub filter: Option<crate::filter::FilterSettings>,
 }
 
@@ -217,6 +218,139 @@ pub async fn cmp(
     cmp_internal(prog_track, src, dst, src, dst, log, settings).await
 }
 
+/// Recursively walks a directory tree on the existing side and records every entry as missing
+/// on the other side.
+#[instrument(skip(prog_track))]
+#[async_recursion]
+async fn expand_missing_tree(
+    prog_track: &'static progress::Progress,
+    existing_path: &std::path::Path,
+    mirror_path: &std::path::Path,
+    existing_root: &std::path::Path,
+    result: CompareResult,
+    log: &LogWriter,
+    settings: &Settings,
+) -> Result<Summary> {
+    let _prog_guard = prog_track.ops.guard();
+    let metadata = tokio::fs::symlink_metadata(existing_path)
+        .await
+        .with_context(|| format!("failed reading metadata from {:?}", &existing_path))?;
+    let existing_obj_type = obj_type(&metadata);
+    let mut summary = Summary::default();
+    summary.mismatch[existing_obj_type][result] += 1;
+    // track file sizes on the appropriate side
+    if metadata.is_file() {
+        match result {
+            CompareResult::DstMissing => summary.src_bytes += metadata.len(),
+            CompareResult::SrcMissing => summary.dst_bytes += metadata.len(),
+            _ => {}
+        }
+    }
+    match result {
+        CompareResult::DstMissing => {
+            log.log_mismatch(
+                result,
+                Some(existing_obj_type),
+                existing_path,
+                None,
+                mirror_path,
+            )
+            .await?;
+        }
+        CompareResult::SrcMissing => {
+            log.log_mismatch(
+                result,
+                None,
+                mirror_path,
+                Some(existing_obj_type),
+                existing_path,
+            )
+            .await?;
+        }
+        _ => {}
+    }
+    if settings.exit_early {
+        return Ok(summary);
+    }
+    if !metadata.is_dir() {
+        return Ok(summary);
+    }
+    let mut entries = tokio::fs::read_dir(existing_path)
+        .await
+        .with_context(|| format!("cannot open directory {:?} for reading", &existing_path))?;
+    let mut join_set = tokio::task::JoinSet::new();
+    let mut success = true;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| format!("failed traversing directory {:?}", &existing_path))?
+    {
+        throttle::get_ops_token().await;
+        let entry_path = entry.path();
+        let entry_name = entry_path.file_name().unwrap();
+        // apply filter if configured
+        if let Some(ref filter) = settings.filter {
+            let relative_path = entry_path
+                .strip_prefix(existing_root)
+                .unwrap_or(&entry_path);
+            let entry_file_type = entry.file_type().await.ok();
+            let is_dir = entry_file_type.map(|ft| ft.is_dir()).unwrap_or(false);
+            if !matches!(
+                filter.should_include(relative_path, is_dir),
+                crate::filter::FilterResult::Included
+            ) {
+                // increment skipped counter based on entry type
+                let entry_obj_type = if is_dir {
+                    ObjType::Dir
+                } else if entry_file_type.map(|ft| ft.is_symlink()).unwrap_or(false) {
+                    ObjType::Symlink
+                } else {
+                    ObjType::File
+                };
+                summary.skipped[entry_obj_type] += 1;
+                continue;
+            }
+        }
+        let child_mirror = mirror_path.join(entry_name);
+        let log = log.clone();
+        let settings = settings.clone();
+        let existing_root = existing_root.to_owned();
+        join_set.spawn(async move {
+            expand_missing_tree(
+                prog_track,
+                &entry_path,
+                &child_mirror,
+                &existing_root,
+                result,
+                &log,
+                &settings,
+            )
+            .await
+        });
+    }
+    drop(entries);
+    while let Some(res) = join_set.join_next().await {
+        match res? {
+            Ok(child_summary) => summary = summary + child_summary,
+            Err(error) => {
+                tracing::error!(
+                    "expand_missing_tree: {:?} failed with: {:#}",
+                    existing_path,
+                    &error
+                );
+                if settings.fail_early {
+                    return Err(error);
+                }
+                success = false;
+            }
+        }
+    }
+    if !success {
+        return Err(anyhow!("expand_missing_tree: {:?} failed!", existing_path));
+    }
+    Ok(summary)
+}
+
 #[instrument(skip(prog_track))]
 #[async_recursion]
 async fn cmp_internal(
@@ -263,15 +397,29 @@ async fn cmp_internal(
             Ok(metadata) => metadata,
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::NotFound {
-                    cmp_summary.mismatch[src_obj_type][CompareResult::DstMissing] += 1;
-                    log.log_mismatch(
-                        CompareResult::DstMissing,
-                        Some(src_obj_type),
-                        src,
-                        None,
-                        dst,
-                    )
-                    .await?;
+                    if settings.expand_missing && src_metadata.is_dir() {
+                        let expanded = expand_missing_tree(
+                            prog_track,
+                            src,
+                            dst,
+                            source_root,
+                            CompareResult::DstMissing,
+                            log,
+                            settings,
+                        )
+                        .await?;
+                        cmp_summary = cmp_summary + expanded;
+                    } else {
+                        cmp_summary.mismatch[src_obj_type][CompareResult::DstMissing] += 1;
+                        log.log_mismatch(
+                            CompareResult::DstMissing,
+                            Some(src_obj_type),
+                            src,
+                            None,
+                            dst,
+                        )
+                        .await?;
+                    }
                     return Ok(cmp_summary);
                 }
                 return Err(err).context(format!("failed reading metadata from {:?}", &dst));
@@ -418,18 +566,45 @@ async fn cmp_internal(
             .await
             .with_context(|| format!("failed reading metadata from {:?}", &dst_path))?;
         let dst_obj_type = obj_type(&dst_entry_metadata);
-        if dst_entry_metadata.is_file() {
-            cmp_summary.dst_bytes += dst_entry_metadata.len();
+        if settings.expand_missing && dst_entry_metadata.is_dir() {
+            match expand_missing_tree(
+                prog_track,
+                &dst_path,
+                &src.join(entry_name),
+                dest_root,
+                CompareResult::SrcMissing,
+                log,
+                settings,
+            )
+            .await
+            {
+                Ok(expanded) => cmp_summary = cmp_summary + expanded,
+                Err(error) => {
+                    tracing::error!(
+                        "expand_missing_tree: {:?} failed with: {:#}",
+                        &dst_path,
+                        &error
+                    );
+                    if settings.fail_early {
+                        return Err(error);
+                    }
+                    success = false;
+                }
+            }
+        } else {
+            if dst_entry_metadata.is_file() {
+                cmp_summary.dst_bytes += dst_entry_metadata.len();
+            }
+            cmp_summary.mismatch[dst_obj_type][CompareResult::SrcMissing] += 1;
+            log.log_mismatch(
+                CompareResult::SrcMissing,
+                None,
+                &src.join(entry_name),
+                Some(dst_obj_type),
+                &dst_path,
+            )
+            .await?;
         }
-        cmp_summary.mismatch[dst_obj_type][CompareResult::SrcMissing] += 1;
-        log.log_mismatch(
-            CompareResult::SrcMissing,
-            None,
-            &src.join(entry_name),
-            Some(dst_obj_type),
-            &dst_path,
-        )
-        .await?;
     }
     // unfortunately ReadDir is opening file-descriptors and there's not a good way to limit this,
     // one thing we CAN do however is to drop it as soon as we're done with it
@@ -532,6 +707,7 @@ mod cmp_tests {
         let compare_settings = Settings {
             fail_early: false,
             exit_early: false,
+            expand_missing: false,
             compare: enum_map! {
                 ObjType::File => filecmp::MetadataCmpSettings {
                     size: true,
@@ -606,6 +782,7 @@ mod cmp_tests {
         let compare_settings_no_filter = Settings {
             fail_early: false,
             exit_early: false,
+            expand_missing: false,
             compare: enum_map! {
                 ObjType::File => filecmp::MetadataCmpSettings {
                     size: true,
@@ -636,6 +813,7 @@ mod cmp_tests {
         let compare_settings_with_filter = Settings {
             fail_early: false,
             exit_early: false,
+            expand_missing: false,
             compare: enum_map! {
                 ObjType::File => filecmp::MetadataCmpSettings {
                     size: true,
@@ -676,6 +854,7 @@ mod cmp_tests {
         let compare_settings = Settings {
             fail_early: false,
             exit_early: false,
+            expand_missing: false,
             compare: enum_map! {
                 ObjType::File => filecmp::MetadataCmpSettings {
                     size: true,
@@ -725,6 +904,7 @@ mod cmp_tests {
         let compare_settings = Settings {
             fail_early: false,
             exit_early: false,
+            expand_missing: false,
             compare: enum_map! {
                 ObjType::File => filecmp::MetadataCmpSettings {
                     size: true,
@@ -771,6 +951,7 @@ mod cmp_tests {
         let compare_settings = Settings {
             fail_early: false,
             exit_early: false,
+            expand_missing: false,
             compare: enum_map! {
                 ObjType::File => filecmp::MetadataCmpSettings {
                     size: true,
@@ -808,6 +989,7 @@ mod cmp_tests {
         let compare_settings = Settings {
             fail_early: false,
             exit_early: false,
+            expand_missing: false,
             compare: enum_map! {
                 ObjType::File => filecmp::MetadataCmpSettings::default(),
                 ObjType::Dir => filecmp::MetadataCmpSettings::default(),
@@ -843,6 +1025,7 @@ mod cmp_tests {
         let compare_settings = Settings {
             fail_early: false,
             exit_early: false,
+            expand_missing: false,
             compare: enum_map! {
                 ObjType::File => filecmp::MetadataCmpSettings {
                     size: true,
@@ -889,6 +1072,7 @@ mod cmp_tests {
         let compare_settings = Settings {
             fail_early: false,
             exit_early: false,
+            expand_missing: false,
             compare: enum_map! {
                 ObjType::File => filecmp::MetadataCmpSettings {
                     size: true,
@@ -925,6 +1109,396 @@ mod cmp_tests {
             summary.skipped[ObjType::Dir],
             2,
             "should skip 2 directories (bar in src + bar in dst)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn expand_missing_dst_reports_all_entries() -> Result<()> {
+        let tmp_dir = setup_test_dirs(true).await?;
+        // remove bar/bar directory entirely from dst
+        tokio::fs::remove_dir_all(&tmp_dir.join("bar").join("bar")).await?;
+        let compare_settings = Settings {
+            fail_early: false,
+            exit_early: false,
+            expand_missing: true,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings::default(),
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: None,
+        };
+        let summary = cmp(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &tmp_dir.join("bar"),
+            &LogWriter::new(None, false).await?,
+            &compare_settings,
+        )
+        .await?;
+        // bar/bar dir has: bar/ (1 dir) + 1.txt, 2.txt, 3.txt (3 files)
+        assert_eq!(
+            summary.mismatch[ObjType::Dir][CompareResult::DstMissing],
+            1,
+            "should report 1 directory as DstMissing"
+        );
+        assert_eq!(
+            summary.mismatch[ObjType::File][CompareResult::DstMissing],
+            3,
+            "should report 3 files as DstMissing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn expand_missing_src_reports_all_entries() -> Result<()> {
+        let tmp_dir = setup_test_dirs(true).await?;
+        // create a new subdir in dst with files
+        let newdir = tmp_dir.join("bar").join("newdir");
+        tokio::fs::create_dir(&newdir).await?;
+        tokio::fs::write(newdir.join("a.txt"), "a").await?;
+        tokio::fs::write(newdir.join("b.txt"), "b").await?;
+        let compare_settings = Settings {
+            fail_early: false,
+            exit_early: false,
+            expand_missing: true,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings::default(),
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: None,
+        };
+        let summary = cmp(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &tmp_dir.join("bar"),
+            &LogWriter::new(None, false).await?,
+            &compare_settings,
+        )
+        .await?;
+        assert_eq!(
+            summary.mismatch[ObjType::Dir][CompareResult::SrcMissing],
+            1,
+            "should report 1 directory as SrcMissing"
+        );
+        assert_eq!(
+            summary.mismatch[ObjType::File][CompareResult::SrcMissing],
+            2,
+            "should report 2 files as SrcMissing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn expand_missing_dst_deeply_nested() -> Result<()> {
+        // verify expansion recurses through multiple directory levels
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let src = tmp_dir.join("src");
+        let dst = tmp_dir.join("dst");
+        tokio::fs::create_dir(&src).await?;
+        tokio::fs::create_dir(&dst).await?;
+        // create src/a/b/c/d.txt -- 3 dirs deep
+        let deep = src.join("a").join("b").join("c");
+        tokio::fs::create_dir_all(&deep).await?;
+        tokio::fs::write(deep.join("d.txt"), "d").await?;
+        // also add a sibling file at an intermediate level
+        tokio::fs::write(src.join("a").join("b").join("mid.txt"), "m").await?;
+        // dst exists but is empty -- everything in src is DstMissing
+        let compare_settings = Settings {
+            fail_early: false,
+            exit_early: false,
+            expand_missing: true,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings::default(),
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: None,
+        };
+        let summary = cmp(
+            &PROGRESS,
+            &src,
+            &dst,
+            &LogWriter::new(None, false).await?,
+            &compare_settings,
+        )
+        .await?;
+        // dirs: a, a/b, a/b/c = 3 DstMissing dirs
+        assert_eq!(
+            summary.mismatch[ObjType::Dir][CompareResult::DstMissing],
+            3,
+            "should report 3 nested directories as DstMissing"
+        );
+        // files: a/b/c/d.txt, a/b/mid.txt = 2 DstMissing files
+        assert_eq!(
+            summary.mismatch[ObjType::File][CompareResult::DstMissing],
+            2,
+            "should report 2 files as DstMissing"
+        );
+        // src_bytes: d.txt(1) + mid.txt(1) = 2
+        assert_eq!(
+            summary.src_bytes, 2,
+            "should track bytes for expanded files"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn expand_missing_src_deeply_nested() -> Result<()> {
+        // verify expansion recurses for SrcMissing through multiple levels
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let src = tmp_dir.join("src");
+        let dst = tmp_dir.join("dst");
+        tokio::fs::create_dir(&src).await?;
+        tokio::fs::create_dir(&dst).await?;
+        // create dst/x/y/z.txt -- dirs only in dst
+        let deep = dst.join("x").join("y");
+        tokio::fs::create_dir_all(&deep).await?;
+        tokio::fs::write(deep.join("z.txt"), "zz").await?;
+        let compare_settings = Settings {
+            fail_early: false,
+            exit_early: false,
+            expand_missing: true,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings::default(),
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: None,
+        };
+        let summary = cmp(
+            &PROGRESS,
+            &src,
+            &dst,
+            &LogWriter::new(None, false).await?,
+            &compare_settings,
+        )
+        .await?;
+        // dirs: x, x/y = 2 SrcMissing dirs
+        assert_eq!(
+            summary.mismatch[ObjType::Dir][CompareResult::SrcMissing],
+            2,
+            "should report 2 nested directories as SrcMissing"
+        );
+        // files: x/y/z.txt = 1 SrcMissing file
+        assert_eq!(
+            summary.mismatch[ObjType::File][CompareResult::SrcMissing],
+            1,
+            "should report 1 file as SrcMissing"
+        );
+        // dst_bytes: z.txt(2)
+        assert_eq!(
+            summary.dst_bytes, 2,
+            "should track bytes for expanded files"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn expand_missing_with_exclude_filter() -> Result<()> {
+        // verify that filters are applied during expansion. exclude *.log files
+        // from the missing subtree
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let src = tmp_dir.join("src");
+        let dst = tmp_dir.join("dst");
+        tokio::fs::create_dir(&src).await?;
+        tokio::fs::create_dir(&dst).await?;
+        // src/missing_dir/ has mixed files
+        let missing = src.join("missing_dir");
+        tokio::fs::create_dir(&missing).await?;
+        tokio::fs::write(missing.join("keep.txt"), "k").await?;
+        tokio::fs::write(missing.join("skip.log"), "s").await?;
+        tokio::fs::write(missing.join("also_keep.txt"), "a").await?;
+        let mut filter = crate::filter::FilterSettings::new();
+        filter.add_exclude("*.log")?;
+        let compare_settings = Settings {
+            fail_early: false,
+            exit_early: false,
+            expand_missing: true,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings::default(),
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: Some(filter),
+        };
+        let summary = cmp(
+            &PROGRESS,
+            &src,
+            &dst,
+            &LogWriter::new(None, false).await?,
+            &compare_settings,
+        )
+        .await?;
+        // missing_dir itself = 1 DstMissing dir
+        assert_eq!(summary.mismatch[ObjType::Dir][CompareResult::DstMissing], 1,);
+        // only keep.txt and also_keep.txt should be reported. skip.log is filtered
+        assert_eq!(
+            summary.mismatch[ObjType::File][CompareResult::DstMissing],
+            2,
+            "should report only non-excluded files as DstMissing"
+        );
+        // skip.log should be counted as skipped
+        assert_eq!(
+            summary.skipped[ObjType::File],
+            1,
+            "should count excluded file as skipped"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn expand_missing_with_include_filter() -> Result<()> {
+        // verify that include filters restrict which children are reported during expansion
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let src = tmp_dir.join("src");
+        let dst = tmp_dir.join("dst");
+        tokio::fs::create_dir(&src).await?;
+        tokio::fs::create_dir(&dst).await?;
+        // src/data/ has a mix of file types
+        let data = src.join("data");
+        tokio::fs::create_dir(&data).await?;
+        tokio::fs::write(data.join("a.rs"), "fn main() {}").await?;
+        tokio::fs::write(data.join("b.txt"), "hello").await?;
+        tokio::fs::write(data.join("c.rs"), "fn test() {}").await?;
+        let mut filter = crate::filter::FilterSettings::new();
+        filter.add_include("**/*.rs")?;
+        let compare_settings = Settings {
+            fail_early: false,
+            exit_early: false,
+            expand_missing: true,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings::default(),
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: Some(filter),
+        };
+        let summary = cmp(
+            &PROGRESS,
+            &src,
+            &dst,
+            &LogWriter::new(None, false).await?,
+            &compare_settings,
+        )
+        .await?;
+        // data dir = 1 DstMissing dir
+        assert_eq!(summary.mismatch[ObjType::Dir][CompareResult::DstMissing], 1,);
+        // only a.rs and c.rs should be reported. b.txt is filtered out
+        assert_eq!(
+            summary.mismatch[ObjType::File][CompareResult::DstMissing],
+            2,
+            "should report only included files as DstMissing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn expand_missing_with_nested_path_filter() -> Result<()> {
+        // verify path-based patterns work correctly during expansion.
+        // only include files under a specific nested path
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let src = tmp_dir.join("src");
+        let dst = tmp_dir.join("dst");
+        tokio::fs::create_dir(&src).await?;
+        tokio::fs::create_dir(&dst).await?;
+        // src/top/ has two subdirs: keep/ and skip/
+        let top = src.join("top");
+        let keep = top.join("keep");
+        let skip = top.join("skip");
+        tokio::fs::create_dir_all(&keep).await?;
+        tokio::fs::create_dir_all(&skip).await?;
+        tokio::fs::write(keep.join("1.txt"), "1").await?;
+        tokio::fs::write(keep.join("2.txt"), "2").await?;
+        tokio::fs::write(skip.join("3.txt"), "3").await?;
+        let mut filter = crate::filter::FilterSettings::new();
+        filter.add_include("top/keep/**")?;
+        let compare_settings = Settings {
+            fail_early: false,
+            exit_early: false,
+            expand_missing: true,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings::default(),
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: Some(filter),
+        };
+        let summary = cmp(
+            &PROGRESS,
+            &src,
+            &dst,
+            &LogWriter::new(None, false).await?,
+            &compare_settings,
+        )
+        .await?;
+        // only keep/ subtree: keep dir(1) + top dir(1) = 2 dirs. skip dir is filtered
+        assert_eq!(
+            summary.mismatch[ObjType::Dir][CompareResult::DstMissing],
+            2,
+            "should report top and keep dirs as DstMissing"
+        );
+        // only 1.txt and 2.txt from keep/
+        assert_eq!(
+            summary.mismatch[ObjType::File][CompareResult::DstMissing],
+            2,
+            "should report only files under keep/ as DstMissing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn expand_missing_false_preserves_original_behavior() -> Result<()> {
+        let tmp_dir = setup_test_dirs(true).await?;
+        // remove bar/bar directory entirely from dst
+        tokio::fs::remove_dir_all(&tmp_dir.join("bar").join("bar")).await?;
+        let compare_settings = Settings {
+            fail_early: false,
+            exit_early: false,
+            expand_missing: false,
+            compare: enum_map! {
+                ObjType::File => filecmp::MetadataCmpSettings::default(),
+                ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                ObjType::Other => filecmp::MetadataCmpSettings::default(),
+            },
+            filter: None,
+        };
+        let summary = cmp(
+            &PROGRESS,
+            &tmp_dir.join("foo"),
+            &tmp_dir.join("bar"),
+            &LogWriter::new(None, false).await?,
+            &compare_settings,
+        )
+        .await?;
+        // without expand_missing, only the top-level dir is reported
+        assert_eq!(
+            summary.mismatch[ObjType::Dir][CompareResult::DstMissing],
+            1,
+            "should report only 1 directory as DstMissing"
+        );
+        assert_eq!(
+            summary.mismatch[ObjType::File][CompareResult::DstMissing],
+            0,
+            "should not report individual files as DstMissing"
         );
         Ok(())
     }
