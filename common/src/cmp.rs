@@ -43,6 +43,10 @@ pub type Skipped = EnumMap<ObjType, u64>;
 pub struct Summary {
     pub mismatch: Mismatch,
     pub skipped: Skipped,
+    /// Total size of regular files compared on the source side, in bytes.
+    pub src_bytes: u64,
+    /// Total size of regular files compared on the destination side, in bytes.
+    pub dst_bytes: u64,
 }
 
 impl std::ops::Add for Summary {
@@ -58,12 +62,27 @@ impl std::ops::Add for Summary {
         for (obj_type, &count) in &other.skipped {
             skipped[obj_type] += count;
         }
-        Self { mismatch, skipped }
+        Self {
+            mismatch,
+            skipped,
+            src_bytes: self.src_bytes + other.src_bytes,
+            dst_bytes: self.dst_bytes + other.dst_bytes,
+        }
     }
 }
 
 impl std::fmt::Display for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        writeln!(
+            f,
+            "src size (compared): {}",
+            bytesize::ByteSize(self.src_bytes)
+        )?;
+        writeln!(
+            f,
+            "dst size (compared): {}",
+            bytesize::ByteSize(self.dst_bytes)
+        )?;
         for (obj_type, &cmp_res_map) in &self.mismatch {
             for (cmp_res, &count) in &cmp_res_map {
                 writeln!(f, "{obj_type:?} {cmp_res:?}: {count}")?;
@@ -235,6 +254,10 @@ async fn cmp_internal(
     }
     let mut cmp_summary = Summary::default();
     let src_obj_type = obj_type(&src_metadata);
+    // track file sizes for the summary
+    if src_metadata.is_file() {
+        cmp_summary.src_bytes += src_metadata.len();
+    }
     let dst_metadata = {
         match tokio::fs::symlink_metadata(dst).await {
             Ok(metadata) => metadata,
@@ -255,6 +278,9 @@ async fn cmp_internal(
             }
         }
     };
+    if dst_metadata.is_file() {
+        cmp_summary.dst_bytes += dst_metadata.len();
+    }
     if !is_file_type_same(&src_metadata, &dst_metadata)
         || !filecmp::metadata_equal(
             &settings.compare[src_obj_type],
@@ -392,6 +418,9 @@ async fn cmp_internal(
             .await
             .with_context(|| format!("failed reading metadata from {:?}", &dst_path))?;
         let dst_obj_type = obj_type(&dst_entry_metadata);
+        if dst_entry_metadata.is_file() {
+            cmp_summary.dst_bytes += dst_entry_metadata.len();
+        }
         cmp_summary.mismatch[dst_obj_type][CompareResult::SrcMissing] += 1;
         log.log_mismatch(
             CompareResult::SrcMissing,
@@ -559,6 +588,10 @@ mod cmp_tests {
             },
         };
         assert_eq!(summary.mismatch, mismatch);
+        // src has 4 regular files of 1 byte each (0.txt, bar/2.txt, bar/3.txt, baz/4.txt)
+        assert_eq!(summary.src_bytes, 4);
+        // dst has: 0.txt(1B), bar/1.txt(1B, SrcMissing), bar/3.txt(1B), baz/4.txt(0B, truncated), baz/7.txt(0B, SrcMissing)
+        assert_eq!(summary.dst_bytes, 3);
         Ok(())
     }
 
