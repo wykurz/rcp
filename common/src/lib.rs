@@ -82,7 +82,7 @@
 //! let dst = Path::new("/path2");
 //!
 //! // output differences to stdout (use false for quiet mode)
-//! let log = common::cmp::LogWriter::new(None, true).await?;
+//! let log = common::cmp::LogWriter::new(None, true, common::cmp::OutputFormat::default()).await?;
 //! let settings = common::cmp::Settings {
 //!     fail_early: false,
 //!     exit_early: false,
@@ -844,6 +844,7 @@ where
         quiet,
         verbose,
         print_summary,
+        suppress_runtime_stats,
     } = output;
     let RuntimeConfig {
         max_workers,
@@ -1080,7 +1081,7 @@ where
             }
         }
     }
-    if print_summary || verbose > 0 {
+    if (print_summary || verbose > 0) && !suppress_runtime_stats {
         if let Err(err) = print_runtime_stats() {
             println!("Failed to print runtime stats: {err:?}");
         }

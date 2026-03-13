@@ -40,6 +40,59 @@ pub type Mismatch = EnumMap<ObjType, EnumMap<CompareResult, u64>>;
 /// Count of skipped items per object type
 pub type Skipped = EnumMap<ObjType, u64>;
 
+/// Output format for comparison results and summary.
+#[derive(Copy, Clone, Debug, Default, clap::ValueEnum)]
+pub enum OutputFormat {
+    /// JSON output (NDJSON for differences, JSON object for summary)
+    #[default]
+    Json,
+    /// Human-readable text output (legacy format)
+    Text,
+}
+
+fn compare_result_name(cr: CompareResult) -> &'static str {
+    match cr {
+        CompareResult::Same => "same",
+        CompareResult::Different => "different",
+        CompareResult::SrcMissing => "src_missing",
+        CompareResult::DstMissing => "dst_missing",
+    }
+}
+
+fn obj_type_name(ot: ObjType) -> &'static str {
+    match ot {
+        ObjType::File => "file",
+        ObjType::Dir => "dir",
+        ObjType::Symlink => "symlink",
+        ObjType::Other => "other",
+    }
+}
+
+/// Encodes a path as a JSON-safe string that is round-trippable for arbitrary
+/// Unix paths. Literal backslashes are escaped as `\\`, and non-UTF-8 bytes
+/// are escaped as `\xHH`. To decode, first parse the JSON string, then scan
+/// left-to-right: `\\` → literal `\`, `\xHH` → raw byte, all other characters
+/// are literal UTF-8.
+fn path_to_json_string(path: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if c == '\\' {
+                out.push_str("\\\\");
+            } else {
+                out.push(c);
+            }
+        }
+        for &b in chunk.invalid() {
+            use std::fmt::Write;
+            write!(out, "\\x{b:02x}").unwrap();
+        }
+    }
+    out
+}
+
 #[derive(Default)]
 pub struct Summary {
     pub mismatch: Mismatch,
@@ -98,10 +151,64 @@ impl std::fmt::Display for Summary {
     }
 }
 
+/// Wraps a [`Summary`] with an [`OutputFormat`] so that [`Display`](std::fmt::Display)
+/// renders either human-readable text or JSON.
+pub struct FormattedSummary {
+    pub summary: Summary,
+    pub format: OutputFormat,
+}
+
+impl std::fmt::Display for FormattedSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self.format {
+            OutputFormat::Text => write!(f, "{}", self.summary),
+            OutputFormat::Json => {
+                let mut mismatch = serde_json::Map::new();
+                for (obj_type, &cmp_res_map) in &self.summary.mismatch {
+                    let mut counts = serde_json::Map::new();
+                    for (cmp_res, &count) in &cmp_res_map {
+                        counts.insert(
+                            compare_result_name(cmp_res).to_string(),
+                            serde_json::Value::Number(count.into()),
+                        );
+                    }
+                    mismatch.insert(
+                        obj_type_name(obj_type).to_string(),
+                        serde_json::Value::Object(counts),
+                    );
+                }
+                let mut skipped = serde_json::Map::new();
+                for (obj_type, &count) in &self.summary.skipped {
+                    if count > 0 {
+                        skipped.insert(
+                            obj_type_name(obj_type).to_string(),
+                            serde_json::Value::Number(count.into()),
+                        );
+                    }
+                }
+                let stats = crate::collect_runtime_stats();
+                let walltime = crate::get_progress().get_duration();
+                let obj = serde_json::json!({
+                    "src_bytes": self.summary.src_bytes,
+                    "dst_bytes": self.summary.dst_bytes,
+                    "mismatch": serde_json::Value::Object(mismatch),
+                    "skipped": serde_json::Value::Object(skipped),
+                    "walltime_ms": walltime.as_millis() as u64,
+                    "cpu_time_user_ms": stats.cpu_time_user_ms,
+                    "cpu_time_kernel_ms": stats.cpu_time_kernel_ms,
+                    "peak_rss_bytes": stats.peak_rss_bytes,
+                });
+                write!(f, "{obj}")
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct LogWriter {
     file: Option<std::sync::Arc<tokio::sync::Mutex<tokio::io::BufWriter<tokio::fs::File>>>>,
     stdout: Option<std::sync::Arc<tokio::sync::Mutex<tokio::io::BufWriter<tokio::io::Stdout>>>>,
+    format: OutputFormat,
 }
 
 impl std::fmt::Debug for LogWriter {
@@ -109,6 +216,7 @@ impl std::fmt::Debug for LogWriter {
         f.debug_struct("LogWriter")
             .field("file", &self.file.is_some())
             .field("stdout", &self.stdout.is_some())
+            .field("format", &self.format)
             .finish()
     }
 }
@@ -119,7 +227,11 @@ impl LogWriter {
     /// If `log_path_opt` is provided, output goes to that file.
     /// Otherwise, if `use_stdout` is true, output goes to stdout.
     /// If both are false/None, no output is produced.
-    pub async fn new(log_path_opt: Option<&std::path::Path>, use_stdout: bool) -> Result<Self> {
+    pub async fn new(
+        log_path_opt: Option<&std::path::Path>,
+        use_stdout: bool,
+        format: OutputFormat,
+    ) -> Result<Self> {
         if let Some(log_path) = log_path_opt {
             let log_file = tokio::fs::OpenOptions::new()
                 .write(true)
@@ -132,6 +244,7 @@ impl LogWriter {
             Ok(Self {
                 file: Some(log),
                 stdout: None,
+                format,
             })
         } else if use_stdout {
             Ok(Self {
@@ -139,13 +252,20 @@ impl LogWriter {
                 stdout: Some(std::sync::Arc::new(tokio::sync::Mutex::new(
                     tokio::io::BufWriter::new(tokio::io::stdout()),
                 ))),
+                format,
             })
         } else {
             Ok(Self {
                 file: None,
                 stdout: None,
+                format,
             })
         }
+    }
+    /// Creates a silent LogWriter that produces no output, using the default format.
+    /// Convenience constructor primarily for tests.
+    pub async fn silent() -> Result<Self> {
+        Self::new(None, false, OutputFormat::default()).await
     }
 
     pub async fn log_mismatch(
@@ -156,10 +276,32 @@ impl LogWriter {
         dst_obj_type: Option<ObjType>,
         dst: &std::path::Path,
     ) -> Result<()> {
-        self.write(&format!(
-            "[{cmp_result:?}]\n\t[{src_obj_type:?}]\t{src:?}\n\t[{dst_obj_type:?}]\t{dst:?}\n"
-        ))
-        .await
+        let msg = match self.format {
+            OutputFormat::Text => {
+                format!(
+                    "[{cmp_result:?}]\n\t[{src_obj_type:?}]\t{src:?}\n\t[{dst_obj_type:?}]\t{dst:?}\n"
+                )
+            }
+            OutputFormat::Json => {
+                let src_type_val = match src_obj_type {
+                    Some(ot) => serde_json::Value::String(obj_type_name(ot).to_string()),
+                    None => serde_json::Value::Null,
+                };
+                let dst_type_val = match dst_obj_type {
+                    Some(ot) => serde_json::Value::String(obj_type_name(ot).to_string()),
+                    None => serde_json::Value::Null,
+                };
+                let obj = serde_json::json!({
+                    "result": compare_result_name(cmp_result),
+                    "src_type": src_type_val,
+                    "src": path_to_json_string(src),
+                    "dst_type": dst_type_val,
+                    "dst": path_to_json_string(dst),
+                });
+                format!("{obj}\n")
+            }
+        };
+        self.write(&msg).await
     }
 
     async fn write(&self, msg: &str) -> Result<()> {
@@ -733,7 +875,12 @@ mod cmp_tests {
             &PROGRESS,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &LogWriter::new(Some(tmp_dir.join("cmp.log").as_path()), false).await?,
+            &LogWriter::new(
+                Some(tmp_dir.join("cmp.log").as_path()),
+                false,
+                OutputFormat::Text,
+            )
+            .await?,
             &compare_settings,
         )
         .await?;
@@ -799,7 +946,7 @@ mod cmp_tests {
             &PROGRESS,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings_no_filter,
         )
         .await?;
@@ -830,7 +977,7 @@ mod cmp_tests {
             &PROGRESS,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings_with_filter,
         )
         .await?;
@@ -871,7 +1018,7 @@ mod cmp_tests {
             &PROGRESS,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings,
         )
         .await?;
@@ -920,7 +1067,7 @@ mod cmp_tests {
             &PROGRESS,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings,
         )
         .await?;
@@ -968,7 +1115,7 @@ mod cmp_tests {
             &PROGRESS,
             &tmp_dir.join("test.txt"),
             &tmp_dir.join("test2.txt"),
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings,
         )
         .await?;
@@ -1003,7 +1150,7 @@ mod cmp_tests {
             &PROGRESS,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings,
         )
         .await?;
@@ -1041,7 +1188,7 @@ mod cmp_tests {
             &PROGRESS,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings,
         )
         .await?;
@@ -1088,7 +1235,7 @@ mod cmp_tests {
             &PROGRESS,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings,
         )
         .await?;
@@ -1135,7 +1282,7 @@ mod cmp_tests {
             &PROGRESS,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings,
         )
         .await?;
@@ -1178,7 +1325,7 @@ mod cmp_tests {
             &PROGRESS,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings,
         )
         .await?;
@@ -1227,7 +1374,7 @@ mod cmp_tests {
             &PROGRESS,
             &src,
             &dst,
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings,
         )
         .await?;
@@ -1280,7 +1427,7 @@ mod cmp_tests {
             &PROGRESS,
             &src,
             &dst,
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings,
         )
         .await?;
@@ -1338,7 +1485,7 @@ mod cmp_tests {
             &PROGRESS,
             &src,
             &dst,
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings,
         )
         .await?;
@@ -1392,7 +1539,7 @@ mod cmp_tests {
             &PROGRESS,
             &src,
             &dst,
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings,
         )
         .await?;
@@ -1444,7 +1591,7 @@ mod cmp_tests {
             &PROGRESS,
             &src,
             &dst,
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings,
         )
         .await?;
@@ -1485,7 +1632,7 @@ mod cmp_tests {
             &PROGRESS,
             &tmp_dir.join("foo"),
             &tmp_dir.join("bar"),
-            &LogWriter::new(None, false).await?,
+            &LogWriter::silent().await?,
             &compare_settings,
         )
         .await?;
@@ -1501,5 +1648,50 @@ mod cmp_tests {
             "should not report individual files as DstMissing"
         );
         Ok(())
+    }
+
+    #[test]
+    fn path_to_json_string_utf8() {
+        let path = std::path::Path::new("/foo/bar/baz.txt");
+        assert_eq!(path_to_json_string(path), "/foo/bar/baz.txt");
+    }
+
+    #[test]
+    fn path_to_json_string_non_utf8() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        // embed 0xFF byte in the middle
+        let os_str = OsStr::from_bytes(b"/tmp/bad\xffname.txt");
+        let path = std::path::Path::new(os_str);
+        assert_eq!(path_to_json_string(path), "/tmp/bad\\xffname.txt");
+    }
+
+    #[test]
+    fn path_to_json_string_multiple_bad_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let os_str = OsStr::from_bytes(b"\x80/ok/\xfe\xff/end");
+        let path = std::path::Path::new(os_str);
+        assert_eq!(path_to_json_string(path), "\\x80/ok/\\xfe\\xff/end");
+    }
+
+    #[test]
+    fn path_to_json_string_escapes_backslashes() {
+        // a path with a literal backslash must be escaped so it doesn't
+        // collide with \xHH byte escapes
+        let path = std::path::Path::new("/tmp/bad\\xffname.txt");
+        assert_eq!(path_to_json_string(path), "/tmp/bad\\\\xffname.txt");
+    }
+
+    #[test]
+    fn path_to_json_string_no_collision() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        // literal backslash-x-f-f in the filename
+        let literal = std::path::Path::new("/tmp/bad\\xffname.txt");
+        // actual 0xFF byte in the filename
+        let raw = std::path::Path::new(OsStr::from_bytes(b"/tmp/bad\xffname.txt"));
+        // these must produce different output
+        assert_ne!(path_to_json_string(literal), path_to_json_string(raw));
     }
 }

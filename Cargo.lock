@@ -1740,6 +1740,7 @@ dependencies = [
  "clap",
  "predicates",
  "rcp-tools-common",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

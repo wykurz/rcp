@@ -57,6 +57,9 @@ pub struct OutputConfig {
     pub verbose: u8,
     /// Print summary statistics at the end
     pub print_summary: bool,
+    /// When true, `run()` will not print text runtime stats after the summary.
+    /// Used when the summary itself includes runtime stats (e.g. JSON format).
+    pub suppress_runtime_stats: bool,
 }
 
 /// Warnings and adjustments for dry-run mode.

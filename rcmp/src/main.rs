@@ -124,6 +124,14 @@ struct Args {
     /// When used with --log, differences are still written to the log file.
     #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
     quiet: bool,
+    /// Output format for differences and summary
+    #[arg(
+        long,
+        default_value = "json",
+        value_name = "FORMAT",
+        help_heading = "Progress & output"
+    )]
+    output_format: common::cmp::OutputFormat,
 
     // Performance & throttling
     /// Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system limit
@@ -191,7 +199,7 @@ struct Args {
     dst: std::path::PathBuf,
 }
 
-async fn async_main(args: Args) -> Result<common::cmp::Summary> {
+async fn async_main(args: Args) -> Result<common::cmp::FormattedSummary> {
     // build filter settings from CLI arguments
     let filter = if let Some(ref path) = args.filter_file {
         Some(common::filter::FilterSettings::from_file(path)?)
@@ -209,7 +217,8 @@ async fn async_main(args: Args) -> Result<common::cmp::Summary> {
     };
     // output to stdout if no log file and not quiet
     let use_stdout = args.log.is_none() && !args.quiet;
-    let log_handle = common::cmp::LogWriter::new(args.log.as_deref(), use_stdout).await?;
+    let log_handle =
+        common::cmp::LogWriter::new(args.log.as_deref(), use_stdout, args.output_format).await?;
     let summary = common::cmp(
         &args.src,
         &args.dst,
@@ -224,7 +233,10 @@ async fn async_main(args: Args) -> Result<common::cmp::Summary> {
     )
     .await?;
     log_handle.flush().await?;
-    Ok(summary)
+    Ok(common::cmp::FormattedSummary {
+        summary,
+        format: args.output_format,
+    })
 }
 
 fn main() -> Result<()> {
@@ -237,6 +249,7 @@ fn main() -> Result<()> {
         quiet: args.quiet,
         verbose: args.verbose,
         print_summary: args.summary,
+        suppress_runtime_stats: matches!(args.output_format, common::cmp::OutputFormat::Json),
     };
     let runtime = common::RuntimeConfig {
         max_workers: args.max_workers,
@@ -276,12 +289,12 @@ fn main() -> Result<()> {
         func,
     );
     match res {
-        Some(summary) => {
+        Some(formatted) => {
             if args.no_check {
                 std::process::exit(0)
             } else {
                 // if there are any differences, return error code 1
-                for (_, cmp_result) in &summary.mismatch {
+                for (_, cmp_result) in &formatted.summary.mismatch {
                     let different = cmp_result[common::cmp::CompareResult::Different] > 0
                         || cmp_result[common::cmp::CompareResult::SrcMissing] > 0
                         || cmp_result[common::cmp::CompareResult::DstMissing] > 0;
