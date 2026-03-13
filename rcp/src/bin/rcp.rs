@@ -1112,6 +1112,7 @@ fn main() -> Result<(), anyhow::Error> {
         quiet: args.quiet,
         verbose: args.verbose,
         print_summary: if is_dry_run { false } else { args.summary },
+        ..Default::default()
     };
     let runtime = common::RuntimeConfig {
         max_workers: args.max_workers,
