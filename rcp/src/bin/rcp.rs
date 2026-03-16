@@ -867,10 +867,12 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
                 Some((src_remote, dst_remote))
             }
             (path::PathType::Remote(src_remote), path::PathType::Local(dst_local)) => {
-                Some((src_remote, path::RemotePath::from_local(&dst_local)))
+                let dst_remote = path::RemotePath::from_local(&dst_local)?;
+                Some((src_remote, dst_remote))
             }
             (path::PathType::Local(src_local), path::PathType::Remote(dst_remote)) => {
-                Some((path::RemotePath::from_local(&src_local), dst_remote))
+                let src_remote = path::RemotePath::from_local(&src_local)?;
+                Some((src_remote, dst_remote))
             }
             (path::PathType::Local(_), path::PathType::Local(_)) => None,
         }

@@ -23,13 +23,18 @@ impl RemotePath {
         })
     }
 
-    #[must_use]
-    pub fn from_local(path: &std::path::Path) -> Self {
-        Self {
+    pub fn from_local(path: &std::path::Path) -> anyhow::Result<Self> {
+        let path = if path.is_relative() {
+            std::path::absolute(path)
+                .with_context(|| format!("failed to resolve relative path: {}", path.display()))?
+        } else {
+            path.to_path_buf()
+        };
+        Ok(Self {
             session: remote::SshSession::local(),
-            path: path.to_path_buf(),
+            path,
             needs_remote_home: false,
-        }
+        })
     }
 
     #[must_use]
@@ -215,8 +220,11 @@ fn parse_path_internal(path: &str, treat_localhost_as_local: bool) -> anyhow::Re
             if remote_path.is_absolute() {
                 (remote_path, false)
             } else {
-                let cwd = std::env::current_dir().context("failed to read current directory")?;
-                (cwd.join(remote_path), false)
+                return Err(anyhow::anyhow!(
+                    "Relative paths are not supported for remote hosts: {path_part}\n\
+Remote paths must be absolute (e.g., host:/absolute/path) or use tilde expansion (e.g., host:~/path).\n\
+If you intended a local path, omit the host prefix."
+                ));
             }
         };
         Ok(PathType::Remote(RemotePath::new(
@@ -426,14 +434,37 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_path_remote_relative_resolved_to_cwd() {
+    fn test_parse_path_remote_relative_is_error() {
+        let result = parse_path("host:relative/path");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Relative paths are not supported for remote hosts"));
+    }
+
+    #[test]
+    fn test_from_local_resolves_relative_path() {
         let cwd = std::env::current_dir().unwrap();
-        match parse_path("host:relative/path").unwrap() {
-            PathType::Remote(remote_path) => {
-                assert_eq!(remote_path.path(), &cwd.join("relative/path"));
-            }
-            _ => panic!("Expected remote path"),
-        }
+        let remote = RemotePath::from_local(std::path::Path::new("relative/path")).unwrap();
+        assert_eq!(remote.path(), &cwd.join("relative/path"));
+        assert!(remote.path().is_absolute());
+    }
+
+    #[test]
+    fn test_from_local_preserves_absolute_path() {
+        let remote = RemotePath::from_local(std::path::Path::new("/absolute/path")).unwrap();
+        assert_eq!(remote.path(), std::path::Path::new("/absolute/path"));
+    }
+
+    #[test]
+    fn test_parse_path_force_remote_relative_is_error() {
+        let result = parse_path_force_remote("localhost:relative/path");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Relative paths are not supported for remote hosts"));
     }
 
     #[test]
