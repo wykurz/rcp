@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use async_recursion::async_recursion;
 use enum_map::{Enum, EnumMap};
 use tokio::io::AsyncWriteExt;
@@ -421,7 +421,7 @@ async fn expand_missing_tree(
         .await
         .with_context(|| format!("cannot open directory {:?} for reading", &existing_path))?;
     let mut join_set = tokio::task::JoinSet::new();
-    let mut success = true;
+    let errors = crate::error_collector::ErrorCollector::default();
     while let Some(entry) = entries
         .next_entry()
         .await
@@ -480,15 +480,15 @@ async fn expand_missing_tree(
                     existing_path,
                     &error
                 );
+                errors.push(error);
                 if settings.fail_early {
-                    return Err(error);
+                    break;
                 }
-                success = false;
             }
         }
     }
-    if !success {
-        return Err(anyhow!("expand_missing_tree: {:?} failed!", existing_path));
+    if let Some(err) = errors.into_error() {
+        return Err(err);
     }
     Ok(summary)
 }
@@ -604,7 +604,7 @@ async fn cmp_internal(
         .await
         .with_context(|| format!("cannot open directory {src:?} for reading"))?;
     let mut join_set = tokio::task::JoinSet::new();
-    let mut success = true;
+    let errors = crate::error_collector::ErrorCollector::default();
     // create a set of all the files we already processed
     let mut processed_files = std::collections::HashSet::new();
     // iterate through src entries and recursively call "cmp" on each one
@@ -727,10 +727,11 @@ async fn cmp_internal(
                         &dst_path,
                         &error
                     );
+                    errors.push(error);
                     if settings.fail_early {
-                        return Err(error);
+                        // unwrap is safe: we just pushed an error
+                        return Err(errors.into_error().unwrap());
                     }
-                    success = false;
                 }
             }
         } else {
@@ -756,15 +757,15 @@ async fn cmp_internal(
             Ok(summary) => cmp_summary = cmp_summary + summary,
             Err(error) => {
                 tracing::error!("cmp: {:?} vs {:?} failed with: {:#}", src, dst, &error);
+                errors.push(error);
                 if settings.fail_early {
-                    return Err(error);
+                    break;
                 }
-                success = false;
             }
         }
     }
-    if !success {
-        return Err(anyhow!("cmp: {:?} vs {:?} failed!", src, dst));
+    if let Some(err) = errors.into_error() {
+        return Err(err);
     }
     Ok(cmp_summary)
 }

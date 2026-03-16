@@ -242,13 +242,13 @@ async fn process_single_file(
 /// Handle a stream that may contain multiple files.
 ///
 /// Loops until the stream is closed (EOF on header read).
-#[instrument(skip(error_occurred, file_recv_stream, directory_tracker))]
+#[instrument(skip(error_collector, file_recv_stream, directory_tracker))]
 async fn handle_file_stream(
     settings: common::copy::Settings,
     preserve: common::preserve::Settings,
     mut file_recv_stream: remote::streams::BoxedRecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
-    error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
 ) -> anyhow::Result<()> {
     let prog = progress();
     tracing::info!("Processing file stream (may contain multiple files)");
@@ -289,7 +289,6 @@ async fn handle_file_stream(
                 file_header.dst.display(),
                 e.source
             );
-            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             match e.stream_state {
                 StreamState::NeedsDrain => {
                     // no data was read yet, drain the file's data to stay in sync
@@ -316,6 +315,8 @@ async fn handle_file_stream(
             }
             if settings.fail_early {
                 fail_early_error = Some(e.source);
+            } else {
+                error_collector.push(e.source);
             }
         }
         // ALWAYS update directory tracker, even on error
@@ -369,13 +370,13 @@ async fn handle_file_stream(
 ///
 /// Opens connections to source's data port and reads file data.
 /// Each connection handles multiple files until source closes it (EOF).
-#[instrument(skip(error_occurred, data_pool, directory_tracker))]
+#[instrument(skip(error_collector, data_pool, directory_tracker))]
 async fn process_incoming_file_streams_tcp(
     settings: common::copy::Settings,
     preserve: common::preserve::Settings,
     data_pool: std::sync::Arc<DataConnectionPool>,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
-    error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
 ) -> anyhow::Result<()> {
     let mut join_set = tokio::task::JoinSet::new();
     // spawn worker tasks that open connections and receive files.
@@ -389,7 +390,7 @@ async fn process_incoming_file_streams_tcp(
     for _ in 0..data_pool.semaphore.available_permits() {
         let pool = data_pool.clone();
         let tracker = directory_tracker.clone();
-        let error_flag = error_occurred.clone();
+        let collector = error_collector.clone();
         let settings = settings.clone();
         let preserve = preserve.clone();
         join_set.spawn(async move {
@@ -409,7 +410,7 @@ async fn process_incoming_file_streams_tcp(
                     *preserve,
                     recv_stream,
                     tracker.clone(),
-                    error_flag.clone(),
+                    collector.clone(),
                 )
                 .await
                 {
@@ -427,17 +428,17 @@ async fn process_incoming_file_streams_tcp(
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 tracing::error!("File stream handling task failed: {e}");
-                error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                 if fail_early {
                     return Err(e);
                 }
+                error_collector.push(e);
             }
             Err(e) => {
                 tracing::error!("File stream handling task panicked: {e}");
-                error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                 if fail_early {
                     return Err(e.into());
                 }
+                error_collector.push(e.into());
             }
         }
     }
@@ -589,13 +590,13 @@ async fn create_symlink(
     }
 }
 
-#[instrument(skip(error_occurred, control_recv_stream, directory_tracker))]
+#[instrument(skip(error_collector, control_recv_stream, directory_tracker))]
 async fn process_control_stream(
     settings: &common::copy::Settings,
     preserve: &common::preserve::Settings,
     mut control_recv_stream: remote::streams::BoxedRecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
-    error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
 ) -> anyhow::Result<()> {
     while let Some(source_message) = control_recv_stream
         .recv_object::<remote::protocol::SourceMessage>()
@@ -637,17 +638,18 @@ async fn process_control_stream(
                     continue;
                 }
                 // try to create directory
-                let create_result = match create_directory(settings, dst).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        tracing::error!("Failed to create directory {:?}: {:#}", dst, e);
-                        error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
-                        if settings.fail_early {
-                            return Err(e);
+                let (create_result, error_already_pushed) =
+                    match create_directory(settings, dst).await {
+                        Ok(result) => (result, false),
+                        Err(e) => {
+                            tracing::error!("Failed to create directory {:?}: {:#}", dst, e);
+                            if settings.fail_early {
+                                return Err(e);
+                            }
+                            error_collector.push(e);
+                            (DirectoryCreateResult::Failed, true)
                         }
-                        DirectoryCreateResult::Failed
-                    }
-                };
+                    };
                 match create_result {
                     DirectoryCreateResult::Created | DirectoryCreateResult::AlreadyExisted => {
                         // add to tracker (sends DirectoryCreated)
@@ -670,8 +672,15 @@ async fn process_control_stream(
                             .context("Failed to add directory to tracker")?;
                     }
                     DirectoryCreateResult::Failed => {
-                        // mark as failed - descendants will be skipped
-                        error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // mark as failed - descendants will be skipped.
+                        // only push the synthetic "not a directory" error when
+                        // create_directory returned Ok(Failed). when it returned
+                        // Err(e), the real error (e.g. EACCES) was already pushed.
+                        if !error_already_pushed {
+                            error_collector.push(anyhow::anyhow!(
+                                "destination {dst:?} exists and is not a directory, use --overwrite to replace"
+                            ));
+                        }
                         let mut tracker = directory_tracker.lock().await;
                         tracker.mark_directory_failed(dst);
                         // if root directory failed, mark root as complete to avoid hang
@@ -688,7 +697,9 @@ async fn process_control_stream(
                             }
                         }
                         if settings.fail_early {
-                            return Err(anyhow::anyhow!("Failed to create directory {:?}", dst));
+                            return Err(anyhow::anyhow!(
+                                "destination {dst:?} exists and is not a directory, use --overwrite to replace"
+                            ));
                         }
                     }
                 }
@@ -727,10 +738,10 @@ async fn process_control_stream(
                 let result = create_symlink(settings, preserve, dst, target, metadata).await;
                 if let Err(e) = result {
                     tracing::error!("Failed to create symlink {:?} -> {:?}: {:#}", src, dst, e);
-                    error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                     if settings.fail_early {
                         return Err(e);
                     }
+                    error_collector.push(e);
                 }
                 // mark root symlink complete
                 if is_root {
@@ -879,12 +890,12 @@ pub async fn run_destination(
     // wrap in Arc<Mutex<>> for shared access
     let control_send_stream = std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
     tracing::info!("Created control streams");
-    let error_occurred = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let error_collector = std::sync::Arc::new(common::error_collector::ErrorCollector::default());
     let directory_tracker = directory_tracker::make_shared(
         control_send_stream,
         *preserve,
         settings.fail_early,
-        error_occurred.clone(),
+        error_collector.clone(),
     );
     // create a pool of data connections to source
     let data_pool = std::sync::Arc::new(DataConnectionPool::new(
@@ -898,14 +909,14 @@ pub async fn run_destination(
         *preserve,
         data_pool.clone(),
         directory_tracker.clone(),
-        error_occurred.clone(),
+        error_collector.clone(),
     );
     let control_future = process_control_stream(
         settings,
         preserve,
         control_recv_stream,
         directory_tracker.clone(),
-        error_occurred.clone(),
+        error_collector.clone(),
     );
     tokio::pin!(file_handler_future);
     tokio::pin!(control_future);
@@ -962,13 +973,12 @@ pub async fn run_destination(
             directories_skipped: 0,
         },
     };
-    if error_occurred.load(std::sync::atomic::Ordering::Relaxed) {
-        Err(common::copy::Error {
-            source: anyhow::anyhow!("Some operations failed during remote copy"),
+    match error_collector.take_error() {
+        Some(err) => Err(common::copy::Error {
+            source: err,
             summary,
         }
-        .into())
-    } else {
-        Ok(("destination OK".to_string(), summary))
+        .into()),
+        None => Ok(("destination OK".to_string(), summary)),
     }
 }

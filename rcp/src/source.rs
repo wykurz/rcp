@@ -13,7 +13,7 @@ struct ChildEntry {
     metadata: std::fs::Metadata,
 }
 
-#[instrument(skip(error_occurred, control_send_stream))]
+#[instrument(skip(error_collector, control_send_stream))]
 #[async_recursion]
 async fn send_directories_and_symlinks(
     settings: &common::copy::Settings,
@@ -22,7 +22,7 @@ async fn send_directories_and_symlinks(
     source_root: &std::path::Path,
     is_root: bool,
     control_send_stream: &remote::streams::BoxedSharedSendStream,
-    error_occurred: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    error_collector: &std::sync::Arc<common::error_collector::ErrorCollector>,
 ) -> anyhow::Result<()> {
     tracing::debug!("Sending data from {:?} to {:?}", &src, dst);
     let src_metadata = match if settings.dereference {
@@ -33,12 +33,12 @@ async fn send_directories_and_symlinks(
         Ok(m) => m,
         Err(e) => {
             tracing::error!("Failed reading metadata from src {src:?}: {e:#}");
-            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             // for root items, failing to read metadata is fatal - we can't proceed
             // and the protocol would hang waiting for root completion
             if settings.fail_early || is_root {
                 return Err(e.into());
             }
+            error_collector.push(e.into());
             return Ok(());
         }
     };
@@ -71,7 +71,6 @@ async fn send_directories_and_symlinks(
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("Failed reading symlink {src:?}: {e:#}");
-                error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                 // notify destination that this symlink was skipped
                 // for root symlinks, this also signals root completion (even if failed)
                 let skip_msg = remote::protocol::SourceMessage::SymlinkSkipped {
@@ -89,6 +88,7 @@ async fn send_directories_and_symlinks(
                 if settings.fail_early {
                     return Err(e.into());
                 }
+                error_collector.push(e.into());
                 return Ok(());
             }
         };
@@ -120,10 +120,10 @@ async fn send_directories_and_symlinks(
         Ok(e) => e,
         Err(e) => {
             tracing::error!("Cannot open directory {src:?} for reading: {e:#}");
-            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             if settings.fail_early {
                 return Err(e.into());
             }
+            error_collector.push(e.into());
             // directory unreadable but we already committed to sending it -
             // send with 0 entries so destination can still complete
             let dir = remote::protocol::SourceMessage::Directory {
@@ -157,10 +157,10 @@ async fn send_directories_and_symlinks(
                     Ok(m) => m,
                     Err(e) => {
                         tracing::error!("Failed reading metadata from {entry_path:?}: {e:#}");
-                        error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                         if settings.fail_early {
                             return Err(e.into());
                         }
+                        error_collector.push(e.into());
                         continue;
                     }
                 };
@@ -212,10 +212,10 @@ async fn send_directories_and_symlinks(
             Ok(None) => break,
             Err(e) => {
                 tracing::error!("Failed traversing src directory {src:?}: {e:#}");
-                error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                 if settings.fail_early {
                     return Err(e.into());
                 }
+                error_collector.push(e.into());
                 break;
             }
         }
@@ -263,15 +263,15 @@ async fn send_directories_and_symlinks(
             source_root,
             false,
             control_send_stream,
-            error_occurred,
+            error_collector,
         )
         .await
         {
             tracing::error!("Failed to send symlink {:?}: {e:#}", child.src_path);
-            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             if settings.fail_early {
                 return Err(e);
             }
+            error_collector.push(e);
         }
     }
     for child in dir_children {
@@ -282,21 +282,21 @@ async fn send_directories_and_symlinks(
             source_root,
             false,
             control_send_stream,
-            error_occurred,
+            error_collector,
         )
         .await
         {
             tracing::error!("Failed to send directory {:?}: {e:#}", child.src_path);
-            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             if settings.fail_early {
                 return Err(e);
             }
+            error_collector.push(e);
         }
     }
     Ok(())
 }
 
-#[instrument(skip(error_occurred, stream_pool, control_send_stream))]
+#[instrument(skip(error_collector, stream_pool, control_send_stream))]
 #[async_recursion]
 async fn send_fs_objects_tcp(
     settings: &common::copy::Settings,
@@ -304,7 +304,7 @@ async fn send_fs_objects_tcp(
     dst: &std::path::Path,
     control_send_stream: remote::streams::BoxedSharedSendStream,
     stream_pool: std::sync::Arc<AcceptingSendStreamPool>,
-    error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
 ) -> anyhow::Result<()> {
     tracing::info!("Sending data from {:?} to {:?}", src, dst);
     let src_metadata = match if settings.dereference {
@@ -315,7 +315,6 @@ async fn send_fs_objects_tcp(
         Ok(m) => m,
         Err(e) => {
             tracing::error!("Failed reading metadata from src {src:?}: {e:#}");
-            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             return Err(e.into());
         }
     };
@@ -341,15 +340,15 @@ async fn send_fs_objects_tcp(
             src, // source_root is src for the root item
             true,
             &control_send_stream,
-            &error_occurred,
+            &error_collector,
         )
         .await
         {
             tracing::error!("Failed to send directories and symlinks: {e:#}");
-            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             if settings.fail_early {
                 return Err(e);
             }
+            error_collector.push(e);
         }
     }
     let mut stream = control_send_stream.lock().await;
@@ -368,13 +367,12 @@ async fn send_fs_objects_tcp(
             &src_metadata,
             true,
             stream_pool,
-            &error_occurred,
+            &error_collector,
             control_send_stream.clone(),
         )
         .await
         {
             tracing::error!("Failed to send root file: {e:#}");
-            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             // always return error for root file failures -
             // there's nothing else to transfer and the protocol would hang
             return Err(e);
@@ -383,7 +381,7 @@ async fn send_fs_objects_tcp(
     Ok(())
 }
 
-#[instrument(skip(error_occurred, control_send_stream, stream_pool))]
+#[instrument(skip(error_collector, control_send_stream, stream_pool))]
 #[async_recursion]
 #[allow(clippy::too_many_arguments)]
 async fn send_file_tcp(
@@ -393,7 +391,7 @@ async fn send_file_tcp(
     src_metadata: &std::fs::Metadata,
     is_root: bool,
     stream_pool: std::sync::Arc<AcceptingSendStreamPool>,
-    error_occurred: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    error_collector: &std::sync::Arc<common::error_collector::ErrorCollector>,
     control_send_stream: remote::streams::BoxedSharedSendStream,
 ) -> anyhow::Result<()> {
     let prog = progress();
@@ -423,7 +421,6 @@ async fn send_file_tcp(
         Ok(f) => f,
         Err(e) => {
             tracing::error!("Failed to open file {src:?}: {e:#}");
-            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             // stream is returned to pool via Drop when pooled_stream goes out of scope
             // for root file copies, failing to open the file is a fatal error -
             // there's nothing else to transfer and the protocol would hang
@@ -443,6 +440,7 @@ async fn send_file_tcp(
             if settings.fail_early {
                 return Err(e.into());
             }
+            error_collector.push(e.into());
             return Ok(());
         }
     };
@@ -479,7 +477,6 @@ async fn send_file_tcp(
         }
         Err(e) => {
             tracing::error!("Failed to send file content for {src:?}: {e:#}");
-            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             // don't return stream to pool on error - it's in a bad state.
             // close it immediately.
             if let Some(mut bad_stream) = pooled_stream.take_and_discard() {
@@ -493,7 +490,7 @@ async fn send_file_tcp(
     }
 }
 
-#[instrument(skip(error_occurred, control_send_stream, stream_pool, pending_limit))]
+#[instrument(skip(error_collector, control_send_stream, stream_pool, pending_limit))]
 #[allow(clippy::too_many_arguments)]
 async fn send_files_in_directory_tcp(
     settings: common::copy::Settings,
@@ -503,7 +500,7 @@ async fn send_files_in_directory_tcp(
     file_count: usize,
     stream_pool: std::sync::Arc<AcceptingSendStreamPool>,
     pending_limit: std::sync::Arc<tokio::sync::Semaphore>,
-    error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
     control_send_stream: remote::streams::BoxedSharedSendStream,
 ) -> anyhow::Result<()> {
     tracing::info!(
@@ -521,7 +518,6 @@ async fn send_files_in_directory_tcp(
         Ok(e) => e,
         Err(e) => {
             tracing::error!("Cannot open directory {src:?} for reading: {e:#}");
-            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
             // send synthetic FileSkipped for all expected files so destination can complete
             for i in 0..file_count {
                 let skip_msg = remote::protocol::SourceMessage::FileSkipped {
@@ -537,6 +533,7 @@ async fn send_files_in_directory_tcp(
             if settings.fail_early {
                 return Err(e.into());
             }
+            error_collector.push(e.into());
             return Ok(());
         }
     };
@@ -554,10 +551,10 @@ async fn send_files_in_directory_tcp(
                     Ok(m) => m,
                     Err(e) => {
                         tracing::error!("Failed reading metadata from {entry_path:?}: {e:#}");
-                        error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                         if settings.fail_early {
                             return Err(e.into());
                         }
+                        error_collector.push(e.into());
                         continue;
                     }
                 };
@@ -585,10 +582,10 @@ async fn send_files_in_directory_tcp(
             Ok(None) => break,
             Err(e) => {
                 tracing::error!("Failed traversing src directory {src:?}: {e:#}");
-                error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                 if settings.fail_early {
                     return Err(e.into());
                 }
+                error_collector.push(e.into());
                 break;
             }
         }
@@ -631,7 +628,7 @@ async fn send_files_in_directory_tcp(
             .await
             .map_err(|_| anyhow::anyhow!("pending limit semaphore closed"))?;
         let pool = stream_pool.clone();
-        let error_flag = error_occurred.clone();
+        let collector = error_collector.clone();
         let control_stream = control_send_stream.clone();
         let settings = settings.clone();
         join_set.spawn(async move {
@@ -642,7 +639,7 @@ async fn send_files_in_directory_tcp(
                 &entry_metadata,
                 false,
                 pool,
-                &error_flag,
+                &collector,
                 control_stream,
             )
             .await;
@@ -658,12 +655,10 @@ async fn send_files_in_directory_tcp(
                 // file-level errors (permission denied, etc.) are handled inside send_file_tcp
                 // by sending FileSkipped and returning Ok(()).
                 tracing::error!("Transport failure sending file from {src:?}: {e:#}");
-                error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                 return Err(e);
             }
             Err(e) => {
                 tracing::error!("Task panicked while sending file from {src:?}: {e:#}");
-                error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                 return Err(e.into());
             }
         }
@@ -732,7 +727,7 @@ enum RecvResult {
 /// - Pool shutdown only happens AFTER this function returns (in handle_connection)
 /// - Deadlock: this function waits for tasks, tasks wait for pool, pool waits for shutdown
 #[instrument(skip(
-    error_occurred,
+    error_collector,
     stream_pool,
     control_recv_stream,
     control_send_stream,
@@ -746,7 +741,7 @@ async fn dispatch_control_messages_tcp(
     control_send_stream: remote::streams::BoxedSharedSendStream,
     stream_pool: std::sync::Arc<AcceptingSendStreamPool>,
     max_pending_files: usize,
-    error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
     pool_shutdown: PoolShutdownToken,
 ) -> anyhow::Result<()> {
     // create semaphore to limit pending file tasks for backpressure
@@ -801,12 +796,10 @@ async fn dispatch_control_messages_tcp(
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
                             tracing::error!("Transport failure in directory send task: {e:#}");
-                            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                             break Err(e);
                         }
                         Err(e) => {
                             tracing::error!("Task panicked: {e:#}");
-                            error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
                             break Err(e.into());
                         }
                     }
@@ -831,7 +824,7 @@ async fn dispatch_control_messages_tcp(
                             dst,
                             file_count
                         );
-                        let error_flag = error_occurred.clone();
+                        let collector = error_collector.clone();
                         let settings = settings.clone();
                         join_set.spawn(send_files_in_directory_tcp(
                             settings,
@@ -841,7 +834,7 @@ async fn dispatch_control_messages_tcp(
                             file_count,
                             stream_pool.clone(),
                             pending_limit.clone(),
-                            error_flag,
+                            collector,
                             control_send_stream.clone(),
                         ));
                     }
@@ -889,7 +882,7 @@ async fn dispatch_control_messages_tcp(
                 } else {
                     // transport errors are always fatal - we can't recover
                     tracing::error!("Transport failure in file send task: {e:#}");
-                    error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
+                    error_collector.push(e);
                     // don't return error here - result already has an error
                 }
             }
@@ -898,7 +891,7 @@ async fn dispatch_control_messages_tcp(
                     tracing::debug!("Task panicked during shutdown: {e:#}");
                 } else {
                     tracing::error!("Task panicked: {e:#}");
-                    error_occurred.store(true, std::sync::atomic::Ordering::Relaxed);
+                    error_collector.push(e.into());
                     // don't return error here - result already has an error
                 }
             }
@@ -1085,7 +1078,7 @@ async fn handle_connection(
     pool_size: usize,
     max_pending_files: usize,
     network_profile: remote::NetworkProfile,
-    error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
     tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Destination control connection established");
@@ -1132,11 +1125,11 @@ async fn handle_connection(
         control_send_stream.clone(),
         stream_pool.clone(),
         max_pending_files,
-        error_occurred.clone(),
+        error_collector.clone(),
         pool_shutdown.clone(),
     ));
     // send files to destination. returns Err only for fatal errors (e.g., root file failure).
-    // individual file failures with fail_early=false return Ok but set error_occurred flag,
+    // individual file failures with fail_early=false return Ok but push errors to collector,
     // and destination is notified via FileSkipped messages on the control channel.
     let send_result = send_fs_objects_tcp(
         settings,
@@ -1144,7 +1137,7 @@ async fn handle_connection(
         dst,
         control_send_stream,
         stream_pool,
-        error_occurred.clone(),
+        error_collector.clone(),
     )
     .await;
     // if send failed, we need to close the pool FIRST so destination's data connections
@@ -1533,7 +1526,7 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
         .await?;
     tracing::info!("Waiting for connection from destination");
     // wait for destination to connect with a timeout
-    let error_occurred = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let error_collector = std::sync::Arc::new(common::error_collector::ErrorCollector::default());
     let accept_timeout = std::time::Duration::from_secs(tcp_config.conn_timeout_sec);
     let pool_size = tcp_config.max_connections;
     let max_pending_files = pool_size * tcp_config.pending_writes_multiplier;
@@ -1563,7 +1556,7 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
                 pool_size,
                 max_pending_files,
                 tcp_config.network_profile,
-                error_occurred.clone(),
+                error_collector.clone(),
                 tls_acceptor,
             )
             .await?;
@@ -1587,13 +1580,12 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
     }
     tracing::info!("Source is done");
     // source doesn't track summary - destination is authoritative
-    if error_occurred.load(std::sync::atomic::Ordering::Relaxed) {
-        Err(common::copy::Error {
-            source: anyhow::anyhow!("Some operations failed during remote copy"),
+    match error_collector.take_error() {
+        Some(err) => Err(common::copy::Error {
+            source: err,
             summary: common::copy::Summary::default(),
         }
-        .into())
-    } else {
-        Ok(("source OK".to_string(), common::copy::Summary::default()))
+        .into()),
+        None => Ok(("source OK".to_string(), common::copy::Summary::default())),
     }
 }

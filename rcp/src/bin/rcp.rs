@@ -1023,7 +1023,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
             || async move { common::copy(&src_path, &dst_path, &settings, &preserve).await };
         join_set.spawn(do_copy());
     }
-    let mut success = true;
+    let error_collector = common::error_collector::ErrorCollector::default();
     let mut copy_summary = common::copy::Summary::default();
     while let Some(res) = join_set.join_next().await {
         match res {
@@ -1038,7 +1038,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
                         }
                         return Err(anyhow!("{}", error));
                     }
-                    success = false;
+                    error_collector.push(error.source);
                 }
             },
             Err(error) => {
@@ -1048,14 +1048,15 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
                     }
                     return Err(anyhow!("{}", error));
                 }
+                error_collector.push(error.into());
             }
         }
     }
-    if !success {
+    if let Some(err) = error_collector.into_error() {
         if args.summary {
-            return Err(anyhow!("rcp encountered errors\n\n{}", &copy_summary));
+            return Err(anyhow!("{:#}\n\n{}", err, &copy_summary));
         }
-        return Err(anyhow!("rcp encountered errors"));
+        return Err(err);
     }
     Ok(copy_summary)
 }

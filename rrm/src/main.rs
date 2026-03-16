@@ -177,7 +177,7 @@ async fn async_main(args: Args) -> Result<common::rm::Summary> {
         let do_rm = || async move { common::rm(&path, &settings).await };
         join_set.spawn(do_rm());
     }
-    let mut success = true;
+    let error_collector = common::error_collector::ErrorCollector::default();
     let mut rm_summary = common::rm::Summary::default();
     while let Some(res) = join_set.join_next().await {
         match res? {
@@ -191,15 +191,15 @@ async fn async_main(args: Args) -> Result<common::rm::Summary> {
                     }
                     return Err(anyhow!("{}", error));
                 }
-                success = false;
+                error_collector.push(error.source);
             }
         }
     }
-    if !success {
+    if let Some(err) = error_collector.into_error() {
         if args.summary {
-            return Err(anyhow!("rrm encountered errors\n\n{}", &rm_summary));
+            return Err(anyhow!("{:#}\n\n{}", err, &rm_summary));
         }
-        return Err(anyhow!("rrm encountered errors"));
+        return Err(err);
     }
     Ok(rm_summary)
 }

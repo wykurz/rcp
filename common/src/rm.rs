@@ -262,7 +262,7 @@ async fn rm_internal(
         .with_context(|| format!("failed reading directory {:?}", &path))
         .map_err(|err| Error::new(err, Default::default()))?;
     let mut join_set = tokio::task::JoinSet::new();
-    let mut success = true;
+    let errors = crate::error_collector::ErrorCollector::default();
     let mut skipped_files = 0;
     let mut skipped_symlinks = 0;
     let mut skipped_dirs = 0;
@@ -327,20 +327,29 @@ async fn rm_internal(
         ..Default::default()
     };
     while let Some(res) = join_set.join_next().await {
-        match res.map_err(|err| Error::new(err.into(), Default::default()))? {
-            Ok(summary) => rm_summary = rm_summary + summary,
-            Err(error) => {
-                tracing::error!("remove: {:?} failed with: {:#}", path, &error);
-                rm_summary = rm_summary + error.summary;
-                if settings.fail_early {
-                    return Err(Error::new(error.source, rm_summary));
+        match res {
+            Ok(result) => match result {
+                Ok(summary) => rm_summary = rm_summary + summary,
+                Err(error) => {
+                    tracing::error!("remove: {:?} failed with: {:#}", path, &error);
+                    rm_summary = rm_summary + error.summary;
+                    errors.push(error.source);
+                    if settings.fail_early {
+                        break;
+                    }
                 }
-                success = false;
+            },
+            Err(error) => {
+                errors.push(error.into());
+                if settings.fail_early {
+                    break;
+                }
             }
         }
     }
-    if !success {
-        return Err(Error::new(anyhow!("rm: {:?} failed!", &path), rm_summary));
+    if errors.has_errors() {
+        // unwrap is safe: has_errors() guarantees into_error() returns Some
+        return Err(Error::new(errors.into_error().unwrap(), rm_summary));
     }
     tracing::debug!("finally remove the empty directory");
     let anything_removed = rm_summary.files_removed > 0
