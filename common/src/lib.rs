@@ -108,6 +108,7 @@ use tracing_subscriber::prelude::*;
 pub mod cmp;
 pub mod config;
 pub mod copy;
+pub mod error_collector;
 pub mod filegen;
 pub mod filter;
 pub mod link;

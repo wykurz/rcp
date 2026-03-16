@@ -68,8 +68,8 @@ pub struct DirectoryTracker {
     preserve: common::preserve::Settings,
     /// whether to fail immediately on errors
     fail_early: bool,
-    /// shared flag to indicate an error occurred during processing
-    error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// collects errors for final reporting
+    error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
 }
 
 impl DirectoryTracker {
@@ -77,7 +77,7 @@ impl DirectoryTracker {
         control_send_stream: remote::streams::BoxedSharedSendStream,
         preserve: common::preserve::Settings,
         fail_early: bool,
-        error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
     ) -> Self {
         Self {
             pending_directories: std::collections::HashMap::new(),
@@ -91,7 +91,7 @@ impl DirectoryTracker {
             control_send_stream,
             preserve,
             fail_early,
-            error_occurred,
+            error_collector,
         }
     }
     /// Check if any ancestor of the given path is a failed directory.
@@ -310,11 +310,10 @@ impl DirectoryTracker {
                 Err(e) => {
                     let err = e.context(format!("failed to set metadata on directory {:?}", dst));
                     tracing::error!("{:#}", err);
-                    self.error_occurred
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     if self.fail_early {
                         return Err(err);
                     }
+                    self.error_collector.push(err);
                 }
             }
         } else {
@@ -382,12 +381,12 @@ pub fn make_shared(
     control_send_stream: remote::streams::BoxedSharedSendStream,
     preserve: common::preserve::Settings,
     fail_early: bool,
-    error_occurred: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
 ) -> SharedDirectoryTracker {
     std::sync::Arc::new(tokio::sync::Mutex::new(DirectoryTracker::new(
         control_send_stream,
         preserve,
         fail_early,
-        error_occurred,
+        error_collector,
     )))
 }

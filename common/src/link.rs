@@ -548,7 +548,7 @@ async fn link_internal(
         ..Default::default()
     };
     let mut join_set = tokio::task::JoinSet::new();
-    let mut all_children_succeeded = true;
+    let errors = crate::error_collector::ErrorCollector::default();
     // create a set of all the files we already processed
     let mut processed_files = std::collections::HashSet::new();
     // iterate through src entries and recursively call "link" on each one
@@ -720,16 +720,18 @@ async fn link_internal(
                         dst,
                         &error
                     );
+                    link_summary = link_summary + error.summary;
                     if settings.copy_settings.fail_early {
-                        return Err(error);
+                        return Err(Error::new(error.source, link_summary));
                     }
-                    all_children_succeeded = false;
+                    errors.push(error.source);
                 }
             },
             Err(error) => {
                 if settings.copy_settings.fail_early {
                     return Err(Error::new(error.into(), link_summary));
                 }
+                errors.push(error.into());
             }
         }
     }
@@ -800,7 +802,7 @@ async fn link_internal(
         };
         preserve::set_dir_metadata(&settings.preserve, preserve_metadata, dst).await
     };
-    if !all_children_succeeded {
+    if errors.has_errors() {
         // child failures take precedence - log metadata error if it also failed
         if let Err(metadata_err) = metadata_result {
             tracing::error!(
@@ -811,10 +813,8 @@ async fn link_internal(
                 &metadata_err
             );
         }
-        return Err(Error::new(
-            anyhow!("link: {:?} {:?} -> {:?} failed!", src, update, dst),
-            link_summary,
-        ))?;
+        // unwrap is safe: has_errors() guarantees into_error() returns Some
+        return Err(Error::new(errors.into_error().unwrap(), link_summary));
     }
     // no child failures, so metadata error is the primary error
     metadata_result.map_err(|err| Error::new(err, link_summary))?;
@@ -2258,5 +2258,60 @@ mod link_tests {
             );
             Ok(())
         }
+    }
+
+    /// Verify that fail-early preserves the summary from the failing subtree.
+    ///
+    /// Regression test: the fail-early return path in the join loop must
+    /// accumulate error.summary from the failing child into the parent's
+    /// link_summary. Without this, directories_created from the child subtree
+    /// would be lost.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_fail_early_preserves_summary_from_failing_subtree() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let test_path = tmp_dir.as_path();
+        // src/sub/  has a file and an unreadable subdirectory:
+        //   src/sub/good.txt            <-- links successfully
+        //   src/sub/unreadable_dir/     <-- mode 000, can't be traversed
+        //     src/sub/unreadable_dir/f.txt
+        let src_dir = test_path.join("src");
+        let sub_dir = src_dir.join("sub");
+        let bad_dir = sub_dir.join("unreadable_dir");
+        tokio::fs::create_dir_all(&bad_dir).await?;
+        tokio::fs::write(sub_dir.join("good.txt"), "content").await?;
+        tokio::fs::write(bad_dir.join("f.txt"), "data").await?;
+        tokio::fs::set_permissions(&bad_dir, std::fs::Permissions::from_mode(0o000)).await?;
+        let dst_dir = test_path.join("dst");
+        let result = link(
+            &PROGRESS,
+            test_path,
+            &src_dir,
+            &dst_dir,
+            &None,
+            &Settings {
+                copy_settings: CopySettings {
+                    fail_early: true,
+                    ..common_settings(false, false).copy_settings
+                },
+                ..common_settings(false, false)
+            },
+            false,
+        )
+        .await;
+        // restore permissions for cleanup
+        tokio::fs::set_permissions(&bad_dir, std::fs::Permissions::from_mode(0o755)).await?;
+        let error = result.expect_err("link should fail due to unreadable directory");
+        // sub/'s link_internal created dst/sub/ (directories_created=1) before
+        // its join loop encountered the unreadable_dir error. that directory
+        // creation must be reflected in the error summary propagated up to the
+        // top-level caller.
+        assert!(
+            error.summary.copy_summary.directories_created >= 2,
+            "fail-early summary should include directories from the failing subtree, \
+             got directories_created={} (expected >= 2: dst/ and dst/sub/)",
+            error.summary.copy_summary.directories_created
+        );
+        Ok(())
     }
 }

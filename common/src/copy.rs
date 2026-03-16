@@ -678,7 +678,7 @@ async fn copy_internal(
     // this is used later to decide if we should clean up an empty directory
     let we_created_this_dir = copy_summary.directories_created == 1;
     let mut join_set = tokio::task::JoinSet::new();
-    let mut all_children_succeeded = true;
+    let errors = crate::error_collector::ErrorCollector::default();
     while let Some(entry) = entries
         .next_entry()
         .await
@@ -771,13 +771,14 @@ async fn copy_internal(
                     if settings.fail_early {
                         return Err(Error::new(error.source, copy_summary));
                     }
-                    all_children_succeeded = false;
+                    errors.push(error.source);
                 }
             },
             Err(error) => {
                 if settings.fail_early {
                     return Err(Error::new(error.into(), copy_summary));
                 }
+                errors.push(error.into());
             }
         }
     }
@@ -841,7 +842,7 @@ async fn copy_internal(
     } else {
         preserve::set_dir_metadata(preserve, &src_metadata, dst).await
     };
-    if !all_children_succeeded {
+    if errors.has_errors() {
         // child failures take precedence - log metadata error if it also failed
         if let Err(metadata_err) = metadata_result {
             tracing::error!(
@@ -851,10 +852,8 @@ async fn copy_internal(
                 &metadata_err
             );
         }
-        return Err(Error::new(
-            anyhow!("copy: {:?} -> {:?} failed!", src, dst),
-            copy_summary,
-        ))?;
+        // unwrap is safe: has_errors() guarantees into_error() returns Some
+        return Err(Error::new(errors.into_error().unwrap(), copy_summary));
     }
     // no child failures, so metadata error is the primary error
     metadata_result.map_err(|err| Error::new(err, copy_summary))?;
@@ -865,6 +864,7 @@ async fn copy_internal(
 mod copy_tests {
     use crate::testutils;
     use anyhow::Context;
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
     use tracing_test::traced_test;
 
@@ -2343,6 +2343,63 @@ mod copy_tests {
             actual_mode, 0o750,
             "directory should have preserved source permissions (0o750), got {:o}",
             actual_mode
+        );
+        Ok(())
+    }
+
+    /// Verify that fail-early does not apply parent directory metadata after a child fails.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_fail_early_does_not_apply_parent_directory_metadata_after_child_error(
+    ) -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let src_dir = test_path.join("src");
+        tokio::fs::create_dir(&src_dir).await?;
+        tokio::fs::write(src_dir.join("readable.txt"), "content").await?;
+        let unreadable_file = src_dir.join("unreadable.txt");
+        tokio::fs::write(&unreadable_file, "secret").await?;
+        tokio::fs::set_permissions(&unreadable_file, std::fs::Permissions::from_mode(0o000))
+            .await?;
+        let fixed_secs = 946684800;
+        let fixed_nsec = 123_456_789;
+        let fixed_time = nix::sys::time::TimeSpec::new(fixed_secs, fixed_nsec);
+        nix::sys::stat::utimensat(
+            nix::fcntl::AT_FDCWD,
+            &src_dir,
+            &fixed_time,
+            &fixed_time,
+            nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+        )?;
+        let src_metadata = tokio::fs::metadata(&src_dir).await?;
+        let dst_dir = test_path.join("dst");
+        let result = copy(
+            &PROGRESS,
+            &src_dir,
+            &dst_dir,
+            &Settings {
+                dereference: false,
+                fail_early: true,
+                overwrite: false,
+                overwrite_compare: Default::default(),
+                chunk_size: 0,
+                remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
+            },
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await;
+        tokio::fs::set_permissions(&unreadable_file, std::fs::Permissions::from_mode(0o644))
+            .await?;
+        assert!(result.is_err(), "copy should fail due to unreadable file");
+        let dst_metadata = tokio::fs::metadata(&dst_dir).await?;
+        assert!(dst_metadata.is_dir());
+        assert_ne!(
+            (dst_metadata.mtime(), dst_metadata.mtime_nsec()),
+            (src_metadata.mtime(), src_metadata.mtime_nsec()),
+            "fail-early should return before applying preserved directory timestamps"
         );
         Ok(())
     }
