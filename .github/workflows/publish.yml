@@ -1,10 +1,11 @@
 name: Publish to crates.io
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: 'Release tag to publish (e.g., v0.28.0)'
+        required: true
       dry-run:
         description: 'Perform a dry run (no actual publishing)'
         required: false
@@ -20,6 +21,8 @@ env:
 jobs:
   validate:
     uses: ./.github/workflows/validate.yml
+    with:
+      ref: ${{ inputs.release_tag }}
 
   publish:
     runs-on: ubuntu-latest
@@ -28,17 +31,13 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
-
-      - name: Install cargo-workspaces
-        run: cargo install cargo-workspaces
+        with:
+          ref: ${{ inputs.release_tag }}
 
       - name: Verify version matches release tag
-        if: github.event_name == 'release'
         run: |
-          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          TAG_VERSION="${{ inputs.release_tag }}"
+          TAG_VERSION="${TAG_VERSION#v}"
           CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           echo "Tag version: $TAG_VERSION"
           echo "Cargo version: $CARGO_VERSION"
@@ -47,9 +46,15 @@ jobs:
             exit 1
           fi
 
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+
+      - name: Install cargo-workspaces
+        run: cargo install cargo-workspaces --version 0.4.2 --locked
+
       - name: Set publish flags
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.dry-run }}" = "true" ]; then
+          if [ "${{ github.event.inputs.dry-run }}" = "true" ]; then
             echo "DRY_RUN=--dry-run" >> $GITHUB_ENV
             echo "Running in DRY-RUN mode"
           else
@@ -58,6 +63,7 @@ jobs:
           fi
 
       - name: Publish to crates.io
+        id: publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
@@ -76,7 +82,9 @@ jobs:
         run: |
           echo "## Publication Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ env.DRY_RUN }}" = "--dry-run" ]; then
+          if [ "${{ steps.publish.outcome }}" != "success" ]; then
+            echo "❌ crates.io publication failed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ env.DRY_RUN }}" = "--dry-run" ]; then
             echo "✅ Dry-run completed successfully" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "No packages were actually published to crates.io" >> $GITHUB_STEP_SUMMARY

@@ -12,16 +12,19 @@ Runs on every push and pull request to `main`:
 - **test**: Runs the full test suite using cargo-nextest
 
 ### release.yml
-Builds and publishes binary packages when a tag is pushed. Triggered by `v*` tag pushes.
+Builds, publishes binary packages, and publishes to crates.io when a tag is pushed. Triggered by `v*` tag pushes.
 
 **Flow:**
-1. Runs validation (format, lint, tests)
+1. Runs validation (format, lint, tests) against the release tag
 2. Creates a draft GitHub release
 3. Builds packages in parallel:
    - Debian packages (amd64 + arm64)
    - RPM packages (amd64 + arm64)
 4. Each build job uploads its package to the draft release
-5. Publishes the release only if all builds succeed (triggers publish.yml for crates.io)
+5. Publishes all workspace crates to crates.io
+6. Publishes the GitHub release (removes draft status) only after crates.io succeeds
+
+All build and publish jobs check out the release tag, ensuring consistency even on manual workflow_dispatch reruns.
 
 **Usage:**
 ```bash
@@ -32,7 +35,7 @@ git push origin v0.24.0
 Or use `just release` which guides you through the process.
 
 ### publish.yml
-Publishes all crates to crates.io when a release is published.
+Manual-only workflow for re-publishing to crates.io (e.g., after a failed release). Requires an explicit release tag input (e.g., `v0.28.0`), validates and publishes from that exact tagged commit.
 
 #### Setup Instructions
 
@@ -53,21 +56,13 @@ Publishes all crates to crates.io when a release is published.
 
 3. **Usage**:
 
-   **Automatic publishing on release**:
-   - Push a version tag: `git tag v0.24.0 && git push origin v0.24.0`
-   - The release.yml workflow creates the GitHub release
-   - When the release is published, this workflow will automatically:
-     - Verify the tag matches the version in Cargo.toml
-     - Check formatting, run clippy, and build documentation
-     - Run the full test suite
-     - Publish all workspace crates to crates.io in dependency order
-     - Skip already published versions automatically
+   Crates.io publishing happens automatically as part of release.yml. This workflow is only needed for manual recovery (e.g., if the crates.io step failed during a release).
 
-   **Manual dry-run testing**:
+   **Manual re-publish**:
    - Go to Actions → Publish to crates.io → Run workflow
-   - Select branch: `main`
-   - Dry run: `true`
-   - This will test the entire flow without actually publishing
+   - Release tag: the tag to publish (e.g., `v0.28.0`)
+   - Dry run: `false` to actually publish, `true` (default) to test
+   - The workflow checks out the specified tag, verifies the Cargo.toml version matches, validates, and publishes from that exact commit
 
 #### How It Works
 
