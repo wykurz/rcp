@@ -7,13 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-03-17
+
 ### Added
 - Add `--preserve-settings` to `rlink` for controlling metadata preservation on directories, symlinks, and copied files. Supports presets (`all`, `none`) and custom per-type format. Defaults to `all` (preserving backward compatibility).
 - Add `--allow-lossy-update` to `rlink` as a safety guard when `--update` comparison attributes are not covered by `--preserve-settings`
 - Add `all` and `none` presets to `--preserve-settings` in `rcp`
+- Add `--expand-missing` flag to `rcmp` to report missing entries individually
+- Report total bytes removed in `rrm` and sizes for compared datasets in `rcmp`
+
+### Changed
+- Change `rcmp` output format to JSON
 
 ### Deprecated
 - Deprecate `--preserve` flag in `rcp` in favor of `--preserve-settings=all`
+
+### Fixed
+- Replace generic error messages with actual root causes in non-fail-early mode
+- Support relative local paths in remote copy
 
 ## [0.28.0] - 2026-02-19
 
@@ -155,7 +166,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See git history for changes in previous versions.
 
-[Unreleased]: https://github.com/wykurz/rcp/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/wykurz/rcp/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/wykurz/rcp/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/wykurz/rcp/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/wykurz/rcp/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/wykurz/rcp/compare/v0.24.0...v0.26.0
