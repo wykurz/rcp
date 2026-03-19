@@ -221,7 +221,8 @@ struct Args {
 
     /// Restrict TCP to specific port ranges (e.g., "8000-8999,10000-10999")
     ///
-    /// Defaults to dynamic port allocation if not specified
+    /// Both `-` and `:` are accepted as range separators (e.g., "8000-8999" or "8000:8999").
+    /// Defaults to dynamic port allocation if not specified.
     #[arg(long, value_name = "RANGES", help_heading = "Remote copy options")]
     port_ranges: Option<String>,
 

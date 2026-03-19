@@ -7,6 +7,8 @@ pub struct PortRanges {
 
 impl PortRanges {
     /// Parse port ranges from a string like "8000-8999,10000-10999"
+    ///
+    /// Both `-` and `:` are accepted as range separators (e.g., "8000-8999" or "8000:8999").
     pub fn parse(ranges_str: &str) -> anyhow::Result<Self> {
         let mut ranges = Vec::new();
         for range_str in ranges_str.split(',') {
@@ -14,7 +16,10 @@ impl PortRanges {
             if range_str.is_empty() {
                 continue;
             }
-            if let Some((start_str, end_str)) = range_str.split_once('-') {
+            if let Some((start_str, end_str)) = range_str
+                .split_once('-')
+                .or_else(|| range_str.split_once(':'))
+            {
                 let start: u16 = start_str
                     .trim()
                     .parse()
@@ -223,8 +228,25 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_range_with_colon() {
+        let ranges = PortRanges::parse("8000:8999").unwrap();
+        assert_eq!(ranges.ranges.len(), 1);
+        assert_eq!(ranges.ranges[0], 8000..9000);
+    }
+
+    #[test]
+    fn test_parse_multiple_ranges_mixed_separators() {
+        let ranges = PortRanges::parse("8000-8999,10000:10999,12345").unwrap();
+        assert_eq!(ranges.ranges.len(), 3);
+        assert_eq!(ranges.ranges[0], 8000..9000);
+        assert_eq!(ranges.ranges[1], 10000..11000);
+        assert_eq!(ranges.ranges[2], 12345..12346);
+    }
+
+    #[test]
     fn test_parse_invalid_range() {
         assert!(PortRanges::parse("9000-8000").is_err()); // start > end
+        assert!(PortRanges::parse("9000:8000").is_err()); // start > end (colon)
         assert!(PortRanges::parse("0-100").is_err()); // port 0 not allowed
         assert!(PortRanges::parse("abc").is_err()); // non-numeric
         assert!(PortRanges::parse("").is_err()); // empty
