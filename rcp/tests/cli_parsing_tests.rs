@@ -486,7 +486,7 @@ fn test_overwrite_filter_requires_overwrite() {
 fn test_overwrite_filter_invalid_value() {
     Command::cargo_bin("rcp")
         .unwrap()
-        .args(["--overwrite", "--overwrite-filter", "oldest", "--help"])
+        .args(["--overwrite", "--overwrite-filter", "oldest", "/tmp/src", "/tmp/dst"])
         .assert()
         .failure()
         .stderr(predicates::str::contains("invalid value 'oldest'"));

@@ -301,9 +301,9 @@ impl RcpdConfig {
         }
         if self.overwrite {
             args.push("--overwrite".to_string());
-        }
-        if let Some(ref filter) = self.overwrite_filter {
-            args.push(format!("--overwrite-filter={filter}"));
+            if let Some(ref filter) = self.overwrite_filter {
+                args.push(format!("--overwrite-filter={filter}"));
+            }
         }
         if let Some(ref prefix) = self.debug_log_prefix {
             args.push(format!("--debug-log-prefix={prefix}"));
