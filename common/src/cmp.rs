@@ -803,6 +803,7 @@ mod cmp_tests {
                     mtime: true,
                     ..Default::default()
                 },
+                overwrite_filter: None,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,

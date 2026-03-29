@@ -457,6 +457,42 @@ fn test_overwrite_compare_default() {
 }
 
 // ============================================================================
+// Overwrite Filter Tests
+// ============================================================================
+
+/// Test that --overwrite-filter=newer is accepted with --overwrite
+#[test]
+fn test_overwrite_filter_newer_with_overwrite() {
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--overwrite", "--overwrite-filter", "newer", "--help"])
+        .assert()
+        .success();
+}
+
+/// Test that --overwrite-filter without --overwrite fails
+#[test]
+fn test_overwrite_filter_requires_overwrite() {
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--overwrite-filter", "newer", "/tmp/src", "/tmp/dst"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--overwrite"));
+}
+
+/// Test that --overwrite-filter rejects invalid values
+#[test]
+fn test_overwrite_filter_invalid_value() {
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--overwrite", "--overwrite-filter", "oldest", "--help"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("invalid value 'oldest'"));
+}
+
+// ============================================================================
 // Argument Combination Tests
 // ============================================================================
 
