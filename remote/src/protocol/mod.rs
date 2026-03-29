@@ -246,6 +246,7 @@ pub struct RcpdConfig {
     pub dereference: bool,
     pub overwrite: bool,
     pub overwrite_compare: String,
+    pub overwrite_filter: Option<String>,
     pub debug_log_prefix: Option<String>,
     /// Port ranges for TCP connections (e.g., "8000-8999,9000-9999")
     pub port_ranges: Option<String>,
@@ -300,6 +301,9 @@ impl RcpdConfig {
         }
         if self.overwrite {
             args.push("--overwrite".to_string());
+        }
+        if let Some(ref filter) = self.overwrite_filter {
+            args.push(format!("--overwrite-filter={filter}"));
         }
         if let Some(ref prefix) = self.debug_log_prefix {
             args.push(format!("--debug-log-prefix={prefix}"));

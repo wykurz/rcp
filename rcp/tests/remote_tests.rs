@@ -527,6 +527,73 @@ fn test_remote_copy_with_overwrite() {
 }
 
 #[test]
+fn test_remote_copy_overwrite_filter_newer_skips_when_dest_is_newer() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("filter_newer.txt");
+    let dst_file = dst_dir.path().join("filter_newer.txt");
+    // create source file
+    create_test_file(&src_file, "old source", 0o644);
+    // create destination file with different content
+    create_test_file(&dst_file, "newer dest", 0o644);
+    // make dest strictly newer than source
+    let future_time = filetime::FileTime::from_unix_time(
+        std::fs::metadata(&src_file)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 10,
+        0,
+    );
+    filetime::set_file_mtime(&dst_file, future_time).unwrap();
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&[
+        "--overwrite",
+        "--overwrite-filter=newer",
+        "--summary",
+        &src_remote,
+        &dst_remote,
+    ]);
+    // dest should not be overwritten because it is newer
+    assert_eq!(get_file_content(&dst_file), "newer dest");
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_unchanged, 1);
+    assert_eq!(summary.files_copied, 0);
+}
+
+#[test]
+fn test_remote_copy_overwrite_filter_newer_copies_when_dest_is_older() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("filter_older.txt");
+    let dst_file = dst_dir.path().join("filter_older.txt");
+    // create destination file first with old content
+    create_test_file(&dst_file, "old dest", 0o644);
+    // set dest mtime to the past
+    let past_time = filetime::FileTime::from_unix_time(1_000_000, 0);
+    filetime::set_file_mtime(&dst_file, past_time).unwrap();
+    // create source file with different content (will have a newer mtime)
+    create_test_file(&src_file, "new source content", 0o644);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&[
+        "--overwrite",
+        "--overwrite-filter=newer",
+        "--summary",
+        &src_remote,
+        &dst_remote,
+    ]);
+    // dest should be overwritten because source is newer
+    assert_eq!(get_file_content(&dst_file), "new source content");
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 1);
+}
+
+#[test]
 fn test_remote_copy_without_overwrite_fails() {
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();

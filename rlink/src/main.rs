@@ -279,6 +279,7 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
                 fail_early: args.fail_early,
                 overwrite: args.overwrite,
                 overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
+                overwrite_filter: None,
                 chunk_size: args.chunk_size,
                 remote_copy_buffer_size: 0, // not used for local operations
                 filter: filter.clone(),

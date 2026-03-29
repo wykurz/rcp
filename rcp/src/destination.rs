@@ -156,6 +156,18 @@ async fn process_single_file(
                         .map_err(err_corrupted)?;
                     return Ok(());
                 }
+                if let Some(common::copy::OverwriteFilter::Newer) = settings.overwrite_filter {
+                    if common::filecmp::dest_is_newer(&src_file_metadata, &dst_metadata) {
+                        tracing::debug!("dest is newer than source, skipping");
+                        prog.files_unchanged.inc();
+                        let mut sink = tokio::io::sink();
+                        file_recv_stream
+                            .copy_exact_to_buffered(&mut sink, file_header.size, 8192)
+                            .await
+                            .map_err(err_corrupted)?;
+                        return Ok(());
+                    }
+                }
                 tracing::debug!("file exists but is different, removing");
                 let removed_file_size = dst_metadata.len();
                 tokio::fs::remove_file(&file_header.dst)

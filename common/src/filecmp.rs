@@ -61,3 +61,112 @@ pub fn metadata_equal<
     }
     true
 }
+
+/// Returns true if dest mtime is strictly greater than src mtime (including nanoseconds).
+///
+/// Unlike [`metadata_equal`], this does not special-case zero nanoseconds for filesystems
+/// without nanosecond precision. Zero nsec is compared literally, which is the safest
+/// default for a directional check: when in doubt, we overwrite rather than skip.
+#[instrument]
+pub fn dest_is_newer<
+    M1: crate::preserve::Metadata + std::fmt::Debug,
+    M2: crate::preserve::Metadata + std::fmt::Debug,
+>(
+    src: &M1,
+    dest: &M2,
+) -> bool {
+    (dest.mtime(), dest.mtime_nsec()) > (src.mtime(), src.mtime_nsec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[derive(Debug)]
+    struct FakeMeta {
+        mtime: i64,
+        mtime_nsec: i64,
+    }
+    impl crate::preserve::Metadata for FakeMeta {
+        fn uid(&self) -> u32 {
+            0
+        }
+        fn gid(&self) -> u32 {
+            0
+        }
+        fn atime(&self) -> i64 {
+            0
+        }
+        fn atime_nsec(&self) -> i64 {
+            0
+        }
+        fn mtime(&self) -> i64 {
+            self.mtime
+        }
+        fn mtime_nsec(&self) -> i64 {
+            self.mtime_nsec
+        }
+        fn permissions(&self) -> std::fs::Permissions {
+            std::os::unix::fs::PermissionsExt::from_mode(0o644)
+        }
+    }
+    #[test]
+    fn dest_newer_by_seconds() {
+        let src = FakeMeta {
+            mtime: 100,
+            mtime_nsec: 0,
+        };
+        let dest = FakeMeta {
+            mtime: 200,
+            mtime_nsec: 0,
+        };
+        assert!(dest_is_newer(&src, &dest));
+    }
+    #[test]
+    fn dest_older_by_seconds() {
+        let src = FakeMeta {
+            mtime: 200,
+            mtime_nsec: 0,
+        };
+        let dest = FakeMeta {
+            mtime: 100,
+            mtime_nsec: 0,
+        };
+        assert!(!dest_is_newer(&src, &dest));
+    }
+    #[test]
+    fn same_mtime_not_newer() {
+        let src = FakeMeta {
+            mtime: 100,
+            mtime_nsec: 500,
+        };
+        let dest = FakeMeta {
+            mtime: 100,
+            mtime_nsec: 500,
+        };
+        assert!(!dest_is_newer(&src, &dest));
+    }
+    #[test]
+    fn dest_newer_by_nsec() {
+        let src = FakeMeta {
+            mtime: 100,
+            mtime_nsec: 500,
+        };
+        let dest = FakeMeta {
+            mtime: 100,
+            mtime_nsec: 600,
+        };
+        assert!(dest_is_newer(&src, &dest));
+    }
+    #[test]
+    fn dest_older_by_nsec() {
+        let src = FakeMeta {
+            mtime: 100,
+            mtime_nsec: 600,
+        };
+        let dest = FakeMeta {
+            mtime: 100,
+            mtime_nsec: 500,
+        };
+        assert!(!dest_is_newer(&src, &dest));
+    }
+}

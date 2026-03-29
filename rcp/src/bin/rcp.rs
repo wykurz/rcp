@@ -59,6 +59,18 @@ struct Args {
     )]
     overwrite_compare: String,
 
+    /// Skip overwriting files that match a condition
+    ///
+    /// Available filters: "newer" (skip if destination mtime is strictly newer than source).
+    /// Requires --overwrite.
+    #[arg(
+        long,
+        value_name = "FILTER",
+        requires = "overwrite",
+        help_heading = "Copy options"
+    )]
+    overwrite_filter: Option<common::copy::OverwriteFilter>,
+
     /// Exit on first error
     #[arg(short = 'e', long = "fail-early", help_heading = "Copy options")]
     fail_early: bool,
@@ -441,6 +453,7 @@ async fn run_rcpd_master(
         dereference: args.dereference,
         overwrite: args.overwrite,
         overwrite_compare: args.overwrite_compare.clone(),
+        overwrite_filter: args.overwrite_filter.map(|f| f.to_string()),
         debug_log_prefix: args.rcpd_debug_log_prefix.clone(),
         port_ranges: args.port_ranges.clone(),
         progress: args.progress,
@@ -1009,6 +1022,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         overwrite: args.overwrite,
         overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)
             .map_err(|err| common::copy::Error::new(err, Default::default()))?,
+        overwrite_filter: args.overwrite_filter,
         chunk_size: args.chunk_size.0,
         // for local copy, buffer size is not used (bypasses user-mode buffering)
         remote_copy_buffer_size: 0,

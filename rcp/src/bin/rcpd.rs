@@ -46,6 +46,15 @@ struct Args {
     )]
     overwrite_compare: String,
 
+    /// Skip overwriting files that match a condition (used with --overwrite)
+    #[arg(
+        long,
+        value_name = "FILTER",
+        requires = "overwrite",
+        help_heading = "Copy options"
+    )]
+    overwrite_filter: Option<common::copy::OverwriteFilter>,
+
     /// Exit on first error
     #[arg(short = 'e', long = "fail-early", help_heading = "Copy options")]
     fail_early: bool,
@@ -332,6 +341,7 @@ where
                 fail_early: args.fail_early,
                 overwrite: args.overwrite,
                 overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
+                overwrite_filter: args.overwrite_filter,
                 chunk_size: args.chunk_size,
                 remote_copy_buffer_size: tcp_config.effective_buffer_size(),
                 filter,
@@ -391,6 +401,7 @@ where
                 fail_early: args.fail_early,
                 overwrite: args.overwrite,
                 overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
+                overwrite_filter: args.overwrite_filter,
                 chunk_size: args.chunk_size,
                 remote_copy_buffer_size: tcp_config.effective_buffer_size(),
                 filter: None,

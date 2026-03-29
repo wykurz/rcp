@@ -60,6 +60,7 @@
 //!     fail_early: false,
 //!     overwrite: false,
 //!     overwrite_compare: Default::default(),
+//!     overwrite_filter: None,
 //!     chunk_size: 0,
 //!     remote_copy_buffer_size: 0,
 //!     filter: None,
