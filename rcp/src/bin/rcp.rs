@@ -71,6 +71,10 @@ struct Args {
     )]
     overwrite_filter: Option<common::copy::OverwriteFilter>,
 
+    /// Do not overwrite existing files
+    #[arg(long, conflicts_with = "overwrite", help_heading = "Copy options")]
+    ignore_existing: bool,
+
     /// Exit on first error
     #[arg(short = 'e', long = "fail-early", help_heading = "Copy options")]
     fail_early: bool,
@@ -454,6 +458,7 @@ async fn run_rcpd_master(
         overwrite: args.overwrite,
         overwrite_compare: args.overwrite_compare.clone(),
         overwrite_filter: args.overwrite_filter.map(|f| f.to_string()),
+        ignore_existing: args.ignore_existing,
         debug_log_prefix: args.rcpd_debug_log_prefix.clone(),
         port_ranges: args.port_ranges.clone(),
         progress: args.progress,
@@ -1023,6 +1028,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)
             .map_err(|err| common::copy::Error::new(err, Default::default()))?,
         overwrite_filter: args.overwrite_filter,
+        ignore_existing: args.ignore_existing,
         chunk_size: args.chunk_size.0,
         // for local copy, buffer size is not used (bypasses user-mode buffering)
         remote_copy_buffer_size: 0,
@@ -1119,6 +1125,7 @@ fn main() -> Result<(), anyhow::Error> {
             args.overwrite,
             !args.include.is_empty() || !args.exclude.is_empty() || args.filter_file.is_some(),
             true,
+            args.ignore_existing,
         )
     });
     let is_dry_run = dry_run_warnings.is_some();

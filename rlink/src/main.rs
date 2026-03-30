@@ -280,6 +280,7 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
                 overwrite: args.overwrite,
                 overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: args.chunk_size,
                 remote_copy_buffer_size: 0, // not used for local operations
                 filter: filter.clone(),
@@ -315,6 +316,7 @@ fn main() -> Result<()> {
             args.overwrite,
             !args.include.is_empty() || !args.exclude.is_empty() || args.filter_file.is_some(),
             true,
+            false, // rlink has no --ignore-existing
         )
     });
     let is_dry_run = dry_run_warnings.is_some();

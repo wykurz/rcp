@@ -81,6 +81,7 @@ impl DryRunWarnings {
     /// `has_overwrite` — whether --overwrite was specified (not applicable to rrm).
     /// `has_filters` — whether --include/--exclude/--filter-file was specified.
     /// `has_destination` — true for rcp/rlink (copy/link to destination), false for rrm.
+    /// `has_ignore_existing` — whether --ignore-existing was specified (checks destination state).
     #[must_use]
     pub fn new(
         has_progress: bool,
@@ -89,6 +90,7 @@ impl DryRunWarnings {
         has_overwrite: bool,
         has_filters: bool,
         has_destination: bool,
+        has_ignore_existing: bool,
     ) -> Self {
         let mut warnings = Vec::new();
         if has_progress {
@@ -103,7 +105,7 @@ impl DryRunWarnings {
                     .to_string(),
             );
         }
-        if !has_filters {
+        if !has_filters && !has_ignore_existing {
             if has_destination {
                 warnings.push(
                     "dry-run: no filtering specified. dry-run is primarily useful to preview \

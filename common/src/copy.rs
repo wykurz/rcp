@@ -64,6 +64,7 @@ pub struct Settings {
     pub overwrite: bool,
     pub overwrite_compare: filecmp::MetadataCmpSettings,
     pub overwrite_filter: Option<OverwriteFilter>,
+    pub ignore_existing: bool,
     pub chunk_size: u64,
     /// Buffer size for remote copy file transfer operations in bytes.
     ///
@@ -205,6 +206,23 @@ pub async fn copy_file(
     preserve: &preserve::Settings,
     is_fresh: bool,
 ) -> Result<Summary, Error> {
+    // check --ignore-existing before dry-run so dry-run output reflects actual behavior.
+    // use symlink_metadata to detect dangling symlinks too (Path::exists follows symlinks)
+    if !is_fresh && settings.ignore_existing && tokio::fs::symlink_metadata(dst).await.is_ok() {
+        if let Some(mode) = settings.dry_run {
+            match mode {
+                DryRunMode::Brief => {}
+                DryRunMode::All => println!("skip file {:?}", dst),
+                DryRunMode::Explain => println!("skip file {:?} (destination exists)", dst),
+            }
+        }
+        tracing::debug!("destination exists, skipping (--ignore-existing)");
+        prog_track.files_unchanged.inc();
+        return Ok(Summary {
+            files_unchanged: 1,
+            ..Default::default()
+        });
+    }
     // handle dry-run mode for files
     if settings.dry_run.is_some() {
         report_dry_run_copy(src, dst, "file");
@@ -482,6 +500,23 @@ async fn copy_internal(
         "open file guard should not be pre-acquired for directories or symlinks"
     );
     if src_metadata.is_symlink() {
+        // check --ignore-existing before dry-run so dry-run output reflects actual behavior.
+        // use symlink_metadata to detect dangling symlinks too (Path::exists follows symlinks)
+        if !is_fresh && settings.ignore_existing && tokio::fs::symlink_metadata(dst).await.is_ok() {
+            if let Some(mode) = settings.dry_run {
+                match mode {
+                    DryRunMode::Brief => {}
+                    DryRunMode::All => println!("skip symlink {:?}", dst),
+                    DryRunMode::Explain => println!("skip symlink {:?} (destination exists)", dst),
+                }
+            }
+            tracing::debug!("destination exists, skipping symlink (--ignore-existing)");
+            prog_track.symlinks_unchanged.inc();
+            return Ok(Summary {
+                symlinks_unchanged: 1,
+                ..Default::default()
+            });
+        }
         // handle dry-run mode for symlinks
         if settings.dry_run.is_some() {
             report_dry_run_copy(src, dst, "symlink");
@@ -497,6 +532,14 @@ async fn copy_internal(
             .map_err(|err| Error::new(err, Default::default()))?;
         // try creating a symlink, if dst path exists and overwrite is set - remove and try again
         if let Err(error) = tokio::fs::symlink(&link, dst).await {
+            if settings.ignore_existing && error.kind() == std::io::ErrorKind::AlreadyExists {
+                tracing::debug!("destination exists, skipping symlink (--ignore-existing)");
+                prog_track.symlinks_unchanged.inc();
+                return Ok(Summary {
+                    symlinks_unchanged: 1,
+                    ..Default::default()
+                });
+            }
             if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
                 let dst_metadata = tokio::fs::symlink_metadata(dst)
                     .await
@@ -615,6 +658,26 @@ async fn copy_internal(
     }
     // handle dry-run mode for directories at the top level
     if settings.dry_run.is_some() {
+        if settings.ignore_existing
+            && !is_fresh
+            && tokio::fs::symlink_metadata(dst).await.is_ok()
+            && !dst.is_dir()
+        {
+            // destination is not a directory - would skip entire subtree
+            if let Some(mode) = settings.dry_run {
+                match mode {
+                    DryRunMode::Brief => {}
+                    DryRunMode::All => println!("skip dir {:?}", dst),
+                    DryRunMode::Explain => {
+                        println!("skip dir {:?} (destination exists, not a directory)", dst);
+                    }
+                }
+            }
+            return Ok(Summary {
+                directories_unchanged: 1,
+                ..Default::default()
+            });
+        }
         report_dry_run_copy(src, dst, "dir");
         // still need to recurse to show contents
     }
@@ -634,12 +697,14 @@ async fn copy_internal(
             !is_fresh,
             "unexpected error creating directory: {dst:?}: {error}"
         );
-        if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
+        if (settings.overwrite || settings.ignore_existing)
+            && error.kind() == std::io::ErrorKind::AlreadyExists
+        {
             // check if the destination is a directory - if so, leave it
             //
             // N.B. the permissions may prevent us from writing to it but the alternative is to open up the directory
             // while we're writing to it which isn't safe
-            let dst_metadata = tokio::fs::metadata(dst)
+            let dst_metadata = tokio::fs::symlink_metadata(dst)
                 .await
                 .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))
                 .map_err(|err| Error::new(err, Default::default()))?;
@@ -650,6 +715,15 @@ async fn copy_internal(
                     directories_unchanged: 1,
                     ..Default::default()
                 }
+            } else if settings.ignore_existing {
+                // destination is not a directory but something exists at this path;
+                // with --ignore-existing we skip the entire subtree
+                tracing::debug!("destination exists but is not a directory, skipping subtree (--ignore-existing)");
+                prog_track.directories_unchanged.inc();
+                return Ok(Summary {
+                    directories_unchanged: 1,
+                    ..Default::default()
+                });
             } else {
                 tracing::info!("'dst' is not a directory, removing and creating a new one");
                 let rm_summary = rm::rm(
@@ -927,6 +1001,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -975,6 +1050,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1050,6 +1126,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1117,6 +1194,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1164,6 +1242,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1259,6 +1338,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1285,6 +1365,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1311,6 +1392,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1337,6 +1419,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1365,6 +1448,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1434,6 +1518,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1515,6 +1600,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1595,6 +1681,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1678,6 +1765,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1724,6 +1812,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1770,6 +1859,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1824,6 +1914,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: Some(OverwriteFilter::Newer),
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1870,6 +1961,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: Some(OverwriteFilter::Newer),
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1915,6 +2007,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: Some(OverwriteFilter::Newer),
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1961,6 +2054,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -1974,6 +2068,117 @@ mod copy_tests {
         assert_eq!(summary.files_copied, 1);
         let content = tokio::fs::read_to_string(&dst_file).await?;
         assert_eq!(content, "older content");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn ignore_existing_skips_when_dest_exists() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let src_file = test_path.join("src.txt");
+        let dst_file = test_path.join("dst.txt");
+        tokio::fs::write(&src_file, "source content").await?;
+        tokio::fs::write(&dst_file, "dest content").await?;
+        let summary = copy_file(
+            &PROGRESS,
+            &src_file,
+            &dst_file,
+            &tokio::fs::metadata(&src_file).await?,
+            &Settings {
+                dereference: false,
+                fail_early: false,
+                overwrite: false,
+                overwrite_compare: Default::default(),
+                overwrite_filter: None,
+                ignore_existing: true,
+                chunk_size: 0,
+                remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
+            },
+            &NO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        assert_eq!(summary.files_unchanged, 1);
+        assert_eq!(summary.files_copied, 0);
+        // dest should still have original content
+        let content = tokio::fs::read_to_string(&dst_file).await?;
+        assert_eq!(content, "dest content");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn ignore_existing_skips_when_dest_is_different_type() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let src_file = test_path.join("src.txt");
+        let dst_dir = test_path.join("dst.txt");
+        tokio::fs::write(&src_file, "source content").await?;
+        // destination is a directory, not a file
+        tokio::fs::create_dir(&dst_dir).await?;
+        let summary = copy_file(
+            &PROGRESS,
+            &src_file,
+            &dst_dir,
+            &tokio::fs::metadata(&src_file).await?,
+            &Settings {
+                dereference: false,
+                fail_early: false,
+                overwrite: false,
+                overwrite_compare: Default::default(),
+                overwrite_filter: None,
+                ignore_existing: true,
+                chunk_size: 0,
+                remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
+            },
+            &NO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        assert_eq!(summary.files_unchanged, 1);
+        assert_eq!(summary.files_copied, 0);
+        // dest directory should still exist
+        assert!(dst_dir.is_dir());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn ignore_existing_copies_when_dest_missing() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::create_temp_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let src_file = test_path.join("src.txt");
+        let dst_file = test_path.join("dst.txt");
+        tokio::fs::write(&src_file, "source content").await?;
+        let summary = copy_file(
+            &PROGRESS,
+            &src_file,
+            &dst_file,
+            &tokio::fs::metadata(&src_file).await?,
+            &Settings {
+                dereference: false,
+                fail_early: false,
+                overwrite: false,
+                overwrite_compare: Default::default(),
+                overwrite_filter: None,
+                ignore_existing: true,
+                chunk_size: 0,
+                remote_copy_buffer_size: 0,
+                filter: None,
+                dry_run: None,
+            },
+            &NO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        assert_eq!(summary.files_copied, 1);
+        let content = tokio::fs::read_to_string(&dst_file).await?;
+        assert_eq!(content, "source content");
         Ok(())
     }
 
@@ -2013,6 +2218,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -2083,6 +2289,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -2142,6 +2349,7 @@ mod copy_tests {
                 overwrite: false,
                 overwrite_compare: filecmp::MetadataCmpSettings::default(),
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -2161,6 +2369,7 @@ mod copy_tests {
                 overwrite: false,
                 overwrite_compare: filecmp::MetadataCmpSettings::default(),
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -2216,6 +2425,7 @@ mod copy_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -2274,6 +2484,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: None,
@@ -2313,6 +2524,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: None,
@@ -2355,6 +2567,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: None,
@@ -2403,6 +2616,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: None,
@@ -2557,6 +2771,7 @@ mod copy_tests {
                 overwrite: false,
                 overwrite_compare: Default::default(),
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -2623,6 +2838,7 @@ mod copy_tests {
                 overwrite: false,
                 overwrite_compare: Default::default(),
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
@@ -2678,6 +2894,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
@@ -2732,6 +2949,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
@@ -2790,6 +3008,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
@@ -2825,6 +3044,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
@@ -2866,6 +3086,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
@@ -2911,6 +3132,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
@@ -2956,6 +3178,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
@@ -3012,6 +3235,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
@@ -3069,6 +3293,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
@@ -3132,6 +3357,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
@@ -3192,6 +3418,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
@@ -3252,6 +3479,7 @@ mod copy_tests {
                     overwrite: true, // enable overwrite mode
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
@@ -3313,6 +3541,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: None,
@@ -3367,6 +3596,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
@@ -3414,6 +3644,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
@@ -3465,6 +3696,7 @@ mod copy_tests {
                     overwrite: false,
                     overwrite_compare: Default::default(),
                     overwrite_filter: None,
+                    ignore_existing: false,
                     chunk_size: 0,
                     remote_copy_buffer_size: 0,
                     filter: None,
@@ -3520,6 +3752,7 @@ mod copy_tests {
                         overwrite: false,
                         overwrite_compare: Default::default(),
                         overwrite_filter: None,
+                        ignore_existing: false,
                         chunk_size: 0,
                         remote_copy_buffer_size: 0,
                         filter: None,

@@ -804,6 +804,7 @@ mod cmp_tests {
                     ..Default::default()
                 },
                 overwrite_filter: None,
+                ignore_existing: false,
                 chunk_size: 0,
                 remote_copy_buffer_size: 0,
                 filter: None,
