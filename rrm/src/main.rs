@@ -214,6 +214,7 @@ fn main() -> Result<()> {
             false, // rrm has no --overwrite
             !args.include.is_empty() || !args.exclude.is_empty() || args.filter_file.is_some(),
             false, // rrm has no destination
+            false, // rrm has no --ignore-existing
         )
     });
     let is_dry_run = dry_run_warnings.is_some();

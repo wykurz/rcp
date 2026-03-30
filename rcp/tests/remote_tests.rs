@@ -594,6 +594,65 @@ fn test_remote_copy_overwrite_filter_newer_copies_when_dest_is_older() {
 }
 
 #[test]
+fn test_remote_copy_ignore_existing_skips_existing_file() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("ignore_test.txt");
+    let dst_file = dst_dir.path().join("ignore_test.txt");
+    create_test_file(&src_file, "source content", 0o644);
+    create_test_file(&dst_file, "existing content", 0o644);
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    let output =
+        run_rcp_and_expect_success(&["--ignore-existing", "--summary", &src_remote, &dst_remote]);
+    // destination should not be overwritten
+    assert_eq!(get_file_content(&dst_file), "existing content");
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_unchanged, 1);
+    assert_eq!(summary.files_copied, 0);
+}
+
+#[test]
+fn test_remote_copy_ignore_existing_copies_new_file() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("new_file.txt");
+    let dst_file = dst_dir.path().join("new_file.txt");
+    create_test_file(&src_file, "source content", 0o644);
+    // no destination file
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    let output =
+        run_rcp_and_expect_success(&["--ignore-existing", "--summary", &src_remote, &dst_remote]);
+    assert_eq!(get_file_content(&dst_file), "source content");
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 1);
+}
+
+#[test]
+fn test_remote_copy_ignore_existing_dir_over_non_dir_skips() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // source is a directory with a file inside
+    let src_subdir = src_dir.path().join("mydir");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("inner.txt"), "inner", 0o644);
+    // destination has a regular file where the directory would be
+    let dst_file = dst_dir.path().join("mydir");
+    create_test_file(&dst_file, "i am a file", 0o644);
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    // should succeed (skip silently), not fail
+    let output =
+        run_rcp_and_expect_success(&["--ignore-existing", "--summary", &src_remote, &dst_remote]);
+    // destination file should still be the original file, not a directory
+    assert!(dst_file.is_file());
+    assert_eq!(get_file_content(&dst_file), "i am a file");
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 0);
+}
+
+#[test]
 fn test_remote_copy_without_overwrite_fails() {
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();

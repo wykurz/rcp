@@ -498,6 +498,27 @@ fn test_overwrite_filter_invalid_value() {
         .stderr(predicates::str::contains("invalid value 'oldest'"));
 }
 
+/// Test that --ignore-existing flag is accepted
+#[test]
+fn test_ignore_existing_flag() {
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--ignore-existing", "--help"])
+        .assert()
+        .success();
+}
+
+/// Test that --ignore-existing conflicts with --overwrite
+#[test]
+fn test_ignore_existing_conflicts_with_overwrite() {
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--ignore-existing", "--overwrite", "/tmp/src", "/tmp/dst"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--overwrite"));
+}
+
 // ============================================================================
 // Argument Combination Tests
 // ============================================================================

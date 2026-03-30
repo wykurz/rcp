@@ -129,6 +129,16 @@ async fn process_single_file(
     // check if destination exists and handle overwrite logic
     let dst_exists = tokio::fs::symlink_metadata(&file_header.dst).await.is_ok();
     if dst_exists {
+        if settings.ignore_existing {
+            tracing::debug!("destination exists, skipping (--ignore-existing)");
+            prog.files_unchanged.inc();
+            let mut sink = tokio::io::sink();
+            file_recv_stream
+                .copy_exact_to_buffered(&mut sink, file_header.size, 8192)
+                .await
+                .map_err(err_corrupted)?;
+            return Ok(());
+        }
         if settings.overwrite {
             tracing::debug!("file exists, check if it's identical");
             let dst_metadata = tokio::fs::symlink_metadata(&file_header.dst)
@@ -466,6 +476,8 @@ enum DirectoryCreateResult {
     Created,
     /// directory already existed (reused)
     AlreadyExisted,
+    /// skipped due to --ignore-existing (destination is not a directory)
+    Skipped,
     /// failed to create directory
     Failed,
 }
@@ -493,6 +505,11 @@ async fn create_directory(
                 tracing::debug!("destination directory already exists, reusing it");
                 prog.directories_unchanged.inc();
                 Ok(DirectoryCreateResult::AlreadyExisted)
+            } else if settings.ignore_existing {
+                // not a directory but ignore_existing is set - skip the subtree
+                tracing::debug!("destination exists but is not a directory, skipping subtree (--ignore-existing)");
+                prog.directories_unchanged.inc();
+                Ok(DirectoryCreateResult::Skipped)
             } else if settings.overwrite {
                 // not a directory but overwrite is enabled - remove and create
                 tracing::info!("destination is not a directory, removing and creating a new one");
@@ -537,6 +554,13 @@ async fn create_symlink(
         Ok(()) => {
             common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
             prog.symlinks_created.inc();
+            Ok(())
+        }
+        Err(error)
+            if settings.ignore_existing && error.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            tracing::debug!("destination exists, skipping symlink (--ignore-existing)");
+            prog.symlinks_unchanged.inc();
             Ok(())
         }
         Err(error) if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -683,12 +707,13 @@ async fn process_control_stream(
                             .await
                             .context("Failed to add directory to tracker")?;
                     }
-                    DirectoryCreateResult::Failed => {
+                    DirectoryCreateResult::Skipped | DirectoryCreateResult::Failed => {
                         // mark as failed - descendants will be skipped.
-                        // only push the synthetic "not a directory" error when
+                        // for Skipped (--ignore-existing), this is intentional and not an error.
+                        // for Failed, push the synthetic "not a directory" error when
                         // create_directory returned Ok(Failed). when it returned
                         // Err(e), the real error (e.g. EACCES) was already pushed.
-                        if !error_already_pushed {
+                        if create_result == DirectoryCreateResult::Failed && !error_already_pushed {
                             error_collector.push(anyhow::anyhow!(
                                 "destination {dst:?} exists and is not a directory, use --overwrite to replace"
                             ));
@@ -708,7 +733,7 @@ async fn process_control_stream(
                                 )?;
                             }
                         }
-                        if settings.fail_early {
+                        if create_result == DirectoryCreateResult::Failed && settings.fail_early {
                             return Err(anyhow::anyhow!(
                                 "destination {dst:?} exists and is not a directory, use --overwrite to replace"
                             ));
