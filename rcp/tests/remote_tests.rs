@@ -15,6 +15,10 @@ fn get_file_content(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap()
 }
 
+fn get_file_mode(path: &std::path::Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
 fn interpret_exit_code(code: i32) -> String {
     match code {
         0 => "Success".to_string(),
@@ -4416,4 +4420,148 @@ fn test_remote_sudo_destination_dir_metadata_error_continues() {
         "both directories should be created (metadata errors happen after creation)"
     );
     eprintln!("✓ Copy continued after destination directory metadata errors");
+}
+
+#[test]
+fn test_remote_preserve_all_special_bits_on_directories() {
+    require_local_ssh();
+    let test_cases: &[(u32, &str)] = &[
+        (0o2755, "setgid"),
+        (0o4755, "setuid"),
+        (0o1755, "sticky"),
+        (0o7755, "setuid+setgid+sticky"),
+    ];
+    for &(mode, description) in test_cases {
+        let (src_dir, dst_dir) = setup_test_env();
+        let src_subdir = src_dir.path().join("dir");
+        std::fs::create_dir(&src_subdir).unwrap();
+        std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(mode)).unwrap();
+        create_test_file(&src_subdir.join("file.txt"), "content", 0o644);
+        let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+        let dst_subdir = dst_dir.path().join("dir");
+        let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+        run_rcp_and_expect_success(&["--preserve-settings=all", &src_remote, &dst_remote]);
+        assert_eq!(
+            get_file_mode(&dst_subdir),
+            mode,
+            "directory special bits not preserved for {description} ({mode:o})"
+        );
+    }
+}
+
+#[test]
+fn test_remote_default_strips_special_bits() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // directory with setgid
+    let src_subdir = src_dir.path().join("dir");
+    std::fs::create_dir(&src_subdir).unwrap();
+    std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(0o2755)).unwrap();
+    // file with setuid
+    create_test_file(&src_subdir.join("file.txt"), "content", 0o4755);
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_subdir = dst_dir.path().join("dir");
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    run_rcp_and_expect_success(&[&src_remote, &dst_remote]);
+    assert_eq!(
+        get_file_mode(&dst_subdir),
+        0o755,
+        "directory special bits should be stripped by default"
+    );
+    assert_eq!(
+        get_file_mode(&dst_subdir.join("file.txt")),
+        0o755,
+        "file special bits should be stripped by default"
+    );
+}
+
+#[test]
+fn test_remote_preserve_settings_dir_7777() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_subdir = src_dir.path().join("parent");
+    std::fs::create_dir(&src_subdir).unwrap();
+    std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(0o2755)).unwrap();
+    let src_child = src_subdir.join("child");
+    std::fs::create_dir(&src_child).unwrap();
+    std::fs::set_permissions(&src_child, std::fs::Permissions::from_mode(0o1755)).unwrap();
+    create_test_file(&src_child.join("file.txt"), "content", 0o4755);
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_subdir = dst_dir.path().join("parent");
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    run_rcp_and_expect_success(&[
+        "--preserve-settings",
+        "d:gid,time,7777",
+        &src_remote,
+        &dst_remote,
+    ]);
+    assert_eq!(
+        get_file_mode(&dst_subdir),
+        0o2755,
+        "parent dir setgid not preserved"
+    );
+    assert_eq!(
+        get_file_mode(&dst_subdir.join("child")),
+        0o1755,
+        "child dir sticky not preserved"
+    );
+    assert_eq!(
+        get_file_mode(&dst_subdir.join("child").join("file.txt")),
+        0o755,
+        "file setuid should be stripped"
+    );
+}
+
+#[test]
+fn test_remote_preserve_all_special_bits_on_files() {
+    require_local_ssh();
+    let test_cases: &[(u32, &str)] = &[
+        (0o4755, "setuid"),
+        (0o2755, "setgid"),
+        (0o1755, "sticky"),
+        (0o6755, "setuid+setgid"),
+        (0o7755, "setuid+setgid+sticky"),
+    ];
+    for &(mode, description) in test_cases {
+        let (src_dir, dst_dir) = setup_test_env();
+        let src_file = src_dir.path().join(format!("test_{mode:o}.txt"));
+        let dst_file = dst_dir.path().join(format!("test_{mode:o}.txt"));
+        create_test_file(&src_file, description, mode);
+        let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+        let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+        run_rcp_and_expect_success(&["--preserve-settings=all", &src_remote, &dst_remote]);
+        assert_eq!(get_file_content(&dst_file), description);
+        assert_eq!(
+            get_file_mode(&dst_file),
+            mode,
+            "file special bits not preserved for {description} ({mode:o})"
+        );
+    }
+}
+
+#[test]
+fn test_remote_preserve_settings_file_7777() {
+    require_local_ssh();
+    let test_cases: &[(u32, &str)] = &[
+        (0o4755, "setuid"),
+        (0o2755, "setgid"),
+        (0o1755, "sticky"),
+        (0o6755, "setuid+setgid"),
+        (0o7755, "setuid+setgid+sticky"),
+    ];
+    for &(mode, description) in test_cases {
+        let (src_dir, dst_dir) = setup_test_env();
+        let src_file = src_dir.path().join(format!("test_{mode:o}.txt"));
+        let dst_file = dst_dir.path().join(format!("test_{mode:o}.txt"));
+        create_test_file(&src_file, description, mode);
+        let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+        let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+        run_rcp_and_expect_success(&["--preserve-settings", "f:7777", &src_remote, &dst_remote]);
+        assert_eq!(get_file_content(&dst_file), description);
+        assert_eq!(
+            get_file_mode(&dst_file),
+            mode,
+            "file special bits not preserved for {description} ({mode:o})"
+        );
+    }
 }
