@@ -535,3 +535,93 @@ fn test_update_preserve_none_succeeds_with_allow_lossy() {
     .success();
     assert!(are_files_hardlinked(&src_file, &dst_file));
 }
+
+#[test]
+fn test_default_preserves_special_bits_on_directories() {
+    let test_cases: &[(u32, &str)] = &[
+        (0o2755, "setgid"),
+        (0o4755, "setuid"),
+        (0o1755, "sticky"),
+        (0o7755, "setuid+setgid+sticky"),
+    ];
+    for &(mode, description) in test_cases {
+        let (src_dir, dst_dir, _) = setup_test_env();
+        let src_subdir = src_dir.path().join("dir");
+        let dst_subdir = dst_dir.path().join("dir");
+        std::fs::create_dir(&src_subdir).unwrap();
+        std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(mode)).unwrap();
+        create_test_file(&src_subdir.join("file.txt"), "content", 0o644);
+        let mut cmd = assert_cmd::Command::cargo_bin("rlink").unwrap();
+        cmd.args([src_subdir.to_str().unwrap(), dst_subdir.to_str().unwrap()])
+            .assert()
+            .success();
+        assert_eq!(
+            get_file_mode(&dst_subdir),
+            mode,
+            "directory special bits not preserved for {description} ({mode:o})"
+        );
+        assert!(are_files_hardlinked(
+            &src_subdir.join("file.txt"),
+            &dst_subdir.join("file.txt")
+        ));
+    }
+}
+
+#[test]
+fn test_preserve_settings_none_strips_special_bits_on_directories() {
+    let (src_dir, dst_dir, _) = setup_test_env();
+    let src_subdir = src_dir.path().join("dir");
+    let dst_subdir = dst_dir.path().join("dir");
+    std::fs::create_dir(&src_subdir).unwrap();
+    std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(0o2755)).unwrap();
+    create_test_file(&src_subdir.join("file.txt"), "content", 0o644);
+    let mut cmd = assert_cmd::Command::cargo_bin("rlink").unwrap();
+    cmd.args([
+        "--preserve-settings",
+        "none",
+        src_subdir.to_str().unwrap(),
+        dst_subdir.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    assert_eq!(
+        get_file_mode(&dst_subdir),
+        0o755,
+        "directory special bits should be stripped with --preserve-settings=none"
+    );
+    assert!(are_files_hardlinked(
+        &src_subdir.join("file.txt"),
+        &dst_subdir.join("file.txt")
+    ));
+}
+
+#[test]
+fn test_preserve_settings_dir_7777_preserves_special_bits() {
+    let test_cases: &[(u32, &str)] = &[(0o2755, "setgid"), (0o1755, "sticky")];
+    for &(mode, description) in test_cases {
+        let (src_dir, dst_dir, _) = setup_test_env();
+        let src_subdir = src_dir.path().join("dir");
+        let dst_subdir = dst_dir.path().join("dir");
+        std::fs::create_dir(&src_subdir).unwrap();
+        std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(mode)).unwrap();
+        create_test_file(&src_subdir.join("file.txt"), "content", 0o644);
+        let mut cmd = assert_cmd::Command::cargo_bin("rlink").unwrap();
+        cmd.args([
+            "--preserve-settings",
+            "d:7777",
+            src_subdir.to_str().unwrap(),
+            dst_subdir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+        assert_eq!(
+            get_file_mode(&dst_subdir),
+            mode,
+            "directory special bits not preserved for {description} ({mode:o})"
+        );
+        assert!(are_files_hardlinked(
+            &src_subdir.join("file.txt"),
+            &dst_subdir.join("file.txt")
+        ));
+    }
+}

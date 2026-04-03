@@ -985,3 +985,255 @@ fn test_path_with_colons_is_local() {
         .stdout(predicates::str::contains("Starting rcpd").not());
     assert_eq!(get_file_content(&dst_file), "timestamp path content");
 }
+
+#[test]
+fn test_preserve_all_preserves_special_bits_on_directories() {
+    let test_cases: &[(u32, &str)] = &[
+        (0o2755, "setgid"),
+        (0o4755, "setuid"),
+        (0o1755, "sticky"),
+        (0o7755, "setuid+setgid+sticky"),
+    ];
+    for &(mode, description) in test_cases {
+        let (src_dir, dst_dir) = setup_test_env();
+        let src_subdir = src_dir.path().join("dir");
+        let dst_subdir = dst_dir.path().join("dir");
+        std::fs::create_dir(&src_subdir).unwrap();
+        std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(mode)).unwrap();
+        create_test_file(&src_subdir.join("file.txt"), "content", 0o644);
+        let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+        cmd.args([
+            "--preserve-settings=all",
+            src_subdir.to_str().unwrap(),
+            dst_subdir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+        assert_eq!(
+            get_file_mode(&dst_subdir),
+            mode,
+            "directory special bits not preserved for {description} ({mode:o})"
+        );
+    }
+}
+
+#[test]
+fn test_default_strips_special_bits_on_directories() {
+    let test_cases: &[(u32, &str)] = &[
+        (0o2755, "setgid"),
+        (0o4755, "setuid"),
+        (0o1755, "sticky"),
+        (0o7755, "setuid+setgid+sticky"),
+    ];
+    for &(mode, description) in test_cases {
+        let (src_dir, dst_dir) = setup_test_env();
+        let src_subdir = src_dir.path().join("dir");
+        let dst_subdir = dst_dir.path().join("dir");
+        std::fs::create_dir(&src_subdir).unwrap();
+        std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(mode)).unwrap();
+        create_test_file(&src_subdir.join("file.txt"), "content", 0o644);
+        let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+        cmd.args([src_subdir.to_str().unwrap(), dst_subdir.to_str().unwrap()])
+            .assert()
+            .success();
+        assert_eq!(
+            get_file_mode(&dst_subdir),
+            mode & 0o0777,
+            "directory special bits not stripped for {description} ({mode:o})"
+        );
+    }
+}
+
+#[test]
+fn test_preserve_settings_dir_gid_time_7777() {
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_subdir = src_dir.path().join("parent");
+    std::fs::create_dir(&src_subdir).unwrap();
+    std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(0o2755)).unwrap();
+    let src_child = src_subdir.join("child");
+    std::fs::create_dir(&src_child).unwrap();
+    std::fs::set_permissions(&src_child, std::fs::Permissions::from_mode(0o1755)).unwrap();
+    create_test_file(&src_child.join("file.txt"), "content", 0o4755);
+    let dst_subdir = dst_dir.path().join("parent");
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args([
+        "--preserve-settings",
+        "d:gid,time,7777",
+        src_subdir.to_str().unwrap(),
+        dst_subdir.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    // directories should preserve special bits (mode_mask=0o7777)
+    assert_eq!(
+        get_file_mode(&dst_subdir),
+        0o2755,
+        "parent dir setgid not preserved"
+    );
+    assert_eq!(
+        get_file_mode(&dst_subdir.join("child")),
+        0o1755,
+        "child dir sticky not preserved"
+    );
+    // file should have special bits stripped (default file mode_mask=0o0777)
+    assert_eq!(
+        get_file_mode(&dst_subdir.join("child").join("file.txt")),
+        0o755,
+        "file setuid should be stripped"
+    );
+}
+
+#[test]
+fn test_preserve_all_preserves_special_bits_on_files() {
+    let test_cases: &[(u32, &str)] = &[
+        (0o4755, "setuid"),
+        (0o2755, "setgid"),
+        (0o1755, "sticky"),
+        (0o6755, "setuid+setgid"),
+        (0o7755, "setuid+setgid+sticky"),
+    ];
+    for &(mode, description) in test_cases {
+        let (src_dir, dst_dir) = setup_test_env();
+        let src_file = src_dir.path().join(format!("test_{mode:o}.txt"));
+        let dst_file = dst_dir.path().join(format!("test_{mode:o}.txt"));
+        create_test_file(&src_file, description, mode);
+        let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+        cmd.args([
+            "--preserve-settings=all",
+            src_file.to_str().unwrap(),
+            dst_file.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+        assert_eq!(get_file_content(&dst_file), description);
+        assert_eq!(
+            get_file_mode(&dst_file),
+            mode,
+            "file special bits not preserved for {description} ({mode:o})"
+        );
+    }
+}
+
+#[test]
+fn test_preserve_settings_file_7777_preserves_special_bits() {
+    let test_cases: &[(u32, &str)] = &[
+        (0o4755, "setuid"),
+        (0o2755, "setgid"),
+        (0o1755, "sticky"),
+        (0o6755, "setuid+setgid"),
+        (0o7755, "setuid+setgid+sticky"),
+    ];
+    for &(mode, description) in test_cases {
+        let (src_dir, dst_dir) = setup_test_env();
+        let src_file = src_dir.path().join(format!("test_{mode:o}.txt"));
+        let dst_file = dst_dir.path().join(format!("test_{mode:o}.txt"));
+        create_test_file(&src_file, description, mode);
+        let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+        cmd.args([
+            "--preserve-settings",
+            "f:7777",
+            src_file.to_str().unwrap(),
+            dst_file.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+        assert_eq!(get_file_content(&dst_file), description);
+        assert_eq!(
+            get_file_mode(&dst_file),
+            mode,
+            "file special bits not preserved for {description} ({mode:o})"
+        );
+    }
+}
+
+#[test]
+fn test_default_strips_special_bits_on_files() {
+    let test_cases: &[(u32, u32, &str)] = &[
+        (0o4755, 0o755, "setuid"),
+        (0o2755, 0o755, "setgid"),
+        (0o1755, 0o755, "sticky"),
+        (0o7777, 0o777, "all special bits"),
+    ];
+    for &(src_mode, expected_mode, description) in test_cases {
+        let (src_dir, dst_dir) = setup_test_env();
+        let src_file = src_dir.path().join(format!("test_{src_mode:o}.txt"));
+        let dst_file = dst_dir.path().join(format!("test_{src_mode:o}.txt"));
+        create_test_file(&src_file, description, src_mode);
+        let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+        cmd.args([src_file.to_str().unwrap(), dst_file.to_str().unwrap()])
+            .assert()
+            .success();
+        assert_eq!(get_file_content(&dst_file), description);
+        assert_eq!(
+            get_file_mode(&dst_file),
+            expected_mode,
+            "file special bits not stripped for {description} ({src_mode:o})"
+        );
+    }
+}
+
+#[test]
+fn test_preserve_settings_symlink_uses_symlink_settings() {
+    // regression test: set_symlink_metadata must use settings.symlink, not
+    // settings.file. with "f:time", only file time is preserved; symlink
+    // time should NOT be preserved.
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_subdir = src_dir.path().join("dir");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("target.txt"), "content", 0o644);
+    create_symlink(std::path::Path::new("target.txt"), &src_subdir.join("link"));
+    // set symlink mtime to year 2000 so it's clearly distinguishable
+    let old_time = filetime::FileTime::from_unix_time(946_684_800, 0);
+    filetime::set_symlink_file_times(src_subdir.join("link"), old_time, old_time).unwrap();
+    let threshold =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+    let src_link_mtime = std::fs::symlink_metadata(src_subdir.join("link"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert!(
+        src_link_mtime < threshold,
+        "source symlink mtime should be year 2000"
+    );
+    // case 1: "f:time" should NOT preserve symlink time (symlink settings are default)
+    let dst_subdir1 = dst_dir.path().join("dir");
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args([
+        "--preserve-settings",
+        "f:time",
+        src_subdir.to_str().unwrap(),
+        dst_subdir1.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    assert!(dst_subdir1.join("link").is_symlink());
+    let dst_link1_mtime = std::fs::symlink_metadata(dst_subdir1.join("link"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert!(
+        dst_link1_mtime > threshold,
+        "symlink mtime should NOT be preserved with f:time (got old mtime)"
+    );
+    // case 2: "l:time" SHOULD preserve symlink time
+    let dst_dir2 = tempfile::tempdir().unwrap();
+    let dst_subdir2 = dst_dir2.path().join("dir");
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args([
+        "--preserve-settings",
+        "l:time",
+        src_subdir.to_str().unwrap(),
+        dst_subdir2.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    assert!(dst_subdir2.join("link").is_symlink());
+    let dst_link2_mtime = std::fs::symlink_metadata(dst_subdir2.join("link"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert!(
+        dst_link2_mtime < threshold,
+        "symlink mtime should be preserved with l:time (got recent mtime)"
+    );
+}
