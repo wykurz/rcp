@@ -438,6 +438,34 @@ async fn link_internal(
         }
     }
     if !src_metadata.is_dir() {
+        if settings.copy_settings.skip_specials {
+            tracing::debug!(
+                "skipping special file {:?} (type: {:?})",
+                src,
+                src_metadata.file_type()
+            );
+            if let Some(mode) = settings.dry_run {
+                match mode {
+                    crate::config::DryRunMode::Brief => {}
+                    crate::config::DryRunMode::All => println!("skip special {:?}", src),
+                    crate::config::DryRunMode::Explain => {
+                        println!(
+                            "skip special {:?} (unsupported file type: {:?})",
+                            src,
+                            src_metadata.file_type()
+                        );
+                    }
+                }
+            }
+            prog_track.specials_skipped.inc();
+            return Ok(Summary {
+                copy_summary: CopySummary {
+                    specials_skipped: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
         return Err(Error::new(
             anyhow!(
                 "copy: {:?} -> {:?} failed, unsupported src file type: {:?}",
@@ -596,6 +624,31 @@ async fn link_internal(
                 link_summary.copy_summary.files_skipped += 1;
                 prog_track.files_skipped.inc();
             }
+            continue;
+        }
+        // skip special files (sockets, FIFOs, devices) when --skip-specials is set
+        let is_special = entry_file_type
+            .as_ref()
+            .is_some_and(|ft| !ft.is_dir() && !ft.is_symlink() && !ft.is_file());
+        if settings.copy_settings.skip_specials && is_special {
+            tracing::debug!("skipping special file {:?}", &entry_path);
+            if let Some(mode) = settings.dry_run {
+                match mode {
+                    crate::config::DryRunMode::Brief => {}
+                    crate::config::DryRunMode::All => {
+                        println!("skip special {:?}", &entry_path)
+                    }
+                    crate::config::DryRunMode::Explain => {
+                        println!(
+                            "skip special {:?} (unsupported file type: {:?})",
+                            &entry_path,
+                            entry_file_type.unwrap()
+                        );
+                    }
+                }
+            }
+            link_summary.copy_summary.specials_skipped += 1;
+            prog_track.specials_skipped.inc();
             continue;
         }
         processed_files.insert(entry_name.to_owned());
@@ -846,6 +899,7 @@ mod link_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1527,6 +1581,7 @@ mod link_tests {
                         overwrite_filter: None,
                         ignore_existing: false,
                         chunk_size: 0,
+                        skip_specials: false,
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
@@ -1589,6 +1644,7 @@ mod link_tests {
                         overwrite_filter: None,
                         ignore_existing: false,
                         chunk_size: 0,
+                        skip_specials: false,
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
@@ -1639,6 +1695,7 @@ mod link_tests {
                         overwrite_filter: None,
                         ignore_existing: false,
                         chunk_size: 0,
+                        skip_specials: false,
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
@@ -1693,6 +1750,7 @@ mod link_tests {
                         overwrite_filter: None,
                         ignore_existing: false,
                         chunk_size: 0,
+                        skip_specials: false,
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
@@ -1747,6 +1805,7 @@ mod link_tests {
                         overwrite_filter: None,
                         ignore_existing: false,
                         chunk_size: 0,
+                        skip_specials: false,
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
@@ -1811,6 +1870,7 @@ mod link_tests {
                         overwrite_filter: None,
                         ignore_existing: false,
                         chunk_size: 0,
+                        skip_specials: false,
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
@@ -1877,6 +1937,7 @@ mod link_tests {
                         overwrite_filter: None,
                         ignore_existing: false,
                         chunk_size: 0,
+                        skip_specials: false,
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
@@ -1949,6 +2010,7 @@ mod link_tests {
                         overwrite_filter: None,
                         ignore_existing: false,
                         chunk_size: 0,
+                        skip_specials: false,
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
@@ -2018,6 +2080,7 @@ mod link_tests {
                         overwrite_filter: None,
                         ignore_existing: false,
                         chunk_size: 0,
+                        skip_specials: false,
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
@@ -2087,6 +2150,7 @@ mod link_tests {
                         overwrite_filter: None,
                         ignore_existing: false,
                         chunk_size: 0,
+                        skip_specials: false,
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
@@ -2157,6 +2221,7 @@ mod link_tests {
                         overwrite_filter: None,
                         ignore_existing: false,
                         chunk_size: 0,
+                        skip_specials: false,
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
@@ -2206,6 +2271,7 @@ mod link_tests {
                         overwrite_filter: None,
                         ignore_existing: false,
                         chunk_size: 0,
+                        skip_specials: false,
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
@@ -2260,6 +2326,7 @@ mod link_tests {
                         overwrite_filter: None,
                         ignore_existing: false,
                         chunk_size: 0,
+                        skip_specials: false,
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
@@ -2340,6 +2407,52 @@ mod link_tests {
              got directories_created={} (expected >= 2: dst/ and dst/sub/)",
             error.summary.copy_summary.directories_created
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn skip_specials_skips_socket_in_link() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let src = test_path.join("src_dir");
+        let dst = test_path.join("dst_dir");
+        tokio::fs::create_dir(&src).await?;
+        tokio::fs::write(src.join("file.txt"), "hello").await?;
+        let _listener = std::os::unix::net::UnixListener::bind(src.join("test.sock"))?;
+        let mut settings = common_settings(false, false);
+        settings.copy_settings.skip_specials = true;
+        let summary = link(&PROGRESS, test_path, &src, &dst, &None, &settings, false).await?;
+        assert_eq!(summary.hard_links_created, 1);
+        assert_eq!(summary.copy_summary.specials_skipped, 1);
+        assert!(dst.join("file.txt").exists());
+        assert!(!dst.join("test.sock").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn skip_specials_top_level_socket_in_link() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let src_socket = test_path.join("test.sock");
+        let dst = test_path.join("dst.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&src_socket)?;
+        let mut settings = common_settings(false, false);
+        settings.copy_settings.skip_specials = true;
+        let summary = link(
+            &PROGRESS,
+            test_path,
+            &src_socket,
+            &dst,
+            &None,
+            &settings,
+            false,
+        )
+        .await?;
+        assert_eq!(summary.copy_summary.specials_skipped, 1);
+        assert_eq!(summary.hard_links_created, 0);
+        assert!(!dst.exists());
         Ok(())
     }
 }

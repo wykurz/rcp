@@ -6,6 +6,21 @@ fn progress() -> &'static common::progress::Progress {
     common::get_progress()
 }
 
+/// increment the appropriate skipped counter based on file type.
+/// special files (sockets, FIFOs, devices) that are filtered out count as files_skipped,
+/// matching local copy behavior. specials_skipped is only for --skip-specials.
+fn count_skipped(metadata: &std::fs::Metadata) {
+    let p = progress();
+    if metadata.is_dir() {
+        p.directories_skipped.inc();
+    } else if metadata.is_symlink() {
+        p.symlinks_skipped.inc();
+    } else {
+        // regular files and special files (sockets, FIFOs, devices)
+        p.files_skipped.inc();
+    }
+}
+
 /// Collected child entry from a directory pre-read.
 struct ChildEntry {
     src_path: std::path::PathBuf,
@@ -59,6 +74,7 @@ async fn send_directories_and_symlinks(
             common::filter::FilterResult::Included => { /* proceed */ }
             _ => {
                 tracing::debug!("Filtered out {:?}: {:?}", src, result);
+                count_skipped(&src_metadata);
                 return Ok(());
             }
         }
@@ -106,10 +122,29 @@ async fn send_directories_and_symlinks(
             .await;
     }
     if !src_metadata.is_dir() {
-        assert!(
-            src_metadata.is_file(),
-            "Encountered fs object that's not a directory, symlink or a file? {src:?}"
-        );
+        if !src_metadata.is_file() {
+            // special file (socket, FIFO, device)
+            if settings.skip_specials {
+                tracing::debug!(
+                    "skipping special file {:?} (type: {:?})",
+                    src,
+                    src_metadata.file_type()
+                );
+                progress().specials_skipped.inc();
+            } else {
+                let err = anyhow::anyhow!(
+                    "copy: {:?} -> {:?} failed, unsupported src file type: {:?}",
+                    src,
+                    dst,
+                    src_metadata.file_type()
+                );
+                tracing::error!("{:#}", &err);
+                if settings.fail_early || is_root {
+                    return Err(err);
+                }
+                error_collector.push(err);
+            }
+        }
         return Ok(());
     }
     // pre-read directory children to compute entry counts before sending Directory message
@@ -172,6 +207,11 @@ async fn send_directories_and_symlinks(
                         common::filter::FilterResult::Included => { /* proceed */ }
                         common::filter::FilterResult::ExcludedByPattern(_) => {
                             tracing::debug!("Filtered out {:?}", entry_path);
+                            // only count dirs/symlinks here; files are counted
+                            // in send_files_in_directory_tcp which re-traverses
+                            if !entry_metadata.is_file() {
+                                count_skipped(&entry_metadata);
+                            }
                             continue;
                         }
                         common::filter::FilterResult::ExcludedByDefault => {
@@ -186,11 +226,17 @@ async fn send_directories_and_symlinks(
                                 }
                                 if !could_match {
                                     tracing::debug!("Filtered out {:?}", entry_path);
+                                    count_skipped(&entry_metadata);
                                     continue;
                                 }
                                 // directory might contain matches - include it
                             } else {
                                 tracing::debug!("Filtered out {:?}", entry_path);
+                                // only count symlinks here; files are counted
+                                // in send_files_in_directory_tcp
+                                if !entry_metadata.is_file() {
+                                    count_skipped(&entry_metadata);
+                                }
                                 continue;
                             }
                         }
@@ -207,6 +253,21 @@ async fn send_directories_and_symlinks(
                     symlink_children.push(child);
                 } else if child.metadata.is_dir() {
                     dir_children.push(child);
+                } else if settings.skip_specials {
+                    tracing::debug!("skipping special file {:?}", &child.src_path);
+                    progress().specials_skipped.inc();
+                } else {
+                    let err = anyhow::anyhow!(
+                        "copy: {:?} -> {:?} failed, unsupported src file type: {:?}",
+                        &child.src_path,
+                        &child.dst_path,
+                        child.metadata.file_type()
+                    );
+                    tracing::error!("{:#}", &err);
+                    if settings.fail_early {
+                        return Err(err);
+                    }
+                    error_collector.push(err);
                 }
             }
             Ok(None) => break,
@@ -319,8 +380,13 @@ async fn send_fs_objects_tcp(
         }
     };
     // determine if we have a root item to send (for DirStructureComplete message)
-    // check filter for all types (files, directories, symlinks)
-    let has_root_item = if let Some(ref filter) = settings.filter {
+    // special files (sockets, FIFOs, devices) never produce protocol messages,
+    // so they never count as root items regardless of --skip-specials
+    let is_special =
+        !src_metadata.is_file() && !src_metadata.is_dir() && !src_metadata.is_symlink();
+    let has_root_item = if is_special {
+        false
+    } else if let Some(ref filter) = settings.filter {
         // for root items, use should_include_root_item which skips anchored patterns
         // (anchored patterns match paths inside the source, not the source itself)
         let file_name = src.file_name().map(std::path::Path::new).unwrap_or(src);
@@ -358,6 +424,10 @@ async fn send_fs_objects_tcp(
         })
         .await?;
     drop(stream);
+    if src_metadata.is_file() && !has_root_item {
+        // root file was filtered out
+        progress().files_skipped.inc();
+    }
     if src_metadata.is_file() && has_root_item {
         // root file
         if let Err(e) = send_file_tcp(
@@ -572,6 +642,7 @@ async fn send_files_in_directory_tcp(
                                     relative_path,
                                     result
                                 );
+                                progress().files_skipped.inc();
                                 continue;
                             }
                         }
@@ -1246,6 +1317,9 @@ async fn dry_run_traverse(
         if should_process {
             summary.files_copied += 1;
             summary.bytes_copied += src_metadata.len();
+        } else {
+            summary.files_skipped += 1;
+            progress().files_skipped.inc();
         }
         return Ok(());
     }
@@ -1272,10 +1346,43 @@ async fn dry_run_traverse(
         }
         if should_process {
             summary.symlinks_created += 1;
+        } else {
+            summary.symlinks_skipped += 1;
+            progress().symlinks_skipped.inc();
         }
         return Ok(());
     }
     if !src_metadata.is_dir() {
+        // special file (socket, FIFO, device)
+        if !should_process {
+            // filtered out by include/exclude - count as files_skipped (matching local copy)
+            summary.files_skipped += 1;
+            progress().files_skipped.inc();
+        } else if settings.skip_specials {
+            if should_report {
+                tracing::info!(
+                    target: "dry_run",
+                    "skip (special file): {:?} -> {:?} [type: {:?}]",
+                    src,
+                    dst,
+                    src_metadata.file_type()
+                );
+            }
+            summary.specials_skipped += 1;
+            progress().specials_skipped.inc();
+        } else {
+            // without --skip-specials, real copy would error on this file type
+            let err = anyhow::anyhow!(
+                "dry-run: {:?} -> {:?} unsupported file type: {:?}",
+                src,
+                dst,
+                src_metadata.file_type()
+            );
+            tracing::error!("{:#}", &err);
+            if settings.fail_early {
+                return Err(err);
+            }
+        }
         return Ok(());
     }
     // directory
@@ -1288,18 +1395,13 @@ async fn dry_run_traverse(
             dst
         );
     }
-    // save current counts before recursing to detect if anything was added
-    let before_files = summary.files_copied;
-    let before_symlinks = summary.symlinks_created;
-    let before_dirs = summary.directories_created;
-    if should_process {
-        summary.directories_created += 1;
-    }
     // if filtered out, check whether to stop or still traverse
     if !should_process {
         match &filter_result {
             // explicitly excluded by pattern - never traverse (excludes are absolute)
             common::filter::FilterResult::ExcludedByPattern(_) => {
+                summary.directories_skipped += 1;
+                progress().directories_skipped.inc();
                 return Ok(());
             }
             // no include pattern matched - traverse only if could contain matches
@@ -1318,15 +1420,27 @@ async fn dry_run_traverse(
                         }
                     }
                     if !should_traverse {
+                        summary.directories_skipped += 1;
+                        progress().directories_skipped.inc();
                         return Ok(());
                     }
+                    // will traverse looking for matches - defer created/skipped decision
                 } else {
+                    summary.directories_skipped += 1;
+                    progress().directories_skipped.inc();
                     return Ok(());
                 }
             }
             // included - will be processed, continue to recurse
             common::filter::FilterResult::Included => {}
         }
+    }
+    // save current counts before recursing to detect if anything was added
+    let before_files = summary.files_copied;
+    let before_symlinks = summary.symlinks_created;
+    let before_dirs = summary.directories_created;
+    if should_process {
+        summary.directories_created += 1;
     }
     // recurse into children
     let mut entries = match tokio::fs::read_dir(src).await {
@@ -1376,17 +1490,29 @@ async fn dry_run_traverse(
     // if nothing was added AND this directory doesn't directly match an include pattern,
     // we should not count it (it was only traversed to look for potential matches).
     // the root directory is never uncounted — it's the user-specified source.
-    if should_process && !is_root {
+    if !is_root {
         let child_content_added = summary.files_copied > before_files
             || summary.symlinks_created > before_symlinks
-            || summary.directories_created > before_dirs + 1; // +1 for this dir
-        if !child_content_added {
-            if let Some(ref filter) = settings.filter {
-                let relative_path = src.strip_prefix(source_root).unwrap_or(src);
-                if !filter.directly_matches_include(relative_path, true) {
-                    // directory was only traversed, don't count it
-                    summary.directories_created -= 1;
+            || summary.directories_created > before_dirs + if should_process { 1 } else { 0 };
+        if should_process {
+            // directly matched directory: un-count if nothing was added and not
+            // directly matched by an include pattern
+            if !child_content_added {
+                if let Some(ref filter) = settings.filter {
+                    let relative_path = src.strip_prefix(source_root).unwrap_or(src);
+                    if !filter.directly_matches_include(relative_path, true) {
+                        summary.directories_created -= 1;
+                    }
                 }
+            }
+        } else {
+            // traversed-only directory: promote to created if descendants matched,
+            // otherwise count as skipped
+            if child_content_added {
+                summary.directories_created += 1;
+            } else {
+                summary.directories_skipped += 1;
+                progress().directories_skipped.inc();
             }
         }
     }
@@ -1579,13 +1705,21 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
         }
     }
     tracing::info!("Source is done");
-    // source doesn't track summary - destination is authoritative
+    // destination is authoritative for copy/unchanged/removed counts, but
+    // skip counts are source-side only (destination never encounters skipped items)
+    let summary = common::copy::Summary {
+        files_skipped: progress().files_skipped.get() as usize,
+        symlinks_skipped: progress().symlinks_skipped.get() as usize,
+        directories_skipped: progress().directories_skipped.get() as usize,
+        specials_skipped: progress().specials_skipped.get() as usize,
+        ..Default::default()
+    };
     match error_collector.take_error() {
         Some(err) => Err(common::copy::Error {
             source: err,
-            summary: common::copy::Summary::default(),
+            summary,
         }
         .into()),
-        None => Ok(("source OK".to_string(), common::copy::Summary::default())),
+        None => Ok(("source OK".to_string(), summary)),
     }
 }

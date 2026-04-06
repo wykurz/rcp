@@ -565,10 +565,15 @@ The directory is still marked complete and parent notifications still propagate.
 
 ### 7.7 Summary Statistics Authority
 
-The destination is the authoritative source for operation statistics:
-- Destination knows what actually landed on disk
-- Source may send files that destination skips or fails to write
-- Master uses only destination's summary for user reporting
+The master merges source and destination summaries based on mode:
+
+- **Normal mode**: destination is authoritative for copy/create/unchanged/remove counts
+  (it knows what actually landed on disk). Source is authoritative for skip counts
+  (filtered and special-file skips happen before items reach the destination).
+- **Dry-run mode**: source is authoritative for all counts (destination is idle).
+
+Skip counts (`files_skipped`, `symlinks_skipped`, `directories_skipped`,
+`specials_skipped`) always come from the source regardless of mode.
 
 ### 7.8 Backpressure
 

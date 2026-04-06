@@ -75,6 +75,10 @@ struct Args {
     #[arg(long, conflicts_with = "overwrite", help_heading = "Copy options")]
     ignore_existing: bool,
 
+    /// Skip special files (sockets, FIFOs, devices) without error
+    #[arg(long, help_heading = "Copy options")]
+    skip_specials: bool,
+
     /// Exit on first error
     #[arg(short = 'e', long = "fail-early", help_heading = "Copy options")]
     fail_early: bool,
@@ -459,6 +463,7 @@ async fn run_rcpd_master(
         overwrite_compare: args.overwrite_compare.clone(),
         overwrite_filter: args.overwrite_filter.map(|f| f.to_string()),
         ignore_existing: args.ignore_existing,
+        skip_specials: args.skip_specials,
         debug_log_prefix: args.rcpd_debug_log_prefix.clone(),
         port_ranges: args.port_ranges.clone(),
         progress: args.progress,
@@ -791,36 +796,49 @@ async fn run_rcpd_master(
         }
     }
     tracing::info!("All rcpd processes finished");
+    // merge source and destination summaries:
+    // - in dry-run mode the source does all the counting (destination is idle)
+    // - in normal mode the destination is authoritative for copy/create/unchanged/remove
+    //   counts and the source is authoritative for skip counts
+    let is_dry_run = args.dry_run.is_some();
+    let merge_summaries = |source: common::copy::Summary, dest: common::copy::Summary| {
+        // for copy/create/unchanged/remove: destination in normal mode, source in dry-run
+        let primary = if is_dry_run { &source } else { &dest };
+        common::copy::Summary {
+            bytes_copied: primary.bytes_copied,
+            files_copied: primary.files_copied,
+            symlinks_created: primary.symlinks_created,
+            directories_created: primary.directories_created,
+            files_unchanged: primary.files_unchanged,
+            symlinks_unchanged: primary.symlinks_unchanged,
+            directories_unchanged: primary.directories_unchanged,
+            // skip counts are always source-only
+            files_skipped: source.files_skipped,
+            symlinks_skipped: source.symlinks_skipped,
+            directories_skipped: source.directories_skipped,
+            specials_skipped: source.specials_skipped,
+            rm_summary: common::rm::Summary {
+                bytes_removed: primary.rm_summary.bytes_removed,
+                files_removed: primary.rm_summary.files_removed,
+                symlinks_removed: primary.rm_summary.symlinks_removed,
+                directories_removed: primary.rm_summary.directories_removed,
+                files_skipped: primary.rm_summary.files_skipped,
+                symlinks_skipped: primary.rm_summary.symlinks_skipped,
+                directories_skipped: primary.rm_summary.directories_skipped,
+            },
+        }
+    };
     // propagate any errors from rcpd processes
     if !errors.is_empty() {
         let combined_error = errors.join("; ");
         tracing::error!("rcpd operation(s) failed: {combined_error}");
-        // for errors, use whichever summary has data (source for dry-run, dest for normal)
-        let summary = if source_summary.files_copied > 0
-            || source_summary.directories_created > 0
-            || source_summary.symlinks_created > 0
-        {
-            source_summary
-        } else {
-            dest_summary
-        };
         return Err(common::copy::Error::new(
             anyhow::anyhow!("rcpd operation(s) failed: {combined_error}"),
-            summary,
+            merge_summaries(source_summary, dest_summary),
         )
         .into());
     }
-    // for dry-run, use source summary (source does all traversal/counting)
-    // for normal copy, use destination summary (destination does actual writes)
-    let summary = if source_summary.files_copied > 0
-        || source_summary.directories_created > 0
-        || source_summary.symlinks_created > 0
-    {
-        source_summary
-    } else {
-        dest_summary
-    };
-    Ok(summary)
+    Ok(merge_summaries(source_summary, dest_summary))
 }
 
 #[instrument]
@@ -1030,6 +1048,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         overwrite_filter: args.overwrite_filter,
         ignore_existing: args.ignore_existing,
         chunk_size: args.chunk_size.0,
+        skip_specials: args.skip_specials,
         // for local copy, buffer size is not used (bypasses user-mode buffering)
         remote_copy_buffer_size: 0,
         filter,
