@@ -3,7 +3,6 @@ use async_recursion::async_recursion;
 use std::os::linux::fs::MetadataExt as LinuxMetadataExt;
 use tracing::instrument;
 
-use crate::config::DryRunMode;
 use crate::copy;
 use crate::copy::{
     check_empty_dir_cleanup, EmptyDirAction, Settings as CopySettings, Summary as CopySummary,
@@ -50,38 +49,6 @@ pub struct Settings {
     pub dry_run: Option<crate::config::DryRunMode>,
     /// metadata preservation settings
     pub preserve: preserve::Settings,
-}
-
-/// Reports a dry-run action for link operations
-fn report_dry_run_link(src: &std::path::Path, dst: &std::path::Path, entry_type: &str) {
-    println!("would link {} {:?} -> {:?}", entry_type, src, dst);
-}
-
-/// Reports a skipped entry during dry-run
-fn report_dry_run_skip(
-    path: &std::path::Path,
-    result: &FilterResult,
-    mode: DryRunMode,
-    entry_type: &str,
-) {
-    match mode {
-        DryRunMode::Brief => { /* brief mode doesn't show skipped files */ }
-        DryRunMode::All => {
-            println!("skip {} {:?}", entry_type, path);
-        }
-        DryRunMode::Explain => match result {
-            FilterResult::ExcludedByDefault => {
-                println!(
-                    "skip {} {:?} (no include pattern matched)",
-                    entry_type, path
-                );
-            }
-            FilterResult::ExcludedByPattern(pattern) => {
-                println!("skip {} {:?} (excluded by '{}')", entry_type, path, pattern);
-            }
-            FilterResult::Included => { /* shouldn't happen */ }
-        },
-    }
 }
 
 /// Check if a path should be filtered out
@@ -224,7 +191,7 @@ pub async fn link(
                         } else {
                             "file"
                         };
-                        report_dry_run_skip(src, &result, mode, entry_type);
+                        crate::dry_run::report_skip(src, &result, mode, entry_type);
                     }
                     // return summary with skipped count
                     let skipped_summary = if src_metadata.is_dir() {
@@ -403,7 +370,7 @@ async fn link_internal(
         if src_metadata.is_file() {
             // handle dry-run mode for top-level files
             if settings.dry_run.is_some() {
-                report_dry_run_link(src, dst, "file");
+                crate::dry_run::report_action("link", src, Some(dst), "file");
                 return Ok(Summary {
                     hard_links_created: 1,
                     ..Default::default()
@@ -484,7 +451,7 @@ async fn link_internal(
         .map_err(|err| Error::new(err, Default::default()))?;
     // handle dry-run mode for directories at the top level
     if settings.dry_run.is_some() {
-        report_dry_run_link(src, dst, "dir");
+        crate::dry_run::report_action("link", src, Some(dst), "dir");
         // still need to recurse to show contents
     }
     let copy_summary = if settings.dry_run.is_some() {
@@ -610,7 +577,7 @@ async fn link_internal(
                 } else {
                     "file"
                 };
-                report_dry_run_skip(&entry_path, &skip_result, mode, entry_type);
+                crate::dry_run::report_skip(&entry_path, &skip_result, mode, entry_type);
             }
             tracing::debug!("skipping {:?} due to filter", &entry_path);
             // increment skipped counters
@@ -663,7 +630,7 @@ async fn link_internal(
             } else {
                 "file"
             };
-            report_dry_run_link(&entry_path, &dst_path, entry_type);
+            crate::dry_run::report_action("link", &entry_path, Some(&dst_path), entry_type);
             // for directories in dry-run, still need to recurse to show all entries
             if entry_is_dir {
                 let settings = settings.clone();
