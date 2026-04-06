@@ -163,6 +163,7 @@ pub struct Progress {
     pub files_skipped: TlsCounter,
     pub symlinks_skipped: TlsCounter,
     pub directories_skipped: TlsCounter,
+    pub specials_skipped: TlsCounter,
     start_time: std::time::Instant,
 }
 
@@ -187,6 +188,7 @@ impl Progress {
             files_skipped: Default::default(),
             symlinks_skipped: Default::default(),
             directories_skipped: Default::default(),
+            specials_skipped: Default::default(),
             start_time: std::time::Instant::now(),
         }
     }
@@ -222,6 +224,7 @@ pub struct SerializableProgress {
     pub files_skipped: u64,
     pub symlinks_skipped: u64,
     pub directories_skipped: u64,
+    pub specials_skipped: u64,
     pub current_time: std::time::SystemTime,
 }
 
@@ -246,6 +249,7 @@ impl Default for SerializableProgress {
             files_skipped: 0,
             symlinks_skipped: 0,
             directories_skipped: 0,
+            specials_skipped: 0,
             current_time: std::time::SystemTime::now(),
         }
     }
@@ -273,6 +277,7 @@ impl From<&Progress> for SerializableProgress {
             files_skipped: progress.files_skipped.get(),
             symlinks_skipped: progress.symlinks_skipped.get(),
             directories_skipped: progress.directories_skipped.get(),
+            specials_skipped: progress.specials_skipped.get(),
             current_time: std::time::SystemTime::now(),
         }
     }
@@ -341,7 +346,8 @@ impl<'a> ProgressPrinter<'a> {
             SKIPPED:\n\
             files:       {:>10}\n\
             symlinks:    {:>10}\n\
-            directories: {:>10}",
+            directories: {:>10}\n\
+            specials:    {:>10}",
             ops.started - ops.finished, // pending
             average_ops_rate,
             current_ops_rate,
@@ -367,6 +373,7 @@ impl<'a> ProgressPrinter<'a> {
             self.progress.files_skipped.get(),
             self.progress.symlinks_skipped.get(),
             self.progress.directories_skipped.get(),
+            self.progress.specials_skipped.get(),
         ))
     }
 }
@@ -487,6 +494,7 @@ impl RcpdProgressPrinter {
             files:       {:>10}\n\
             symlinks:    {:>10}\n\
             directories: {:>10}\n\
+            specials:    {:>10}\n\
             ==== DESTINATION ====\n\
             OPS:\n\
             pending: {:>10}\n\
@@ -527,6 +535,7 @@ impl RcpdProgressPrinter {
             source_progress.files_skipped,
             source_progress.symlinks_skipped,
             source_progress.directories_skipped,
+            source_progress.specials_skipped,
             // destination section
             dest_progress.ops_started - dest_progress.ops_finished, // pending
             dest_ops_rate_avg,

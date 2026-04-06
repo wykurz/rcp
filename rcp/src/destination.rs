@@ -999,6 +999,7 @@ pub async fn run_destination(
         files_skipped: 0,
         symlinks_skipped: 0,
         directories_skipped: 0,
+        specials_skipped: 0,
         rm_summary: common::rm::Summary {
             bytes_removed: prog.bytes_removed.get(),
             files_removed: prog.files_removed.get() as usize,

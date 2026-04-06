@@ -806,6 +806,7 @@ mod cmp_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,

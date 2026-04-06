@@ -59,6 +59,10 @@ struct Args {
     #[arg(long, conflicts_with = "overwrite", help_heading = "Copy options")]
     ignore_existing: bool,
 
+    /// Skip special files (sockets, FIFOs, devices) without error
+    #[arg(long, help_heading = "Copy options")]
+    skip_specials: bool,
+
     /// Exit on first error
     #[arg(short = 'e', long = "fail-early", help_heading = "Copy options")]
     fail_early: bool,
@@ -348,6 +352,7 @@ where
                 overwrite_filter: args.overwrite_filter,
                 ignore_existing: args.ignore_existing,
                 chunk_size: args.chunk_size,
+                skip_specials: args.skip_specials,
                 remote_copy_buffer_size: tcp_config.effective_buffer_size(),
                 filter,
                 dry_run,
@@ -376,9 +381,16 @@ where
                 }
                 Err(error) => {
                     let runtime_stats = common::collect_runtime_stats();
+                    // try to extract the real summary from common::copy::Error
+                    let (error_msg, summary) = match error.downcast::<common::copy::Error>() {
+                        Ok(copy_error) => (format!("{:#}", copy_error.source), copy_error.summary),
+                        Err(other_error) => {
+                            (format!("{other_error:#}"), common::copy::Summary::default())
+                        }
+                    };
                     remote::protocol::RcpdResult::Failure {
-                        error: format!("{error:#}"),
-                        summary: common::copy::Summary::default(),
+                        error: error_msg,
+                        summary,
                         runtime_stats,
                     }
                 }
@@ -409,6 +421,7 @@ where
                 overwrite_filter: args.overwrite_filter,
                 ignore_existing: args.ignore_existing,
                 chunk_size: args.chunk_size,
+                skip_specials: args.skip_specials,
                 remote_copy_buffer_size: tcp_config.effective_buffer_size(),
                 filter: None,
                 dry_run: None,

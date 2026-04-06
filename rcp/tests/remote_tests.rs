@@ -229,6 +229,10 @@ fn parse_summary_from_output(output: &std::process::Output) -> Option<common::co
         parse_field!(line, "files removed: ", summary.rm_summary.files_removed, found_any);
         parse_field!(line, "symlinks removed: ", summary.rm_summary.symlinks_removed, found_any);
         parse_field!(line, "directories removed: ", summary.rm_summary.directories_removed, found_any);
+        parse_field!(line, "files skipped: ", summary.files_skipped, found_any);
+        parse_field!(line, "symlinks skipped: ", summary.symlinks_skipped, found_any);
+        parse_field!(line, "directories skipped: ", summary.directories_skipped, found_any);
+        parse_field!(line, "specials skipped: ", summary.specials_skipped, found_any);
         // special handling for bytes_removed which has a unit suffix (e.g., "40 B")
         if let Some(value_str) = line.strip_prefix("bytes removed: ") {
             if let Some(num_str) = value_str.split_whitespace().next() {
@@ -4564,4 +4568,29 @@ fn test_remote_preserve_settings_file_7777() {
             "file special bits not preserved for {description} ({mode:o})"
         );
     }
+}
+
+/// Test that --skip-specials correctly skips sockets in remote copy and reports the count
+#[test]
+fn test_remote_skip_specials() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_path = src_dir.path().join("src");
+    let dst_path = dst_dir.path().join("dst");
+    std::fs::create_dir(&src_path).unwrap();
+    create_test_file(&src_path.join("file.txt"), "hello", 0o644);
+    // create a unix socket inside the source directory
+    let _listener = std::os::unix::net::UnixListener::bind(src_path.join("test.sock")).unwrap();
+    let src_remote = format!("localhost:{}", src_path.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_path.to_str().unwrap());
+    let output =
+        run_rcp_and_expect_success(&["--skip-specials", "--summary", &src_remote, &dst_remote]);
+    let summary = parse_summary_from_output(&output).expect("should parse summary");
+    assert_eq!(summary.files_copied, 1, "should copy the regular file");
+    assert_eq!(
+        summary.specials_skipped, 1,
+        "should report 1 skipped special in summary"
+    );
+    assert!(dst_path.join("file.txt").exists());
+    assert!(!dst_path.join("test.sock").exists());
 }

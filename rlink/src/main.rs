@@ -38,6 +38,10 @@ struct Args {
     #[arg(short = 'e', long = "fail-early", help_heading = "Linking options")]
     fail_early: bool,
 
+    /// Skip special files (sockets, FIFOs, devices) without error
+    #[arg(long, help_heading = "Linking options")]
+    skip_specials: bool,
+
     /// Directory with updated contents of `link`
     #[arg(long, value_name = "PATH", help_heading = "Linking options")]
     update: Option<std::path::PathBuf>,
@@ -282,6 +286,7 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: args.chunk_size,
+                skip_specials: args.skip_specials,
                 remote_copy_buffer_size: 0, // not used for local operations
                 filter: filter.clone(),
                 dry_run: args.dry_run,

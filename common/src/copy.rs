@@ -66,6 +66,8 @@ pub struct Settings {
     pub overwrite_filter: Option<OverwriteFilter>,
     pub ignore_existing: bool,
     pub chunk_size: u64,
+    /// Skip special files (sockets, FIFOs, devices) without error.
+    pub skip_specials: bool,
     /// Buffer size for remote copy file transfer operations in bytes.
     ///
     /// This is only used for remote copy operations and controls the buffer size
@@ -326,6 +328,7 @@ pub struct Summary {
     pub files_skipped: usize,
     pub symlinks_skipped: usize,
     pub directories_skipped: usize,
+    pub specials_skipped: usize,
     pub rm_summary: RmSummary,
 }
 
@@ -343,6 +346,7 @@ impl std::ops::Add for Summary {
             files_skipped: self.files_skipped + other.files_skipped,
             symlinks_skipped: self.symlinks_skipped + other.symlinks_skipped,
             directories_skipped: self.directories_skipped + other.directories_skipped,
+            specials_skipped: self.specials_skipped + other.specials_skipped,
             rm_summary: self.rm_summary + other.rm_summary,
         }
     }
@@ -364,6 +368,7 @@ impl std::fmt::Display for Summary {
             files skipped: {}\n\
             symlinks skipped: {}\n\
             directories skipped: {}\n\
+            specials skipped: {}\n\
             \n\
             delete:\n\
             -------\n\
@@ -378,6 +383,7 @@ impl std::fmt::Display for Summary {
             self.files_skipped,
             self.symlinks_skipped,
             self.directories_skipped,
+            self.specials_skipped,
             &self.rm_summary,
         )
     }
@@ -646,6 +652,31 @@ async fn copy_internal(
         });
     }
     if !src_metadata.is_dir() {
+        if settings.skip_specials {
+            tracing::debug!(
+                "skipping special file {:?} (type: {:?})",
+                src,
+                src_metadata.file_type()
+            );
+            if let Some(mode) = settings.dry_run {
+                match mode {
+                    DryRunMode::Brief => {}
+                    DryRunMode::All => println!("skip special {:?}", src),
+                    DryRunMode::Explain => {
+                        println!(
+                            "skip special {:?} (unsupported file type: {:?})",
+                            src,
+                            src_metadata.file_type()
+                        );
+                    }
+                }
+            }
+            prog_track.specials_skipped.inc();
+            return Ok(Summary {
+                specials_skipped: 1,
+                ..Default::default()
+            });
+        }
         return Err(Error::new(
             anyhow!(
                 "copy: {:?} -> {:?} failed, unsupported src file type: {:?}",
@@ -830,6 +861,29 @@ async fn copy_internal(
             }
             continue;
         }
+        // skip special files (sockets, FIFOs, devices) when --skip-specials is set
+        let is_special = entry_file_type
+            .as_ref()
+            .is_some_and(|ft| !ft.is_dir() && !ft.is_symlink() && !ft.is_file());
+        if settings.skip_specials && is_special {
+            tracing::debug!("skipping special file {:?}", &entry_path);
+            if let Some(mode) = settings.dry_run {
+                match mode {
+                    DryRunMode::Brief => {}
+                    DryRunMode::All => println!("skip special {:?}", &entry_path),
+                    DryRunMode::Explain => {
+                        println!(
+                            "skip special {:?} (unsupported file type: {:?})",
+                            &entry_path,
+                            entry_file_type.unwrap()
+                        );
+                    }
+                }
+            }
+            copy_summary.specials_skipped += 1;
+            prog_track.specials_skipped.inc();
+            continue;
+        }
         // for regular files (not dirs, not symlinks), acquire the open file permit before
         // spawning the task. this provides backpressure so we don't create unbounded tasks.
         // it's safe because files are leaf nodes that never recurse, so no deadlock is possible.
@@ -1003,6 +1057,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1052,6 +1107,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1128,6 +1184,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1196,6 +1253,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1244,6 +1302,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1340,6 +1399,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1367,6 +1427,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1394,6 +1455,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1421,6 +1483,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1450,6 +1513,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1520,6 +1584,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1602,6 +1667,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1683,6 +1749,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1767,6 +1834,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1814,6 +1882,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1861,6 +1930,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1916,6 +1986,7 @@ mod copy_tests {
                 overwrite_filter: Some(OverwriteFilter::Newer),
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -1963,6 +2034,7 @@ mod copy_tests {
                 overwrite_filter: Some(OverwriteFilter::Newer),
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -2009,6 +2081,7 @@ mod copy_tests {
                 overwrite_filter: Some(OverwriteFilter::Newer),
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -2056,6 +2129,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -2093,6 +2167,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: true,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -2132,6 +2207,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: true,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -2168,6 +2244,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: true,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -2220,6 +2297,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -2291,6 +2369,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -2351,6 +2430,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -2371,6 +2451,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -2427,6 +2508,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -2486,6 +2568,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: None,
@@ -2526,6 +2609,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: None,
@@ -2569,6 +2653,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: None,
@@ -2618,6 +2703,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: None,
@@ -2773,6 +2859,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -2840,6 +2927,7 @@ mod copy_tests {
                 overwrite_filter: None,
                 ignore_existing: false,
                 chunk_size: 0,
+                skip_specials: false,
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
@@ -2896,6 +2984,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
@@ -2951,6 +3040,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
@@ -3010,6 +3100,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
@@ -3046,6 +3137,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
@@ -3088,6 +3180,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
@@ -3134,6 +3227,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
@@ -3180,6 +3274,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
@@ -3237,6 +3332,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
@@ -3295,6 +3391,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
@@ -3359,6 +3456,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
@@ -3420,6 +3518,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: Some(crate::config::DryRunMode::Explain),
@@ -3481,6 +3580,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
@@ -3543,6 +3643,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: Some(crate::config::DryRunMode::Brief),
@@ -3598,6 +3699,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
@@ -3646,6 +3748,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: Some(crate::config::DryRunMode::Explain),
@@ -3698,6 +3801,7 @@ mod copy_tests {
                     overwrite_filter: None,
                     ignore_existing: false,
                     chunk_size: 0,
+                    skip_specials: false,
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: None,
@@ -3754,6 +3858,7 @@ mod copy_tests {
                         overwrite_filter: None,
                         ignore_existing: false,
                         chunk_size: 0,
+                        skip_specials: false,
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
@@ -3775,6 +3880,167 @@ mod copy_tests {
                 assert_eq!(content, format!("L{}F0", level));
                 check_dir = check_dir.join(format!("d{}", level));
             }
+            Ok(())
+        }
+    }
+
+    mod skip_specials_tests {
+        use super::*;
+
+        #[tokio::test]
+        #[traced_test]
+        async fn skip_specials_skips_socket_in_directory() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::setup_test_dir().await?;
+            let test_path = tmp_dir.as_path();
+            let src = test_path.join("src_dir");
+            let dst = test_path.join("dst_dir");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::write(src.join("file.txt"), "hello").await?;
+            // create a unix socket inside the source directory
+            let _listener = std::os::unix::net::UnixListener::bind(src.join("test.sock"))?;
+            let summary = copy(
+                &PROGRESS,
+                &src,
+                &dst,
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    overwrite_filter: None,
+                    ignore_existing: false,
+                    chunk_size: 0,
+                    skip_specials: true,
+                    remote_copy_buffer_size: 0,
+                    filter: None,
+                    dry_run: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await?;
+            assert_eq!(summary.files_copied, 1);
+            assert_eq!(summary.specials_skipped, 1);
+            assert!(dst.join("file.txt").exists());
+            assert!(!dst.join("test.sock").exists());
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[traced_test]
+        async fn skip_specials_skips_fifo_in_directory() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::setup_test_dir().await?;
+            let test_path = tmp_dir.as_path();
+            let src = test_path.join("src_dir");
+            let dst = test_path.join("dst_dir");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::write(src.join("file.txt"), "hello").await?;
+            // create a FIFO inside the source directory
+            nix::unistd::mkfifo(
+                &src.join("test.fifo"),
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            )?;
+            let summary = copy(
+                &PROGRESS,
+                &src,
+                &dst,
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    overwrite_filter: None,
+                    ignore_existing: false,
+                    chunk_size: 0,
+                    skip_specials: true,
+                    remote_copy_buffer_size: 0,
+                    filter: None,
+                    dry_run: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await?;
+            assert_eq!(summary.files_copied, 1);
+            assert_eq!(summary.specials_skipped, 1);
+            assert!(dst.join("file.txt").exists());
+            assert!(!dst.join("test.fifo").exists());
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[traced_test]
+        async fn special_file_errors_without_skip_specials() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::setup_test_dir().await?;
+            let test_path = tmp_dir.as_path();
+            let src = test_path.join("src_dir");
+            let dst = test_path.join("dst_dir");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::write(src.join("file.txt"), "hello").await?;
+            let _listener = std::os::unix::net::UnixListener::bind(src.join("test.sock"))?;
+            let result = copy(
+                &PROGRESS,
+                &src,
+                &dst,
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    overwrite_filter: None,
+                    ignore_existing: false,
+                    chunk_size: 0,
+                    skip_specials: false,
+                    remote_copy_buffer_size: 0,
+                    filter: None,
+                    dry_run: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await;
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(
+                format!("{:#}", err).contains("unsupported src file type"),
+                "error should mention unsupported file type, got: {:#}",
+                err
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[traced_test]
+        async fn skip_specials_top_level_socket() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::setup_test_dir().await?;
+            let test_path = tmp_dir.as_path();
+            let src_socket = test_path.join("test.sock");
+            let dst = test_path.join("dst.sock");
+            let _listener = std::os::unix::net::UnixListener::bind(&src_socket)?;
+            let summary = copy(
+                &PROGRESS,
+                &src_socket,
+                &dst,
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    overwrite_filter: None,
+                    ignore_existing: false,
+                    chunk_size: 0,
+                    skip_specials: true,
+                    remote_copy_buffer_size: 0,
+                    filter: None,
+                    dry_run: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await?;
+            assert_eq!(summary.specials_skipped, 1);
+            assert_eq!(summary.files_copied, 0);
+            assert!(!dst.exists());
             Ok(())
         }
     }
