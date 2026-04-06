@@ -1278,15 +1278,8 @@ async fn dry_run_traverse(
     } else {
         common::filter::FilterResult::Included
     };
-    let (should_process, skip_reason) = match &filter_result {
-        common::filter::FilterResult::Included => (true, None),
-        common::filter::FilterResult::ExcludedByDefault => {
-            (false, Some("no include pattern matched".to_string()))
-        }
-        common::filter::FilterResult::ExcludedByPattern(p) => {
-            (false, Some(format!("excluded by pattern: {}", p)))
-        }
-    };
+    let should_process = matches!(filter_result, common::filter::FilterResult::Included);
+    let skip_reason = common::dry_run::format_skip_reason(&filter_result);
     // determine if we should report this entry based on dry-run mode
     let should_report = match dry_run_mode {
         common::config::DryRunMode::Brief => should_process,

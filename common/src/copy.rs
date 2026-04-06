@@ -80,38 +80,6 @@ pub struct Settings {
     pub dry_run: Option<crate::config::DryRunMode>,
 }
 
-/// Reports a dry-run action for copy operations
-fn report_dry_run_copy(src: &std::path::Path, dst: &std::path::Path, entry_type: &str) {
-    println!("would copy {} {:?} -> {:?}", entry_type, src, dst);
-}
-
-/// Reports a skipped entry during dry-run
-fn report_dry_run_skip(
-    path: &std::path::Path,
-    result: &FilterResult,
-    mode: DryRunMode,
-    entry_type: &str,
-) {
-    match mode {
-        DryRunMode::Brief => { /* brief mode doesn't show skipped files */ }
-        DryRunMode::All => {
-            println!("skip {} {:?}", entry_type, path);
-        }
-        DryRunMode::Explain => match result {
-            FilterResult::ExcludedByDefault => {
-                println!(
-                    "skip {} {:?} (no include pattern matched)",
-                    entry_type, path
-                );
-            }
-            FilterResult::ExcludedByPattern(pattern) => {
-                println!("skip {} {:?} (excluded by '{}')", entry_type, path, pattern);
-            }
-            FilterResult::Included => { /* shouldn't happen */ }
-        },
-    }
-}
-
 /// Check if a path should be filtered out
 fn should_skip_entry(
     filter: &Option<FilterSettings>,
@@ -227,7 +195,7 @@ pub async fn copy_file(
     }
     // handle dry-run mode for files
     if settings.dry_run.is_some() {
-        report_dry_run_copy(src, dst, "file");
+        crate::dry_run::report_action("copy", src, Some(dst), "file");
         return Ok(Summary {
             files_copied: 1,
             bytes_copied: src_metadata.len(),
@@ -421,7 +389,7 @@ pub async fn copy(
                         } else {
                             "file"
                         };
-                        report_dry_run_skip(src, &result, mode, entry_type);
+                        crate::dry_run::report_skip(src, &result, mode, entry_type);
                     }
                     // return summary with skipped count
                     let skipped_summary = if src_metadata.is_dir() {
@@ -525,7 +493,7 @@ async fn copy_internal(
         }
         // handle dry-run mode for symlinks
         if settings.dry_run.is_some() {
-            report_dry_run_copy(src, dst, "symlink");
+            crate::dry_run::report_action("copy", src, Some(dst), "symlink");
             return Ok(Summary {
                 symlinks_created: 1,
                 ..Default::default()
@@ -709,7 +677,7 @@ async fn copy_internal(
                 ..Default::default()
             });
         }
-        report_dry_run_copy(src, dst, "dir");
+        crate::dry_run::report_action("copy", src, Some(dst), "dir");
         // still need to recurse to show contents
     }
     tracing::debug!("process contents of 'src' directory");
@@ -845,7 +813,7 @@ async fn copy_internal(
                 } else {
                     "file"
                 };
-                report_dry_run_skip(&entry_path, &skip_result, mode, entry_type);
+                crate::dry_run::report_skip(&entry_path, &skip_result, mode, entry_type);
             }
             tracing::debug!("skipping {:?} due to filter", &entry_path);
             // increment skipped counters

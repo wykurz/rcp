@@ -111,6 +111,7 @@ use tracing_subscriber::prelude::*;
 pub mod cmp;
 pub mod config;
 pub mod copy;
+pub mod dry_run;
 pub mod error_collector;
 pub mod filegen;
 pub mod filter;

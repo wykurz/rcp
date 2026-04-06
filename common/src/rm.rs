@@ -3,7 +3,6 @@ use async_recursion::async_recursion;
 use std::os::unix::fs::PermissionsExt;
 use tracing::instrument;
 
-use crate::config::DryRunMode;
 use crate::filter::{FilterResult, FilterSettings};
 use crate::progress;
 
@@ -38,38 +37,6 @@ pub struct Settings {
     pub filter: Option<crate::filter::FilterSettings>,
     /// dry-run mode for previewing operations
     pub dry_run: Option<crate::config::DryRunMode>,
-}
-
-/// Reports a dry-run action for remove operations
-fn report_dry_run_rm(path: &std::path::Path, entry_type: &str) {
-    println!("would remove {} {:?}", entry_type, path);
-}
-
-/// Reports a skipped entry during dry-run
-fn report_dry_run_skip(
-    path: &std::path::Path,
-    result: &FilterResult,
-    mode: DryRunMode,
-    entry_type: &str,
-) {
-    match mode {
-        DryRunMode::Brief => { /* brief mode doesn't show skipped files */ }
-        DryRunMode::All => {
-            println!("skip {} {:?}", entry_type, path);
-        }
-        DryRunMode::Explain => match result {
-            FilterResult::ExcludedByDefault => {
-                println!(
-                    "skip {} {:?} (no include pattern matched)",
-                    entry_type, path
-                );
-            }
-            FilterResult::ExcludedByPattern(pattern) => {
-                println!("skip {} {:?} (excluded by '{}')", entry_type, path, pattern);
-            }
-            FilterResult::Included => { /* shouldn't happen */ }
-        },
-    }
 }
 
 /// Check if a path should be filtered out
@@ -166,7 +133,7 @@ pub async fn rm(
                         } else {
                             "file"
                         };
-                        report_dry_run_skip(path, &result, mode, entry_type);
+                        crate::dry_run::report_skip(path, &result, mode, entry_type);
                     }
                     // return summary with skipped count
                     let skipped_summary = if path_metadata.is_dir() {
@@ -216,7 +183,7 @@ async fn rm_internal(
         // handle dry-run mode for files/symlinks
         if settings.dry_run.is_some() {
             let entry_type = if is_symlink { "symlink" } else { "file" };
-            report_dry_run_rm(path, entry_type);
+            crate::dry_run::report_action("remove", path, None, entry_type);
             return Ok(Summary {
                 bytes_removed: file_size,
                 files_removed: if is_symlink { 0 } else { 1 },
@@ -294,7 +261,7 @@ async fn rm_internal(
                 } else {
                     "file"
                 };
-                report_dry_run_skip(&entry_path, &skip_result, mode, entry_type);
+                crate::dry_run::report_skip(&entry_path, &skip_result, mode, entry_type);
             }
             tracing::debug!("skipping {:?} due to filter", &entry_path);
             // increment skipped counters - will be added to rm_summary below
@@ -385,7 +352,7 @@ async fn rm_internal(
                 anything_skipped
             );
         } else {
-            report_dry_run_rm(path, "dir");
+            crate::dry_run::report_action("remove", path, None, "dir");
             rm_summary.directories_removed += 1;
         }
         return Ok(rm_summary);
@@ -437,6 +404,7 @@ async fn rm_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DryRunMode;
     use crate::testutils;
     use tracing_test::traced_test;
 
