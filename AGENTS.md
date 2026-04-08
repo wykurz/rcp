@@ -125,6 +125,8 @@ For any non-trivial coding task, create an agent team with two members:
 
 Iterate until both are satisfied before considering the task complete.
 
+Then, before declaring the task done, run `/codex:review --base main` and iterate on the resulting feedback until all comments worth addressing are fixed. Use judgment on which comments to address — not every suggestion is worth acting on, but every one should be evaluated.
+
 ## Commit Guidelines
 
 Keep commit subjects concise and imperative, matching the existing history style (e.g., "Fix how we manage dependencies"). Provide context and issue links in the body when applicable.
