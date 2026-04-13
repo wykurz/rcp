@@ -88,6 +88,44 @@ use anyhow::Context;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+const TRANSFER_HINTS: &str = "\
+    This may indicate:\n\
+    - Insufficient disk space on remote host\n\
+    - Permission denied creating $HOME/.cache/rcp/bin\n\
+    - base64 command not available on remote host";
+
+/// Build an error message for a failed stdin write during binary transfer.
+///
+/// When writing base64 data to the remote SSH process fails (typically a broken
+/// pipe because the remote command exited early), this formats the error to
+/// include remote stderr (which reveals the actual cause) and the exit status.
+fn format_write_error(
+    write_err: &std::io::Error,
+    stderr_data: &[u8],
+    status: &dyn std::fmt::Display,
+) -> String {
+    let stderr = String::from_utf8_lossy(stderr_data);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        format!(
+            "failed to write base64 data to remote stdin: {write_err}\n\
+            \n\
+            remote command exited with status: {status}\n\
+            remote stderr was empty\n\
+            \n\
+            {TRANSFER_HINTS}"
+        )
+    } else {
+        format!(
+            "failed to write base64 data to remote stdin: {write_err}\n\
+            \n\
+            remote stderr: {stderr}\n\
+            \n\
+            {TRANSFER_HINTS}"
+        )
+    }
+}
+
 /// Find local static rcpd binary suitable for deployment
 ///
 /// Searches in the following order:
@@ -341,18 +379,20 @@ async fn transfer_binary_base64(
     // this ensures the child process receives EOF on stdin before we wait for it to finish
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // write all base64 data to stdin
-    stdin
-        .write_all(encoded.as_bytes())
-        .await
-        .context("failed to write base64 data to remote stdin")?;
+    // write all base64 data to stdin, capturing errors instead of returning
+    // immediately — if this fails (e.g. broken pipe), we still need to read
+    // stderr to learn why the remote command failed
+    let write_result = stdin.write_all(encoded.as_bytes()).await;
 
-    // shutdown and explicitly drop stdin to ensure EOF is sent to child process
-    stdin.shutdown().await.context("failed to shutdown stdin")?;
+    if write_result.is_ok() {
+        // shutdown stdin to send EOF to the remote `base64 -d` process
+        stdin.shutdown().await.context("failed to shutdown stdin")?;
+    }
+    // drop stdin so the remote process can finish even if the write failed
     drop(stdin);
 
-    // now read stdout and stderr to completion
-    // these will complete once the child process exits and closes the pipes
+    // read stdout and stderr to completion — stderr is critical for diagnostics
+    // when the remote command fails before accepting all input
     let stdout_fut = async {
         let mut buf = Vec::new();
         let _ = stdout.read_to_end(&mut buf).await;
@@ -373,6 +413,12 @@ async fn transfer_binary_base64(
         .await
         .context("failed to wait for remote command completion")?;
 
+    // if writing to stdin failed (broken pipe), the remote command exited early —
+    // include stderr so the user sees the actual cause (e.g. "Permission denied")
+    if let Err(write_err) = write_result {
+        anyhow::bail!("{}", format_write_error(&write_err, &stderr_data, &status));
+    }
+
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr_data);
         anyhow::bail!(
@@ -380,10 +426,7 @@ async fn transfer_binary_base64(
             \n\
             stderr: {}\n\
             \n\
-            This may indicate:\n\
-            - Insufficient disk space on remote host\n\
-            - Permission denied creating $HOME/.cache/rcp/bin\n\
-            - base64 command not available on remote host",
+            {TRANSFER_HINTS}",
             stderr
         );
     }
@@ -560,5 +603,58 @@ mod tests {
         // verify it's deterministic
         let hash2 = compute_sha256(&data);
         assert_eq!(hash, hash2);
+    }
+
+    #[test]
+    fn write_error_with_stderr_includes_remote_output() {
+        let err = std::io::Error::from_raw_os_error(32); // EPIPE
+        let stderr = b"mkdir: cannot create directory: Permission denied";
+        let msg = format_write_error(&err, stderr, &"exited with 1");
+        assert!(msg.contains("Broken pipe"), "should contain write error");
+        assert!(
+            msg.contains("Permission denied"),
+            "should contain remote stderr"
+        );
+        assert!(
+            msg.contains("This may indicate"),
+            "should contain hint text"
+        );
+        // should NOT contain the exit status line when stderr is present
+        assert!(
+            !msg.contains("remote command exited with status"),
+            "should omit status when stderr is available"
+        );
+    }
+
+    #[test]
+    fn write_error_without_stderr_includes_exit_status() {
+        let err = std::io::Error::from_raw_os_error(32);
+        let stderr = b"";
+        let msg = format_write_error(&err, stderr, &"exited with 126");
+        assert!(msg.contains("Broken pipe"), "should contain write error");
+        assert!(
+            msg.contains("remote command exited with status: exited with 126"),
+            "should contain exit status"
+        );
+        assert!(
+            msg.contains("remote stderr was empty"),
+            "should note stderr was empty"
+        );
+        assert!(
+            msg.contains("This may indicate"),
+            "should contain hint text"
+        );
+    }
+
+    #[test]
+    fn write_error_trims_whitespace_only_stderr() {
+        let err = std::io::Error::from_raw_os_error(32);
+        let stderr = b"  \n\t  ";
+        let msg = format_write_error(&err, stderr, &"exited with 1");
+        // whitespace-only stderr should be treated as empty
+        assert!(
+            msg.contains("remote stderr was empty"),
+            "whitespace-only stderr should be treated as empty"
+        );
     }
 }
