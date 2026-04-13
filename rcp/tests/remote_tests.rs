@@ -2286,6 +2286,110 @@ fn test_remote_auto_deploy_cleanup_old_versions() {
 }
 
 #[test]
+fn test_remote_auto_deploy_on_version_mismatch() {
+    // test that auto-deployment triggers when --rcpd-path points to an rcpd
+    // binary that exists and is executable but reports an incompatible version
+    let home = make_test_home();
+    let override_home = home.path().to_str().unwrap().to_string();
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("version_mismatch_test.txt");
+    let dst_file = dst_dir.path().join("version_mismatch_test.txt");
+    create_test_file(&src_file, "testing version mismatch auto-deploy", 0o644);
+
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+
+    // create a fake rcpd that reports an incompatible version
+    let fake_rcpd_dir = tempfile::tempdir().unwrap();
+    let fake_rcpd_path = fake_rcpd_dir.path().join("rcpd");
+    std::fs::write(
+        &fake_rcpd_path,
+        "#!/bin/sh\necho '{\"semantic\":\"0.0.0-fake\"}'\n",
+    )
+    .expect("Failed to create fake rcpd");
+    std::fs::set_permissions(&fake_rcpd_path, std::fs::Permissions::from_mode(0o755))
+        .expect("Failed to set permissions on fake rcpd");
+
+    // get current version to verify deployment
+    let version_output = std::process::Command::new(assert_cmd::cargo::cargo_bin("rcp"))
+        .arg("--protocol-version")
+        .output()
+        .expect("Failed to get version");
+    assert!(
+        version_output.status.success(),
+        "rcp --protocol-version failed with status {:?}: {}",
+        version_output.status,
+        String::from_utf8_lossy(&version_output.stderr)
+    );
+    let version_json: serde_json::Value =
+        serde_json::from_slice(&version_output.stdout).expect("Failed to parse version JSON");
+    let semantic_version = version_json["semantic"]
+        .as_str()
+        .expect("Missing semantic version");
+
+    // clean up any previously deployed rcpd for this version to force deployment
+    let cache_dir = cache_bin_dir(home.path());
+    let deployed_rcpd = cache_dir.join(format!("rcpd-{}", semantic_version));
+    if deployed_rcpd.exists() {
+        match std::fs::remove_file(&deployed_rcpd) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!(
+                "Failed to remove previously deployed rcpd at {}: {}",
+                deployed_rcpd.display(),
+                e
+            ),
+        }
+    }
+
+    let rcpd_path_arg = format!("--rcpd-path={}", fake_rcpd_path.to_str().unwrap());
+    eprintln!(
+        "Testing auto-deployment on version mismatch (fake rcpd reports 0.0.0-fake, expected {})",
+        semantic_version
+    );
+
+    let output = run_rcp_with_args_home_and_env(
+        &[
+            "--auto-deploy-rcpd",
+            &rcpd_path_arg,
+            &src_remote,
+            &dst_remote,
+        ],
+        home.path(),
+        &[("RCP_REMOTE_HOME_OVERRIDE", override_home.as_str())],
+    );
+    print_command_output(&output);
+
+    // verify the copy succeeded despite version mismatch
+    assert!(
+        output.status.success(),
+        "Copy with auto-deploy should succeed when rcpd has version mismatch"
+    );
+    assert!(dst_file.exists(), "Destination file should exist");
+    assert_eq!(
+        get_file_content(&dst_file),
+        "testing version mismatch auto-deploy"
+    );
+
+    // verify that the correct rcpd was deployed to cache
+    assert!(
+        deployed_rcpd.exists(),
+        "rcpd should be deployed to {}",
+        deployed_rcpd.display()
+    );
+
+    // verify it's executable
+    let metadata = std::fs::metadata(&deployed_rcpd).expect("Failed to get deployed rcpd metadata");
+    assert!(
+        metadata.permissions().mode() & 0o100 != 0,
+        "deployed rcpd should be executable"
+    );
+
+    eprintln!("✓ Auto-deployment on version mismatch test succeeded");
+}
+
+#[test]
 fn test_remote_auto_deploy_error_explicit_rcpd_not_found() {
     // test error handling when explicit --rcpd-path points to nonexistent binary
     require_local_ssh();
