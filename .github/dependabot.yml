@@ -4,8 +4,25 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
+    groups:
+      all-actions:
+        patterns:
+          - "*"
 
   - package-ecosystem: "nix"
     directory: "/"
     schedule:
       interval: "monthly"
+    groups:
+      all-nix:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      all-cargo:
+        patterns:
+          - "*"
