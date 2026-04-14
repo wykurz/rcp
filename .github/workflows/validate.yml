@@ -22,7 +22,7 @@ jobs:
         ref: ${{ inputs.ref || github.sha }}
 
     - name: Setup Rust
-      uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1
+      uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1
       with:
         components: rustfmt, clippy
         target: x86_64-unknown-linux-musl
@@ -68,7 +68,7 @@ jobs:
         ref: ${{ inputs.ref || github.sha }}
 
     - name: Setup Rust
-      uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1
+      uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1
       with:
         target: x86_64-unknown-linux-musl
 
@@ -126,7 +126,7 @@ jobs:
         ref: ${{ inputs.ref || github.sha }}
 
     - name: Setup Rust
-      uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1
+      uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1
       with:
         target: x86_64-unknown-linux-musl
 
@@ -184,7 +184,7 @@ jobs:
         ref: ${{ inputs.ref || github.sha }}
 
     - name: Setup Rust
-      uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1
+      uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1
       with:
         target: x86_64-unknown-linux-musl
 
@@ -266,7 +266,7 @@ jobs:
         ref: ${{ inputs.ref || github.sha }}
 
     - name: Setup Rust
-      uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1
+      uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1
 
     - name: Build all binaries (glibc)
       run: cargo build --workspace --release --target x86_64-unknown-linux-gnu
