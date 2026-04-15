@@ -21,5 +21,5 @@ rustdoc-args = ["--cfg", "tokio_unstable"]
 name = "throttle"
 
 [dependencies]
-tokio = { version = "1.50", features = ["full", "parking_lot", "tracing"] }
+tokio = { version = "1.52", features = ["full", "parking_lot", "tracing"] }
 tracing = "0.1"

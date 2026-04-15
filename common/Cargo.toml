@@ -43,7 +43,7 @@ rand = "0.10"
 sysinfo = "0.38"
 thiserror = "2.0"
 throttle = { workspace = true }
-tokio = { version = "1.50", features = ["full", "parking_lot", "tracing"] }
+tokio = { version = "1.52", features = ["full", "parking_lot", "tracing"] }
 tracing = "0.1"
 tracing-chrome = "0.7"
 tracing-flame = "0.2"

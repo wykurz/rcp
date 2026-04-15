@@ -32,7 +32,7 @@ bytesize = "2.3"
 clap = { version = "4", features = ["derive"] }
 common = { workspace = true }
 thiserror = "2.0"
-tokio = { version = "1.50", features = ["full", "parking_lot", "tracing"] }
+tokio = { version = "1.52", features = ["full", "parking_lot", "tracing"] }
 tracing = "0.1"
 
 [package.metadata.deb]
