@@ -67,7 +67,7 @@ jobs:
           echo "notes_file=/tmp/release-notes.md" >> $GITHUB_OUTPUT
 
       - name: Create Draft Release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           draft: true
@@ -115,7 +115,7 @@ jobs:
 
       - name: Upload to GitHub Release
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           files: ./rcp-deb-amd64-${{ env.RELEASE_TAG }}.zip
@@ -162,7 +162,7 @@ jobs:
 
       - name: Upload to GitHub Release
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           files: ./rcp-rpm-amd64-${{ env.RELEASE_TAG }}.zip
@@ -208,7 +208,7 @@ jobs:
 
       - name: Upload to GitHub Release
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           files: ./rcp-deb-arm64-${{ env.RELEASE_TAG }}.zip
@@ -254,7 +254,7 @@ jobs:
 
       - name: Upload to GitHub Release
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           files: ./rcp-rpm-arm64-${{ env.RELEASE_TAG }}.zip
@@ -326,7 +326,7 @@ jobs:
       contents: write
     steps:
       - name: Publish Release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           draft: false
