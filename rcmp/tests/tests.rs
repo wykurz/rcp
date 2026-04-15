@@ -5,7 +5,7 @@ use tempfile::tempdir;
 #[test]
 fn check_rcmp_help() {
     let mut cmd = Command::cargo_bin("rcmp").unwrap();
-    cmd.arg("--help").assert();
+    cmd.arg("--help").assert().success();
 }
 
 #[test]

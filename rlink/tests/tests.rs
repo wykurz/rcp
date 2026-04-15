@@ -3,7 +3,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[test]
 fn check_rlink_help() {
     let mut cmd = assert_cmd::Command::cargo_bin("rlink").unwrap();
-    cmd.arg("--help").assert();
+    cmd.arg("--help").assert().success();
 }
 
 fn setup_test_env() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {

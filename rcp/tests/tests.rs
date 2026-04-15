@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 #[test]
 fn check_rcp_help() {
     let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
-    cmd.arg("--help").assert();
+    cmd.arg("--help").assert().success();
 }
 
 fn setup_test_env() -> (tempfile::TempDir, tempfile::TempDir) {
