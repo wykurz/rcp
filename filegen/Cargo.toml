@@ -33,7 +33,7 @@ common = { workspace = true }
 rand = "0.10"
 thiserror = "2.0"
 throttle = { workspace = true }
-tokio = { version = "1.50", features = ["full", "parking_lot", "tracing"] }
+tokio = { version = "1.52", features = ["full", "parking_lot", "tracing"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
