@@ -229,11 +229,13 @@ fn accepts_modified_before_months_uppercase_m() {
 }
 
 #[test]
+#[cfg(not(target_env = "musl"))]
 fn accepts_created_before_year() {
     accept_duration("--created-before", "1y", "rrm_accept_created_year");
 }
 
 #[test]
+#[cfg(not(target_env = "musl"))]
 fn accepts_created_before_long_form() {
     accept_duration("--created-before", "6months", "rrm_accept_created_longform");
 }
@@ -253,6 +255,7 @@ fn rejects_invalid_modified_before_duration() {
 }
 
 #[test]
+#[cfg(not(target_env = "musl"))]
 fn rejects_invalid_created_before_duration() {
     let tmp = std::env::temp_dir().join("rrm_parse_test_dir2");
     let _ = std::fs::create_dir(&tmp);
@@ -262,5 +265,24 @@ fn rejects_invalid_created_before_duration() {
         .assert()
         .failure()
         .stdout(predicates::str::contains("--created-before"));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// On musl, --created-before is accepted by clap but rejected at startup because
+/// std::fs::Metadata::created() cannot read btime under musl's stat wrapper.
+#[test]
+#[cfg(target_env = "musl")]
+fn rejects_created_before_on_musl() {
+    let tmp = std::env::temp_dir().join("rrm_musl_created_before");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir(&tmp).unwrap();
+    Command::cargo_bin("rrm")
+        .unwrap()
+        .args(["--created-before", "1y", tmp.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "--created-before is not supported on musl builds",
+        ));
     let _ = std::fs::remove_dir_all(&tmp);
 }

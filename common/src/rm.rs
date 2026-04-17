@@ -35,10 +35,28 @@ pub struct Settings {
     pub fail_early: bool,
     /// filter settings for include/exclude patterns
     pub filter: Option<crate::filter::FilterSettings>,
-    /// time-based filter (mtime/btime); applies to files and symlinks only
+    /// time-based filter (mtime/btime); applied to each entry individually (files,
+    /// symlinks, and directories). This is an entry filter, not a subtree gate:
+    /// directories are always traversed, and the filter only decides whether each
+    /// entry — including the directory itself, after its children are processed — is
+    /// eligible for removal. A directory whose own timestamps are too recent is left
+    /// intact even when its children have been removed; a non-empty leftover directory
+    /// is logged at info and not treated as an error.
     pub time_filter: Option<TimeFilter>,
     /// dry-run mode for previewing operations
     pub dry_run: Option<crate::config::DryRunMode>,
+}
+
+/// Returns true when `err`'s chain contains an `io::Error` with `ErrorKind::Unsupported`.
+/// Used to downgrade time-filter eval failures on filesystems / entry types that don't
+/// report btime (e.g. many symlinks) from `error!` to `warn!` so they don't flood logs
+/// on otherwise-successful runs.
+fn is_unsupported_io_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::Unsupported)
+    })
 }
 
 /// Check if a path should be filtered out
@@ -162,9 +180,8 @@ pub async fn rm(
             }
         }
     }
-    // note: time filter for files/symlinks is applied inside rm_internal — no need to
-    // duplicate the check here since rm_internal already skips the file/symlink branch
-    // without touching directories.
+    // note: the time filter (applied to files, symlinks, and directories) is handled
+    // inside rm_internal, so we don't duplicate the check here.
     rm_internal(prog_track, path, path, settings).await
 }
 #[instrument(skip(prog_track, settings))]
@@ -218,13 +235,24 @@ async fn rm_internal(
                     if settings.fail_early {
                         return Err(Error::new(err, Default::default()));
                     }
-                    // log and skip — never delete an entry whose age we cannot verify
-                    tracing::error!(
-                        "time filter evaluation failed for {} {:?}, skipping: {:#}",
-                        entry_type,
-                        &path,
-                        &err
-                    );
+                    // log and skip — never delete an entry whose age we cannot verify.
+                    // btime being unsupported (common for symlinks) is expected noise, so
+                    // downgrade to warn; anything else is unexpected and stays at error.
+                    if is_unsupported_io_error(&err) {
+                        tracing::warn!(
+                            "time filter evaluation unsupported for {} {:?}, skipping: {:#}",
+                            entry_type,
+                            &path,
+                            &err
+                        );
+                    } else {
+                        tracing::error!(
+                            "time filter evaluation failed for {} {:?}, skipping: {:#}",
+                            entry_type,
+                            &path,
+                            &err
+                        );
+                    }
                     return Ok(make_skipped_summary());
                 }
             }
@@ -386,20 +414,69 @@ async fn rm_internal(
             .filter
             .as_ref()
             .is_some_and(|f| f.has_includes() && !f.directly_matches_include(relative_path, true));
+    // evaluate the directory's own time filter to decide whether to remove it.
+    // the time filter is an entry filter, not a subtree gate: children are already handled
+    // by their own recursive calls, so this decision only controls the final remove_dir.
+    // returns Ok(true) = proceed, Ok(false) = skip (too new), Err propagates a fail-early.
+    // the src_metadata captured at entry is used so rrm's own mutations during traversal
+    // don't change the answer.
+    let dir_passes_time_filter: bool = if let Some(ref time_filter) = settings.time_filter {
+        match time_filter.matches(&src_metadata) {
+            Ok(result) => match result.as_skip_reason() {
+                Some(reason) => {
+                    if let Some(mode) = settings.dry_run {
+                        crate::dry_run::report_time_skip(path, reason, mode, "dir");
+                    }
+                    false
+                }
+                None => true,
+            },
+            Err(err) => {
+                let err = err.context(format!("failed evaluating time filter on {:?}", &path));
+                if settings.fail_early {
+                    return Err(Error::new(err, rm_summary));
+                }
+                // log and skip — never remove a directory whose age we cannot verify.
+                // btime being unsupported on the filesystem is expected noise; downgrade
+                // to warn. anything else is unexpected and stays at error.
+                if is_unsupported_io_error(&err) {
+                    tracing::warn!(
+                        "time filter evaluation unsupported for dir {:?}, leaving it intact: {:#}",
+                        &path,
+                        &err
+                    );
+                } else {
+                    tracing::error!(
+                        "time filter evaluation failed for dir {:?}, leaving it intact: {:#}",
+                        &path,
+                        &err
+                    );
+                }
+                false
+            }
+        }
+    } else {
+        true
+    };
     // handle dry-run mode for directories.
     // `traversed_only` catches dirs only entered to search for include pattern matches.
-    // `anything_skipped` catches dirs that would still have content after partial removal
-    // (applies to both include and exclude filters).
-    // the real-mode path below only needs `traversed_only` because the subsequent `remove_dir`
-    // call handles the non-empty case via ENOTEMPTY.
+    // `anything_skipped` catches dirs that would still have content after partial removal.
+    // `!dir_passes_time_filter` catches dirs whose own timestamps disqualify removal.
+    // the real-mode path below only needs `traversed_only` and `!dir_passes_time_filter`
+    // because the subsequent `remove_dir` call handles the non-empty case via ENOTEMPTY.
     if settings.dry_run.is_some() {
-        if traversed_only || anything_skipped {
+        if traversed_only || anything_skipped || !dir_passes_time_filter {
             tracing::debug!(
-                "dry-run: directory {:?} would not be removed (removed={}, skipped={})",
+                "dry-run: directory {:?} would not be removed (removed={}, skipped={}, time_ok={})",
                 &path,
                 anything_removed,
-                anything_skipped
+                anything_skipped,
+                dir_passes_time_filter
             );
+            if !dir_passes_time_filter {
+                prog_track.directories_skipped.inc();
+                rm_summary.directories_skipped += 1;
+            }
         } else {
             crate::dry_run::report_action("remove", path, None, "dir");
             rm_summary.directories_removed += 1;
@@ -416,6 +493,17 @@ async fn rm_internal(
         );
         return Ok(rm_summary);
     }
+    // skip directories whose own timestamps don't satisfy the time filter.
+    // children have already been processed; this only gates the dir's own removal.
+    if !dir_passes_time_filter {
+        tracing::debug!(
+            "directory {:?} skipped by time filter, leaving it intact",
+            &path
+        );
+        prog_track.directories_skipped.inc();
+        rm_summary.directories_skipped += 1;
+        return Ok(rm_summary);
+    }
     // when filtering is active, directories may not be empty because we only removed
     // matching files (includes) or skipped excluded files; use remove_dir (not remove_dir_all)
     // so non-empty directories fail gracefully with ENOTEMPTY
@@ -427,10 +515,11 @@ async fn rm_internal(
         }
         Err(err) if any_filter_active => {
             // with filtering, it's expected that directories may not be empty because we only
-            // removed matching files; raw_os_error 39 is ENOTEMPTY on Linux
+            // removed matching files; raw_os_error 39 is ENOTEMPTY on Linux. this is not an
+            // error — surface it at info so users can see which directories survived.
             if err.kind() == std::io::ErrorKind::DirectoryNotEmpty || err.raw_os_error() == Some(39)
             {
-                tracing::debug!(
+                tracing::info!(
                     "directory {:?} not empty after filtering, leaving it intact",
                     &path
                 );
@@ -1167,6 +1256,8 @@ mod tests {
             let file = test_path.join("old.txt");
             tokio::fs::write(&file, "x").await?;
             set_mtime_age(&file, std::time::Duration::from_secs(7200))?;
+            // age test_path so the root dir passes its own time filter check
+            set_mtime_age(&test_path, std::time::Duration::from_secs(7200))?;
             let summary = rm(
                 &PROGRESS,
                 &test_path,
@@ -1195,6 +1286,7 @@ mod tests {
             let file = test_path.join("new.txt");
             tokio::fs::write(&file, "x").await?;
             set_mtime_age(&file, std::time::Duration::from_secs(60))?;
+            set_mtime_age(&test_path, std::time::Duration::from_secs(7200))?;
             let summary = rm(
                 &PROGRESS,
                 &test_path,
@@ -1215,20 +1307,25 @@ mod tests {
             Ok(())
         }
 
-        /// Time filter applies to files only — directories descend regardless.
+        /// A fresh subdirectory is descended into (children are handled individually),
+        /// but the fresh_dir itself is not removed because its own mtime is too recent.
         #[tokio::test]
         #[traced_test]
-        async fn time_filter_does_not_apply_to_directories() -> Result<(), anyhow::Error> {
+        async fn fresh_subdirectory_is_descended_but_not_removed() -> Result<(), anyhow::Error> {
             let test_path = testutils::create_temp_dir().await?;
-            let dir = test_path.join("dir");
-            tokio::fs::create_dir(&dir).await?;
-            let old_file = dir.join("old.txt");
-            let new_file = dir.join("new.txt");
+            let old_file = test_path.join("old.txt");
+            let fresh_dir = test_path.join("fresh_dir");
+            let fresh_child = fresh_dir.join("fresh_child.txt");
+            let old_child = fresh_dir.join("old_child.txt");
             tokio::fs::write(&old_file, "x").await?;
-            tokio::fs::write(&new_file, "x").await?;
+            tokio::fs::create_dir(&fresh_dir).await?;
+            tokio::fs::write(&fresh_child, "x").await?;
+            tokio::fs::write(&old_child, "x").await?;
             set_mtime_age(&old_file, std::time::Duration::from_secs(7200))?;
-            set_mtime_age(&new_file, std::time::Duration::from_secs(60))?;
-            // even though 'dir' is freshly created (recent mtime), it should be traversed.
+            set_mtime_age(&old_child, std::time::Duration::from_secs(7200))?;
+            // fresh_child keeps its recent mtime; so does fresh_dir (we took the mtime
+            // snapshot before remove_file mutates it)
+            set_mtime_age(&test_path, std::time::Duration::from_secs(7200))?;
             let summary = rm(
                 &PROGRESS,
                 &test_path,
@@ -1243,23 +1340,101 @@ mod tests {
                 },
             )
             .await?;
-            assert_eq!(summary.files_removed, 1, "old file should be removed");
-            assert_eq!(summary.files_skipped, 1, "new file should be skipped");
-            // directories must never be counted as time-filter-skipped; even though
-            // 'dir' and test_path both have recent mtime, they are traversed normally.
+            // we descend into fresh_dir: old_child removed, fresh_child skipped
+            assert_eq!(summary.files_removed, 2, "old.txt and old_child removed");
             assert_eq!(
-                summary.directories_skipped, 0,
-                "directories must never be skipped by time filter"
+                summary.files_skipped, 1,
+                "fresh_child skipped inside fresh_dir"
             );
-            // 'dir' still contains 'new.txt', so neither 'dir' nor the root are empty —
-            // neither should be removed.
+            assert_eq!(
+                summary.directories_skipped, 1,
+                "fresh_dir itself is skipped at removal time"
+            );
             assert_eq!(
                 summary.directories_removed, 0,
-                "non-empty directories should not be removed"
+                "root survives because fresh_dir is still inside it"
             );
-            assert!(!old_file.exists(), "old.txt should be removed");
+            assert!(!old_file.exists());
+            assert!(!old_child.exists(), "old_child inside fresh_dir removed");
+            assert!(
+                fresh_dir.exists(),
+                "fresh_dir kept despite its old child being removed"
+            );
+            assert!(fresh_child.exists(), "fresh_child inside fresh_dir kept");
+            Ok(())
+        }
+
+        /// An old directory that still holds a new (skipped) file survives as non-empty.
+        /// The leftover-dir case is not treated as an error.
+        #[tokio::test]
+        #[traced_test]
+        async fn old_dir_with_new_file_leaves_non_empty_dir_without_error(
+        ) -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let old_dir = test_path.join("old_dir");
+            tokio::fs::create_dir(&old_dir).await?;
+            let new_file = old_dir.join("new.txt");
+            tokio::fs::write(&new_file, "x").await?;
+            set_mtime_age(&new_file, std::time::Duration::from_secs(60))?;
+            set_mtime_age(&old_dir, std::time::Duration::from_secs(7200))?;
+            set_mtime_age(&test_path, std::time::Duration::from_secs(7200))?;
+            let result = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: None,
+                    time_filter: Some(TimeFilter {
+                        modified_before: Some(std::time::Duration::from_secs(3600)),
+                        created_before: None,
+                    }),
+                    dry_run: None,
+                },
+            )
+            .await;
+            let summary = result.expect("ENOTEMPTY should not surface as an error");
+            assert_eq!(summary.files_skipped, 1, "new file should be skipped");
+            assert_eq!(
+                summary.directories_removed, 0,
+                "old_dir cannot be removed while new.txt remains"
+            );
+            assert!(old_dir.exists(), "old_dir should still exist");
             assert!(new_file.exists(), "new.txt should still exist");
-            assert!(dir.exists(), "dir should still exist (contains new.txt)");
+            // the 'left intact' message is logged at info level
+            assert!(
+                logs_contain("not empty after filtering, leaving it intact"),
+                "should log ENOTEMPTY case at info"
+            );
+            Ok(())
+        }
+
+        /// An old, already-empty directory is removed by the time filter run.
+        #[tokio::test]
+        #[traced_test]
+        async fn old_empty_directory_is_removed() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let old_empty = test_path.join("old_empty");
+            tokio::fs::create_dir(&old_empty).await?;
+            set_mtime_age(&old_empty, std::time::Duration::from_secs(7200))?;
+            set_mtime_age(&test_path, std::time::Duration::from_secs(7200))?;
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: None,
+                    time_filter: Some(TimeFilter {
+                        modified_before: Some(std::time::Duration::from_secs(3600)),
+                        created_before: None,
+                    }),
+                    dry_run: None,
+                },
+            )
+            .await?;
+            // both old_empty and test_path itself are removed
+            assert_eq!(summary.directories_removed, 2);
+            assert!(!old_empty.exists());
+            assert!(!test_path.exists());
             Ok(())
         }
 
@@ -1277,6 +1452,7 @@ mod tests {
             set_mtime_age(&old_keep, std::time::Duration::from_secs(7200))?;
             set_mtime_age(&old_drop, std::time::Duration::from_secs(7200))?;
             set_mtime_age(&new_drop, std::time::Duration::from_secs(60))?;
+            set_mtime_age(&test_path, std::time::Duration::from_secs(7200))?;
             let mut filter = crate::filter::FilterSettings::new();
             filter.add_exclude("*.log").unwrap();
             let summary = rm(
@@ -1319,6 +1495,7 @@ mod tests {
             tokio::fs::write(&new_file, "x").await?;
             set_mtime_age(&old_file, std::time::Duration::from_secs(7200))?;
             set_mtime_age(&new_file, std::time::Duration::from_secs(60))?;
+            set_mtime_age(&test_path, std::time::Duration::from_secs(7200))?;
             let summary = rm(
                 &PROGRESS,
                 &test_path,
@@ -1343,6 +1520,48 @@ mod tests {
             );
             assert!(old_file.exists(), "old.txt should still exist (dry-run)");
             assert!(new_file.exists(), "new.txt should still exist (dry-run)");
+            Ok(())
+        }
+
+        /// A fresh top-level directory is traversed (its old children are removed),
+        /// but the root itself is not removed because its own mtime is too recent.
+        #[tokio::test]
+        #[traced_test]
+        async fn fresh_top_level_directory_is_traversed_but_not_removed(
+        ) -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let old_inside = test_path.join("old.txt");
+            tokio::fs::write(&old_inside, "x").await?;
+            set_mtime_age(&old_inside, std::time::Duration::from_secs(7200))?;
+            // test_path itself is left fresh (recent mtime)
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: None,
+                    time_filter: Some(TimeFilter {
+                        modified_before: Some(std::time::Duration::from_secs(3600)),
+                        created_before: None,
+                    }),
+                    dry_run: None,
+                },
+            )
+            .await?;
+            assert_eq!(
+                summary.files_removed, 1,
+                "old child should be removed despite fresh parent"
+            );
+            assert_eq!(
+                summary.directories_skipped, 1,
+                "fresh root itself is skipped at removal time"
+            );
+            assert_eq!(
+                summary.directories_removed, 0,
+                "fresh root must not be removed"
+            );
+            assert!(test_path.exists(), "fresh root should still exist");
+            assert!(!old_inside.exists(), "old child should be gone");
             Ok(())
         }
 
