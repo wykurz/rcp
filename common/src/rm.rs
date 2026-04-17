@@ -3,7 +3,7 @@ use async_recursion::async_recursion;
 use std::os::unix::fs::PermissionsExt;
 use tracing::instrument;
 
-use crate::filter::{FilterResult, FilterSettings};
+use crate::filter::{FilterResult, FilterSettings, TimeFilter};
 use crate::progress;
 
 /// Error type for remove operations that preserves operation summary even on failure.
@@ -35,6 +35,8 @@ pub struct Settings {
     pub fail_early: bool,
     /// filter settings for include/exclude patterns
     pub filter: Option<crate::filter::FilterSettings>,
+    /// time-based filter (mtime/btime); applies to files and symlinks only
+    pub time_filter: Option<TimeFilter>,
     /// dry-run mode for previewing operations
     pub dry_run: Option<crate::config::DryRunMode>,
 }
@@ -160,6 +162,9 @@ pub async fn rm(
             }
         }
     }
+    // note: time filter for files/symlinks is applied inside rm_internal — no need to
+    // duplicate the check here since rm_internal already skips the file/symlink branch
+    // without touching directories.
     rm_internal(prog_track, path, path, settings).await
 }
 #[instrument(skip(prog_track, settings))]
@@ -180,6 +185,50 @@ async fn rm_internal(
         tracing::debug!("not a directory, just remove");
         let is_symlink = src_metadata.file_type().is_symlink();
         let file_size = if is_symlink { 0 } else { src_metadata.len() };
+        // apply time filter before removing (files/symlinks only)
+        if let Some(ref time_filter) = settings.time_filter {
+            let entry_type = if is_symlink { "symlink" } else { "file" };
+            let make_skipped_summary = || {
+                tracing::debug!("skipping {:?} due to time filter", &path);
+                if is_symlink {
+                    prog_track.symlinks_skipped.inc();
+                    Summary {
+                        symlinks_skipped: 1,
+                        ..Default::default()
+                    }
+                } else {
+                    prog_track.files_skipped.inc();
+                    Summary {
+                        files_skipped: 1,
+                        ..Default::default()
+                    }
+                }
+            };
+            match time_filter.matches(&src_metadata) {
+                Ok(result) => {
+                    if let Some(skip_reason) = result.as_skip_reason() {
+                        if let Some(mode) = settings.dry_run {
+                            crate::dry_run::report_time_skip(path, skip_reason, mode, entry_type);
+                        }
+                        return Ok(make_skipped_summary());
+                    }
+                }
+                Err(err) => {
+                    let err = err.context(format!("failed evaluating time filter on {:?}", &path));
+                    if settings.fail_early {
+                        return Err(Error::new(err, Default::default()));
+                    }
+                    // log and skip — never delete an entry whose age we cannot verify
+                    tracing::error!(
+                        "time filter evaluation failed for {} {:?}, skipping: {:#}",
+                        entry_type,
+                        &path,
+                        &err
+                    );
+                    return Ok(make_skipped_summary());
+                }
+            }
+        }
         // handle dry-run mode for files/symlinks
         if settings.dry_run.is_some() {
             let entry_type = if is_symlink { "symlink" } else { "file" };
@@ -370,12 +419,13 @@ async fn rm_internal(
     // when filtering is active, directories may not be empty because we only removed
     // matching files (includes) or skipped excluded files; use remove_dir (not remove_dir_all)
     // so non-empty directories fail gracefully with ENOTEMPTY
+    let any_filter_active = settings.filter.is_some() || settings.time_filter.is_some();
     match tokio::fs::remove_dir(path).await {
         Ok(()) => {
             prog_track.directories_removed.inc();
             rm_summary.directories_removed += 1;
         }
-        Err(err) if settings.filter.is_some() => {
+        Err(err) if any_filter_active => {
             // with filtering, it's expected that directories may not be empty because we only
             // removed matching files; raw_os_error 39 is ENOTEMPTY on Linux
             if err.kind() == std::io::ErrorKind::DirectoryNotEmpty || err.raw_os_error() == Some(39)
@@ -433,6 +483,7 @@ mod tests {
                 fail_early: false,
                 filter: None,
                 dry_run: None,
+                time_filter: None,
             },
         )
         .await?;
@@ -461,6 +512,7 @@ mod tests {
                 fail_early: true,
                 filter: None,
                 dry_run: None,
+                time_filter: None,
             },
         )
         .await;
@@ -495,6 +547,7 @@ mod tests {
                     fail_early: false,
                     filter: Some(filter),
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?;
@@ -541,6 +594,7 @@ mod tests {
                     fail_early: false,
                     filter: Some(filter),
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?;
@@ -573,6 +627,7 @@ mod tests {
                     fail_early: false,
                     filter: Some(filter),
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?;
@@ -609,6 +664,7 @@ mod tests {
                     fail_early: false,
                     filter: Some(filter),
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?;
@@ -645,6 +701,7 @@ mod tests {
                     fail_early: false,
                     filter: Some(filter),
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?;
@@ -691,6 +748,7 @@ mod tests {
                     fail_early: false,
                     filter: Some(filter),
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?;
@@ -744,6 +802,7 @@ mod tests {
                     fail_early: false,
                     filter: Some(filter),
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?;
@@ -789,6 +848,7 @@ mod tests {
                     fail_early: false,
                     filter: Some(filter),
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?;
@@ -833,6 +893,7 @@ mod tests {
                     fail_early: false,
                     filter: Some(filter),
                     dry_run: Some(DryRunMode::Explain),
+                    time_filter: None,
                 },
             )
             .await?;
@@ -873,6 +934,7 @@ mod tests {
                     fail_early: false,
                     filter: Some(filter),
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?;
@@ -918,6 +980,7 @@ mod tests {
                     fail_early: false,
                     filter: None,
                     dry_run: Some(DryRunMode::Brief),
+                    time_filter: None,
                 },
             )
             .await?;
@@ -965,6 +1028,7 @@ mod tests {
                     fail_early: false,
                     filter: Some(filter),
                     dry_run: Some(DryRunMode::Brief),
+                    time_filter: None,
                 },
             )
             .await?;
@@ -1021,6 +1085,7 @@ mod tests {
                     fail_early: false,
                     filter: Some(filter),
                     dry_run: Some(DryRunMode::Explain),
+                    time_filter: None,
                 },
             )
             .await?;
@@ -1069,6 +1134,7 @@ mod tests {
                     fail_early: false,
                     filter: Some(filter),
                     dry_run: Some(DryRunMode::Explain),
+                    time_filter: None,
                 },
             )
             .await?;
@@ -1080,6 +1146,234 @@ mod tests {
             // verify nothing was actually removed (dry-run mode)
             assert!(test_path.join("foo").exists(), "foo should still exist");
             assert!(test_path.join("baz").exists(), "baz should still exist");
+            Ok(())
+        }
+    }
+    mod time_filter_tests {
+        use super::*;
+        use crate::filter::TimeFilter;
+
+        fn set_mtime_age(path: &std::path::Path, age: std::time::Duration) -> anyhow::Result<()> {
+            let past = filetime::FileTime::from_system_time(std::time::SystemTime::now() - age);
+            filetime::set_file_mtime(path, past)?;
+            Ok(())
+        }
+
+        /// File with mtime older than threshold is removed.
+        #[tokio::test]
+        #[traced_test]
+        async fn removes_files_older_than_modified_before() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let file = test_path.join("old.txt");
+            tokio::fs::write(&file, "x").await?;
+            set_mtime_age(&file, std::time::Duration::from_secs(7200))?;
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: None,
+                    time_filter: Some(TimeFilter {
+                        modified_before: Some(std::time::Duration::from_secs(3600)),
+                        created_before: None,
+                    }),
+                    dry_run: None,
+                },
+            )
+            .await?;
+            assert_eq!(summary.files_removed, 1, "old file should be removed");
+            assert_eq!(summary.files_skipped, 0);
+            assert!(!file.exists(), "old.txt should be removed");
+            Ok(())
+        }
+
+        /// File with mtime newer than threshold is skipped.
+        #[tokio::test]
+        #[traced_test]
+        async fn keeps_files_newer_than_modified_before() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let file = test_path.join("new.txt");
+            tokio::fs::write(&file, "x").await?;
+            set_mtime_age(&file, std::time::Duration::from_secs(60))?;
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: None,
+                    time_filter: Some(TimeFilter {
+                        modified_before: Some(std::time::Duration::from_secs(3600)),
+                        created_before: None,
+                    }),
+                    dry_run: None,
+                },
+            )
+            .await?;
+            assert_eq!(summary.files_removed, 0, "new file should not be removed");
+            assert_eq!(summary.files_skipped, 1, "new file should be skipped");
+            assert!(file.exists(), "new.txt should still exist");
+            Ok(())
+        }
+
+        /// Time filter applies to files only — directories descend regardless.
+        #[tokio::test]
+        #[traced_test]
+        async fn time_filter_does_not_apply_to_directories() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let dir = test_path.join("dir");
+            tokio::fs::create_dir(&dir).await?;
+            let old_file = dir.join("old.txt");
+            let new_file = dir.join("new.txt");
+            tokio::fs::write(&old_file, "x").await?;
+            tokio::fs::write(&new_file, "x").await?;
+            set_mtime_age(&old_file, std::time::Duration::from_secs(7200))?;
+            set_mtime_age(&new_file, std::time::Duration::from_secs(60))?;
+            // even though 'dir' is freshly created (recent mtime), it should be traversed.
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: None,
+                    time_filter: Some(TimeFilter {
+                        modified_before: Some(std::time::Duration::from_secs(3600)),
+                        created_before: None,
+                    }),
+                    dry_run: None,
+                },
+            )
+            .await?;
+            assert_eq!(summary.files_removed, 1, "old file should be removed");
+            assert_eq!(summary.files_skipped, 1, "new file should be skipped");
+            // directories must never be counted as time-filter-skipped; even though
+            // 'dir' and test_path both have recent mtime, they are traversed normally.
+            assert_eq!(
+                summary.directories_skipped, 0,
+                "directories must never be skipped by time filter"
+            );
+            // 'dir' still contains 'new.txt', so neither 'dir' nor the root are empty —
+            // neither should be removed.
+            assert_eq!(
+                summary.directories_removed, 0,
+                "non-empty directories should not be removed"
+            );
+            assert!(!old_file.exists(), "old.txt should be removed");
+            assert!(new_file.exists(), "new.txt should still exist");
+            assert!(dir.exists(), "dir should still exist (contains new.txt)");
+            Ok(())
+        }
+
+        /// Time filter combines with glob exclude — both must pass for removal.
+        #[tokio::test]
+        #[traced_test]
+        async fn time_filter_combines_with_glob_exclude() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let old_keep = test_path.join("keep.log");
+            let old_drop = test_path.join("drop.txt");
+            let new_drop = test_path.join("recent.txt");
+            tokio::fs::write(&old_keep, "x").await?;
+            tokio::fs::write(&old_drop, "x").await?;
+            tokio::fs::write(&new_drop, "x").await?;
+            set_mtime_age(&old_keep, std::time::Duration::from_secs(7200))?;
+            set_mtime_age(&old_drop, std::time::Duration::from_secs(7200))?;
+            set_mtime_age(&new_drop, std::time::Duration::from_secs(60))?;
+            let mut filter = crate::filter::FilterSettings::new();
+            filter.add_exclude("*.log").unwrap();
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: Some(filter),
+                    time_filter: Some(TimeFilter {
+                        modified_before: Some(std::time::Duration::from_secs(3600)),
+                        created_before: None,
+                    }),
+                    dry_run: None,
+                },
+            )
+            .await?;
+            // only old_drop passes both filters
+            assert_eq!(summary.files_removed, 1, "only old_drop should be removed");
+            assert_eq!(
+                summary.files_skipped, 2,
+                "old_keep and recent_drop should be skipped"
+            );
+            assert!(
+                old_keep.exists(),
+                "keep.log excluded by glob, should remain"
+            );
+            assert!(!old_drop.exists(), "drop.txt should be removed");
+            assert!(new_drop.exists(), "recent.txt should remain (too new)");
+            Ok(())
+        }
+
+        /// Dry-run with time filter previews removal without modifying files.
+        #[tokio::test]
+        #[traced_test]
+        async fn time_filter_with_dry_run() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let old_file = test_path.join("old.txt");
+            let new_file = test_path.join("new.txt");
+            tokio::fs::write(&old_file, "x").await?;
+            tokio::fs::write(&new_file, "x").await?;
+            set_mtime_age(&old_file, std::time::Duration::from_secs(7200))?;
+            set_mtime_age(&new_file, std::time::Duration::from_secs(60))?;
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: false,
+                    filter: None,
+                    time_filter: Some(TimeFilter {
+                        modified_before: Some(std::time::Duration::from_secs(3600)),
+                        created_before: None,
+                    }),
+                    dry_run: Some(DryRunMode::Explain),
+                },
+            )
+            .await?;
+            assert_eq!(
+                summary.files_removed, 1,
+                "should report old file would be removed"
+            );
+            assert_eq!(
+                summary.files_skipped, 1,
+                "should report new file would be skipped"
+            );
+            assert!(old_file.exists(), "old.txt should still exist (dry-run)");
+            assert!(new_file.exists(), "new.txt should still exist (dry-run)");
+            Ok(())
+        }
+
+        /// Time filter on a single-file root argument increments skip when too new.
+        #[tokio::test]
+        #[traced_test]
+        async fn time_filter_on_root_file_argument() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let new_file = test_path.join("new.txt");
+            tokio::fs::write(&new_file, "x").await?;
+            set_mtime_age(&new_file, std::time::Duration::from_secs(60))?;
+            let summary = rm(
+                &PROGRESS,
+                &new_file,
+                &Settings {
+                    fail_early: false,
+                    filter: None,
+                    time_filter: Some(TimeFilter {
+                        modified_before: Some(std::time::Duration::from_secs(3600)),
+                        created_before: None,
+                    }),
+                    dry_run: None,
+                },
+            )
+            .await?;
+            assert_eq!(summary.files_removed, 0);
+            assert_eq!(
+                summary.files_skipped, 1,
+                "root file too new should be skipped"
+            );
+            assert!(new_file.exists(), "root file should still exist");
             Ok(())
         }
     }

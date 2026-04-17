@@ -389,6 +389,135 @@ impl FilterSettings {
     }
 }
 
+/// Time-based filter for matching entries by age (mtime/btime).
+///
+/// Used in addition to glob filters to skip entries that are not yet old enough.
+/// Each threshold is interpreted as a minimum age — an entry matches when its
+/// timestamp is at least the threshold ago (i.e. the timestamp is "before"
+/// `now - threshold`). When both fields are set, both conditions must hold (AND).
+///
+/// `created_before` uses the file's birth time (`std::fs::Metadata::created()`).
+/// Some Linux filesystems do not expose btime; in that case [`Self::matches`]
+/// returns an error rather than silently treating the file as a match.
+#[derive(Debug, Clone, Default)]
+pub struct TimeFilter {
+    /// minimum age based on mtime; entry matches when mtime is at least this old
+    pub modified_before: Option<std::time::Duration>,
+    /// minimum age based on btime; entry matches when btime is at least this old
+    pub created_before: Option<std::time::Duration>,
+}
+
+/// Outcome of evaluating a [`TimeFilter`] against a metadata entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeFilterResult {
+    /// entry passes both configured time thresholds (or no thresholds are set)
+    Matched,
+    /// entry's mtime is too recent to satisfy `modified_before`
+    TooNewModified,
+    /// entry's btime is too recent to satisfy `created_before`
+    TooNewCreated,
+    /// entry fails both `modified_before` and `created_before`
+    TooNewBoth,
+}
+
+/// Why an entry was skipped by a [`TimeFilter`] — the subset of [`TimeFilterResult`]
+/// that does not include `Matched`. Constructed via `TimeFilterResult::as_skip_reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeSkipReason {
+    /// entry's mtime is too recent
+    TooNewModified,
+    /// entry's btime is too recent
+    TooNewCreated,
+    /// both mtime and btime are too recent
+    TooNewBoth,
+}
+
+impl TimeFilterResult {
+    /// Returns the skip reason when this result represents a skip, or `None` when matched.
+    pub fn as_skip_reason(self) -> Option<TimeSkipReason> {
+        match self {
+            TimeFilterResult::Matched => None,
+            TimeFilterResult::TooNewModified => Some(TimeSkipReason::TooNewModified),
+            TimeFilterResult::TooNewCreated => Some(TimeSkipReason::TooNewCreated),
+            TimeFilterResult::TooNewBoth => Some(TimeSkipReason::TooNewBoth),
+        }
+    }
+}
+
+impl TimeFilter {
+    /// Returns true when no time thresholds are configured.
+    pub fn is_empty(&self) -> bool {
+        self.modified_before.is_none() && self.created_before.is_none()
+    }
+    /// Evaluate this filter against `metadata`.
+    ///
+    /// Returns:
+    /// - `Ok(TimeFilterResult::Matched)` when the entry passes all configured thresholds.
+    /// - `Ok(TimeFilterResult::TooNew*)` when one or both thresholds are not yet met.
+    /// - `Err(_)` when `created_before` is configured and the underlying `created()`
+    ///   call fails (e.g., a filesystem that does not expose birth time).
+    pub fn matches(&self, metadata: &std::fs::Metadata) -> anyhow::Result<TimeFilterResult> {
+        let mtime = if self.modified_before.is_some() {
+            Some(
+                metadata
+                    .modified()
+                    .context("failed to read mtime from metadata")?,
+            )
+        } else {
+            None
+        };
+        let btime = if self.created_before.is_some() {
+            Some(
+                metadata
+                    .created()
+                    .context("failed to read birth time (created) from metadata")?,
+            )
+        } else {
+            None
+        };
+        Ok(self.evaluate(mtime, btime, std::time::SystemTime::now()))
+    }
+    /// Pure-logic evaluation of this filter against raw timestamps.
+    ///
+    /// The timestamps are only inspected when the corresponding threshold is configured.
+    /// When a threshold is configured but the timestamp is `None`, the entry is treated as
+    /// "too new" for that axis (a `None` timestamp has no age signal, so it cannot satisfy
+    /// an age threshold). This helper is for deterministic unit testing of the AND logic;
+    /// prefer [`Self::matches`] for real callers.
+    fn evaluate(
+        &self,
+        mtime: Option<std::time::SystemTime>,
+        btime: Option<std::time::SystemTime>,
+        now: std::time::SystemTime,
+    ) -> TimeFilterResult {
+        let modified_too_new = self
+            .modified_before
+            .is_some_and(|threshold| mtime.is_none_or(|t| !is_at_least_age(now, t, threshold)));
+        let created_too_new = self
+            .created_before
+            .is_some_and(|threshold| btime.is_none_or(|t| !is_at_least_age(now, t, threshold)));
+        match (modified_too_new, created_too_new) {
+            (false, false) => TimeFilterResult::Matched,
+            (true, false) => TimeFilterResult::TooNewModified,
+            (false, true) => TimeFilterResult::TooNewCreated,
+            (true, true) => TimeFilterResult::TooNewBoth,
+        }
+    }
+}
+
+/// Returns true if `timestamp` is at least `age` old relative to `now`.
+/// Treats clock skew (timestamp in the future) as "not old enough".
+fn is_at_least_age(
+    now: std::time::SystemTime,
+    timestamp: std::time::SystemTime,
+    age: std::time::Duration,
+) -> bool {
+    match now.duration_since(timestamp) {
+        Ok(elapsed) => elapsed >= age,
+        Err(_) => false,
+    }
+}
+
 /// Data transfer object for FilterSettings serialization.
 /// Used for passing filter settings across process boundaries (e.g., to rcpd).
 #[derive(Serialize, Deserialize)]
@@ -880,5 +1009,285 @@ mod tests {
         assert!(settings.directly_matches_include(Path::new("foo/target"), true));
         // should not match files
         assert!(!settings.directly_matches_include(Path::new("target"), false));
+    }
+
+    mod time_filter_tests {
+        use super::*;
+        use crate::testutils;
+
+        fn write_with_mtime(path: &std::path::Path, age: std::time::Duration) {
+            std::fs::write(path, "x").unwrap();
+            let past = filetime::FileTime::from_system_time(std::time::SystemTime::now() - age);
+            filetime::set_file_mtime(path, past).unwrap();
+        }
+
+        #[test]
+        fn is_empty_when_no_thresholds_set() {
+            assert!(TimeFilter::default().is_empty());
+            let only_mtime = TimeFilter {
+                modified_before: Some(std::time::Duration::from_secs(1)),
+                created_before: None,
+            };
+            assert!(!only_mtime.is_empty());
+            let only_btime = TimeFilter {
+                modified_before: None,
+                created_before: Some(std::time::Duration::from_secs(1)),
+            };
+            assert!(!only_btime.is_empty());
+        }
+
+        #[tokio::test]
+        async fn matches_returns_matched_when_no_thresholds() {
+            let tmp = testutils::create_temp_dir().await.unwrap();
+            let path = tmp.join("file");
+            write_with_mtime(&path, std::time::Duration::from_secs(0));
+            let metadata = std::fs::metadata(&path).unwrap();
+            assert_eq!(
+                TimeFilter::default().matches(&metadata).unwrap(),
+                TimeFilterResult::Matched
+            );
+        }
+
+        #[tokio::test]
+        async fn matches_when_mtime_older_than_threshold() {
+            let tmp = testutils::create_temp_dir().await.unwrap();
+            let path = tmp.join("file");
+            write_with_mtime(&path, std::time::Duration::from_secs(7200));
+            let metadata = std::fs::metadata(&path).unwrap();
+            let filter = TimeFilter {
+                modified_before: Some(std::time::Duration::from_secs(3600)),
+                created_before: None,
+            };
+            assert_eq!(
+                filter.matches(&metadata).unwrap(),
+                TimeFilterResult::Matched
+            );
+        }
+
+        #[tokio::test]
+        async fn reports_too_new_modified_when_mtime_recent() {
+            let tmp = testutils::create_temp_dir().await.unwrap();
+            let path = tmp.join("file");
+            write_with_mtime(&path, std::time::Duration::from_secs(0));
+            let metadata = std::fs::metadata(&path).unwrap();
+            let filter = TimeFilter {
+                modified_before: Some(std::time::Duration::from_secs(3600)),
+                created_before: None,
+            };
+            assert_eq!(
+                filter.matches(&metadata).unwrap(),
+                TimeFilterResult::TooNewModified
+            );
+        }
+
+        /// Exercises `matches()` on the `created_before` axis with real metadata.
+        /// The expected outcome depends on whether the filesystem exposes birth time:
+        /// - Supported: a freshly-written file has a recent btime → `TooNewCreated`.
+        /// - Unsupported: `matches()` must return `Err` (the contract is to surface
+        ///   the failure rather than silently treat the file as a match).
+        /// Deterministic on either platform — drift in either branch will fail loudly.
+        #[tokio::test]
+        async fn matches_exercises_btime_deterministically() {
+            let tmp = testutils::create_temp_dir().await.unwrap();
+            let path = tmp.join("file");
+            std::fs::write(&path, "x").unwrap();
+            let metadata = std::fs::metadata(&path).unwrap();
+            let filter = TimeFilter {
+                modified_before: None,
+                created_before: Some(std::time::Duration::from_secs(3600)),
+            };
+            let result = filter.matches(&metadata);
+            match metadata.created() {
+                Ok(_) => assert_eq!(result.unwrap(), TimeFilterResult::TooNewCreated),
+                Err(_) => assert!(
+                    result.is_err(),
+                    "matches() must return Err when created_before is set but btime is unavailable"
+                ),
+            }
+        }
+
+        #[tokio::test]
+        async fn matches_with_zero_threshold_is_always_satisfied() {
+            // any file is at least zero seconds old
+            let tmp = testutils::create_temp_dir().await.unwrap();
+            let path = tmp.join("file");
+            write_with_mtime(&path, std::time::Duration::from_secs(0));
+            let metadata = std::fs::metadata(&path).unwrap();
+            let filter = TimeFilter {
+                modified_before: Some(std::time::Duration::from_secs(0)),
+                created_before: None,
+            };
+            assert_eq!(
+                filter.matches(&metadata).unwrap(),
+                TimeFilterResult::Matched
+            );
+        }
+
+        /// Focused unit tests for the pure-logic [`TimeFilter::evaluate`] helper.
+        /// Using raw timestamps makes AND/OR boundaries deterministic without depending
+        /// on platform btime support or filesystem timestamp resolution.
+        mod evaluate_and_or_logic {
+            use super::*;
+
+            fn now() -> std::time::SystemTime {
+                // pick a fixed anchor far in the past so threshold subtraction cannot underflow
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(10_000_000)
+            }
+
+            fn age_before(
+                t: std::time::SystemTime,
+                age: std::time::Duration,
+            ) -> std::time::SystemTime {
+                t - age
+            }
+
+            #[test]
+            fn no_thresholds_always_matches_regardless_of_timestamps() {
+                let filter = TimeFilter::default();
+                assert_eq!(
+                    filter.evaluate(None, None, now()),
+                    TimeFilterResult::Matched
+                );
+                assert_eq!(
+                    filter.evaluate(
+                        Some(age_before(now(), std::time::Duration::from_secs(0))),
+                        None,
+                        now()
+                    ),
+                    TimeFilterResult::Matched
+                );
+            }
+
+            #[test]
+            fn and_logic_both_pass_is_matched() {
+                let filter = TimeFilter {
+                    modified_before: Some(std::time::Duration::from_secs(3600)),
+                    created_before: Some(std::time::Duration::from_secs(3600)),
+                };
+                let old = age_before(now(), std::time::Duration::from_secs(7200));
+                assert_eq!(
+                    filter.evaluate(Some(old), Some(old), now()),
+                    TimeFilterResult::Matched
+                );
+            }
+
+            #[test]
+            fn and_logic_only_mtime_passes_reports_created_too_new() {
+                let filter = TimeFilter {
+                    modified_before: Some(std::time::Duration::from_secs(3600)),
+                    created_before: Some(std::time::Duration::from_secs(3600)),
+                };
+                let old = age_before(now(), std::time::Duration::from_secs(7200));
+                let recent = age_before(now(), std::time::Duration::from_secs(60));
+                assert_eq!(
+                    filter.evaluate(Some(old), Some(recent), now()),
+                    TimeFilterResult::TooNewCreated
+                );
+            }
+
+            #[test]
+            fn and_logic_only_btime_passes_reports_modified_too_new() {
+                let filter = TimeFilter {
+                    modified_before: Some(std::time::Duration::from_secs(3600)),
+                    created_before: Some(std::time::Duration::from_secs(3600)),
+                };
+                let old = age_before(now(), std::time::Duration::from_secs(7200));
+                let recent = age_before(now(), std::time::Duration::from_secs(60));
+                assert_eq!(
+                    filter.evaluate(Some(recent), Some(old), now()),
+                    TimeFilterResult::TooNewModified
+                );
+            }
+
+            #[test]
+            fn and_logic_neither_passes_reports_too_new_both() {
+                let filter = TimeFilter {
+                    modified_before: Some(std::time::Duration::from_secs(3600)),
+                    created_before: Some(std::time::Duration::from_secs(3600)),
+                };
+                let recent = age_before(now(), std::time::Duration::from_secs(60));
+                assert_eq!(
+                    filter.evaluate(Some(recent), Some(recent), now()),
+                    TimeFilterResult::TooNewBoth
+                );
+            }
+
+            #[test]
+            fn threshold_boundary_exactly_at_age_matches() {
+                // a timestamp exactly `threshold` ago is considered "at least threshold old"
+                let filter = TimeFilter {
+                    modified_before: Some(std::time::Duration::from_secs(3600)),
+                    created_before: None,
+                };
+                let exact = age_before(now(), std::time::Duration::from_secs(3600));
+                assert_eq!(
+                    filter.evaluate(Some(exact), None, now()),
+                    TimeFilterResult::Matched
+                );
+            }
+
+            #[test]
+            fn future_timestamp_treated_as_too_new() {
+                // clock skew: if mtime is AFTER now, treat as "not old enough"
+                let filter = TimeFilter {
+                    modified_before: Some(std::time::Duration::from_secs(1)),
+                    created_before: None,
+                };
+                let future = now() + std::time::Duration::from_secs(3600);
+                assert_eq!(
+                    filter.evaluate(Some(future), None, now()),
+                    TimeFilterResult::TooNewModified
+                );
+            }
+
+            #[test]
+            fn missing_timestamp_when_threshold_configured_is_too_new() {
+                // None with a configured threshold has no age signal; treat as too new
+                // (used when the OS can't produce the timestamp — see evaluate doc comment)
+                let filter = TimeFilter {
+                    modified_before: Some(std::time::Duration::from_secs(3600)),
+                    created_before: Some(std::time::Duration::from_secs(3600)),
+                };
+                let old = age_before(now(), std::time::Duration::from_secs(7200));
+                assert_eq!(
+                    filter.evaluate(Some(old), None, now()),
+                    TimeFilterResult::TooNewCreated
+                );
+                assert_eq!(
+                    filter.evaluate(None, Some(old), now()),
+                    TimeFilterResult::TooNewModified
+                );
+                assert_eq!(
+                    filter.evaluate(None, None, now()),
+                    TimeFilterResult::TooNewBoth
+                );
+            }
+        }
+
+        /// Tests for the skip-reason projection.
+        mod skip_reason {
+            use super::*;
+
+            #[test]
+            fn matched_yields_none() {
+                assert_eq!(TimeFilterResult::Matched.as_skip_reason(), None);
+            }
+
+            #[test]
+            fn too_new_variants_yield_matching_reasons() {
+                assert_eq!(
+                    TimeFilterResult::TooNewModified.as_skip_reason(),
+                    Some(TimeSkipReason::TooNewModified)
+                );
+                assert_eq!(
+                    TimeFilterResult::TooNewCreated.as_skip_reason(),
+                    Some(TimeSkipReason::TooNewCreated)
+                );
+                assert_eq!(
+                    TimeFilterResult::TooNewBoth.as_skip_reason(),
+                    Some(TimeSkipReason::TooNewBoth)
+                );
+            }
+        }
     }
 }

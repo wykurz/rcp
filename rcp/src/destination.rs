@@ -194,6 +194,7 @@ async fn process_single_file(
                         fail_early: settings.fail_early,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await
@@ -520,6 +521,7 @@ async fn create_directory(
                         fail_early: settings.fail_early,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await?;
@@ -612,6 +614,7 @@ async fn create_symlink(
                         fail_early: settings.fail_early,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await
