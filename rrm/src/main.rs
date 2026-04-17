@@ -44,6 +44,29 @@ struct Args {
     #[arg(long, value_name = "PATH", conflicts_with_all = ["include", "exclude"], help_heading = "Filtering")]
     filter_file: Option<std::path::PathBuf>,
 
+    /// Only remove files whose modification time is at least this old
+    ///
+    /// Accepts human-readable durations (humantime format). Examples: `1y`, `6months`, `30d`,
+    /// `12h`, `30m`, `45s`. NOTE: `M` means months, lowercase `m` means minutes — they are
+    /// different units. Applies to files and symlinks only; directories are always traversed
+    /// and removed if empty afterwards. For symlinks the filter uses the symlink's own
+    /// timestamps (not the target's). When combined with `--created-before`, both conditions
+    /// must hold (AND).
+    #[arg(long, value_name = "DURATION", help_heading = "Filtering")]
+    modified_before: Option<String>,
+
+    /// Only remove files whose creation (birth) time is at least this old
+    ///
+    /// Accepts human-readable durations (humantime format). Examples: `1y`, `6months`, `30d`,
+    /// `12h`, `30m`, `45s`. NOTE: `M` means months, lowercase `m` means minutes — they are
+    /// different units. Applies to files and symlinks only; directories are always traversed
+    /// and removed if empty afterwards. For symlinks the filter uses the symlink's own
+    /// timestamps (not the target's). Some Linux filesystems (and most symlinks) do not
+    /// expose birth time; such entries are logged and skipped rather than removed. Pass
+    /// --fail-early to abort on the first such error instead.
+    #[arg(long, value_name = "DURATION", help_heading = "Filtering")]
+    created_before: Option<String>,
+
     /// Preview mode - show what would be removed without actually removing
     ///
     /// --progress and --summary are suppressed in dry-run mode (use -v to
@@ -150,6 +173,38 @@ struct Args {
     paths: Vec<std::path::PathBuf>,
 }
 
+fn parse_duration_arg(flag: &str, value: &str) -> Result<std::time::Duration> {
+    humantime::parse_duration(value).map_err(|err| {
+        anyhow!(
+            "{} value {:?} is not a valid duration: {}\n\
+             Hint: use suffixes like 1y, 6months, 30d, 12h, 30m, 45s. \
+             Note that 'M' means months and 'm' means minutes.",
+            flag,
+            value,
+            err
+        )
+    })
+}
+
+fn build_time_filter(
+    modified_before: Option<&str>,
+    created_before: Option<&str>,
+) -> Result<Option<common::filter::TimeFilter>> {
+    let modified_before = modified_before
+        .map(|v| parse_duration_arg("--modified-before", v))
+        .transpose()?;
+    let created_before = created_before
+        .map(|v| parse_duration_arg("--created-before", v))
+        .transpose()?;
+    if modified_before.is_none() && created_before.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(common::filter::TimeFilter {
+        modified_before,
+        created_before,
+    }))
+}
+
 #[instrument]
 async fn async_main(args: Args) -> Result<common::rm::Summary> {
     // build filter settings once before the loop
@@ -167,11 +222,16 @@ async fn async_main(args: Args) -> Result<common::rm::Summary> {
     } else {
         None
     };
+    let time_filter = build_time_filter(
+        args.modified_before.as_deref(),
+        args.created_before.as_deref(),
+    )?;
     let mut join_set = tokio::task::JoinSet::new();
     for path in args.paths {
         let settings = common::rm::Settings {
             fail_early: args.fail_early,
             filter: filter.clone(),
+            time_filter: time_filter.clone(),
             dry_run: args.dry_run,
         };
         let do_rm = || async move { common::rm(&path, &settings).await };
@@ -212,7 +272,11 @@ fn main() -> Result<()> {
             args.summary,
             args.verbose,
             false, // rrm has no --overwrite
-            !args.include.is_empty() || !args.exclude.is_empty() || args.filter_file.is_some(),
+            !args.include.is_empty()
+                || !args.exclude.is_empty()
+                || args.filter_file.is_some()
+                || args.modified_before.is_some()
+                || args.created_before.is_some(),
             false, // rrm has no destination
             false, // rrm has no --ignore-existing
         )

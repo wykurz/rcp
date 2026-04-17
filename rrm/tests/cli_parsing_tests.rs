@@ -193,3 +193,74 @@ fn test_progress_delay_duration() {
         .assert()
         .success();
 }
+
+// ============================================================================
+// Time-filter Argument Parsing Tests
+// ============================================================================
+
+// Helpers for duration-accept tests: run against an empty temp dir in dry-run
+// mode so parsing is actually exercised (unlike --help, which short-circuits
+// clap before the duration is forwarded to build_time_filter).
+fn accept_duration(flag: &str, value: &str, dir_name: &str) {
+    let tmp = std::env::temp_dir().join(dir_name);
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir(&tmp).unwrap();
+    Command::cargo_bin("rrm")
+        .unwrap()
+        .args(["--dry-run", "brief", flag, value, tmp.to_str().unwrap()])
+        .assert()
+        .success();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn accepts_modified_before_year() {
+    accept_duration("--modified-before", "1y", "rrm_accept_mod_year");
+}
+
+#[test]
+fn accepts_modified_before_days() {
+    accept_duration("--modified-before", "30d", "rrm_accept_mod_days");
+}
+
+#[test]
+fn accepts_modified_before_months_uppercase_m() {
+    accept_duration("--modified-before", "6M", "rrm_accept_mod_months");
+}
+
+#[test]
+fn accepts_created_before_year() {
+    accept_duration("--created-before", "1y", "rrm_accept_created_year");
+}
+
+#[test]
+fn accepts_created_before_long_form() {
+    accept_duration("--created-before", "6months", "rrm_accept_created_longform");
+}
+
+#[test]
+fn rejects_invalid_modified_before_duration() {
+    // create a temp directory that won't be removed (parsing fails first)
+    let tmp = std::env::temp_dir().join("rrm_parse_test_dir");
+    let _ = std::fs::create_dir(&tmp);
+    Command::cargo_bin("rrm")
+        .unwrap()
+        .args(["--modified-before", "foo", tmp.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("--modified-before"));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn rejects_invalid_created_before_duration() {
+    let tmp = std::env::temp_dir().join("rrm_parse_test_dir2");
+    let _ = std::fs::create_dir(&tmp);
+    Command::cargo_bin("rrm")
+        .unwrap()
+        .args(["--created-before", "not-a-duration", tmp.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("--created-before"));
+    let _ = std::fs::remove_dir_all(&tmp);
+}

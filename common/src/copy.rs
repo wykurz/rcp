@@ -242,6 +242,7 @@ pub async fn copy_file(
                     fail_early: settings.fail_early,
                     filter: None,
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await
@@ -575,6 +576,7 @@ async fn copy_internal(
                         fail_early: settings.fail_early,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await
@@ -732,6 +734,7 @@ async fn copy_internal(
                         fail_early: settings.fail_early,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await
@@ -1519,6 +1522,7 @@ mod copy_tests {
                     fail_early: false,
                     filter: None,
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?
@@ -1529,6 +1533,7 @@ mod copy_tests {
                         fail_early: false,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await?;
@@ -1596,6 +1601,7 @@ mod copy_tests {
                     fail_early: false,
                     filter: None,
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?
@@ -1606,6 +1612,7 @@ mod copy_tests {
                         fail_early: false,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await?;
@@ -1678,6 +1685,7 @@ mod copy_tests {
                     fail_early: false,
                     filter: None,
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?
@@ -1688,6 +1696,7 @@ mod copy_tests {
                         fail_early: false,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await?;
@@ -1763,6 +1772,7 @@ mod copy_tests {
                     fail_early: false,
                     filter: None,
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?
@@ -1773,6 +1783,7 @@ mod copy_tests {
                         fail_early: false,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await?;

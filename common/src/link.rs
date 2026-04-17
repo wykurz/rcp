@@ -138,6 +138,7 @@ async fn hard_link_helper(
                     fail_early: settings.copy_settings.fail_early,
                     filter: None,
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await
@@ -487,6 +488,7 @@ async fn link_internal(
                         fail_early: settings.copy_settings.fail_early,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await
@@ -1147,6 +1149,7 @@ mod link_tests {
                     fail_early: false,
                     filter: None,
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?
@@ -1157,6 +1160,7 @@ mod link_tests {
                         fail_early: false,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await?;
@@ -1209,6 +1213,7 @@ mod link_tests {
                     fail_early: false,
                     filter: None,
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?
@@ -1219,6 +1224,7 @@ mod link_tests {
                         fail_early: false,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await?;
@@ -1285,6 +1291,7 @@ mod link_tests {
                     fail_early: false,
                     filter: None,
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?
@@ -1295,6 +1302,7 @@ mod link_tests {
                         fail_early: false,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await?
@@ -1305,6 +1313,7 @@ mod link_tests {
                         fail_early: false,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await?
@@ -1315,6 +1324,7 @@ mod link_tests {
                         fail_early: false,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await?;
@@ -1380,6 +1390,7 @@ mod link_tests {
                     fail_early: false,
                     filter: None,
                     dry_run: None,
+                    time_filter: None,
                 },
             )
             .await?
@@ -1390,6 +1401,7 @@ mod link_tests {
                         fail_early: false,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await?
@@ -1400,6 +1412,7 @@ mod link_tests {
                         fail_early: false,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await?
@@ -1410,6 +1423,7 @@ mod link_tests {
                         fail_early: false,
                         filter: None,
                         dry_run: None,
+                        time_filter: None,
                     },
                 )
                 .await?;
