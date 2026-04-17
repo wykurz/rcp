@@ -118,14 +118,6 @@ Before making any changes to remote copy operations, **always read [docs/remote_
 
 ## Agent Team Workflow
 
-For any non-trivial coding task, create an agent team with two members:
-
-1. **coder** — plans, writes code, runs tests, responds to reviewer feedback.
-2. **reviewer** — reviews changes for correctness, conventions, and potential issues.
-
-Iterate until both are satisfied before considering the task complete.
-
-Then, before declaring the task done, run `/codex:review --base main` and iterate on the resulting feedback until all comments worth addressing are fixed. Use judgment on which comments to address — not every suggestion is worth acting on, but every one should be evaluated.
 
 After creating a PR, check all review comments (including automated ones from Copilot). Evaluate each on its merit — address valid suggestions and respond to ones that aren't applicable.
 
