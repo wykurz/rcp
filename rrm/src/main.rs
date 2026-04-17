@@ -44,27 +44,37 @@ struct Args {
     #[arg(long, value_name = "PATH", conflicts_with_all = ["include", "exclude"], help_heading = "Filtering")]
     filter_file: Option<std::path::PathBuf>,
 
-    /// Only remove files whose modification time is at least this old
+    /// Only remove entries whose modification time is at least this old
     ///
     /// Accepts human-readable durations (humantime format). Examples: `1y`, `6months`, `30d`,
     /// `12h`, `30m`, `45s`. NOTE: `M` means months, lowercase `m` means minutes — they are
-    /// different units. Applies to files and symlinks only; directories are always traversed
-    /// and removed if empty afterwards. For symlinks the filter uses the symlink's own
-    /// timestamps (not the target's). When combined with `--created-before`, both conditions
-    /// must hold (AND).
+    /// different units. This is an entry filter: it applies independently to each file,
+    /// symlink, and directory. Directories are always traversed regardless of their own
+    /// timestamps; a directory is only removed when its own mtime is old enough AND it
+    /// ends up empty after its children have been processed. A directory left non-empty
+    /// after filtering (because it contained skipped new children) is logged at info and
+    /// left intact — this is not an error. For symlinks the filter uses the symlink's own
+    /// timestamps (not the target's). When combined with `--created-before`, both
+    /// conditions must hold (AND).
     #[arg(long, value_name = "DURATION", help_heading = "Filtering")]
     modified_before: Option<String>,
 
-    /// Only remove files whose creation (birth) time is at least this old
+    /// Only remove entries whose creation (birth) time is at least this old
     ///
     /// Accepts human-readable durations (humantime format). Examples: `1y`, `6months`, `30d`,
     /// `12h`, `30m`, `45s`. NOTE: `M` means months, lowercase `m` means minutes — they are
-    /// different units. Applies to files and symlinks only; directories are always traversed
-    /// and removed if empty afterwards. For symlinks the filter uses the symlink's own
-    /// timestamps (not the target's). Some Linux filesystems (and most symlinks) do not
-    /// expose birth time; such entries are logged and skipped rather than removed. Pass
-    /// --fail-early to abort on the first such error instead.
+    /// different units. This is an entry filter: it applies independently to each file,
+    /// symlink, and directory. Directories are always traversed regardless of their own
+    /// timestamps; a directory is only removed when its own btime is old enough AND it
+    /// ends up empty after its children have been processed. A directory left non-empty
+    /// after filtering is logged at info and left intact — this is not an error. For
+    /// symlinks the filter uses the symlink's own timestamps (not the target's). Some
+    /// Linux filesystems (and most symlinks) do not expose birth time; such entries are
+    /// logged and skipped rather than removed. Pass --fail-early to abort on the first
+    /// such error instead. NOT AVAILABLE on musl builds — rebuild against glibc to use
+    /// this flag.
     #[arg(long, value_name = "DURATION", help_heading = "Filtering")]
+    #[cfg_attr(target_env = "musl", arg(hide = true))]
     created_before: Option<String>,
 
     /// Preview mode - show what would be removed without actually removing
@@ -266,6 +276,15 @@ async fn async_main(args: Args) -> Result<common::rm::Summary> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    #[cfg(target_env = "musl")]
+    if args.created_before.is_some() {
+        return Err(anyhow!(
+            "--created-before is not supported on musl builds: birth time (btime) is not \
+             readable via std::fs::Metadata::created() under musl, so every entry would \
+             fail evaluation and be skipped. Use --modified-before instead, or rebuild \
+             rrm against glibc."
+        ));
+    }
     let dry_run_warnings = args.dry_run.map(|_| {
         common::DryRunWarnings::new(
             args.progress || args.progress_type.is_some() || args.progress_delay.is_some(),
