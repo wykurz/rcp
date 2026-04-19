@@ -87,6 +87,20 @@ struct Args {
     #[arg(long, help_heading = "Progress & output")]
     summary: bool,
 
+    /// Quiet mode, don't report errors
+    #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
+    quiet: bool,
+
+    /// Maximum number of open files (concurrent file writes)
+    ///
+    /// Since filegen's random data generation is CPU-intensive, the default is set to the number
+    /// of physical CPU cores. This optimizes performance by matching concurrency to compute
+    /// capacity rather than allowing excessive parallelism that would cause CPU contention.
+    ///
+    /// Set to 0 for no limit. Increase if using slow storage where I/O latency dominates.
+    #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
+    max_open_files: Option<usize>,
+
     /// Chunk size used to calculate number of I/O per file
     ///
     /// Modifying this setting to a value > 0 is REQUIRED when using --iops-throttle.
@@ -98,10 +112,6 @@ struct Args {
     )]
     chunk_size: u64,
 
-    // note: filegen's --max-open-files default differs from the common help text
-    // (it falls back to physical CPU cores rather than 80% of the system limit,
-    // because random-data generation is CPU-bound). The fallback is applied in
-    // main(); see also the "filegen Performance" section in README.md.
     #[command(flatten)]
     common: common::cli::CommonArgs,
 }
@@ -146,20 +156,19 @@ fn main() -> Result<(), anyhow::Error> {
         let args = args.clone();
         || async_main(args)
     };
-    let output = args.common.output_config(args.summary);
+    let output = args.common.output_config(args.quiet, args.summary);
     let runtime = args.common.runtime_config();
     // filegen's random data generation is CPU-intensive, so we default to
     // available parallelism rather than 80% of RLIMIT_NOFILE used by other tools.
     // use 1 as absolute minimum to avoid accidentally disabling limits.
-    let max_open_files = args.common.max_open_files.unwrap_or_else(|| {
+    let max_open_files = args.max_open_files.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
     });
-    let throttle = common::ThrottleConfig {
-        max_open_files: Some(max_open_files),
-        ..args.common.throttle_config(args.chunk_size)
-    };
+    let throttle = args
+        .common
+        .throttle_config(Some(max_open_files), args.chunk_size);
     let tracing = common::TracingConfig {
         remote_layer: None,
         debug_log_file: None,

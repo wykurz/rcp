@@ -71,7 +71,14 @@ struct Args {
     #[arg(short = 'L', long, help_heading = "Copy options")]
     dereference: bool,
 
-    // Progress & output
+    /// Quiet mode, don't report errors
+    #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
+    quiet: bool,
+
+    /// Maximum number of open files (0 = no limit, unspecified = 80% of system limit)
+    #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
+    max_open_files: Option<usize>,
+
     /// Chunk size for calculating I/O operations per file
     ///
     /// Required when using --iops-throttle (must be > 0)
@@ -83,10 +90,9 @@ struct Args {
     )]
     chunk_size: u64,
 
-    // note: rcpd never reads --progress-type or --summary from the master CLI
-    // (master sets progress mode out-of-band via control messages and never
-    // asks rcpd for a summary). Those flags are accepted as no-ops via
-    // CommonArgs to keep the shared definition simple.
+    // note: rcpd never reads --progress-type from the master CLI (master sets
+    // progress mode out-of-band via control messages). The flag is accepted as
+    // a no-op via CommonArgs to keep the shared definition simple.
     #[command(flatten)]
     common: common::cli::CommonArgs,
 
@@ -682,9 +688,11 @@ fn main() -> Result<(), anyhow::Error> {
         filename
     });
     // rcpd never prints a user-facing summary (results stream to master).
-    let output = args.common.output_config(false);
+    let output = args.common.output_config(args.quiet, false);
     let runtime = args.common.runtime_config();
-    let throttle = args.common.throttle_config(args.chunk_size);
+    let throttle = args
+        .common
+        .throttle_config(args.max_open_files, args.chunk_size);
     let tracing = common::TracingConfig {
         remote_layer: Some(tracing_layer),
         debug_log_file,

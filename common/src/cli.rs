@@ -3,13 +3,15 @@
 //! Each binary flattens [`CommonArgs`] into its own clap struct via
 //! `#[command(flatten)]`. Tool-specific arguments live in the binary itself.
 //!
-//! `chunk_size` is intentionally NOT in this struct: rcp/rcpd parse it as
-//! `bytesize::ByteSize` (to accept "16MiB" etc.), while rrm/rlink/rcmp/filegen
-//! parse it as a bare `u64`. Each binary keeps its own field.
-//!
-//! `summary` is also kept per-binary: rcpd never prints a summary (it streams
-//! results back to the master), so giving it a no-op `--summary` flag would
-//! mislead users.
+//! Fields intentionally NOT in this struct, so each binary can document them
+//! accurately:
+//! - `chunk_size` — rcp/rcpd parse as `bytesize::ByteSize` (e.g. "16MiB"),
+//!   others as bare `u64`.
+//! - `summary` — rcpd streams results to the master and never prints a summary.
+//! - `max_open_files` — filegen falls back to physical CPU cores instead of
+//!   80% of the system rlimit, because random-data generation is CPU-bound.
+//! - `quiet` — rcmp's `--quiet` also suppresses stdout differences (not just
+//!   error output), so its help text differs from the other tools.
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct CommonArgs {
@@ -32,13 +34,7 @@ pub struct CommonArgs {
     /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, help_heading = "Progress & output")]
     pub verbose: u8,
-    /// Quiet mode, don't report errors
-    #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
-    pub quiet: bool,
     // Performance & throttling
-    /// Maximum number of open files (0 = no limit, unspecified = 80% of system limit)
-    #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
-    pub max_open_files: Option<usize>,
     /// Throttle the number of operations per second (0 = no throttle)
     #[arg(
         long,
@@ -77,12 +73,13 @@ pub struct CommonArgs {
 }
 
 impl CommonArgs {
-    /// Build a [`crate::OutputConfig`] from these args plus the binary's
-    /// per-instance `print_summary` decision.
+    /// Build a [`crate::OutputConfig`]. `quiet` and `print_summary` are
+    /// supplied by the caller (each binary owns its own `--quiet` and
+    /// `--summary` flags so it can document binary-specific semantics).
     #[must_use]
-    pub fn output_config(&self, print_summary: bool) -> crate::OutputConfig {
+    pub fn output_config(&self, quiet: bool, print_summary: bool) -> crate::OutputConfig {
         crate::OutputConfig {
-            quiet: self.quiet,
+            quiet,
             verbose: self.verbose,
             print_summary,
             ..Default::default()
@@ -96,13 +93,17 @@ impl CommonArgs {
             max_blocking_threads: self.max_blocking_threads,
         }
     }
-    /// Build a [`crate::ThrottleConfig`] from these args. `chunk_size` is
-    /// supplied by the caller because each binary parses it as a different
-    /// type at the CLI layer.
+    /// Build a [`crate::ThrottleConfig`]. `max_open_files` and `chunk_size`
+    /// are supplied by the caller (filegen has its own `--max-open-files`
+    /// default; chunk_size has different parser types per binary).
     #[must_use]
-    pub fn throttle_config(&self, chunk_size: u64) -> crate::ThrottleConfig {
+    pub fn throttle_config(
+        &self,
+        max_open_files: Option<usize>,
+        chunk_size: u64,
+    ) -> crate::ThrottleConfig {
         crate::ThrottleConfig {
-            max_open_files: self.max_open_files,
+            max_open_files,
             ops_throttle: self.ops_throttle,
             iops_throttle: self.iops_throttle,
             chunk_size,
