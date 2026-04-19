@@ -13,30 +13,9 @@ use crate::rm;
 use crate::rm::{Settings as RmSettings, Summary as RmSummary};
 use crate::walk::{self, EntryKind};
 
-/// Error type for copy operations that preserves operation summary even on failure.
-///
-/// # Logging Convention
-/// When logging this error, use `{:#}` or `{:?}` format to preserve the error chain:
-/// ```ignore
-/// tracing::error!("operation failed: {:#}", &error); // ✅ Shows full chain
-/// tracing::error!("operation failed: {:?}", &error); // ✅ Shows full chain
-/// ```
-/// The Display implementation also shows the full chain, but workspace linting enforces `{:#}`
-/// for consistency.
-#[derive(Debug, thiserror::Error)]
-#[error("{source:#}")]
-pub struct Error {
-    #[source]
-    pub source: anyhow::Error,
-    pub summary: Summary,
-}
-
-impl Error {
-    #[must_use]
-    pub fn new(source: anyhow::Error, summary: Summary) -> Self {
-        Error { source, summary }
-    }
-}
+/// Error type for copy operations. See [`crate::error::OperationError`] for
+/// logging conventions and rationale.
+pub type Error = crate::error::OperationError<Summary>;
 
 /// Filter condition for overwrite operations.
 ///
