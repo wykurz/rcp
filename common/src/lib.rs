@@ -124,6 +124,7 @@ pub mod version;
 pub mod filecmp;
 pub mod progress;
 mod testutils;
+pub mod walk;
 
 pub use config::{
     DryRunMode, DryRunWarnings, OutputConfig, RuntimeConfig, ThrottleConfig, TracingConfig,

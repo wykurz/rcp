@@ -8,10 +8,10 @@ use crate::copy::{
     check_empty_dir_cleanup, EmptyDirAction, Settings as CopySettings, Summary as CopySummary,
 };
 use crate::filecmp;
-use crate::filter::{FilterResult, FilterSettings};
 use crate::preserve;
 use crate::progress;
 use crate::rm;
+use crate::walk::{self, EntryKind};
 
 /// Error type for link operations that preserves operation summary even on failure.
 ///
@@ -51,20 +51,27 @@ pub struct Settings {
     pub preserve: preserve::Settings,
 }
 
-/// Check if a path should be filtered out
-fn should_skip_entry(
-    filter: &Option<FilterSettings>,
-    relative_path: &std::path::Path,
-    is_dir: bool,
-) -> Option<FilterResult> {
-    if let Some(ref f) = filter {
-        let result = f.should_include(relative_path, is_dir);
-        match result {
-            FilterResult::Included => None,
-            _ => Some(result),
-        }
-    } else {
-        None
+/// Summary with the appropriate `*_skipped` counter set to 1 for the given entry kind.
+/// Special files count as `files_skipped` to match the historical mapping used
+/// when filters skip an entry (`specials_skipped` is reserved for `--skip-specials`).
+fn skipped_summary_for(kind: EntryKind) -> Summary {
+    let copy_summary = match kind {
+        EntryKind::Dir => CopySummary {
+            directories_skipped: 1,
+            ..Default::default()
+        },
+        EntryKind::Symlink => CopySummary {
+            symlinks_skipped: 1,
+            ..Default::default()
+        },
+        EntryKind::File | EntryKind::Special => CopySummary {
+            files_skipped: 1,
+            ..Default::default()
+        },
+    };
+    Summary {
+        copy_summary,
+        ..Default::default()
     }
 }
 
@@ -184,46 +191,12 @@ pub async fn link(
             match result {
                 crate::filter::FilterResult::Included => {}
                 result => {
+                    let kind = EntryKind::from_metadata(&src_metadata);
                     if let Some(mode) = settings.dry_run {
-                        let entry_type = if src_metadata.is_dir() {
-                            "directory"
-                        } else if src_metadata.file_type().is_symlink() {
-                            "symlink"
-                        } else {
-                            "file"
-                        };
-                        crate::dry_run::report_skip(src, &result, mode, entry_type);
+                        crate::dry_run::report_skip(src, &result, mode, kind.label_long());
                     }
-                    // return summary with skipped count
-                    let skipped_summary = if src_metadata.is_dir() {
-                        prog_track.directories_skipped.inc();
-                        Summary {
-                            copy_summary: CopySummary {
-                                directories_skipped: 1,
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        }
-                    } else if src_metadata.file_type().is_symlink() {
-                        prog_track.symlinks_skipped.inc();
-                        Summary {
-                            copy_summary: CopySummary {
-                                symlinks_skipped: 1,
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        }
-                    } else {
-                        prog_track.files_skipped.inc();
-                        Summary {
-                            copy_summary: CopySummary {
-                                files_skipped: 1,
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        }
-                    };
-                    return Ok(skipped_summary);
+                    kind.inc_skipped(prog_track);
+                    return Ok(skipped_summary_for(kind));
                 }
             }
         }
@@ -564,42 +537,25 @@ async fn link_internal(
         let entry_name = entry_path.file_name().unwrap();
         // check entry type for filter matching and dry-run reporting
         let entry_file_type = src_entry.file_type().await.ok();
-        let entry_is_dir = entry_file_type.map(|ft| ft.is_dir()).unwrap_or(false);
-        let entry_is_symlink = entry_file_type.map(|ft| ft.is_symlink()).unwrap_or(false);
+        let entry_kind = EntryKind::from_file_type(entry_file_type.as_ref());
+        let entry_is_dir = entry_kind == EntryKind::Dir;
+        let entry_is_symlink = entry_kind == EntryKind::Symlink;
         // compute relative path from source_root for filter matching
         let relative_path = entry_path.strip_prefix(source_root).unwrap_or(&entry_path);
         // apply filter if configured
-        if let Some(skip_result) = should_skip_entry(&settings.filter, relative_path, entry_is_dir)
+        if let Some(skip_result) =
+            walk::should_skip_entry(&settings.filter, relative_path, entry_is_dir)
         {
             if let Some(mode) = settings.dry_run {
-                let entry_type = if entry_is_dir {
-                    "dir"
-                } else if entry_is_symlink {
-                    "symlink"
-                } else {
-                    "file"
-                };
-                crate::dry_run::report_skip(&entry_path, &skip_result, mode, entry_type);
+                crate::dry_run::report_skip(&entry_path, &skip_result, mode, entry_kind.label());
             }
             tracing::debug!("skipping {:?} due to filter", &entry_path);
-            // increment skipped counters
-            if entry_is_dir {
-                link_summary.copy_summary.directories_skipped += 1;
-                prog_track.directories_skipped.inc();
-            } else if entry_is_symlink {
-                link_summary.copy_summary.symlinks_skipped += 1;
-                prog_track.symlinks_skipped.inc();
-            } else {
-                link_summary.copy_summary.files_skipped += 1;
-                prog_track.files_skipped.inc();
-            }
+            link_summary = link_summary + skipped_summary_for(entry_kind);
+            entry_kind.inc_skipped(prog_track);
             continue;
         }
         // skip special files (sockets, FIFOs, devices) when --skip-specials is set
-        let is_special = entry_file_type
-            .as_ref()
-            .is_some_and(|ft| !ft.is_dir() && !ft.is_symlink() && !ft.is_file());
-        if settings.copy_settings.skip_specials && is_special {
+        if settings.copy_settings.skip_specials && entry_kind == EntryKind::Special {
             tracing::debug!("skipping special file {:?}", &entry_path);
             if let Some(mode) = settings.dry_run {
                 match mode {
@@ -625,14 +581,7 @@ async fn link_internal(
         let update_path = update.as_ref().map(|s| s.join(entry_name));
         // handle dry-run mode for link operations
         if let Some(_mode) = settings.dry_run {
-            let entry_type = if entry_is_dir {
-                "dir"
-            } else if entry_is_symlink {
-                "symlink"
-            } else {
-                "file"
-            };
-            crate::dry_run::report_action("link", &entry_path, Some(&dst_path), entry_type);
+            crate::dry_run::report_action("link", &entry_path, Some(&dst_path), entry_kind.label());
             // for directories in dry-run, still need to recurse to show all entries
             if entry_is_dir {
                 let settings = settings.clone();
