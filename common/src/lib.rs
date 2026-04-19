@@ -823,47 +823,70 @@ pub fn generate_trace_filename(prefix: &str, identifier: &str, extension: &str) 
     format!("{prefix}-{identifier}-{hostname}-{pid}-{timestamp}.{extension}")
 }
 
-#[instrument(skip(func))] // "func" is not Debug printable
-pub fn run<Fut, Summary, Error>(
-    progress: Option<ProgressSettings>,
-    output: OutputConfig,
-    runtime: RuntimeConfig,
-    throttle: ThrottleConfig,
-    tracing_config: TracingConfig,
-    func: impl FnOnce() -> Fut,
-) -> Option<Summary>
-// we return an Option rather than a Result to indicate that callers of this function should NOT print the error
-where
-    Summary: std::fmt::Display,
-    Error: std::fmt::Display + std::fmt::Debug,
-    Fut: std::future::Future<Output = Result<Summary, Error>>,
-{
-    // force initialization of PROGRESS to set start_time at the beginning of the run
-    // (for remote master operations, PROGRESS is otherwise only accessed at the end in
-    // print_runtime_stats(), leading to near-zero walltime)
-    let _ = get_progress();
-    // validate configuration
-    if let Err(e) = throttle.validate() {
-        eprintln!("Configuration error: {e}");
-        return None;
+/// Build the verbose-level [`tracing_subscriber::EnvFilter`] used by every
+/// non-profile tracing layer (file, fmt, remote). Excludes noisy deps that are
+/// rarely useful when debugging rcp.
+fn build_verbose_env_filter(verbose: u8) -> tracing_subscriber::EnvFilter {
+    let level_directive = match verbose {
+        0 => "error".parse().unwrap(),
+        1 => "info".parse().unwrap(),
+        2 => "debug".parse().unwrap(),
+        _ => "trace".parse().unwrap(),
+    };
+    tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(level_directive)
+        .add_directive("tokio=info".parse().unwrap())
+        .add_directive("runtime=info".parse().unwrap())
+        .add_directive("quinn=warn".parse().unwrap())
+        .add_directive("rustls=warn".parse().unwrap())
+        .add_directive("h2=warn".parse().unwrap())
+}
+
+/// Build the [`tracing_subscriber::EnvFilter`] used by chrome/flame profile
+/// layers. Profiling layers don't share the verbose-level filter because they
+/// have their own `--profile-level`. Returns the formatted filter string —
+/// callers re-parse it per layer because EnvFilter isn't Clone.
+fn build_profile_filter_str(profile_level: Option<&str>) -> String {
+    let level_str = profile_level.unwrap_or("trace");
+    let valid_levels = ["trace", "debug", "info", "warn", "error", "off"];
+    if !valid_levels.contains(&level_str.to_lowercase().as_str()) {
+        eprintln!(
+            "Invalid --profile-level '{level_str}'. Valid values: trace, debug, info, warn, error, off"
+        );
+        std::process::exit(1);
     }
-    // unpack configs for internal use
-    let OutputConfig {
-        quiet,
-        verbose,
-        print_summary,
-        suppress_runtime_stats,
-    } = output;
-    let RuntimeConfig {
-        max_workers,
-        max_blocking_threads,
-    } = runtime;
-    let ThrottleConfig {
-        max_open_files,
-        ops_throttle,
-        iops_throttle,
-        chunk_size: _,
-    } = throttle;
+    format!("tokio=off,quinn=off,h2=off,hyper=off,rustls=off,{level_str}")
+}
+
+/// Guards from chrome/flame tracing layers that must outlive the runtime to
+/// flush traces on shutdown. Hold the returned struct for the lifetime of the
+/// run.
+#[allow(dead_code)] // fields are kept alive only for their Drop side-effects
+struct TracingGuards {
+    chrome: Option<tracing_chrome::FlushGuard>,
+    flame: Option<tracing_flame::FlushGuard<std::io::BufWriter<std::fs::File>>>,
+}
+
+/// Install the global [`tracing_subscriber`] registry from a [`TracingConfig`].
+/// Caller must hold the returned [`TracingGuards`] until the run finishes so
+/// that chrome/flame traces are flushed before the file handles close.
+///
+/// In quiet mode this is a no-op (the subscriber is never installed).
+fn install_tracing_subscriber(
+    quiet: bool,
+    verbose: u8,
+    tracing_config: TracingConfig,
+) -> TracingGuards {
+    if quiet {
+        assert!(
+            verbose == 0,
+            "Quiet mode and verbose mode are mutually exclusive"
+        );
+        return TracingGuards {
+            chrome: None,
+            flame: None,
+        };
+    }
     let TracingConfig {
         remote_layer: remote_tracing_layer,
         debug_log_file,
@@ -874,59 +897,29 @@ where
         tokio_console,
         tokio_console_port,
     } = tracing_config;
-    // guards must be kept alive for the duration of the run to ensure traces are flushed
-    let mut _chrome_guard: Option<tracing_chrome::FlushGuard> = None;
-    let mut _flame_guard: Option<tracing_flame::FlushGuard<std::io::BufWriter<std::fs::File>>> =
-        None;
-    if quiet {
-        assert!(
-            verbose == 0,
-            "Quiet mode and verbose mode are mutually exclusive"
-        );
+    let file_layer = debug_log_file.map(|log_file_path| {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file_path)
+            .unwrap_or_else(|e| {
+                panic!("Failed to create debug log file at '{log_file_path}': {e}")
+            });
+        tracing_subscriber::fmt::layer()
+            .with_target(true)
+            .with_line_number(true)
+            .with_thread_ids(true)
+            .with_timer(LocalTimeFormatter)
+            .with_ansi(false)
+            .with_writer(file)
+            .with_filter(build_verbose_env_filter(verbose))
+    });
+    // fmt_layer for local console output (when not using remote tracing)
+    let fmt_layer = if remote_tracing_layer.is_some() {
+        None
     } else {
-        // helper to create the verbose-level filter consistently
-        let make_env_filter = || {
-            let level_directive = match verbose {
-                0 => "error".parse().unwrap(),
-                1 => "info".parse().unwrap(),
-                2 => "debug".parse().unwrap(),
-                _ => "trace".parse().unwrap(),
-            };
-            // filter out noisy dependencies - they're extremely verbose at DEBUG/TRACE level
-            // and not useful for debugging rcp
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(level_directive)
-                .add_directive("tokio=info".parse().unwrap())
-                .add_directive("runtime=info".parse().unwrap())
-                .add_directive("quinn=warn".parse().unwrap())
-                .add_directive("rustls=warn".parse().unwrap())
-                .add_directive("h2=warn".parse().unwrap())
-        };
-        let file_layer = if let Some(ref log_file_path) = debug_log_file {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_file_path)
-                .unwrap_or_else(|e| {
-                    panic!("Failed to create debug log file at '{log_file_path}': {e}")
-                });
-            let file_layer = tracing_subscriber::fmt::layer()
-                .with_target(true)
-                .with_line_number(true)
-                .with_thread_ids(true)
-                .with_timer(LocalTimeFormatter)
-                .with_ansi(false)
-                .with_writer(file)
-                .with_filter(make_env_filter());
-            Some(file_layer)
-        } else {
-            None
-        };
-        // fmt_layer for local console output (when not using remote tracing)
-        let fmt_layer = if remote_tracing_layer.is_some() {
-            None
-        } else {
-            let fmt_layer = tracing_subscriber::fmt::layer()
+        Some(
+            tracing_subscriber::fmt::layer()
                 .with_target(true)
                 .with_line_number(true)
                 .with_span_events(if verbose > 2 {
@@ -937,102 +930,87 @@ where
                 .with_timer(LocalTimeFormatter)
                 .pretty()
                 .with_writer(ProgWriter::new)
-                .with_filter(make_env_filter());
-            Some(fmt_layer)
-        };
-        // apply env_filter to remote_tracing_layer so it respects verbose level
-        let remote_tracing_layer =
-            remote_tracing_layer.map(|layer| layer.with_filter(make_env_filter()));
-        let console_layer = if tokio_console {
-            let console_port = tokio_console_port.unwrap_or(6669);
-            let retention_seconds: u64 =
-                read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS", 60);
-            eprintln!("Tokio console server listening on 127.0.0.1:{console_port}");
-            let console_layer = console_subscriber::ConsoleLayer::builder()
-                .retention(std::time::Duration::from_secs(retention_seconds))
-                .server_addr(([127, 0, 0, 1], console_port))
-                .spawn();
-            Some(console_layer)
-        } else {
-            None
-        };
-        // build profile filter for chrome/flame layers
-        // uses EnvFilter to capture spans from our crates at the specified level
-        // while excluding noisy dependencies like tokio, quinn, h2, etc.
-        let profiling_enabled = chrome_trace_prefix.is_some() || flamegraph_prefix.is_some();
-        let profile_filter_str = if profiling_enabled {
-            let level_str = profile_level.as_deref().unwrap_or("trace");
-            // validate level is a known tracing level
-            let valid_levels = ["trace", "debug", "info", "warn", "error", "off"];
-            if !valid_levels.contains(&level_str.to_lowercase().as_str()) {
-                eprintln!(
-                    "Invalid --profile-level '{}'. Valid values: trace, debug, info, warn, error, off",
-                    level_str
-                );
-                std::process::exit(1);
+                .with_filter(build_verbose_env_filter(verbose)),
+        )
+    };
+    // apply env_filter to remote_tracing_layer so it respects verbose level
+    let remote_tracing_layer =
+        remote_tracing_layer.map(|layer| layer.with_filter(build_verbose_env_filter(verbose)));
+    let console_layer = tokio_console.then(|| {
+        let console_port = tokio_console_port.unwrap_or(6669);
+        let retention_seconds: u64 =
+            read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS", 60);
+        eprintln!("Tokio console server listening on 127.0.0.1:{console_port}");
+        console_subscriber::ConsoleLayer::builder()
+            .retention(std::time::Duration::from_secs(retention_seconds))
+            .server_addr(([127, 0, 0, 1], console_port))
+            .spawn()
+    });
+    // chrome/flame share a profile filter; build the string once and re-parse
+    // per layer (EnvFilter isn't Clone).
+    let profile_filter_str = (chrome_trace_prefix.is_some() || flamegraph_prefix.is_some())
+        .then(|| build_profile_filter_str(profile_level.as_deref()));
+    let make_profile_filter =
+        || tracing_subscriber::EnvFilter::new(profile_filter_str.as_ref().unwrap());
+    let mut chrome_guard = None;
+    let chrome_layer = chrome_trace_prefix.as_ref().map(|prefix| {
+        let filename = generate_trace_filename(prefix, &trace_identifier, "json");
+        eprintln!("Chrome trace will be written to: {filename}");
+        let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+            .file(&filename)
+            .include_args(true)
+            .build();
+        chrome_guard = Some(guard);
+        layer.with_filter(make_profile_filter())
+    });
+    let mut flame_guard = None;
+    let flame_layer = flamegraph_prefix.as_ref().and_then(|prefix| {
+        let filename = generate_trace_filename(prefix, &trace_identifier, "folded");
+        eprintln!("Flamegraph data will be written to: {filename}");
+        match tracing_flame::FlameLayer::with_file(&filename) {
+            Ok((layer, guard)) => {
+                flame_guard = Some(guard);
+                Some(layer.with_filter(make_profile_filter()))
             }
-            // exclude noisy deps, include everything else at the profile level
-            Some(format!(
-                "tokio=off,quinn=off,h2=off,hyper=off,rustls=off,{}",
-                level_str
-            ))
-        } else {
-            None
-        };
-        // helper to create profile filter (already validated above)
-        let make_profile_filter =
-            || tracing_subscriber::EnvFilter::new(profile_filter_str.as_ref().unwrap());
-        // chrome tracing layer (produces JSON viewable in Perfetto UI)
-        let chrome_layer = if let Some(ref prefix) = chrome_trace_prefix {
-            let filename = generate_trace_filename(prefix, &trace_identifier, "json");
-            eprintln!("Chrome trace will be written to: {filename}");
-            let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
-                .file(&filename)
-                .include_args(true)
-                .build();
-            _chrome_guard = Some(guard);
-            Some(layer.with_filter(make_profile_filter()))
-        } else {
-            None
-        };
-        // flamegraph layer (produces folded stacks for inferno)
-        let flame_layer = if let Some(ref prefix) = flamegraph_prefix {
-            let filename = generate_trace_filename(prefix, &trace_identifier, "folded");
-            eprintln!("Flamegraph data will be written to: {filename}");
-            match tracing_flame::FlameLayer::with_file(&filename) {
-                Ok((layer, guard)) => {
-                    _flame_guard = Some(guard);
-                    Some(layer.with_filter(make_profile_filter()))
-                }
-                Err(e) => {
-                    eprintln!("Failed to create flamegraph layer: {e}");
-                    None
-                }
+            Err(e) => {
+                eprintln!("Failed to create flamegraph layer: {e}");
+                None
             }
-        } else {
-            None
-        };
-        tracing_subscriber::registry()
-            .with(file_layer)
-            .with(fmt_layer)
-            .with(remote_tracing_layer)
-            .with(console_layer)
-            .with(chrome_layer)
-            .with(flame_layer)
-            .init();
+        }
+    });
+    tracing_subscriber::registry()
+        .with(file_layer)
+        .with(fmt_layer)
+        .with(remote_tracing_layer)
+        .with(console_layer)
+        .with(chrome_layer)
+        .with(flame_layer)
+        .init();
+    TracingGuards {
+        chrome: chrome_guard,
+        flame: flame_guard,
     }
+}
+
+/// Build a multi-threaded tokio runtime configured per `runtime`, and apply
+/// the `max_open_files` limit from `throttle`. Falls back to ~80% of the
+/// system rlimit (capped at 4096) when `max_open_files` is unset.
+fn build_tokio_runtime(
+    runtime: &RuntimeConfig,
+    throttle: &ThrottleConfig,
+) -> tokio::runtime::Runtime {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
-    if max_workers > 0 {
-        builder.worker_threads(max_workers);
+    if runtime.max_workers > 0 {
+        builder.worker_threads(runtime.max_workers);
     }
-    if max_blocking_threads > 0 {
-        builder.max_blocking_threads(max_blocking_threads);
+    if runtime.max_blocking_threads > 0 {
+        builder.max_blocking_threads(runtime.max_blocking_threads);
     }
     if !sysinfo::set_open_files_limit(usize::MAX) {
         tracing::info!("Failed to update the open files limit (expected on non-linux targets)");
     }
-    let set_max_open_files = max_open_files.unwrap_or_else(|| {
+    let set_max_open_files = throttle.max_open_files.unwrap_or_else(|| {
         let limit = get_max_open_files().expect(
             "We failed to query rlimit, if this is expected try specifying --max-open-files",
         ) as usize;
@@ -1046,7 +1024,12 @@ where
     } else {
         tracing::info!("Not applying any limit to max open files!");
     }
-    let runtime = builder.build().expect("Failed to create runtime");
+    builder.build().expect("Failed to create runtime")
+}
+
+/// Spawn the ops/iops throttle replenisher tasks onto `runtime` if the
+/// throttles are enabled.
+fn spawn_throttle_replenishers(runtime: &tokio::runtime::Runtime, throttle: &ThrottleConfig) {
     fn get_replenish_interval(replenish: usize) -> (usize, std::time::Duration) {
         let mut replenish = replenish;
         let mut interval = std::time::Duration::from_secs(1);
@@ -1056,18 +1039,53 @@ where
         }
         (replenish, interval)
     }
-    if ops_throttle > 0 {
-        let (replenish, interval) = get_replenish_interval(ops_throttle);
+    if throttle.ops_throttle > 0 {
+        let (replenish, interval) = get_replenish_interval(throttle.ops_throttle);
         throttle::init_ops_tokens(replenish);
         runtime.spawn(throttle::run_ops_replenish_thread(replenish, interval));
     }
-    if iops_throttle > 0 {
-        let (replenish, interval) = get_replenish_interval(iops_throttle);
+    if throttle.iops_throttle > 0 {
+        let (replenish, interval) = get_replenish_interval(throttle.iops_throttle);
         throttle::init_iops_tokens(replenish);
         runtime.spawn(throttle::run_iops_replenish_thread(replenish, interval));
     }
+}
+
+#[instrument(skip(func))] // "func" is not Debug printable
+pub fn run<Fut, Summary, Error>(
+    progress: Option<ProgressSettings>,
+    output: OutputConfig,
+    runtime_config: RuntimeConfig,
+    throttle_config: ThrottleConfig,
+    tracing_config: TracingConfig,
+    func: impl FnOnce() -> Fut,
+) -> Option<Summary>
+// we return an Option rather than a Result to indicate that callers of this function should NOT print the error
+where
+    Summary: std::fmt::Display,
+    Error: std::fmt::Display + std::fmt::Debug,
+    Fut: std::future::Future<Output = Result<Summary, Error>>,
+{
+    // force initialization of PROGRESS to set start_time at the beginning of the run
+    // (for remote master operations, PROGRESS is otherwise only accessed at the end in
+    // print_runtime_stats(), leading to near-zero walltime)
+    let _ = get_progress();
+    if let Err(e) = throttle_config.validate() {
+        eprintln!("Configuration error: {e}");
+        return None;
+    }
+    let OutputConfig {
+        quiet,
+        verbose,
+        print_summary,
+        suppress_runtime_stats,
+    } = output;
+    // tracing guards must outlive the runtime so chrome/flame traces flush
+    let _tracing_guards = install_tracing_subscriber(quiet, verbose, tracing_config);
+    let runtime = build_tokio_runtime(&runtime_config, &throttle_config);
+    spawn_throttle_replenishers(&runtime, &throttle_config);
     let res = {
-        let _progress = progress.map(|settings| {
+        let _progress_tracker = progress.map(|settings| {
             tracing::debug!("Requesting progress updates {settings:?}");
             let delay = settings.progress_delay.map(|delay_str| {
                 humantime::parse_duration(&delay_str)
