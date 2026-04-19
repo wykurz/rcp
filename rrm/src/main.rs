@@ -84,68 +84,9 @@ struct Args {
     #[arg(long, value_name = "MODE", help_heading = "Filtering")]
     dry_run: Option<common::DryRunMode>,
 
-    // Progress & output
-    /// Show progress
-    #[arg(long, help_heading = "Progress & output")]
-    progress: bool,
-
-    /// Toggles the type of progress to show
-    ///
-    /// If specified, --progress flag is implied.
-    ///
-    /// Options are: `ProgressBar` (animated progress bar), `TextUpdates` (appropriate for logging), Auto (default, will
-    /// choose between `ProgressBar` or `TextUpdates` depending on the type of terminal attached to stderr)
-    #[arg(long, value_name = "TYPE", help_heading = "Progress & output")]
-    progress_type: Option<common::ProgressType>,
-
-    /// Sets the delay between progress updates
-    ///
-    /// - For the interactive (--progress-type=ProgressBar), the default is 200ms.
-    /// - For the non-interactive (--progress-type=TextUpdates), the default is 10s.
-    ///
-    /// If specified, --progress flag is implied.
-    ///
-    /// This option accepts a human readable duration, e.g. "200ms", "10s", "5min" etc.
-    #[arg(long, value_name = "DELAY", help_heading = "Progress & output")]
-    progress_delay: Option<String>,
-
-    /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR)
-    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, help_heading = "Progress & output")]
-    verbose: u8,
-
     /// Print summary at the end
     #[arg(long, help_heading = "Progress & output")]
     summary: bool,
-
-    /// Quiet mode, don't report errors
-    #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
-    quiet: bool,
-
-    // Performance & throttling
-    /// Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system limit
-    #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
-    max_open_files: Option<usize>,
-
-    /// Throttle the number of operations per second, 0 means no throttle
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Performance & throttling"
-    )]
-    ops_throttle: usize,
-
-    /// Throttle the number of I/O operations per second, 0 means no throttle
-    ///
-    /// I/O is calculated based on provided chunk size -- number of I/O operations for a file is calculated as:
-    /// ((file size - 1) / chunk size) + 1
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Performance & throttling"
-    )]
-    iops_throttle: usize,
 
     /// Chunk size used to calculate number of I/O per file
     ///
@@ -158,24 +99,8 @@ struct Args {
     )]
     chunk_size: u64,
 
-    // Advanced settings
-    /// Number of worker threads, 0 means number of cores
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Advanced settings"
-    )]
-    max_workers: usize,
-
-    /// Number of blocking worker threads, 0 means Tokio runtime default (512)
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Advanced settings"
-    )]
-    max_blocking_threads: usize,
+    #[command(flatten)]
+    common: common::cli::CommonArgs,
 
     // ARGUMENTS
     /// Path(s) to remove
@@ -278,9 +203,9 @@ fn main() -> Result<()> {
     }
     let dry_run_warnings = args.dry_run.map(|_| {
         common::DryRunWarnings::new(
-            args.progress || args.progress_type.is_some() || args.progress_delay.is_some(),
+            args.common.progress_requested(),
             args.summary,
-            args.verbose,
+            args.common.verbose,
             false, // rrm has no --overwrite
             !args.include.is_empty()
                 || !args.exclude.is_empty()
@@ -296,22 +221,9 @@ fn main() -> Result<()> {
         let args = args.clone();
         || async_main(args)
     };
-    let output = common::OutputConfig {
-        quiet: args.quiet,
-        verbose: args.verbose,
-        print_summary: if is_dry_run { false } else { args.summary },
-        ..Default::default()
-    };
-    let runtime = common::RuntimeConfig {
-        max_workers: args.max_workers,
-        max_blocking_threads: args.max_blocking_threads,
-    };
-    let throttle = common::ThrottleConfig {
-        max_open_files: args.max_open_files,
-        ops_throttle: args.ops_throttle,
-        iops_throttle: args.iops_throttle,
-        chunk_size: args.chunk_size,
-    };
+    let output = args.common.output_config(!is_dry_run && args.summary);
+    let runtime = args.common.runtime_config();
+    let throttle = args.common.throttle_config(args.chunk_size);
     let tracing = common::TracingConfig {
         remote_layer: None,
         debug_log_file: None,
@@ -322,25 +234,12 @@ fn main() -> Result<()> {
         tokio_console: false,
         tokio_console_port: None,
     };
-    let res = common::run(
-        if !is_dry_run
-            && (args.progress || args.progress_type.is_some() || args.progress_delay.is_some())
-        {
-            Some(common::ProgressSettings {
-                progress_type: common::GeneralProgressType::User(
-                    args.progress_type.unwrap_or_default(),
-                ),
-                progress_delay: args.progress_delay,
-            })
-        } else {
-            None
-        },
-        output,
-        runtime,
-        throttle,
-        tracing,
-        func,
-    );
+    let progress = if is_dry_run {
+        None
+    } else {
+        args.common.user_progress_settings()
+    };
+    let res = common::run(progress, output, runtime, throttle, tracing, func);
     if let Some(warnings) = dry_run_warnings {
         warnings.print();
     }

@@ -83,74 +83,9 @@ struct Args {
     #[arg(long, help_heading = "Generation options")]
     leaf_files: bool,
 
-    // Progress & output
-    /// Show progress
-    #[arg(long, help_heading = "Progress & output")]
-    progress: bool,
-
-    /// Toggles the type of progress to show
-    ///
-    /// If specified, --progress flag is implied.
-    ///
-    /// Options are: `ProgressBar` (animated progress bar), `TextUpdates` (appropriate for logging), Auto (default, will
-    /// choose between `ProgressBar` or `TextUpdates` depending on the type of terminal attached to stderr)
-    #[arg(long, value_name = "TYPE", help_heading = "Progress & output")]
-    progress_type: Option<common::ProgressType>,
-
-    /// Sets the delay between progress updates
-    ///
-    /// - For the interactive (--progress-type=ProgressBar), the default is 200ms.
-    /// - For the non-interactive (--progress-type=TextUpdates), the default is 10s.
-    ///
-    /// If specified, --progress flag is implied.
-    ///
-    /// This option accepts a human readable duration, e.g. "200ms", "10s", "5min" etc.
-    #[arg(long, value_name = "DELAY", help_heading = "Progress & output")]
-    progress_delay: Option<String>,
-
-    /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR)
-    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, help_heading = "Progress & output")]
-    verbose: u8,
-
     /// Print summary at the end
     #[arg(long, help_heading = "Progress & output")]
     summary: bool,
-
-    /// Quiet mode, don't report errors
-    #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
-    quiet: bool,
-
-    // Performance & throttling
-    /// Maximum number of open files (concurrent file writes)
-    ///
-    /// Since filegen's random data generation is CPU-intensive, the default is set to the number
-    /// of physical CPU cores. This optimizes performance by matching concurrency to compute
-    /// capacity rather than allowing excessive parallelism that would cause CPU contention.
-    ///
-    /// Set to 0 for no limit. Increase if using slow storage where I/O latency dominates.
-    #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
-    max_open_files: Option<usize>,
-
-    /// Throttle the number of operations per second, 0 means no throttle
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Performance & throttling"
-    )]
-    ops_throttle: usize,
-
-    /// Throttle the number of I/O operations per second, 0 means no throttle
-    ///
-    /// I/O is calculated based on provided chunk size -- number of I/O operations for a file is calculated as:
-    /// ((file size - 1) / chunk size) + 1
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Performance & throttling"
-    )]
-    iops_throttle: usize,
 
     /// Chunk size used to calculate number of I/O per file
     ///
@@ -163,24 +98,12 @@ struct Args {
     )]
     chunk_size: u64,
 
-    // Advanced settings
-    /// Number of worker threads, 0 means number of cores
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Advanced settings"
-    )]
-    max_workers: usize,
-
-    /// Number of blocking worker threads, 0 means Tokio runtime default (512)
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Advanced settings"
-    )]
-    max_blocking_threads: usize,
+    // note: filegen's --max-open-files default differs from the common help text
+    // (it falls back to physical CPU cores rather than 80% of the system limit,
+    // because random-data generation is CPU-bound). The fallback is applied in
+    // main(); see also the "filegen Performance" section in README.md.
+    #[command(flatten)]
+    common: common::cli::CommonArgs,
 }
 
 #[instrument]
@@ -223,29 +146,19 @@ fn main() -> Result<(), anyhow::Error> {
         let args = args.clone();
         || async_main(args)
     };
-    let output = common::OutputConfig {
-        quiet: args.quiet,
-        verbose: args.verbose,
-        print_summary: args.summary,
-        ..Default::default()
-    };
-    let runtime = common::RuntimeConfig {
-        max_workers: args.max_workers,
-        max_blocking_threads: args.max_blocking_threads,
-    };
+    let output = args.common.output_config(args.summary);
+    let runtime = args.common.runtime_config();
     // filegen's random data generation is CPU-intensive, so we default to
     // available parallelism rather than 80% of RLIMIT_NOFILE used by other tools.
     // use 1 as absolute minimum to avoid accidentally disabling limits.
-    let max_open_files = args.max_open_files.unwrap_or_else(|| {
+    let max_open_files = args.common.max_open_files.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
     });
     let throttle = common::ThrottleConfig {
         max_open_files: Some(max_open_files),
-        ops_throttle: args.ops_throttle,
-        iops_throttle: args.iops_throttle,
-        chunk_size: args.chunk_size,
+        ..args.common.throttle_config(args.chunk_size)
     };
     let tracing = common::TracingConfig {
         remote_layer: None,
@@ -257,23 +170,19 @@ fn main() -> Result<(), anyhow::Error> {
         tokio_console: false,
         tokio_console_port: None,
     };
-    let res = common::run(
-        if args.progress || args.progress_type.is_some() {
-            Some(common::ProgressSettings {
-                progress_type: common::GeneralProgressType::User(
-                    args.progress_type.unwrap_or_default(),
-                ),
-                progress_delay: args.progress_delay,
-            })
-        } else {
-            None
-        },
-        output,
-        runtime,
-        throttle,
-        tracing,
-        func,
-    );
+    // note: filegen historically does not treat --progress-delay alone as
+    // implying --progress (unlike rrm/rlink). preserve that behavior here.
+    let progress = if args.common.progress || args.common.progress_type.is_some() {
+        Some(common::ProgressSettings {
+            progress_type: common::GeneralProgressType::User(
+                args.common.progress_type.unwrap_or_default(),
+            ),
+            progress_delay: args.common.progress_delay.clone(),
+        })
+    } else {
+        None
+    };
+    let res = common::run(progress, output, runtime, throttle, tracing, func);
     if res.is_none() {
         std::process::exit(1);
     }

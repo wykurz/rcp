@@ -142,59 +142,9 @@ struct Args {
     #[arg(long, value_name = "MODE", help_heading = "Filtering")]
     dry_run: Option<common::DryRunMode>,
 
-    // Progress & output
-    /// Show progress
-    #[arg(long, help_heading = "Progress & output")]
-    progress: bool,
-
-    /// Set the type of progress display
-    ///
-    /// If specified, --progress flag is implied.
-    #[arg(long, value_name = "TYPE", help_heading = "Progress & output")]
-    progress_type: Option<common::ProgressType>,
-
-    /// Set delay between progress updates
-    ///
-    /// Default is 200ms for interactive mode (`ProgressBar`) and 10s for non-interactive mode (`TextUpdates`). If specified, --progress flag is implied. Accepts human-readable durations like "200ms", "10s", "5min".
-    #[arg(long, value_name = "DELAY", help_heading = "Progress & output")]
-    progress_delay: Option<String>,
-
     /// Print summary at the end
     #[arg(long, help_heading = "Progress & output")]
     summary: bool,
-
-    /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR)
-    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, help_heading = "Progress & output")]
-    verbose: u8,
-
-    /// Quiet mode, don't report errors
-    #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
-    quiet: bool,
-
-    // Performance & throttling
-    /// Maximum number of open files (0 = no limit, unspecified = 80% of system limit)
-    #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
-    max_open_files: Option<usize>,
-
-    /// Throttle the number of operations per second, 0 means no throttle
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Performance & throttling"
-    )]
-    ops_throttle: usize,
-
-    /// Limit I/O operations per second (0 = no throttle)
-    ///
-    /// Requires --chunk-size to calculate I/O operations per file: ((`file_size` - 1) / `chunk_size`) + 1
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Performance & throttling"
-    )]
-    iops_throttle: usize,
 
     /// Chunk size for calculating I/O operations per file
     ///
@@ -207,24 +157,8 @@ struct Args {
     )]
     chunk_size: bytesize::ByteSize,
 
-    // Advanced settings
-    /// Number of worker threads (0 = number of CPU cores)
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Advanced settings"
-    )]
-    max_workers: usize,
-
-    /// Number of blocking worker threads (0 = Tokio default of 512)
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Advanced settings"
-    )]
-    max_blocking_threads: usize,
+    #[command(flatten)]
+    common: common::cli::CommonArgs,
 
     // Remote copy options
     /// IP address to bind the master TCP server to
@@ -450,13 +384,13 @@ async fn run_rcpd_master(
         None
     };
     let rcpd_config = remote::protocol::RcpdConfig {
-        verbose: args.verbose,
+        verbose: args.common.verbose,
         fail_early: args.fail_early,
-        max_workers: args.max_workers,
-        max_blocking_threads: args.max_blocking_threads,
-        max_open_files: args.max_open_files,
-        ops_throttle: args.ops_throttle,
-        iops_throttle: args.iops_throttle,
+        max_workers: args.common.max_workers,
+        max_blocking_threads: args.common.max_blocking_threads,
+        max_open_files: args.common.max_open_files,
+        ops_throttle: args.common.ops_throttle,
+        iops_throttle: args.common.iops_throttle,
         chunk_size: args.chunk_size.0 as usize,
         dereference: args.dereference,
         overwrite: args.overwrite,
@@ -466,8 +400,8 @@ async fn run_rcpd_master(
         skip_specials: args.skip_specials,
         debug_log_prefix: args.rcpd_debug_log_prefix.clone(),
         port_ranges: args.port_ranges.clone(),
-        progress: args.progress,
-        progress_delay: args.progress_delay.clone(),
+        progress: args.common.progress,
+        progress_delay: args.common.progress_delay.clone(),
         remote_copy_conn_timeout_sec: args.remote_copy_conn_timeout_sec,
         network_profile: args.network_profile,
         buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
@@ -1114,9 +1048,9 @@ fn main() -> Result<(), anyhow::Error> {
     let is_remote_operation = has_remote_paths(&args);
     let dry_run_warnings = args.dry_run.map(|_| {
         common::DryRunWarnings::new(
-            args.progress || args.progress_type.is_some() || args.progress_delay.is_some(),
+            args.common.progress_requested(),
             args.summary,
-            args.verbose,
+            args.common.verbose,
             args.overwrite,
             !args.include.is_empty() || !args.exclude.is_empty() || args.filter_file.is_some(),
             true,
@@ -1128,22 +1062,9 @@ fn main() -> Result<(), anyhow::Error> {
         let args = args.clone();
         || async_main(args)
     };
-    let output = common::OutputConfig {
-        quiet: args.quiet,
-        verbose: args.verbose,
-        print_summary: if is_dry_run { false } else { args.summary },
-        ..Default::default()
-    };
-    let runtime = common::RuntimeConfig {
-        max_workers: args.max_workers,
-        max_blocking_threads: args.max_blocking_threads,
-    };
-    let throttle = common::ThrottleConfig {
-        max_open_files: args.max_open_files,
-        ops_throttle: args.ops_throttle,
-        iops_throttle: args.iops_throttle,
-        chunk_size: args.chunk_size.0,
-    };
+    let output = args.common.output_config(!is_dry_run && args.summary);
+    let runtime = args.common.runtime_config();
+    let throttle = args.common.throttle_config(args.chunk_size.0);
     let tracing = common::TracingConfig {
         remote_layer: None,
         debug_log_file: None,
@@ -1154,32 +1075,22 @@ fn main() -> Result<(), anyhow::Error> {
         tokio_console: args.tokio_console,
         tokio_console_port: args.tokio_console_port,
     };
-    let res = common::run(
-        if !is_dry_run
-            && (args.progress || args.progress_type.is_some() || args.progress_delay.is_some())
-        {
-            Some(common::ProgressSettings {
-                progress_type: if is_remote_operation {
-                    common::GeneralProgressType::RemoteMaster {
-                        progress_type: args.progress_type.unwrap_or_default(),
-                        get_progress_snapshot: Box::new(
-                            remote::tracelog::get_latest_progress_snapshot,
-                        ),
-                    }
-                } else {
-                    common::GeneralProgressType::User(args.progress_type.unwrap_or_default())
-                },
-                progress_delay: args.progress_delay,
-            })
-        } else {
-            None
-        },
-        output,
-        runtime,
-        throttle,
-        tracing,
-        func,
-    );
+    let progress = if !is_dry_run && args.common.progress_requested() {
+        Some(common::ProgressSettings {
+            progress_type: if is_remote_operation {
+                common::GeneralProgressType::RemoteMaster {
+                    progress_type: args.common.progress_type.unwrap_or_default(),
+                    get_progress_snapshot: Box::new(remote::tracelog::get_latest_progress_snapshot),
+                }
+            } else {
+                common::GeneralProgressType::User(args.common.progress_type.unwrap_or_default())
+            },
+            progress_delay: args.common.progress_delay,
+        })
+    } else {
+        None
+    };
+    let res = common::run(progress, output, runtime, throttle, tracing, func);
     if let Some(warnings) = dry_run_warnings {
         warnings.print();
     }

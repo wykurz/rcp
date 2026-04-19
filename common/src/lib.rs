@@ -108,6 +108,7 @@ use tracing::instrument;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::prelude::*;
 
+pub mod cli;
 pub mod cmp;
 pub mod config;
 pub mod copy;
