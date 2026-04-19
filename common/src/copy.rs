@@ -7,11 +7,11 @@ use tracing::instrument;
 
 use crate::config::DryRunMode;
 use crate::filecmp;
-use crate::filter::{FilterResult, FilterSettings};
 use crate::preserve;
 use crate::progress;
 use crate::rm;
 use crate::rm::{Settings as RmSettings, Summary as RmSummary};
+use crate::walk::{self, EntryKind};
 
 /// Error type for copy operations that preserves operation summary even on failure.
 ///
@@ -80,20 +80,23 @@ pub struct Settings {
     pub dry_run: Option<crate::config::DryRunMode>,
 }
 
-/// Check if a path should be filtered out
-fn should_skip_entry(
-    filter: &Option<FilterSettings>,
-    relative_path: &std::path::Path,
-    is_dir: bool,
-) -> Option<FilterResult> {
-    if let Some(ref f) = filter {
-        let result = f.should_include(relative_path, is_dir);
-        match result {
-            FilterResult::Included => None,
-            _ => Some(result),
-        }
-    } else {
-        None
+/// Summary with the appropriate `*_skipped` counter set to 1 for the given entry kind.
+/// Special files count as `files_skipped` to match the historical mapping used
+/// when filters skip an entry (`specials_skipped` is reserved for `--skip-specials`).
+fn skipped_summary_for(kind: EntryKind) -> Summary {
+    match kind {
+        EntryKind::Dir => Summary {
+            directories_skipped: 1,
+            ..Default::default()
+        },
+        EntryKind::Symlink => Summary {
+            symlinks_skipped: 1,
+            ..Default::default()
+        },
+        EntryKind::File | EntryKind::Special => Summary {
+            files_skipped: 1,
+            ..Default::default()
+        },
     }
 }
 
@@ -124,7 +127,7 @@ pub enum EmptyDirAction {
 /// * `is_root` - whether this is the root (user-specified) source directory
 /// * `is_dry_run` - whether we're in dry-run mode
 pub fn check_empty_dir_cleanup(
-    filter: Option<&FilterSettings>,
+    filter: Option<&crate::filter::FilterSettings>,
     we_created_dir: bool,
     anything_copied: bool,
     relative_path: &std::path::Path,
@@ -382,37 +385,12 @@ pub async fn copy(
             match result {
                 crate::filter::FilterResult::Included => {}
                 result => {
+                    let kind = EntryKind::from_metadata(&src_metadata);
                     if let Some(mode) = settings.dry_run {
-                        let entry_type = if src_metadata.is_dir() {
-                            "directory"
-                        } else if src_metadata.is_symlink() {
-                            "symlink"
-                        } else {
-                            "file"
-                        };
-                        crate::dry_run::report_skip(src, &result, mode, entry_type);
+                        crate::dry_run::report_skip(src, &result, mode, kind.label_long());
                     }
-                    // return summary with skipped count
-                    let skipped_summary = if src_metadata.is_dir() {
-                        prog_track.directories_skipped.inc();
-                        Summary {
-                            directories_skipped: 1,
-                            ..Default::default()
-                        }
-                    } else if src_metadata.is_symlink() {
-                        prog_track.symlinks_skipped.inc();
-                        Summary {
-                            symlinks_skipped: 1,
-                            ..Default::default()
-                        }
-                    } else {
-                        prog_track.files_skipped.inc();
-                        Summary {
-                            files_skipped: 1,
-                            ..Default::default()
-                        }
-                    };
-                    return Ok(skipped_summary);
+                    kind.inc_skipped(prog_track);
+                    return Ok(skipped_summary_for(kind));
                 }
             }
         }
@@ -801,42 +779,24 @@ async fn copy_internal(
         let dst_path = dst.join(entry_name);
         // check entry type for filter matching and skip counting
         let entry_file_type = entry.file_type().await.ok();
-        let entry_is_dir = entry_file_type.map(|ft| ft.is_dir()).unwrap_or(false);
-        let entry_is_symlink = entry_file_type.map(|ft| ft.is_symlink()).unwrap_or(false);
+        let entry_kind = EntryKind::from_file_type(entry_file_type.as_ref());
+        let entry_is_dir = entry_kind == EntryKind::Dir;
         // compute relative path from source_root for filter matching
         let relative_path = entry_path.strip_prefix(source_root).unwrap_or(&entry_path);
         // apply filter if configured
-        if let Some(skip_result) = should_skip_entry(&settings.filter, relative_path, entry_is_dir)
+        if let Some(skip_result) =
+            walk::should_skip_entry(&settings.filter, relative_path, entry_is_dir)
         {
             if let Some(mode) = settings.dry_run {
-                let entry_type = if entry_is_dir {
-                    "dir"
-                } else if entry_is_symlink {
-                    "symlink"
-                } else {
-                    "file"
-                };
-                crate::dry_run::report_skip(&entry_path, &skip_result, mode, entry_type);
+                crate::dry_run::report_skip(&entry_path, &skip_result, mode, entry_kind.label());
             }
             tracing::debug!("skipping {:?} due to filter", &entry_path);
-            // increment skipped counters
-            if entry_is_dir {
-                copy_summary.directories_skipped += 1;
-                prog_track.directories_skipped.inc();
-            } else if entry_is_symlink {
-                copy_summary.symlinks_skipped += 1;
-                prog_track.symlinks_skipped.inc();
-            } else {
-                copy_summary.files_skipped += 1;
-                prog_track.files_skipped.inc();
-            }
+            copy_summary = copy_summary + skipped_summary_for(entry_kind);
+            entry_kind.inc_skipped(prog_track);
             continue;
         }
         // skip special files (sockets, FIFOs, devices) when --skip-specials is set
-        let is_special = entry_file_type
-            .as_ref()
-            .is_some_and(|ft| !ft.is_dir() && !ft.is_symlink() && !ft.is_file());
-        if settings.skip_specials && is_special {
+        if settings.skip_specials && entry_kind == EntryKind::Special {
             tracing::debug!("skipping special file {:?}", &entry_path);
             if let Some(mode) = settings.dry_run {
                 match mode {
@@ -2710,6 +2670,7 @@ mod copy_tests {
 
     mod empty_dir_cleanup_tests {
         use super::*;
+        use crate::filter::FilterSettings;
         use std::path::Path;
         #[test]
         fn test_check_empty_dir_cleanup_no_filter() {
@@ -3597,6 +3558,7 @@ mod copy_tests {
     }
     mod dry_run_tests {
         use super::*;
+        use crate::filter::FilterSettings;
         /// Test that dry-run mode for directories doesn't create the destination
         /// and doesn't try to set metadata on non-existent directories.
         #[tokio::test]

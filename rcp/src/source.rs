@@ -10,15 +10,7 @@ fn progress() -> &'static common::progress::Progress {
 /// special files (sockets, FIFOs, devices) that are filtered out count as files_skipped,
 /// matching local copy behavior. specials_skipped is only for --skip-specials.
 fn count_skipped(metadata: &std::fs::Metadata) {
-    let p = progress();
-    if metadata.is_dir() {
-        p.directories_skipped.inc();
-    } else if metadata.is_symlink() {
-        p.symlinks_skipped.inc();
-    } else {
-        // regular files and special files (sockets, FIFOs, devices)
-        p.files_skipped.inc();
-    }
+    common::walk::EntryKind::from_metadata(metadata).inc_skipped(progress());
 }
 
 /// Collected child entry from a directory pre-read.
