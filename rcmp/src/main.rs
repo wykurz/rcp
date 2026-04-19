@@ -88,42 +88,10 @@ struct Args {
     #[arg(long, value_name = "PATH", conflicts_with_all = ["include", "exclude"], help_heading = "Filtering")]
     filter_file: Option<std::path::PathBuf>,
 
-    // Progress & output
-    /// Show progress
-    #[arg(long, help_heading = "Progress & output")]
-    progress: bool,
-
-    /// Set the type of progress display
-    ///
-    /// If specified, --progress flag is implied.
-    #[arg(long, value_name = "TYPE", help_heading = "Progress & output")]
-    progress_type: Option<common::ProgressType>,
-
-    /// Sets the delay between progress updates
-    ///
-    /// - For the interactive (--progress-type=ProgressBar), the default is 200ms.
-    /// - For the non-interactive (--progress-type=TextUpdates), the default is 10s.
-    ///
-    /// If specified, --progress flag is implied.
-    ///
-    /// This option accepts a human readable duration, e.g. "200ms", "10s", "5min" etc.
-    #[arg(long, value_name = "DELAY", help_heading = "Progress & output")]
-    progress_delay: Option<String>,
-
-    /// Verbose level (implies "summary"): -v INFO / -vv DEBUG / -vvv TRACE (default: ERROR)
-    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, help_heading = "Progress & output")]
-    verbose: u8,
-
     /// Print summary at the end
     #[arg(long, help_heading = "Progress & output")]
     summary: bool,
 
-    /// Quiet mode, suppress stdout output (errors and differences)
-    ///
-    /// Without --log, differences are printed to stdout. This flag suppresses that.
-    /// When used with --log, differences are still written to the log file.
-    #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
-    quiet: bool,
     /// Output format for differences and summary
     #[arg(
         long,
@@ -132,32 +100,6 @@ struct Args {
         help_heading = "Progress & output"
     )]
     output_format: common::cmp::OutputFormat,
-
-    // Performance & throttling
-    /// Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system limit
-    #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
-    max_open_files: Option<usize>,
-
-    /// Throttle the number of operations per second, 0 means no throttle
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Performance & throttling"
-    )]
-    ops_throttle: usize,
-
-    /// Throttle the number of I/O operations per second, 0 means no throttle
-    ///
-    /// I/O is calculated based on provided chunk size -- number of I/O operations for a file is calculated as:
-    /// ((file size - 1) / chunk size) + 1
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Performance & throttling"
-    )]
-    iops_throttle: usize,
 
     /// Chunk size used to calculate number of I/O per file
     ///
@@ -170,24 +112,8 @@ struct Args {
     )]
     chunk_size: u64,
 
-    // Advanced settings
-    /// Number of worker threads, 0 means number of cores
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Advanced settings"
-    )]
-    max_workers: usize,
-
-    /// Number of blocking worker threads, 0 means Tokio runtime default (512)
-    #[arg(
-        long,
-        default_value = "0",
-        value_name = "N",
-        help_heading = "Advanced settings"
-    )]
-    max_blocking_threads: usize,
+    #[command(flatten)]
+    common: common::cli::CommonArgs,
 
     // ARGUMENTS
     /// File or directory to compare
@@ -207,7 +133,7 @@ async fn async_main(args: Args) -> Result<common::cmp::FormattedSummary> {
         &args.exclude,
     )?;
     // output to stdout if no log file and not quiet
-    let use_stdout = args.log.is_none() && !args.quiet;
+    let use_stdout = args.log.is_none() && !args.common.quiet;
     let log_handle =
         common::cmp::LogWriter::new(args.log.as_deref(), use_stdout, args.output_format).await?;
     let summary = common::cmp(
@@ -237,21 +163,11 @@ fn main() -> Result<()> {
         || async_main(args)
     };
     let output = common::OutputConfig {
-        quiet: args.quiet,
-        verbose: args.verbose,
-        print_summary: args.summary,
         suppress_runtime_stats: matches!(args.output_format, common::cmp::OutputFormat::Json),
+        ..args.common.output_config(args.summary)
     };
-    let runtime = common::RuntimeConfig {
-        max_workers: args.max_workers,
-        max_blocking_threads: args.max_blocking_threads,
-    };
-    let throttle = common::ThrottleConfig {
-        max_open_files: args.max_open_files,
-        ops_throttle: args.ops_throttle,
-        iops_throttle: args.iops_throttle,
-        chunk_size: args.chunk_size,
-    };
+    let runtime = args.common.runtime_config();
+    let throttle = args.common.throttle_config(args.chunk_size);
     let tracing = common::TracingConfig {
         remote_layer: None,
         debug_log_file: None,
@@ -262,23 +178,19 @@ fn main() -> Result<()> {
         tokio_console: false,
         tokio_console_port: None,
     };
-    let res = common::run(
-        if args.progress || args.progress_type.is_some() {
-            Some(common::ProgressSettings {
-                progress_type: common::GeneralProgressType::User(
-                    args.progress_type.unwrap_or_default(),
-                ),
-                progress_delay: args.progress_delay,
-            })
-        } else {
-            None
-        },
-        output,
-        runtime,
-        throttle,
-        tracing,
-        func,
-    );
+    // note: rcmp historically does not treat --progress-delay alone as implying
+    // --progress (unlike rrm/rlink). preserve that behavior here.
+    let progress = if args.common.progress || args.common.progress_type.is_some() {
+        Some(common::ProgressSettings {
+            progress_type: common::GeneralProgressType::User(
+                args.common.progress_type.unwrap_or_default(),
+            ),
+            progress_delay: args.common.progress_delay.clone(),
+        })
+    } else {
+        None
+    };
+    let res = common::run(progress, output, runtime, throttle, tracing, func);
     match res {
         Some(formatted) => {
             if args.no_check {
