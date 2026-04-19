@@ -672,20 +672,11 @@ async fn run_rcpd_master(
         }
     });
     // build filter settings from CLI arguments for source-side filtering
-    let filter = if let Some(ref path) = args.filter_file {
-        Some(common::filter::FilterSettings::from_file(path)?)
-    } else if !args.include.is_empty() || !args.exclude.is_empty() {
-        let mut settings = common::filter::FilterSettings::new();
-        for p in &args.include {
-            settings.add_include(p)?;
-        }
-        for p in &args.exclude {
-            settings.add_exclude(p)?;
-        }
-        Some(settings)
-    } else {
-        None
-    };
+    let filter = common::filter::FilterSettings::from_args(
+        args.filter_file.as_deref(),
+        &args.include,
+        &args.exclude,
+    )?;
     // send MasterHello to source rcpd (include dest fingerprint for mutual TLS)
     {
         let _span = tracing::trace_span!("send_master_hello_to_source").entered();
@@ -1018,27 +1009,12 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         })
         .collect::<anyhow::Result<Vec<(std::path::PathBuf, std::path::PathBuf)>>>()?;
     // build filter settings from CLI arguments
-    let filter = if let Some(ref path) = args.filter_file {
-        Some(
-            common::filter::FilterSettings::from_file(path)
-                .map_err(|err| common::copy::Error::new(err, Default::default()))?,
-        )
-    } else if !args.include.is_empty() || !args.exclude.is_empty() {
-        let mut settings = common::filter::FilterSettings::new();
-        for p in &args.include {
-            settings
-                .add_include(p)
-                .map_err(|err| common::copy::Error::new(err, Default::default()))?;
-        }
-        for p in &args.exclude {
-            settings
-                .add_exclude(p)
-                .map_err(|err| common::copy::Error::new(err, Default::default()))?;
-        }
-        Some(settings)
-    } else {
-        None
-    };
+    let filter = common::filter::FilterSettings::from_args(
+        args.filter_file.as_deref(),
+        &args.include,
+        &args.exclude,
+    )
+    .map_err(|err| common::copy::Error::new(err, Default::default()))?;
     let settings = common::copy::Settings {
         dereference: args.dereference,
         fail_early: args.fail_early,

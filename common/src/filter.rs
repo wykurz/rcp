@@ -358,6 +358,38 @@ impl FilterSettings {
             .with_context(|| format!("failed to read filter file: {:?}", path))?;
         Self::parse_content(&content)
     }
+    /// Build filter settings from CLI arguments. Either reads patterns from a
+    /// filter file, builds them from --include/--exclude lists, or returns
+    /// `None` when no filtering was requested.
+    ///
+    /// The file path and the include/exclude lists are mutually exclusive: the
+    /// CLI layer enforces this via clap's `conflicts_with_all`, and this helper
+    /// returns an error if a non-clap caller passes both.
+    pub fn from_args(
+        filter_file: Option<&std::path::Path>,
+        include: &[String],
+        exclude: &[String],
+    ) -> Result<Option<Self>, anyhow::Error> {
+        if filter_file.is_some() && (!include.is_empty() || !exclude.is_empty()) {
+            return Err(anyhow!(
+                "filter_file is mutually exclusive with include/exclude patterns"
+            ));
+        }
+        if let Some(path) = filter_file {
+            return Ok(Some(Self::from_file(path)?));
+        }
+        if include.is_empty() && exclude.is_empty() {
+            return Ok(None);
+        }
+        let mut settings = Self::new();
+        for p in include {
+            settings.add_include(p)?;
+        }
+        for p in exclude {
+            settings.add_exclude(p)?;
+        }
+        Ok(Some(settings))
+    }
     /// Parse filter settings from a string (filter file format)
     pub fn parse_content(content: &str) -> Result<Self, anyhow::Error> {
         let mut settings = Self::new();
@@ -1288,6 +1320,101 @@ mod tests {
                     Some(TimeSkipReason::TooNewBoth)
                 );
             }
+        }
+    }
+    mod from_args_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        /// RAII guard that writes a uniquely-named filter file under the
+        /// system temp dir and removes it when dropped. /tmp policies vary
+        /// (systemd-tmpfiles often runs weekly, never on some hosts), so
+        /// explicit cleanup keeps tests from leaving junk behind.
+        struct TempFilterFile {
+            path: std::path::PathBuf,
+        }
+        impl TempFilterFile {
+            fn new(content: &str) -> Self {
+                let n = SEQ.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir()
+                    .join(format!("rcp-from-args-test-{}-{n}.txt", std::process::id()));
+                std::fs::write(&path, content).unwrap();
+                Self { path }
+            }
+            fn path(&self) -> &std::path::Path {
+                &self.path
+            }
+        }
+        impl Drop for TempFilterFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+        #[test]
+        fn returns_none_when_nothing_specified() {
+            let result = FilterSettings::from_args(None, &[], &[]).unwrap();
+            assert!(result.is_none());
+        }
+        #[test]
+        fn builds_from_include_only() {
+            let include = vec!["*.rs".to_string(), "Cargo.toml".to_string()];
+            let settings = FilterSettings::from_args(None, &include, &[])
+                .unwrap()
+                .expect("should return Some when include is non-empty");
+            assert_eq!(settings.includes.len(), 2);
+            assert!(settings.excludes.is_empty());
+        }
+        #[test]
+        fn builds_from_exclude_only() {
+            let exclude = vec!["*.log".to_string(), "target/".to_string()];
+            let settings = FilterSettings::from_args(None, &[], &exclude)
+                .unwrap()
+                .expect("should return Some when exclude is non-empty");
+            assert!(settings.includes.is_empty());
+            assert_eq!(settings.excludes.len(), 2);
+        }
+        #[test]
+        fn builds_from_include_and_exclude() {
+            let include = vec!["*.rs".to_string()];
+            let exclude = vec!["target/".to_string()];
+            let settings = FilterSettings::from_args(None, &include, &exclude)
+                .unwrap()
+                .expect("should return Some");
+            assert_eq!(settings.includes.len(), 1);
+            assert_eq!(settings.excludes.len(), 1);
+        }
+        #[test]
+        fn loads_from_filter_file() {
+            let file = TempFilterFile::new("--include *.rs\n--exclude target/\n");
+            let settings = FilterSettings::from_args(Some(file.path()), &[], &[])
+                .unwrap()
+                .expect("should return Some when filter file is read");
+            assert_eq!(settings.includes.len(), 1);
+            assert_eq!(settings.excludes.len(), 1);
+        }
+        #[test]
+        fn errors_when_filter_file_combined_with_include() {
+            let file = TempFilterFile::new("--include *.rs\n");
+            let include = vec!["*.txt".to_string()];
+            let err = FilterSettings::from_args(Some(file.path()), &include, &[]).unwrap_err();
+            assert!(err.to_string().contains("mutually exclusive"));
+        }
+        #[test]
+        fn errors_when_filter_file_combined_with_exclude() {
+            let file = TempFilterFile::new("--include *.rs\n");
+            let exclude = vec!["*.log".to_string()];
+            let err = FilterSettings::from_args(Some(file.path()), &[], &exclude).unwrap_err();
+            assert!(err.to_string().contains("mutually exclusive"));
+        }
+        #[test]
+        fn propagates_invalid_include_pattern() {
+            let include = vec!["".to_string()];
+            assert!(FilterSettings::from_args(None, &include, &[]).is_err());
+        }
+        #[test]
+        fn propagates_missing_filter_file() {
+            let path = std::path::PathBuf::from("/nonexistent/path/filters.txt");
+            assert!(FilterSettings::from_args(Some(&path), &[], &[]).is_err());
         }
     }
 }

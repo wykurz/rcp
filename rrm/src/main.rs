@@ -218,20 +218,11 @@ fn build_time_filter(
 #[instrument]
 async fn async_main(args: Args) -> Result<common::rm::Summary> {
     // build filter settings once before the loop
-    let filter = if let Some(ref path) = args.filter_file {
-        Some(common::filter::FilterSettings::from_file(path)?)
-    } else if !args.include.is_empty() || !args.exclude.is_empty() {
-        let mut filter_settings = common::filter::FilterSettings::new();
-        for p in &args.include {
-            filter_settings.add_include(p)?;
-        }
-        for p in &args.exclude {
-            filter_settings.add_exclude(p)?;
-        }
-        Some(filter_settings)
-    } else {
-        None
-    };
+    let filter = common::filter::FilterSettings::from_args(
+        args.filter_file.as_deref(),
+        &args.include,
+        &args.exclude,
+    )?;
     let time_filter = build_time_filter(
         args.modified_before.as_deref(),
         args.created_before.as_deref(),

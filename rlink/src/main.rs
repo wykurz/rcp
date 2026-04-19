@@ -263,20 +263,11 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
     }
     let result = common::link(&args.src, &dst, &args.update, {
         // build filter settings from CLI arguments
-        let filter = if let Some(ref path) = args.filter_file {
-            Some(common::filter::FilterSettings::from_file(path)?)
-        } else if !args.include.is_empty() || !args.exclude.is_empty() {
-            let mut filter_settings = common::filter::FilterSettings::new();
-            for p in &args.include {
-                filter_settings.add_include(p)?;
-            }
-            for p in &args.exclude {
-                filter_settings.add_exclude(p)?;
-            }
-            Some(filter_settings)
-        } else {
-            None
-        };
+        let filter = common::filter::FilterSettings::from_args(
+            args.filter_file.as_deref(),
+            &args.include,
+            &args.exclude,
+        )?;
         &common::link::Settings {
             copy_settings: common::copy::Settings {
                 dereference: false, // currently not supported
