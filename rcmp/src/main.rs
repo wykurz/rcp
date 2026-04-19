@@ -92,6 +92,13 @@ struct Args {
     #[arg(long, help_heading = "Progress & output")]
     summary: bool,
 
+    /// Quiet mode, suppress stdout output (errors and differences)
+    ///
+    /// Without --log, differences are printed to stdout. This flag suppresses that.
+    /// When used with --log, differences are still written to the log file.
+    #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
+    quiet: bool,
+
     /// Output format for differences and summary
     #[arg(
         long,
@@ -100,6 +107,10 @@ struct Args {
         help_heading = "Progress & output"
     )]
     output_format: common::cmp::OutputFormat,
+
+    /// Maximum number of open files (0 = no limit, unspecified = 80% of system limit)
+    #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
+    max_open_files: Option<usize>,
 
     /// Chunk size used to calculate number of I/O per file
     ///
@@ -133,7 +144,7 @@ async fn async_main(args: Args) -> Result<common::cmp::FormattedSummary> {
         &args.exclude,
     )?;
     // output to stdout if no log file and not quiet
-    let use_stdout = args.log.is_none() && !args.common.quiet;
+    let use_stdout = args.log.is_none() && !args.quiet;
     let log_handle =
         common::cmp::LogWriter::new(args.log.as_deref(), use_stdout, args.output_format).await?;
     let summary = common::cmp(
@@ -164,10 +175,12 @@ fn main() -> Result<()> {
     };
     let output = common::OutputConfig {
         suppress_runtime_stats: matches!(args.output_format, common::cmp::OutputFormat::Json),
-        ..args.common.output_config(args.summary)
+        ..args.common.output_config(args.quiet, args.summary)
     };
     let runtime = args.common.runtime_config();
-    let throttle = args.common.throttle_config(args.chunk_size);
+    let throttle = args
+        .common
+        .throttle_config(args.max_open_files, args.chunk_size);
     let tracing = common::TracingConfig {
         remote_layer: None,
         debug_log_file: None,

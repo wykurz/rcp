@@ -146,6 +146,14 @@ struct Args {
     #[arg(long, help_heading = "Progress & output")]
     summary: bool,
 
+    /// Quiet mode, don't report errors
+    #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
+    quiet: bool,
+
+    /// Maximum number of open files (0 = no limit, unspecified = 80% of system limit)
+    #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
+    max_open_files: Option<usize>,
+
     /// Chunk size for calculating I/O operations per file
     ///
     /// Required when using --iops-throttle (must be > 0)
@@ -388,7 +396,7 @@ async fn run_rcpd_master(
         fail_early: args.fail_early,
         max_workers: args.common.max_workers,
         max_blocking_threads: args.common.max_blocking_threads,
-        max_open_files: args.common.max_open_files,
+        max_open_files: args.max_open_files,
         ops_throttle: args.common.ops_throttle,
         iops_throttle: args.common.iops_throttle,
         chunk_size: args.chunk_size.0 as usize,
@@ -1062,9 +1070,13 @@ fn main() -> Result<(), anyhow::Error> {
         let args = args.clone();
         || async_main(args)
     };
-    let output = args.common.output_config(!is_dry_run && args.summary);
+    let output = args
+        .common
+        .output_config(args.quiet, !is_dry_run && args.summary);
     let runtime = args.common.runtime_config();
-    let throttle = args.common.throttle_config(args.chunk_size.0);
+    let throttle = args
+        .common
+        .throttle_config(args.max_open_files, args.chunk_size.0);
     let tracing = common::TracingConfig {
         remote_layer: None,
         debug_log_file: None,

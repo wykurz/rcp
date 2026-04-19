@@ -88,6 +88,14 @@ struct Args {
     #[arg(long, help_heading = "Progress & output")]
     summary: bool,
 
+    /// Quiet mode, don't report errors
+    #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
+    quiet: bool,
+
+    /// Maximum number of open files, 0 means no limit, leaving unspecified means using 80% of max open files system limit
+    #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
+    max_open_files: Option<usize>,
+
     /// Chunk size used to calculate number of I/O per file
     ///
     /// Modifying this setting to a value > 0 is REQUIRED when using --iops-throttle.
@@ -221,9 +229,13 @@ fn main() -> Result<()> {
         let args = args.clone();
         || async_main(args)
     };
-    let output = args.common.output_config(!is_dry_run && args.summary);
+    let output = args
+        .common
+        .output_config(args.quiet, !is_dry_run && args.summary);
     let runtime = args.common.runtime_config();
-    let throttle = args.common.throttle_config(args.chunk_size);
+    let throttle = args
+        .common
+        .throttle_config(args.max_open_files, args.chunk_size);
     let tracing = common::TracingConfig {
         remote_layer: None,
         debug_log_file: None,
