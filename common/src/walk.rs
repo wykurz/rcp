@@ -93,7 +93,7 @@ pub fn should_skip_entry(
     relative_path: &std::path::Path,
     is_dir: bool,
 ) -> Option<FilterResult> {
-    if let Some(ref f) = filter {
+    if let Some(f) = filter {
         let result = f.should_include(relative_path, is_dir);
         match result {
             FilterResult::Included => None,

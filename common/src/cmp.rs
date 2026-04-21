@@ -511,21 +511,20 @@ async fn cmp_internal(
         .await
         .with_context(|| format!("failed reading metadata from {:?}", &src))?;
     // apply filter to root item (when src == source_root, this is the initial call)
-    if src == source_root {
-        if let Some(ref filter) = settings.filter {
-            if let Some(name) = src.file_name() {
-                let is_dir = src_metadata.is_dir();
-                if !matches!(
-                    filter.should_include_root_item(name.as_ref(), is_dir),
-                    crate::filter::FilterResult::Included
-                ) {
-                    // root item filtered out, return summary with skipped count
-                    let src_obj_type = obj_type(&src_metadata);
-                    let mut summary = Summary::default();
-                    summary.skipped[src_obj_type] += 1;
-                    return Ok(summary);
-                }
-            }
+    if src == source_root
+        && let Some(filter) = &settings.filter
+        && let Some(name) = src.file_name()
+    {
+        let is_dir = src_metadata.is_dir();
+        if !matches!(
+            filter.should_include_root_item(name.as_ref(), is_dir),
+            crate::filter::FilterResult::Included
+        ) {
+            // root item filtered out, return summary with skipped count
+            let src_obj_type = obj_type(&src_metadata);
+            let mut summary = Summary::default();
+            summary.skipped[src_obj_type] += 1;
+            return Ok(summary);
         }
     }
     let mut cmp_summary = Summary::default();

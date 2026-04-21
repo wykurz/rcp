@@ -1,6 +1,6 @@
 use anyhow::Context;
 use tokio::io::AsyncWriteExt;
-use tracing::{instrument, Instrument};
+use tracing::{Instrument, instrument};
 
 use super::directory_tracker;
 
@@ -166,17 +166,17 @@ async fn process_single_file(
                         .map_err(err_corrupted)?;
                     return Ok(());
                 }
-                if let Some(common::copy::OverwriteFilter::Newer) = settings.overwrite_filter {
-                    if common::filecmp::dest_is_newer(&src_file_metadata, &dst_metadata) {
-                        tracing::debug!("dest is newer than source, skipping");
-                        prog.files_unchanged.inc();
-                        let mut sink = tokio::io::sink();
-                        file_recv_stream
-                            .copy_exact_to_buffered(&mut sink, file_header.size, 8192)
-                            .await
-                            .map_err(err_corrupted)?;
-                        return Ok(());
-                    }
+                if let Some(common::copy::OverwriteFilter::Newer) = settings.overwrite_filter
+                    && common::filecmp::dest_is_newer(&src_file_metadata, &dst_metadata)
+                {
+                    tracing::debug!("dest is newer than source, skipping");
+                    prog.files_unchanged.inc();
+                    let mut sink = tokio::io::sink();
+                    file_recv_stream
+                        .copy_exact_to_buffered(&mut sink, file_header.size, 8192)
+                        .await
+                        .map_err(err_corrupted)?;
+                    return Ok(());
                 }
                 tracing::debug!("file exists but is different, removing");
                 let removed_file_size = dst_metadata.len();
@@ -508,7 +508,9 @@ async fn create_directory(
                 Ok(DirectoryCreateResult::AlreadyExisted)
             } else if settings.ignore_existing {
                 // not a directory but ignore_existing is set - skip the subtree
-                tracing::debug!("destination exists but is not a directory, skipping subtree (--ignore-existing)");
+                tracing::debug!(
+                    "destination exists but is not a directory, skipping subtree (--ignore-existing)"
+                );
                 prog.directories_unchanged.inc();
                 Ok(DirectoryCreateResult::Skipped)
             } else if settings.overwrite {
@@ -664,15 +666,13 @@ async fn process_control_stream(
                 if has_failed_ancestor {
                     tracing::warn!("Skipping directory {:?} - ancestor failed to create", dst);
                     // still count as a processed child entry for the parent
-                    if !is_root {
-                        if let Some(parent) = dst.parent() {
-                            directory_tracker
-                                .lock()
-                                .await
-                                .process_child_entry(parent)
-                                .await
-                                .context("Failed to update parent tracker for skipped directory")?;
-                        }
+                    if !is_root && let Some(parent) = dst.parent() {
+                        directory_tracker
+                            .lock()
+                            .await
+                            .process_child_entry(parent)
+                            .await
+                            .context("Failed to update parent tracker for skipped directory")?;
                     }
                     continue;
                 }
@@ -729,12 +729,11 @@ async fn process_control_stream(
                         }
                         // failed directory won't go through complete_directory, so
                         // notify parent immediately
-                        if !is_root {
-                            if let Some(parent) = dst.parent() {
-                                tracker.process_child_entry(parent).await.context(
-                                    "Failed to update parent tracker for failed directory",
-                                )?;
-                            }
+                        if !is_root && let Some(parent) = dst.parent() {
+                            tracker
+                                .process_child_entry(parent)
+                                .await
+                                .context("Failed to update parent tracker for failed directory")?;
                         }
                         if create_result == DirectoryCreateResult::Failed && settings.fail_early {
                             return Err(anyhow::anyhow!(
@@ -762,15 +761,13 @@ async fn process_control_stream(
                 if has_failed_ancestor {
                     tracing::warn!("Skipping symlink {:?} - ancestor failed to create", dst);
                     // still count as a processed child entry for the parent
-                    if !is_root {
-                        if let Some(parent) = dst.parent() {
-                            directory_tracker
-                                .lock()
-                                .await
-                                .process_child_entry(parent)
-                                .await
-                                .context("Failed to update parent tracker for skipped symlink")?;
-                        }
+                    if !is_root && let Some(parent) = dst.parent() {
+                        directory_tracker
+                            .lock()
+                            .await
+                            .process_child_entry(parent)
+                            .await
+                            .context("Failed to update parent tracker for skipped symlink")?;
                     }
                     continue;
                 }
@@ -788,15 +785,13 @@ async fn process_control_stream(
                     directory_tracker.lock().await.set_root_complete();
                 }
                 // count this symlink as a processed child entry for its parent
-                if !is_root {
-                    if let Some(parent) = dst.parent() {
-                        directory_tracker
-                            .lock()
-                            .await
-                            .process_child_entry(parent)
-                            .await
-                            .context("Failed to update parent tracker for symlink")?;
-                    }
+                if !is_root && let Some(parent) = dst.parent() {
+                    directory_tracker
+                        .lock()
+                        .await
+                        .process_child_entry(parent)
+                        .await
+                        .context("Failed to update parent tracker for symlink")?;
                 }
             }
             remote::protocol::SourceMessage::DirStructureComplete { has_root_item } => {
@@ -836,15 +831,13 @@ async fn process_control_stream(
                     directory_tracker.lock().await.set_root_complete();
                 }
                 // count this skipped symlink as a processed child entry for its parent
-                if !is_root {
-                    if let Some(parent) = src_dst.dst.parent() {
-                        directory_tracker
-                            .lock()
-                            .await
-                            .process_child_entry(parent)
-                            .await
-                            .context("Failed to update parent tracker for skipped symlink")?;
-                    }
+                if !is_root && let Some(parent) = src_dst.dst.parent() {
+                    directory_tracker
+                        .lock()
+                        .await
+                        .process_child_entry(parent)
+                        .await
+                        .context("Failed to update parent tracker for skipped symlink")?;
                 }
             }
         }

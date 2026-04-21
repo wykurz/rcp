@@ -101,8 +101,8 @@
 //! ```
 
 use crate::cmp::ObjType;
-use anyhow::anyhow;
 use anyhow::Context;
+use anyhow::anyhow;
 use std::io::IsTerminal;
 use tracing::instrument;
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -183,14 +183,12 @@ pub fn is_localhost(host: &str) -> bool {
     let mut buf = [0u8; 256];
     // Safety: gethostname writes to buf and returns 0 on success
     let result = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if result == 0 {
-        if let Ok(hostname_cstr) = std::ffi::CStr::from_bytes_until_nul(&buf) {
-            if let Ok(hostname) = hostname_cstr.to_str() {
-                if host == hostname {
-                    return true;
-                }
-            }
-        }
+    if result == 0
+        && let Ok(hostname_cstr) = std::ffi::CStr::from_bytes_until_nul(&buf)
+        && let Ok(hostname) = hostname_cstr.to_str()
+        && host == hostname
+    {
+        return true;
     }
     false
 }
@@ -1107,10 +1105,11 @@ where
             }
         }
     }
-    if (print_summary || verbose > 0) && !suppress_runtime_stats {
-        if let Err(err) = print_runtime_stats() {
-            println!("Failed to print runtime stats: {err:?}");
-        }
+    if (print_summary || verbose > 0)
+        && !suppress_runtime_stats
+        && let Err(err) = print_runtime_stats()
+    {
+        println!("Failed to print runtime stats: {err:?}");
     }
     res.ok()
 }

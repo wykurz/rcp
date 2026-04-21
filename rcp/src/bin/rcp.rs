@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use clap::Parser;
 use tracing::instrument;
 
@@ -576,7 +576,7 @@ async fn run_rcpd_master(
     )
     .await?;
     drop(source_tracing_send); // we only receive on tracing connection
-                               // connect to destination rcpd (control + tracing)
+    // connect to destination rcpd (control + tracing)
     tracing::info!("Connecting to destination rcpd...");
     let (mut dest_send_stream, mut dest_recv_stream) = connect_to_rcpd(
         &dest_rcpd.conn_info,
@@ -787,8 +787,8 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
             return Err(anyhow!(
                 "expanding source directory ({:?}) using dot operator ('.') is not supported, please use absolute \
                 path or '*' instead",
-                std::path::PathBuf::from(src))
-            );
+                std::path::PathBuf::from(src)
+            ));
         }
     }
     // choose parser based on --force-remote flag
@@ -889,10 +889,10 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         return match run_rcpd_master(&args, &preserve, &remote_src, &remote_dst).await {
             Ok(summary) => Ok(summary),
             Err(error) => {
-                if let Some(copy_error) = error.downcast_ref::<common::copy::Error>() {
-                    if args.summary {
-                        return Err(anyhow!("{}\n\n{}", copy_error, &copy_error.summary));
-                    }
+                if let Some(copy_error) = error.downcast_ref::<common::copy::Error>()
+                    && args.summary
+                {
+                    return Err(anyhow!("{}\n\n{}", copy_error, &copy_error.summary));
                 }
                 Err(error)
             }

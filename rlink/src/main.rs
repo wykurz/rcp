@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
@@ -195,43 +195,40 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
     };
     let update_compare = common::parse_metadata_cmp_settings(&args.update_compare)?;
     // validate --update comparison attributes against preserve settings
-    if args.update.is_some() {
-        if let Err(msg) = common::validate_update_compare_vs_preserve(&update_compare, &preserve) {
-            if !args.allow_lossy_update {
-                return Err(anyhow!("{msg}"));
-            }
-            tracing::warn!("{msg}");
+    if args.update.is_some()
+        && let Err(msg) = common::validate_update_compare_vs_preserve(&update_compare, &preserve)
+    {
+        if !args.allow_lossy_update {
+            return Err(anyhow!("{msg}"));
         }
+        tracing::warn!("{msg}");
     }
-    let result = common::link(&args.src, &dst, &args.update, {
-        // build filter settings from CLI arguments
-        let filter = common::filter::FilterSettings::from_args(
-            args.filter_file.as_deref(),
-            &args.include,
-            &args.exclude,
-        )?;
-        &common::link::Settings {
-            copy_settings: common::copy::Settings {
-                dereference: false, // currently not supported
-                fail_early: args.fail_early,
-                overwrite: args.overwrite,
-                overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
-                overwrite_filter: None,
-                ignore_existing: false,
-                chunk_size: args.chunk_size,
-                skip_specials: args.skip_specials,
-                remote_copy_buffer_size: 0, // not used for local operations
-                filter: filter.clone(),
-                dry_run: args.dry_run,
-            },
-            update_compare,
-            update_exclusive: args.update_exclusive,
-            filter,
+    let filter = common::filter::FilterSettings::from_args(
+        args.filter_file.as_deref(),
+        &args.include,
+        &args.exclude,
+    )?;
+    let settings = common::link::Settings {
+        copy_settings: common::copy::Settings {
+            dereference: false, // currently not supported
+            fail_early: args.fail_early,
+            overwrite: args.overwrite,
+            overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
+            overwrite_filter: None,
+            ignore_existing: false,
+            chunk_size: args.chunk_size,
+            skip_specials: args.skip_specials,
+            remote_copy_buffer_size: 0, // not used for local operations
+            filter: filter.clone(),
             dry_run: args.dry_run,
-            preserve,
-        }
-    })
-    .await;
+        },
+        update_compare,
+        update_exclusive: args.update_exclusive,
+        filter,
+        dry_run: args.dry_run,
+        preserve,
+    };
+    let result = common::link(&args.src, &dst, &args.update, &settings).await;
     match result {
         Ok(summary) => Ok(summary),
         Err(error) => {

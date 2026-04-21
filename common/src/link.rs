@@ -1,11 +1,11 @@
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_recursion::async_recursion;
 use std::os::linux::fs::MetadataExt as LinuxMetadataExt;
 use tracing::instrument;
 
 use crate::copy;
 use crate::copy::{
-    check_empty_dir_cleanup, EmptyDirAction, Settings as CopySettings, Summary as CopySummary,
+    EmptyDirAction, Settings as CopySettings, Summary as CopySummary, check_empty_dir_cleanup,
 };
 use crate::filecmp;
 use crate::preserve;
@@ -101,44 +101,45 @@ async fn hard_link_helper(
     settings: &Settings,
 ) -> Result<Summary, Error> {
     let mut link_summary = Summary::default();
-    if let Err(error) = tokio::fs::hard_link(src, dst).await {
-        if settings.copy_settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
-            tracing::debug!("'dst' already exists, check if we need to update");
-            let dst_metadata = tokio::fs::symlink_metadata(dst)
-                .await
-                .with_context(|| format!("cannot read {dst:?} metadata"))
-                .map_err(|err| Error::new(err, Default::default()))?;
-            if is_hard_link(src_metadata, &dst_metadata) {
-                tracing::debug!("no change, leaving file as is");
-                prog_track.hard_links_unchanged.inc();
-                return Ok(Summary {
-                    hard_links_unchanged: 1,
-                    ..Default::default()
-                });
-            }
-            tracing::info!("'dst' file type changed, removing and hard-linking");
-            let rm_summary = rm::rm(
-                prog_track,
-                dst,
-                &rm::Settings {
-                    fail_early: settings.copy_settings.fail_early,
-                    filter: None,
-                    dry_run: None,
-                    time_filter: None,
-                },
-            )
+    if let Err(error) = tokio::fs::hard_link(src, dst).await
+        && settings.copy_settings.overwrite
+        && error.kind() == std::io::ErrorKind::AlreadyExists
+    {
+        tracing::debug!("'dst' already exists, check if we need to update");
+        let dst_metadata = tokio::fs::symlink_metadata(dst)
             .await
-            .map_err(|err| {
-                let rm_summary = err.summary;
-                link_summary.copy_summary.rm_summary = rm_summary;
-                Error::new(err.source, link_summary)
-            })?;
-            link_summary.copy_summary.rm_summary = rm_summary;
-            tokio::fs::hard_link(src, dst)
-                .await
-                .with_context(|| format!("failed to hard link {:?} to {:?}", src, dst))
-                .map_err(|err| Error::new(err, link_summary))?;
+            .with_context(|| format!("cannot read {dst:?} metadata"))
+            .map_err(|err| Error::new(err, Default::default()))?;
+        if is_hard_link(src_metadata, &dst_metadata) {
+            tracing::debug!("no change, leaving file as is");
+            prog_track.hard_links_unchanged.inc();
+            return Ok(Summary {
+                hard_links_unchanged: 1,
+                ..Default::default()
+            });
         }
+        tracing::info!("'dst' file type changed, removing and hard-linking");
+        let rm_summary = rm::rm(
+            prog_track,
+            dst,
+            &rm::Settings {
+                fail_early: settings.copy_settings.fail_early,
+                filter: None,
+                dry_run: None,
+                time_filter: None,
+            },
+        )
+        .await
+        .map_err(|err| {
+            let rm_summary = err.summary;
+            link_summary.copy_summary.rm_summary = rm_summary;
+            Error::new(err.source, link_summary)
+        })?;
+        link_summary.copy_summary.rm_summary = rm_summary;
+        tokio::fs::hard_link(src, dst)
+            .await
+            .with_context(|| format!("failed to hard link {src:?} to {dst:?}"))
+            .map_err(|err| Error::new(err, link_summary))?;
     }
     prog_track.hard_links_created.inc();
     link_summary.hard_links_created = 1;
@@ -900,8 +901,8 @@ mod link_tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_link_destination_permission_error_includes_root_cause(
-    ) -> Result<(), anyhow::Error> {
+    async fn test_link_destination_permission_error_includes_root_cause()
+    -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
         let readonly_parent = test_path.join("readonly_dest");

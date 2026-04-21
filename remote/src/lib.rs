@@ -118,7 +118,7 @@
 #[cfg(not(tokio_unstable))]
 compile_error!("tokio_unstable cfg must be enabled; see .cargo/config.toml");
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use tracing::instrument;
 
 pub mod deploy;
@@ -374,10 +374,10 @@ pub(crate) fn shell_escape(s: &str) -> String {
 ///
 /// Returns an error if HOME is not set or is empty
 pub async fn get_remote_home(session: &std::sync::Arc<openssh::Session>) -> anyhow::Result<String> {
-    if let Ok(home_override) = std::env::var("RCP_REMOTE_HOME_OVERRIDE") {
-        if !home_override.is_empty() {
-            return Ok(home_override);
-        }
+    if let Ok(home_override) = std::env::var("RCP_REMOTE_HOME_OVERRIDE")
+        && !home_override.is_empty()
+    {
+        return Ok(home_override);
     }
     let output = session
         .command("sh")
@@ -557,14 +557,13 @@ async fn discover_rcpd_path_internal<S: DiscoverySession + ?Sized>(
     if let Ok(current_exe) = current_exe_override
         .map(Ok)
         .unwrap_or_else(std::env::current_exe)
+        && let Some(bin_dir) = current_exe.parent()
     {
-        if let Some(bin_dir) = current_exe.parent() {
-            let path = bin_dir.join("rcpd").display().to_string();
-            tracing::debug!("Trying same directory as rcp: {}", path);
-            if session.test_executable(&path).await? {
-                tracing::info!("Found rcpd in same directory as rcp: {}", path);
-                return Ok(path);
-            }
+        let path = bin_dir.join("rcpd").display().to_string();
+        tracing::debug!("Trying same directory as rcp: {}", path);
+        if session.test_executable(&path).await? {
+            tracing::info!("Found rcpd in same directory as rcp: {}", path);
+            return Ok(path);
         }
     }
     // try PATH

@@ -151,14 +151,14 @@ pub fn find_local_rcpd_binary() -> anyhow::Result<PathBuf> {
     // try same directory as current executable first
     // this ensures we use the same build (debug/release) as the running rcp
     // and covers development builds where rcp and rcpd are both in target/
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(bin_dir) = current_exe.parent() {
-            let path = bin_dir.join("rcpd");
-            searched_paths.push(format!("Same directory: {}", path.display()));
-            if path.exists() && path.is_file() {
-                tracing::info!("Found local rcpd binary at {}", path.display());
-                return Ok(path);
-            }
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(bin_dir) = current_exe.parent()
+    {
+        let path = bin_dir.join("rcpd");
+        searched_paths.push(format!("Same directory: {}", path.display()));
+        if path.exists() && path.is_file() {
+            tracing::info!("Found local rcpd binary at {}", path.display());
+            return Ok(path);
         }
     }
 
@@ -169,17 +169,17 @@ pub fn find_local_rcpd_binary() -> anyhow::Result<PathBuf> {
         .output()
         .ok();
 
-    if let Some(output) = which_output {
-        if output.status.success() {
-            let path_str = String::from_utf8_lossy(&output.stdout);
-            let path_str = path_str.trim();
-            if !path_str.is_empty() {
-                let path = PathBuf::from(path_str);
-                searched_paths.push(format!("PATH: {}", path.display()));
-                if path.exists() && path.is_file() {
-                    tracing::info!("Found local rcpd binary in PATH: {}", path.display());
-                    return Ok(path);
-                }
+    if let Some(output) = which_output
+        && output.status.success()
+    {
+        let path_str = String::from_utf8_lossy(&output.stdout);
+        let path_str = path_str.trim();
+        if !path_str.is_empty() {
+            let path = PathBuf::from(path_str);
+            searched_paths.push(format!("PATH: {}", path.display()));
+            if path.exists() && path.is_file() {
+                tracing::info!("Found local rcpd binary in PATH: {}", path.display());
+                return Ok(path);
             }
         }
     }

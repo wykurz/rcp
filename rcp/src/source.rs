@@ -1,6 +1,6 @@
 use anyhow::Context;
 use async_recursion::async_recursion;
-use tracing::{instrument, Instrument};
+use tracing::{Instrument, instrument};
 
 fn progress() -> &'static common::progress::Progress {
     common::get_progress()
@@ -390,8 +390,8 @@ async fn send_fs_objects_tcp(
     } else {
         true
     };
-    if !src_metadata.is_file() {
-        if let Err(e) = send_directories_and_symlinks(
+    if !src_metadata.is_file()
+        && let Err(e) = send_directories_and_symlinks(
             settings,
             src,
             dst,
@@ -401,13 +401,12 @@ async fn send_fs_objects_tcp(
             &error_collector,
         )
         .await
-        {
-            tracing::error!("Failed to send directories and symlinks: {e:#}");
-            if settings.fail_early {
-                return Err(e);
-            }
-            error_collector.push(e);
+    {
+        tracing::error!("Failed to send directories and symlinks: {e:#}");
+        if settings.fail_early {
+            return Err(e);
         }
+        error_collector.push(e);
     }
     let mut stream = control_send_stream.lock().await;
     stream
@@ -1482,12 +1481,10 @@ async fn dry_run_traverse(
         if should_process {
             // directly matched directory: un-count if nothing was added and not
             // directly matched by an include pattern
-            if !child_content_added {
-                if let Some(ref filter) = settings.filter {
-                    let relative_path = src.strip_prefix(source_root).unwrap_or(src);
-                    if !filter.directly_matches_include(relative_path, true) {
-                        summary.directories_created -= 1;
-                    }
+            if !child_content_added && let Some(filter) = &settings.filter {
+                let relative_path = src.strip_prefix(source_root).unwrap_or(src);
+                if !filter.directly_matches_include(relative_path, true) {
+                    summary.directories_created -= 1;
                 }
             }
         } else {
