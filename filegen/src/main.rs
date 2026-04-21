@@ -21,7 +21,7 @@ impl std::str::FromStr for Dirwidth {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow::anyhow!("Invalid dirwidth specification '{}': {}", s, e))?;
         // validate that all values are > 0
-        if let Some((index, _)) = value.iter().enumerate().find(|(_, &v)| v == 0) {
+        if let Some((index, _)) = value.iter().enumerate().find(|&(_, &v)| v == 0) {
             anyhow::bail!(
                 "Invalid dirwidth specification '{}': value at position {} is 0. All values must be greater than 0.",
                 s,

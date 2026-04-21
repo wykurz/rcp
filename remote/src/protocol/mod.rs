@@ -349,10 +349,8 @@ impl RcpdConfig {
         if let Some(ref prefix) = self.flamegraph_prefix {
             args.push(format!("--flamegraph={prefix}"));
         }
-        if profiling_enabled {
-            if let Some(ref level) = self.profile_level {
-                args.push(format!("--profile-level={level}"));
-            }
+        if profiling_enabled && let Some(level) = &self.profile_level {
+            args.push(format!("--profile-level={level}"));
         }
         if self.tokio_console {
             args.push("--tokio-console".to_string());

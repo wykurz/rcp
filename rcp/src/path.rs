@@ -169,16 +169,22 @@ fn join_path_with_filename(host_prefix: Option<String>, dir_path: &str, filename
 }
 
 pub fn expand_local_home(path: &str) -> anyhow::Result<std::path::PathBuf> {
+    expand_home_with(path, || {
+        std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .context("HOME environment variable is not set; required for tilde expansion")
+    })
+}
+
+fn expand_home_with(
+    path: &str,
+    home: impl FnOnce() -> anyhow::Result<std::path::PathBuf>,
+) -> anyhow::Result<std::path::PathBuf> {
     if let Some(rest) = path.strip_prefix("~/") {
-        let home = std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .context("HOME environment variable is not set; required for '~/' expansion")?;
-        return Ok(home.join(rest));
-    } else if path == "~" {
-        let home = std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .context("HOME environment variable is not set; required for '~' expansion")?;
-        return Ok(home);
+        return Ok(home()?.join(rest));
+    }
+    if path == "~" {
+        return home();
     }
     Ok(std::path::PathBuf::from(path))
 }
@@ -383,21 +389,21 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_path_local_tilde_expands() {
-        let tmp_home = tempfile::tempdir().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", tmp_home.path());
-        match parse_path("~/docs/file.txt").unwrap() {
-            PathType::Local(path) => {
-                assert_eq!(path, tmp_home.path().join("docs/file.txt"));
-            }
-            _ => panic!("Expected local path"),
-        }
-        if let Some(prev) = original_home {
-            std::env::set_var("HOME", prev);
-        } else {
-            std::env::remove_var("HOME");
-        }
+    fn test_expand_home_with_tilde_slash() {
+        let home = std::path::PathBuf::from("/tmp/fake-home");
+        let expanded = expand_home_with("~/docs/file.txt", || Ok(home.clone())).unwrap();
+        assert_eq!(expanded, home.join("docs/file.txt"));
+    }
+    #[test]
+    fn test_expand_home_with_bare_tilde() {
+        let home = std::path::PathBuf::from("/tmp/fake-home");
+        let expanded = expand_home_with("~", || Ok(home.clone())).unwrap();
+        assert_eq!(expanded, home);
+    }
+    #[test]
+    fn test_expand_home_with_non_tilde_path_does_not_read_home() {
+        let expanded = expand_home_with("/abs/path", || panic!("home should not be read")).unwrap();
+        assert_eq!(expanded, std::path::PathBuf::from("/abs/path"));
     }
 
     #[test]
@@ -438,9 +444,11 @@ mod tests {
         let result = parse_path("host:relative/path");
         assert!(result.is_err());
         let error = result.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Relative paths are not supported for remote hosts"));
+        assert!(
+            error
+                .to_string()
+                .contains("Relative paths are not supported for remote hosts")
+        );
     }
 
     #[test]
@@ -462,9 +470,11 @@ mod tests {
         let result = parse_path_force_remote("localhost:relative/path");
         assert!(result.is_err());
         let error = result.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Relative paths are not supported for remote hosts"));
+        assert!(
+            error
+                .to_string()
+                .contains("Relative paths are not supported for remote hosts")
+        );
     }
 
     #[test]

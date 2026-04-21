@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Upgrade workspace to Rust 2024 edition; modernize code to use `let` chains and 2024 idioms
+
 ## [0.31.0] - 2026-04-02
 
 ### Fixed

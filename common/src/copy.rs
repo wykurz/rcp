@@ -1,6 +1,6 @@
 use std::os::unix::fs::MetadataExt;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_recursion::async_recursion;
 use throttle::get_file_iops_tokens;
 use tracing::instrument;
@@ -204,15 +204,15 @@ pub async fn copy_file(
                         ..Default::default()
                     });
                 }
-                if let Some(OverwriteFilter::Newer) = settings.overwrite_filter {
-                    if filecmp::dest_is_newer(src_metadata, &dst_metadata) {
-                        tracing::debug!("dest is newer than source, skipping");
-                        prog_track.files_unchanged.inc();
-                        return Ok(Summary {
-                            files_unchanged: 1,
-                            ..Default::default()
-                        });
-                    }
+                if let Some(OverwriteFilter::Newer) = settings.overwrite_filter
+                    && filecmp::dest_is_newer(src_metadata, &dst_metadata)
+                {
+                    tracing::debug!("dest is newer than source, skipping");
+                    prog_track.files_unchanged.inc();
+                    return Ok(Summary {
+                        files_unchanged: 1,
+                        ..Default::default()
+                    });
                 }
             }
             tracing::info!("file is different, removing existing file");
@@ -676,7 +676,9 @@ async fn copy_internal(
             } else if settings.ignore_existing {
                 // destination is not a directory but something exists at this path;
                 // with --ignore-existing we skip the entire subtree
-                tracing::debug!("destination exists but is not a directory, skipping subtree (--ignore-existing)");
+                tracing::debug!(
+                    "destination exists but is not a directory, skipping subtree (--ignore-existing)"
+                );
                 prog_track.directories_unchanged.inc();
                 return Ok(Summary {
                     directories_unchanged: 1,
@@ -2303,7 +2305,7 @@ mod copy_tests {
         // Verify the directory and its contents were copied
         assert!(copied_dir.is_dir());
         assert!(!copied_dir.is_symlink()); // Should be a real directory, not a symlink
-                                           // Verify files were copied with correct content
+        // Verify files were copied with correct content
         let file1_content = tokio::fs::read_to_string(copied_dir.join("file1.txt")).await?;
         let file2_content = tokio::fs::read_to_string(copied_dir.join("file2.txt")).await?;
         assert_eq!(file1_content, "content1");
@@ -2811,8 +2813,8 @@ mod copy_tests {
     /// Verify that fail-early does not apply parent directory metadata after a child fails.
     #[tokio::test]
     #[traced_test]
-    async fn test_fail_early_does_not_apply_parent_directory_metadata_after_child_error(
-    ) -> Result<(), anyhow::Error> {
+    async fn test_fail_early_does_not_apply_parent_directory_metadata_after_child_error()
+    -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::create_temp_dir().await?;
         let test_path = tmp_dir.as_path();
         let src_dir = test_path.join("src");

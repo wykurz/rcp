@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_recursion::async_recursion;
 use tracing::instrument;
 
@@ -321,18 +321,22 @@ mod tests {
         assert_eq!(summary.bytes_written, 300);
         // verify deep nesting works
         assert!(test_path.join("file0").exists()); // root files
-        assert!(test_path
-            .join("dir0")
-            .join("dir0")
-            .join("dir0")
-            .join("file0")
-            .exists());
-        assert!(test_path
-            .join("dir1")
-            .join("dir1")
-            .join("dir1")
-            .join("file1")
-            .exists());
+        assert!(
+            test_path
+                .join("dir0")
+                .join("dir0")
+                .join("dir0")
+                .join("file0")
+                .exists()
+        );
+        assert!(
+            test_path
+                .join("dir1")
+                .join("dir1")
+                .join("dir1")
+                .join("file1")
+                .exists()
+        );
         // cleanup
         tokio::fs::remove_dir_all(test_path).await?;
         Ok(())

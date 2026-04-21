@@ -9,13 +9,12 @@ fn main() {
         .current_dir("..")
         .args(["describe", "--tags", "--long", "--always", "--dirty"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let describe = String::from_utf8_lossy(&output.stdout);
-            let describe = describe.trim();
-            if !describe.is_empty() {
-                println!("cargo:rustc-env=RCP_GIT_DESCRIBE={}", describe);
-            }
+        let describe = String::from_utf8_lossy(&output.stdout);
+        let describe = describe.trim();
+        if !describe.is_empty() {
+            println!("cargo:rustc-env=RCP_GIT_DESCRIBE={describe}");
         }
     }
 
@@ -24,13 +23,12 @@ fn main() {
         .current_dir("..")
         .args(["rev-parse", "HEAD"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let hash = String::from_utf8_lossy(&output.stdout);
-            let hash = hash.trim();
-            if !hash.is_empty() {
-                println!("cargo:rustc-env=RCP_GIT_HASH={}", hash);
-            }
+        let hash = String::from_utf8_lossy(&output.stdout);
+        let hash = hash.trim();
+        if !hash.is_empty() {
+            println!("cargo:rustc-env=RCP_GIT_HASH={hash}");
         }
     }
 

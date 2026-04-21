@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_recursion::async_recursion;
 use std::os::unix::fs::PermissionsExt;
 use tracing::instrument;
@@ -1154,8 +1154,8 @@ mod tests {
         /// matches an include pattern (not merely traversed).
         #[tokio::test]
         #[traced_test]
-        async fn test_dry_run_include_directly_matched_empty_dir_reported(
-        ) -> Result<(), anyhow::Error> {
+        async fn test_dry_run_include_directly_matched_empty_dir_reported()
+        -> Result<(), anyhow::Error> {
             let test_path = testutils::create_temp_dir().await?;
             // create structure:
             // test/
@@ -1318,8 +1318,8 @@ mod tests {
         /// The leftover-dir case is not treated as an error.
         #[tokio::test]
         #[traced_test]
-        async fn old_dir_with_new_file_leaves_non_empty_dir_without_error(
-        ) -> Result<(), anyhow::Error> {
+        async fn old_dir_with_new_file_leaves_non_empty_dir_without_error()
+        -> Result<(), anyhow::Error> {
             let test_path = testutils::create_temp_dir().await?;
             let old_dir = test_path.join("old_dir");
             tokio::fs::create_dir(&old_dir).await?;
@@ -1477,8 +1477,8 @@ mod tests {
         /// but the root itself is not removed because its own mtime is too recent.
         #[tokio::test]
         #[traced_test]
-        async fn fresh_top_level_directory_is_traversed_but_not_removed(
-        ) -> Result<(), anyhow::Error> {
+        async fn fresh_top_level_directory_is_traversed_but_not_removed()
+        -> Result<(), anyhow::Error> {
             let test_path = testutils::create_temp_dir().await?;
             let old_inside = test_path.join("old.txt");
             tokio::fs::write(&old_inside, "x").await?;

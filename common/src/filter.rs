@@ -34,7 +34,7 @@
 //! ));
 //! ```
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
 
@@ -105,12 +105,11 @@ impl FilterPattern {
             }
             // for non-anchored patterns, also try matching against just the filename
             // unless it's a path pattern (in which case full path match is required)
-            if !self.is_path_pattern() {
-                if let Some(file_name) = relative_path.file_name() {
-                    if self.matcher.is_match(Path::new(file_name)) {
-                        return true;
-                    }
-                }
+            if !self.is_path_pattern()
+                && let Some(file_name) = relative_path.file_name()
+                && self.matcher.is_match(Path::new(file_name))
+            {
+                return true;
             }
             false
         }
@@ -306,10 +305,10 @@ impl FilterSettings {
             }
         }
         // case 3: dir_path is descendant of prefix
-        if let Some(after_prefix) = dir_str.strip_prefix(prefix) {
-            if after_prefix.is_empty() || after_prefix.starts_with('/') {
-                return true;
-            }
+        if let Some(after_prefix) = dir_str.strip_prefix(prefix)
+            && (after_prefix.is_empty() || after_prefix.starts_with('/'))
+        {
+            return true;
         }
         false
     }
@@ -413,7 +412,8 @@ impl FilterSettings {
             } else {
                 return Err(anyhow!(
                     "line {}: invalid syntax '{}', expected '--include PATTERN' or '--exclude PATTERN'",
-                    line_num, line
+                    line_num,
+                    line
                 ));
             }
         }
@@ -761,7 +761,7 @@ mod tests {
         let pattern = FilterPattern::parse("*.rs").unwrap();
         assert!(pattern.matches(Path::new("foo.rs"), false));
         assert!(pattern.matches(Path::new("src/foo.rs"), false)); // matches filename
-                                                                  // nested paths also match via filename
+        // nested paths also match via filename
         assert!(pattern.matches(Path::new("a/b/c/foo.rs"), false));
     }
     #[test]

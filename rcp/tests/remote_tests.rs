@@ -43,14 +43,14 @@ fn interpret_exit_code(code: i32) -> String {
 const TIMEOUT_EXIT_CODE: i32 = 124;
 
 fn assert_not_timeout(output: &std::process::Output) {
-    if let Some(code) = output.status.code() {
-        if code == TIMEOUT_EXIT_CODE {
-            panic!(
-                "rcp was killed by timeout wrapper (exit code 124). \
-                 This indicates rcp hung and did not complete within the time limit. \
-                 This is NOT the same as an expected failure from rcp."
-            );
-        }
+    if let Some(code) = output.status.code()
+        && code == TIMEOUT_EXIT_CODE
+    {
+        panic!(
+            "rcp was killed by timeout wrapper (exit code 124). \
+             This indicates rcp hung and did not complete within the time limit. \
+             This is NOT the same as an expected failure from rcp."
+        );
     }
 }
 
@@ -234,12 +234,12 @@ fn parse_summary_from_output(output: &std::process::Output) -> Option<common::co
         parse_field!(line, "directories skipped: ", summary.directories_skipped, found_any);
         parse_field!(line, "specials skipped: ", summary.specials_skipped, found_any);
         // special handling for bytes_removed which has a unit suffix (e.g., "40 B")
-        if let Some(value_str) = line.strip_prefix("bytes removed: ") {
-            if let Some(num_str) = value_str.split_whitespace().next() {
-                summary.rm_summary.bytes_removed = num_str.parse().ok()?;
-                found_any = true;
-                continue;
-            }
+        if let Some(value_str) = line.strip_prefix("bytes removed: ")
+            && let Some(num_str) = value_str.split_whitespace().next()
+        {
+            summary.rm_summary.bytes_removed = num_str.parse().ok()?;
+            found_any = true;
+            continue;
         }
         // If no prefix matched, do nothing.
     }
@@ -984,7 +984,7 @@ fn test_remote_overwrite_directory_with_directory() {
     assert_eq!(get_file_content(&dst_subdir.join("file2.txt")), "content2"); // new
     assert_eq!(get_file_content(&dst_subdir.join("file3.txt")), "content3"); // new
     assert_eq!(get_file_content(&dst_subdir.join("file4.txt")), "old file4"); // unchanged
-                                                                              // verify summary
+    // verify summary
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.files_copied, 3); // file1, file2, file3
     assert_eq!(summary.rm_summary.files_removed, 1); // file1.txt overwrite removes the old file first
@@ -1268,7 +1268,7 @@ fn test_remote_copy_directory_with_unreadable_files_continue() {
     assert_eq!(summary.files_copied, 3);
     assert_eq!(summary.directories_created, 1);
     assert_eq!(summary.bytes_copied, 54); // sum of 3 readable files
-                                          // verify non-zero exit code
+    // verify non-zero exit code
     assert!(!output.status.success());
 }
 
@@ -1354,7 +1354,7 @@ fn test_remote_copy_nested_directories_with_unreadable_files() {
     let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
     assert_eq!(summary.files_copied, 3);
     assert_eq!(summary.directories_created, 2); // root + subdir
-                                                // verify non-zero exit code
+    // verify non-zero exit code
     assert!(!output.status.success());
 }
 
@@ -1409,7 +1409,7 @@ fn test_remote_copy_mixed_success_with_symlink_errors() {
     assert_eq!(summary.files_copied, 3); // good_file.txt, target.txt, zzz_another.txt
     assert_eq!(summary.symlinks_created, 1); // good_symlink
     assert_eq!(summary.directories_created, 1); // mixed_ops
-                                                // verify non-zero exit code
+    // verify non-zero exit code
     assert!(!output.status.success());
 }
 
@@ -2521,11 +2521,11 @@ fn test_remote_auto_deploy_error_checksum_mismatch() {
     if let Ok(entries) = std::fs::read_dir(&cache_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(filename) = path.file_name() {
-                if filename.to_string_lossy().starts_with("rcpd-") {
-                    deployed_binary = Some(path);
-                    break;
-                }
+            if let Some(filename) = path.file_name()
+                && filename.to_string_lossy().starts_with("rcpd-")
+            {
+                deployed_binary = Some(path);
+                break;
             }
         }
     }

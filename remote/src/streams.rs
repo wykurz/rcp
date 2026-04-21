@@ -1,8 +1,8 @@
 use bytes::Buf;
 use futures::SinkExt;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tracing::instrument;
 
 /// Framed send stream for length-delimited messages.
