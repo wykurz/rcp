@@ -1095,7 +1095,10 @@ fn main() -> Result<(), anyhow::Error> {
                     get_progress_snapshot: Box::new(remote::tracelog::get_latest_progress_snapshot),
                 }
             } else {
-                common::GeneralProgressType::User(args.common.progress_type.unwrap_or_default())
+                common::GeneralProgressType::User {
+                    progress_type: args.common.progress_type.unwrap_or_default(),
+                    kind: common::progress::LocalProgressKind::Copy,
+                }
             },
             progress_delay: args.common.progress_delay,
         })

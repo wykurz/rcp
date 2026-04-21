@@ -249,7 +249,8 @@ fn main() -> Result<()> {
     let progress = if is_dry_run {
         None
     } else {
-        args.common.user_progress_settings()
+        args.common
+            .user_progress_settings(common::progress::LocalProgressKind::Remove)
     };
     let res = common::run(progress, output, runtime, throttle, tracing, func);
     if let Some(warnings) = dry_run_warnings {

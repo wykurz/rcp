@@ -115,15 +115,22 @@ impl CommonArgs {
         self.progress || self.progress_type.is_some() || self.progress_delay.is_some()
     }
     /// Build user-facing [`crate::ProgressSettings`] when any progress flag was
-    /// set, else `None`. For `rcp`'s remote-master and `rcpd`'s remote progress
-    /// modes, build `ProgressSettings` directly instead of using this helper.
+    /// set, else `None`. `kind` selects the tool-specific printer. For `rcp`'s
+    /// remote-master and `rcpd`'s remote progress modes, build `ProgressSettings`
+    /// directly instead of using this helper.
     #[must_use]
-    pub fn user_progress_settings(&self) -> Option<crate::ProgressSettings> {
+    pub fn user_progress_settings(
+        &self,
+        kind: crate::progress::LocalProgressKind,
+    ) -> Option<crate::ProgressSettings> {
         if !self.progress_requested() {
             return None;
         }
         Some(crate::ProgressSettings {
-            progress_type: crate::GeneralProgressType::User(self.progress_type.unwrap_or_default()),
+            progress_type: crate::GeneralProgressType::User {
+                progress_type: self.progress_type.unwrap_or_default(),
+                kind,
+            },
             progress_delay: self.progress_delay.clone(),
         })
     }

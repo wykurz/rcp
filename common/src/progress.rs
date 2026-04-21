@@ -283,14 +283,80 @@ impl From<&Progress> for SerializableProgress {
     }
 }
 
-pub struct ProgressPrinter<'a> {
+/// Trait implemented by per-tool progress printers.
+///
+/// Each tool has its own printer that only renders sections relevant to what
+/// the tool actually does (e.g. `rrm` has no COPIED section; `rcmp` only shows
+/// OPS). Prefer adding a new specialized printer over extending a shared one.
+pub trait LocalProgressReport: Send {
+    fn print(&mut self) -> anyhow::Result<String>;
+}
+
+/// Selects which tool-specific printer to instantiate for a local progress run.
+#[derive(Copy, Clone, Debug)]
+pub enum LocalProgressKind {
+    Copy,
+    Remove,
+    Link,
+    Compare,
+    Filegen,
+}
+
+fn ops_rates(
+    progress: &Progress,
+    last_ops: u64,
+    last_update: std::time::Instant,
+    now: std::time::Instant,
+) -> (Status, f64, f64) {
+    let ops = progress.ops.get();
+    let total_secs = progress.get_duration().as_secs_f64();
+    let curr_secs = (now - last_update).as_secs_f64();
+    let average = if total_secs > 0.0 {
+        ops.finished as f64 / total_secs
+    } else {
+        0.0
+    };
+    let current = if curr_secs > 0.0 {
+        (ops.finished - last_ops) as f64 / curr_secs
+    } else {
+        0.0
+    };
+    (ops, average, current)
+}
+
+fn bytes_rates(
+    total: u64,
+    last: u64,
+    total_secs: f64,
+    curr_secs: f64,
+) -> (bytesize::ByteSize, bytesize::ByteSize) {
+    let average = if total_secs > 0.0 {
+        total as f64 / total_secs
+    } else {
+        0.0
+    };
+    let current = if curr_secs > 0.0 {
+        (total - last) as f64 / curr_secs
+    } else {
+        0.0
+    };
+    (
+        bytesize::ByteSize(average as u64),
+        bytesize::ByteSize(current as u64),
+    )
+}
+
+/// Progress printer for `rcp` (local copy). Shows COPIED/UNCHANGED/REMOVED/SKIPPED
+/// for files, symlinks, and directories. Hard-link counters are omitted because
+/// `rcp` never creates hard links.
+pub struct CopyProgressPrinter<'a> {
     progress: &'a Progress,
     last_ops: u64,
     last_bytes: u64,
     last_update: std::time::Instant,
 }
 
-impl<'a> ProgressPrinter<'a> {
+impl<'a> CopyProgressPrinter<'a> {
     pub fn new(progress: &'a Progress) -> Self {
         Self {
             progress,
@@ -299,22 +365,20 @@ impl<'a> ProgressPrinter<'a> {
             last_update: std::time::Instant::now(),
         }
     }
+}
 
-    pub fn print(&mut self) -> anyhow::Result<String> {
-        let time_now = std::time::Instant::now();
-        let ops = self.progress.ops.get();
-        let total_duration_secs = self.progress.get_duration().as_secs_f64();
-        let curr_duration_secs = (time_now - self.last_update).as_secs_f64();
-        let average_ops_rate = ops.finished as f64 / total_duration_secs;
-        let current_ops_rate = (ops.finished - self.last_ops) as f64 / curr_duration_secs;
+impl<'a> LocalProgressReport for CopyProgressPrinter<'a> {
+    fn print(&mut self) -> anyhow::Result<String> {
+        let now = std::time::Instant::now();
+        let (ops, avg_ops, cur_ops) =
+            ops_rates(self.progress, self.last_ops, self.last_update, now);
         let bytes = self.progress.bytes_copied.get();
-        let average_bytes_rate = bytes as f64 / total_duration_secs;
-        let current_bytes_rate = (bytes - self.last_bytes) as f64 / curr_duration_secs;
-        // update self
+        let total_secs = self.progress.get_duration().as_secs_f64();
+        let curr_secs = (now - self.last_update).as_secs_f64();
+        let (avg_bytes, cur_bytes) = bytes_rates(bytes, self.last_bytes, total_secs, curr_secs);
         self.last_ops = ops.finished;
         self.last_bytes = bytes;
-        self.last_update = time_now;
-        // nice to have: convert to a table
+        self.last_update = now;
         Ok(format!(
             "---------------------\n\
             OPS:\n\
@@ -329,13 +393,11 @@ impl<'a> ProgressPrinter<'a> {
             files:       {:>10}\n\
             symlinks:    {:>10}\n\
             directories: {:>10}\n\
-            hard-links:  {:>10}\n\
             -----------------------\n\
             UNCHANGED:\n\
             files:       {:>10}\n\
             symlinks:    {:>10}\n\
             directories: {:>10}\n\
-            hard-links:  {:>10}\n\
             -----------------------\n\
             REMOVED:\n\
             bytes:       {:>10}\n\
@@ -348,33 +410,304 @@ impl<'a> ProgressPrinter<'a> {
             symlinks:    {:>10}\n\
             directories: {:>10}\n\
             specials:    {:>10}",
-            ops.started - ops.finished, // pending
-            average_ops_rate,
-            current_ops_rate,
-            // copy
-            bytesize::ByteSize(average_bytes_rate as u64),
-            bytesize::ByteSize(current_bytes_rate as u64),
-            bytesize::ByteSize(self.progress.bytes_copied.get()),
+            ops.started - ops.finished,
+            avg_ops,
+            cur_ops,
+            avg_bytes,
+            cur_bytes,
+            bytesize::ByteSize(bytes),
             self.progress.files_copied.get(),
             self.progress.symlinks_created.get(),
             self.progress.directories_created.get(),
-            self.progress.hard_links_created.get(),
-            // unchanged
             self.progress.files_unchanged.get(),
             self.progress.symlinks_unchanged.get(),
             self.progress.directories_unchanged.get(),
-            self.progress.hard_links_unchanged.get(),
-            // remove
             bytesize::ByteSize(self.progress.bytes_removed.get()),
             self.progress.files_removed.get(),
             self.progress.symlinks_removed.get(),
             self.progress.directories_removed.get(),
-            // skipped
             self.progress.files_skipped.get(),
             self.progress.symlinks_skipped.get(),
             self.progress.directories_skipped.get(),
             self.progress.specials_skipped.get(),
         ))
+    }
+}
+
+/// Progress printer for `rrm`. Only shows REMOVED and SKIPPED — `rrm` never
+/// creates, copies, or leaves entries unchanged.
+pub struct RemoveProgressPrinter<'a> {
+    progress: &'a Progress,
+    last_ops: u64,
+    last_bytes_removed: u64,
+    last_update: std::time::Instant,
+}
+
+impl<'a> RemoveProgressPrinter<'a> {
+    pub fn new(progress: &'a Progress) -> Self {
+        Self {
+            progress,
+            last_ops: progress.ops.get().finished,
+            last_bytes_removed: progress.bytes_removed.get(),
+            last_update: std::time::Instant::now(),
+        }
+    }
+}
+
+impl<'a> LocalProgressReport for RemoveProgressPrinter<'a> {
+    fn print(&mut self) -> anyhow::Result<String> {
+        let now = std::time::Instant::now();
+        let (ops, avg_ops, cur_ops) =
+            ops_rates(self.progress, self.last_ops, self.last_update, now);
+        let bytes_removed = self.progress.bytes_removed.get();
+        let total_secs = self.progress.get_duration().as_secs_f64();
+        let curr_secs = (now - self.last_update).as_secs_f64();
+        let (avg_bytes, cur_bytes) = bytes_rates(
+            bytes_removed,
+            self.last_bytes_removed,
+            total_secs,
+            curr_secs,
+        );
+        self.last_ops = ops.finished;
+        self.last_bytes_removed = bytes_removed;
+        self.last_update = now;
+        Ok(format!(
+            "---------------------\n\
+            OPS:\n\
+            pending: {:>10}\n\
+            average: {:>10.2} items/s\n\
+            current: {:>10.2} items/s\n\
+            -----------------------\n\
+            REMOVED:\n\
+            average: {:>10}/s\n\
+            current: {:>10}/s\n\
+            bytes:       {:>10}\n\
+            files:       {:>10}\n\
+            symlinks:    {:>10}\n\
+            directories: {:>10}\n\
+            -----------------------\n\
+            SKIPPED:\n\
+            files:       {:>10}\n\
+            symlinks:    {:>10}\n\
+            directories: {:>10}",
+            ops.started - ops.finished,
+            avg_ops,
+            cur_ops,
+            avg_bytes,
+            cur_bytes,
+            bytesize::ByteSize(bytes_removed),
+            self.progress.files_removed.get(),
+            self.progress.symlinks_removed.get(),
+            self.progress.directories_removed.get(),
+            self.progress.files_skipped.get(),
+            self.progress.symlinks_skipped.get(),
+            self.progress.directories_skipped.get(),
+        ))
+    }
+}
+
+/// Progress printer for `rlink`. Like [`CopyProgressPrinter`] but also reports
+/// hard-link counters, since `rlink`'s primary output is hard links (with copies
+/// as a fallback for `--update` changes).
+pub struct LinkProgressPrinter<'a> {
+    progress: &'a Progress,
+    last_ops: u64,
+    last_bytes: u64,
+    last_update: std::time::Instant,
+}
+
+impl<'a> LinkProgressPrinter<'a> {
+    pub fn new(progress: &'a Progress) -> Self {
+        Self {
+            progress,
+            last_ops: progress.ops.get().finished,
+            last_bytes: progress.bytes_copied.get(),
+            last_update: std::time::Instant::now(),
+        }
+    }
+}
+
+impl<'a> LocalProgressReport for LinkProgressPrinter<'a> {
+    fn print(&mut self) -> anyhow::Result<String> {
+        let now = std::time::Instant::now();
+        let (ops, avg_ops, cur_ops) =
+            ops_rates(self.progress, self.last_ops, self.last_update, now);
+        let bytes = self.progress.bytes_copied.get();
+        let total_secs = self.progress.get_duration().as_secs_f64();
+        let curr_secs = (now - self.last_update).as_secs_f64();
+        let (avg_bytes, cur_bytes) = bytes_rates(bytes, self.last_bytes, total_secs, curr_secs);
+        self.last_ops = ops.finished;
+        self.last_bytes = bytes;
+        self.last_update = now;
+        Ok(format!(
+            "---------------------\n\
+            OPS:\n\
+            pending: {:>10}\n\
+            average: {:>10.2} items/s\n\
+            current: {:>10.2} items/s\n\
+            -----------------------\n\
+            LINKED / COPIED:\n\
+            average: {:>10}/s\n\
+            current: {:>10}/s\n\
+            bytes:   {:>10}\n\
+            hard-links:  {:>10}\n\
+            files:       {:>10}\n\
+            symlinks:    {:>10}\n\
+            directories: {:>10}\n\
+            -----------------------\n\
+            UNCHANGED:\n\
+            hard-links:  {:>10}\n\
+            files:       {:>10}\n\
+            symlinks:    {:>10}\n\
+            directories: {:>10}\n\
+            -----------------------\n\
+            REMOVED:\n\
+            bytes:       {:>10}\n\
+            files:       {:>10}\n\
+            symlinks:    {:>10}\n\
+            directories: {:>10}\n\
+            -----------------------\n\
+            SKIPPED:\n\
+            files:       {:>10}\n\
+            symlinks:    {:>10}\n\
+            directories: {:>10}\n\
+            specials:    {:>10}",
+            ops.started - ops.finished,
+            avg_ops,
+            cur_ops,
+            avg_bytes,
+            cur_bytes,
+            bytesize::ByteSize(bytes),
+            self.progress.hard_links_created.get(),
+            self.progress.files_copied.get(),
+            self.progress.symlinks_created.get(),
+            self.progress.directories_created.get(),
+            self.progress.hard_links_unchanged.get(),
+            self.progress.files_unchanged.get(),
+            self.progress.symlinks_unchanged.get(),
+            self.progress.directories_unchanged.get(),
+            bytesize::ByteSize(self.progress.bytes_removed.get()),
+            self.progress.files_removed.get(),
+            self.progress.symlinks_removed.get(),
+            self.progress.directories_removed.get(),
+            self.progress.files_skipped.get(),
+            self.progress.symlinks_skipped.get(),
+            self.progress.directories_skipped.get(),
+            self.progress.specials_skipped.get(),
+        ))
+    }
+}
+
+/// Progress printer for `rcmp`. Compare operations only drive the ops counter —
+/// they don't copy, remove, or modify anything — so only OPS is shown.
+pub struct CompareProgressPrinter<'a> {
+    progress: &'a Progress,
+    last_ops: u64,
+    last_update: std::time::Instant,
+}
+
+impl<'a> CompareProgressPrinter<'a> {
+    pub fn new(progress: &'a Progress) -> Self {
+        Self {
+            progress,
+            last_ops: progress.ops.get().finished,
+            last_update: std::time::Instant::now(),
+        }
+    }
+}
+
+impl<'a> LocalProgressReport for CompareProgressPrinter<'a> {
+    fn print(&mut self) -> anyhow::Result<String> {
+        let now = std::time::Instant::now();
+        let (ops, avg_ops, cur_ops) =
+            ops_rates(self.progress, self.last_ops, self.last_update, now);
+        self.last_ops = ops.finished;
+        self.last_update = now;
+        Ok(format!(
+            "---------------------\n\
+            OPS:\n\
+            pending: {:>10}\n\
+            compared: {:>9}\n\
+            average: {:>10.2} items/s\n\
+            current: {:>10.2} items/s",
+            ops.started - ops.finished,
+            ops.finished,
+            avg_ops,
+            cur_ops,
+        ))
+    }
+}
+
+/// Progress printer for `filegen`. Shows a GENERATED section instead of COPIED,
+/// because `filegen` creates files and directories rather than copying them.
+pub struct FilegenProgressPrinter<'a> {
+    progress: &'a Progress,
+    last_ops: u64,
+    last_bytes: u64,
+    last_update: std::time::Instant,
+}
+
+impl<'a> FilegenProgressPrinter<'a> {
+    pub fn new(progress: &'a Progress) -> Self {
+        Self {
+            progress,
+            last_ops: progress.ops.get().finished,
+            last_bytes: progress.bytes_copied.get(),
+            last_update: std::time::Instant::now(),
+        }
+    }
+}
+
+impl<'a> LocalProgressReport for FilegenProgressPrinter<'a> {
+    fn print(&mut self) -> anyhow::Result<String> {
+        let now = std::time::Instant::now();
+        let (ops, avg_ops, cur_ops) =
+            ops_rates(self.progress, self.last_ops, self.last_update, now);
+        let bytes = self.progress.bytes_copied.get();
+        let total_secs = self.progress.get_duration().as_secs_f64();
+        let curr_secs = (now - self.last_update).as_secs_f64();
+        let (avg_bytes, cur_bytes) = bytes_rates(bytes, self.last_bytes, total_secs, curr_secs);
+        self.last_ops = ops.finished;
+        self.last_bytes = bytes;
+        self.last_update = now;
+        Ok(format!(
+            "---------------------\n\
+            OPS:\n\
+            pending: {:>10}\n\
+            average: {:>10.2} items/s\n\
+            current: {:>10.2} items/s\n\
+            -----------------------\n\
+            GENERATED:\n\
+            average: {:>10}/s\n\
+            current: {:>10}/s\n\
+            bytes:       {:>10}\n\
+            files:       {:>10}\n\
+            directories: {:>10}",
+            ops.started - ops.finished,
+            avg_ops,
+            cur_ops,
+            avg_bytes,
+            cur_bytes,
+            bytesize::ByteSize(bytes),
+            self.progress.files_copied.get(),
+            self.progress.directories_created.get(),
+        ))
+    }
+}
+
+/// Construct the tool-specific printer for the given [`LocalProgressKind`],
+/// borrowing the global [`Progress`] for its lifetime.
+#[must_use]
+pub fn make_local_printer<'a>(
+    kind: LocalProgressKind,
+    progress: &'a Progress,
+) -> Box<dyn LocalProgressReport + 'a> {
+    match kind {
+        LocalProgressKind::Copy => Box::new(CopyProgressPrinter::new(progress)),
+        LocalProgressKind::Remove => Box::new(RemoveProgressPrinter::new(progress)),
+        LocalProgressKind::Link => Box::new(LinkProgressPrinter::new(progress)),
+        LocalProgressKind::Compare => Box::new(CompareProgressPrinter::new(progress)),
+        LocalProgressKind::Filegen => Box::new(FilegenProgressPrinter::new(progress)),
     }
 }
 
@@ -825,6 +1158,75 @@ mod tests {
         for (i, counter) in counters.iter().enumerate() {
             assert_eq!(counter.get(), (i + 1) as u64 * 100);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn copy_printer_omits_hard_links() -> Result<()> {
+        let progress = Progress::new();
+        let mut printer = CopyProgressPrinter::new(&progress);
+        let output = printer.print()?;
+        assert!(output.contains("COPIED:"));
+        assert!(output.contains("UNCHANGED:"));
+        assert!(output.contains("REMOVED:"));
+        assert!(output.contains("SKIPPED:"));
+        assert!(!output.contains("hard-links"));
+        Ok(())
+    }
+
+    #[test]
+    fn remove_printer_hides_copy_and_unchanged() -> Result<()> {
+        let progress = Progress::new();
+        let mut printer = RemoveProgressPrinter::new(&progress);
+        let output = printer.print()?;
+        assert!(output.contains("REMOVED:"));
+        assert!(output.contains("SKIPPED:"));
+        assert!(!output.contains("COPIED:"));
+        assert!(!output.contains("UNCHANGED:"));
+        assert!(!output.contains("hard-links"));
+        assert!(!output.contains("specials:"));
+        Ok(())
+    }
+
+    #[test]
+    fn link_printer_shows_hard_links() -> Result<()> {
+        let progress = Progress::new();
+        let mut printer = LinkProgressPrinter::new(&progress);
+        let output = printer.print()?;
+        assert!(output.contains("LINKED / COPIED:"));
+        assert!(output.contains("UNCHANGED:"));
+        assert!(output.contains("REMOVED:"));
+        assert!(output.contains("SKIPPED:"));
+        assert!(output.contains("hard-links"));
+        Ok(())
+    }
+
+    #[test]
+    fn compare_printer_only_shows_ops() -> Result<()> {
+        let progress = Progress::new();
+        let mut printer = CompareProgressPrinter::new(&progress);
+        let output = printer.print()?;
+        assert!(output.contains("OPS:"));
+        assert!(!output.contains("COPIED:"));
+        assert!(!output.contains("UNCHANGED:"));
+        assert!(!output.contains("REMOVED:"));
+        assert!(!output.contains("SKIPPED:"));
+        assert!(!output.contains("GENERATED:"));
+        Ok(())
+    }
+
+    #[test]
+    fn filegen_printer_shows_generated() -> Result<()> {
+        let progress = Progress::new();
+        let mut printer = FilegenProgressPrinter::new(&progress);
+        let output = printer.print()?;
+        assert!(output.contains("OPS:"));
+        assert!(output.contains("GENERATED:"));
+        assert!(!output.contains("COPIED:"));
+        assert!(!output.contains("UNCHANGED:"));
+        assert!(!output.contains("REMOVED:"));
+        assert!(!output.contains("SKIPPED:"));
+        assert!(!output.contains("symlinks:"));
         Ok(())
     }
 }

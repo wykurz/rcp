@@ -195,9 +195,10 @@ fn main() -> Result<()> {
     // --progress (unlike rrm/rlink). preserve that behavior here.
     let progress = if args.common.progress || args.common.progress_type.is_some() {
         Some(common::ProgressSettings {
-            progress_type: common::GeneralProgressType::User(
-                args.common.progress_type.unwrap_or_default(),
-            ),
+            progress_type: common::GeneralProgressType::User {
+                progress_type: args.common.progress_type.unwrap_or_default(),
+                kind: common::progress::LocalProgressKind::Compare,
+            },
             progress_delay: args.common.progress_delay.clone(),
         })
     } else {

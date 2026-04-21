@@ -239,7 +239,10 @@ pub enum ProgressType {
 }
 
 pub enum GeneralProgressType {
-    User(ProgressType),
+    User {
+        progress_type: ProgressType,
+        kind: progress::LocalProgressKind,
+    },
     Remote(tokio::sync::mpsc::UnboundedSender<remote_tracing::TracingMessage>),
     RemoteMaster {
         progress_type: ProgressType,
@@ -251,7 +254,10 @@ pub enum GeneralProgressType {
 impl std::fmt::Debug for GeneralProgressType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GeneralProgressType::User(pt) => write!(f, "User({pt:?})"),
+            GeneralProgressType::User {
+                progress_type,
+                kind,
+            } => write!(f, "User(progress_type: {progress_type:?}, kind: {kind:?})"),
             GeneralProgressType::Remote(_) => write!(f, "Remote(<sender>)"),
             GeneralProgressType::RemoteMaster { progress_type, .. } => {
                 write!(
@@ -273,6 +279,7 @@ fn progress_bar(
     lock: &std::sync::Mutex<bool>,
     cvar: &std::sync::Condvar,
     delay_opt: &Option<std::time::Duration>,
+    kind: progress::LocalProgressKind,
 ) {
     let delay = delay_opt.unwrap_or(std::time::Duration::from_millis(200));
     PBAR.set_style(
@@ -280,7 +287,7 @@ fn progress_bar(
             .unwrap()
             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
     );
-    let mut prog_printer = progress::ProgressPrinter::new(&PROGRESS);
+    let mut prog_printer = progress::make_local_printer(kind, &PROGRESS);
     let mut is_done = lock.lock().unwrap();
     loop {
         PBAR.set_position(PBAR.position() + 1); // do we need to update?
@@ -304,9 +311,10 @@ fn text_updates(
     lock: &std::sync::Mutex<bool>,
     cvar: &std::sync::Condvar,
     delay_opt: &Option<std::time::Duration>,
+    kind: progress::LocalProgressKind,
 ) {
     let delay = delay_opt.unwrap_or(std::time::Duration::from_secs(10));
-    let mut prog_printer = progress::ProgressPrinter::new(&PROGRESS);
+    let mut prog_printer = progress::make_local_printer(kind, &PROGRESS);
     let mut is_done = lock.lock().unwrap();
     loop {
         eprintln!("=======================");
@@ -434,22 +442,19 @@ impl ProgressTracker {
                         progress_type,
                     );
                 }
-                _ => {
+                GeneralProgressType::User {
+                    progress_type,
+                    kind,
+                } => {
                     let interactive = match progress_type {
-                        GeneralProgressType::User(ProgressType::Auto) => {
-                            std::io::stderr().is_terminal()
-                        }
-                        GeneralProgressType::User(ProgressType::ProgressBar) => true,
-                        GeneralProgressType::User(ProgressType::TextUpdates) => false,
-                        GeneralProgressType::Remote(_)
-                        | GeneralProgressType::RemoteMaster { .. } => {
-                            unreachable!("Invalid progress type: {progress_type:?}")
-                        }
+                        ProgressType::Auto => std::io::stderr().is_terminal(),
+                        ProgressType::ProgressBar => true,
+                        ProgressType::TextUpdates => false,
                     };
                     if interactive {
-                        progress_bar(lock, cvar, &delay_opt);
+                        progress_bar(lock, cvar, &delay_opt, kind);
                     } else {
-                        text_updates(lock, cvar, &delay_opt);
+                        text_updates(lock, cvar, &delay_opt, kind);
                     }
                 }
             }
