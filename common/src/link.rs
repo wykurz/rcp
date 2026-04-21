@@ -101,45 +101,55 @@ async fn hard_link_helper(
     settings: &Settings,
 ) -> Result<Summary, Error> {
     let mut link_summary = Summary::default();
-    if let Err(error) = tokio::fs::hard_link(src, dst).await
-        && settings.copy_settings.overwrite
-        && error.kind() == std::io::ErrorKind::AlreadyExists
-    {
-        tracing::debug!("'dst' already exists, check if we need to update");
-        let dst_metadata = tokio::fs::symlink_metadata(dst)
+    match tokio::fs::hard_link(src, dst).await {
+        Ok(()) => {}
+        Err(error)
+            if settings.copy_settings.overwrite
+                && error.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            tracing::debug!("'dst' already exists, check if we need to update");
+            let dst_metadata = tokio::fs::symlink_metadata(dst)
+                .await
+                .with_context(|| format!("cannot read {dst:?} metadata"))
+                .map_err(|err| Error::new(err, Default::default()))?;
+            if is_hard_link(src_metadata, &dst_metadata) {
+                tracing::debug!("no change, leaving file as is");
+                prog_track.hard_links_unchanged.inc();
+                return Ok(Summary {
+                    hard_links_unchanged: 1,
+                    ..Default::default()
+                });
+            }
+            tracing::info!("'dst' file type changed, removing and hard-linking");
+            let rm_summary = rm::rm(
+                prog_track,
+                dst,
+                &rm::Settings {
+                    fail_early: settings.copy_settings.fail_early,
+                    filter: None,
+                    dry_run: None,
+                    time_filter: None,
+                },
+            )
             .await
-            .with_context(|| format!("cannot read {dst:?} metadata"))
-            .map_err(|err| Error::new(err, Default::default()))?;
-        if is_hard_link(src_metadata, &dst_metadata) {
-            tracing::debug!("no change, leaving file as is");
-            prog_track.hard_links_unchanged.inc();
-            return Ok(Summary {
-                hard_links_unchanged: 1,
-                ..Default::default()
-            });
-        }
-        tracing::info!("'dst' file type changed, removing and hard-linking");
-        let rm_summary = rm::rm(
-            prog_track,
-            dst,
-            &rm::Settings {
-                fail_early: settings.copy_settings.fail_early,
-                filter: None,
-                dry_run: None,
-                time_filter: None,
-            },
-        )
-        .await
-        .map_err(|err| {
-            let rm_summary = err.summary;
+            .map_err(|err| {
+                let rm_summary = err.summary;
+                link_summary.copy_summary.rm_summary = rm_summary;
+                Error::new(err.source, link_summary)
+            })?;
             link_summary.copy_summary.rm_summary = rm_summary;
-            Error::new(err.source, link_summary)
-        })?;
-        link_summary.copy_summary.rm_summary = rm_summary;
-        tokio::fs::hard_link(src, dst)
-            .await
-            .with_context(|| format!("failed to hard link {src:?} to {dst:?}"))
-            .map_err(|err| Error::new(err, link_summary))?;
+            tokio::fs::hard_link(src, dst)
+                .await
+                .with_context(|| format!("failed to hard link {src:?} to {dst:?}"))
+                .map_err(|err| Error::new(err, link_summary))?;
+        }
+        Err(error) => {
+            return Err(Error::new(
+                anyhow::Error::from(error)
+                    .context(format!("failed to hard link {src:?} to {dst:?}")),
+                link_summary,
+            ));
+        }
     }
     prog_track.hard_links_created.inc();
     link_summary.hard_links_created = 1;
@@ -935,6 +945,33 @@ mod link_tests {
             err_msg.to_lowercase().contains("permission denied") || err_msg.contains("EACCES"),
             "Error message must include permission denied text. Got: {}",
             err_msg
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn hard_link_file_into_readonly_parent_returns_error() -> Result<(), anyhow::Error> {
+        // regression: hard_link_helper used to silently ignore non-AlreadyExists errors
+        // and report hard_links_created=1 when the underlying hard_link call had failed
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let src = tmp_dir.join("src.txt");
+        tokio::fs::write(&src, "content").await?;
+        let readonly_parent = tmp_dir.join("readonly_parent");
+        tokio::fs::create_dir(&readonly_parent).await?;
+        tokio::fs::set_permissions(&readonly_parent, std::fs::Permissions::from_mode(0o555))
+            .await?;
+        let dst = readonly_parent.join("dst.txt");
+        let settings = common_settings(false, false);
+        let result = link(&PROGRESS, &tmp_dir, &src, &dst, &None, &settings, false).await;
+        tokio::fs::set_permissions(&readonly_parent, std::fs::Permissions::from_mode(0o755))
+            .await?;
+        let err = result.expect_err("link into read-only parent should fail");
+        assert_eq!(err.summary.hard_links_created, 0);
+        let err_msg = format!("{:#}", err.source);
+        assert!(
+            err_msg.to_lowercase().contains("permission denied") || err_msg.contains("EACCES"),
+            "error should include root cause, got: {err_msg}"
         );
         Ok(())
     }
