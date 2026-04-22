@@ -156,6 +156,10 @@ static OPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
 static IOPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
+// per-op concurrency cap, driven by the congestion controller. Distinct
+// from OPS_THROTTLE (rate) and OPEN_FILES_LIMIT (FDs).
+static OPS_IN_FLIGHT_LIMIT: std::sync::LazyLock<semaphore::Semaphore> =
+    std::sync::LazyLock::new(semaphore::Semaphore::new);
 
 pub fn set_max_open_files(max_open_files: usize) {
     OPEN_FILES_LIMIT.setup(max_open_files);
@@ -168,6 +172,33 @@ pub struct OpenFileGuard {
 pub async fn open_file_permit() -> OpenFileGuard {
     OpenFileGuard {
         _permit: OPEN_FILES_LIMIT.acquire().await,
+    }
+}
+
+/// Dynamically set the maximum number of concurrent operations in flight.
+///
+/// Increasing the cap is instant; decreasing it can temporarily overshoot
+/// if permits are already held — they return naturally on drop. This is
+/// the enforcement knob the adaptive controller drives.
+///
+/// Setting to 0 disables the cap for *subsequent* acquires (they return
+/// immediately without a permit), but does not wake acquirers already
+/// blocked inside the semaphore's wait queue — they remain parked until
+/// permits become available. Callers that need a cancellable disable
+/// should use a higher-level shutdown signal.
+pub fn set_max_ops_in_flight(max_in_flight: usize) {
+    OPS_IN_FLIGHT_LIMIT.set_max(max_in_flight);
+}
+
+pub struct OpsInFlightGuard {
+    _permit: Option<tokio::sync::SemaphorePermit<'static>>,
+}
+
+/// Acquire a permit from the ops-in-flight cap. No-op (returns immediately)
+/// when the cap is not configured.
+pub async fn ops_in_flight_permit() -> OpsInFlightGuard {
+    OpsInFlightGuard {
+        _permit: OPS_IN_FLIGHT_LIMIT.acquire().await,
     }
 }
 
@@ -213,4 +244,25 @@ pub async fn run_iops_replenish_thread(replenish: usize, interval: std::time::Du
     IOPS_THROTTLE
         .run_replenish_thread(replenish, interval)
         .await;
+}
+
+/// Dynamically update the ops-throttle replenish count.
+///
+/// Takes effect on the next iteration of the replenish loop started by
+/// [`run_ops_replenish_thread`] — no loop restart, no permits forcibly
+/// drained. Setting `value = 0` pauses replenishment (tokens already in
+/// the bucket will be consumed but no new ones will be added).
+///
+/// Intended for congestion-control layers that translate a Controller's
+/// decisions into dynamic rate targets. The ops-throttle must already
+/// have been initialized via [`init_ops_tokens`] with a non-zero value;
+/// otherwise the replenish loop will have exited and this call is a no-op.
+pub fn set_ops_replenish(value: usize) {
+    OPS_THROTTLE.set_replenish(value);
+}
+
+/// Dynamically update the iops-throttle replenish count. See
+/// [`set_ops_replenish`] for the semantics.
+pub fn set_iops_replenish(value: usize) {
+    IOPS_THROTTLE.set_replenish(value);
 }
