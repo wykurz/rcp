@@ -1675,6 +1675,7 @@ dependencies = [
  "nix",
  "procfs",
  "rand",
+ "rcp-tools-congestion",
  "rcp-tools-throttle",
  "serde",
  "serde_json",
@@ -1686,6 +1687,14 @@ dependencies = [
  "tracing-flame",
  "tracing-subscriber",
  "tracing-test",
+]
+
+[[package]]
+name = "rcp-tools-congestion"
+version = "0.32.0"
+dependencies = [
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1770,6 +1779,7 @@ dependencies = [
  "enum-map",
  "futures",
  "hex",
+ "humantime",
  "if-addrs",
  "openssh",
  "rand",

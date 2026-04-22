@@ -3,6 +3,7 @@ resolver = "2"
 
 members = [
   "common",
+  "congestion",
   "filegen",
   "rcmp",
   "rcp",
@@ -22,6 +23,7 @@ edition = "2024"
 [workspace.dependencies]
 # Internal library crates (use local names as keys)
 throttle = { package = "rcp-tools-throttle", version = "0.32.0", path = "throttle" }
+congestion = { package = "rcp-tools-congestion", version = "0.32.0", path = "congestion" }
 common = { package = "rcp-tools-common", version = "0.32.0", path = "common" }
 remote = { package = "rcp-tools-remote", version = "0.32.0", path = "remote" }
 
