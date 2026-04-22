@@ -70,6 +70,91 @@ pub struct CommonArgs {
         help_heading = "Advanced settings"
     )]
     pub max_blocking_threads: usize,
+    // Congestion control (experimental, opt-in)
+    /// Enable adaptive metadata-ops throttling (Vegas-style latency controller)
+    #[arg(long, help_heading = "Congestion control")]
+    pub auto_meta_throttle: bool,
+    /// Initial concurrency window for adaptive metadata throttle
+    #[arg(
+        long,
+        default_value = "1",
+        value_name = "N",
+        help_heading = "Congestion control"
+    )]
+    pub auto_meta_initial_cwnd: u32,
+    /// Minimum concurrency window (floor below which cwnd cannot shrink)
+    #[arg(
+        long,
+        default_value = "1",
+        value_name = "N",
+        help_heading = "Congestion control (advanced)"
+    )]
+    pub auto_meta_min_cwnd: u32,
+    /// Maximum concurrency window (ceiling on adaptive growth)
+    #[arg(
+        long,
+        default_value = "4096",
+        value_name = "N",
+        help_heading = "Congestion control"
+    )]
+    pub auto_meta_max_cwnd: u32,
+    /// Latency inflation ratio below which cwnd grows (ewma / min_latency)
+    #[arg(
+        long,
+        default_value = "1.1",
+        value_name = "F",
+        help_heading = "Congestion control (advanced)"
+    )]
+    pub auto_meta_alpha: f64,
+    /// Latency inflation ratio above which cwnd shrinks
+    #[arg(
+        long,
+        default_value = "1.5",
+        value_name = "F",
+        help_heading = "Congestion control (advanced)"
+    )]
+    pub auto_meta_beta: f64,
+    /// EWMA smoothing factor in [0.0, 1.0]; higher is more responsive
+    #[arg(
+        long,
+        default_value = "0.3",
+        value_name = "F",
+        help_heading = "Congestion control (advanced)"
+    )]
+    pub auto_meta_ewma_alpha: f64,
+    /// How much to grow cwnd on each under-shoot tick
+    #[arg(
+        long,
+        default_value = "1",
+        value_name = "N",
+        help_heading = "Congestion control (advanced)"
+    )]
+    pub auto_meta_increase_step: u32,
+    /// How much to shrink cwnd on each over-shoot tick
+    #[arg(
+        long,
+        default_value = "1",
+        value_name = "N",
+        help_heading = "Congestion control (advanced)"
+    )]
+    pub auto_meta_decrease_step: u32,
+    /// Max age of the min-latency baseline (e.g. "10s") before it is
+    /// discarded and re-established from new samples
+    #[arg(
+        long,
+        default_value = "10s",
+        value_name = "DUR",
+        help_heading = "Congestion control (advanced)"
+    )]
+    pub auto_meta_min_latency_max_age: humantime::Duration,
+    /// Control-loop tick interval (e.g. "50ms")
+    #[arg(
+        long,
+        default_value = "50ms",
+        value_name = "DUR",
+        help_heading = "Congestion control (advanced)"
+    )]
+    pub auto_meta_tick_interval: humantime::Duration,
 }
 
 impl CommonArgs {
@@ -102,11 +187,26 @@ impl CommonArgs {
         max_open_files: Option<usize>,
         chunk_size: u64,
     ) -> crate::ThrottleConfig {
+        let auto_meta = self
+            .auto_meta_throttle
+            .then(|| crate::AutoMetaThrottleConfig {
+                initial_cwnd: self.auto_meta_initial_cwnd,
+                min_cwnd: self.auto_meta_min_cwnd,
+                max_cwnd: self.auto_meta_max_cwnd,
+                alpha: self.auto_meta_alpha,
+                beta: self.auto_meta_beta,
+                ewma_alpha: self.auto_meta_ewma_alpha,
+                increase_step: self.auto_meta_increase_step,
+                decrease_step: self.auto_meta_decrease_step,
+                min_latency_max_age: self.auto_meta_min_latency_max_age.into(),
+                tick_interval: self.auto_meta_tick_interval.into(),
+            });
         crate::ThrottleConfig {
             max_open_files,
             ops_throttle: self.ops_throttle,
             iops_throttle: self.iops_throttle,
             chunk_size,
+            auto_meta,
         }
     }
     /// Returns true if any progress-related flag was set.

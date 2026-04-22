@@ -400,6 +400,10 @@ async fn run_rcpd_master(
         ops_throttle: args.common.ops_throttle,
         iops_throttle: args.common.iops_throttle,
         chunk_size: args.chunk_size.0 as usize,
+        auto_meta: args
+            .common
+            .throttle_config(args.max_open_files, args.chunk_size.0)
+            .auto_meta,
         dereference: args.dereference,
         overwrite: args.overwrite,
         overwrite_compare: args.overwrite_compare.clone(),

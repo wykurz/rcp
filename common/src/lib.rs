@@ -129,7 +129,8 @@ mod testutils;
 pub mod walk;
 
 pub use config::{
-    DryRunMode, DryRunWarnings, OutputConfig, RuntimeConfig, ThrottleConfig, TracingConfig,
+    AutoMetaThrottleConfig, DryRunMode, DryRunWarnings, OutputConfig, RuntimeConfig,
+    ThrottleConfig, TracingConfig,
 };
 pub use progress::{RcpdProgressPrinter, SerializableProgress};
 
@@ -1052,6 +1053,90 @@ fn spawn_throttle_replenishers(runtime: &tokio::runtime::Runtime, throttle: &Thr
         throttle::init_iops_tokens(replenish);
         runtime.spawn(throttle::run_iops_replenish_thread(replenish, interval));
     }
+    if let Some(auto) = throttle.auto_meta {
+        spawn_auto_meta_throttle(runtime, auto);
+    }
+}
+
+/// Wire up the adaptive metadata-ops control loop:
+/// 1. Seed `OPS_IN_FLIGHT_LIMIT` with the controller's initial cwnd so the
+///    first probe finds a permit available.
+/// 2. Install a `RoutingSink` that routes metadata samples to a bounded
+///    channel drained by a `ControlUnit<VegasController>`.
+/// 3. Spawn an adapter task that forwards each emitted `Decision` into
+///    `throttle::set_max_ops_in_flight`.
+/// 4. Spawn a drop-monitor task that periodically surfaces any sample
+///    drops — an operator-facing signal that the channel capacity or
+///    the control-loop tick is misconfigured.
+///
+/// Only one auto-meta config is supported per process. If a sample sink
+/// was already installed, it is silently replaced.
+fn spawn_auto_meta_throttle(runtime: &tokio::runtime::Runtime, auto: AutoMetaThrottleConfig) {
+    let initial_cwnd = auto
+        .initial_cwnd
+        .clamp(auto.min_cwnd.max(1), auto.max_cwnd.max(1));
+    throttle::set_max_ops_in_flight(initial_cwnd as usize);
+    let vegas = congestion::VegasController::new(congestion::VegasConfig {
+        initial_cwnd: auto.initial_cwnd,
+        min_cwnd: auto.min_cwnd,
+        max_cwnd: auto.max_cwnd,
+        alpha: auto.alpha,
+        beta: auto.beta,
+        ewma_alpha: auto.ewma_alpha,
+        increase_step: auto.increase_step,
+        decrease_step: auto.decrease_step,
+        min_latency_max_age: auto.min_latency_max_age,
+    });
+    let mut builder = congestion::RoutingSinkBuilder::new();
+    let metadata_rx = builder.metadata_receiver();
+    let sink = std::sync::Arc::new(builder.build());
+    congestion::install_sample_sink(sink.clone());
+    let (unit, mut decision_rx) =
+        congestion::ControlUnit::new(vegas, metadata_rx, auto.tick_interval);
+    runtime.spawn(unit.run());
+    // adapter: forward each decision to the throttle enforcement layer.
+    runtime.spawn(async move {
+        while decision_rx.changed().await.is_ok() {
+            let decision = *decision_rx.borrow();
+            match decision.max_in_flight {
+                Some(max) => throttle::set_max_ops_in_flight(max as usize),
+                None => tracing::warn!(
+                    "auto-meta-throttle: controller emitted a decision without max_in_flight; \
+                     leaving throttle at its last cap"
+                ),
+            }
+        }
+        tracing::debug!("auto-meta-throttle: adapter loop exiting (decision channel closed)");
+    });
+    // drop-monitor: periodically surface any sample drops so operators can
+    // tell if the control loop is stalling or the channel is too tight.
+    let sink_for_monitor = sink;
+    runtime.spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut last_reported = 0u64;
+        loop {
+            interval.tick().await;
+            let total = sink_for_monitor.dropped_samples();
+            if total > last_reported {
+                tracing::warn!(
+                    "auto-meta-throttle: RoutingSink dropped {} samples in the last 10s \
+                     (total: {}); the control-loop channel is under-scaled or the task \
+                     is stalling",
+                    total - last_reported,
+                    total,
+                );
+                last_reported = total;
+            }
+        }
+    });
+    tracing::info!(
+        "auto-meta-throttle enabled: initial_cwnd={}, max_cwnd={}, alpha={}, beta={}, tick={:?}",
+        auto.initial_cwnd,
+        auto.max_cwnd,
+        auto.alpha,
+        auto.beta,
+        auto.tick_interval,
+    );
 }
 
 #[instrument(skip(func))] // "func" is not Debug printable

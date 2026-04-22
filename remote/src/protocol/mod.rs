@@ -242,6 +242,10 @@ pub struct RcpdConfig {
     pub ops_throttle: usize,
     pub iops_throttle: usize,
     pub chunk_size: usize,
+    /// Adaptive metadata-ops throttle settings, propagated from the
+    /// master's `--auto-meta-*` flags. `None` means the feature is off on
+    /// this rcpd instance.
+    pub auto_meta: Option<common::AutoMetaThrottleConfig>,
     // common::copy::Settings
     pub dereference: bool,
     pub overwrite: bool,
@@ -367,6 +371,27 @@ impl RcpdConfig {
                 crate::tls::fingerprint_to_hex(&fp)
             ));
         }
+        // propagate the adaptive metadata-ops throttle settings to rcpd so a
+        // remote copy uses the same control law as the master-side tool.
+        if let Some(auto) = &self.auto_meta {
+            args.push("--auto-meta-throttle".to_string());
+            args.push(format!("--auto-meta-initial-cwnd={}", auto.initial_cwnd));
+            args.push(format!("--auto-meta-min-cwnd={}", auto.min_cwnd));
+            args.push(format!("--auto-meta-max-cwnd={}", auto.max_cwnd));
+            args.push(format!("--auto-meta-alpha={}", auto.alpha));
+            args.push(format!("--auto-meta-beta={}", auto.beta));
+            args.push(format!("--auto-meta-ewma-alpha={}", auto.ewma_alpha));
+            args.push(format!("--auto-meta-increase-step={}", auto.increase_step));
+            args.push(format!("--auto-meta-decrease-step={}", auto.decrease_step));
+            args.push(format!(
+                "--auto-meta-min-latency-max-age={}",
+                humantime::format_duration(auto.min_latency_max_age),
+            ));
+            args.push(format!(
+                "--auto-meta-tick-interval={}",
+                humantime::format_duration(auto.tick_interval),
+            ));
+        }
         args
     }
 }
@@ -455,4 +480,85 @@ pub enum RcpdResult {
         summary: common::copy::Summary,
         runtime_stats: common::RuntimeStats,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_rcpd_config() -> RcpdConfig {
+        RcpdConfig {
+            verbose: 0,
+            fail_early: false,
+            max_workers: 0,
+            max_blocking_threads: 0,
+            max_open_files: None,
+            ops_throttle: 0,
+            iops_throttle: 0,
+            chunk_size: 0,
+            auto_meta: None,
+            dereference: false,
+            overwrite: false,
+            overwrite_compare: "size,mtime".to_string(),
+            overwrite_filter: None,
+            ignore_existing: false,
+            skip_specials: false,
+            debug_log_prefix: None,
+            port_ranges: None,
+            progress: false,
+            progress_delay: None,
+            remote_copy_conn_timeout_sec: 30,
+            network_profile: crate::NetworkProfile::default(),
+            buffer_size: None,
+            max_connections: 1,
+            pending_writes_multiplier: 1,
+            chrome_trace_prefix: None,
+            flamegraph_prefix: None,
+            profile_level: None,
+            tokio_console: false,
+            tokio_console_port: None,
+            encryption: true,
+            master_cert_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn to_args_omits_auto_meta_when_none() {
+        let args = minimal_rcpd_config().to_args();
+        assert!(
+            !args.iter().any(|a| a.starts_with("--auto-meta")),
+            "no auto-meta flags should be emitted when auto_meta is None: {args:?}",
+        );
+    }
+
+    #[test]
+    fn to_args_propagates_all_auto_meta_fields() {
+        let mut config = minimal_rcpd_config();
+        config.auto_meta = Some(common::AutoMetaThrottleConfig {
+            initial_cwnd: 8,
+            min_cwnd: 2,
+            max_cwnd: 128,
+            alpha: 1.2,
+            beta: 1.6,
+            ewma_alpha: 0.4,
+            increase_step: 2,
+            decrease_step: 3,
+            min_latency_max_age: std::time::Duration::from_secs(20),
+            tick_interval: std::time::Duration::from_millis(75),
+        });
+        let args = config.to_args();
+        let has = |needle: &str| args.iter().any(|a| a == needle);
+        let has_prefix = |needle: &str| args.iter().any(|a| a.starts_with(needle));
+        assert!(has("--auto-meta-throttle"));
+        assert!(has("--auto-meta-initial-cwnd=8"));
+        assert!(has("--auto-meta-min-cwnd=2"));
+        assert!(has("--auto-meta-max-cwnd=128"));
+        assert!(has_prefix("--auto-meta-alpha=1.2"));
+        assert!(has_prefix("--auto-meta-beta=1.6"));
+        assert!(has_prefix("--auto-meta-ewma-alpha=0.4"));
+        assert!(has("--auto-meta-increase-step=2"));
+        assert!(has("--auto-meta-decrease-step=3"));
+        assert!(has_prefix("--auto-meta-min-latency-max-age="));
+        assert!(has_prefix("--auto-meta-tick-interval="));
+    }
 }

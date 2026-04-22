@@ -25,6 +25,26 @@ pub struct RuntimeConfig {
     pub max_blocking_threads: usize,
 }
 
+/// Tunables for the adaptive metadata-throttle control loop.
+///
+/// Populated from CLI flags when `--auto-meta-throttle` is set; otherwise
+/// this field is `None` on [`ThrottleConfig`] and the control loop is not
+/// spawned. Serializable so that `rcp` can propagate the settings to
+/// remote `rcpd` processes over the control channel.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct AutoMetaThrottleConfig {
+    pub initial_cwnd: u32,
+    pub min_cwnd: u32,
+    pub max_cwnd: u32,
+    pub alpha: f64,
+    pub beta: f64,
+    pub ewma_alpha: f64,
+    pub increase_step: u32,
+    pub decrease_step: u32,
+    pub min_latency_max_age: std::time::Duration,
+    pub tick_interval: std::time::Duration,
+}
+
 /// Throttling configuration for resource control
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ThrottleConfig {
@@ -36,6 +56,8 @@ pub struct ThrottleConfig {
     pub iops_throttle: usize,
     /// Chunk size for I/O operations (bytes)
     pub chunk_size: u64,
+    /// Adaptive metadata-ops throttle, if enabled via `--auto-meta-throttle`.
+    pub auto_meta: Option<AutoMetaThrottleConfig>,
 }
 
 impl ThrottleConfig {
@@ -43,6 +65,23 @@ impl ThrottleConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.iops_throttle > 0 && self.chunk_size == 0 {
             return Err("chunk_size must be specified when using iops_throttle".to_string());
+        }
+        if let Some(auto) = &self.auto_meta {
+            if auto.max_cwnd == 0 {
+                return Err("auto-meta-max-cwnd must be > 0".to_string());
+            }
+            if auto.min_cwnd > auto.max_cwnd {
+                return Err("auto-meta-min-cwnd must be <= auto-meta-max-cwnd".to_string());
+            }
+            if !(0.0..=1.0).contains(&auto.ewma_alpha) {
+                return Err("auto-meta-ewma-alpha must be in [0.0, 1.0]".to_string());
+            }
+            if auto.alpha >= auto.beta {
+                return Err("auto-meta-alpha must be < auto-meta-beta".to_string());
+            }
+            if auto.tick_interval.is_zero() {
+                return Err("auto-meta-tick-interval must be > 0".to_string());
+            }
         }
         Ok(())
     }
