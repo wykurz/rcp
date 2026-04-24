@@ -271,6 +271,147 @@ mod tests {
         assert_eq!(actions_nan[0], AdapterAction::SetOpsReplenish(0));
     }
 
+    /// Property-based coverage: `apply_decision` is pure and finite-state,
+    /// so we can drive it across the whole input space to verify
+    /// contract invariants, not just the hand-picked transitions above.
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Arbitrary Decision, covering both-None through both-Some with
+        /// finite rate values (NaN is specifically tested elsewhere).
+        fn any_decision() -> impl Strategy<Value = Decision> {
+            (
+                prop::option::of(1u32..10_000),
+                prop::option::of(0.0f64..100_000.0),
+            )
+                .prop_map(|(max, rate)| Decision {
+                    max_in_flight: max,
+                    rate_per_sec: rate,
+                })
+        }
+
+        proptest! {
+            /// Identity: re-applying the same decision emits no actions.
+            /// This is the no-op case the adapter relies on for idle ticks
+            /// when the controller emits the same value tick after tick.
+            #[test]
+            fn identity_emits_no_actions(d in any_decision()) {
+                prop_assert!(apply_decision(d, d).is_empty());
+            }
+
+            /// Dimension independence: the set of dimensions that differ
+            /// between `prev` and `new` fully determines which kinds of
+            /// actions the adapter emits. If only `max_in_flight` changed,
+            /// rate actions must not appear, and vice versa.
+            #[test]
+            fn only_changed_dimensions_produce_actions(
+                prev in any_decision(),
+                new in any_decision(),
+            ) {
+                let actions = apply_decision(prev, new);
+                let max_changed = prev.max_in_flight != new.max_in_flight;
+                let rate_changed = prev.rate_per_sec != new.rate_per_sec;
+                let has_max_action = actions
+                    .iter()
+                    .any(|a| matches!(a, AdapterAction::SetMaxInFlight(_)));
+                let has_rate_action = actions.iter().any(|a| {
+                    matches!(
+                        a,
+                        AdapterAction::SetOpsReplenish(_)
+                            | AdapterAction::EnableOpsThrottle
+                            | AdapterAction::DisableOpsThrottle
+                    )
+                });
+                prop_assert_eq!(has_max_action, max_changed);
+                prop_assert_eq!(has_rate_action, rate_changed);
+            }
+
+            /// Rate enablement always pairs a SetOpsReplenish with an
+            /// EnableOpsThrottle — the ordering matters (replenish first
+            /// so the new count is live when the flag flips on) and
+            /// neither should ever appear alone.
+            #[test]
+            fn rate_some_transitions_pair_replenish_and_enable(
+                prev in any_decision(),
+                rate in 0.0f64..100_000.0,
+            ) {
+                let new = Decision {
+                    max_in_flight: prev.max_in_flight,
+                    rate_per_sec: Some(rate),
+                };
+                let actions = apply_decision(prev, new);
+                if prev.rate_per_sec == Some(rate) {
+                    // no change on rate dimension — no rate actions.
+                    prop_assert!(!actions.iter().any(|a| matches!(a,
+                        AdapterAction::SetOpsReplenish(_)
+                        | AdapterAction::EnableOpsThrottle
+                    )));
+                } else {
+                    // Some rate change: must emit exactly [SetOpsReplenish, EnableOpsThrottle] in order.
+                    let rate_actions: Vec<_> = actions
+                        .iter()
+                        .filter(|a| matches!(
+                            a,
+                            AdapterAction::SetOpsReplenish(_)
+                                | AdapterAction::EnableOpsThrottle
+                                | AdapterAction::DisableOpsThrottle
+                        ))
+                        .copied()
+                        .collect();
+                    prop_assert_eq!(rate_actions.len(), 2);
+                    prop_assert!(matches!(
+                        rate_actions[0],
+                        AdapterAction::SetOpsReplenish(_)
+                    ));
+                    prop_assert_eq!(rate_actions[1], AdapterAction::EnableOpsThrottle);
+                }
+            }
+
+            /// A Some -> None transition on rate always emits a single
+            /// DisableOpsThrottle — and never an EnableOpsThrottle or
+            /// SetOpsReplenish (which would contradict "no limit").
+            #[test]
+            fn rate_none_transitions_only_disable(
+                prev_rate in 0.0f64..100_000.0,
+                prev_max in prop::option::of(1u32..10_000),
+            ) {
+                let prev = Decision {
+                    max_in_flight: prev_max,
+                    rate_per_sec: Some(prev_rate),
+                };
+                let new = Decision {
+                    max_in_flight: prev_max,
+                    rate_per_sec: None,
+                };
+                let actions = apply_decision(prev, new);
+                let rate_actions: Vec<_> = actions
+                    .iter()
+                    .filter(|a| matches!(
+                        a,
+                        AdapterAction::SetOpsReplenish(_)
+                            | AdapterAction::EnableOpsThrottle
+                            | AdapterAction::DisableOpsThrottle
+                    ))
+                    .copied()
+                    .collect();
+                prop_assert_eq!(rate_actions, vec![AdapterAction::DisableOpsThrottle]);
+            }
+
+            /// For any Decision, the total number of emitted actions is
+            /// bounded: at most 1 max-in-flight action + at most 2 rate
+            /// actions = 3.
+            #[test]
+            fn action_count_bounded(
+                prev in any_decision(),
+                new in any_decision(),
+            ) {
+                let actions = apply_decision(prev, new);
+                prop_assert!(actions.len() <= 3);
+            }
+        }
+    }
+
     #[test]
     fn full_cycle_disable_then_re_enable_applies_enable() {
         // Regression for the rate re-enable bug: after a Some->None that
