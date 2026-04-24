@@ -216,9 +216,13 @@ impl Semaphore {
     }
 
     pub async fn run_replenish_thread(&self, replenish: usize, interval: std::time::Duration) {
-        if !self.flag.load(Ordering::Acquire) {
-            return;
-        }
+        // No early-return on `flag == false`: the auto-meta bootstrap path
+        // spawns this thread and then immediately calls `disable()` so the
+        // adapter can enable rate capping later via
+        // [`crate::enable_ops_throttle`]. If the thread exited on `!flag`
+        // here it would race that sequence and die before it ever looped.
+        // With `replenish == 0`, each iteration is a no-op, so running
+        // the loop while disabled is cheap.
         self.replenish.store(replenish, Ordering::Release);
         loop {
             tokio::time::sleep(interval).await;
@@ -418,6 +422,42 @@ mod tests {
             0,
             "debt must be fully consumed once all permits have returned",
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replenish_thread_survives_disable_spawn_enable_cycle() {
+        // Regression for the auto-meta bootstrap path: setup + disable +
+        // spawn replenish thread + later enable + set_replenish. The
+        // thread was previously exiting immediately on `!flag` (losing
+        // its replenish loop) which defeated the whole point of
+        // bootstrapping the ops-throttle for a later rate decision.
+        let sem = std::sync::Arc::new(Semaphore::new());
+        sem.setup(1);
+        sem.disable();
+        // spawn the thread AFTER disable — the exact order the auto-meta
+        // bootstrap uses in production.
+        let sem2 = sem.clone();
+        let handle = tokio::spawn(async move {
+            sem2.run_replenish_thread(0, std::time::Duration::from_millis(100))
+                .await;
+        });
+        let_spawned_task_run().await;
+        // enable + set a rate — the thread must still be alive to
+        // respond.
+        assert!(sem.enable());
+        sem.set_replenish(5);
+        // drain anything that was in the pool to force a refill
+        while sem.sem.available_permits() > 0 {
+            sem.consume().await;
+        }
+        tokio::time::advance(std::time::Duration::from_millis(150)).await;
+        let_spawned_task_run().await;
+        assert_eq!(
+            sem.sem.available_permits(),
+            5,
+            "thread did not refill after the disable-then-enable cycle",
+        );
+        handle.abort();
     }
 
     #[tokio::test]

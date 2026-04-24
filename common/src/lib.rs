@@ -1034,6 +1034,17 @@ fn build_tokio_runtime(
 
 /// Spawn the ops/iops throttle replenisher tasks onto `runtime` if the
 /// throttles are enabled.
+///
+/// When `auto_meta` is set, the ops-throttle is forced to a fixed 100ms
+/// replenish interval (matching the constant the auto-meta adapter uses
+/// when converting `Decision::rate_per_sec` → tokens-per-interval) *and*
+/// is bootstrapped even if `--ops-throttle` was zero. That way:
+///
+/// 1. a future rate-aware controller's `rate_per_sec: Some(_)` decisions
+///    actually gate ops instead of silently no-opping;
+/// 2. the adapter's 100ms conversion assumption matches the thread's
+///    real interval, regardless of the user's static `--ops-throttle`
+///    value.
 fn spawn_throttle_replenishers(runtime: &tokio::runtime::Runtime, throttle: &ThrottleConfig) {
     fn get_replenish_interval(replenish: usize) -> (usize, std::time::Duration) {
         let mut replenish = replenish;
@@ -1044,7 +1055,23 @@ fn spawn_throttle_replenishers(runtime: &tokio::runtime::Runtime, throttle: &Thr
         }
         (replenish, interval)
     }
-    if throttle.ops_throttle > 0 {
+    let auto_meta_on = throttle.auto_meta.is_some();
+    if auto_meta_on {
+        // Force the fixed 100ms cadence the adapter assumes. Bootstrap
+        // with at least 1 token so `setup()` enables the semaphore; if
+        // the user didn't pass `--ops-throttle`, immediately disable —
+        // the adapter re-enables only when a rate decision arrives.
+        let interval = std::time::Duration::from_millis(100);
+        let initial_replenish = (throttle.ops_throttle as f64 * 0.1) as usize;
+        throttle::init_ops_tokens(initial_replenish.max(1));
+        if throttle.ops_throttle == 0 {
+            throttle::disable_ops_throttle();
+        }
+        runtime.spawn(throttle::run_ops_replenish_thread(
+            initial_replenish,
+            interval,
+        ));
+    } else if throttle.ops_throttle > 0 {
         let (replenish, interval) = get_replenish_interval(throttle.ops_throttle);
         throttle::init_ops_tokens(replenish);
         runtime.spawn(throttle::run_ops_replenish_thread(replenish, interval));
@@ -1139,38 +1166,59 @@ where
     } = output;
     // tracing guards must outlive the runtime so chrome/flame traces flush
     let _tracing_guards = install_tracing_subscriber(quiet, verbose, tracing_config);
-    let runtime = build_tokio_runtime(&runtime_config, &throttle_config);
-    spawn_throttle_replenishers(&runtime, &throttle_config);
     let res = {
-        let _progress_tracker = progress.map(|settings| {
-            tracing::debug!("Requesting progress updates {settings:?}");
-            let delay = settings.progress_delay.map(|delay_str| {
-                humantime::parse_duration(&delay_str)
-                    .expect("Couldn't parse duration out of --progress-delay")
+        let runtime = build_tokio_runtime(&runtime_config, &throttle_config);
+        spawn_throttle_replenishers(&runtime, &throttle_config);
+        let res = {
+            let _progress_tracker = progress.map(|settings| {
+                tracing::debug!("Requesting progress updates {settings:?}");
+                let delay = settings.progress_delay.map(|delay_str| {
+                    humantime::parse_duration(&delay_str)
+                        .expect("Couldn't parse duration out of --progress-delay")
+                });
+                ProgressTracker::new(settings.progress_type, delay)
             });
-            ProgressTracker::new(settings.progress_type, delay)
-        });
-        runtime.block_on(func())
+            runtime.block_on(func())
+        };
+        match &res {
+            Ok(summary) => {
+                if print_summary || verbose > 0 {
+                    println!("{summary}");
+                }
+            }
+            Err(err) => {
+                if !quiet {
+                    println!("{err:?}");
+                }
+            }
+        }
+        if (print_summary || verbose > 0)
+            && !suppress_runtime_stats
+            && let Err(err) = print_runtime_stats()
+        {
+            println!("Failed to print runtime stats: {err:?}");
+        }
+        res
+        // runtime drops here, cancelling all spawned tasks (control
+        // loop, adapter, replenishers) and releasing their permits.
     };
-    match &res {
-        Ok(summary) => {
-            if print_summary || verbose > 0 {
-                println!("{summary}");
-            }
-        }
-        Err(err) => {
-            if !quiet {
-                println!("{err:?}");
-            }
-        }
-    }
-    if (print_summary || verbose > 0)
-        && !suppress_runtime_stats
-        && let Err(err) = print_runtime_stats()
-    {
-        println!("Failed to print runtime stats: {err:?}");
-    }
+    // Clear process-wide state so a second `run()` in the same process
+    // starts on a clean slate. Without this, a later run inherits the
+    // previous auto-meta sample sink and ops-in-flight cap, and its
+    // probes acquire against stale limits even when auto_meta is off.
+    reset_process_throttle_state();
     res.ok()
+}
+
+/// Reset process-wide throttle + congestion state to its pre-`run()`
+/// defaults. Called by [`run`] on exit so callers that invoke it more
+/// than once in a single process (library users, integration tests
+/// outside this crate) aren't affected by the previous invocation's
+/// decisions.
+fn reset_process_throttle_state() {
+    congestion::clear_sample_sink();
+    throttle::set_max_ops_in_flight(0);
+    throttle::disable_ops_throttle();
 }
 
 #[cfg(test)]
