@@ -93,14 +93,19 @@ pub async fn write_file(
     let _ops_guard = prog_track.ops.guard();
     let original_filesize = filesize;
     let mut bytes = vec![0u8; bufsize];
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .await
-        .with_context(|| format!("Error opening {:?}", &path))
-        .map_err(|err| Error::new(err, Default::default()))?;
+    // The file open is the single metadata syscall in this path; wrap it
+    // with the cwnd permit + probe so filegen participates in the same
+    // adaptive control loop as copy/rm/link.
+    let mut file = crate::walk::run_metadata_probed(
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path),
+    )
+    .await
+    .with_context(|| format!("Error opening {:?}", &path))
+    .map_err(|err| Error::new(err, Default::default()))?;
     while filesize > 0 {
         {
             // make sure rng falls out of scope before await
@@ -153,7 +158,10 @@ pub async fn filegen(
             leaf_files: *leaf_files,
         };
         let recurse = || async move {
-            tokio::fs::create_dir(&path)
+            // Bracket the create_dir metadata syscall with the cwnd permit
+            // + probe so filegen participates in the same adaptive control
+            // loop as copy/rm/link.
+            crate::walk::run_metadata_probed(tokio::fs::create_dir(&path))
                 .await
                 .with_context(|| format!("Error creating directory {:?}", &path))
                 .map_err(|err| Error::new(err, Default::default()))?;

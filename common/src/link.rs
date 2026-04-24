@@ -513,42 +513,18 @@ async fn link_internal(
     let mut processed_files = std::collections::HashSet::new();
     // iterate through src entries and recursively call "link" on each one
     loop {
-        // gate per-entry work at the top of the loop. The ops-in-flight
-        // permit is scoped tightly around the actual syscalls so cwnd
-        // caps concurrent FS work without deadlocking deep trees. The
-        // Probe starts *after* the permit is held so queueing on the
-        // controller's own semaphore doesn't get reported back to Vegas
-        // as filesystem latency.
-        throttle::get_ops_token().await;
-        let ops_permit = throttle::ops_in_flight_permit().await;
-        let probe = congestion::Probe::start_metadata();
-        let maybe_entry = src_entries
-            .next_entry()
+        let Some((src_entry, entry_file_type)) =
+            crate::walk::next_entry_probed(&mut src_entries, || {
+                format!("failed traversing directory {:?}", &src)
+            })
             .await
-            .with_context(|| format!("failed traversing directory {:?}", &src))
-            .map_err(|err| Error::new(err, link_summary))?;
-        let Some(src_entry) = maybe_entry else {
-            probe.discard();
-            drop(ops_permit);
+            .map_err(|err| Error::new(err, link_summary))?
+        else {
             break;
         };
         let cwd_path = cwd.to_owned();
         let entry_path = src_entry.path();
         let entry_name = entry_path.file_name().unwrap();
-        // check entry type for filter matching and dry-run reporting; on
-        // error, discard the probe rather than recording an Ok sample —
-        // error paths should not skew the controller's latency baseline.
-        let entry_file_type = match src_entry.file_type().await {
-            Ok(file_type) => {
-                probe.complete_ok(0);
-                Some(file_type)
-            }
-            Err(_) => {
-                probe.discard();
-                None
-            }
-        };
-        drop(ops_permit);
         let entry_kind = EntryKind::from_file_type(entry_file_type.as_ref());
         let entry_is_dir = entry_kind == EntryKind::Dir;
         let entry_is_symlink = entry_kind == EntryKind::Symlink;
@@ -650,12 +626,16 @@ async fn link_internal(
             .with_context(|| format!("cannot open directory {:?} for reading", &update))
             .map_err(|err| Error::new(err, link_summary))?;
         // iterate through update entries and for each one that's not present in src call "copy"
-        while let Some(update_entry) = update_entries
-            .next_entry()
-            .await
-            .with_context(|| format!("failed traversing directory {:?}", &update))
-            .map_err(|err| Error::new(err, link_summary))?
-        {
+        loop {
+            let Some((update_entry, _entry_file_type)) =
+                crate::walk::next_entry_probed(&mut update_entries, || {
+                    format!("failed traversing directory {:?}", &update)
+                })
+                .await
+                .map_err(|err| Error::new(err, link_summary))?
+            else {
+                break;
+            };
             let entry_path = update_entry.path();
             let entry_name = entry_path.file_name().unwrap();
             if processed_files.contains(entry_name) {

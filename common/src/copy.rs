@@ -746,42 +746,17 @@ async fn copy_internal(
     let mut join_set = tokio::task::JoinSet::new();
     let errors = crate::error_collector::ErrorCollector::default();
     loop {
-        // gate per-entry work at the top of the loop. The ops-in-flight
-        // permit is scoped tightly around the actual syscalls so cwnd
-        // caps concurrent FS work without deadlocking deep trees. The
-        // Probe starts *after* the permit is held so queueing on the
-        // controller's own semaphore doesn't get reported back to Vegas
-        // as filesystem latency.
-        throttle::get_ops_token().await;
-        let ops_permit = throttle::ops_in_flight_permit().await;
-        let probe = congestion::Probe::start_metadata();
-        let maybe_entry = entries
-            .next_entry()
-            .await
-            .with_context(|| format!("failed traversing src directory {:?}", &src))
-            .map_err(|err| Error::new(err, copy_summary))?;
-        let Some(entry) = maybe_entry else {
-            probe.discard();
-            drop(ops_permit);
+        let Some((entry, entry_file_type)) = crate::walk::next_entry_probed(&mut entries, || {
+            format!("failed traversing src directory {:?}", &src)
+        })
+        .await
+        .map_err(|err| Error::new(err, copy_summary))?
+        else {
             break;
         };
         let entry_path = entry.path();
         let entry_name = entry_path.file_name().unwrap();
         let dst_path = dst.join(entry_name);
-        // check entry type for filter matching and skip counting; on
-        // error, discard the probe rather than recording an Ok sample —
-        // error paths should not skew the controller's latency baseline.
-        let entry_file_type = match entry.file_type().await {
-            Ok(file_type) => {
-                probe.complete_ok(0);
-                Some(file_type)
-            }
-            Err(_) => {
-                probe.discard();
-                None
-            }
-        };
-        drop(ops_permit);
         let entry_kind = EntryKind::from_file_type(entry_file_type.as_ref());
         let entry_is_dir = entry_kind == EntryKind::Dir;
         // compute relative path from source_root for filter matching

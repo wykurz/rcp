@@ -1063,11 +1063,11 @@ fn spawn_throttle_replenishers(runtime: &tokio::runtime::Runtime, throttle: &Thr
 ///    first probe finds a permit available.
 /// 2. Install a `RoutingSink` that routes metadata samples to a bounded
 ///    channel drained by a `ControlUnit<VegasController>`.
-/// 3. Spawn an adapter task that forwards each emitted `Decision` into
-///    `throttle::set_max_ops_in_flight`.
-/// 4. Spawn a drop-monitor task that periodically surfaces any sample
-///    drops — an operator-facing signal that the channel capacity or
-///    the control-loop tick is misconfigured.
+/// 3. Spawn a combined adapter/monitor task that forwards each emitted
+///    `Decision` into the throttle enforcement layer and periodically
+///    surfaces any dropped samples. The task exits cleanly when the
+///    control unit stops publishing decisions, so it doesn't leak as
+///    an unbounded background loop.
 ///
 /// Only one auto-meta config is supported per process. If a sample sink
 /// was already installed, it is silently replaced.
@@ -1094,40 +1094,81 @@ fn spawn_auto_meta_throttle(runtime: &tokio::runtime::Runtime, auto: AutoMetaThr
     let (unit, mut decision_rx) =
         congestion::ControlUnit::new(vegas, metadata_rx, auto.tick_interval);
     runtime.spawn(unit.run());
-    // adapter: forward each decision to the throttle enforcement layer.
+    // Combined adapter + drop-monitor task. Handling both here means the
+    // monitor stops when the control unit goes away (decision channel
+    // closes), rather than living as an independent infinite loop.
     runtime.spawn(async move {
-        while decision_rx.changed().await.is_ok() {
-            let decision = *decision_rx.borrow();
-            match decision.max_in_flight {
-                Some(max) => throttle::set_max_ops_in_flight(max as usize),
-                None => tracing::warn!(
-                    "auto-meta-throttle: controller emitted a decision without max_in_flight; \
-                     leaving throttle at its last cap"
-                ),
-            }
-        }
-        tracing::debug!("auto-meta-throttle: adapter loop exiting (decision channel closed)");
-    });
-    // drop-monitor: periodically surface any sample drops so operators can
-    // tell if the control loop is stalling or the channel is too tight.
-    let sink_for_monitor = sink;
-    runtime.spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut drop_report_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        drop_report_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // swallow the at-t=0 tick so the first report fires after a full
+        // 10s interval rather than immediately.
+        drop_report_interval.tick().await;
         let mut last_reported = 0u64;
+        // Track the previously-applied decision so we can diff per the
+        // Decision contract: None on a given dimension means "no limit"
+        // and must actively disable any cap we had set on that dimension.
+        let mut last_applied: congestion::Decision = congestion::Decision::UNLIMITED;
         loop {
-            interval.tick().await;
-            let total = sink_for_monitor.dropped_samples();
-            if total > last_reported {
-                tracing::warn!(
-                    "auto-meta-throttle: RoutingSink dropped {} samples in the last 10s \
-                     (total: {}); the control-loop channel is under-scaled or the task \
-                     is stalling",
-                    total - last_reported,
-                    total,
-                );
-                last_reported = total;
+            tokio::select! {
+                changed = decision_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let decision = *decision_rx.borrow();
+                    if decision.max_in_flight != last_applied.max_in_flight {
+                        match decision.max_in_flight {
+                            // 0 is the "disabled" sentinel for set_max_ops_in_flight —
+                            // new acquires return immediately without a permit, which
+                            // is exactly the "no limit" semantics we want.
+                            Some(max) => throttle::set_max_ops_in_flight(max as usize),
+                            None => throttle::set_max_ops_in_flight(0),
+                        }
+                    }
+                    if decision.rate_per_sec != last_applied.rate_per_sec {
+                        match decision.rate_per_sec {
+                            Some(rate) => {
+                                // Convert ops/sec to per-interval count. Assumes
+                                // the replenisher was started with a 100ms
+                                // interval (the common case produced by
+                                // get_replenish_interval when ops_throttle > 100).
+                                // If --ops-throttle was not set, set_ops_replenish
+                                // and enable_ops_throttle are no-ops. The built-in
+                                // Vegas controller never emits rate_per_sec today;
+                                // this branch exists so future rate-aware
+                                // controllers plug in without another adapter
+                                // change.
+                                let replenish = (rate * 0.1).max(0.0) as usize;
+                                throttle::set_ops_replenish(replenish);
+                                // Re-enable the gate in case a prior None
+                                // transition disabled it — the controller is
+                                // asking to cap again.
+                                throttle::enable_ops_throttle();
+                            }
+                            // "no limit" — disable the rate gate entirely so
+                            // get_ops_token becomes a no-op, rather than
+                            // pausing replenishment (which would stall ops once
+                            // the bucket drained).
+                            None => throttle::disable_ops_throttle(),
+                        }
+                    }
+                    last_applied = decision;
+                }
+                _ = drop_report_interval.tick() => {
+                    let total = sink.dropped_samples();
+                    if total > last_reported {
+                        tracing::warn!(
+                            "auto-meta-throttle: RoutingSink dropped {} samples in the last 10s \
+                             (total: {}); the control-loop channel is under-scaled or the task \
+                             is stalling",
+                            total - last_reported,
+                            total,
+                        );
+                        last_reported = total;
+                    }
+                }
             }
         }
+        tracing::debug!("auto-meta-throttle: adapter/monitor exiting (decision channel closed)");
     });
     tracing::info!(
         "auto-meta-throttle enabled: initial_cwnd={}, max_cwnd={}, alpha={}, beta={}, tick={:?}",
