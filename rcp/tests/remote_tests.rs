@@ -4702,7 +4702,7 @@ fn test_remote_skip_specials() {
 /// Verifies that `--auto-meta-throttle` and its tuning flags propagate
 /// from the rcp master to the rcpd processes over the remote protocol.
 ///
-/// Before launching each rcpd, the master stderr the full ssh command line
+/// Before launching each rcpd, the master logs the full ssh command line
 /// at `Will run remotely: ... /rcpd --role <source|destination> ...`.
 /// The `--auto-meta-*` flags MUST appear there for the role's rcpd to
 /// apply them. This is the deterministic propagation point — it doesn't
