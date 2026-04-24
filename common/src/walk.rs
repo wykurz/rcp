@@ -3,9 +3,15 @@
 //! [`EntryKind`] classifies a directory entry by file type, and exposes the
 //! per-type bits (dry-run label, skipped-counter increment) so callers don't
 //! re-implement the dispatch.
+//!
+//! [`next_entry_probed`] wraps `tokio::fs::ReadDir::next_entry` with the full
+//! per-entry throttle + congestion-probe prologue so copy/link/rm share a
+//! single source of truth for the "probe after permit, permit before
+//! children" invariant.
 
 use crate::filter::{FilterResult, FilterSettings};
 use crate::progress::Progress;
+use anyhow::Context;
 
 /// Classification of a filesystem entry by type.
 ///
@@ -82,6 +88,84 @@ impl EntryKind {
             Self::File | Self::Special => prog.files_skipped.inc(),
         }
     }
+}
+
+/// Pull the next directory entry with the full per-entry throttle + probe
+/// prologue applied:
+///
+/// 1. Await the static ops rate gate.
+/// 2. Acquire the dynamic ops-in-flight permit (a no-op when
+///    `--auto-meta-throttle` is not enabled).
+/// 3. Start a metadata [`congestion::Probe`] — *after* the permit is held,
+///    so self-inflicted queueing on the in-flight semaphore is not reported
+///    back to the controller as filesystem latency.
+/// 4. Call `next_entry()` and, on success, classify via `file_type()`.
+/// 5. Complete the probe on success; discard it on error or exhaustion —
+///    error paths must not skew the controller's latency baseline.
+/// 6. Release the permit before returning, so the caller can spawn / await
+///    children without holding it across task boundaries (which would
+///    deadlock at any tree depth greater than cwnd).
+///
+/// The error is left as `anyhow::Error` so each caller can wrap it in the
+/// site-specific error type (`copy::Error`, `link::Error`, `rm::Error`)
+/// without this helper needing to be generic over the summary payload.
+pub async fn next_entry_probed<F>(
+    entries: &mut tokio::fs::ReadDir,
+    context: F,
+) -> anyhow::Result<Option<(tokio::fs::DirEntry, Option<std::fs::FileType>)>>
+where
+    F: FnOnce() -> String,
+{
+    throttle::get_ops_token().await;
+    let ops_permit = throttle::ops_in_flight_permit().await;
+    let probe = congestion::Probe::start_metadata();
+    let maybe_entry = entries.next_entry().await.with_context(context)?;
+    let Some(entry) = maybe_entry else {
+        probe.discard();
+        drop(ops_permit);
+        return Ok(None);
+    };
+    let entry_file_type = match entry.file_type().await {
+        Ok(file_type) => {
+            probe.complete_ok(0);
+            Some(file_type)
+        }
+        Err(_) => {
+            probe.discard();
+            None
+        }
+    };
+    drop(ops_permit);
+    Ok(Some((entry, entry_file_type)))
+}
+
+/// Bracket a single metadata-producing future with the cwnd permit and a
+/// congestion probe. The probe completes successfully when `op` returns
+/// `Ok`, and is discarded on error so error paths don't skew the
+/// controller's latency baseline.
+///
+/// Use this at sites that perform one isolated metadata op (e.g. filegen's
+/// `create_dir` / `open`). For directory iteration, prefer
+/// [`next_entry_probed`] which also handles the `next_entry` +
+/// `file_type` classification in one unit.
+///
+/// Note: unlike [`next_entry_probed`], this helper does **not** acquire
+/// the static ops rate token — callers that rate-limit at a different
+/// granularity (such as filegen, which gates at per-task spawn time)
+/// would otherwise double-count.
+pub async fn run_metadata_probed<F, T, E>(op: F) -> Result<T, E>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let ops_permit = throttle::ops_in_flight_permit().await;
+    let probe = congestion::Probe::start_metadata();
+    let result = op.await;
+    match &result {
+        Ok(_) => probe.complete_ok(0),
+        Err(_) => probe.discard(),
+    }
+    drop(ops_permit);
+    result
 }
 
 /// Decide whether an entry should be skipped by the filter, returning the

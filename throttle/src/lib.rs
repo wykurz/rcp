@@ -166,7 +166,7 @@ pub fn set_max_open_files(max_open_files: usize) {
 }
 
 pub struct OpenFileGuard {
-    _permit: Option<tokio::sync::SemaphorePermit<'static>>,
+    _permit: Option<semaphore::Permit<'static>>,
 }
 
 pub async fn open_file_permit() -> OpenFileGuard {
@@ -191,7 +191,7 @@ pub fn set_max_ops_in_flight(max_in_flight: usize) {
 }
 
 pub struct OpsInFlightGuard {
-    _permit: Option<tokio::sync::SemaphorePermit<'static>>,
+    _permit: Option<semaphore::Permit<'static>>,
 }
 
 /// Acquire a permit from the ops-in-flight cap. No-op (returns immediately)
@@ -265,4 +265,26 @@ pub fn set_ops_replenish(value: usize) {
 /// [`set_ops_replenish`] for the semantics.
 pub fn set_iops_replenish(value: usize) {
     IOPS_THROTTLE.set_replenish(value);
+}
+
+/// Disable the ops-throttle, making [`get_ops_token`] a no-op. Mirrors
+/// the "unlimited on this dimension" semantics of `Decision` so an
+/// adaptive controller can transition a previously-set rate back to "no
+/// limit" by sending `rate_per_sec: None`.
+///
+/// The replenish loop keeps running (it has no mid-loop flag check) but
+/// its token additions become inert until the flag is flipped back on
+/// via [`enable_ops_throttle`].
+pub fn disable_ops_throttle() {
+    OPS_THROTTLE.disable();
+}
+
+/// Re-enable the ops-throttle after [`disable_ops_throttle`] — the
+/// counterpart that allows a controller to toggle rate capping on and
+/// off via `Decision::rate_per_sec`. Returns `true` if enablement took
+/// effect, `false` if the throttle was never initialized (i.e.
+/// `--ops-throttle` was not set at startup) so there is nothing to
+/// enable.
+pub fn enable_ops_throttle() -> bool {
+    OPS_THROTTLE.enable()
 }

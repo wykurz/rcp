@@ -243,6 +243,110 @@ async fn auto_meta_pipeline_propagates_probes_to_controller() {
 }
 
 #[tokio::test]
+async fn cmp_emits_one_metadata_sample_per_tree_entry() {
+    // cmp walks both the src AND the dst directories (the dst walk
+    // reports entries missing from src); each tree entry on each side
+    // emits one metadata probe. Two identical 5-entry trees therefore
+    // produce 10 probes total — 5 from the src walk and 5 from the
+    // dst walk.
+    let _guard = SINK_GUARD.lock().await;
+    let sink = install_sink();
+    let tmp = make_tempdir("cmp_samples").await;
+    let src = tmp.join("src");
+    let dst = tmp.join("dst");
+    make_small_tree(&src).await.expect("create src tree");
+    make_small_tree(&dst).await.expect("create dst tree");
+    let log = common::cmp::LogWriter::silent().await.expect("silent log");
+    common::cmp::cmp(
+        &PROGRESS,
+        &src,
+        &dst,
+        &log,
+        &common::cmp::Settings {
+            fail_early: false,
+            exit_early: false,
+            expand_missing: false,
+            compare: Default::default(),
+            filter: None,
+        },
+    )
+    .await
+    .expect("cmp succeeds");
+    congestion::clear_sample_sink();
+    assert_eq!(sink.metadata_count(), 10);
+}
+
+#[tokio::test]
+async fn filegen_emits_metadata_samples_for_created_dirs_and_files() {
+    // filegen creates a tree of dirs + files. Each subdirectory creation
+    // (create_dir) and each file open emits one metadata probe. With
+    // dirwidth=[2] and numfiles=2, filegen generates files at every
+    // level (leaf_files defaults to false, i.e. not leaf-only):
+    //   root: 2 files + 2 subdirs created
+    //     dir0: 2 files (leaf)
+    //     dir1: 2 files (leaf)
+    // Totals: 2 create_dir + 6 open = 8 probes.
+    let _guard = SINK_GUARD.lock().await;
+    let sink = install_sink();
+    let tmp = make_tempdir("filegen_samples").await;
+    let root = tmp.join("gen");
+    tokio::fs::create_dir(&root).await.expect("mkdir root");
+    let config = common::filegen::FileGenConfig::new(root, vec![2], 2, 16);
+    common::filegen::filegen(&PROGRESS, &config)
+        .await
+        .expect("filegen succeeds");
+    congestion::clear_sample_sink();
+    assert_eq!(sink.metadata_count(), 8);
+}
+
+#[tokio::test]
+async fn link_update_path_emits_probes_for_update_tree() {
+    // Regression: the update walk (for entries present in `update/` but
+    // not in `src/`) was iterating with a raw next_entry() and bypassed
+    // both probing and cwnd gating. This test pins down that it now
+    // probes. With src holding the small-tree (5 probes on src walk)
+    // and update holding 3 unique top-level files, we expect 5 src
+    // probes + 3 update probes = 8 total.
+    let _guard = SINK_GUARD.lock().await;
+    let sink = install_sink();
+    let tmp = make_tempdir("link_update_samples").await;
+    let src = tmp.join("src");
+    let update = tmp.join("update");
+    let dst = tmp.join("dst");
+    make_small_tree(&src).await.expect("create src tree");
+    tokio::fs::create_dir(&update).await.expect("create update");
+    tokio::fs::write(update.join("u1.txt"), b"u1")
+        .await
+        .expect("u1");
+    tokio::fs::write(update.join("u2.txt"), b"u2")
+        .await
+        .expect("u2");
+    tokio::fs::write(update.join("u3.txt"), b"u3")
+        .await
+        .expect("u3");
+    link::link(
+        &PROGRESS,
+        tmp.as_path(),
+        &src,
+        &dst,
+        &Some(update),
+        &link::Settings {
+            copy_settings: default_copy_settings(),
+            update_compare: Default::default(),
+            update_exclusive: false,
+            filter: None,
+            dry_run: None,
+            preserve: preserve::preserve_all(),
+        },
+        true,
+    )
+    .await
+    .expect("link succeeds");
+    congestion::clear_sample_sink();
+    assert_eq!(sink.metadata_count(), 8);
+}
+
+#[tokio::test]
 async fn link_emits_one_metadata_sample_per_tree_entry() {
     let _guard = SINK_GUARD.lock().await;
     let sink = install_sink();

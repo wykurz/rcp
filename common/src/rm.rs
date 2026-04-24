@@ -270,43 +270,15 @@ async fn rm_internal(
     let mut skipped_symlinks = 0;
     let mut skipped_dirs = 0;
     loop {
-        // gate per-entry work at the top of the loop. The ops-in-flight
-        // permit is scoped tightly around the actual syscalls (getdents
-        // in next_entry + stat in file_type) so cwnd caps concurrent FS
-        // work without deadlocking when tree depth exceeds cwnd: tasks
-        // that have finished their own syscalls release the permit
-        // before awaiting their children. The Probe must start *after*
-        // the permit is held so queueing on our own semaphore doesn't
-        // get reported as filesystem latency — otherwise self-inflicted
-        // backlog would feed back into Vegas as "the FS got slower."
-        throttle::get_ops_token().await;
-        let ops_permit = throttle::ops_in_flight_permit().await;
-        let probe = congestion::Probe::start_metadata();
-        let maybe_entry = entries
-            .next_entry()
-            .await
-            .with_context(|| format!("failed traversing directory {:?}", &path))
-            .map_err(|err| Error::new(err, Default::default()))?;
-        let Some(entry) = maybe_entry else {
-            probe.discard();
-            drop(ops_permit);
+        let Some((entry, entry_file_type)) = crate::walk::next_entry_probed(&mut entries, || {
+            format!("failed traversing directory {:?}", &path)
+        })
+        .await
+        .map_err(|err| Error::new(err, Default::default()))?
+        else {
             break;
         };
         let entry_path = entry.path();
-        // check entry type for filter matching and skip counting; on
-        // error, discard the probe rather than recording an Ok sample —
-        // error paths should not skew the controller's latency baseline.
-        let entry_file_type = match entry.file_type().await {
-            Ok(file_type) => {
-                probe.complete_ok(0);
-                Some(file_type)
-            }
-            Err(_) => {
-                probe.discard();
-                None
-            }
-        };
-        drop(ops_permit);
         let entry_kind = EntryKind::from_file_type(entry_file_type.as_ref());
         let entry_is_dir = entry_kind == EntryKind::Dir;
         // compute relative path from source_root for filter matching

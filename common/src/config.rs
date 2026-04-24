@@ -70,11 +70,23 @@ impl ThrottleConfig {
             if auto.max_cwnd == 0 {
                 return Err("auto-meta-max-cwnd must be > 0".to_string());
             }
+            if auto.min_cwnd == 0 {
+                return Err("auto-meta-min-cwnd must be >= 1".to_string());
+            }
             if auto.min_cwnd > auto.max_cwnd {
                 return Err("auto-meta-min-cwnd must be <= auto-meta-max-cwnd".to_string());
             }
             if !(0.0..=1.0).contains(&auto.ewma_alpha) {
                 return Err("auto-meta-ewma-alpha must be in [0.0, 1.0]".to_string());
+            }
+            // alpha and beta are latency-inflation ratios; values <= 1.0 are
+            // nonsensical since the EWMA-to-baseline ratio is >= 1.0 by
+            // construction (baseline = running minimum).
+            if auto.alpha <= 1.0 {
+                return Err("auto-meta-alpha must be > 1.0".to_string());
+            }
+            if auto.beta <= 1.0 {
+                return Err("auto-meta-beta must be > 1.0".to_string());
             }
             if auto.alpha >= auto.beta {
                 return Err("auto-meta-alpha must be < auto-meta-beta".to_string());
@@ -203,5 +215,77 @@ impl Default for TracingConfig {
             tokio_console: false,
             tokio_console_port: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_meta_validation_tests {
+    use super::*;
+
+    fn valid_auto_meta() -> AutoMetaThrottleConfig {
+        AutoMetaThrottleConfig {
+            initial_cwnd: 1,
+            min_cwnd: 1,
+            max_cwnd: 4096,
+            alpha: 1.1,
+            beta: 1.5,
+            ewma_alpha: 0.3,
+            increase_step: 1,
+            decrease_step: 1,
+            min_latency_max_age: std::time::Duration::from_secs(10),
+            tick_interval: std::time::Duration::from_millis(50),
+        }
+    }
+
+    fn config_with(auto: AutoMetaThrottleConfig) -> ThrottleConfig {
+        ThrottleConfig {
+            max_open_files: None,
+            ops_throttle: 0,
+            iops_throttle: 0,
+            chunk_size: 0,
+            auto_meta: Some(auto),
+        }
+    }
+
+    #[test]
+    fn defaults_validate() {
+        assert!(config_with(valid_auto_meta()).validate().is_ok());
+    }
+
+    #[test]
+    fn min_cwnd_zero_is_rejected() {
+        let mut auto = valid_auto_meta();
+        auto.min_cwnd = 0;
+        let err = config_with(auto).validate().unwrap_err();
+        assert!(err.contains("min-cwnd"), "got: {err}");
+    }
+
+    #[test]
+    fn alpha_at_or_below_one_is_rejected() {
+        let mut auto = valid_auto_meta();
+        auto.alpha = 1.0;
+        assert!(config_with(auto).validate().is_err());
+        let mut auto = valid_auto_meta();
+        auto.alpha = 0.9;
+        assert!(config_with(auto).validate().is_err());
+    }
+
+    #[test]
+    fn beta_at_or_below_one_is_rejected() {
+        let mut auto = valid_auto_meta();
+        // keep alpha < beta so the alpha-vs-beta check isn't what trips it
+        auto.alpha = 0.9;
+        auto.beta = 1.0;
+        let err = config_with(auto).validate().unwrap_err();
+        assert!(err.contains("alpha") || err.contains("beta"), "got: {err}");
+    }
+
+    #[test]
+    fn alpha_greater_than_beta_is_rejected() {
+        let mut auto = valid_auto_meta();
+        auto.alpha = 1.6;
+        auto.beta = 1.5;
+        let err = config_with(auto).validate().unwrap_err();
+        assert!(err.contains("alpha") && err.contains("beta"), "got: {err}");
     }
 }
