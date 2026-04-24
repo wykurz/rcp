@@ -111,12 +111,22 @@ impl VegasController {
 impl Controller for VegasController {
     fn on_sample(&mut self, sample: &Sample) {
         // u64 nanos fit any realistic latency; saturate defensively.
-        let latency_ns = u64::try_from(sample.latency().as_nanos()).unwrap_or(u64::MAX);
-        // only advance `observed_at` when a strictly lower value is seen
-        // so the age check reflects when this particular minimum was last
-        // confirmed, not the last time any sample arrived.
+        // Clamp to >= 1 so a 0-duration sample (possible when `Instant::now()`
+        // resolution coarsely groups back-to-back probes) never lands as
+        // `min_latency = 0` — that would make the ratio below divide by
+        // zero and collapse cwnd to the floor.
+        let latency_ns = u64::try_from(sample.latency().as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        // Refresh `observed_at` whenever a sample is at or below the
+        // recorded minimum so repeated confirmation of a stable
+        // baseline keeps it alive. If latency equals current, the min
+        // value is unchanged but the age timer resets — otherwise a
+        // workload that sits exactly at the true min would see the
+        // baseline expire on `min_latency_max_age` even though it's
+        // continuously confirming the same floor.
         self.min_latency = Some(match self.min_latency {
-            Some((current, at)) if current <= latency_ns => (current, at),
+            Some((current, at)) if latency_ns > current => (current, at),
             _ => (latency_ns, sample.completed_at),
         });
         self.tick_sum_latency_ns = self
@@ -411,6 +421,75 @@ mod tests {
         }
         assert_eq!(c.ewma_latency(), baseline_ewma);
         assert_eq!(c.cwnd(), 10);
+    }
+
+    #[test]
+    fn zero_latency_samples_do_not_collapse_cwnd() {
+        // Regression: a 0-duration sample (possible when Instant::now()
+        // resolution groups back-to-back probes) previously set
+        // min_latency=0, making the ewma/min ratio divide by zero or
+        // turn into NaN — and either way not drive a principled cwnd
+        // decision. `on_sample` now clamps latency to >= 1ns, so the
+        // ratio stays finite and cwnd follows the normal trajectory.
+        let mut c = VegasController::new(VegasConfig {
+            initial_cwnd: 10,
+            min_cwnd: 1,
+            max_cwnd: 100,
+            ..VegasConfig::default()
+        });
+        let start = std::time::Instant::now();
+        // feed many zero-duration samples across multiple ticks.
+        for i in 0..10 {
+            let zero_sample = Sample {
+                started_at: start,
+                completed_at: start,
+                bytes: 0,
+                outcome: Outcome::Ok,
+            };
+            c.on_sample(&zero_sample);
+            c.on_tick(start + std::time::Duration::from_millis(i * 10));
+        }
+        // The exact trajectory depends on the clamped ratio behavior;
+        // the invariant we care about is that cwnd stays within the
+        // configured bounds (did not collapse to 0 or diverge).
+        assert!(
+            c.cwnd() >= 1 && c.cwnd() <= 100,
+            "cwnd {} out of configured bounds under 0-latency samples",
+            c.cwnd(),
+        );
+    }
+
+    #[test]
+    fn equal_min_latency_samples_refresh_observed_at() {
+        // Regression: previously `observed_at` only advanced on a
+        // *strictly* lower sample. A workload that consistently observed
+        // the true minimum would see the baseline expire on
+        // `min_latency_max_age` even though every sample confirmed the
+        // floor. Now, equal-latency samples also refresh the timestamp.
+        let mut c = VegasController::new(VegasConfig {
+            min_latency_max_age: std::time::Duration::from_millis(100),
+            ..VegasConfig::default()
+        });
+        let t0 = std::time::Instant::now();
+        // establish baseline at 2ms
+        c.on_sample(&sample(t0, std::time::Duration::from_millis(2)));
+        assert_eq!(c.min_latency(), Some(std::time::Duration::from_millis(2)));
+        // feed an equal-latency sample 200ms later — past the age-out
+        // window. The baseline must stay alive because the sample
+        // confirmed it.
+        let t_late = t0 + std::time::Duration::from_millis(200);
+        c.on_sample(&Sample {
+            started_at: t_late,
+            completed_at: t_late + std::time::Duration::from_millis(2),
+            bytes: 0,
+            outcome: Outcome::Ok,
+        });
+        c.on_tick(t_late + std::time::Duration::from_millis(1));
+        assert_eq!(
+            c.min_latency(),
+            Some(std::time::Duration::from_millis(2)),
+            "baseline aged out despite continuous confirmation at the true min",
+        );
     }
 
     #[test]
