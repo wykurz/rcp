@@ -53,3 +53,4 @@ tracing-test = "0.2"
 
 [dev-dependencies]
 filetime = "0.2"
+proptest = "1"
