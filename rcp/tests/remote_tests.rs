@@ -2541,7 +2541,7 @@ fn test_remote_auto_deploy_error_checksum_mismatch() {
     // the checksum verification happens AFTER successful transfer.
     // to test actual checksum mismatch, we'd need to: (1) intercept the transfer (not possible in integration test),
     // (2) modify the checksum verification code to inject failures (not good), or (3) test at unit level in deploy.rs (better approach).
-    // for now, let's just verify that the deployment succeeds and includes checksum verification in the output logs
+    // for now, let's just verify that the deployment succeeds and includes checksum verification in the output stderr
     std::fs::remove_file(&deployed_binary).expect("failed to remove corrupted binary");
     // re-deploy (should succeed with checksum verification)
     let output = run_rcp_with_args(&[
@@ -2555,7 +2555,7 @@ fn test_remote_auto_deploy_error_checksum_mismatch() {
         output.status.success(),
         "deployment with checksum verification should succeed"
     );
-    // verify that checksum verification happened (check logs)
+    // verify that checksum verification happened (check stderr)
     let combined_output = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -2754,7 +2754,7 @@ fn test_remote_force_remote_flag_uses_rcpd() {
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
     // run_rcp_and_expect_success uses --force-remote
     let output = run_rcp_and_expect_success(&[&src_remote, &dst_remote]);
-    // should show rcpd being started (indicates remote mode was used, logs go to stdout)
+    // should show rcpd being started (indicates remote mode was used, stderr go to stdout)
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("Starting rcpd"),
@@ -2777,7 +2777,7 @@ fn test_remote_localhost_without_force_remote_is_local() {
     let output = run_rcp_without_force_remote(&[&src_remote, &dst_remote]);
     print_command_output(&output);
     assert!(output.status.success(), "Copy should succeed");
-    // logs go to stdout
+    // stderr go to stdout
     let stdout = String::from_utf8_lossy(&output.stdout);
     // should show warning about localhost being local
     assert!(
@@ -4697,4 +4697,72 @@ fn test_remote_skip_specials() {
     );
     assert!(dst_path.join("file.txt").exists());
     assert!(!dst_path.join("test.sock").exists());
+}
+
+/// Verifies that `--auto-meta-throttle` and its tuning flags propagate
+/// from the rcp master to the rcpd processes over the remote protocol.
+///
+/// Before launching each rcpd, the master stderr the full ssh command line
+/// at `Will run remotely: ... /rcpd --role <source|destination> ...`.
+/// The `--auto-meta-*` flags MUST appear there for the role's rcpd to
+/// apply them. This is the deterministic propagation point — it doesn't
+/// depend on rcpd finishing startup or any log being forwarded back
+/// (which can be flaky under TLS handshake retries in localhost setups).
+#[test]
+fn test_remote_auto_meta_throttle_flags_propagate_to_rcpd() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_path = src_dir.path().join("src");
+    std::fs::create_dir(&src_path).unwrap();
+    create_test_file(&src_path.join("a.txt"), "a", 0o644);
+    create_test_file(&src_path.join("b.txt"), "b", 0o644);
+    let src_remote = format!("localhost:{}", src_path.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_dir.path().join("dst").to_str().unwrap(),);
+    let output = run_rcp_and_expect_success(&[
+        "--auto-meta-throttle",
+        "--auto-meta-initial-cwnd=7",
+        "--auto-meta-max-cwnd=321",
+        "--auto-meta-alpha=1.13",
+        "--auto-meta-beta=1.77",
+        &src_remote,
+        &dst_remote,
+    ]);
+    // Tracing fmt layer writes to stdout in this project (via the
+    // progress-bar-aware ProgWriter), so the "Will run remotely" log
+    // we match on is captured on stdout, not stderr.
+    let log_output = String::from_utf8_lossy(&output.stdout);
+    let expected_flags = [
+        "--auto-meta-throttle",
+        "--auto-meta-initial-cwnd=7",
+        "--auto-meta-max-cwnd=321",
+        "--auto-meta-alpha=1.13",
+        "--auto-meta-beta=1.77",
+    ];
+    let rcpd_command_line_for_role = |role: &str| -> Option<String> {
+        // Match on the role substring alongside the "Will run remotely"
+        // log so we find the right line per rcpd invocation. Avoid
+        // relying on exact quote-escaping around "--role" — ANSI/format
+        // differences between environments make that brittle.
+        log_output
+            .lines()
+            .find(|line| {
+                line.contains("Will run remotely") && line.contains("--role") && line.contains(role)
+            })
+            .map(str::to_owned)
+    };
+    for role in ["source", "destination"] {
+        let line = rcpd_command_line_for_role(role).unwrap_or_else(|| {
+            panic!(
+                "no 'Will run remotely' log for rcpd role={role}. \
+                 stdout length = {} bytes.",
+                log_output.len()
+            )
+        });
+        for flag in &expected_flags {
+            assert!(
+                line.contains(flag),
+                "rcpd-{role} command line missing {flag}. Full line:\n{line}",
+            );
+        }
+    }
 }

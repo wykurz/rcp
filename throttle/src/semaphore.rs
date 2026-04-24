@@ -179,6 +179,13 @@ impl Semaphore {
         true
     }
 
+    /// Return the currently-configured cap. Intended for metrics and tests
+    /// that want to observe the most recent `set_max` / `setup` value
+    /// without having to probe the inner semaphore.
+    pub fn current_limit(&self) -> usize {
+        self.limit.load(Ordering::Acquire)
+    }
+
     /// Update the per-interval replenish count. Takes effect on the next
     /// iteration of `run_replenish_thread` without restarting the loop.
     pub fn set_replenish(&self, value: usize) {
@@ -358,6 +365,59 @@ mod tests {
         sem.consume().await;
         sem.consume().await;
         assert_eq!(sem.sem.available_permits(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_set_max_and_permit_drops_converge() {
+        // Stress test: many workers concurrently acquire+hold+drop permits
+        // while the test thread issues a sequence of set_max calls that
+        // shrink the cap below the current held count. The CAS loop in
+        // Permit::drop must race cleanly so the final state matches the
+        // last cap, not some drift from debt accounting bugs.
+        let sem = std::sync::Arc::new(Semaphore::new());
+        sem.set_max(50);
+        let workers = 50;
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let sem = sem.clone();
+            handles.push(tokio::spawn(async move {
+                // acquire, hold briefly, drop — repeat a few times.
+                for _ in 0..10 {
+                    if let Some(guard) = sem.acquire().await {
+                        // tiny yield so set_max has a chance to interleave
+                        // while we hold the permit.
+                        tokio::task::yield_now().await;
+                        drop(guard);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        // meanwhile, shrink and grow the cap across the workers' lifetime.
+        for target in [10, 40, 5, 30, 1, 20].iter().copied() {
+            tokio::task::yield_now().await;
+            sem.set_max(target);
+        }
+        // settle on a final cap and let workers finish.
+        sem.set_max(15);
+        for h in handles {
+            h.await.expect("worker completes");
+        }
+        // After all workers complete and settle, the semaphore's
+        // available_permits must equal the final cap: every permit either
+        // returned to the pool or was consumed by forget_debt on drop.
+        // No drift, no leak.
+        assert_eq!(
+            sem.sem.available_permits(),
+            15,
+            "expected final cap (15), got {} — forget_debt accounting drifted",
+            sem.sem.available_permits(),
+        );
+        assert_eq!(
+            sem.forget_debt.load(Ordering::Acquire),
+            0,
+            "debt must be fully consumed once all permits have returned",
+        );
     }
 
     #[tokio::test]

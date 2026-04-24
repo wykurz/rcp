@@ -288,3 +288,11 @@ pub fn disable_ops_throttle() {
 pub fn enable_ops_throttle() -> bool {
     OPS_THROTTLE.enable()
 }
+
+/// Current in-flight concurrency cap, for metrics and integration tests.
+/// Returns `0` when the cap has been set to zero (disabled) or has never
+/// been configured.
+#[must_use]
+pub fn current_ops_in_flight_limit() -> usize {
+    OPS_IN_FLIGHT_LIMIT.current_limit()
+}
