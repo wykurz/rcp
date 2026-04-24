@@ -24,9 +24,13 @@
 //! - [`FixedController`] — honors a static concurrency/rate budget. Mirrors
 //!   the existing manual `--ops-throttle` / `--iops-throttle` knobs and is
 //!   the regression baseline for adaptive algorithms.
+//! - [`VegasController`] — adaptive controller that tracks queueing-delay
+//!   inflation (ratio of smoothed current latency to observed minimum)
+//!   and adjusts the concurrency cap to stay at the onset of inflation.
 //!
-//! Adaptive controllers (Vegas-style, BBR-style) are planned on this same
-//! trait in later phases.
+//! Additional adaptive variants (for example BBR-style) can be layered
+//! on the same trait without changes to the enforcement or control-loop
+//! layers.
 //!
 //! # Testing
 //!

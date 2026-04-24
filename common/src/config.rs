@@ -273,11 +273,13 @@ mod auto_meta_validation_tests {
     #[test]
     fn beta_at_or_below_one_is_rejected() {
         let mut auto = valid_auto_meta();
-        // keep alpha < beta so the alpha-vs-beta check isn't what trips it
-        auto.alpha = 0.9;
+        // alpha must be > 1.0 so the earlier alpha check passes and we
+        // isolate the beta branch. (alpha < beta is checked after the
+        // individual-bound checks, so 1.05 / 1.0 falls to the beta check.)
+        auto.alpha = 1.05;
         auto.beta = 1.0;
         let err = config_with(auto).validate().unwrap_err();
-        assert!(err.contains("alpha") || err.contains("beta"), "got: {err}");
+        assert!(err.contains("beta"), "got: {err}");
     }
 
     #[test]
