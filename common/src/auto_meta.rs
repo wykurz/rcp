@@ -119,7 +119,21 @@ pub(crate) fn apply_decision(
     if new.rate_per_sec != prev.rate_per_sec {
         match new.rate_per_sec {
             Some(rate) => {
-                let replenish = (rate * REPLENISH_INTERVAL_SECS).max(0.0) as usize;
+                // Preserve rate<=0 (and NaN) as a genuine "halt" signal —
+                // matches the simulator's `can_submit` contract. For any
+                // strictly-positive rate, enforce a floor of 1 token per
+                // interval so rates below 10 ops/sec (which would truncate
+                // to 0 at the 100ms interval) don't silently pause the
+                // gate after the initial drain. The tradeoff: a
+                // rate-aware controller that asks for less than 10 ops/sec
+                // gets the 10-ops/sec floor instead of a pause. Static
+                // `--ops-throttle` values below the floor are rejected at
+                // config-validation time.
+                let replenish = if rate > 0.0 {
+                    ((rate * REPLENISH_INTERVAL_SECS) as usize).max(1)
+                } else {
+                    0
+                };
                 actions.push(AdapterAction::SetOpsReplenish(replenish));
                 actions.push(AdapterAction::EnableOpsThrottle);
             }
@@ -256,6 +270,23 @@ mod tests {
         // 125 ops/sec at 100ms intervals => 12.5 tokens, truncated to 12.
         let actions = apply_decision(Decision::UNLIMITED, Decision::with_rate(125.0));
         assert_eq!(actions[0], AdapterAction::SetOpsReplenish(12));
+    }
+
+    #[test]
+    fn rate_conversion_floors_positive_rates_at_one_token() {
+        // Regression: rates below the 100ms conversion floor (< 10 ops/sec)
+        // previously truncated to 0 tokens/interval, which pauses the gate
+        // after the initial drain. Now any strictly-positive rate produces
+        // at least 1 token per interval — effectively clamping the enforced
+        // rate to a floor of 10 ops/sec. A controller that asks for less
+        // than 10 ops/sec gets 10 (over-rate) instead of 0 (halt).
+        let actions = apply_decision(Decision::UNLIMITED, Decision::with_rate(5.0));
+        assert_eq!(actions[0], AdapterAction::SetOpsReplenish(1));
+        let actions = apply_decision(Decision::UNLIMITED, Decision::with_rate(0.1));
+        assert_eq!(actions[0], AdapterAction::SetOpsReplenish(1));
+        // At exactly the 10 ops/sec threshold, conversion still produces 1.
+        let actions = apply_decision(Decision::UNLIMITED, Decision::with_rate(10.0));
+        assert_eq!(actions[0], AdapterAction::SetOpsReplenish(1));
     }
 
     #[test]

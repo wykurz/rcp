@@ -60,6 +60,17 @@ pub struct ThrottleConfig {
     pub auto_meta: Option<AutoMetaThrottleConfig>,
 }
 
+/// Minimum static `--ops-throttle` when `--auto-meta-throttle` is on.
+///
+/// Auto-meta forces the ops-throttle to a fixed 100ms replenish interval
+/// so the adapter's `Decision::rate_per_sec` → tokens-per-interval
+/// conversion is always correct. That means the per-interval token count
+/// is `rate / 10` and rounds to zero for rates below 10 ops/sec — which
+/// would silently pause the gate after the initial drain. Reject the
+/// combination explicitly so the user hits a clear error instead of
+/// mysterious quiescence.
+pub const AUTO_META_MIN_OPS_THROTTLE: usize = 10;
+
 impl ThrottleConfig {
     /// Validate configuration and return errors if invalid
     pub fn validate(&self) -> Result<(), String> {
@@ -93,6 +104,17 @@ impl ThrottleConfig {
             }
             if auto.tick_interval.is_zero() {
                 return Err("auto-meta-tick-interval must be > 0".to_string());
+            }
+            if self.ops_throttle > 0 && self.ops_throttle < AUTO_META_MIN_OPS_THROTTLE {
+                return Err(format!(
+                    "--auto-meta-throttle is incompatible with --ops-throttle={} \
+                     (auto-meta uses a fixed 100ms replenish interval; rates below \
+                     {} ops/sec round to zero tokens per interval and would pause \
+                     the throttle after the initial token). Either raise ops-throttle \
+                     to >= {} or drop --auto-meta-throttle to get the legacy adaptive \
+                     interval.",
+                    self.ops_throttle, AUTO_META_MIN_OPS_THROTTLE, AUTO_META_MIN_OPS_THROTTLE,
+                ));
             }
         }
         Ok(())
@@ -280,6 +302,41 @@ mod auto_meta_validation_tests {
         auto.beta = 1.0;
         let err = config_with(auto).validate().unwrap_err();
         assert!(err.contains("beta"), "got: {err}");
+    }
+
+    #[test]
+    fn ops_throttle_below_floor_is_rejected_under_auto_meta() {
+        let mut config = config_with(valid_auto_meta());
+        config.ops_throttle = 5;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("ops-throttle") && err.contains("auto-meta-throttle"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn ops_throttle_at_or_above_floor_is_accepted_under_auto_meta() {
+        let mut config = config_with(valid_auto_meta());
+        config.ops_throttle = AUTO_META_MIN_OPS_THROTTLE;
+        assert!(config.validate().is_ok());
+        config.ops_throttle = AUTO_META_MIN_OPS_THROTTLE + 100;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn ops_throttle_below_floor_is_fine_without_auto_meta() {
+        // The floor only applies when auto-meta forces a fixed 100ms
+        // cadence. Without auto-meta, the adaptive get_replenish_interval
+        // picks an interval that works for any rate.
+        let config = ThrottleConfig {
+            max_open_files: None,
+            ops_throttle: 5,
+            iops_throttle: 0,
+            chunk_size: 0,
+            auto_meta: None,
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]
