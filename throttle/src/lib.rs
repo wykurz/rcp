@@ -254,9 +254,16 @@ pub async fn run_iops_replenish_thread(replenish: usize, interval: std::time::Du
 /// the bucket will be consumed but no new ones will be added).
 ///
 /// Intended for congestion-control layers that translate a Controller's
-/// decisions into dynamic rate targets. The ops-throttle must already
-/// have been initialized via [`init_ops_tokens`] with a non-zero value;
-/// otherwise the replenish loop will have exited and this call is a no-op.
+/// decisions into dynamic rate targets. For the update to visibly gate
+/// ops, two things must be true:
+///
+/// 1. A replenish task must be running (spawned via
+///    [`run_ops_replenish_thread`]); otherwise the new value is stored
+///    but no token refills happen.
+/// 2. The ops-throttle must be enabled (via [`init_ops_tokens`] with a
+///    non-zero value, or [`enable_ops_throttle`] after a prior
+///    [`disable_ops_throttle`]); otherwise [`get_ops_token`] is a no-op
+///    regardless of the replenish count.
 pub fn set_ops_replenish(value: usize) {
     OPS_THROTTLE.set_replenish(value);
 }
