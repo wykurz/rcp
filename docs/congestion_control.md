@@ -11,7 +11,9 @@ scope here is conceptual; specific flag names are covered in
 - [Motivation](#motivation)
 - [Goals and Non-Goals](#goals-and-non-goals)
 - [Architecture](#architecture)
+- [Why Concurrency Is the Lever](#why-concurrency-is-the-lever)
 - [The Control Signal](#the-control-signal)
+- [The Control Law](#the-control-law)
 - [Enforcement Model](#enforcement-model)
 - [Interaction with Static Throttles](#interaction-with-static-throttles)
 - [Remote Copy](#remote-copy)
@@ -108,18 +110,63 @@ decision to the enforcement layer.
 the filesystem-op callers wait on. These existed before congestion
 control; the new piece is that their capacity is now a moving target.
 
+## Why Concurrency Is the Lever
+
+The control loop measures *latency* and modifies *concurrency*. Those
+two quantities are tied together by Little's Law applied to a
+closed-loop system:
+
+```
+  throughput  =  in_flight / latency
+```
+
+When the filesystem is uncongested, every op costs a roughly constant
+`baseline` wall-clock time. Pushing more ops in parallel grows
+throughput linearly (`in_flight / baseline`) until *something*
+saturates — disk, network, metadata server. Past that knee, additional
+in-flight work doesn't get serviced any faster; it queues. The
+`latency` term inflates while `throughput` flattens. That's the regime
+we need to detect and stay just below.
+
+So:
+
+- **Why concurrency, not rate?** A rate cap forces the operator to
+  know the filesystem's capacity in advance. A concurrency cap lets the
+  *filesystem* tell us when it's saturated (via inflated latency) and
+  back off without us needing to know the underlying capacity.
+- **Why measure latency, not throughput?** Throughput at saturation is
+  unstable — small load variations swing it across the knee
+  unpredictably. Latency moves continuously and is cheaper to read:
+  every op produces one sample.
+
+The single control knob throughout this document — **`cwnd`** (Vegas's
+"congestion window") — is exactly the maximum number of in-flight
+operations the controller will permit at any instant. We use `cwnd`,
+"concurrency cap", and "max in-flight" interchangeably; they are the
+same number, just expressed in TCP terminology vs. systems terminology.
+
 ## The Control Signal
 
-The algorithm's job is to find a concurrency level that saturates the
-bottleneck without queueing. It reasons about two derived quantities:
+The algorithm's job is to find a `cwnd` that saturates the bottleneck
+without queueing. It reasons about two derived quantities, both
+collected from the same per-op latency probes:
 
-- **Baseline latency.** The minimum operation latency we've seen
-  recently — an estimate of what the filesystem costs per op when
-  uncongested.
-- **Smoothed current latency.** An exponentially-weighted moving average
-  of recent operation latencies.
+- **Baseline latency** — the minimum operation latency we've seen
+  recently. By construction this is the floor; no individual sample can
+  be faster.
+- **Smoothed current latency** — an EWMA of recent operation latencies.
+  Smoothing absorbs single-sample noise so a brief slow op doesn't kick
+  the controller off course.
 
 Their ratio is the congestion signal:
+
+```
+  ratio  =  smoothed_current / baseline
+```
+
+By construction `ratio >= 1.0` (the smoothed current can't be smaller
+than the running minimum that defines the baseline). So the regime we
+care about is the strip between 1.0 and "very large":
 
 ```
        latency ratio
@@ -135,11 +182,6 @@ Their ratio is the congestion signal:
               └───────────────────────────────── time
 ```
 
-- Below `alpha` (e.g. 1.1× baseline): we're under-utilized; grow `cwnd`.
-- Above `beta` (e.g. 1.5× baseline): the queue is building; shrink
-  `cwnd`.
-- Between: hold.
-
 The baseline ages out after a configurable interval so a single stale
 low-latency outlier can't pin the controller at the floor forever. When
 the baseline ages out, the smoothed-latency estimate is reset alongside
@@ -147,12 +189,71 @@ it so the newly-established baseline is compared to a fresh window of
 samples rather than to inflated state carried over from a congested
 period.
 
+## The Control Law
+
+Each tick, the controller bins the current `ratio` into one of three
+regions and applies a fixed step to `cwnd`:
+
+```
+       ratio range          tick action
+   ────────────────────────────────────────
+       ratio  <  alpha      cwnd += increase_step    (grow)
+   alpha <= ratio <= beta   cwnd unchanged           (hold)
+       ratio  >  beta       cwnd -= decrease_step    (shrink)
+```
+
+Defaults: `alpha = 1.10`, `beta = 1.50`, `increase_step = decrease_step
+= 1`. Each step is then clamped to `[min_cwnd, max_cwnd]`.
+
+A few worked examples make the shape concrete. Assume a 0.5ms baseline,
+default thresholds, and `cwnd = 20` going into the tick:
+
+| Smoothed current | Ratio | Decision | New `cwnd` |
+|------------------|-------|----------|------------|
+| 0.50 ms          | 1.00  | grow     | 21         |
+| 0.55 ms          | 1.10  | hold     | 20 (1.10 == alpha; not below) |
+| 0.70 ms          | 1.40  | hold     | 20         |
+| 0.75 ms          | 1.50  | hold     | 20 (1.50 == beta; not above) |
+| 1.00 ms          | 2.00  | shrink   | 19         |
+| 2.50 ms          | 5.00  | shrink   | 19         |
+| 0.40 ms          | 0.80  | —        | impossible (see below) |
+
+**Two things to notice in this table.** First, the law is a
+*binary trigger*, not a proportional response: a ratio of 5.0 shrinks
+by exactly the same one step as a ratio of 1.51. Sustained inflation
+drives faster *effective* shrinkage because the ratio stays above
+`beta` over many consecutive ticks — but each individual tick still
+takes one step. This is the classic Vegas shape: simpler control law,
+less prone to oscillation under noisy latency than a gain-tuned PID.
+
+Second, **a ratio below 1.0 cannot occur.** The smoothed current is
+itself an EWMA of samples that have already been folded into the
+running min, so it is bounded below by that min. The baseline-age-out
+path preserves this property: when the min is discarded as stale, the
+smoothed current is reset alongside it so the next tick re-establishes
+both from the same fresh window of samples.
+
+The "responsiveness" of the controller is shaped by three knobs in
+combination:
+
+- `--auto-meta-tick-interval` (how often the binning above is
+  evaluated; default 50 ms);
+- `--auto-meta-ewma-alpha` (how much weight a single tick's mean gives
+  to the smoothed current; default 0.3);
+- `--auto-meta-increase-step` / `--auto-meta-decrease-step` (the per-
+  tick step magnitudes).
+
+Aggressive tuning compresses the time it takes to track a moving knee;
+conservative tuning trades off some throughput for less jitter. The
+defaults are deliberately on the conservative side.
+
 ## Enforcement Model
 
-The controller's output is an absolute *concurrency cap* — the maximum
-number of filesystem operations that may be in flight at any moment.
-This maps onto a semaphore whose capacity is updated whenever the
-controller changes its mind.
+The controller's output is a fresh value for `cwnd`. The enforcement
+layer maps that directly onto a semaphore whose capacity is set to the
+current `cwnd` and updated every time the controller changes its
+mind — so "in-flight at the syscall layer" never exceeds whatever the
+algorithm last decided.
 
 At the call site, each syscall is bracketed by permit acquisition and a
 *probe* that measures its wall-clock duration:
