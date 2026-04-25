@@ -64,7 +64,7 @@ Three concentric layers. Each is independently testable and replaceable.
 ```
                         ┌───────────────────────────┐
                         │         Algorithm         │
-                        │  (controller trait + impl) │
+                        │ (controller trait + impl) │
                         │   sample in → decision    │
                         └─────────▲─────────┬───────┘
                                   │         │
@@ -73,7 +73,7 @@ Three concentric layers. Each is independently testable and replaceable.
                         ┌─────────┴─────────────────┐
                         │       Control Loop        │
                         │  sample routing + tick +  │
-                        │      decision broadcast    │
+                        │      decision broadcast   │
                         └─────────▲─────────┬───────┘
                                   │         │
                           probes  │         │ limits
@@ -124,14 +124,14 @@ Their ratio is the congestion signal:
 ```
        latency ratio
               │
-  beta ──────┤                ┌── shrink cwnd ──┐
-              │               │                 │
-              │               │                 │
-  alpha ─────┤    ┌── hold ──┤
-              │   │           
-    1.0  ────┤───┘                              
-              │   grow cwnd                     
-              │                                 
+   beta ──────┤              ┌── shrink cwnd ──┐
+              │              │                 │
+              │              │                 │
+   alpha ─────┤   ┌── hold ──┤
+              │   │
+     1.0  ────┤───┘
+              │     grow cwnd
+              │
               └───────────────────────────────── time
 ```
 
@@ -166,9 +166,9 @@ At the call site, each syscall is bracketed by permit acquisition and a
   rate gate │   │   (the syscalls)    │           │ release
             │   │                     │           │
             │   └── probe completes ──┘           │
-            │     (sample emitted)                │
+            │       (sample emitted)              │
             │                                     │
-            └──── release permit ────────────────┘
+            └──── release permit ─────────────────┘
 ```
 
 Two important properties follow from this placement:
@@ -190,14 +190,14 @@ Two important properties follow from this placement:
 The adaptive and static knobs compose:
 
 ```
-              rate gate         concurrency gate
-              (token             (semaphore)
-              bucket)            
-    caller ───▶ [  ] ──────▶ [    ] ────▶ syscall
+            rate gate     concurrency gate
+              (token        (semaphore)
+              bucket)
+  caller ───▶ [  ] ────────▶ [    ] ────▶ syscall
                 ▲                ▲
                 │                │
-       --ops-throttle    --auto-meta-throttle
-       (static rate)     (dynamic concurrency)
+         --ops-throttle   --auto-meta-throttle
+          (static rate)   (dynamic concurrency)
 ```
 
 Either can be enabled independently:
