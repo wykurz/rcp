@@ -48,6 +48,7 @@ API documentation for the command-line tools is available on docs.rs:
 - [Security](docs/security.md) - Threat model and security architecture
 - [Remote Copy](docs/remote_copy.md) - rcpd deployment, version checking, troubleshooting
 - [Remote Protocol](docs/remote_protocol.md) - Wire protocol specification
+- [Congestion Control](docs/congestion_control.md) - Adaptive metadata throttling design and tuning
 - [Testing](docs/testing.md) - Test infrastructure and Docker multi-host testing
 
 Examples
@@ -204,6 +205,12 @@ Using `rcp` it's also possible to copy multiple sources into a single destinatio
 
 ## Throttling
 
+Two complementary mechanisms: **static caps** that you set once based on
+budget or policy, and **adaptive metadata throttling** that watches
+filesystem latency and adjusts concurrency on the fly.
+
+### Static caps
+
 - set `--ops-throttle` to limit the maximum number of operations per second
   - useful if you want to avoid interfering with other work on the storage / host
 
@@ -212,6 +219,44 @@ Using `rcp` it's also possible to copy multiple sources into a single destinatio
 
 - set `--max-open-files` to limit the maximum number of open files
   - RCP tools will automatically adjust the maximum based on the system limits however, this setting can be used if there are additional constraints
+
+### Adaptive metadata throttling (`--auto-meta-throttle`)
+
+Pass `--auto-meta-throttle` to enable a Vegas-style latency controller
+that watches per-op latency and grows or shrinks the in-flight
+concurrency cap (`cwnd`) on the fly. The controller stays just below
+the saturation point of whatever metadata path the tool is hitting —
+useful on shared distributed filesystems (Weka, Lustre, NFS, etc.)
+where a fixed `--ops-throttle` is hard to pick: too low and the job
+takes all day, too high and the filesystem suffers.
+
+```fish
+# Adaptive throttling alone — recommended default for distributed FS.
+> rcp --auto-meta-throttle src/ dst/
+
+# Compose with a hard rate ceiling: ops-throttle is the static
+# upper bound, auto-meta backs off further under transient load.
+# When both are set, --ops-throttle must be >= 10 (auto-meta uses a
+# fixed 100ms internal cadence, so rates below 10 ops/sec round to
+# zero tokens per interval).
+> rcp --auto-meta-throttle --ops-throttle=5000 src/ dst/
+```
+
+**Remote copies** propagate `--auto-meta-*` flags to both `rcpd`
+processes (source and destination) automatically, so each side runs
+its own controller against the local part of the filesystem it
+actually observes.
+
+**Tuning knobs** (all listed under `--help-all` on each binary): the
+initial / minimum / maximum `cwnd`, the grow/shrink ratio thresholds
+(`alpha`, `beta`), the EWMA smoothing factor, per-tick step sizes, the
+baseline-age-out interval, and the control-loop tick cadence. Defaults
+are conservative and a good starting point.
+
+For the design rationale (why concurrency is the lever, what
+`cwnd` is, the exact control law including worked ratio→action
+examples, and how the controller stays robust to load it generates
+itself), see [docs/congestion_control.md](docs/congestion_control.md).
 
 ## Error handling
 
