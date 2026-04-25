@@ -13,6 +13,7 @@ scope here is conceptual; specific flag names are covered in
 - [Architecture](#architecture)
 - [Why Concurrency Is the Lever](#why-concurrency-is-the-lever)
 - [The Control Signal](#the-control-signal)
+- [Why Our Own Load Doesn't Skew the Baseline](#why-our-own-load-doesnt-skew-the-baseline)
 - [The Control Law](#the-control-law)
 - [Enforcement Model](#enforcement-model)
 - [Interaction with Static Throttles](#interaction-with-static-throttles)
@@ -182,12 +183,50 @@ care about is the strip between 1.0 and "very large":
               └───────────────────────────────── time
 ```
 
-The baseline ages out after a configurable interval so a single stale
-low-latency outlier can't pin the controller at the floor forever. When
-the baseline ages out, the smoothed-latency estimate is reset alongside
-it so the newly-established baseline is compared to a fresh window of
-samples rather than to inflated state carried over from a congested
-period.
+## Why Our Own Load Doesn't Skew the Baseline
+
+A reasonable worry when reading the previous section: if the controller
+is generating the load it's measuring, every sample collected at high
+`cwnd` is inflated by our own queueing. Won't the baseline itself drift
+up to match — leaving us with a controller that treats the inflated
+latency as the new normal and never shrinks?
+
+Three design choices keep the baseline trustworthy:
+
+1. **The baseline is a running minimum, not an average.** `min_latency`
+   records the *smallest* sample observed in the last
+   `min_latency_max_age` window (default 10s). Even when 99% of samples
+   in that window are slow because we're saturating the filesystem, a
+   single fast sample — typically from earlier, before `cwnd` ramped
+   high enough to queue — pins the floor to the true uncongested cost.
+   Slow samples can never drag the floor up; they simply aren't
+   smaller.
+
+2. **The control law shrinks `cwnd` long before the window expires.**
+   When `ratio > beta`, the very next tick (50 ms by default) shrinks
+   `cwnd` by one step. Continued inflation keeps shrinking it.  Once
+   `cwnd` has dropped enough for the queue to drain, a low-latency
+   sample either re-confirms the existing minimum (refreshing the
+   age-out timer) or establishes a new, lower one. So in any healthy
+   operating regime the baseline is continuously re-validated long
+   before it could expire.
+
+3. **If the baseline does expire under sustained saturation, the
+   smoothed estimate is reset alongside it.** The case left open is
+   *persistent* overload — e.g. `min_cwnd` is configured high and the
+   filesystem is genuinely overloaded for more than 10 seconds. When
+   the baseline ages out, the next sample establishes a new (inflated)
+   floor. To prevent that newly-bad baseline from making the next tick
+   look "uncongested" and grow `cwnd` further, the EWMA is reset at
+   the same instant. The first sample-bearing tick after a reset
+   replays the cold-start path and never adjusts `cwnd`, buying a full
+   smoothing window for the controller to reconverge before any growth
+   decision.
+
+The only state the controller carries across a baseline reset is
+`cwnd` itself — intentionally. The next ratio is computed from a fresh
+baseline and a fresh smoothed current, so "current latency is normal"
+can't be inferred from a window of uniformly inflated samples.
 
 ## The Control Law
 
