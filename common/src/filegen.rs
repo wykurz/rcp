@@ -97,6 +97,7 @@ pub async fn write_file(
     // with the cwnd permit + probe so filegen participates in the same
     // adaptive control loop as copy/rm/link.
     let mut file = crate::walk::run_metadata_probed(
+        congestion::Side::Destination,
         tokio::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -161,10 +162,13 @@ pub async fn filegen(
             // Bracket the create_dir metadata syscall with the cwnd permit
             // + probe so filegen participates in the same adaptive control
             // loop as copy/rm/link.
-            crate::walk::run_metadata_probed(tokio::fs::create_dir(&path))
-                .await
-                .with_context(|| format!("Error creating directory {:?}", &path))
-                .map_err(|err| Error::new(err, Default::default()))?;
+            crate::walk::run_metadata_probed(
+                congestion::Side::Destination,
+                tokio::fs::create_dir(&path),
+            )
+            .await
+            .with_context(|| format!("Error creating directory {:?}", &path))
+            .map_err(|err| Error::new(err, Default::default()))?;
             prog_track.directories_created.inc();
             let dir_summary = Summary {
                 directories_created: 1,

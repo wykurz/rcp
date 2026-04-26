@@ -90,15 +90,26 @@ impl EntryKind {
     }
 }
 
+/// Map a [`congestion::Side`] to its [`throttle::Side`] counterpart. The
+/// two enums are intentionally independent — congestion has no
+/// dependency on throttle — but they're 1:1.
+fn throttle_side(side: congestion::Side) -> throttle::Side {
+    match side {
+        congestion::Side::Source => throttle::Side::Source,
+        congestion::Side::Destination => throttle::Side::Destination,
+    }
+}
+
 /// Pull the next directory entry with the full per-entry throttle + probe
 /// prologue applied:
 ///
 /// 1. Await the static ops rate gate.
-/// 2. Acquire the dynamic ops-in-flight permit (a no-op when
-///    `--auto-meta-throttle` is not enabled).
-/// 3. Start a metadata [`congestion::Probe`] — *after* the permit is held,
-///    so self-inflicted queueing on the in-flight semaphore is not reported
-///    back to the controller as filesystem latency.
+/// 2. Acquire the dynamic ops-in-flight permit on the given [`Side`] (a
+///    no-op when that side's cap is not configured).
+/// 3. Start a metadata [`congestion::Probe`] tagged with the same side —
+///    *after* the permit is held, so self-inflicted queueing on the
+///    in-flight semaphore is not reported back to the controller as
+///    filesystem latency.
 /// 4. Call `next_entry()` and, on success, classify via `file_type()`.
 /// 5. Complete the probe on success; discard it on error or exhaustion —
 ///    error paths must not skew the controller's latency baseline.
@@ -106,19 +117,25 @@ impl EntryKind {
 ///    children without holding it across task boundaries (which would
 ///    deadlock at any tree depth greater than cwnd).
 ///
+/// `side` is almost always [`congestion::Side::Source`] — directory walks
+/// are reads of the source filesystem. The exception is `cmp`'s
+/// destination walk in `expand_missing` mode, which iterates the dst
+/// tree and uses [`congestion::Side::Destination`].
+///
 /// The error is left as `anyhow::Error` so each caller can wrap it in the
 /// site-specific error type (`copy::Error`, `link::Error`, `rm::Error`)
 /// without this helper needing to be generic over the summary payload.
 pub async fn next_entry_probed<F>(
     entries: &mut tokio::fs::ReadDir,
+    side: congestion::Side,
     context: F,
 ) -> anyhow::Result<Option<(tokio::fs::DirEntry, Option<std::fs::FileType>)>>
 where
     F: FnOnce() -> String,
 {
     throttle::get_ops_token().await;
-    let ops_permit = throttle::ops_in_flight_permit().await;
-    let probe = congestion::Probe::start_metadata();
+    let ops_permit = throttle::ops_in_flight_permit(throttle_side(side)).await;
+    let probe = congestion::Probe::start_metadata(side);
     let maybe_entry = entries.next_entry().await.with_context(context)?;
     let Some(entry) = maybe_entry else {
         probe.discard();
@@ -140,25 +157,30 @@ where
 }
 
 /// Bracket a single metadata-producing future with the cwnd permit and a
-/// congestion probe. The probe completes successfully when `op` returns
-/// `Ok`, and is discarded on error so error paths don't skew the
-/// controller's latency baseline.
+/// congestion probe on the given [`Side`]. The probe completes
+/// successfully when `op` returns `Ok`, and is discarded on error so
+/// error paths don't skew the controller's latency baseline.
 ///
-/// Use this at sites that perform one isolated metadata op (e.g. filegen's
-/// `create_dir` / `open`). For directory iteration, prefer
-/// [`next_entry_probed`] which also handles the `next_entry` +
-/// `file_type` classification in one unit.
+/// Use this at sites that perform one isolated metadata op:
+///
+/// - Source-side first-touch reads on a path that wasn't surfaced by a
+///   prior tree walk (e.g. the top-of-function `metadata` lookups in
+///   `rcp/source.rs`).
+/// - Destination-side mutations: `create_dir` for new dst directories,
+///   `hard_link` / `symlink` / `remove_file` / `remove_dir` /
+///   `set_permissions`, and the `OpenOptions::open(O_CREAT)` in
+///   `filegen`'s `write_file`.
 ///
 /// Note: unlike [`next_entry_probed`], this helper does **not** acquire
 /// the static ops rate token — callers that rate-limit at a different
 /// granularity (such as filegen, which gates at per-task spawn time)
 /// would otherwise double-count.
-pub async fn run_metadata_probed<F, T, E>(op: F) -> Result<T, E>
+pub async fn run_metadata_probed<F, T, E>(side: congestion::Side, op: F) -> Result<T, E>
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
-    let ops_permit = throttle::ops_in_flight_permit().await;
-    let probe = congestion::Probe::start_metadata();
+    let ops_permit = throttle::ops_in_flight_permit(throttle_side(side)).await;
+    let probe = congestion::Probe::start_metadata(side);
     let result = op.await;
     match &result {
         Ok(_) => probe.complete_ok(0),

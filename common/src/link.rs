@@ -101,7 +101,12 @@ async fn hard_link_helper(
     settings: &Settings,
 ) -> Result<Summary, Error> {
     let mut link_summary = Summary::default();
-    match tokio::fs::hard_link(src, dst).await {
+    match crate::walk::run_metadata_probed(
+        congestion::Side::Destination,
+        tokio::fs::hard_link(src, dst),
+    )
+    .await
+    {
         Ok(()) => {}
         Err(error)
             if settings.copy_settings.overwrite
@@ -138,10 +143,13 @@ async fn hard_link_helper(
                 Error::new(err.source, link_summary)
             })?;
             link_summary.copy_summary.rm_summary = rm_summary;
-            tokio::fs::hard_link(src, dst)
-                .await
-                .with_context(|| format!("failed to hard link {src:?} to {dst:?}"))
-                .map_err(|err| Error::new(err, link_summary))?;
+            crate::walk::run_metadata_probed(
+                congestion::Side::Destination,
+                tokio::fs::hard_link(src, dst),
+            )
+            .await
+            .with_context(|| format!("failed to hard link {src:?} to {dst:?}"))
+            .map_err(|err| Error::new(err, link_summary))?;
         }
         Err(error) => {
             return Err(Error::new(
@@ -424,7 +432,10 @@ async fn link_internal(
             directories_created: 1,
             ..Default::default()
         }
-    } else if let Err(error) = tokio::fs::create_dir(dst).await {
+    } else if let Err(error) =
+        crate::walk::run_metadata_probed(congestion::Side::Destination, tokio::fs::create_dir(dst))
+            .await
+    {
         assert!(!is_fresh, "unexpected error creating directory: {:?}", &dst);
         if settings.copy_settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
             // check if the destination is a directory - if so, leave it
@@ -514,7 +525,7 @@ async fn link_internal(
     // iterate through src entries and recursively call "link" on each one
     loop {
         let Some((src_entry, entry_file_type)) =
-            crate::walk::next_entry_probed(&mut src_entries, || {
+            crate::walk::next_entry_probed(&mut src_entries, congestion::Side::Source, || {
                 format!("failed traversing directory {:?}", &src)
             })
             .await
@@ -627,12 +638,13 @@ async fn link_internal(
             .map_err(|err| Error::new(err, link_summary))?;
         // iterate through update entries and for each one that's not present in src call "copy"
         loop {
-            let Some((update_entry, _entry_file_type)) =
-                crate::walk::next_entry_probed(&mut update_entries, || {
-                    format!("failed traversing directory {:?}", &update)
-                })
-                .await
-                .map_err(|err| Error::new(err, link_summary))?
+            let Some((update_entry, _entry_file_type)) = crate::walk::next_entry_probed(
+                &mut update_entries,
+                congestion::Side::Source,
+                || format!("failed traversing directory {:?}", &update),
+            )
+            .await
+            .map_err(|err| Error::new(err, link_summary))?
             else {
                 break;
             };

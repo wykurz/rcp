@@ -32,7 +32,7 @@ async fn send_directories_and_symlinks(
     error_collector: &std::sync::Arc<common::error_collector::ErrorCollector>,
 ) -> anyhow::Result<()> {
     tracing::debug!("Sending data from {:?} to {:?}", &src, dst);
-    let src_metadata = match common::walk::run_metadata_probed(async {
+    let src_metadata = match common::walk::run_metadata_probed(common::Side::Source, async {
         if settings.dereference {
             tokio::fs::metadata(&src).await
         } else {
@@ -175,7 +175,7 @@ async fn send_directories_and_symlinks(
         }
     };
     loop {
-        match common::walk::next_entry_probed(&mut entries, || {
+        match common::walk::next_entry_probed(&mut entries, common::Side::Source, || {
             format!("failed traversing src directory {:?}", &src)
         })
         .await
@@ -184,25 +184,26 @@ async fn send_directories_and_symlinks(
                 let entry_path = entry.path();
                 let entry_name = entry_path.file_name().unwrap();
                 let dst_path = dst.join(entry_name);
-                let entry_metadata = match common::walk::run_metadata_probed(async {
-                    if settings.dereference {
-                        tokio::fs::metadata(&entry_path).await
-                    } else {
-                        tokio::fs::symlink_metadata(&entry_path).await
-                    }
-                })
-                .await
-                {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::error!("Failed reading metadata from {entry_path:?}: {e:#}");
-                        if settings.fail_early {
-                            return Err(e.into());
+                let entry_metadata =
+                    match common::walk::run_metadata_probed(common::Side::Source, async {
+                        if settings.dereference {
+                            tokio::fs::metadata(&entry_path).await
+                        } else {
+                            tokio::fs::symlink_metadata(&entry_path).await
                         }
-                        error_collector.push(e.into());
-                        continue;
-                    }
-                };
+                    })
+                    .await
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!("Failed reading metadata from {entry_path:?}: {e:#}");
+                            if settings.fail_early {
+                                return Err(e.into());
+                            }
+                            error_collector.push(e.into());
+                            continue;
+                        }
+                    };
                 // apply filter for child entries
                 if let Some(ref filter) = settings.filter {
                     let relative_path = entry_path.strip_prefix(source_root).unwrap_or(&entry_path);
@@ -372,7 +373,7 @@ async fn send_fs_objects_tcp(
     error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
 ) -> anyhow::Result<()> {
     tracing::info!("Sending data from {:?} to {:?}", src, dst);
-    let src_metadata = match common::walk::run_metadata_probed(async {
+    let src_metadata = match common::walk::run_metadata_probed(common::Side::Source, async {
         if settings.dereference {
             tokio::fs::metadata(src).await
         } else {
@@ -615,7 +616,7 @@ async fn send_files_in_directory_tcp(
         }
     };
     loop {
-        match common::walk::next_entry_probed(&mut entries, || {
+        match common::walk::next_entry_probed(&mut entries, common::Side::Source, || {
             format!("failed traversing src directory {:?}", &src)
         })
         .await
@@ -624,25 +625,26 @@ async fn send_files_in_directory_tcp(
                 let entry_path = entry.path();
                 let entry_name = entry_path.file_name().unwrap();
                 let dst_path = dst.join(entry_name);
-                let entry_metadata = match common::walk::run_metadata_probed(async {
-                    if settings.dereference {
-                        tokio::fs::metadata(&entry_path).await
-                    } else {
-                        tokio::fs::symlink_metadata(&entry_path).await
-                    }
-                })
-                .await
-                {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::error!("Failed reading metadata from {entry_path:?}: {e:#}");
-                        if settings.fail_early {
-                            return Err(e.into());
+                let entry_metadata =
+                    match common::walk::run_metadata_probed(common::Side::Source, async {
+                        if settings.dereference {
+                            tokio::fs::metadata(&entry_path).await
+                        } else {
+                            tokio::fs::symlink_metadata(&entry_path).await
                         }
-                        error_collector.push(e.into());
-                        continue;
-                    }
-                };
+                    })
+                    .await
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!("Failed reading metadata from {entry_path:?}: {e:#}");
+                            if settings.fail_early {
+                                return Err(e.into());
+                            }
+                            error_collector.push(e.into());
+                            continue;
+                        }
+                    };
                 if entry_metadata.is_file() {
                     // apply filter if configured
                     if let Some(ref filter) = settings.filter {
@@ -1265,7 +1267,7 @@ async fn dry_run_traverse(
     dry_run_mode: common::config::DryRunMode,
     summary: &mut common::copy::Summary,
 ) -> anyhow::Result<()> {
-    let src_metadata = match common::walk::run_metadata_probed(async {
+    let src_metadata = match common::walk::run_metadata_probed(common::Side::Source, async {
         if settings.dereference {
             tokio::fs::metadata(src).await
         } else {
@@ -1466,7 +1468,7 @@ async fn dry_run_traverse(
         }
     };
     loop {
-        match common::walk::next_entry_probed(&mut entries, || {
+        match common::walk::next_entry_probed(&mut entries, common::Side::Source, || {
             format!("failed traversing src directory {:?}", &src)
         })
         .await
