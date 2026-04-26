@@ -650,7 +650,10 @@ async fn copy_internal(
             directories_created: 1, // report as would be created
             ..Default::default()
         }
-    } else if let Err(error) = tokio::fs::create_dir(dst).await {
+    } else if let Err(error) =
+        crate::walk::run_metadata_probed(congestion::Side::Destination, tokio::fs::create_dir(dst))
+            .await
+    {
         assert!(
             !is_fresh,
             "unexpected error creating directory: {dst:?}: {error}"
@@ -746,11 +749,12 @@ async fn copy_internal(
     let mut join_set = tokio::task::JoinSet::new();
     let errors = crate::error_collector::ErrorCollector::default();
     loop {
-        let Some((entry, entry_file_type)) = crate::walk::next_entry_probed(&mut entries, || {
-            format!("failed traversing src directory {:?}", &src)
-        })
-        .await
-        .map_err(|err| Error::new(err, copy_summary))?
+        let Some((entry, entry_file_type)) =
+            crate::walk::next_entry_probed(&mut entries, congestion::Side::Source, || {
+                format!("failed traversing src directory {:?}", &src)
+            })
+            .await
+            .map_err(|err| Error::new(err, copy_summary))?
         else {
             break;
         };

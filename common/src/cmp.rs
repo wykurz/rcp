@@ -423,10 +423,11 @@ async fn expand_missing_tree(
     let mut join_set = tokio::task::JoinSet::new();
     let errors = crate::error_collector::ErrorCollector::default();
     loop {
-        let Some((entry, entry_file_type)) = crate::walk::next_entry_probed(&mut entries, || {
-            format!("failed traversing directory {:?}", &existing_path)
-        })
-        .await?
+        let Some((entry, entry_file_type)) =
+            crate::walk::next_entry_probed(&mut entries, congestion::Side::Source, || {
+                format!("failed traversing directory {:?}", &existing_path)
+            })
+            .await?
         else {
             break;
         };
@@ -610,7 +611,7 @@ async fn cmp_internal(
     // iterate through src entries and recursively call "cmp" on each one
     loop {
         let Some((src_entry, entry_file_type)) =
-            crate::walk::next_entry_probed(&mut src_entries, || {
+            crate::walk::next_entry_probed(&mut src_entries, congestion::Side::Source, || {
                 format!("failed traversing directory {:?}", &src)
             })
             .await?
@@ -670,7 +671,7 @@ async fn cmp_internal(
     // iterate through update entries and log each one that's not present in src
     loop {
         let Some((dst_entry, entry_file_type)) =
-            crate::walk::next_entry_probed(&mut dst_entries, || {
+            crate::walk::next_entry_probed(&mut dst_entries, congestion::Side::Destination, || {
                 format!("failed traversing directory {:?}", &dst)
             })
             .await?

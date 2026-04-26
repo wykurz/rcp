@@ -37,19 +37,37 @@ const REPLENISH_INTERVAL_SECS: f64 = 0.1;
 /// same cadence.
 pub(crate) const DROP_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Drive the auto-meta adapter loop: consume controller decisions from
-/// `decision_rx`, dispatch each to the [`throttle`] layer via
-/// [`apply_decision`], and periodically surface the routing sink's
-/// dropped-sample count. Exits cleanly when the decision channel closes.
+/// Map a [`congestion::Side`] to its [`throttle::Side`] counterpart. The
+/// two enums are intentionally independent — `throttle` has no
+/// dependency on `congestion` — but they're 1:1.
+fn throttle_side(side: congestion::Side) -> throttle::Side {
+    match side {
+        congestion::Side::Source => throttle::Side::Source,
+        congestion::Side::Destination => throttle::Side::Destination,
+    }
+}
+
+/// Drive the auto-meta adapter loop for a single [`Side`]: consume
+/// controller decisions from `decision_rx`, dispatch each to the
+/// [`throttle`] layer (on the same side) via [`apply_decision`], and
+/// periodically surface the routing sink's dropped-sample count. Exits
+/// cleanly when the decision channel closes.
+///
+/// One adapter task runs per side. Each side has its own decision
+/// channel (own controller) and its own enforcement gate, but both
+/// adapters share the same `RoutingSink` (so drop counts are
+/// process-wide rather than per-side).
 ///
 /// Lives in this module (rather than inline in
 /// [`crate::spawn_auto_meta_throttle`]) so unit tests can drive it
 /// directly on the current tokio runtime without spawning a dedicated
 /// one or touching tool-level setup.
 pub(crate) async fn run_adapter(
+    side: congestion::Side,
     mut decision_rx: tokio::sync::watch::Receiver<congestion::Decision>,
     sink: std::sync::Arc<congestion::RoutingSink>,
 ) {
+    let throttle_side = throttle_side(side);
     let mut drop_report_interval = tokio::time::interval(DROP_REPORT_INTERVAL);
     drop_report_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // swallow the at-t=0 tick so the first report fires after a full
@@ -66,7 +84,9 @@ pub(crate) async fn run_adapter(
                 let decision = *decision_rx.borrow();
                 for action in apply_decision(last_applied, decision) {
                     match action {
-                        AdapterAction::SetMaxInFlight(n) => throttle::set_max_ops_in_flight(n),
+                        AdapterAction::SetMaxInFlight(n) => {
+                            throttle::set_max_ops_in_flight(throttle_side, n);
+                        }
                         AdapterAction::SetOpsReplenish(n) => throttle::set_ops_replenish(n),
                         AdapterAction::EnableOpsThrottle => {
                             throttle::enable_ops_throttle();
@@ -80,9 +100,9 @@ pub(crate) async fn run_adapter(
                 let total = sink.dropped_samples();
                 if total > last_reported {
                     tracing::warn!(
-                        "auto-meta-throttle: RoutingSink dropped {} samples in the last {:?} \
-                         (total: {}); the control-loop channel is under-scaled or the task \
-                         is stalling",
+                        "auto-meta-throttle ({side:?}): RoutingSink dropped {} samples in \
+                         the last {:?} (total: {}); the control-loop channel is under-scaled \
+                         or the task is stalling",
                         total - last_reported,
                         DROP_REPORT_INTERVAL,
                         total,
@@ -92,7 +112,9 @@ pub(crate) async fn run_adapter(
             }
         }
     }
-    tracing::debug!("auto-meta-throttle: adapter/monitor exiting (decision channel closed)");
+    tracing::debug!(
+        "auto-meta-throttle ({side:?}): adapter/monitor exiting (decision channel closed)",
+    );
 }
 
 /// Diff two [`congestion::Decision`]s and produce the minimal sequence of
@@ -467,38 +489,47 @@ mod tests {
     mod feedback {
         use super::*;
         use congestion::{
-            ControlUnit, Controller, Decision, FixedController, RoutingSinkBuilder, Sample,
+            ControlUnit, Controller, Decision, FixedController, RoutingSinkBuilder, Sample, Side,
         };
 
         /// Serialize these tests against each other. The only other consumer of
-        /// the `OPS_IN_FLIGHT_LIMIT` global is the cwnd-deadlock integration
-        /// test in `common/tests/probe_metadata.rs`, which lives in a separate
-        /// test binary and does not share this process.
+        /// the per-side `OPS_IN_FLIGHT_LIMIT_*` globals is the cwnd-deadlock
+        /// integration test in `common/tests/probe_metadata.rs`, which lives
+        /// in a separate test binary and does not share this process.
         static FEEDBACK_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
         /// Reset the global throttle + sample-sink state after a test so
         /// a subsequent test sees a clean slate regardless of ordering.
         async fn reset_globals() {
-            throttle::set_max_ops_in_flight(0);
+            throttle::set_max_ops_in_flight(throttle::Side::Source, 0);
+            throttle::set_max_ops_in_flight(throttle::Side::Destination, 0);
             throttle::disable_ops_throttle();
             congestion::clear_sample_sink();
         }
 
         /// Build the wiring used by every feedback test and return the
-        /// bits the caller needs to manipulate (sample sender via the
-        /// installed sink, adapter/unit join handles).
+        /// adapter / unit join handles. Tests run a single side at a time;
+        /// the wired probes and observed cwnd are scoped to that side.
         async fn wire_adapter<C: congestion::Controller + 'static>(
+            side: Side,
             controller: C,
             tick: std::time::Duration,
         ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
             let mut builder = RoutingSinkBuilder::new();
-            let metadata_rx = builder.metadata_receiver();
+            let metadata_rx = builder.metadata_receiver(side);
             let sink = std::sync::Arc::new(builder.build());
             congestion::install_sample_sink(sink.clone());
             let (unit, decision_rx) = ControlUnit::new(controller, metadata_rx, tick);
             let unit_handle = unit.spawn();
-            let adapter_handle = tokio::spawn(run_adapter(decision_rx, sink));
+            let adapter_handle = tokio::spawn(run_adapter(side, decision_rx, sink));
             (unit_handle, adapter_handle)
+        }
+
+        fn throttle_side(side: Side) -> throttle::Side {
+            match side {
+                Side::Source => throttle::Side::Source,
+                Side::Destination => throttle::Side::Destination,
+            }
         }
 
         #[tokio::test]
@@ -506,25 +537,29 @@ mod tests {
             let _g = FEEDBACK_GUARD.lock().await;
             reset_globals().await;
             // FixedController(42) emits `with_concurrency(42)` forever. The
-            // first decision after startup must land on OPS_IN_FLIGHT_LIMIT
-            // — proving unit -> adapter -> throttle wiring.
+            // first decision after startup must land on the source-side
+            // OPS_IN_FLIGHT_LIMIT — proving unit -> adapter -> throttle
+            // wiring on that side.
+            let side = Side::Source;
             let (unit, adapter) = wire_adapter(
+                side,
                 FixedController::with_concurrency(42),
                 std::time::Duration::from_millis(10),
             )
             .await;
+            let throttle_side = throttle_side(side);
             // poll for up to 500ms; adapter runs on another task and the
             // watch's initial value must be consumed before we can observe.
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
             loop {
-                if throttle::current_ops_in_flight_limit() == 42 {
+                if throttle::current_ops_in_flight_limit(throttle_side) == 42 {
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
                     panic!(
                         "adapter did not apply initial cwnd=42 within 500ms; \
                          current limit = {}",
-                        throttle::current_ops_in_flight_limit(),
+                        throttle::current_ops_in_flight_limit(throttle_side),
                     );
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -568,6 +603,8 @@ mod tests {
             // in order. Watching throttle::current_ops_in_flight_limit()
             // transition through the sequence proves the decision -> action
             // pipeline is wired end-to-end.
+            let side = Side::Source;
+            let throttle_side = throttle_side(side);
             let tick = std::time::Duration::from_millis(20);
             let controller = ScriptedController {
                 script: vec![
@@ -577,19 +614,19 @@ mod tests {
                 ],
                 idx: 0,
             };
-            let (unit, adapter) = wire_adapter(controller, tick).await;
+            let (unit, adapter) = wire_adapter(side, controller, tick).await;
             // Observe each target cwnd in sequence. The controller's
             // on_tick produces one per tick, so after ~N ticks each value
             // in the script should land. Allow slack for interleaving.
             for target in [5_usize, 25, 3] {
                 let deadline = std::time::Instant::now() + tick * 20;
-                while throttle::current_ops_in_flight_limit() != target {
+                while throttle::current_ops_in_flight_limit(throttle_side) != target {
                     if std::time::Instant::now() >= deadline {
                         panic!(
                             "cwnd did not reach scripted value {target} within {:?}; \
                              observed = {}",
                             tick * 20,
-                            throttle::current_ops_in_flight_limit(),
+                            throttle::current_ops_in_flight_limit(throttle_side),
                         );
                     }
                     tokio::time::sleep(tick / 4).await;
@@ -608,15 +645,17 @@ mod tests {
             // transition must land as SetMaxInFlight(0) at the throttle
             // so the semaphore disables its cap, matching the Decision
             // "None means no limit" contract.
+            let side = Side::Source;
+            let throttle_side = throttle_side(side);
             let tick = std::time::Duration::from_millis(20);
             let controller = ScriptedController {
                 script: vec![Decision::with_concurrency(15), Decision::UNLIMITED],
                 idx: 0,
             };
-            let (unit, adapter) = wire_adapter(controller, tick).await;
+            let (unit, adapter) = wire_adapter(side, controller, tick).await;
             // First, observe 15 land.
             let deadline = std::time::Instant::now() + tick * 10;
-            while throttle::current_ops_in_flight_limit() != 15 {
+            while throttle::current_ops_in_flight_limit(throttle_side) != 15 {
                 if std::time::Instant::now() >= deadline {
                     panic!("cwnd=15 never landed");
                 }
@@ -624,11 +663,11 @@ mod tests {
             }
             // Then observe the UNLIMITED → SetMaxInFlight(0) land.
             let deadline = std::time::Instant::now() + tick * 20;
-            while throttle::current_ops_in_flight_limit() != 0 {
+            while throttle::current_ops_in_flight_limit(throttle_side) != 0 {
                 if std::time::Instant::now() >= deadline {
                     panic!(
                         "cwnd did not clear to 0 after None decision; observed {}",
-                        throttle::current_ops_in_flight_limit(),
+                        throttle::current_ops_in_flight_limit(throttle_side),
                     );
                 }
                 tokio::time::sleep(tick / 4).await;
@@ -645,8 +684,9 @@ mod tests {
             // Dropping the ControlUnit (via the join handle completing after
             // its sample channel closes) must cause the adapter task to
             // exit. We set this up with a tight tick + short-lived unit.
+            let side = Side::Source;
             let mut builder = RoutingSinkBuilder::new();
-            let metadata_rx = builder.metadata_receiver();
+            let metadata_rx = builder.metadata_receiver(side);
             let sink = std::sync::Arc::new(builder.build());
             congestion::install_sample_sink(sink.clone());
             let (unit, decision_rx) = ControlUnit::new(
@@ -655,7 +695,7 @@ mod tests {
                 std::time::Duration::from_millis(5),
             );
             let unit_handle = unit.spawn();
-            let adapter_handle = tokio::spawn(run_adapter(decision_rx, sink));
+            let adapter_handle = tokio::spawn(run_adapter(side, decision_rx, sink));
             // Let the initial decision land, then tear down the sink so
             // ControlUnit's sample channel closes and it exits. Its watch
             // sender drops, which closes the adapter's decision channel.

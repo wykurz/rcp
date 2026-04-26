@@ -16,6 +16,8 @@ scope here is conceptual; specific flag names are covered in
 - [Why Our Own Load Doesn't Skew the Baseline](#why-our-own-load-doesnt-skew-the-baseline)
 - [The Control Law](#the-control-law)
 - [Enforcement Model](#enforcement-model)
+- [What Counts as a Metadata Op](#what-counts-as-a-metadata-op)
+- [Two Controllers: Source and Destination](#two-controllers-source-and-destination)
 - [Interaction with Static Throttles](#interaction-with-static-throttles)
 - [Remote Copy](#remote-copy)
 - [Tuning and Observability](#tuning-and-observability)
@@ -293,6 +295,95 @@ layer maps that directly onto a semaphore whose capacity is set to the
 current `cwnd` and updated every time the controller changes its
 mind — so "in-flight at the syscall layer" never exceeds whatever the
 algorithm last decided.
+
+## What Counts as a Metadata Op
+
+The probe machinery isn't free, and it isn't applied uniformly to every
+syscall a tool makes. Two principles decide what gets probed:
+
+1. **One probe per file per controller, at first touch.** Most
+   filesystems cache inode lookups aggressively: the first `stat` of a
+   file pulls the inode into cache, and subsequent reads of the same
+   metadata are nearly free. So an isolated probe at the *first*
+   metadata read per file gives the controller a representative latency
+   sample, and probing every subsequent metadata read on that file
+   would add cost without adding signal.
+
+2. **Each metadata mutation is its own first touch.** Caching helps
+   reads, not writes — every `unlink`, `mkdir`, `hard_link`, `open`-
+   with-`O_CREAT` actually does new work on the filesystem. Each one
+   gets its own probe.
+
+In code, this comes out to:
+
+- **Probed (read side):** the directory-walk pair `next_entry()` +
+  `file_type()` — the first metadata touch per directory entry. We
+  bracket the pair as one probe because they're tightly coupled and
+  `file_type` typically serves out of the dirent cache populated by
+  `next_entry`.
+- **Probed (write side):** `tokio::fs::create_dir`,
+  `tokio::fs::hard_link`, `tokio::fs::symlink`, `tokio::fs::remove_file`,
+  `tokio::fs::remove_dir`, `tokio::fs::set_permissions`, and the
+  `OpenOptions::open(create:true, …)` call inside `filegen`'s
+  `write_file`. Each is one probe per syscall.
+- **Not probed by design:**
+  - Subsequent metadata reads on a file already touched by the walk
+    (e.g. a follow-up `symlink_metadata` later in the same operation).
+    Cache-warmed; signal redundant.
+  - Data-path reads/writes (`tokio::fs::copy`, the read-loop and
+    write-loop inside the copy pipeline). Bandwidth-bound, not
+    service-time-bound; a Vegas-style controller doesn't fit. See
+    [Pluggability](#pluggability) for the BBR direction.
+
+## Two Controllers: Source and Destination
+
+Filesystems vary enormously. A copy from a saturated NFS mount to a
+local SSD has two completely independent service-time profiles, and
+forcing them onto a single controller pessimizes both. Following the
+guideline *one controller per filesystem, one controller per operation
+class*, we run two metadata controllers per process:
+
+- **Source-side controller** — gates *reads* of the source filesystem:
+  the directory walk's `next_entry`+`file_type` probe.
+- **Destination-side controller** — gates *writes* of the destination
+  filesystem: `create_dir`, `hard_link`, `unlink`, etc. on the dst
+  path.
+
+Each controller runs the same algorithm with its own independent state
+(its own `min_latency`, EWMA, `cwnd`) and its own enforcement
+semaphore. A probe site is annotated with the side it belongs to; the
+control loop and enforcement gate are picked accordingly.
+
+How tools map onto this:
+
+| Tool      | Source-side probes                         | Destination-side probes                                         |
+|-----------|--------------------------------------------|-----------------------------------------------------------------|
+| `rcp`     | walk of the source tree                    | `create_dir` / file open / `symlink` on dst                     |
+| `rrm`     | walk of the path being removed             | `remove_file` / `remove_dir` / pre-unlink `set_permissions`     |
+| `rlink`   | walk of src (and update, when set)         | `hard_link` on dst                                              |
+| `rcmp`    | walk of src                                | walk of dst                                                     |
+| `filegen` | (none — filegen doesn't read directories)  | `create_dir` for subdirs, `open(create:true)` for each file     |
+
+Two notes on this layout:
+
+- **Single-path tools (rrm, filegen) still get two controllers.** rrm's
+  source-side gates the walk and dst-side gates the unlinks; on the
+  same filesystem they have meaningfully different latency profiles
+  (reads vs. mutations), so a separate controller per side captures
+  more signal than collapsing them. filegen has no read side, so its
+  source-side controller stays idle — harmless.
+- **rcmp's "destination" probes are reads, not writes.** Compare-only
+  tools read both sides without mutating. We still route the dst-side
+  walk through the dst-side controller because the principle is "one
+  per filesystem"; a saturated dst-FS shouldn't push the src-FS
+  controller into shrinking when src-FS is fine.
+
+In remote copy, this layout is already enforced by the architecture:
+`rcpd-source` only does source-side work (one controller per process,
+gating local source reads), and `rcpd-destination` only does
+destination-side work (one controller, gating local destination
+writes). Each rcpd has exactly one controller because each touches
+exactly one filesystem.
 
 At the call site, each syscall is bracketed by permit acquisition and a
 *probe* that measures its wall-clock duration:

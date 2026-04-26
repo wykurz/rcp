@@ -227,10 +227,13 @@ async fn rm_internal(
                 ..Default::default()
             });
         }
-        tokio::fs::remove_file(path)
-            .await
-            .with_context(|| format!("failed removing {:?}", &path))
-            .map_err(|err| Error::new(err, Default::default()))?;
+        crate::walk::run_metadata_probed(
+            congestion::Side::Destination,
+            tokio::fs::remove_file(path),
+        )
+        .await
+        .with_context(|| format!("failed removing {:?}", &path))
+        .map_err(|err| Error::new(err, Default::default()))?;
         if is_symlink {
             prog_track.symlinks_removed.inc();
             return Ok(Summary {
@@ -270,11 +273,12 @@ async fn rm_internal(
     let mut skipped_symlinks = 0;
     let mut skipped_dirs = 0;
     loop {
-        let Some((entry, entry_file_type)) = crate::walk::next_entry_probed(&mut entries, || {
-            format!("failed traversing directory {:?}", &path)
-        })
-        .await
-        .map_err(|err| Error::new(err, Default::default()))?
+        let Some((entry, entry_file_type)) =
+            crate::walk::next_entry_probed(&mut entries, congestion::Side::Source, || {
+                format!("failed traversing directory {:?}", &path)
+            })
+            .await
+            .map_err(|err| Error::new(err, Default::default()))?
         else {
             break;
         };
@@ -454,7 +458,12 @@ async fn rm_internal(
     // matching files (includes) or skipped excluded files; use remove_dir (not remove_dir_all)
     // so non-empty directories fail gracefully with ENOTEMPTY
     let any_filter_active = settings.filter.is_some() || settings.time_filter.is_some();
-    match tokio::fs::remove_dir(path).await {
+    match crate::walk::run_metadata_probed(
+        congestion::Side::Destination,
+        tokio::fs::remove_dir(path),
+    )
+    .await
+    {
         Ok(()) => {
             prog_track.directories_removed.inc();
             rm_summary.directories_removed += 1;

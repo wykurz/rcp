@@ -150,16 +150,40 @@
 
 mod semaphore;
 
+/// Which side of an operation a permit / cap belongs to. Mirrors
+/// `congestion::Side` (kept as an independent enum so this crate has no
+/// dependency on `congestion`). The two are convertible 1:1 by the
+/// auto-meta adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Side {
+    /// Reads of the source filesystem (directory walks, source-side stats).
+    Source,
+    /// Writes/mutations of the destination filesystem (`create_dir`,
+    /// `hard_link`, `unlink`, `open(O_CREAT)`, …).
+    Destination,
+}
+
 static OPEN_FILES_LIMIT: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
 static OPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
 static IOPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
-// per-op concurrency cap, driven by the congestion controller. Distinct
-// from OPS_THROTTLE (rate) and OPEN_FILES_LIMIT (FDs).
-static OPS_IN_FLIGHT_LIMIT: std::sync::LazyLock<semaphore::Semaphore> =
+// Per-op concurrency caps, driven by the congestion controller. One
+// semaphore per [`Side`] so source-side and destination-side throttling
+// are independent. Distinct from OPS_THROTTLE (rate) and
+// OPEN_FILES_LIMIT (FDs).
+static OPS_IN_FLIGHT_LIMIT_SRC: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
+static OPS_IN_FLIGHT_LIMIT_DST: std::sync::LazyLock<semaphore::Semaphore> =
+    std::sync::LazyLock::new(semaphore::Semaphore::new);
+
+fn ops_in_flight_limit(side: Side) -> &'static semaphore::Semaphore {
+    match side {
+        Side::Source => &OPS_IN_FLIGHT_LIMIT_SRC,
+        Side::Destination => &OPS_IN_FLIGHT_LIMIT_DST,
+    }
+}
 
 pub fn set_max_open_files(max_open_files: usize) {
     OPEN_FILES_LIMIT.setup(max_open_files);
@@ -175,7 +199,8 @@ pub async fn open_file_permit() -> OpenFileGuard {
     }
 }
 
-/// Dynamically set the maximum number of concurrent operations in flight.
+/// Dynamically set the maximum number of concurrent operations in flight
+/// on the given [`Side`].
 ///
 /// Increasing the cap is instant; decreasing it can temporarily overshoot
 /// if permits are already held — they return naturally on drop. This is
@@ -186,19 +211,19 @@ pub async fn open_file_permit() -> OpenFileGuard {
 /// blocked inside the semaphore's wait queue — they remain parked until
 /// permits become available. Callers that need a cancellable disable
 /// should use a higher-level shutdown signal.
-pub fn set_max_ops_in_flight(max_in_flight: usize) {
-    OPS_IN_FLIGHT_LIMIT.set_max(max_in_flight);
+pub fn set_max_ops_in_flight(side: Side, max_in_flight: usize) {
+    ops_in_flight_limit(side).set_max(max_in_flight);
 }
 
 pub struct OpsInFlightGuard {
     _permit: Option<semaphore::Permit<'static>>,
 }
 
-/// Acquire a permit from the ops-in-flight cap. No-op (returns immediately)
-/// when the cap is not configured.
-pub async fn ops_in_flight_permit() -> OpsInFlightGuard {
+/// Acquire a permit from the ops-in-flight cap on the given [`Side`].
+/// No-op (returns immediately) when the cap on that side is not configured.
+pub async fn ops_in_flight_permit(side: Side) -> OpsInFlightGuard {
     OpsInFlightGuard {
-        _permit: OPS_IN_FLIGHT_LIMIT.acquire().await,
+        _permit: ops_in_flight_limit(side).acquire().await,
     }
 }
 
@@ -296,10 +321,10 @@ pub fn enable_ops_throttle() -> bool {
     OPS_THROTTLE.enable()
 }
 
-/// Current in-flight concurrency cap, for metrics and integration tests.
-/// Returns `0` when the cap has been set to zero (disabled) or has never
-/// been configured.
+/// Current in-flight concurrency cap on the given [`Side`], for metrics
+/// and integration tests. Returns `0` when the cap has been set to zero
+/// (disabled) or has never been configured.
 #[must_use]
-pub fn current_ops_in_flight_limit() -> usize {
-    OPS_IN_FLIGHT_LIMIT.current_limit()
+pub fn current_ops_in_flight_limit(side: Side) -> usize {
+    ops_in_flight_limit(side).current_limit()
 }

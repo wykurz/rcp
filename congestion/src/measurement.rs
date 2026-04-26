@@ -12,18 +12,38 @@
 
 use crate::controller::{Outcome, Sample};
 
+/// Which side of an operation a probe is on.
+///
+/// Tools like `rcp` and `rcmp` touch two filesystems with different
+/// service-time profiles; we run an independent controller per side so a
+/// saturated source doesn't drag the destination's `cwnd` down or vice
+/// versa. Single-path tools (`rrm`, `filegen`) still partition reads
+/// (`Source`) from writes/mutations (`Destination`) since those have
+/// different latency profiles even on the same filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Side {
+    /// Reads of the source filesystem — directory walks, source-side stats.
+    Source,
+    /// Writes/mutations of the destination filesystem — `create_dir`,
+    /// `hard_link`, `unlink`, `open(O_CREAT)`, etc.
+    Destination,
+}
+
 /// Which resource a probe is measuring.
 ///
-/// Separate kinds feed independent controllers in the control loop (e.g. a
-/// metadata controller vs. a data-read controller), but share the same
-/// measurement machinery.
+/// Separate kinds feed independent controllers in the control loop. The
+/// metadata kind is parameterized by [`Side`] so source-side and
+/// destination-side metadata operations route to independent controllers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResourceKind {
-    /// Directory entries, stat, open, unlink, link, mkdir, rename, etc.
-    MetadataOps,
-    /// Individual read chunks in a copy pipeline.
+    /// Directory entries, stat, open, unlink, link, mkdir, rename, etc.,
+    /// tagged with the [`Side`] whose controller should track it.
+    Metadata(Side),
+    /// Individual read chunks in a copy pipeline. Reserved for future
+    /// data-path controllers; not currently routed to any sink channel.
     DataRead,
-    /// Individual write chunks in a copy or filegen pipeline.
+    /// Individual write chunks in a copy or filegen pipeline. Reserved
+    /// for future data-path controllers.
     DataWrite,
 }
 
@@ -70,10 +90,10 @@ fn emit(kind: ResourceKind, sample: &Sample) {
 /// # Lifecycle
 ///
 /// ```no_run
-/// use congestion::Probe;
+/// use congestion::{Probe, Side};
 ///
 /// # async fn example() {
-/// let probe = Probe::start_metadata();
+/// let probe = Probe::start_metadata(Side::Source);
 /// // ... perform the syscall or operation ...
 /// probe.complete_ok(0);
 /// # }
@@ -96,9 +116,9 @@ impl Probe {
             started_at: std::time::Instant::now(),
         }
     }
-    /// Shorthand for `Probe::start(ResourceKind::MetadataOps)`.
-    pub fn start_metadata() -> Self {
-        Self::start(ResourceKind::MetadataOps)
+    /// Shorthand for `Probe::start(ResourceKind::Metadata(side))`.
+    pub fn start_metadata(side: Side) -> Self {
+        Self::start(ResourceKind::Metadata(side))
     }
     /// Shorthand for `Probe::start(ResourceKind::DataRead)`.
     pub fn start_read() -> Self {
@@ -150,7 +170,7 @@ mod tests {
     fn probe_without_sink_is_a_no_op() {
         let _guard = SINK_GUARD.blocking_lock();
         clear_sample_sink();
-        let probe = Probe::start_metadata();
+        let probe = Probe::start_metadata(Side::Source);
         probe.complete_ok(0);
     }
 
@@ -159,8 +179,8 @@ mod tests {
         let _guard = SINK_GUARD.blocking_lock();
         let sink = std::sync::Arc::new(CollectingSink::new());
         install_sample_sink(sink.clone());
-        Probe::start_metadata().complete_ok(0);
-        Probe::start_metadata().complete_ok(0);
+        Probe::start_metadata(Side::Source).complete_ok(0);
+        Probe::start_metadata(Side::Source).complete_ok(0);
         assert_eq!(sink.metadata_count(), 2);
         clear_sample_sink();
     }
@@ -170,7 +190,7 @@ mod tests {
         let _guard = SINK_GUARD.blocking_lock();
         let sink = std::sync::Arc::new(CollectingSink::new());
         install_sample_sink(sink.clone());
-        Probe::start_metadata().complete_ok(0);
+        Probe::start_metadata(Side::Source).complete_ok(0);
         Probe::start_read().complete_ok(4096);
         Probe::start_write().complete_ok(8192);
         assert_eq!(sink.metadata_count(), 1);
@@ -184,7 +204,7 @@ mod tests {
         let _guard = SINK_GUARD.blocking_lock();
         let sink = std::sync::Arc::new(CollectingSink::new());
         install_sample_sink(sink.clone());
-        let probe = Probe::start_metadata();
+        let probe = Probe::start_metadata(Side::Source);
         std::thread::sleep(std::time::Duration::from_millis(5));
         probe.complete_ok(0);
         let samples = sink.metadata_samples();
@@ -198,7 +218,7 @@ mod tests {
         let _guard = SINK_GUARD.blocking_lock();
         let sink = std::sync::Arc::new(CollectingSink::new());
         install_sample_sink(sink.clone());
-        Probe::start_metadata().discard();
+        Probe::start_metadata(Side::Source).discard();
         assert_eq!(sink.metadata_count(), 0);
         clear_sample_sink();
     }
@@ -212,7 +232,7 @@ mod tests {
         let sink = std::sync::Arc::new(CollectingSink::new());
         install_sample_sink(sink.clone());
         {
-            let _probe = Probe::start_metadata();
+            let _probe = Probe::start_metadata(Side::Source);
             // _probe falls out of scope here without complete or discard
         }
         assert_eq!(sink.metadata_count(), 0);
@@ -224,11 +244,11 @@ mod tests {
         let _guard = SINK_GUARD.blocking_lock();
         let first = std::sync::Arc::new(CollectingSink::new());
         install_sample_sink(first.clone());
-        Probe::start_metadata().complete_ok(0);
+        Probe::start_metadata(Side::Source).complete_ok(0);
         let second = std::sync::Arc::new(CollectingSink::new());
         install_sample_sink(second.clone());
-        Probe::start_metadata().complete_ok(0);
-        Probe::start_metadata().complete_ok(0);
+        Probe::start_metadata(Side::Source).complete_ok(0);
+        Probe::start_metadata(Side::Source).complete_ok(0);
         assert_eq!(first.metadata_count(), 1);
         assert_eq!(second.metadata_count(), 2);
         clear_sample_sink();

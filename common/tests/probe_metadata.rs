@@ -81,17 +81,15 @@ async fn rm_emits_one_metadata_sample_per_tree_entry() {
     congestion::clear_sample_sink();
     assert_eq!(result.directories_removed, 3);
     assert_eq!(result.files_removed, 3);
-    let samples = sink.metadata_samples();
-    // exactly one probe per directory entry iterated across all three dirs.
-    assert_eq!(
-        samples.len(),
-        5,
-        "expected 5 metadata samples (a, b, 1.txt, 2.txt, 3.txt), got {}",
-        samples.len(),
-    );
+    // Source-side: one probe per directory entry the walk discovered —
+    // a, b, 1.txt, 2.txt, 3.txt = 5 entries.
+    assert_eq!(sink.metadata_count_for(congestion::Side::Source), 5);
+    // Destination-side: one probe per mutation — 3 remove_file calls
+    // (the .txt files) + 3 remove_dir calls (a, b, root tree).
+    assert_eq!(sink.metadata_count_for(congestion::Side::Destination), 6);
     // every sample should have a non-zero latency; an all-zero result would
     // mean the probe is bracketing something that isn't a syscall.
-    for s in &samples {
+    for s in &sink.metadata_samples() {
         assert!(
             s.latency() > std::time::Duration::ZERO,
             "sample latency must be non-zero: {:?}",
@@ -119,7 +117,15 @@ async fn copy_emits_one_metadata_sample_per_tree_entry() {
     .await
     .expect("copy succeeds");
     congestion::clear_sample_sink();
-    assert_eq!(sink.metadata_count(), 5);
+    // Source-side: one probe per src entry — 5 entries.
+    assert_eq!(sink.metadata_count_for(congestion::Side::Source), 5);
+    // Destination-side: one create_dir probe per directory the copy
+    // creates on dst — root + a + b = 3. (File data goes through
+    // tokio::fs::copy, which is intentionally unprobed today; the
+    // first-touch principle says the open inside it would be the right
+    // place to probe but that requires refactoring away from
+    // tokio::fs::copy.)
+    assert_eq!(sink.metadata_count_for(congestion::Side::Destination), 3);
 }
 
 /// Regression test for a deadlock that occurs when the ops-in-flight
@@ -136,9 +142,9 @@ async fn rm_on_deep_tree_does_not_deadlock_at_cwnd_one() {
     // install the full auto-meta pipeline with cwnd == 1 so any
     // held-across-join semantics would trigger immediately.
     let mut builder = congestion::RoutingSinkBuilder::new();
-    let metadata_rx = builder.metadata_receiver();
+    let metadata_rx = builder.metadata_receiver(congestion::Side::Source);
     congestion::install_sample_sink(std::sync::Arc::new(builder.build()));
-    throttle::set_max_ops_in_flight(1);
+    throttle::set_max_ops_in_flight(throttle::Side::Source, 1);
     let vegas = congestion::VegasController::new(congestion::VegasConfig {
         initial_cwnd: 1,
         min_cwnd: 1,
@@ -175,7 +181,7 @@ async fn rm_on_deep_tree_does_not_deadlock_at_cwnd_one() {
         .expect("rm completed within 5s — deadlock detected if timeout fired")
         .expect("rm succeeded");
     congestion::clear_sample_sink();
-    throttle::set_max_ops_in_flight(0);
+    throttle::set_max_ops_in_flight(throttle::Side::Source, 0);
     ctrl_handle.abort();
     assert_eq!(result.directories_removed, 6);
     assert_eq!(result.files_removed, 1);
@@ -192,7 +198,7 @@ async fn rm_on_deep_tree_does_not_deadlock_at_cwnd_one() {
 async fn auto_meta_pipeline_propagates_probes_to_controller() {
     let _guard = SINK_GUARD.lock().await;
     let mut builder = congestion::RoutingSinkBuilder::new();
-    let metadata_rx = builder.metadata_receiver();
+    let metadata_rx = builder.metadata_receiver(congestion::Side::Source);
     congestion::install_sample_sink(std::sync::Arc::new(builder.build()));
     let controller = congestion::VegasController::new(congestion::VegasConfig {
         initial_cwnd: 5,
@@ -244,11 +250,9 @@ async fn auto_meta_pipeline_propagates_probes_to_controller() {
 
 #[tokio::test]
 async fn cmp_emits_one_metadata_sample_per_tree_entry() {
-    // cmp walks both the src AND the dst directories (the dst walk
-    // reports entries missing from src); each tree entry on each side
-    // emits one metadata probe. Two identical 5-entry trees therefore
-    // produce 10 probes total — 5 from the src walk and 5 from the
-    // dst walk.
+    // cmp walks both the src AND the dst directories. With src and dst
+    // controllers split, each side gets exactly its own walk's probes —
+    // 5 entries each on identical 5-entry trees.
     let _guard = SINK_GUARD.lock().await;
     let sink = install_sink();
     let tmp = make_tempdir("cmp_samples").await;
@@ -273,7 +277,8 @@ async fn cmp_emits_one_metadata_sample_per_tree_entry() {
     .await
     .expect("cmp succeeds");
     congestion::clear_sample_sink();
-    assert_eq!(sink.metadata_count(), 10);
+    assert_eq!(sink.metadata_count_for(congestion::Side::Source), 5);
+    assert_eq!(sink.metadata_count_for(congestion::Side::Destination), 5);
 }
 
 #[tokio::test]
@@ -343,7 +348,12 @@ async fn link_update_path_emits_probes_for_update_tree() {
     .await
     .expect("link succeeds");
     congestion::clear_sample_sink();
-    assert_eq!(sink.metadata_count(), 8);
+    // src walk: 5 entries (small-tree) + 3 update files = 8 src probes.
+    assert_eq!(sink.metadata_count_for(congestion::Side::Source), 8);
+    // dst probes: 3 create_dir (root, a, b) + 3 hard_link (the small-tree
+    // .txt files). The update-path files (u1/u2/u3) go through
+    // copy::copy → tokio::fs::copy, which is intentionally unprobed today.
+    assert_eq!(sink.metadata_count_for(congestion::Side::Destination), 6);
 }
 
 #[tokio::test]
@@ -373,5 +383,8 @@ async fn link_emits_one_metadata_sample_per_tree_entry() {
     .await
     .expect("link succeeds");
     congestion::clear_sample_sink();
-    assert_eq!(sink.metadata_count(), 5);
+    // Source-side: 5 walk probes for the small-tree.
+    assert_eq!(sink.metadata_count_for(congestion::Side::Source), 5);
+    // Destination-side: 3 hard_links + 3 create_dir = 6.
+    assert_eq!(sink.metadata_count_for(congestion::Side::Destination), 6);
 }

@@ -133,6 +133,11 @@ pub use config::{
     AutoMetaThrottleConfig, DryRunMode, DryRunWarnings, OutputConfig, RuntimeConfig,
     ThrottleConfig, TracingConfig,
 };
+// Re-export `Side` from the congestion crate so downstream binaries
+// (rcp, rrm, …) and integration tests can pass `common::Side::Source` /
+// `common::Side::Destination` to `walk::next_entry_probed` and friends
+// without taking a direct dependency on `congestion`.
+pub use congestion::Side;
 pub use progress::{RcpdProgressPrinter, SerializableProgress};
 
 // Define RcpdType in common since remote depends on common
@@ -1086,16 +1091,19 @@ fn spawn_throttle_replenishers(runtime: &tokio::runtime::Runtime, throttle: &Thr
     }
 }
 
-/// Wire up the adaptive metadata-ops control loop:
-/// 1. Seed `OPS_IN_FLIGHT_LIMIT` with the controller's initial cwnd so the
-///    first probe finds a permit available.
-/// 2. Install a `RoutingSink` that routes metadata samples to a bounded
-///    channel drained by a `ControlUnit<VegasController>`.
-/// 3. Spawn a combined adapter/monitor task that forwards each emitted
-///    `Decision` into the throttle enforcement layer and periodically
-///    surfaces any dropped samples. The task exits cleanly when the
-///    control unit stops publishing decisions, so it doesn't leak as
-///    an unbounded background loop.
+/// Wire up the adaptive metadata-ops control loops — one per [`Side`]:
+///
+/// 1. Seed both per-side `OPS_IN_FLIGHT_LIMIT_*` semaphores with the
+///    controller's initial cwnd so the first probe on either side finds
+///    a permit available.
+/// 2. Install one `RoutingSink` that routes source-side metadata samples
+///    to a `ControlUnit<VegasController>` and destination-side samples to
+///    a separate `ControlUnit<VegasController>`.
+/// 3. Spawn one combined adapter/monitor task per side. Each forwards
+///    its controller's `Decision`s into the side's throttle gate and
+///    periodically surfaces any dropped samples. The tasks exit cleanly
+///    when their respective control unit stops publishing decisions, so
+///    they don't leak as unbounded background loops.
 ///
 /// Only one auto-meta config is supported per process. If a sample sink
 /// was already installed, it is silently replaced.
@@ -1103,30 +1111,41 @@ fn spawn_auto_meta_throttle(runtime: &tokio::runtime::Runtime, auto: AutoMetaThr
     let initial_cwnd = auto
         .initial_cwnd
         .clamp(auto.min_cwnd.max(1), auto.max_cwnd.max(1));
-    throttle::set_max_ops_in_flight(initial_cwnd as usize);
-    let vegas = congestion::VegasController::new(congestion::VegasConfig {
-        initial_cwnd: auto.initial_cwnd,
-        min_cwnd: auto.min_cwnd,
-        max_cwnd: auto.max_cwnd,
-        alpha: auto.alpha,
-        beta: auto.beta,
-        ewma_alpha: auto.ewma_alpha,
-        increase_step: auto.increase_step,
-        decrease_step: auto.decrease_step,
-        min_latency_max_age: auto.min_latency_max_age,
-    });
+    // Seed both sides with the same initial cwnd; each side then
+    // adapts independently from there.
+    throttle::set_max_ops_in_flight(throttle::Side::Source, initial_cwnd as usize);
+    throttle::set_max_ops_in_flight(throttle::Side::Destination, initial_cwnd as usize);
     let mut builder = congestion::RoutingSinkBuilder::new();
-    let metadata_rx = builder.metadata_receiver();
+    let metadata_src_rx = builder.metadata_receiver(congestion::Side::Source);
+    let metadata_dst_rx = builder.metadata_receiver(congestion::Side::Destination);
     let sink = std::sync::Arc::new(builder.build());
     congestion::install_sample_sink(sink.clone());
-    let (unit, decision_rx) = congestion::ControlUnit::new(vegas, metadata_rx, auto.tick_interval);
-    runtime.spawn(unit.run());
-    // Combined adapter + drop-monitor task. Handling both here means the
-    // monitor stops when the control unit goes away (decision channel
-    // closes), rather than living as an independent infinite loop.
-    runtime.spawn(auto_meta::run_adapter(decision_rx, sink));
+    for (side, metadata_rx) in [
+        (congestion::Side::Source, metadata_src_rx),
+        (congestion::Side::Destination, metadata_dst_rx),
+    ] {
+        let vegas = congestion::VegasController::new(congestion::VegasConfig {
+            initial_cwnd: auto.initial_cwnd,
+            min_cwnd: auto.min_cwnd,
+            max_cwnd: auto.max_cwnd,
+            alpha: auto.alpha,
+            beta: auto.beta,
+            ewma_alpha: auto.ewma_alpha,
+            increase_step: auto.increase_step,
+            decrease_step: auto.decrease_step,
+            min_latency_max_age: auto.min_latency_max_age,
+        });
+        let (unit, decision_rx) =
+            congestion::ControlUnit::new(vegas, metadata_rx, auto.tick_interval);
+        runtime.spawn(unit.run());
+        // One adapter+monitor per side. Both share the same RoutingSink
+        // (drop accounting is process-wide), but each gates its own
+        // throttle::Side and watches its own decision stream.
+        runtime.spawn(auto_meta::run_adapter(side, decision_rx, sink.clone()));
+    }
     tracing::info!(
-        "auto-meta-throttle enabled: initial_cwnd={}, max_cwnd={}, alpha={}, beta={}, tick={:?}",
+        "auto-meta-throttle enabled (per-side controllers): \
+         initial_cwnd={}, max_cwnd={}, alpha={}, beta={}, tick={:?}",
         auto.initial_cwnd,
         auto.max_cwnd,
         auto.alpha,
@@ -1217,7 +1236,8 @@ where
 /// decisions.
 fn reset_process_throttle_state() {
     congestion::clear_sample_sink();
-    throttle::set_max_ops_in_flight(0);
+    throttle::set_max_ops_in_flight(throttle::Side::Source, 0);
+    throttle::set_max_ops_in_flight(throttle::Side::Destination, 0);
     throttle::disable_ops_throttle();
 }
 

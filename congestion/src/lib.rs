@@ -50,6 +50,8 @@ mod vegas;
 pub use control_loop::{ControlUnit, DEFAULT_TICK_INTERVAL, RoutingSink, RoutingSinkBuilder};
 pub use controller::{Controller, Decision, Outcome, Sample};
 pub use fixed::FixedController;
-pub use measurement::{Probe, ResourceKind, SampleSink, clear_sample_sink, install_sample_sink};
+pub use measurement::{
+    Probe, ResourceKind, SampleSink, Side, clear_sample_sink, install_sample_sink,
+};
 pub use noop::NoopController;
 pub use vegas::{VegasConfig, VegasController};

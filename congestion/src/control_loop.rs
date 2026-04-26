@@ -24,7 +24,7 @@
 //! [`RoutingSink::dropped_samples`] for diagnostics.
 
 use crate::controller::{Controller, Decision, Sample};
-use crate::measurement::{ResourceKind, SampleSink};
+use crate::measurement::{ResourceKind, SampleSink, Side};
 
 /// Default cadence at which a control unit calls `on_tick`.
 pub const DEFAULT_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -120,7 +120,8 @@ impl<C: Controller + 'static> ControlUnit<C> {
 /// dropped rather than blocking or allocating; the drop count is exposed
 /// by [`RoutingSink::dropped_samples`].
 pub struct RoutingSink {
-    metadata: Option<tokio::sync::mpsc::Sender<Sample>>,
+    metadata_src: Option<tokio::sync::mpsc::Sender<Sample>>,
+    metadata_dst: Option<tokio::sync::mpsc::Sender<Sample>>,
     read: Option<tokio::sync::mpsc::Sender<Sample>>,
     write: Option<tokio::sync::mpsc::Sender<Sample>>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -137,7 +138,8 @@ impl RoutingSink {
 impl SampleSink for RoutingSink {
     fn record(&self, kind: ResourceKind, sample: &Sample) {
         let tx = match kind {
-            ResourceKind::MetadataOps => self.metadata.as_ref(),
+            ResourceKind::Metadata(Side::Source) => self.metadata_src.as_ref(),
+            ResourceKind::Metadata(Side::Destination) => self.metadata_dst.as_ref(),
             ResourceKind::DataRead => self.read.as_ref(),
             ResourceKind::DataWrite => self.write.as_ref(),
         };
@@ -160,7 +162,8 @@ impl SampleSink for RoutingSink {
 /// call registers a channel for the corresponding [`ResourceKind`] and
 /// returns the receiver the caller must hand to a [`ControlUnit`].
 pub struct RoutingSinkBuilder {
-    metadata: Option<tokio::sync::mpsc::Sender<Sample>>,
+    metadata_src: Option<tokio::sync::mpsc::Sender<Sample>>,
+    metadata_dst: Option<tokio::sync::mpsc::Sender<Sample>>,
     read: Option<tokio::sync::mpsc::Sender<Sample>>,
     write: Option<tokio::sync::mpsc::Sender<Sample>>,
     capacity: usize,
@@ -170,7 +173,8 @@ pub struct RoutingSinkBuilder {
 impl Default for RoutingSinkBuilder {
     fn default() -> Self {
         Self {
-            metadata: None,
+            metadata_src: None,
+            metadata_dst: None,
             read: None,
             write: None,
             capacity: DEFAULT_CHANNEL_CAPACITY,
@@ -188,10 +192,15 @@ impl RoutingSinkBuilder {
         self.capacity = capacity.max(1);
         self
     }
-    /// Register a channel for metadata samples and return its receiver.
-    pub fn metadata_receiver(&mut self) -> tokio::sync::mpsc::Receiver<Sample> {
+    /// Register a channel for metadata samples on the given [`Side`] and
+    /// return its receiver. Each side has its own channel so source-side
+    /// and destination-side controllers run independently.
+    pub fn metadata_receiver(&mut self, side: Side) -> tokio::sync::mpsc::Receiver<Sample> {
         let (tx, rx) = tokio::sync::mpsc::channel(self.capacity);
-        self.metadata = Some(tx);
+        match side {
+            Side::Source => self.metadata_src = Some(tx),
+            Side::Destination => self.metadata_dst = Some(tx),
+        }
         rx
     }
     /// Register a channel for read-throughput samples and return its receiver.
@@ -208,7 +217,8 @@ impl RoutingSinkBuilder {
     }
     pub fn build(self) -> RoutingSink {
         RoutingSink {
-            metadata: self.metadata,
+            metadata_src: self.metadata_src,
+            metadata_dst: self.metadata_dst,
             read: self.read,
             write: self.write,
             dropped: self.dropped,
@@ -287,11 +297,11 @@ mod tests {
     #[tokio::test]
     async fn routing_sink_dispatches_by_resource_kind() {
         let mut builder = RoutingSinkBuilder::new();
-        let mut meta_rx = builder.metadata_receiver();
+        let mut meta_rx = builder.metadata_receiver(Side::Source);
         let mut read_rx = builder.read_receiver();
         let sink = builder.build();
         // metadata sample reaches metadata_rx
-        sink.record(ResourceKind::MetadataOps, &make_sample(2));
+        sink.record(ResourceKind::Metadata(Side::Source), &make_sample(2));
         let s = meta_rx.recv().await.expect("metadata sample delivered");
         assert_eq!(s.bytes, 0);
         // read sample reaches read_rx
@@ -307,10 +317,10 @@ mod tests {
     async fn routing_sink_counts_dropped_samples_when_channel_is_full() {
         // tight capacity + no receiver draining → excess samples are dropped.
         let mut builder = RoutingSinkBuilder::new().with_capacity(2);
-        let _meta_rx = builder.metadata_receiver();
+        let _meta_rx = builder.metadata_receiver(Side::Source);
         let sink = builder.build();
         for _ in 0..5 {
-            sink.record(ResourceKind::MetadataOps, &make_sample(1));
+            sink.record(ResourceKind::Metadata(Side::Source), &make_sample(1));
         }
         // first 2 fit in the channel buffer; remaining 3 are dropped.
         assert_eq!(sink.dropped_samples(), 3);
@@ -323,10 +333,10 @@ mod tests {
         // `cargo test`'s threaded runner.
         let _guard = crate::measurement::SINK_GUARD.lock().await;
         let mut builder = RoutingSinkBuilder::new();
-        let mut meta_rx = builder.metadata_receiver();
+        let mut meta_rx = builder.metadata_receiver(Side::Source);
         let sink = builder.build();
         install_sample_sink(std::sync::Arc::new(sink));
-        Probe::start_metadata().complete_ok(0);
+        Probe::start_metadata(Side::Source).complete_ok(0);
         let s = meta_rx.recv().await.expect("sample flowed through");
         assert_eq!(s.bytes, 0);
         clear_sample_sink();
