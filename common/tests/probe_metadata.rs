@@ -1,4 +1,4 @@
-//! Integration test verifying that the tree-walk metadata probes wired into
+//! Integration test verifying that the per-syscall metadata probes wired into
 //! `common::rm`, `common::copy`, and `common::link` actually emit samples
 //! when a `SampleSink` is installed.
 //!
@@ -81,11 +81,6 @@ async fn rm_emits_one_metadata_sample_per_tree_entry() {
     congestion::clear_sample_sink();
     assert_eq!(result.directories_removed, 3);
     assert_eq!(result.files_removed, 3);
-    // Source-side walk: one probe per directory entry the walk discovered —
-    // a, b, 1.txt, 2.txt, 3.txt = 5 entries. (rm walks the source tree to
-    // find what to delete; from the controller's standpoint that's a
-    // source-side walk even though the actual delete syscalls hit dst.)
-    assert_eq!(sink.walk_count_for(congestion::Side::Source), 5);
     // Source-side metadata: 1 stat for the top-level path before walking.
     assert!(sink.metadata_count_for(congestion::Side::Source) >= 1);
     // Destination-side metadata: one probe per mutation — 3 remove_file
@@ -93,11 +88,7 @@ async fn rm_emits_one_metadata_sample_per_tree_entry() {
     assert_eq!(sink.metadata_count_for(congestion::Side::Destination), 6);
     // every sample should have a non-zero latency; an all-zero result would
     // mean the probe is bracketing something that isn't a syscall.
-    for s in sink
-        .walk_samples()
-        .iter()
-        .chain(sink.metadata_samples().iter())
-    {
+    for s in sink.metadata_samples().iter() {
         assert!(
             s.latency() > std::time::Duration::ZERO,
             "sample latency must be non-zero: {:?}",
@@ -125,111 +116,50 @@ async fn copy_emits_one_metadata_sample_per_tree_entry() {
     .await
     .expect("copy succeeds");
     congestion::clear_sample_sink();
-    // Source-side walk: one probe per src entry — 5 entries.
-    assert_eq!(sink.walk_count_for(congestion::Side::Source), 5);
-    // Destination-side metadata: at least the 3 create_dir probes for
-    // root + a + b. With preserve_all() each of the 3 dirs and 3 files
-    // also incurs preserve probes (chown + chmod + utimens, plus an
-    // open for files), so we just sanity-check non-zero. Specifically
-    // brittle counts for preserve probes are exercised in the
-    // controller-level tests, not here.
-    assert!(
-        sink.metadata_count_for(congestion::Side::Destination) >= 3,
-        "expected at least 3 dst metadata probes (create_dir × 3), got {}",
-        sink.metadata_count_for(congestion::Side::Destination)
+    // Source-side metadata: one symlink_metadata per copy_internal call —
+    // 6 entries (root + a + b + 3 .txt files) = 6 src probes.
+    assert_eq!(
+        sink.metadata_count_for(congestion::Side::Source),
+        6,
+        "expected 6 src metadata probes (one symlink_metadata per entry)",
     );
-}
-
-/// Regression test for a deadlock that occurs when the ops-in-flight
-/// permit is held across a spawned task's `join_set.join_next()` await.
-///
-/// With cwnd=1 and any tree depth >= 2, the parent task would hold the
-/// only permit while waiting for children; children would block forever
-/// trying to acquire. The fix is to scope the permit tightly around the
-/// actual syscalls in the tree-walk loop so it is released before the
-/// join — which this test pins down.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rm_on_deep_tree_does_not_deadlock_at_cwnd_one() {
-    let _guard = SINK_GUARD.lock().await;
-    // install the full auto-meta pipeline with cwnd == 1 so any
-    // held-across-join semantics would trigger immediately. The walk
-    // helpers used by `rm` route through SrcWalk, so that's the
-    // resource we cap.
-    let mut builder = congestion::RoutingSinkBuilder::new();
-    let walk_rx = builder.walk_receiver(congestion::Side::Source);
-    congestion::install_sample_sink(std::sync::Arc::new(builder.build()));
-    throttle::set_max_ops_in_flight(throttle::Resource::SrcWalk, 1);
-    let vegas = congestion::VegasController::new(congestion::VegasConfig {
-        initial_cwnd: 1,
-        min_cwnd: 1,
-        max_cwnd: 1,
-        ..congestion::VegasConfig::default()
-    });
-    let (unit, _decision_rx, _snapshot_rx) = congestion::ControlUnit::new(
-        "test-walk-src",
-        vegas,
-        walk_rx,
-        std::time::Duration::from_millis(50),
+    // Destination-side metadata for the 6 entries:
+    //   - 3 dirs:  1 create_dir + 3 preserve (chown + chmod + utimens) = 4 each
+    //   - 3 files: 4 preserve (chown + open + chmod + utimens)         = 4 each
+    // tokio::fs::copy itself is unprobed (data-path), so 6 × 4 = 24 dst.
+    assert_eq!(
+        sink.metadata_count_for(congestion::Side::Destination),
+        24,
+        "expected 24 dst metadata probes (4 per entry × 6 entries)",
     );
-    let ctrl_handle = unit.spawn();
-    let tmp = make_tempdir("deadlock").await;
-    let root = tmp.join("deep");
-    // 5-deep chain: deep/d1/d2/d3/d4/leaf.txt
-    let mut path = root.clone();
-    for _ in 0..5 {
-        path.push("d");
-        tokio::fs::create_dir_all(&path).await.expect("mkdir");
-    }
-    tokio::fs::write(path.join("leaf.txt"), b"x")
-        .await
-        .expect("leaf file");
-    // 5-second watchdog: pre-fix this call hangs forever at cwnd=1.
-    let rm_fut = rm::rm(
-        &PROGRESS,
-        &root,
-        &rm::Settings {
-            fail_early: false,
-            filter: None,
-            dry_run: None,
-            time_filter: None,
-        },
-    );
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), rm_fut)
-        .await
-        .expect("rm completed within 5s — deadlock detected if timeout fired")
-        .expect("rm succeeded");
-    congestion::clear_sample_sink();
-    throttle::set_max_ops_in_flight(throttle::Resource::SrcWalk, 0);
-    ctrl_handle.abort();
-    assert_eq!(result.directories_removed, 6);
-    assert_eq!(result.files_removed, 1);
 }
 
 /// End-to-end integration test for the auto-meta-throttle pipeline:
 /// Probe -> RoutingSink -> ControlUnit<VegasController> -> Decision watch.
 ///
 /// Doesn't drive throttle::set_max_ops_in_flight (that's validated in the
-/// congestion unit tests). Asserts only that the full pipeline flows:
-/// running a real rm over a tree moves the controller's cwnd away from the
-/// initial UNLIMITED watch value, proving every layer is wired correctly.
+/// congestion unit tests). Asserts that the full pipeline flows: running
+/// a real rm over a tree results in the controller actually consuming
+/// metadata samples (visible via the snapshot's `samples_seen` counter).
 #[tokio::test]
 async fn auto_meta_pipeline_propagates_probes_to_controller() {
     let _guard = SINK_GUARD.lock().await;
-    // Tap the walk-source channel: rm walks the src tree, so its
-    // probes land there. (The pipeline being exercised is the same
-    // regardless of which channel we tap; pick the one with the
-    // most samples to keep this assertion robust.)
+    // Tap the metadata-destination channel: rm's per-file unlinks and
+    // dir removals all hit the destination side, so its probes land
+    // there. (The pipeline being exercised is the same regardless of
+    // which channel we tap; pick the one with the most samples to keep
+    // this assertion robust.)
     let mut builder = congestion::RoutingSinkBuilder::new();
-    let walk_rx = builder.walk_receiver(congestion::Side::Source);
+    let metadata_rx = builder.metadata_receiver(congestion::Side::Destination);
     congestion::install_sample_sink(std::sync::Arc::new(builder.build()));
     let controller = congestion::VegasController::new(congestion::VegasConfig {
         initial_cwnd: 5,
         ..congestion::VegasConfig::default()
     });
-    let (unit, decision_rx, _snapshot_rx) = congestion::ControlUnit::new(
+    let (unit, decision_rx, mut snapshot_rx) = congestion::ControlUnit::new(
         "pipeline-test",
         controller,
-        walk_rx,
+        metadata_rx,
         std::time::Duration::from_millis(20),
     );
     let handle = unit.spawn();
@@ -241,7 +171,11 @@ async fn auto_meta_pipeline_propagates_probes_to_controller() {
         Some(5),
         "ControlUnit must publish the initial cwnd on startup",
     );
-    // walk a tree; probes fire on each entry and flow through the sink
+    // baseline the snapshot sample count; the assertion below only
+    // counts samples observed AFTER this point.
+    let samples_before = snapshot_rx.borrow_and_update().samples_seen;
+    // walk a tree; probes fire on each metadata syscall and flow through the sink.
+    // small_tree under root yields 6 dst probes (3 remove_file + 3 remove_dir).
     let tmp = make_tempdir("pipeline").await;
     let root = tmp.join("tree");
     make_small_tree(&root).await.expect("create tree");
@@ -259,50 +193,26 @@ async fn auto_meta_pipeline_propagates_probes_to_controller() {
     .expect("rm succeeds");
     // give the ControlUnit time to consume samples across a few ticks
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    // first sample-bearing tick is the bootstrap (baseline establishment);
-    // by 100ms / 20ms = 5 ticks, a well-behaved controller has had ample
-    // opportunity to adjust cwnd in response to real samples.
+    let final_snapshot = *snapshot_rx.borrow();
     let final_decision = *decision_rx.borrow();
     congestion::clear_sample_sink();
     handle.abort();
+    // The controller must have ingested the samples that flowed through
+    // the routing sink. With the small_tree fixture, rm produces 6 dst
+    // probes (3 remove_file + 3 remove_dir); samples_seen is monotonic
+    // and any positive delta proves probes -> sink -> control unit ->
+    // controller all wired correctly.
+    let samples_after = final_snapshot.samples_seen;
+    assert!(
+        samples_after > samples_before,
+        "controller must consume samples — saw {} before rm and {} after",
+        samples_before,
+        samples_after,
+    );
     assert!(
         final_decision.max_in_flight.is_some(),
         "pipeline must keep publishing concrete decisions",
     );
-}
-
-#[tokio::test]
-async fn cmp_emits_one_metadata_sample_per_tree_entry() {
-    // cmp walks both the src AND the dst directories. With src and dst
-    // controllers split, each side gets exactly its own walk's probes —
-    // 5 entries each on identical 5-entry trees.
-    let _guard = SINK_GUARD.lock().await;
-    let sink = install_sink();
-    let tmp = make_tempdir("cmp_samples").await;
-    let src = tmp.join("src");
-    let dst = tmp.join("dst");
-    make_small_tree(&src).await.expect("create src tree");
-    make_small_tree(&dst).await.expect("create dst tree");
-    let log = common::cmp::LogWriter::silent().await.expect("silent log");
-    common::cmp::cmp(
-        &PROGRESS,
-        &src,
-        &dst,
-        &log,
-        &common::cmp::Settings {
-            fail_early: false,
-            exit_early: false,
-            expand_missing: false,
-            compare: Default::default(),
-            filter: None,
-        },
-    )
-    .await
-    .expect("cmp succeeds");
-    congestion::clear_sample_sink();
-    // cmp walks both src and dst, so each side gets 5 walk probes.
-    assert_eq!(sink.walk_count_for(congestion::Side::Source), 5);
-    assert_eq!(sink.walk_count_for(congestion::Side::Destination), 5);
 }
 
 #[tokio::test]
@@ -326,24 +236,23 @@ async fn filegen_emits_metadata_samples_for_created_dirs_and_files() {
         .expect("filegen succeeds");
     congestion::clear_sample_sink();
     // filegen probes only the destination-side mutations (mkdir + open)
-    // — there's no source tree to walk. At least 8: 2 create_dir + 6
-    // file opens. There's no walk-src activity at all.
+    // — there's no source tree. At least 8: 2 create_dir + 6 file opens.
     assert!(
         sink.metadata_count_for(congestion::Side::Destination) >= 8,
         "expected at least 8 dst metadata probes, got {}",
         sink.metadata_count_for(congestion::Side::Destination)
     );
-    assert_eq!(sink.walk_count(), 0);
 }
 
 #[tokio::test]
 async fn link_update_path_emits_probes_for_update_tree() {
-    // Regression: the update walk (for entries present in `update/` but
-    // not in `src/`) was iterating with a raw next_entry() and bypassed
-    // both probing and cwnd gating. This test pins down that it now
-    // probes. With src holding the small-tree (5 probes on src walk)
-    // and update holding 3 unique top-level files, we expect 5 src
-    // probes + 3 update probes = 8 total.
+    // Pins the per-file metadata probes that fire when `link` processes
+    // entries present in `update/` but not in `src/`. These end up on
+    // the spawned `copy::copy` calls inside the update-walk segment of
+    // `link_internal`; if that segment regressed and stopped invoking
+    // copy (or invoked it without probes), the dst count would drop by
+    // the 4 preserve probes per update file (× 3 = 12) and the src
+    // count would drop by the per-file `symlink_metadata` (× 3 = 3).
     let _guard = SINK_GUARD.lock().await;
     let sink = install_sink();
     let tmp = make_tempdir("link_update_samples").await;
@@ -380,17 +289,25 @@ async fn link_update_path_emits_probes_for_update_tree() {
     .await
     .expect("link succeeds");
     congestion::clear_sample_sink();
-    // src walk: 5 entries (small-tree) + 3 update files = 8 walk probes.
-    assert_eq!(sink.walk_count_for(congestion::Side::Source), 8);
-    // dst metadata probes: at least 6 — 3 create_dir (root, a, b) +
-    // 3 hard_link (the small-tree .txt files). With preserve_all()
-    // each of the 6 entries also incurs additional preserve probes
-    // (chown + chmod + utimens, and File::open for files), so we
-    // assert a lower bound rather than an exact count.
-    assert!(
-        sink.metadata_count_for(congestion::Side::Destination) >= 6,
-        "expected at least 6 dst metadata probes, got {}",
-        sink.metadata_count_for(congestion::Side::Destination)
+    // Source-side: 6 link_internal symlink_metadata(src) calls (root + a +
+    // b + 3 .txt) + 1 top-level symlink_metadata(update) (succeeds, dirs
+    // only at top level — recursive update lookups for src/{a,b,*.txt}
+    // are NotFound, so their probes are discarded) + 3 copy_internal
+    // symlink_metadata calls (one per u*.txt under update) = 10.
+    assert_eq!(
+        sink.metadata_count_for(congestion::Side::Source),
+        10,
+        "expected 10 src metadata probes — drops to 7 if the update-walk \
+         path stops spawning copies for u*.txt",
+    );
+    // Destination-side: 15 from the small-tree link (see
+    // link_emits_one_metadata_sample_per_tree_entry) + 12 for the 3
+    // update-only files (4 preserve probes per file via copy_file) = 27.
+    assert_eq!(
+        sink.metadata_count_for(congestion::Side::Destination),
+        27,
+        "expected 27 dst metadata probes — drops to 15 if the update-walk \
+         path stops spawning copies for u*.txt",
     );
 }
 
@@ -421,14 +338,20 @@ async fn link_emits_one_metadata_sample_per_tree_entry() {
     .await
     .expect("link succeeds");
     congestion::clear_sample_sink();
-    // Source-side: 5 walk probes for the small-tree.
-    assert_eq!(sink.walk_count_for(congestion::Side::Source), 5);
-    // Destination-side metadata: at least 6 — 3 hard_link + 3
-    // create_dir. preserve_all() pulls in additional probes per
-    // entry, so we just assert a lower bound here.
-    assert!(
-        sink.metadata_count_for(congestion::Side::Destination) >= 6,
-        "expected at least 6 dst metadata probes, got {}",
-        sink.metadata_count_for(congestion::Side::Destination)
+    // Source-side metadata: one symlink_metadata per link_internal call —
+    // 6 entries (root + a + b + 3 .txt files) = 6 src probes.
+    assert_eq!(
+        sink.metadata_count_for(congestion::Side::Source),
+        6,
+        "expected 6 src metadata probes (one symlink_metadata per entry)",
+    );
+    // Destination-side metadata for the 6 entries:
+    //   - 3 dirs:  1 create_dir + 3 preserve (chown + chmod + utimens) = 4 each
+    //   - 3 files: 1 hard_link (no preserve in hard_link_helper)       = 1 each
+    // Total: 12 + 3 = 15 dst.
+    assert_eq!(
+        sink.metadata_count_for(congestion::Side::Destination),
+        15,
+        "expected 15 dst metadata probes (4 per dir × 3 + 1 per file × 3)",
     );
 }

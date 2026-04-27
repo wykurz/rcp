@@ -84,7 +84,7 @@ impl<C: Controller + 'static> ControlUnit<C> {
     ///
     /// `label` is a short, stable string that identifies this unit in
     /// log events and in the snapshot registry (e.g. `"meta-src"`,
-    /// `"walk-dst"`). Multiple units of the same controller type are
+    /// `"meta-dst"`). Multiple units of the same controller type are
     /// typical, so using only the controller name would make logs
     /// ambiguous.
     pub fn new(
@@ -204,8 +204,6 @@ impl<C: Controller + 'static> ControlUnit<C> {
 /// dropped rather than blocking or allocating; the drop count is exposed
 /// by [`RoutingSink::dropped_samples`].
 pub struct RoutingSink {
-    walk_src: Option<tokio::sync::mpsc::Sender<Sample>>,
-    walk_dst: Option<tokio::sync::mpsc::Sender<Sample>>,
     metadata_src: Option<tokio::sync::mpsc::Sender<Sample>>,
     metadata_dst: Option<tokio::sync::mpsc::Sender<Sample>>,
     read: Option<tokio::sync::mpsc::Sender<Sample>>,
@@ -224,8 +222,6 @@ impl RoutingSink {
 impl SampleSink for RoutingSink {
     fn record(&self, kind: ResourceKind, sample: &Sample) {
         let tx = match kind {
-            ResourceKind::Walk(Side::Source) => self.walk_src.as_ref(),
-            ResourceKind::Walk(Side::Destination) => self.walk_dst.as_ref(),
             ResourceKind::Metadata(Side::Source) => self.metadata_src.as_ref(),
             ResourceKind::Metadata(Side::Destination) => self.metadata_dst.as_ref(),
             ResourceKind::DataRead => self.read.as_ref(),
@@ -250,8 +246,6 @@ impl SampleSink for RoutingSink {
 /// call registers a channel for the corresponding [`ResourceKind`] and
 /// returns the receiver the caller must hand to a [`ControlUnit`].
 pub struct RoutingSinkBuilder {
-    walk_src: Option<tokio::sync::mpsc::Sender<Sample>>,
-    walk_dst: Option<tokio::sync::mpsc::Sender<Sample>>,
     metadata_src: Option<tokio::sync::mpsc::Sender<Sample>>,
     metadata_dst: Option<tokio::sync::mpsc::Sender<Sample>>,
     read: Option<tokio::sync::mpsc::Sender<Sample>>,
@@ -263,8 +257,6 @@ pub struct RoutingSinkBuilder {
 impl Default for RoutingSinkBuilder {
     fn default() -> Self {
         Self {
-            walk_src: None,
-            walk_dst: None,
             metadata_src: None,
             metadata_dst: None,
             read: None,
@@ -283,19 +275,6 @@ impl RoutingSinkBuilder {
     pub fn with_capacity(mut self, capacity: usize) -> Self {
         self.capacity = capacity.max(1);
         self
-    }
-    /// Register a channel for walk-class samples on the given [`Side`]
-    /// and return its receiver. The walk class is for directory
-    /// iteration (`getdents` + cached `file_type`) — kept separate
-    /// from per-file metadata syscalls because the latency regimes
-    /// differ.
-    pub fn walk_receiver(&mut self, side: Side) -> tokio::sync::mpsc::Receiver<Sample> {
-        let (tx, rx) = tokio::sync::mpsc::channel(self.capacity);
-        match side {
-            Side::Source => self.walk_src = Some(tx),
-            Side::Destination => self.walk_dst = Some(tx),
-        }
-        rx
     }
     /// Register a channel for per-file metadata samples on the given
     /// [`Side`] and return its receiver. Covers single metadata
@@ -323,8 +302,6 @@ impl RoutingSinkBuilder {
     }
     pub fn build(self) -> RoutingSink {
         RoutingSink {
-            walk_src: self.walk_src,
-            walk_dst: self.walk_dst,
             metadata_src: self.metadata_src,
             metadata_dst: self.metadata_dst,
             read: self.read,

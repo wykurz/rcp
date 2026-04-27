@@ -18,8 +18,6 @@ pub struct CollectingSink {
 
 #[derive(Default)]
 struct CollectingInner {
-    walk_src: Vec<Sample>,
-    walk_dst: Vec<Sample>,
     metadata_src: Vec<Sample>,
     metadata_dst: Vec<Sample>,
     read: Vec<Sample>,
@@ -29,19 +27,6 @@ struct CollectingInner {
 impl CollectingSink {
     pub fn new() -> Self {
         Self::default()
-    }
-    /// Total number of walk samples recorded across both sides.
-    pub fn walk_count(&self) -> usize {
-        let inner = self.inner.lock().expect("collecting sink mutex poisoned");
-        inner.walk_src.len() + inner.walk_dst.len()
-    }
-    /// Number of walk samples recorded for the given [`Side`].
-    pub fn walk_count_for(&self, side: Side) -> usize {
-        let inner = self.inner.lock().expect("collecting sink mutex poisoned");
-        match side {
-            Side::Source => inner.walk_src.len(),
-            Side::Destination => inner.walk_dst.len(),
-        }
     }
     /// Total number of metadata samples recorded across both sides.
     pub fn metadata_count(&self) -> usize {
@@ -71,21 +56,6 @@ impl CollectingSink {
             .expect("collecting sink mutex poisoned")
             .write
             .len()
-    }
-    /// Snapshot of all walk samples recorded so far, both sides combined.
-    pub fn walk_samples(&self) -> Vec<Sample> {
-        let inner = self.inner.lock().expect("collecting sink mutex poisoned");
-        let mut out = inner.walk_src.clone();
-        out.extend(inner.walk_dst.iter().copied());
-        out
-    }
-    /// Snapshot of all walk samples recorded so far for the given [`Side`].
-    pub fn walk_samples_for(&self, side: Side) -> Vec<Sample> {
-        let inner = self.inner.lock().expect("collecting sink mutex poisoned");
-        match side {
-            Side::Source => inner.walk_src.clone(),
-            Side::Destination => inner.walk_dst.clone(),
-        }
     }
     /// Snapshot of all metadata samples recorded so far, both sides combined.
     pub fn metadata_samples(&self) -> Vec<Sample> {
@@ -121,8 +91,6 @@ impl CollectingSink {
     /// Forget everything recorded so far. Useful between test phases.
     pub fn reset(&self) {
         let mut inner = self.inner.lock().expect("collecting sink mutex poisoned");
-        inner.walk_src.clear();
-        inner.walk_dst.clear();
         inner.metadata_src.clear();
         inner.metadata_dst.clear();
         inner.read.clear();
@@ -134,8 +102,6 @@ impl SampleSink for CollectingSink {
     fn record(&self, kind: ResourceKind, sample: &Sample) {
         let mut inner = self.inner.lock().expect("collecting sink mutex poisoned");
         match kind {
-            ResourceKind::Walk(Side::Source) => inner.walk_src.push(*sample),
-            ResourceKind::Walk(Side::Destination) => inner.walk_dst.push(*sample),
             ResourceKind::Metadata(Side::Source) => inner.metadata_src.push(*sample),
             ResourceKind::Metadata(Side::Destination) => inner.metadata_dst.push(*sample),
             ResourceKind::DataRead => inner.read.push(*sample),
