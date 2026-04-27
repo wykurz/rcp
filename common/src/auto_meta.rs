@@ -530,7 +530,8 @@ mod tests {
             let metadata_rx = builder.metadata_receiver(side);
             let sink = std::sync::Arc::new(builder.build());
             congestion::install_sample_sink(sink.clone());
-            let (unit, decision_rx) = ControlUnit::new("test", controller, metadata_rx, tick);
+            let (unit, decision_rx, _snapshot_rx) =
+                ControlUnit::new("test", controller, metadata_rx, tick);
             let unit_handle = unit.spawn();
             let adapter_handle = tokio::spawn(run_adapter(resource, true, decision_rx, sink));
             (unit_handle, adapter_handle)
@@ -695,7 +696,7 @@ mod tests {
             let metadata_rx = builder.metadata_receiver(side);
             let sink = std::sync::Arc::new(builder.build());
             congestion::install_sample_sink(sink.clone());
-            let (unit, decision_rx) = ControlUnit::new(
+            let (unit, decision_rx, _snapshot_rx) = ControlUnit::new(
                 "test",
                 FixedController::with_concurrency(1),
                 metadata_rx,

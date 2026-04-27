@@ -81,6 +81,36 @@ impl Decision {
     }
 }
 
+/// Read-only view of a controller's internal state, intended for the
+/// progress bar and other observability surfaces.
+///
+/// Snapshots are sampled — never authoritative for enforcement. They
+/// expose the same fields a Vegas-style controller reasons about
+/// (`cwnd`, baseline, smoothed observed latency, sample count) so a
+/// renderer can show *why* the current `cwnd` is what it is. Controllers
+/// without a meaningful internal state (e.g. `Noop`) return
+/// [`ControllerSnapshot::default`]; controllers without a latency
+/// signal (e.g. `Fixed`) populate `cwnd` only and leave the latency
+/// fields at zero.
+///
+/// `latency_ratio` is intentionally not pre-computed — the renderer
+/// derives it from `ewma_latency / min_latency` so there is one source
+/// of truth.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ControllerSnapshot {
+    /// Current concurrency window the controller would emit on its
+    /// next tick. `0` means "no cap configured."
+    pub cwnd: u32,
+    /// Lowest latency observed, the controller's uncongested baseline.
+    /// `Duration::ZERO` if no signal yet.
+    pub min_latency: std::time::Duration,
+    /// EWMA-smoothed observed latency. `Duration::ZERO` if no
+    /// sample-bearing tick has fired yet.
+    pub ewma_latency: std::time::Duration,
+    /// Cumulative number of samples the controller has consumed.
+    pub samples_seen: u64,
+}
+
 /// A pluggable congestion-control algorithm.
 ///
 /// A `Controller` is a stateful, synchronous state machine that consumes
@@ -103,6 +133,13 @@ pub trait Controller: Send {
     /// Short, stable identifier used in logs and metrics (e.g. "noop",
     /// "fixed", "vegas").
     fn name(&self) -> &'static str;
+    /// Snapshot of the controller's observable state for diagnostics
+    /// and progress display. Default returns an empty snapshot, which
+    /// is appropriate for controllers that have no meaningful internal
+    /// state to surface.
+    fn snapshot(&self) -> ControllerSnapshot {
+        ControllerSnapshot::default()
+    }
 }
 
 #[cfg(test)]

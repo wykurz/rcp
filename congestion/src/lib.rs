@@ -48,7 +48,7 @@ pub mod testing;
 mod vegas;
 
 pub use control_loop::{ControlUnit, DEFAULT_TICK_INTERVAL, RoutingSink, RoutingSinkBuilder};
-pub use controller::{Controller, Decision, Outcome, Sample};
+pub use controller::{Controller, ControllerSnapshot, Decision, Outcome, Sample};
 pub use fixed::FixedController;
 pub use measurement::{
     Probe, ResourceKind, SampleSink, Side, clear_sample_sink, install_sample_sink,

@@ -1,7 +1,7 @@
 //! A controller that honors a static, user-supplied budget. Matches the
 //! behavior of the existing manual `--ops-throttle` / `--iops-throttle` flags.
 
-use crate::controller::{Controller, Decision, Sample};
+use crate::controller::{Controller, ControllerSnapshot, Decision, Sample};
 
 /// Controller that always emits the same configured [`Decision`].
 ///
@@ -38,6 +38,12 @@ impl Controller for FixedController {
     }
     fn name(&self) -> &'static str {
         "fixed"
+    }
+    fn snapshot(&self) -> ControllerSnapshot {
+        ControllerSnapshot {
+            cwnd: self.decision.max_in_flight.unwrap_or(0),
+            ..ControllerSnapshot::default()
+        }
     }
 }
 
