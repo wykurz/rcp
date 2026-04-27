@@ -90,13 +90,21 @@ impl EntryKind {
     }
 }
 
-/// Map a [`congestion::Side`] to its [`throttle::Side`] counterpart. The
-/// two enums are intentionally independent — congestion has no
-/// dependency on throttle — but they're 1:1.
-fn throttle_side(side: congestion::Side) -> throttle::Side {
+/// Resolve the [`throttle::Resource`] for a single per-file metadata
+/// syscall (`stat`, `mkdir`, `unlink`, …) on the given [`congestion::Side`].
+fn meta_resource(side: congestion::Side) -> throttle::Resource {
     match side {
-        congestion::Side::Source => throttle::Side::Source,
-        congestion::Side::Destination => throttle::Side::Destination,
+        congestion::Side::Source => throttle::Resource::SrcMeta,
+        congestion::Side::Destination => throttle::Resource::DstMeta,
+    }
+}
+
+/// Resolve the [`throttle::Resource`] for directory iteration
+/// (`getdents` + cached `file_type`) on the given [`congestion::Side`].
+fn walk_resource(side: congestion::Side) -> throttle::Resource {
+    match side {
+        congestion::Side::Source => throttle::Resource::SrcWalk,
+        congestion::Side::Destination => throttle::Resource::DstWalk,
     }
 }
 
@@ -104,9 +112,10 @@ fn throttle_side(side: congestion::Side) -> throttle::Side {
 /// prologue applied:
 ///
 /// 1. Await the static ops rate gate.
-/// 2. Acquire the dynamic ops-in-flight permit on the given [`Side`] (a
-///    no-op when that side's cap is not configured).
-/// 3. Start a metadata [`congestion::Probe`] tagged with the same side —
+/// 2. Acquire the dynamic ops-in-flight permit on the walk resource for
+///    the given [`congestion::Side`] (a no-op when that resource's cap is not
+///    configured).
+/// 3. Start a walk-class [`congestion::Probe`] tagged with the same side —
 ///    *after* the permit is held, so self-inflicted queueing on the
 ///    in-flight semaphore is not reported back to the controller as
 ///    filesystem latency.
@@ -134,8 +143,8 @@ where
     F: FnOnce() -> String,
 {
     throttle::get_ops_token().await;
-    let ops_permit = throttle::ops_in_flight_permit(throttle_side(side)).await;
-    let probe = congestion::Probe::start_metadata(side);
+    let ops_permit = throttle::ops_in_flight_permit(walk_resource(side)).await;
+    let probe = congestion::Probe::start_walk(side);
     let maybe_entry = entries.next_entry().await.with_context(context)?;
     let Some(entry) = maybe_entry else {
         probe.discard();
@@ -157,7 +166,7 @@ where
 }
 
 /// Bracket a single metadata-producing future with the cwnd permit and a
-/// congestion probe on the given [`Side`]. The probe completes
+/// congestion probe on the given [`congestion::Side`]. The probe completes
 /// successfully when `op` returns `Ok`, and is discarded on error so
 /// error paths don't skew the controller's latency baseline.
 ///
@@ -179,7 +188,7 @@ pub async fn run_metadata_probed<F, T, E>(side: congestion::Side, op: F) -> Resu
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
-    let ops_permit = throttle::ops_in_flight_permit(throttle_side(side)).await;
+    let ops_permit = throttle::ops_in_flight_permit(meta_resource(side)).await;
     let probe = congestion::Probe::start_metadata(side);
     let result = op.await;
     match &result {

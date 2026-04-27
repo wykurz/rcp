@@ -120,10 +120,13 @@ pub async fn rm(
     if let Some(ref filter) = settings.filter {
         let path_name = path.file_name().map(std::path::Path::new);
         if let Some(name) = path_name {
-            let path_metadata = tokio::fs::symlink_metadata(path)
-                .await
-                .with_context(|| format!("failed reading metadata from {:?}", &path))
-                .map_err(|err| Error::new(err, Default::default()))?;
+            let path_metadata = crate::walk::run_metadata_probed(
+                congestion::Side::Source,
+                tokio::fs::symlink_metadata(path),
+            )
+            .await
+            .with_context(|| format!("failed reading metadata from {:?}", &path))
+            .map_err(|err| Error::new(err, Default::default()))?;
             let is_dir = path_metadata.is_dir();
             let result = filter.should_include_root_item(name, is_dir);
             match result {
@@ -153,10 +156,13 @@ async fn rm_internal(
 ) -> Result<Summary, Error> {
     let _ops_guard = prog_track.ops.guard();
     tracing::debug!("read path metadata");
-    let src_metadata = tokio::fs::symlink_metadata(path)
-        .await
-        .with_context(|| format!("failed reading metadata from {:?}", &path))
-        .map_err(|err| Error::new(err, Default::default()))?;
+    let src_metadata = crate::walk::run_metadata_probed(
+        congestion::Side::Source,
+        tokio::fs::symlink_metadata(path),
+    )
+    .await
+    .with_context(|| format!("failed reading metadata from {:?}", &path))
+    .map_err(|err| Error::new(err, Default::default()))?;
     if !src_metadata.is_dir() {
         tracing::debug!("not a directory, just remove");
         let is_symlink = src_metadata.file_type().is_symlink();

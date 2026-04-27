@@ -1091,19 +1091,26 @@ fn spawn_throttle_replenishers(runtime: &tokio::runtime::Runtime, throttle: &Thr
     }
 }
 
-/// Wire up the adaptive metadata-ops control loops — one per [`Side`]:
+/// Wire up the adaptive metadata-ops control loops — one per
+/// (side × class) [`throttle::Resource`] pair (4 in total):
 ///
-/// 1. Seed both per-side `OPS_IN_FLIGHT_LIMIT_*` semaphores with the
-///    controller's initial cwnd so the first probe on either side finds
-///    a permit available.
-/// 2. Install one `RoutingSink` that routes source-side metadata samples
-///    to a `ControlUnit<VegasController>` and destination-side samples to
-///    a separate `ControlUnit<VegasController>`.
-/// 3. Spawn one combined adapter/monitor task per side. Each forwards
-///    its controller's `Decision`s into the side's throttle gate and
-///    periodically surfaces any dropped samples. The tasks exit cleanly
-///    when their respective control unit stops publishing decisions, so
-///    they don't leak as unbounded background loops.
+/// 1. Seed every per-resource `OPS_IN_FLIGHT_LIMIT_*` semaphore with the
+///    controller's initial cwnd so the first probe on any resource
+///    finds a permit available.
+/// 2. Install one `RoutingSink` that fans walk and metadata samples out
+///    to four independent `ControlUnit<VegasController>`s — one per
+///    `(Walk|Metadata) × (Source|Destination)`. Splitting walk vs.
+///    metadata keeps cache-warm directory iteration from dragging the
+///    real-syscall baseline up; splitting source vs. destination keeps
+///    a saturated source from dragging the destination's cwnd down.
+/// 3. Spawn one combined adapter/monitor task per resource. Only one
+///    of the four (the destination metadata controller, by convention)
+///    drives the global ops-throttle rate gate — the global
+///    `OPS_THROTTLE` is shared, so multiple writers would fight. The
+///    other three apply only their concurrency caps.
+/// 4. Each adapter exits cleanly when its control unit stops
+///    publishing decisions, so they don't leak as unbounded background
+///    loops.
 ///
 /// Only one auto-meta config is supported per process. If a sample sink
 /// was already installed, it is silently replaced.
@@ -1111,19 +1118,48 @@ fn spawn_auto_meta_throttle(runtime: &tokio::runtime::Runtime, auto: AutoMetaThr
     let initial_cwnd = auto
         .initial_cwnd
         .clamp(auto.min_cwnd.max(1), auto.max_cwnd.max(1));
-    // Seed both sides with the same initial cwnd; each side then
-    // adapts independently from there.
-    throttle::set_max_ops_in_flight(throttle::Side::Source, initial_cwnd as usize);
-    throttle::set_max_ops_in_flight(throttle::Side::Destination, initial_cwnd as usize);
+    // Seed every resource with the same initial cwnd; each then adapts
+    // independently from there.
+    for resource in [
+        throttle::Resource::SrcWalk,
+        throttle::Resource::SrcMeta,
+        throttle::Resource::DstWalk,
+        throttle::Resource::DstMeta,
+    ] {
+        throttle::set_max_ops_in_flight(resource, initial_cwnd as usize);
+    }
     let mut builder = congestion::RoutingSinkBuilder::new();
+    let walk_src_rx = builder.walk_receiver(congestion::Side::Source);
+    let walk_dst_rx = builder.walk_receiver(congestion::Side::Destination);
     let metadata_src_rx = builder.metadata_receiver(congestion::Side::Source);
     let metadata_dst_rx = builder.metadata_receiver(congestion::Side::Destination);
     let sink = std::sync::Arc::new(builder.build());
     congestion::install_sample_sink(sink.clone());
-    for (side, metadata_rx) in [
-        (congestion::Side::Source, metadata_src_rx),
-        (congestion::Side::Destination, metadata_dst_rx),
-    ] {
+    // Four controllers — one per resource. Only the DstMeta adapter
+    // drives the global rate gate to avoid four writers fighting over a
+    // single shared `OPS_THROTTLE`.
+    let resources: [(
+        &'static str,
+        throttle::Resource,
+        tokio::sync::mpsc::Receiver<congestion::Sample>,
+        bool,
+    ); 4] = [
+        ("walk-src", throttle::Resource::SrcWalk, walk_src_rx, false),
+        ("walk-dst", throttle::Resource::DstWalk, walk_dst_rx, false),
+        (
+            "meta-src",
+            throttle::Resource::SrcMeta,
+            metadata_src_rx,
+            false,
+        ),
+        (
+            "meta-dst",
+            throttle::Resource::DstMeta,
+            metadata_dst_rx,
+            true,
+        ),
+    ];
+    for (label, resource, sample_rx, apply_rate) in resources {
         let vegas = congestion::VegasController::new(congestion::VegasConfig {
             initial_cwnd: auto.initial_cwnd,
             min_cwnd: auto.min_cwnd,
@@ -1136,16 +1172,18 @@ fn spawn_auto_meta_throttle(runtime: &tokio::runtime::Runtime, auto: AutoMetaThr
             min_latency_max_age: auto.min_latency_max_age,
         });
         let (unit, decision_rx) =
-            congestion::ControlUnit::new(vegas, metadata_rx, auto.tick_interval);
+            congestion::ControlUnit::new(label, vegas, sample_rx, auto.tick_interval);
         runtime.spawn(unit.run());
-        // One adapter+monitor per side. Both share the same RoutingSink
-        // (drop accounting is process-wide), but each gates its own
-        // throttle::Side and watches its own decision stream.
-        runtime.spawn(auto_meta::run_adapter(side, decision_rx, sink.clone()));
+        runtime.spawn(auto_meta::run_adapter(
+            resource,
+            apply_rate,
+            decision_rx,
+            sink.clone(),
+        ));
     }
     tracing::info!(
-        "auto-meta-throttle enabled (per-side controllers): \
-         initial_cwnd={}, max_cwnd={}, alpha={}, beta={}, tick={:?}",
+        "auto-meta-throttle enabled (per-resource controllers: walk-src, walk-dst, \
+         meta-src, meta-dst): initial_cwnd={}, max_cwnd={}, alpha={}, beta={}, tick={:?}",
         auto.initial_cwnd,
         auto.max_cwnd,
         auto.alpha,
@@ -1236,8 +1274,14 @@ where
 /// decisions.
 fn reset_process_throttle_state() {
     congestion::clear_sample_sink();
-    throttle::set_max_ops_in_flight(throttle::Side::Source, 0);
-    throttle::set_max_ops_in_flight(throttle::Side::Destination, 0);
+    for resource in [
+        throttle::Resource::SrcWalk,
+        throttle::Resource::SrcMeta,
+        throttle::Resource::DstWalk,
+        throttle::Resource::DstMeta,
+    ] {
+        throttle::set_max_ops_in_flight(resource, 0);
+    }
     throttle::disable_ops_throttle();
 }
 

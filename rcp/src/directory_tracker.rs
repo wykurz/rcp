@@ -277,7 +277,12 @@ impl DirectoryTracker {
         // handle empty directory cleanup for directories we created
         if was_created && !keep_if_empty {
             // try to remove if empty (best effort - may fail if not empty due to races)
-            match tokio::fs::remove_dir(dst).await {
+            match common::walk::run_metadata_probed(
+                common::Side::Destination,
+                tokio::fs::remove_dir(dst),
+            )
+            .await
+            {
                 Ok(()) => {
                     tracing::info!("Removed empty directory: {:?}", dst);
                     // don't apply metadata or increment counter for removed directories

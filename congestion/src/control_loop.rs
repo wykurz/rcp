@@ -41,7 +41,20 @@ pub const DEFAULT_CHANNEL_CAPACITY: usize = 4096;
 /// [`ControlUnit::spawn`]. The task runs until the sample channel's senders
 /// are all dropped (typically because [`clear_sample_sink`][crate::clear_sample_sink]
 /// was called and the RoutingSink went away).
+///
+/// # Logging
+///
+/// Each unit emits structured `tracing` events keyed by its [`label`] so
+/// multiple units can be told apart in mixed logs:
+///
+/// - `tracing::trace!` on every tick with the published [`Decision`].
+/// - `tracing::debug!` whenever the published decision differs from the
+///   prior tick's. This is the right level for watching cwnd evolve in
+///   production without drowning in per-tick noise.
+///
+/// [`label`]: ControlUnit::label
 pub struct ControlUnit<C: Controller> {
+    label: &'static str,
     controller: C,
     sample_rx: tokio::sync::mpsc::Receiver<Sample>,
     decision_tx: tokio::sync::watch::Sender<Decision>,
@@ -53,7 +66,13 @@ impl<C: Controller + 'static> ControlUnit<C> {
     /// decision stream. The initial decision in the watch is
     /// [`Decision::UNLIMITED`] until `spawn` pushes the controller's first
     /// tick through.
+    ///
+    /// `label` is a short, stable string that identifies this unit in
+    /// log events (e.g. `"meta-src"`, `"walk-dst"`). Multiple units of
+    /// the same controller type are typical, so using only the
+    /// controller name would make logs ambiguous.
     pub fn new(
+        label: &'static str,
         controller: C,
         sample_rx: tokio::sync::mpsc::Receiver<Sample>,
         tick_interval: std::time::Duration,
@@ -61,6 +80,7 @@ impl<C: Controller + 'static> ControlUnit<C> {
         let (tx, rx) = tokio::sync::watch::channel(Decision::UNLIMITED);
         (
             Self {
+                label,
                 controller,
                 sample_rx,
                 decision_tx: tx,
@@ -68,6 +88,12 @@ impl<C: Controller + 'static> ControlUnit<C> {
             },
             rx,
         )
+    }
+
+    /// The label this unit was constructed with, used as the
+    /// `unit` field on every emitted tracing event.
+    pub fn label(&self) -> &'static str {
+        self.label
     }
 
     /// Spawn the control loop on the current tokio runtime. Returns a
@@ -84,12 +110,16 @@ impl<C: Controller + 'static> ControlUnit<C> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
         let initial = self.controller.on_tick(std::time::Instant::now());
+        Self::log_tick(self.label, self.controller.name(), &initial, None);
         let _ = self.decision_tx.send(initial);
+        let mut last = initial;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     let decision = self.controller.on_tick(std::time::Instant::now());
+                    Self::log_tick(self.label, self.controller.name(), &decision, Some(&last));
                     let _ = self.decision_tx.send(decision);
+                    last = decision;
                 }
                 sample = self.sample_rx.recv() => {
                     match sample {
@@ -107,9 +137,38 @@ impl<C: Controller + 'static> ControlUnit<C> {
             }
         }
         tracing::debug!(
-            "control loop exiting: sample channel closed (controller: {})",
-            self.controller.name(),
+            unit = %self.label,
+            controller = %self.controller.name(),
+            "control loop exiting: sample channel closed",
         );
+    }
+
+    fn log_tick(
+        label: &'static str,
+        controller: &'static str,
+        decision: &Decision,
+        previous: Option<&Decision>,
+    ) {
+        // every tick at trace; only changes at debug, so production logs
+        // can stay at debug without drowning in unchanged-cwnd churn.
+        tracing::trace!(
+            unit = %label,
+            controller = %controller,
+            max_in_flight = ?decision.max_in_flight,
+            rate_per_sec = ?decision.rate_per_sec,
+            "control tick",
+        );
+        if previous.is_none_or(|p| p != decision) {
+            tracing::debug!(
+                unit = %label,
+                controller = %controller,
+                max_in_flight = ?decision.max_in_flight,
+                rate_per_sec = ?decision.rate_per_sec,
+                prev_max_in_flight = ?previous.and_then(|p| p.max_in_flight),
+                prev_rate_per_sec = ?previous.and_then(|p| p.rate_per_sec),
+                "decision changed",
+            );
+        }
     }
 }
 
@@ -120,6 +179,8 @@ impl<C: Controller + 'static> ControlUnit<C> {
 /// dropped rather than blocking or allocating; the drop count is exposed
 /// by [`RoutingSink::dropped_samples`].
 pub struct RoutingSink {
+    walk_src: Option<tokio::sync::mpsc::Sender<Sample>>,
+    walk_dst: Option<tokio::sync::mpsc::Sender<Sample>>,
     metadata_src: Option<tokio::sync::mpsc::Sender<Sample>>,
     metadata_dst: Option<tokio::sync::mpsc::Sender<Sample>>,
     read: Option<tokio::sync::mpsc::Sender<Sample>>,
@@ -138,6 +199,8 @@ impl RoutingSink {
 impl SampleSink for RoutingSink {
     fn record(&self, kind: ResourceKind, sample: &Sample) {
         let tx = match kind {
+            ResourceKind::Walk(Side::Source) => self.walk_src.as_ref(),
+            ResourceKind::Walk(Side::Destination) => self.walk_dst.as_ref(),
             ResourceKind::Metadata(Side::Source) => self.metadata_src.as_ref(),
             ResourceKind::Metadata(Side::Destination) => self.metadata_dst.as_ref(),
             ResourceKind::DataRead => self.read.as_ref(),
@@ -162,6 +225,8 @@ impl SampleSink for RoutingSink {
 /// call registers a channel for the corresponding [`ResourceKind`] and
 /// returns the receiver the caller must hand to a [`ControlUnit`].
 pub struct RoutingSinkBuilder {
+    walk_src: Option<tokio::sync::mpsc::Sender<Sample>>,
+    walk_dst: Option<tokio::sync::mpsc::Sender<Sample>>,
     metadata_src: Option<tokio::sync::mpsc::Sender<Sample>>,
     metadata_dst: Option<tokio::sync::mpsc::Sender<Sample>>,
     read: Option<tokio::sync::mpsc::Sender<Sample>>,
@@ -173,6 +238,8 @@ pub struct RoutingSinkBuilder {
 impl Default for RoutingSinkBuilder {
     fn default() -> Self {
         Self {
+            walk_src: None,
+            walk_dst: None,
             metadata_src: None,
             metadata_dst: None,
             read: None,
@@ -192,9 +259,23 @@ impl RoutingSinkBuilder {
         self.capacity = capacity.max(1);
         self
     }
-    /// Register a channel for metadata samples on the given [`Side`] and
-    /// return its receiver. Each side has its own channel so source-side
-    /// and destination-side controllers run independently.
+    /// Register a channel for walk-class samples on the given [`Side`]
+    /// and return its receiver. The walk class is for directory
+    /// iteration (`getdents` + cached `file_type`) — kept separate
+    /// from per-file metadata syscalls because the latency regimes
+    /// differ.
+    pub fn walk_receiver(&mut self, side: Side) -> tokio::sync::mpsc::Receiver<Sample> {
+        let (tx, rx) = tokio::sync::mpsc::channel(self.capacity);
+        match side {
+            Side::Source => self.walk_src = Some(tx),
+            Side::Destination => self.walk_dst = Some(tx),
+        }
+        rx
+    }
+    /// Register a channel for per-file metadata samples on the given
+    /// [`Side`] and return its receiver. Covers single metadata
+    /// syscalls — both lookups (`stat`) and mutations (`mkdir`,
+    /// `unlink`, `hard_link`, etc.).
     pub fn metadata_receiver(&mut self, side: Side) -> tokio::sync::mpsc::Receiver<Sample> {
         let (tx, rx) = tokio::sync::mpsc::channel(self.capacity);
         match side {
@@ -217,6 +298,8 @@ impl RoutingSinkBuilder {
     }
     pub fn build(self) -> RoutingSink {
         RoutingSink {
+            walk_src: self.walk_src,
+            walk_dst: self.walk_dst,
             metadata_src: self.metadata_src,
             metadata_dst: self.metadata_dst,
             read: self.read,
@@ -248,7 +331,7 @@ mod tests {
         let (_tx, rx) = tokio::sync::mpsc::channel::<Sample>(32);
         let controller = FixedController::with_concurrency(42);
         let (unit, mut decision_rx) =
-            ControlUnit::new(controller, rx, std::time::Duration::from_millis(10));
+            ControlUnit::new("test", controller, rx, std::time::Duration::from_millis(10));
         unit.spawn();
         // initial decision published by the first tick
         decision_rx
@@ -282,8 +365,12 @@ mod tests {
         let controller = CountingController {
             count: count.clone(),
         };
-        let (unit, _decision_rx) =
-            ControlUnit::new(controller, rx, std::time::Duration::from_millis(100));
+        let (unit, _decision_rx) = ControlUnit::new(
+            "test",
+            controller,
+            rx,
+            std::time::Duration::from_millis(100),
+        );
         let handle = unit.spawn();
         for _ in 0..5 {
             tx.send(make_sample(1)).await.expect("send sample");
@@ -346,6 +433,7 @@ mod tests {
     async fn control_unit_exits_when_all_senders_dropped() {
         let (tx, rx) = tokio::sync::mpsc::channel::<Sample>(32);
         let (unit, _decision_rx) = ControlUnit::new(
+            "test",
             NoopController::new(),
             rx,
             std::time::Duration::from_millis(10),

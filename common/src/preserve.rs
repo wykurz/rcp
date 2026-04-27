@@ -138,26 +138,29 @@ async fn set_owner<Meta: Metadata + std::fmt::Debug>(
     let dst = path.to_owned();
     let uid = metadata.uid();
     let gid = metadata.gid();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        tracing::debug!("setting uid and gid");
-        let uid_val = if settings.uid { Some(uid.into()) } else { None };
-        let gid_val = if settings.gid { Some(gid.into()) } else { None };
-        nix::unistd::fchownat(
-            nix::fcntl::AT_FDCWD,
-            &dst,
-            uid_val,
-            gid_val,
-            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
-        )
-        .with_context(|| {
-            format!(
-                "cannot set {:?} owner to {:?} and/or group id to {:?}",
-                &dst, &uid_val, &gid_val
+    crate::walk::run_metadata_probed(congestion::Side::Destination, async {
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            tracing::debug!("setting uid and gid");
+            let uid_val = if settings.uid { Some(uid.into()) } else { None };
+            let gid_val = if settings.gid { Some(gid.into()) } else { None };
+            nix::unistd::fchownat(
+                nix::fcntl::AT_FDCWD,
+                &dst,
+                uid_val,
+                gid_val,
+                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
             )
-        })?;
-        Ok(())
+            .with_context(|| {
+                format!(
+                    "cannot set {:?} owner to {:?} and/or group id to {:?}",
+                    &dst, &uid_val, &gid_val
+                )
+            })?;
+            Ok(())
+        })
+        .await?
     })
-    .await?
+    .await
 }
 
 #[instrument]
@@ -174,21 +177,24 @@ async fn set_time<Meta: Metadata + std::fmt::Debug>(
     let atime_nsec = metadata.atime_nsec();
     let mtime = metadata.mtime();
     let mtime_nsec = metadata.mtime_nsec();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        tracing::debug!("setting timestamps");
-        let atime_spec = nix::sys::time::TimeSpec::new(atime, atime_nsec);
-        let mtime_spec = nix::sys::time::TimeSpec::new(mtime, mtime_nsec);
-        nix::sys::stat::utimensat(
-            nix::fcntl::AT_FDCWD,
-            &dst,
-            &atime_spec,
-            &mtime_spec,
-            nix::sys::stat::UtimensatFlags::NoFollowSymlink,
-        )
-        .with_context(|| format!("failed setting timestamps for {:?}", &dst))?;
-        Ok(())
+    crate::walk::run_metadata_probed(congestion::Side::Destination, async {
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            tracing::debug!("setting timestamps");
+            let atime_spec = nix::sys::time::TimeSpec::new(atime, atime_nsec);
+            let mtime_spec = nix::sys::time::TimeSpec::new(mtime, mtime_nsec);
+            nix::sys::stat::utimensat(
+                nix::fcntl::AT_FDCWD,
+                &dst,
+                &atime_spec,
+                &mtime_spec,
+                nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+            )
+            .with_context(|| format!("failed setting timestamps for {:?}", &dst))?;
+            Ok(())
+        })
+        .await?
     })
-    .await?
+    .await
 }
 
 pub async fn set_file_metadata<Meta: Metadata + std::fmt::Debug>(
@@ -213,10 +219,17 @@ pub async fn set_file_metadata<Meta: Metadata + std::fmt::Debug>(
     // than applying permissions for an unverified owner — setting setuid on
     // a file whose ownership we couldn't control would be a security risk.
     set_owner(&settings.file.user_and_time, path, metadata).await?;
-    let file = tokio::fs::File::open(path).await?;
-    file.set_permissions(permissions.clone())
-        .await
-        .with_context(|| format!("cannot set {:?} permissions to {:?}", &path, &permissions))?;
+    let file = crate::walk::run_metadata_probed(
+        congestion::Side::Destination,
+        tokio::fs::File::open(path),
+    )
+    .await?;
+    crate::walk::run_metadata_probed(
+        congestion::Side::Destination,
+        file.set_permissions(permissions.clone()),
+    )
+    .await
+    .with_context(|| format!("cannot set {:?} permissions to {:?}", &path, &permissions))?;
     drop(file);
     set_time(&settings.file.user_and_time, path, metadata).await?;
     Ok(())
@@ -236,9 +249,12 @@ pub async fn set_dir_metadata<Meta: Metadata + std::fmt::Debug>(
     // same ordering as set_file_metadata: chown → chmod → utimensat.
     // see that function for rationale.
     set_owner(&settings.dir.user_and_time, path, metadata).await?;
-    tokio::fs::set_permissions(path, permissions.clone())
-        .await
-        .with_context(|| format!("cannot set {:?} permissions to {:?}", &path, &permissions))?;
+    crate::walk::run_metadata_probed(
+        congestion::Side::Destination,
+        tokio::fs::set_permissions(path, permissions.clone()),
+    )
+    .await
+    .with_context(|| format!("cannot set {:?} permissions to {:?}", &path, &permissions))?;
     set_time(&settings.dir.user_and_time, path, metadata).await?;
     Ok(())
 }

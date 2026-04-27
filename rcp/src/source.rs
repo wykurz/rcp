@@ -79,7 +79,12 @@ async fn send_directories_and_symlinks(
         return Ok(());
     }
     if src_metadata.is_symlink() {
-        let target = match tokio::fs::read_link(&src).await {
+        let target = match common::walk::run_metadata_probed(
+            common::Side::Source,
+            tokio::fs::read_link(&src),
+        )
+        .await
+        {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("Failed reading symlink {src:?}: {e:#}");
@@ -492,9 +497,11 @@ async fn send_file_tcp(
         ))
         .await;
     // open the file AFTER borrowing a stream for backpressure
-    let file = match tokio::fs::File::open(src)
-        .instrument(tracing::trace_span!("file_open"))
-        .await
+    let file = match common::walk::run_metadata_probed(
+        common::Side::Source,
+        tokio::fs::File::open(src).instrument(tracing::trace_span!("file_open")),
+    )
+    .await
     {
         Ok(f) => f,
         Err(e) => {
@@ -1338,7 +1345,12 @@ async fn dry_run_traverse(
         return Ok(());
     }
     if src_metadata.is_symlink() {
-        let target = match tokio::fs::read_link(src).await {
+        let target = match common::walk::run_metadata_probed(
+            common::Side::Source,
+            tokio::fs::read_link(src),
+        )
+        .await
+        {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("Failed reading symlink {src:?}: {e:#}");

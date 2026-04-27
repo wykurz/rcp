@@ -113,10 +113,13 @@ async fn hard_link_helper(
                 && error.kind() == std::io::ErrorKind::AlreadyExists =>
         {
             tracing::debug!("'dst' already exists, check if we need to update");
-            let dst_metadata = tokio::fs::symlink_metadata(dst)
-                .await
-                .with_context(|| format!("cannot read {dst:?} metadata"))
-                .map_err(|err| Error::new(err, Default::default()))?;
+            let dst_metadata = crate::walk::run_metadata_probed(
+                congestion::Side::Destination,
+                tokio::fs::symlink_metadata(dst),
+            )
+            .await
+            .with_context(|| format!("cannot read {dst:?} metadata"))
+            .map_err(|err| Error::new(err, Default::default()))?;
             if is_hard_link(src_metadata, &dst_metadata) {
                 tracing::debug!("no change, leaving file as is");
                 prog_track.hard_links_unchanged.inc();
@@ -180,10 +183,13 @@ pub async fn link(
     if let Some(ref filter) = settings.filter {
         let src_name = src.file_name().map(std::path::Path::new);
         if let Some(name) = src_name {
-            let src_metadata = tokio::fs::symlink_metadata(src)
-                .await
-                .with_context(|| format!("failed reading metadata from {:?}", &src))
-                .map_err(|err| Error::new(err, Default::default()))?;
+            let src_metadata = crate::walk::run_metadata_probed(
+                congestion::Side::Source,
+                tokio::fs::symlink_metadata(src),
+            )
+            .await
+            .with_context(|| format!("failed reading metadata from {:?}", &src))
+            .map_err(|err| Error::new(err, Default::default()))?;
             let is_dir = src_metadata.is_dir();
             let result = filter.should_include_root_item(name, is_dir);
             match result {
@@ -216,14 +222,21 @@ async fn link_internal(
 ) -> Result<Summary, Error> {
     let _prog_guard = prog_track.ops.guard();
     tracing::debug!("reading source metadata");
-    let src_metadata = tokio::fs::symlink_metadata(src)
-        .await
-        .with_context(|| format!("failed reading metadata from {:?}", &src))
-        .map_err(|err| Error::new(err, Default::default()))?;
+    let src_metadata = crate::walk::run_metadata_probed(
+        congestion::Side::Source,
+        tokio::fs::symlink_metadata(src),
+    )
+    .await
+    .with_context(|| format!("failed reading metadata from {:?}", &src))
+    .map_err(|err| Error::new(err, Default::default()))?;
     let update_metadata_opt = match update {
         Some(update) => {
             tracing::debug!("reading 'update' metadata");
-            let update_metadata_res = tokio::fs::symlink_metadata(update).await;
+            let update_metadata_res = crate::walk::run_metadata_probed(
+                congestion::Side::Source,
+                tokio::fs::symlink_metadata(update),
+            )
+            .await;
             match update_metadata_res {
                 Ok(update_metadata) => Some(update_metadata),
                 Err(error) => {
@@ -442,10 +455,13 @@ async fn link_internal(
             //
             // N.B. the permissions may prevent us from writing to it but the alternative is to open up the directory
             // while we're writing to it which isn't safe
-            let dst_metadata = tokio::fs::metadata(dst)
-                .await
-                .with_context(|| format!("failed reading metadata from {:?}", &dst))
-                .map_err(|err| Error::new(err, Default::default()))?;
+            let dst_metadata = crate::walk::run_metadata_probed(
+                congestion::Side::Destination,
+                tokio::fs::metadata(dst),
+            )
+            .await
+            .with_context(|| format!("failed reading metadata from {:?}", &dst))
+            .map_err(|err| Error::new(err, Default::default()))?;
             if dst_metadata.is_dir() {
                 tracing::debug!("'dst' is a directory, leaving it as is");
                 CopySummary {
@@ -477,19 +493,22 @@ async fn link_internal(
                         },
                     )
                 })?;
-                tokio::fs::create_dir(dst)
-                    .await
-                    .with_context(|| format!("cannot create directory {dst:?}"))
-                    .map_err(|err| {
-                        copy_summary.rm_summary = rm_summary;
-                        Error::new(
-                            err,
-                            Summary {
-                                copy_summary,
-                                ..Default::default()
-                            },
-                        )
-                    })?;
+                crate::walk::run_metadata_probed(
+                    congestion::Side::Destination,
+                    tokio::fs::create_dir(dst),
+                )
+                .await
+                .with_context(|| format!("cannot create directory {dst:?}"))
+                .map_err(|err| {
+                    copy_summary.rm_summary = rm_summary;
+                    Error::new(
+                        err,
+                        Summary {
+                            copy_summary,
+                            ..Default::default()
+                        },
+                    )
+                })?;
                 // anything copied into dst may assume they don't need to check for conflicts
                 is_fresh = true;
                 CopySummary {
@@ -745,7 +764,12 @@ async fn link_internal(
                 "directory {:?} has nothing to link inside, removing empty directory",
                 &dst
             );
-            match tokio::fs::remove_dir(dst).await {
+            match crate::walk::run_metadata_probed(
+                congestion::Side::Destination,
+                tokio::fs::remove_dir(dst),
+            )
+            .await
+            {
                 Ok(()) => {
                     link_summary.copy_summary.directories_created = 0;
                     return Ok(link_summary);
