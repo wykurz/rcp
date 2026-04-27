@@ -165,10 +165,11 @@ where
     Ok(Some((entry, entry_file_type)))
 }
 
-/// Bracket a single metadata-producing future with the cwnd permit and a
-/// congestion probe on the given [`congestion::Side`]. The probe completes
-/// successfully when `op` returns `Ok`, and is discarded on error so
-/// error paths don't skew the controller's latency baseline.
+/// Bracket a single metadata-producing future with the full per-op
+/// gating prologue: the static ops rate gate, the cwnd permit, and a
+/// congestion probe on the given [`congestion::Side`]. The probe
+/// completes successfully when `op` returns `Ok`, and is discarded on
+/// error so error paths don't skew the controller's latency baseline.
 ///
 /// Use this at sites that perform one isolated metadata op:
 ///
@@ -177,14 +178,32 @@ where
 ///   `rcp/source.rs`).
 /// - Destination-side mutations: `create_dir` for new dst directories,
 ///   `hard_link` / `symlink` / `remove_file` / `remove_dir` /
-///   `set_permissions`, and the `OpenOptions::open(O_CREAT)` in
-///   `filegen`'s `write_file`.
+///   `set_permissions`, etc.
 ///
-/// Note: unlike [`next_entry_probed`], this helper does **not** acquire
-/// the static ops rate token — callers that rate-limit at a different
-/// granularity (such as filegen, which gates at per-task spawn time)
-/// would otherwise double-count.
+/// `--ops-throttle` is the shared metadata rate gate, so this helper
+/// acquires it on every call — same as [`next_entry_probed`]. Callers
+/// that already rate-gate upstream (such as filegen, which gates at
+/// per-task spawn time so we don't fan out an unbounded task queue
+/// before any token is consumed) must use
+/// [`run_metadata_probed_no_rate`] instead to avoid double-counting.
 pub async fn run_metadata_probed<F, T, E>(side: congestion::Side, op: F) -> Result<T, E>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    throttle::get_ops_token().await;
+    run_metadata_probed_no_rate(side, op).await
+}
+
+/// Variant of [`run_metadata_probed`] that skips the static ops rate
+/// gate — for callers that already rate-limit at a coarser granularity
+/// upstream and would otherwise consume two tokens per metadata op.
+///
+/// Concretely: `filegen` gates the rate at task-spawn time so the
+/// number of in-flight `write_file` futures stays bounded by the rate.
+/// The `OpenOptions::open(O_CREAT)` inside the spawned task is the only
+/// metadata syscall in that path; rate-gating it again would halve the
+/// effective rate.
+pub async fn run_metadata_probed_no_rate<F, T, E>(side: congestion::Side, op: F) -> Result<T, E>
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
