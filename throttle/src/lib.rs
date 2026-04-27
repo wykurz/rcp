@@ -150,17 +150,27 @@
 
 mod semaphore;
 
-/// Which side of an operation a permit / cap belongs to. Mirrors
-/// `congestion::Side` (kept as an independent enum so this crate has no
-/// dependency on `congestion`). The two are convertible 1:1 by the
-/// auto-meta adapter.
+/// Which throttled metadata resource a permit / cap belongs to.
+///
+/// The four variants partition metadata work along two axes — which
+/// filesystem (source vs destination) and which operation class (cache-warm
+/// directory iteration vs real per-file syscalls). Each variant gets its
+/// own concurrency cap so the per-resource latency regimes don't bleed into
+/// one another. Mirrors the congestion crate's `ResourceKind` for metadata
+/// kinds; this enum is intentionally independent so `throttle` has no
+/// dependency on `congestion`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Side {
-    /// Reads of the source filesystem (directory walks, source-side stats).
-    Source,
-    /// Writes/mutations of the destination filesystem (`create_dir`,
-    /// `hard_link`, `unlink`, `open(O_CREAT)`, …).
-    Destination,
+pub enum Resource {
+    /// Source-side directory iteration (`getdents` + cached `file_type`).
+    SrcWalk,
+    /// Source-side per-file metadata syscall (`stat`, `read_link`, `open`).
+    SrcMeta,
+    /// Destination-side directory iteration. Used by tools that walk dst
+    /// (e.g. `rcmp` / `rrm`).
+    DstWalk,
+    /// Destination-side per-file metadata syscall — both lookups and
+    /// mutations (`create_dir`, `hard_link`, `unlink`, `chmod`, …).
+    DstMeta,
 }
 
 static OPEN_FILES_LIMIT: std::sync::LazyLock<semaphore::Semaphore> =
@@ -169,19 +179,25 @@ static OPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
 static IOPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
-// Per-op concurrency caps, driven by the congestion controller. One
-// semaphore per [`Side`] so source-side and destination-side throttling
-// are independent. Distinct from OPS_THROTTLE (rate) and
-// OPEN_FILES_LIMIT (FDs).
-static OPS_IN_FLIGHT_LIMIT_SRC: std::sync::LazyLock<semaphore::Semaphore> =
+// Per-op concurrency caps driven by the congestion controller. One
+// semaphore per [`Resource`] so each (side × class) pair is throttled
+// independently. Distinct from OPS_THROTTLE (rate) and OPEN_FILES_LIMIT
+// (FDs).
+static OPS_IN_FLIGHT_LIMIT_SRC_WALK: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
-static OPS_IN_FLIGHT_LIMIT_DST: std::sync::LazyLock<semaphore::Semaphore> =
+static OPS_IN_FLIGHT_LIMIT_SRC_META: std::sync::LazyLock<semaphore::Semaphore> =
+    std::sync::LazyLock::new(semaphore::Semaphore::new);
+static OPS_IN_FLIGHT_LIMIT_DST_WALK: std::sync::LazyLock<semaphore::Semaphore> =
+    std::sync::LazyLock::new(semaphore::Semaphore::new);
+static OPS_IN_FLIGHT_LIMIT_DST_META: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
 
-fn ops_in_flight_limit(side: Side) -> &'static semaphore::Semaphore {
-    match side {
-        Side::Source => &OPS_IN_FLIGHT_LIMIT_SRC,
-        Side::Destination => &OPS_IN_FLIGHT_LIMIT_DST,
+fn ops_in_flight_limit(resource: Resource) -> &'static semaphore::Semaphore {
+    match resource {
+        Resource::SrcWalk => &OPS_IN_FLIGHT_LIMIT_SRC_WALK,
+        Resource::SrcMeta => &OPS_IN_FLIGHT_LIMIT_SRC_META,
+        Resource::DstWalk => &OPS_IN_FLIGHT_LIMIT_DST_WALK,
+        Resource::DstMeta => &OPS_IN_FLIGHT_LIMIT_DST_META,
     }
 }
 
@@ -200,7 +216,7 @@ pub async fn open_file_permit() -> OpenFileGuard {
 }
 
 /// Dynamically set the maximum number of concurrent operations in flight
-/// on the given [`Side`].
+/// for the given [`Resource`].
 ///
 /// Increasing the cap is instant; decreasing it can temporarily overshoot
 /// if permits are already held — they return naturally on drop. This is
@@ -211,19 +227,19 @@ pub async fn open_file_permit() -> OpenFileGuard {
 /// blocked inside the semaphore's wait queue — they remain parked until
 /// permits become available. Callers that need a cancellable disable
 /// should use a higher-level shutdown signal.
-pub fn set_max_ops_in_flight(side: Side, max_in_flight: usize) {
-    ops_in_flight_limit(side).set_max(max_in_flight);
+pub fn set_max_ops_in_flight(resource: Resource, max_in_flight: usize) {
+    ops_in_flight_limit(resource).set_max(max_in_flight);
 }
 
 pub struct OpsInFlightGuard {
     _permit: Option<semaphore::Permit<'static>>,
 }
 
-/// Acquire a permit from the ops-in-flight cap on the given [`Side`].
-/// No-op (returns immediately) when the cap on that side is not configured.
-pub async fn ops_in_flight_permit(side: Side) -> OpsInFlightGuard {
+/// Acquire a permit from the ops-in-flight cap for the given [`Resource`].
+/// No-op (returns immediately) when that resource's cap is not configured.
+pub async fn ops_in_flight_permit(resource: Resource) -> OpsInFlightGuard {
     OpsInFlightGuard {
-        _permit: ops_in_flight_limit(side).acquire().await,
+        _permit: ops_in_flight_limit(resource).acquire().await,
     }
 }
 
@@ -321,10 +337,10 @@ pub fn enable_ops_throttle() -> bool {
     OPS_THROTTLE.enable()
 }
 
-/// Current in-flight concurrency cap on the given [`Side`], for metrics
-/// and integration tests. Returns `0` when the cap has been set to zero
-/// (disabled) or has never been configured.
+/// Current in-flight concurrency cap for the given [`Resource`], for
+/// metrics and integration tests. Returns `0` when the cap has been set
+/// to zero (disabled) or has never been configured.
 #[must_use]
-pub fn current_ops_in_flight_limit(side: Side) -> usize {
-    ops_in_flight_limit(side).current_limit()
+pub fn current_ops_in_flight_limit(resource: Resource) -> usize {
+    ops_in_flight_limit(resource).current_limit()
 }

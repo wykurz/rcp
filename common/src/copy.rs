@@ -160,7 +160,15 @@ pub async fn copy_file(
 ) -> Result<Summary, Error> {
     // check --ignore-existing before dry-run so dry-run output reflects actual behavior.
     // use symlink_metadata to detect dangling symlinks too (Path::exists follows symlinks)
-    if !is_fresh && settings.ignore_existing && tokio::fs::symlink_metadata(dst).await.is_ok() {
+    if !is_fresh
+        && settings.ignore_existing
+        && crate::walk::run_metadata_probed(
+            congestion::Side::Destination,
+            tokio::fs::symlink_metadata(dst),
+        )
+        .await
+        .is_ok()
+    {
         if let Some(mode) = settings.dry_run {
             match mode {
                 DryRunMode::Brief => {}
@@ -190,10 +198,13 @@ pub async fn copy_file(
     if !is_fresh && dst.exists() {
         if settings.overwrite {
             tracing::debug!("file exists, check if it's identical");
-            let dst_metadata = tokio::fs::symlink_metadata(dst)
-                .await
-                .with_context(|| format!("failed reading metadata from {:?}", &dst))
-                .map_err(|err| Error::new(err, Default::default()))?;
+            let dst_metadata = crate::walk::run_metadata_probed(
+                congestion::Side::Destination,
+                tokio::fs::symlink_metadata(dst),
+            )
+            .await
+            .with_context(|| format!("failed reading metadata from {:?}", &dst))
+            .map_err(|err| Error::new(err, Default::default()))?;
             if is_file_type_same(src_metadata, &dst_metadata) {
                 if filecmp::metadata_equal(&settings.overwrite_compare, src_metadata, &dst_metadata)
                 {
@@ -355,10 +366,13 @@ pub async fn copy(
     if let Some(ref filter) = settings.filter {
         let src_name = src.file_name().map(std::path::Path::new);
         if let Some(name) = src_name {
-            let src_metadata = tokio::fs::symlink_metadata(src)
-                .await
-                .with_context(|| format!("failed reading metadata from src: {:?}", &src))
-                .map_err(|err| Error::new(err, Default::default()))?;
+            let src_metadata = crate::walk::run_metadata_probed(
+                congestion::Side::Source,
+                tokio::fs::symlink_metadata(src),
+            )
+            .await
+            .with_context(|| format!("failed reading metadata from src: {:?}", &src))
+            .map_err(|err| Error::new(err, Default::default()))?;
             let is_dir = src_metadata.is_dir();
             let result = filter.should_include_root_item(name, is_dir);
             match result {
@@ -395,19 +409,25 @@ async fn copy_internal(
 ) -> Result<Summary, Error> {
     let _ops_guard = prog_track.ops.guard();
     tracing::debug!("reading source metadata");
-    let src_metadata = tokio::fs::symlink_metadata(src)
-        .await
-        .with_context(|| format!("failed reading metadata from src: {:?}", &src))
-        .map_err(|err| Error::new(err, Default::default()))?;
+    let src_metadata = crate::walk::run_metadata_probed(
+        congestion::Side::Source,
+        tokio::fs::symlink_metadata(src),
+    )
+    .await
+    .with_context(|| format!("failed reading metadata from src: {:?}", &src))
+    .map_err(|err| Error::new(err, Default::default()))?;
     if settings.dereference && src_metadata.is_symlink() {
         debug_assert!(
             open_file_guard.is_none(),
             "open file guard should not be pre-acquired for symlinks"
         );
-        let link = tokio::fs::canonicalize(&src)
-            .await
-            .with_context(|| format!("failed reading src symlink {:?}", &src))
-            .map_err(|err| Error::new(err, Default::default()))?;
+        let link = crate::walk::run_metadata_probed(
+            congestion::Side::Source,
+            tokio::fs::canonicalize(&src),
+        )
+        .await
+        .with_context(|| format!("failed reading src symlink {:?}", &src))
+        .map_err(|err| Error::new(err, Default::default()))?;
         return copy(prog_track, &link, dst, settings, preserve, is_fresh).await;
     }
     if src_metadata.is_file() {
@@ -434,7 +454,15 @@ async fn copy_internal(
     if src_metadata.is_symlink() {
         // check --ignore-existing before dry-run so dry-run output reflects actual behavior.
         // use symlink_metadata to detect dangling symlinks too (Path::exists follows symlinks)
-        if !is_fresh && settings.ignore_existing && tokio::fs::symlink_metadata(dst).await.is_ok() {
+        if !is_fresh
+            && settings.ignore_existing
+            && crate::walk::run_metadata_probed(
+                congestion::Side::Destination,
+                tokio::fs::symlink_metadata(dst),
+            )
+            .await
+            .is_ok()
+        {
             if let Some(mode) = settings.dry_run {
                 match mode {
                     DryRunMode::Brief => {}
@@ -458,12 +486,18 @@ async fn copy_internal(
             });
         }
         let mut rm_summary = RmSummary::default();
-        let link = tokio::fs::read_link(src)
-            .await
-            .with_context(|| format!("failed reading symlink {:?}", &src))
-            .map_err(|err| Error::new(err, Default::default()))?;
+        let link =
+            crate::walk::run_metadata_probed(congestion::Side::Source, tokio::fs::read_link(src))
+                .await
+                .with_context(|| format!("failed reading symlink {:?}", &src))
+                .map_err(|err| Error::new(err, Default::default()))?;
         // try creating a symlink, if dst path exists and overwrite is set - remove and try again
-        if let Err(error) = tokio::fs::symlink(&link, dst).await {
+        if let Err(error) = crate::walk::run_metadata_probed(
+            congestion::Side::Destination,
+            tokio::fs::symlink(&link, dst),
+        )
+        .await
+        {
             if settings.ignore_existing && error.kind() == std::io::ErrorKind::AlreadyExists {
                 tracing::debug!("destination exists, skipping symlink (--ignore-existing)");
                 prog_track.symlinks_unchanged.inc();
@@ -473,27 +507,36 @@ async fn copy_internal(
                 });
             }
             if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
-                let dst_metadata = tokio::fs::symlink_metadata(dst)
-                    .await
-                    .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))
-                    .map_err(|err| Error::new(err, Default::default()))?;
+                let dst_metadata = crate::walk::run_metadata_probed(
+                    congestion::Side::Destination,
+                    tokio::fs::symlink_metadata(dst),
+                )
+                .await
+                .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))
+                .map_err(|err| Error::new(err, Default::default()))?;
                 if is_file_type_same(&src_metadata, &dst_metadata) {
-                    let dst_link = tokio::fs::read_link(dst)
-                        .await
-                        .with_context(|| format!("failed reading dst symlink: {:?}", &dst))
-                        .map_err(|err| Error::new(err, Default::default()))?;
+                    let dst_link = crate::walk::run_metadata_probed(
+                        congestion::Side::Destination,
+                        tokio::fs::read_link(dst),
+                    )
+                    .await
+                    .with_context(|| format!("failed reading dst symlink: {:?}", &dst))
+                    .map_err(|err| Error::new(err, Default::default()))?;
                     if link == dst_link {
                         tracing::debug!(
                             "'dst' is a symlink and points to the same location as 'src'"
                         );
                         if preserve.symlink.any() {
                             // do we need to update the metadata for this symlink?
-                            let dst_metadata = tokio::fs::symlink_metadata(dst)
-                                .await
-                                .with_context(|| {
-                                    format!("failed reading metadata from dst: {:?}", &dst)
-                                })
-                                .map_err(|err| Error::new(err, Default::default()))?;
+                            let dst_metadata = crate::walk::run_metadata_probed(
+                                congestion::Side::Destination,
+                                tokio::fs::symlink_metadata(dst),
+                            )
+                            .await
+                            .with_context(|| {
+                                format!("failed reading metadata from dst: {:?}", &dst)
+                            })
+                            .map_err(|err| Error::new(err, Default::default()))?;
                             if !filecmp::metadata_equal(
                                 &settings.overwrite_compare,
                                 &src_metadata,
@@ -545,16 +588,19 @@ async fn copy_internal(
                     };
                     Error::new(err.source, copy_summary)
                 })?;
-                tokio::fs::symlink(&link, dst)
-                    .await
-                    .with_context(|| format!("failed creating symlink {:?}", &dst))
-                    .map_err(|err| {
-                        let copy_summary = Summary {
-                            rm_summary,
-                            ..Default::default()
-                        };
-                        Error::new(err, copy_summary)
-                    })?;
+                crate::walk::run_metadata_probed(
+                    congestion::Side::Destination,
+                    tokio::fs::symlink(&link, dst),
+                )
+                .await
+                .with_context(|| format!("failed creating symlink {:?}", &dst))
+                .map_err(|err| {
+                    let copy_summary = Summary {
+                        rm_summary,
+                        ..Default::default()
+                    };
+                    Error::new(err, copy_summary)
+                })?;
             } else {
                 return Err(Error::new(
                     anyhow!("failed creating symlink {:?}", &dst),
@@ -618,7 +664,12 @@ async fn copy_internal(
     if settings.dry_run.is_some() {
         if settings.ignore_existing
             && !is_fresh
-            && tokio::fs::symlink_metadata(dst).await.is_ok()
+            && crate::walk::run_metadata_probed(
+                congestion::Side::Destination,
+                tokio::fs::symlink_metadata(dst),
+            )
+            .await
+            .is_ok()
             && !dst.is_dir()
         {
             // destination is not a directory - would skip entire subtree
@@ -665,10 +716,13 @@ async fn copy_internal(
             //
             // N.B. the permissions may prevent us from writing to it but the alternative is to open up the directory
             // while we're writing to it which isn't safe
-            let dst_metadata = tokio::fs::symlink_metadata(dst)
-                .await
-                .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))
-                .map_err(|err| Error::new(err, Default::default()))?;
+            let dst_metadata = crate::walk::run_metadata_probed(
+                congestion::Side::Destination,
+                tokio::fs::symlink_metadata(dst),
+            )
+            .await
+            .with_context(|| format!("failed reading metadata from dst: {:?}", &dst))
+            .map_err(|err| Error::new(err, Default::default()))?;
             if dst_metadata.is_dir() {
                 tracing::debug!("'dst' is a directory, leaving it as is");
                 prog_track.directories_unchanged.inc();
@@ -708,16 +762,19 @@ async fn copy_internal(
                     };
                     Error::new(err.source, copy_summary)
                 })?;
-                tokio::fs::create_dir(dst)
-                    .await
-                    .with_context(|| format!("cannot create directory {dst:?}"))
-                    .map_err(|err| {
-                        let copy_summary = Summary {
-                            rm_summary,
-                            ..Default::default()
-                        };
-                        Error::new(err, copy_summary)
-                    })?;
+                crate::walk::run_metadata_probed(
+                    congestion::Side::Destination,
+                    tokio::fs::create_dir(dst),
+                )
+                .await
+                .with_context(|| format!("cannot create directory {dst:?}"))
+                .map_err(|err| {
+                    let copy_summary = Summary {
+                        rm_summary,
+                        ..Default::default()
+                    };
+                    Error::new(err, copy_summary)
+                })?;
                 // anything copied into dst may assume they don't need to check for conflicts
                 is_fresh = true;
                 prog_track.directories_created.inc();
@@ -887,7 +944,12 @@ async fn copy_internal(
                 "directory {:?} has nothing to copy inside, removing empty directory",
                 &dst
             );
-            match tokio::fs::remove_dir(dst).await {
+            match crate::walk::run_metadata_probed(
+                congestion::Side::Destination,
+                tokio::fs::remove_dir(dst),
+            )
+            .await
+            {
                 Ok(()) => {
                     copy_summary.directories_created = 0;
                     return Ok(copy_summary);

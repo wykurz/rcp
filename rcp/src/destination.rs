@@ -127,7 +127,12 @@ async fn process_single_file(
         stream_state: StreamState::DataConsumed,
     };
     // check if destination exists and handle overwrite logic
-    let dst_exists = tokio::fs::symlink_metadata(&file_header.dst).await.is_ok();
+    let dst_exists = common::walk::run_metadata_probed(
+        common::Side::Destination,
+        tokio::fs::symlink_metadata(&file_header.dst),
+    )
+    .await
+    .is_ok();
     if dst_exists {
         if settings.ignore_existing {
             tracing::debug!("destination exists, skipping (--ignore-existing)");
@@ -141,9 +146,12 @@ async fn process_single_file(
         }
         if settings.overwrite {
             tracing::debug!("file exists, check if it's identical");
-            let dst_metadata = tokio::fs::symlink_metadata(&file_header.dst)
-                .await
-                .map_err(|e| err_needs_drain(e.into()))?;
+            let dst_metadata = common::walk::run_metadata_probed(
+                common::Side::Destination,
+                tokio::fs::symlink_metadata(&file_header.dst),
+            )
+            .await
+            .map_err(|e| err_needs_drain(e.into()))?;
             let is_file = dst_metadata.is_file();
             if is_file {
                 let src_file_metadata = remote::protocol::FileMetadata {
@@ -180,9 +188,12 @@ async fn process_single_file(
                 }
                 tracing::debug!("file exists but is different, removing");
                 let removed_file_size = dst_metadata.len();
-                tokio::fs::remove_file(&file_header.dst)
-                    .await
-                    .map_err(|e| err_needs_drain(e.into()))?;
+                common::walk::run_metadata_probed(
+                    common::Side::Destination,
+                    tokio::fs::remove_file(&file_header.dst),
+                )
+                .await
+                .map_err(|e| err_needs_drain(e.into()))?;
                 prog.files_removed.inc();
                 prog.bytes_removed.add(removed_file_size);
             } else {
@@ -215,10 +226,12 @@ async fn process_single_file(
             size = file_header.size
         ))
         .await;
-    let mut file = tokio::fs::File::create(&file_header.dst)
-        .instrument(tracing::trace_span!("file_create"))
-        .await
-        .map_err(|e| err_needs_drain(e.into()))?;
+    let mut file = common::walk::run_metadata_probed(
+        common::Side::Destination,
+        tokio::fs::File::create(&file_header.dst).instrument(tracing::trace_span!("file_create")),
+    )
+    .await
+    .map_err(|e| err_needs_drain(e.into()))?;
     // buffer size is set by tcp_config.effective_remote_copy_buffer_size() based on network profile,
     // but capped at file size to avoid over-allocation for small files
     let file_size = file_header.size.min(usize::MAX as u64) as usize;
@@ -492,7 +505,9 @@ async fn create_directory(
     dst: &std::path::Path,
 ) -> anyhow::Result<DirectoryCreateResult> {
     let prog = progress();
-    match tokio::fs::create_dir(dst).await {
+    match common::walk::run_metadata_probed(common::Side::Destination, tokio::fs::create_dir(dst))
+        .await
+    {
         Ok(()) => {
             // don't increment counter here - will be done in complete_directory
             // when we know we're keeping this directory
@@ -500,7 +515,11 @@ async fn create_directory(
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // something exists at destination - check what it is
-            let dst_metadata = tokio::fs::symlink_metadata(dst).await?;
+            let dst_metadata = common::walk::run_metadata_probed(
+                common::Side::Destination,
+                tokio::fs::symlink_metadata(dst),
+            )
+            .await?;
             if dst_metadata.is_dir() {
                 // directory already exists - reuse it (no overwrite needed for directories)
                 tracing::debug!("destination directory already exists, reusing it");
@@ -527,7 +546,11 @@ async fn create_directory(
                     },
                 )
                 .await?;
-                tokio::fs::create_dir(dst).await?;
+                common::walk::run_metadata_probed(
+                    common::Side::Destination,
+                    tokio::fs::create_dir(dst),
+                )
+                .await?;
                 // don't increment counter here - will be done in complete_directory
                 Ok(DirectoryCreateResult::Created)
             } else {
@@ -554,7 +577,12 @@ async fn create_symlink(
     metadata: &remote::protocol::Metadata,
 ) -> anyhow::Result<()> {
     let prog = progress();
-    match tokio::fs::symlink(target, dst).await {
+    match common::walk::run_metadata_probed(
+        common::Side::Destination,
+        tokio::fs::symlink(target, dst),
+    )
+    .await
+    {
         Ok(()) => {
             common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
             prog.symlinks_created.inc();
@@ -568,13 +596,19 @@ async fn create_symlink(
             Ok(())
         }
         Err(error) if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let dst_metadata = tokio::fs::symlink_metadata(dst)
-                .await
-                .with_context(|| format!("failed reading metadata from dst: {dst:?}"))?;
+            let dst_metadata = common::walk::run_metadata_probed(
+                common::Side::Destination,
+                tokio::fs::symlink_metadata(dst),
+            )
+            .await
+            .with_context(|| format!("failed reading metadata from dst: {dst:?}"))?;
             if dst_metadata.is_symlink() {
-                let dst_link = tokio::fs::read_link(dst)
-                    .await
-                    .with_context(|| format!("failed reading dst symlink: {dst:?}"))?;
+                let dst_link = common::walk::run_metadata_probed(
+                    common::Side::Destination,
+                    tokio::fs::read_link(dst),
+                )
+                .await
+                .with_context(|| format!("failed reading dst symlink: {dst:?}"))?;
                 if *target == dst_link {
                     tracing::debug!(
                         "destination is a symlink and points to the same location as source"
@@ -601,8 +635,16 @@ async fn create_symlink(
                     tracing::info!(
                         "destination is a symlink but points to a different location, removing"
                     );
-                    tokio::fs::remove_file(dst).await?;
-                    tokio::fs::symlink(target, dst).await?;
+                    common::walk::run_metadata_probed(
+                        common::Side::Destination,
+                        tokio::fs::remove_file(dst),
+                    )
+                    .await?;
+                    common::walk::run_metadata_probed(
+                        common::Side::Destination,
+                        tokio::fs::symlink(target, dst),
+                    )
+                    .await?;
                     common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
                     prog.symlinks_removed.inc();
                     prog.symlinks_created.inc();
@@ -621,7 +663,11 @@ async fn create_symlink(
                 )
                 .await
                 .map_err(|err| anyhow::anyhow!("Failed to remove destination: {err}"))?;
-                tokio::fs::symlink(target, dst).await?;
+                common::walk::run_metadata_probed(
+                    common::Side::Destination,
+                    tokio::fs::symlink(target, dst),
+                )
+                .await?;
                 common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
                 prog.symlinks_created.inc();
             }
