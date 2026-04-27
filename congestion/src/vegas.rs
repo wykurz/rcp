@@ -14,7 +14,7 @@
 //! filesystem control; more sophisticated schemes (periodic drains, BBR) can
 //! be layered on top in their own `impl Controller`s.
 
-use crate::controller::{Controller, Decision, Sample};
+use crate::controller::{Controller, ControllerSnapshot, Decision, Sample};
 
 /// Tunable parameters for [`VegasController`].
 ///
@@ -74,6 +74,11 @@ pub struct VegasController {
     ewma_latency_ns: Option<f64>,
     tick_sum_latency_ns: u128,
     tick_sample_count: u64,
+    /// Cumulative number of samples consumed across the controller's
+    /// lifetime. Surfaced via [`ControllerSnapshot::samples_seen`] for
+    /// observability — distinct from `tick_sample_count`, which resets
+    /// each tick.
+    total_samples: u64,
 }
 
 impl VegasController {
@@ -88,6 +93,7 @@ impl VegasController {
             ewma_latency_ns: None,
             tick_sum_latency_ns: 0,
             tick_sample_count: 0,
+            total_samples: 0,
         }
     }
     /// Current concurrency target. Useful for tests and metrics.
@@ -133,6 +139,7 @@ impl Controller for VegasController {
             .tick_sum_latency_ns
             .saturating_add(u128::from(latency_ns));
         self.tick_sample_count = self.tick_sample_count.saturating_add(1);
+        self.total_samples = self.total_samples.saturating_add(1);
     }
     fn on_tick(&mut self, now: std::time::Instant) -> Decision {
         // discard a stale min estimate so the next sample can re-establish
@@ -183,6 +190,14 @@ impl Controller for VegasController {
     }
     fn name(&self) -> &'static str {
         "vegas"
+    }
+    fn snapshot(&self) -> ControllerSnapshot {
+        ControllerSnapshot {
+            cwnd: self.cwnd,
+            min_latency: self.min_latency().unwrap_or_default(),
+            ewma_latency: self.ewma_latency().unwrap_or_default(),
+            samples_seen: self.total_samples,
+        }
     }
 }
 

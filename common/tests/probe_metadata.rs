@@ -165,7 +165,7 @@ async fn rm_on_deep_tree_does_not_deadlock_at_cwnd_one() {
         max_cwnd: 1,
         ..congestion::VegasConfig::default()
     });
-    let (unit, _decision_rx) = congestion::ControlUnit::new(
+    let (unit, _decision_rx, _snapshot_rx) = congestion::ControlUnit::new(
         "test-walk-src",
         vegas,
         walk_rx,
@@ -226,7 +226,7 @@ async fn auto_meta_pipeline_propagates_probes_to_controller() {
         initial_cwnd: 5,
         ..congestion::VegasConfig::default()
     });
-    let (unit, decision_rx) = congestion::ControlUnit::new(
+    let (unit, decision_rx, _snapshot_rx) = congestion::ControlUnit::new(
         "pipeline-test",
         controller,
         walk_rx,

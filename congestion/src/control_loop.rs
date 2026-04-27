@@ -23,7 +23,7 @@
 //! silently dropped. The count of dropped samples is exposed via
 //! [`RoutingSink::dropped_samples`] for diagnostics.
 
-use crate::controller::{Controller, Decision, Sample};
+use crate::controller::{Controller, ControllerSnapshot, Decision, Sample};
 use crate::measurement::{ResourceKind, SampleSink, Side};
 
 /// Default cadence at which a control unit calls `on_tick`.
@@ -36,11 +36,24 @@ pub const DEFAULT_CHANNEL_CAPACITY: usize = 4096;
 
 /// A single resource's control task.
 ///
-/// Construct with [`ControlUnit::new`], receive the decision watch via the
-/// returned `(unit, rx)` tuple, then spawn the unit with
-/// [`ControlUnit::spawn`]. The task runs until the sample channel's senders
-/// are all dropped (typically because [`clear_sample_sink`][crate::clear_sample_sink]
-/// was called and the RoutingSink went away).
+/// Construct with [`ControlUnit::new`], receive the decision and snapshot
+/// watches via the returned `(unit, decision_rx, snapshot_rx)` tuple, then
+/// spawn the unit with [`ControlUnit::spawn`]. The task runs until the
+/// sample channel's senders are all dropped (typically because
+/// [`clear_sample_sink`][crate::clear_sample_sink] was called and the
+/// `RoutingSink` went away).
+///
+/// # Watches
+///
+/// Two watches keep enforcement and observability separate:
+///
+/// - `decision_rx` carries the [`Decision`] the enforcement layer applies.
+///   Subscribers wake on every change so caps land promptly.
+/// - `snapshot_rx` carries a [`ControllerSnapshot`] for diagnostics —
+///   used by the progress bar and other UI surfaces. Snapshot-only
+///   changes (e.g. baseline drift on an unchanged `cwnd`) do not wake
+///   enforcement, and a busy enforcement subscriber does not stall
+///   snapshot publication.
 ///
 /// # Logging
 ///
@@ -58,35 +71,45 @@ pub struct ControlUnit<C: Controller> {
     controller: C,
     sample_rx: tokio::sync::mpsc::Receiver<Sample>,
     decision_tx: tokio::sync::watch::Sender<Decision>,
+    snapshot_tx: tokio::sync::watch::Sender<ControllerSnapshot>,
     tick_interval: std::time::Duration,
 }
 
 impl<C: Controller + 'static> ControlUnit<C> {
-    /// Build a new control unit. Returns the unit and a receiver for its
-    /// decision stream. The initial decision in the watch is
-    /// [`Decision::UNLIMITED`] until `spawn` pushes the controller's first
-    /// tick through.
+    /// Build a new control unit. Returns the unit, a receiver for its
+    /// decision stream, and a receiver for its snapshot stream. The
+    /// initial decision is [`Decision::UNLIMITED`] and the initial
+    /// snapshot is [`ControllerSnapshot::default`] until the first tick
+    /// fires.
     ///
     /// `label` is a short, stable string that identifies this unit in
-    /// log events (e.g. `"meta-src"`, `"walk-dst"`). Multiple units of
-    /// the same controller type are typical, so using only the
-    /// controller name would make logs ambiguous.
+    /// log events and in the snapshot registry (e.g. `"meta-src"`,
+    /// `"walk-dst"`). Multiple units of the same controller type are
+    /// typical, so using only the controller name would make logs
+    /// ambiguous.
     pub fn new(
         label: &'static str,
         controller: C,
         sample_rx: tokio::sync::mpsc::Receiver<Sample>,
         tick_interval: std::time::Duration,
-    ) -> (Self, tokio::sync::watch::Receiver<Decision>) {
-        let (tx, rx) = tokio::sync::watch::channel(Decision::UNLIMITED);
+    ) -> (
+        Self,
+        tokio::sync::watch::Receiver<Decision>,
+        tokio::sync::watch::Receiver<ControllerSnapshot>,
+    ) {
+        let (decision_tx, decision_rx) = tokio::sync::watch::channel(Decision::UNLIMITED);
+        let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(ControllerSnapshot::default());
         (
             Self {
                 label,
                 controller,
                 sample_rx,
-                decision_tx: tx,
+                decision_tx,
+                snapshot_tx,
                 tick_interval,
             },
-            rx,
+            decision_rx,
+            snapshot_rx,
         )
     }
 
@@ -112,6 +135,7 @@ impl<C: Controller + 'static> ControlUnit<C> {
         let initial = self.controller.on_tick(std::time::Instant::now());
         Self::log_tick(self.label, self.controller.name(), &initial, None);
         let _ = self.decision_tx.send(initial);
+        let _ = self.snapshot_tx.send(self.controller.snapshot());
         let mut last = initial;
         loop {
             tokio::select! {
@@ -119,6 +143,7 @@ impl<C: Controller + 'static> ControlUnit<C> {
                     let decision = self.controller.on_tick(std::time::Instant::now());
                     Self::log_tick(self.label, self.controller.name(), &decision, Some(&last));
                     let _ = self.decision_tx.send(decision);
+                    let _ = self.snapshot_tx.send(self.controller.snapshot());
                     last = decision;
                 }
                 sample = self.sample_rx.recv() => {
@@ -330,7 +355,7 @@ mod tests {
     async fn control_unit_publishes_initial_decision_on_spawn() {
         let (_tx, rx) = tokio::sync::mpsc::channel::<Sample>(32);
         let controller = FixedController::with_concurrency(42);
-        let (unit, mut decision_rx) =
+        let (unit, mut decision_rx, _snapshot_rx) =
             ControlUnit::new("test", controller, rx, std::time::Duration::from_millis(10));
         unit.spawn();
         // initial decision published by the first tick
@@ -365,7 +390,7 @@ mod tests {
         let controller = CountingController {
             count: count.clone(),
         };
-        let (unit, _decision_rx) = ControlUnit::new(
+        let (unit, _decision_rx, _snapshot_rx) = ControlUnit::new(
             "test",
             controller,
             rx,
@@ -432,7 +457,7 @@ mod tests {
     #[tokio::test]
     async fn control_unit_exits_when_all_senders_dropped() {
         let (tx, rx) = tokio::sync::mpsc::channel::<Sample>(32);
-        let (unit, _decision_rx) = ControlUnit::new(
+        let (unit, _decision_rx, _snapshot_rx) = ControlUnit::new(
             "test",
             NoopController::new(),
             rx,

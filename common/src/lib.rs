@@ -119,6 +119,7 @@ pub mod error_collector;
 pub mod filegen;
 pub mod filter;
 pub mod link;
+pub mod observability;
 pub mod preserve;
 pub mod remote_tracing;
 pub mod rm;
@@ -298,7 +299,9 @@ fn progress_bar(
     let mut is_done = lock.lock().unwrap();
     loop {
         PBAR.set_position(PBAR.position() + 1); // do we need to update?
-        PBAR.set_message(prog_printer.print().unwrap());
+        let mut msg = prog_printer.print().unwrap();
+        msg.push_str(&observability::render_lines());
+        PBAR.set_message(msg);
         let result = cvar.wait_timeout(is_done, delay).unwrap();
         is_done = result.0;
         if *is_done {
@@ -326,9 +329,10 @@ fn text_updates(
     loop {
         eprintln!("=======================");
         eprintln!(
-            "{}\n--{}",
+            "{}\n--{}{}",
             get_datetime_prefix(),
-            prog_printer.print().unwrap()
+            prog_printer.print().unwrap(),
+            observability::render_lines(),
         );
         let result = cvar.wait_timeout(is_done, delay).unwrap();
         is_done = result.0;
@@ -1171,8 +1175,9 @@ fn spawn_auto_meta_throttle(runtime: &tokio::runtime::Runtime, auto: AutoMetaThr
             decrease_step: auto.decrease_step,
             min_latency_max_age: auto.min_latency_max_age,
         });
-        let (unit, decision_rx) =
+        let (unit, decision_rx, snapshot_rx) =
             congestion::ControlUnit::new(label, vegas, sample_rx, auto.tick_interval);
+        observability::register_unit(label, snapshot_rx);
         runtime.spawn(unit.run());
         runtime.spawn(auto_meta::run_adapter(
             resource,
@@ -1274,6 +1279,7 @@ where
 /// decisions.
 fn reset_process_throttle_state() {
     congestion::clear_sample_sink();
+    observability::clear();
     for resource in [
         throttle::Resource::SrcWalk,
         throttle::Resource::SrcMeta,
