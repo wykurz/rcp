@@ -98,10 +98,10 @@ pub struct CommonArgs {
         help_heading = "Congestion control"
     )]
     pub auto_meta_max_cwnd: u32,
-    /// Latency inflation ratio below which cwnd grows (ewma / min_latency)
+    /// Latency inflation ratio below which cwnd grows (ewma / baseline)
     #[arg(
         long,
-        default_value = "1.1",
+        default_value = "1.3",
         value_name = "F",
         help_heading = "Congestion control (advanced)"
     )]
@@ -109,7 +109,7 @@ pub struct CommonArgs {
     /// Latency inflation ratio above which cwnd shrinks
     #[arg(
         long,
-        default_value = "1.5",
+        default_value = "2.5",
         value_name = "F",
         help_heading = "Congestion control (advanced)"
     )]
@@ -138,8 +138,8 @@ pub struct CommonArgs {
         help_heading = "Congestion control (advanced)"
     )]
     pub auto_meta_decrease_step: u32,
-    /// Max age of the min-latency baseline (e.g. "10s") before it is
-    /// discarded and re-established from new samples
+    /// Max age (e.g. "10s") of samples in the baseline window before
+    /// they are discarded and the baseline is re-established from new samples
     #[arg(
         long,
         default_value = "10s",
