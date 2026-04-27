@@ -91,8 +91,10 @@ impl ThrottleConfig {
                 return Err("auto-meta-ewma-alpha must be in [0.0, 1.0]".to_string());
             }
             // alpha and beta are latency-inflation ratios; values <= 1.0 are
-            // nonsensical since the EWMA-to-baseline ratio is >= 1.0 by
-            // construction (baseline = running minimum).
+            // nonsensical since the EWMA-to-baseline ratio normally rides at
+            // or above 1.0 (baseline = p10 of recent samples, EWMA = mean of
+            // all recent samples; mean >= p10 by definition modulo sample
+            // ordering effects).
             if auto.alpha <= 1.0 {
                 return Err("auto-meta-alpha must be > 1.0".to_string());
             }
@@ -249,8 +251,8 @@ mod auto_meta_validation_tests {
             initial_cwnd: 1,
             min_cwnd: 1,
             max_cwnd: 4096,
-            alpha: 1.1,
-            beta: 1.5,
+            alpha: 1.3,
+            beta: 2.5,
             ewma_alpha: 0.3,
             increase_step: 1,
             decrease_step: 1,

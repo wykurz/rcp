@@ -101,8 +101,10 @@ pub struct ControllerSnapshot {
     /// Current concurrency window the controller would emit on its
     /// next tick. `0` means "no cap configured."
     pub cwnd: u32,
-    /// Lowest latency observed, the controller's uncongested baseline.
-    /// `Duration::ZERO` if no signal yet.
+    /// Uncongested baseline latency (p10 of the recent sample window).
+    /// Retains the historical `min_latency` field name for backwards
+    /// compatibility with renderers; the value is no longer a strict
+    /// minimum. `Duration::ZERO` if no signal yet.
     pub min_latency: std::time::Duration,
     /// EWMA-smoothed observed latency. `Duration::ZERO` if no
     /// sample-bearing tick has fired yet.

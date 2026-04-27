@@ -155,9 +155,10 @@ The algorithm's job is to find a `cwnd` that saturates the bottleneck
 without queueing. It reasons about two derived quantities, both
 collected from the same per-op latency probes:
 
-- **Baseline latency** — the minimum operation latency we've seen
-  recently. By construction this is the floor; no individual sample can
-  be faster.
+- **Baseline latency** — the p10 percentile of recent operation
+  latencies, computed each tick over a sliding window of the last
+  ~4096 samples. This is the *uncongested floor*: most samples in the
+  window are at least this fast.
 - **Smoothed current latency** — an EWMA of recent operation latencies.
   Smoothing absorbs single-sample noise so a brief slow op doesn't kick
   the controller off course.
@@ -168,9 +169,10 @@ Their ratio is the congestion signal:
   ratio  =  smoothed_current / baseline
 ```
 
-By construction `ratio >= 1.0` (the smoothed current can't be smaller
-than the running minimum that defines the baseline). So the regime we
-care about is the strip between 1.0 and "very large":
+In normal operation `ratio >= 1.0` (the smoothed mean of the same
+window is bounded below by the lower decile, modulo sample-ordering
+noise). So the regime we care about is the strip between 1.0 and
+"very large":
 
 ```
        latency ratio
@@ -196,38 +198,52 @@ latency as the new normal and never shrinks?
 
 Three design choices keep the baseline trustworthy:
 
-1. **The baseline is a running minimum, not an average.** `min_latency`
-   records the *smallest* sample observed in the last
-   `min_latency_max_age` window (default 10s). Even when 99% of samples
-   in that window are slow because we're saturating the filesystem, a
-   single fast sample — typically from earlier, before `cwnd` ramped
-   high enough to queue — pins the floor to the true uncongested cost.
-   Slow samples can never drag the floor up; they simply aren't
-   smaller.
+1. **The baseline is the p10 of the recent sample window, not a strict
+   minimum or an average.** Every per-op latency goes into a sliding
+   window capped at ~4096 samples; on each tick the controller takes
+   the value at the 10th percentile of that window as the uncongested
+   floor. The p10 is robust to a single fast outlier (the floor only
+   moves when the lower decile of the window moves with it), naturally
+   weighted toward recent samples (older entries fall out of the
+   window), and tolerant of the natural per-op variance of real
+   filesystems — variance that on a Weka or Lustre mount routinely
+   spans an order of magnitude even on an idle metadata path. A strict
+   running minimum, in contrast, would latch onto the single fastest
+   sample (which may be a kernel cache hit unrepresentative of typical
+   service time) and read ordinary variance as queueing.
 
-2. **The control law shrinks `cwnd` long before the window expires.**
+   What the p10 admits and rejects, concretely: a workload that
+   alternates between fast and slow phases will see the p10 follow
+   the fast phase as long as roughly 10% of recent samples come from
+   it; if the slow phase becomes overwhelmingly dominant, the p10
+   drifts up too — but only after the fast phase has actually fallen
+   out of representation, not on the strength of a single anomaly.
+   Conversely, one freakishly fast outlier at the top of the window
+   doesn't pin the baseline; the p10 absorbs it without moving.
+
+2. **The control law shrinks `cwnd` long before samples age out.**
    When `ratio > beta`, the very next tick (50 ms by default) shrinks
-   `cwnd` by one step. Continued inflation keeps shrinking it.  Once
-   `cwnd` has dropped enough for the queue to drain, a low-latency
-   sample either re-confirms the existing minimum (refreshing the
-   age-out timer) or establishes a new, lower one. So in any healthy
-   operating regime the baseline is continuously re-validated long
-   before it could expire.
+   `cwnd` by one step. Continued inflation keeps shrinking it. Once
+   `cwnd` has dropped enough for the queue to drain, fresh low-latency
+   samples enter the window and the p10 tracks the true uncongested
+   floor. So in any healthy operating regime the baseline is
+   continuously re-validated long before sample age-out matters.
 
-3. **If the baseline does expire under sustained saturation, the
+3. **If the window does empty under sustained saturation, the
    smoothed estimate is reset alongside it.** The case left open is
    *persistent* overload — e.g. `min_cwnd` is configured high and the
-   filesystem is genuinely overloaded for more than 10 seconds. When
-   the baseline ages out, the next sample establishes a new (inflated)
-   floor. To prevent that newly-bad baseline from making the next tick
-   look "uncongested" and grow `cwnd` further, the EWMA is reset at
-   the same instant. The first sample-bearing tick after a reset
-   replays the cold-start path and never adjusts `cwnd`, buying a full
-   smoothing window for the controller to reconverge before any growth
-   decision.
+   filesystem is genuinely overloaded for more than the
+   `min_latency_max_age` window (default 10s). When every sample in
+   the window has aged out, the next sample establishes a new
+   (inflated) floor. To prevent that newly-bad baseline from making
+   the next tick look "uncongested" and grow `cwnd` further, the EWMA
+   is reset at the same instant. The first sample-bearing tick after
+   a reset replays the cold-start path and never adjusts `cwnd`,
+   buying a full smoothing window for the controller to reconverge
+   before any growth decision.
 
-The only state the controller carries across a baseline reset is
-`cwnd` itself — intentionally. The next ratio is computed from a fresh
+The only state the controller carries across a window reset is `cwnd`
+itself — intentionally. The next ratio is computed from a fresh
 baseline and a fresh smoothed current, so "current latency is normal"
 can't be inferred from a window of uniformly inflated samples.
 
@@ -244,8 +260,14 @@ regions and applies a fixed step to `cwnd`:
        ratio  >  beta       cwnd -= decrease_step    (shrink)
 ```
 
-Defaults: `alpha = 1.10`, `beta = 1.50`, `increase_step = decrease_step
-= 1`. Each step is then clamped to `[min_cwnd, max_cwnd]`.
+Defaults: `alpha = 1.30`, `beta = 2.50`, `increase_step =
+decrease_step = 1`. Each step is then clamped to `[min_cwnd,
+max_cwnd]`. The thresholds are deliberately loose: real metadata
+syscalls on a networked filesystem routinely show ewma-to-baseline
+ratios in the 1.5–2.0× band even when the filesystem is *not*
+congested, simply because per-op latency variance on these mounts is
+naturally large. Tighter thresholds would misread that variance as
+queueing and ratchet `cwnd` toward the floor.
 
 A few worked examples make the shape concrete. Assume a 0.5ms baseline,
 default thresholds, and `cwnd = 20` going into the tick:
@@ -253,27 +275,33 @@ default thresholds, and `cwnd = 20` going into the tick:
 | Smoothed current | Ratio | Decision | New `cwnd` |
 |------------------|-------|----------|------------|
 | 0.50 ms          | 1.00  | grow     | 21         |
-| 0.55 ms          | 1.10  | hold     | 20 (1.10 == alpha; not below) |
-| 0.70 ms          | 1.40  | hold     | 20         |
-| 0.75 ms          | 1.50  | hold     | 20 (1.50 == beta; not above) |
-| 1.00 ms          | 2.00  | shrink   | 19         |
+| 0.60 ms          | 1.20  | grow     | 21         |
+| 0.65 ms          | 1.30  | hold     | 20 (1.30 == alpha; not below) |
+| 1.00 ms          | 2.00  | hold     | 20         |
+| 1.25 ms          | 2.50  | hold     | 20 (2.50 == beta; not above) |
+| 1.50 ms          | 3.00  | shrink   | 19         |
 | 2.50 ms          | 5.00  | shrink   | 19         |
-| 0.40 ms          | 0.80  | —        | impossible (see below) |
+| 0.40 ms          | 0.80  | —        | unusual (see below) |
 
 **Two things to notice in this table.** First, the law is a
 *binary trigger*, not a proportional response: a ratio of 5.0 shrinks
-by exactly the same one step as a ratio of 1.51. Sustained inflation
+by exactly the same one step as a ratio of 2.51. Sustained inflation
 drives faster *effective* shrinkage because the ratio stays above
 `beta` over many consecutive ticks — but each individual tick still
 takes one step. This is the classic Vegas shape: simpler control law,
 less prone to oscillation under noisy latency than a gain-tuned PID.
 
-Second, **a ratio below 1.0 cannot occur.** The smoothed current is
-itself an EWMA of samples that have already been folded into the
-running min, so it is bounded below by that min. The baseline-age-out
-path preserves this property: when the min is discarded as stale, the
-smoothed current is reset alongside it so the next tick re-establishes
-both from the same fresh window of samples.
+Second, **a ratio below 1.0 is unusual.** In the typical case the
+smoothed current is the EWMA of samples whose lower decile is the p10
+baseline, so the mean is bounded below by p10 modulo sample-ordering
+noise. A brief excursion under 1.0 is possible if the EWMA's
+exponential weight is dominated by an unusually-fast burst that has
+not yet diluted into the broader window's percentile — this is benign
+and the next tick treats `ratio < alpha` as growth headroom anyway.
+The window-empty path preserves the rest of the invariants: when the
+window is exhausted by age-out, the smoothed current is reset
+alongside it so the next tick re-establishes both from the same fresh
+sample stream.
 
 The "responsiveness" of the controller is shaped by three knobs in
 combination:
@@ -350,7 +378,7 @@ metadata controllers per process — one per [`Side`]:
 | **Metadata** | source single-stat, `read_link`, source-side `File::open` | destination create / unlink / chmod / `hard_link` / `set_permissions` |
 
 Each controller runs the same algorithm with its own independent state
-(its own `min_latency`, EWMA, `cwnd`) and its own enforcement
+(its own p10 baseline window, EWMA, `cwnd`) and its own enforcement
 semaphore. A probe site is annotated with the side
 (`Metadata(Source)`, `Metadata(Destination)`); the control loop and
 enforcement gate are picked accordingly.
