@@ -152,22 +152,15 @@ mod semaphore;
 
 /// Which throttled metadata resource a permit / cap belongs to.
 ///
-/// The four variants partition metadata work along two axes — which
-/// filesystem (source vs destination) and which operation class (cache-warm
-/// directory iteration vs real per-file syscalls). Each variant gets its
-/// own concurrency cap so the per-resource latency regimes don't bleed into
-/// one another. Mirrors the congestion crate's `ResourceKind` for metadata
-/// kinds; this enum is intentionally independent so `throttle` has no
-/// dependency on `congestion`.
+/// One variant per filesystem side (source vs destination); each gets its
+/// own concurrency cap so a saturated source doesn't drag the destination
+/// down or vice versa. Mirrors the congestion crate's `ResourceKind` for
+/// metadata kinds; this enum is intentionally independent so `throttle`
+/// has no dependency on `congestion`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Resource {
-    /// Source-side directory iteration (`getdents` + cached `file_type`).
-    SrcWalk,
     /// Source-side per-file metadata syscall (`stat`, `read_link`, `open`).
     SrcMeta,
-    /// Destination-side directory iteration. Used by tools that walk dst
-    /// (e.g. `rcmp` / `rrm`).
-    DstWalk,
     /// Destination-side per-file metadata syscall — both lookups and
     /// mutations (`create_dir`, `hard_link`, `unlink`, `chmod`, …).
     DstMeta,
@@ -180,23 +173,16 @@ static OPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
 static IOPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
 // Per-op concurrency caps driven by the congestion controller. One
-// semaphore per [`Resource`] so each (side × class) pair is throttled
-// independently. Distinct from OPS_THROTTLE (rate) and OPEN_FILES_LIMIT
-// (FDs).
-static OPS_IN_FLIGHT_LIMIT_SRC_WALK: std::sync::LazyLock<semaphore::Semaphore> =
-    std::sync::LazyLock::new(semaphore::Semaphore::new);
+// semaphore per [`Resource`] so each side is throttled independently.
+// Distinct from OPS_THROTTLE (rate) and OPEN_FILES_LIMIT (FDs).
 static OPS_IN_FLIGHT_LIMIT_SRC_META: std::sync::LazyLock<semaphore::Semaphore> =
-    std::sync::LazyLock::new(semaphore::Semaphore::new);
-static OPS_IN_FLIGHT_LIMIT_DST_WALK: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
 static OPS_IN_FLIGHT_LIMIT_DST_META: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
 
 fn ops_in_flight_limit(resource: Resource) -> &'static semaphore::Semaphore {
     match resource {
-        Resource::SrcWalk => &OPS_IN_FLIGHT_LIMIT_SRC_WALK,
         Resource::SrcMeta => &OPS_IN_FLIGHT_LIMIT_SRC_META,
-        Resource::DstWalk => &OPS_IN_FLIGHT_LIMIT_DST_WALK,
         Resource::DstMeta => &OPS_IN_FLIGHT_LIMIT_DST_META,
     }
 }

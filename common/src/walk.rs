@@ -4,10 +4,11 @@
 //! per-type bits (dry-run label, skipped-counter increment) so callers don't
 //! re-implement the dispatch.
 //!
-//! [`next_entry_probed`] wraps `tokio::fs::ReadDir::next_entry` with the full
-//! per-entry throttle + congestion-probe prologue so copy/link/rm share a
-//! single source of truth for the "probe after permit, permit before
-//! children" invariant.
+//! [`next_entry_probed`] wraps `tokio::fs::ReadDir::next_entry` (plus the
+//! follow-up `file_type()` lookup) with the static ops rate gate so
+//! copy/link/rm share a single source of truth for walk iteration. The
+//! walk path is deliberately not congestion-probed — see the function's
+//! own docs for why.
 
 use crate::filter::{FilterResult, FilterSettings};
 use crate::progress::Progress;
@@ -99,69 +100,44 @@ fn meta_resource(side: congestion::Side) -> throttle::Resource {
     }
 }
 
-/// Resolve the [`throttle::Resource`] for directory iteration
-/// (`getdents` + cached `file_type`) on the given [`congestion::Side`].
-fn walk_resource(side: congestion::Side) -> throttle::Resource {
-    match side {
-        congestion::Side::Source => throttle::Resource::SrcWalk,
-        congestion::Side::Destination => throttle::Resource::DstWalk,
-    }
-}
-
-/// Pull the next directory entry with the full per-entry throttle + probe
-/// prologue applied:
+/// Pull the next directory entry, gated only by the static ops rate
+/// gate.
+///
+/// Walks are deliberately not probed: `tokio::fs::ReadDir::next_entry`
+/// returns buffered entries from a prior `getdents` batch without
+/// entering the kernel, so most "walk probes" don't measure filesystem
+/// service time at all. The resulting bimodal latency distribution
+/// (cache hit vs. real `getdents`) collapses any baseline a controller
+/// could derive from it. The fix is to probe only the per-file
+/// metadata syscalls that follow the walk, where each sample reflects
+/// real filesystem work.
+///
+/// The prologue is therefore just:
 ///
 /// 1. Await the static ops rate gate.
-/// 2. Acquire the dynamic ops-in-flight permit on the walk resource for
-///    the given [`congestion::Side`] (a no-op when that resource's cap is not
-///    configured).
-/// 3. Start a walk-class [`congestion::Probe`] tagged with the same side —
-///    *after* the permit is held, so self-inflicted queueing on the
-///    in-flight semaphore is not reported back to the controller as
-///    filesystem latency.
-/// 4. Call `next_entry()` and, on success, classify via `file_type()`.
-/// 5. Complete the probe on success; discard it on error or exhaustion —
-///    error paths must not skew the controller's latency baseline.
-/// 6. Release the permit before returning, so the caller can spawn / await
-///    children without holding it across task boundaries (which would
-///    deadlock at any tree depth greater than cwnd).
+/// 2. Call `next_entry()` and, on success, classify via `file_type()`.
 ///
-/// `side` is almost always [`congestion::Side::Source`] — directory walks
-/// are reads of the source filesystem. The exception is `cmp`'s
-/// destination walk in `expand_missing` mode, which iterates the dst
-/// tree and uses [`congestion::Side::Destination`].
+/// `side` is currently unused at runtime but kept on the signature so
+/// callers stay self-documenting and future per-side gating can be
+/// reintroduced without touching every call site.
 ///
 /// The error is left as `anyhow::Error` so each caller can wrap it in the
 /// site-specific error type (`copy::Error`, `link::Error`, `rm::Error`)
 /// without this helper needing to be generic over the summary payload.
 pub async fn next_entry_probed<F>(
     entries: &mut tokio::fs::ReadDir,
-    side: congestion::Side,
+    _side: congestion::Side,
     context: F,
 ) -> anyhow::Result<Option<(tokio::fs::DirEntry, Option<std::fs::FileType>)>>
 where
     F: FnOnce() -> String,
 {
     throttle::get_ops_token().await;
-    let ops_permit = throttle::ops_in_flight_permit(walk_resource(side)).await;
-    let probe = congestion::Probe::start_walk(side);
     let maybe_entry = entries.next_entry().await.with_context(context)?;
     let Some(entry) = maybe_entry else {
-        probe.discard();
-        drop(ops_permit);
         return Ok(None);
     };
-    let entry_file_type = match entry.file_type().await {
-        Ok(file_type) => {
-            probe.complete_ok(0);
-            Some(file_type)
-        }
-        Err(_) => {
-            probe.discard();
-            None
-        }
-    };
-    drop(ops_permit);
+    let entry_file_type = entry.file_type().await.ok();
     Ok(Some((entry, entry_file_type)))
 }
 

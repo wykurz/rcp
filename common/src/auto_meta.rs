@@ -508,9 +508,7 @@ mod tests {
         /// Reset the global throttle + sample-sink state after a test so
         /// a subsequent test sees a clean slate regardless of ordering.
         async fn reset_globals() {
-            throttle::set_max_ops_in_flight(throttle::Resource::SrcWalk, 0);
             throttle::set_max_ops_in_flight(throttle::Resource::SrcMeta, 0);
-            throttle::set_max_ops_in_flight(throttle::Resource::DstWalk, 0);
             throttle::set_max_ops_in_flight(throttle::Resource::DstMeta, 0);
             throttle::disable_ops_throttle();
             congestion::clear_sample_sink();

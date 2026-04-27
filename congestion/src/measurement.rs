@@ -32,24 +32,12 @@ pub enum Side {
 /// Which resource a probe is measuring.
 ///
 /// Separate kinds feed independent controllers in the control loop.
-/// Metadata kinds are split along two axes so each controller's samples
-/// stay within a single latency regime:
-///
-/// - **Walk** vs **Metadata**: directory iteration (`getdents` + cached
-///   `file_type`) is mostly cache-warm and faster than real per-file
-///   metadata syscalls. Mixing them on one controller would let cache
-///   hits pull `min_latency` to a few microseconds, making every real
-///   stat look "slow" and pinning `cwnd` at the floor.
-/// - **Source** vs **Destination** ([`Side`]): different filesystems
-///   typically have different service-time profiles; one cap per side
-///   prevents a saturated source from dragging down the destination's
-///   `cwnd` and vice versa.
+/// Metadata kinds are split by [`Side`]: different filesystems typically
+/// have different service-time profiles, so one cap per side prevents a
+/// saturated source from dragging down the destination's `cwnd` and vice
+/// versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResourceKind {
-    /// Directory iteration: `next_entry` (getdents-batched) plus the
-    /// cached `file_type` lookup that follows it. Mostly served from
-    /// the dirent cache.
-    Walk(Side),
     /// Single per-file metadata syscall: `stat`, `symlink_metadata`,
     /// `mkdir`, `unlink`, `hard_link`, `symlink`, `chmod`,
     /// `open(O_CREAT)`, `read_link`, etc. Real round-trip work each
@@ -131,12 +119,6 @@ impl Probe {
             kind,
             started_at: std::time::Instant::now(),
         }
-    }
-    /// Shorthand for `Probe::start(ResourceKind::Walk(side))`. Use this
-    /// to bracket directory iteration work (`next_entry` + cached
-    /// `file_type`).
-    pub fn start_walk(side: Side) -> Self {
-        Self::start(ResourceKind::Walk(side))
     }
     /// Shorthand for `Probe::start(ResourceKind::Metadata(side))`. Use
     /// this to bracket a single per-file metadata syscall (lookup or

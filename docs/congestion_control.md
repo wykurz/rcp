@@ -17,7 +17,7 @@ scope here is conceptual; specific flag names are covered in
 - [The Control Law](#the-control-law)
 - [Enforcement Model](#enforcement-model)
 - [What Counts as a Metadata Op](#what-counts-as-a-metadata-op)
-- [Four Controllers: Walk × Metadata × Source × Destination](#four-controllers-walk--metadata--source--destination)
+- [Two Controllers: One per Filesystem Side](#two-controllers-one-per-filesystem-side)
 - [Interaction with Static Throttles](#interaction-with-static-throttles)
 - [Remote Copy](#remote-copy)
 - [Tuning and Observability](#tuning-and-observability)
@@ -103,11 +103,12 @@ emits absolute limits — concurrency, rate, or both. No I/O, no clocks
 except time values passed in. This purity lets a deterministic simulator
 drive any algorithm through synthetic workloads for regression testing.
 
-**Control loop.** Async glue. Each controlled resource (metadata,
-read-throughput, write-throughput) has its own instance, running as a
-lightweight task. It drains a bounded sample queue, calls the
-algorithm's tick on a configurable cadence, and publishes each emitted
-decision to the enforcement layer.
+**Control loop.** Async glue. Each controlled resource has its own
+instance, running as a lightweight task. It drains a bounded sample
+queue, calls the algorithm's tick on a configurable cadence, and
+publishes each emitted decision to the enforcement layer. We run one
+controller per filesystem side (source vs destination) — see
+[Two Controllers: One per Filesystem Side](#two-controllers-one-per-filesystem-side).
 
 **Enforcement.** The hot-path gates — semaphores and token buckets that
 the filesystem-op callers wait on. These existed before congestion
@@ -298,8 +299,8 @@ algorithm last decided.
 
 ## What Counts as a Metadata Op
 
-We probe **every** metadata-touching syscall the tools issue, on both
-the read side and the write side. The cost of a probe is two
+We probe most per-file metadata syscalls the mutating tools issue, on
+both the read side and the write side. The cost of a probe is two
 `Instant::now()` calls plus a non-blocking channel send (or a no-op when
 no sink is installed), so wide coverage is cheap; in exchange we get a
 control signal that doesn't have visibility holes the controller can be
@@ -307,88 +308,78 @@ fooled by.
 
 What "wide coverage" means concretely:
 
-- **Read-side metadata, walk-class:** the directory-walk pair
-  `next_entry()` + `file_type()`. We bracket the pair as one probe
-  because they're tightly coupled and `file_type` typically serves out
-  of the dirent cache populated by `next_entry`.
-- **Read-side metadata, single-syscall:** every `tokio::fs::metadata`,
-  `symlink_metadata`, `read_link`, `canonicalize`, and `File::open` on
-  the source path.
+- **Read-side metadata:** every `tokio::fs::symlink_metadata`,
+  `metadata`, `read_link`, `canonicalize`, and `File::open` along the
+  source-side paths of `rcp`, `rlink`, and `rrm`. Each is one probe per
+  syscall.
 - **Write-side metadata:** `create_dir`, `hard_link`, `symlink`,
   `remove_file`, `remove_dir`, `set_permissions`, the `chown` and
   `utimens` syscalls inside `preserve::set_*_metadata`, and the
   `File::open` / `OpenOptions::open(create:true, …)` for new files.
   Each is one probe per syscall.
-- **Not probed by design:** data-path reads/writes (the read-loop and
-  write-loop inside the copy pipeline, and `tokio::fs::copy` itself).
-  Bandwidth-bound, not service-time-bound; a Vegas-style controller
-  doesn't fit. See [Pluggability](#pluggability) for the BBR direction.
+- **Not probed today — `rcmp`.** The compare tool reads source and
+  destination metadata via raw `tokio::fs::symlink_metadata` (see
+  `common::cmp`); none of those calls are bracketed by
+  `walk::run_metadata_probed`, so `rcmp` does not currently exercise
+  the metadata controllers. Adding probes there is a follow-up.
+- **Not probed by design — directory iteration.** Walks (`next_entry`
+  + cached `file_type`) are *not* probed. `tokio::fs::ReadDir`
+  amortizes a single `getdents` syscall over many `next_entry` calls,
+  so most "walk probes" don't enter the kernel at all and complete in
+  tens of nanoseconds. The resulting bimodal cache-hit / real-syscall
+  distribution collapses any baseline a controller could derive from
+  it and pins `cwnd` at the floor. The per-file metadata syscalls that
+  *follow* the walk still carry a clean signal, so we let those drive
+  the controllers and skip the walk path entirely.
+- **Not probed by design — data path.** The read-loop and write-loop
+  inside the copy pipeline, and `tokio::fs::copy` itself. Bandwidth-
+  bound, not service-time-bound; a Vegas-style controller doesn't fit.
+  See [Pluggability](#pluggability) for the BBR direction.
 
-The risk of probing every metadata syscall is that *kinds* of metadata
-ops have different latency regimes — a cache-warm `getdents` is much
-faster than a cold `stat`. Mixing the two on one controller would let
-cache hits drag `min_latency` down and make every real syscall look
-"slow." We address this not by probing fewer sites, but by routing
-samples to **separate controllers per (op-class × filesystem-side)**
-— see the next section.
-
-## Four Controllers: Walk × Metadata × Source × Destination
+## Two Controllers: One per Filesystem Side
 
 Filesystems vary enormously. A copy from a saturated NFS mount to a
 local SSD has two completely independent service-time profiles, and
-forcing them onto a single controller pessimizes both. Likewise,
-mixing cache-warm directory iteration with cold per-file metadata on
-the same controller lets `min_latency` collapse to a few microseconds
-and the controller treats every real `stat` as "slow."
+forcing them onto a single controller pessimizes both.
 
-Following the guideline *one controller per filesystem, one controller
-per operation class*, we run four metadata controllers per process,
-partitioning along two axes:
+Following the guideline *one controller per filesystem*, we run two
+metadata controllers per process — one per [`Side`]:
 
-|                | **Source-side**            | **Destination-side**        |
-|----------------|----------------------------|-----------------------------|
-| **Walk**       | source directory iteration | destination dir iteration   |
-| **Metadata**   | source single-stat / open  | destination create / unlink / chmod |
+|              | **Source-side**                   | **Destination-side**                  |
+|--------------|-----------------------------------|---------------------------------------|
+| **Metadata** | source single-stat, `read_link`, source-side `File::open` | destination create / unlink / chmod / `hard_link` / `set_permissions` |
 
 Each controller runs the same algorithm with its own independent state
 (its own `min_latency`, EWMA, `cwnd`) and its own enforcement
-semaphore. A probe site is annotated with both axes (`Walk(Source)`,
-`Metadata(Destination)`, …); the control loop and enforcement gate
-are picked accordingly.
+semaphore. A probe site is annotated with the side
+(`Metadata(Source)`, `Metadata(Destination)`); the control loop and
+enforcement gate are picked accordingly.
 
 How tools map onto this:
 
-| Tool      | walk-src  | meta-src                   | walk-dst | meta-dst                                 |
-|-----------|-----------|----------------------------|----------|------------------------------------------|
-| `rcp`     | source tree walk | top-level / dereferenced stats, `read_link`, file open  | —        | `create_dir`, `symlink`, file create, `set_permissions`, `chown`, `utimens` |
-| `rrm`     | walk of the path being removed | top-level stat | — | `remove_file`, `remove_dir`, pre-unlink `set_permissions` |
-| `rlink`   | src (and update, when set) walks | top-level stats | — | `hard_link`, `create_dir`, `set_permissions` |
-| `rcmp`    | walk of src      | top-level stats           | walk of dst | (compare-only — no writes) |
-| `filegen` | — | — | — | `create_dir`, `open(create:true)`, `set_permissions` |
+| Tool      | meta-src                                       | meta-dst                                       |
+|-----------|------------------------------------------------|------------------------------------------------|
+| `rcp`     | top-level / dereferenced stats, `read_link`, file open | `create_dir`, `symlink`, file create, `set_permissions`, `chown`, `utimens` |
+| `rrm`     | top-level stat                                 | `remove_file`, `remove_dir`, pre-unlink `set_permissions` |
+| `rlink`   | top-level stats                                | `hard_link`, `create_dir`, `set_permissions`   |
+| `rcmp`    | (no probes today — see note above)             | (no probes today — compare-only, no writes)    |
+| `filegen` | —                                              | `create_dir`, `open(create:true)`, `set_permissions` |
 
-Two notes on this layout:
+Single-path tools (rrm, filegen) still get both controllers. rrm
+exercises meta-src + meta-dst; filegen exercises only meta-dst; the
+unused controller stays idle (harmless). Carrying both uniformly
+keeps the wiring identical across tools.
 
-- **Single-path tools (rrm, filegen) still get all four controllers.**
-  rrm exercises walk-src + meta-dst; filegen exercises only meta-dst;
-  the unused controllers stay idle (harmless). Carrying all four
-  uniformly keeps the wiring identical across tools.
-- **rcmp's "destination" probes are reads, not writes.** Compare-only
-  tools read both sides without mutating, so they only exercise
-  walk-src and walk-dst. The principle "one controller per filesystem"
-  still applies — a saturated dst-FS shouldn't push the src-FS
-  controller into shrinking when src-FS is fine.
-
-A note on the rate dimension: the four controllers all gate their own
+A note on the rate dimension: both controllers gate their own
 in-flight concurrency independently, but the global ops-throttle
 (rate-per-second) is shared across the process. Only one controller —
 destination metadata, by convention — drives that single rate gate;
-the other three apply concurrency only.
+the other applies concurrency only.
 
 In remote copy, this layout maps cleanly: `rcpd-source` exercises
-walk-src and meta-src (only ever reads its local source filesystem),
-and `rcpd-destination` exercises meta-dst (only ever mutates its
-local destination filesystem). The unused channels stay idle on each
-side.
+meta-src (only ever reads its local source filesystem), and
+`rcpd-destination` exercises meta-dst (only ever mutates its local
+destination filesystem). The unused channel stays idle on each side.
 
 At the call site, each syscall is bracketed by permit acquisition and a
 *probe* that measures its wall-clock duration:
@@ -488,8 +479,8 @@ tick cadence. Defaults are conservative; aggressive-but-sensible tuning
 comes from field measurements.
 
 The control loop emits structured `tracing` events on a few channels —
-each tagged with a `unit` field so the four controllers can be told
-apart in mixed logs (`walk-src`, `walk-dst`, `meta-src`, `meta-dst`):
+each tagged with a `unit` field so the two controllers can be told
+apart in mixed logs (`meta-src`, `meta-dst`):
 
 - **`tracing::info!`** at startup, describing the effective auto-meta
   configuration.
