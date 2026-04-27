@@ -1289,6 +1289,14 @@ fn reset_process_throttle_state() {
         throttle::set_max_ops_in_flight(resource, 0);
     }
     throttle::disable_ops_throttle();
+    // Without these resets, a second run() in the same process inherits
+    // the previous run's open-files cap and iops-throttle even when the
+    // caller passes 0 ("no limit"): `set_max_open_files` / `init_iops_tokens`
+    // are skipped on 0, leaving the prior `setup(N)` in force. setup(0)
+    // disables the semaphore, so the next run sees a clean slate and can
+    // either re-init with a fresh value or stay disabled.
+    throttle::set_max_open_files(0);
+    throttle::init_iops_tokens(0);
 }
 
 #[cfg(test)]

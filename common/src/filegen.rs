@@ -95,8 +95,11 @@ pub async fn write_file(
     let mut bytes = vec![0u8; bufsize];
     // The file open is the single metadata syscall in this path; wrap it
     // with the cwnd permit + probe so filegen participates in the same
-    // adaptive control loop as copy/rm/link.
-    let mut file = crate::walk::run_metadata_probed(
+    // adaptive control loop as copy/rm/link. Use the `_no_rate` variant
+    // because filegen gates the ops-throttle at task-spawn time (see
+    // `filegen` below) — going through the rate-gating helper here
+    // would consume two tokens per file and halve the effective rate.
+    let mut file = crate::walk::run_metadata_probed_no_rate(
         congestion::Side::Destination,
         tokio::fs::OpenOptions::new()
             .write(true)
