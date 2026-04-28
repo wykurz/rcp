@@ -374,9 +374,20 @@ async fn expand_missing_tree(
     settings: &Settings,
 ) -> Result<Summary> {
     let _prog_guard = prog_track.ops.guard();
-    let metadata = tokio::fs::symlink_metadata(existing_path)
-        .await
-        .with_context(|| format!("failed reading metadata from {:?}", &existing_path))?;
+    // The side we probe against is fully determined by which tree is
+    // missing: `DstMissing` means we're enumerating src, `SrcMissing`
+    // means we're enumerating dst. `Same` / `Different` are never
+    // passed in (the only two call sites pass the `*Missing` variants),
+    // but be defensive and default to source.
+    let side = match result {
+        CompareResult::DstMissing => congestion::Side::Source,
+        CompareResult::SrcMissing => congestion::Side::Destination,
+        CompareResult::Same | CompareResult::Different => congestion::Side::Source,
+    };
+    let metadata =
+        crate::walk::run_metadata_probed(side, tokio::fs::symlink_metadata(existing_path))
+            .await
+            .with_context(|| format!("failed reading metadata from {:?}", &existing_path))?;
     let existing_obj_type = obj_type(&metadata);
     let mut summary = Summary::default();
     summary.mismatch[existing_obj_type][result] += 1;
@@ -424,7 +435,7 @@ async fn expand_missing_tree(
     let errors = crate::error_collector::ErrorCollector::default();
     loop {
         let Some((entry, entry_file_type)) =
-            crate::walk::next_entry_probed(&mut entries, congestion::Side::Source, || {
+            crate::walk::next_entry_probed(&mut entries, side, || {
                 format!("failed traversing directory {:?}", &existing_path)
             })
             .await?
@@ -509,9 +520,12 @@ async fn cmp_internal(
     let _prog_guard = prog_track.ops.guard();
     tracing::debug!("reading source metadata");
     // it is impossible for src not exist other than user passing invalid path (which is an error)
-    let src_metadata = tokio::fs::symlink_metadata(src)
-        .await
-        .with_context(|| format!("failed reading metadata from {:?}", &src))?;
+    let src_metadata = crate::walk::run_metadata_probed(
+        congestion::Side::Source,
+        tokio::fs::symlink_metadata(src),
+    )
+    .await
+    .with_context(|| format!("failed reading metadata from {:?}", &src))?;
     // apply filter to root item (when src == source_root, this is the initial call)
     if src == source_root
         && let Some(filter) = &settings.filter
@@ -536,7 +550,12 @@ async fn cmp_internal(
         cmp_summary.src_bytes += src_metadata.len();
     }
     let dst_metadata = {
-        match tokio::fs::symlink_metadata(dst).await {
+        let probed = crate::walk::run_metadata_probed(
+            congestion::Side::Destination,
+            tokio::fs::symlink_metadata(dst),
+        )
+        .await;
+        match probed {
             Ok(metadata) => metadata,
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::NotFound {
@@ -707,9 +726,12 @@ async fn cmp_internal(
         }
         tracing::debug!("found a new entry in the 'dst' directory");
         let dst_path = dst.join(entry_name);
-        let dst_entry_metadata = tokio::fs::symlink_metadata(&dst_path)
-            .await
-            .with_context(|| format!("failed reading metadata from {:?}", &dst_path))?;
+        let dst_entry_metadata = crate::walk::run_metadata_probed(
+            congestion::Side::Destination,
+            tokio::fs::symlink_metadata(&dst_path),
+        )
+        .await
+        .with_context(|| format!("failed reading metadata from {:?}", &dst_path))?;
         let dst_obj_type = obj_type(&dst_entry_metadata);
         if settings.expand_missing && dst_entry_metadata.is_dir() {
             match expand_missing_tree(
