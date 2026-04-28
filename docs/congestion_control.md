@@ -345,20 +345,23 @@ What "wide coverage" means concretely:
   `utimens` syscalls inside `preserve::set_*_metadata`, and the
   `File::open` / `OpenOptions::open(create:true, …)` for new files.
   Each is one probe per syscall.
-- **Not probed today — `rcmp`.** The compare tool reads source and
-  destination metadata via raw `tokio::fs::symlink_metadata` (see
-  `common::cmp`); none of those calls are bracketed by
-  `walk::run_metadata_probed`, so `rcmp` does not currently exercise
-  the metadata controllers. Adding probes there is a follow-up.
 - **Not probed by design — directory iteration.** Walks (`next_entry`
-  + cached `file_type`) are *not* probed. `tokio::fs::ReadDir`
-  amortizes a single `getdents` syscall over many `next_entry` calls,
-  so most "walk probes" don't enter the kernel at all and complete in
-  tens of nanoseconds. The resulting bimodal cache-hit / real-syscall
-  distribution collapses any baseline a controller could derive from
-  it and pins `cwnd` at the floor. The per-file metadata syscalls that
-  *follow* the walk still carry a clean signal, so we let those drive
-  the controllers and skip the walk path entirely.
+  + cached `file_type`) are *not* probed and *not* concurrency-capped.
+  `tokio::fs::ReadDir` amortizes a single `getdents` syscall over many
+  `next_entry` calls, so most "walk probes" don't enter the kernel at
+  all and complete in tens of nanoseconds. The resulting bimodal
+  cache-hit / real-syscall distribution collapses any baseline a
+  controller could derive from it and pins `cwnd` at the floor. The
+  per-file metadata syscalls that *follow* the walk still carry a
+  clean signal, so we let those drive the controllers and skip the
+  walk path entirely. One side-effect worth flagging: a workload that
+  walks a wide tree but filters most entries away (large
+  `--include`/`--exclude` exclusions) will still spawn concurrent
+  directory scans without any auto-meta backpressure, since the
+  filter short-circuit happens before any metadata syscall fires.
+  Walks self-pace through the OS getdents cache and the global
+  `--ops-throttle` rate gate still applies; if you need a hard cap on
+  walk-side load on a fragile NAS, reach for `--ops-throttle`.
 - **Not probed by design — data path.** The read-loop and write-loop
   inside the copy pipeline, and `tokio::fs::copy` itself. Bandwidth-
   bound, not service-time-bound; a Vegas-style controller doesn't fit.
@@ -390,7 +393,7 @@ How tools map onto this:
 | `rcp`     | top-level / dereferenced stats, `read_link`, file open | `create_dir`, `symlink`, file create, `set_permissions`, `chown`, `utimens` |
 | `rrm`     | top-level stat                                 | `remove_file`, `remove_dir`, pre-unlink `set_permissions` |
 | `rlink`   | top-level stats                                | `hard_link`, `create_dir`, `set_permissions`   |
-| `rcmp`    | (no probes today — see note above)             | (no probes today — compare-only, no writes)    |
+| `rcmp`    | per-entry `symlink_metadata` on the src tree   | per-entry `symlink_metadata` on the dst tree (compare-only — no writes) |
 | `filegen` | —                                              | `create_dir`, `open(create:true)`, `set_permissions` |
 
 Single-path tools (rrm, filegen) still get both controllers. rrm

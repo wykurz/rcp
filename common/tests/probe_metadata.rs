@@ -245,6 +245,52 @@ async fn filegen_emits_metadata_samples_for_created_dirs_and_files() {
 }
 
 #[tokio::test]
+async fn cmp_emits_metadata_samples_per_tree_entry() {
+    // cmp walks src and dst in parallel and stats every entry on each
+    // side. With identical small_tree fixtures (5 non-root entries)
+    // and the root included, cmp_internal recurses 6 times — each
+    // recursion does one src and one dst symlink_metadata. The walks
+    // themselves are unprobed (Resource::Walk was removed), so the
+    // signal comes purely from those symlink_metadata calls.
+    let _guard = SINK_GUARD.lock().await;
+    let sink = install_sink();
+    let tmp = make_tempdir("cmp_samples").await;
+    let src = tmp.join("src");
+    let dst = tmp.join("dst");
+    make_small_tree(&src).await.expect("create src tree");
+    make_small_tree(&dst).await.expect("create dst tree");
+    let log = common::cmp::LogWriter::silent().await.expect("silent log");
+    common::cmp::cmp(
+        &PROGRESS,
+        &src,
+        &dst,
+        &log,
+        &common::cmp::Settings {
+            fail_early: false,
+            exit_early: false,
+            expand_missing: false,
+            compare: Default::default(),
+            filter: None,
+        },
+    )
+    .await
+    .expect("cmp succeeds");
+    congestion::clear_sample_sink();
+    // 6 entries × 1 src symlink_metadata each = 6 src probes.
+    assert_eq!(
+        sink.metadata_count_for(congestion::Side::Source),
+        6,
+        "expected 6 src metadata probes (one symlink_metadata per entry)",
+    );
+    // 6 entries × 1 dst symlink_metadata each = 6 dst probes.
+    assert_eq!(
+        sink.metadata_count_for(congestion::Side::Destination),
+        6,
+        "expected 6 dst metadata probes (one symlink_metadata per entry)",
+    );
+}
+
+#[tokio::test]
 async fn link_update_path_emits_probes_for_update_tree() {
     // Pins the per-file metadata probes that fire when `link` processes
     // entries present in `update/` but not in `src/`. These end up on
