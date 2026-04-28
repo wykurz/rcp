@@ -60,33 +60,62 @@ pub fn clear() {
         .clear();
 }
 
+/// Width (in display chars) of every right-aligned numeric column in
+/// the rendered panel. Wide enough to fit the realistic worst cases
+/// without truncation: `999.9µs`, `1234.5×`, `999.9k`.
+const FIELD_WIDTH: usize = 7;
+
+/// Section separator drawn above the auto-meta panel. Matches the
+/// dashed style used elsewhere in the progress printers so the panel
+/// reads as just another section break rather than free-floating text.
+const SEPARATOR: &str = "-----------------------";
+
 /// Render the registered units as a multi-line block suitable for
-/// appending to the progress display. Returns an empty string if no
-/// units are registered (so non-adaptive runs render an unmodified
-/// progress bar).
+/// appending to the progress display. Returns an empty string when
+/// either (a) no units are registered (non-adaptive run) or (b) every
+/// registered unit has zero samples — typically a brief startup window
+/// before the first probe lands, or a unit class that the current tool
+/// never exercises (e.g. `meta-src` for `filegen`, which only ever
+/// touches the destination side).
 ///
-/// The format is one fixed-width line per unit:
+/// The format is one fixed-width line per unit, prefixed by a dashed
+/// separator so the panel sits visually apart from the COPIED/REMOVED/
+/// SKIPPED sections above it:
 ///
 /// ```text
-/// walk-src cwnd=42  base=0.8ms  ewma=2.1ms  ratio=2.6×  samples=1.2k
+/// -----------------------
+/// meta-src  cwnd=  42  base=  0.8ms  ewma=  2.1ms  ratio=   2.6×  samples=   1.2k
 /// ```
 ///
 /// Unit labels are padded to a uniform width so columns align even
-/// across mixed `walk-` / `meta-` names. Each line begins with a
-/// newline so it composes cleanly when appended to an existing
-/// message.
+/// when the registry grows beyond `meta-src` / `meta-dst`. Numeric
+/// columns are right-aligned to a uniform fixed width.
 #[must_use]
 pub fn render_lines() -> String {
     let units = registered_units();
     if units.is_empty() {
         return String::new();
     }
-    let label_width = units.iter().map(|u| u.label.len()).max().unwrap_or(0);
+    // Snapshot once per render so a probe completing mid-render can't
+    // make a row appear/disappear between the empty check and the loop.
+    let snapshots: Vec<(&'static str, ControllerSnapshot)> = units
+        .iter()
+        .map(|u| (u.label, *u.snapshot_rx.borrow()))
+        .collect();
+    let visible: Vec<(&'static str, ControllerSnapshot)> = snapshots
+        .into_iter()
+        .filter(|(_, snap)| snap.samples_seen > 0)
+        .collect();
+    if visible.is_empty() {
+        return String::new();
+    }
+    let label_width = visible.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
     let mut out = String::new();
-    for unit in &units {
-        let snap = *unit.snapshot_rx.borrow();
+    out.push('\n');
+    out.push_str(SEPARATOR);
+    for (label, snap) in &visible {
         out.push('\n');
-        out.push_str(&format_unit_line(unit.label, label_width, snap));
+        out.push_str(&format_unit_line(label, label_width, *snap));
     }
     out
 }
@@ -102,9 +131,10 @@ fn format_unit_line(label: &str, label_width: usize, snap: ControllerSnapshot) -
         format!("{ratio:.1}×")
     };
     format!(
-        "{label:<width$}  cwnd={cwnd:<4}  base={base}  ewma={ewma}  ratio={ratio:<5}  samples={samples}",
+        "{label:<lwidth$}  cwnd={cwnd:>4}  base={base:>fwidth$}  ewma={ewma:>fwidth$}  ratio={ratio:>fwidth$}  samples={samples:>fwidth$}",
         label = label,
-        width = label_width,
+        lwidth = label_width,
+        fwidth = FIELD_WIDTH,
         cwnd = snap.cwnd,
         base = format_duration(snap.min_latency),
         ewma = format_duration(snap.ewma_latency),
@@ -113,12 +143,12 @@ fn format_unit_line(label: &str, label_width: usize, snap: ControllerSnapshot) -
     )
 }
 
-/// Compact, uniform-width latency formatter. Picks the unit so the
-/// number stays in 1–3 digits ("0.8ms", "12ms", "1.4s") to keep
-/// columns roughly aligned.
+/// Compact latency formatter. Picks the unit so the number stays in
+/// 1–4 chars (`58`, `1.7`, `33.5`, `999.9`); the outer format string
+/// pads the result to [`FIELD_WIDTH`] so consecutive rows line up.
 fn format_duration(d: std::time::Duration) -> String {
     if d.is_zero() {
-        return String::from("  —  ");
+        return String::from("—");
     }
     let nanos = d.as_nanos();
     if nanos < 1_000 {
@@ -219,27 +249,124 @@ mod tests {
         register_unit("meta-dst", rx_b);
         let out = render_lines();
         let lines: Vec<&str> = out.split('\n').filter(|s| !s.is_empty()).collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("walk-src"));
-        assert!(lines[0].contains("cwnd=8"));
+        // Separator + 2 unit rows.
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], SEPARATOR);
+        assert!(lines[1].contains("walk-src"));
+        // cwnd is right-aligned to 4 chars; numeric columns to FIELD_WIDTH.
+        assert!(lines[1].contains("cwnd=   8"));
         // EWMA / min_latency = 2ms / 800µs = 2.5×
-        assert!(lines[0].contains("ratio=2.5×"));
-        assert!(lines[0].contains("samples=1.2k"));
-        assert!(lines[1].contains("meta-dst"));
-        assert!(lines[1].contains("cwnd=16"));
-        assert!(lines[1].contains("samples=5.7k"));
+        assert!(lines[1].contains("ratio=   2.5×"));
+        assert!(lines[1].contains("samples=   1.2k"));
+        assert!(lines[2].contains("meta-dst"));
+        assert!(lines[2].contains("cwnd=  16"));
+        assert!(lines[2].contains("samples=   5.7k"));
+        clear();
+    }
+
+    #[test]
+    fn render_lines_skips_units_with_zero_samples() {
+        // Tools that don't exercise a side (e.g. rrm never walks the
+        // destination tree) leave that controller's `samples_seen` at
+        // zero. We don't show the row at all rather than render a
+        // permanent placeholder of dashes.
+        let _g = GUARD.lock().unwrap();
+        clear();
+        let (_tx_a, rx_a) = tokio::sync::watch::channel(ControllerSnapshot {
+            cwnd: 8,
+            min_latency: std::time::Duration::from_micros(800),
+            ewma_latency: std::time::Duration::from_millis(2),
+            samples_seen: 1234,
+        });
+        let (_tx_b, rx_b) = tokio::sync::watch::channel(ControllerSnapshot {
+            cwnd: 1,
+            min_latency: std::time::Duration::ZERO,
+            ewma_latency: std::time::Duration::ZERO,
+            samples_seen: 0,
+        });
+        register_unit("walk-src", rx_a);
+        register_unit("walk-dst", rx_b);
+        let out = render_lines();
+        assert!(out.contains("walk-src"));
+        assert!(!out.contains("walk-dst"));
+        clear();
+    }
+
+    #[test]
+    fn render_lines_is_empty_when_all_units_have_zero_samples() {
+        // At startup, before any probes have completed, every controller
+        // reports samples_seen = 0. The panel shouldn't render a bare
+        // separator with nothing under it.
+        let _g = GUARD.lock().unwrap();
+        clear();
+        let (_tx, rx) = tokio::sync::watch::channel(ControllerSnapshot::default());
+        register_unit("walk-src", rx);
+        assert_eq!(render_lines(), "");
         clear();
     }
 
     #[test]
     fn render_lines_shows_em_dash_when_baseline_unset() {
+        // It's possible (briefly) for a unit to have samples_seen > 0
+        // but the published snapshot's min_latency still at zero, if the
+        // snapshot was captured between on_sample and the first
+        // sample-bearing on_tick. Guard against the resulting 0/0 by
+        // emitting "—" for ratio.
         let _g = GUARD.lock().unwrap();
         clear();
-        let (_tx, rx) = tokio::sync::watch::channel(ControllerSnapshot::default());
+        let (_tx, rx) = tokio::sync::watch::channel(ControllerSnapshot {
+            cwnd: 1,
+            min_latency: std::time::Duration::ZERO,
+            ewma_latency: std::time::Duration::ZERO,
+            samples_seen: 1,
+        });
         register_unit("walk-src", rx);
         let out = render_lines();
-        // ratio is "—" when no baseline yet, prevents a 0/0 division.
-        assert!(out.contains("ratio=—"));
+        assert!(out.contains("ratio="));
+        assert!(out.contains("—"));
+        clear();
+    }
+
+    #[test]
+    fn render_lines_columns_are_aligned_across_rows() {
+        // Regression: durations like "58ns" (4 chars) and "33.5µs" (6
+        // chars) used to land in unpadded columns, so consecutive rows
+        // were visually misaligned. With FIELD_WIDTH right-alignment,
+        // each "key=" anchor must start at the same display-column on
+        // every rendered row. We compare char counts rather than byte
+        // offsets so the multi-byte `µ` doesn't confuse the check.
+        let _g = GUARD.lock().unwrap();
+        clear();
+        let (_tx_a, rx_a) = tokio::sync::watch::channel(ControllerSnapshot {
+            cwnd: 1,
+            min_latency: std::time::Duration::from_nanos(58),
+            ewma_latency: std::time::Duration::from_micros(33),
+            samples_seen: 629_000,
+        });
+        let (_tx_b, rx_b) = tokio::sync::watch::channel(ControllerSnapshot {
+            cwnd: 1,
+            min_latency: std::time::Duration::from_micros(1700),
+            ewma_latency: std::time::Duration::from_micros(3500),
+            samples_seen: 64_600,
+        });
+        register_unit("walk-src", rx_a);
+        register_unit("meta-src", rx_b);
+        let out = render_lines();
+        let row_lines: Vec<&str> = out
+            .split('\n')
+            .filter(|s| !s.is_empty() && *s != SEPARATOR)
+            .collect();
+        assert_eq!(row_lines.len(), 2);
+        let char_offset = |row: &str, key: &str| -> Option<usize> {
+            let byte = row.find(key)?;
+            Some(row[..byte].chars().count())
+        };
+        for key in ["cwnd=", "base=", "ewma=", "ratio=", "samples="] {
+            let col_a = char_offset(row_lines[0], key);
+            let col_b = char_offset(row_lines[1], key);
+            assert_eq!(col_a, col_b, "{key} column misaligned: {row_lines:?}");
+            assert!(col_a.is_some(), "{key} missing from row: {row_lines:?}");
+        }
         clear();
     }
 }
