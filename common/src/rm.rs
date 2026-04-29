@@ -312,8 +312,27 @@ async fn rm_internal(
         }
         let settings = settings.clone();
         let source_root = source_root.to_owned();
-        let do_rm =
-            || async move { rm_internal(prog_track, &entry_path, &source_root, &settings).await };
+        // for positively-known leaf entries (files, symlinks, special),
+        // acquire the pending-meta permit BEFORE spawning so we don't create
+        // unbounded tasks. We deliberately skip pre-acquire when
+        // `entry_file_type` is None (file_type() lookup failed): the entry
+        // could actually be a directory, and a chain of such unknown-typed
+        // directories holding permits while recursing would deadlock the
+        // pending-meta pool. Directories also skip pre-acquire for the same
+        // reason. We use the pending-meta semaphore (not open-files) because
+        // rm operations don't hold fds — and rm is reachable from copy_file's
+        // overwrite path, which already holds an open-files permit; using a
+        // distinct semaphore avoids that cross-pool deadlock.
+        let known_leaf = entry_file_type.as_ref().is_some_and(|ft| !ft.is_dir());
+        let pending_guard = if known_leaf {
+            Some(throttle::pending_meta_permit().await)
+        } else {
+            None
+        };
+        let do_rm = || async move {
+            let _pending_guard = pending_guard;
+            rm_internal(prog_track, &entry_path, &source_root, &settings).await
+        };
         join_set.spawn(do_rm());
     }
     // unfortunately ReadDir is opening file-descriptors and there's not a good way to limit this,
@@ -1555,6 +1574,121 @@ mod tests {
                 "root file too new should be skipped"
             );
             assert!(new_file.exists(), "root file should still exist");
+            Ok(())
+        }
+    }
+
+    /// Stress tests exercising max-open-files saturation during rm.
+    mod max_open_files_tests {
+        use super::*;
+
+        /// wide rm: many files with a very low open-files limit.
+        /// verifies all files are removed correctly under permit saturation.
+        #[tokio::test]
+        #[traced_test]
+        async fn wide_rm_under_open_files_saturation() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let file_count = 200;
+            for i in 0..file_count {
+                tokio::fs::write(
+                    test_path.join(format!("{}.txt", i)),
+                    format!("content-{}", i),
+                )
+                .await?;
+            }
+            // set a very low limit to force permit contention
+            throttle::set_max_open_files(4);
+            let summary = rm(
+                &PROGRESS,
+                &test_path,
+                &Settings {
+                    fail_early: true,
+                    filter: None,
+                    dry_run: None,
+                    time_filter: None,
+                },
+            )
+            .await?;
+            assert_eq!(summary.files_removed, file_count);
+            assert_eq!(summary.directories_removed, 1);
+            assert!(!test_path.exists());
+            Ok(())
+        }
+
+        /// deep + wide rm: directory tree deeper than the open-files limit, with files
+        /// at every level. verifies no deadlock occurs (directories don't consume permits).
+        #[tokio::test]
+        #[traced_test]
+        async fn deep_tree_no_deadlock_under_open_files_saturation() -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let depth = 20;
+            let files_per_level = 5;
+            let limit = 4;
+            // create a directory chain deeper than the permit limit, with files at each level
+            let mut dir = test_path.clone();
+            for level in 0..depth {
+                tokio::fs::create_dir_all(&dir).await?;
+                for f in 0..files_per_level {
+                    tokio::fs::write(
+                        dir.join(format!("f{}_{}.txt", level, f)),
+                        format!("L{}F{}", level, f),
+                    )
+                    .await?;
+                }
+                dir = dir.join(format!("d{}", level));
+            }
+            throttle::set_max_open_files(limit);
+            let summary = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                rm(
+                    &PROGRESS,
+                    &test_path,
+                    &Settings {
+                        fail_early: true,
+                        filter: None,
+                        dry_run: None,
+                        time_filter: None,
+                    },
+                ),
+            )
+            .await
+            .context("rm timed out — possible deadlock")?
+            .context("rm failed")?;
+            assert_eq!(summary.files_removed, depth * files_per_level);
+            assert_eq!(summary.directories_removed, depth);
+            assert!(!test_path.exists());
+            Ok(())
+        }
+
+        /// Locks down the boolean used at the rm spawn site to decide whether
+        /// to pre-acquire a pending-meta permit. A naive `entry_is_dir = false
+        /// ⇒ pre-acquire` policy treats unknown-typed entries (when
+        /// `DirEntry::file_type()` fails) as leaves, so the spawned task
+        /// holds the permit even if the entry is actually a directory and
+        /// recurses. A chain of such entries can deadlock the pool. The
+        /// safer pattern — `pre-acquire iff positively-known-not-directory`
+        /// — keeps the predicate `false` for unknown types.
+        #[test]
+        fn pre_acquire_skips_unknown_filetype() -> Result<(), anyhow::Error> {
+            let tmp = std::env::temp_dir().join(format!(
+                "rcp_pre_acquire_test_{}_{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir(&tmp)?;
+            let dir_path = tmp.join("d");
+            std::fs::create_dir(&dir_path)?;
+            let file_path = tmp.join("f");
+            std::fs::write(&file_path, "x")?;
+            let dir_ft = std::fs::metadata(&dir_path)?.file_type();
+            let file_ft = std::fs::metadata(&file_path)?.file_type();
+            // The exact predicate used in the rm spawn site:
+            let known_leaf =
+                |ft: Option<std::fs::FileType>| ft.as_ref().is_some_and(|t| !t.is_dir());
+            assert!(!known_leaf(None), "unknown filetype must skip pre-acquire");
+            assert!(!known_leaf(Some(dir_ft)), "directory must skip pre-acquire");
+            assert!(known_leaf(Some(file_ft)), "regular file must pre-acquire");
+            std::fs::remove_dir_all(&tmp).ok();
             Ok(())
         }
     }

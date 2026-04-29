@@ -3867,6 +3867,82 @@ mod copy_tests {
             }
             Ok(())
         }
+
+        /// Regression: copy_file → rm cross-pool deadlock.
+        ///
+        /// Scenario: many parallel copies overwrite destinations that are
+        /// directories (so each copy_file path takes the
+        /// "remove existing then copy" branch, and rm recurses). Each copy
+        /// task holds an open-files permit during copy_file; if rm also
+        /// drew permits from the open-files pool, a saturated pool would
+        /// deadlock — every permit held by a copy task waiting for rm to
+        /// release one. Decoupling rm onto pending-meta avoids that.
+        #[tokio::test]
+        #[traced_test]
+        async fn parallel_overwrite_dir_with_file_no_deadlock() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+            let src = tmp_dir.join("src");
+            let dst = tmp_dir.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&dst).await?;
+            // 8 sources are regular files; the 8 corresponding destinations
+            // are directories with nested files — copy with --overwrite
+            // forces rm of each dst directory tree from inside copy_file.
+            let n = 8;
+            for i in 0..n {
+                tokio::fs::write(src.join(format!("e{}", i)), format!("file-{}", i)).await?;
+                let dst_subdir = dst.join(format!("e{}", i));
+                tokio::fs::create_dir(&dst_subdir).await?;
+                for j in 0..3 {
+                    tokio::fs::write(
+                        dst_subdir.join(format!("inner_{}.txt", j)),
+                        format!("inner-{}-{}", i, j),
+                    )
+                    .await?;
+                }
+            }
+            // Saturate the open-files pool: if rm shared this pool, every
+            // outer copy task would hold its single permit and the inner rm
+            // recursion would block forever.
+            throttle::set_max_open_files(2);
+            let summary = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                copy(
+                    &PROGRESS,
+                    &src,
+                    &dst,
+                    &Settings {
+                        dereference: false,
+                        fail_early: true,
+                        overwrite: true,
+                        overwrite_compare: Default::default(),
+                        overwrite_filter: None,
+                        ignore_existing: false,
+                        chunk_size: 0,
+                        skip_specials: false,
+                        remote_copy_buffer_size: 0,
+                        filter: None,
+                        dry_run: None,
+                    },
+                    &NO_PRESERVE_SETTINGS,
+                    false,
+                ),
+            )
+            .await
+            .context(
+                "copy timed out — deadlock between copy_file's open-files permit and inner rm",
+            )?
+            .context("copy failed")?;
+            assert_eq!(summary.files_copied, n);
+            assert_eq!(summary.rm_summary.files_removed, n * 3);
+            assert_eq!(summary.rm_summary.directories_removed, n);
+            for i in 0..n {
+                let path = dst.join(format!("e{}", i));
+                let content = tokio::fs::read_to_string(&path).await?;
+                assert_eq!(content, format!("file-{}", i));
+            }
+            Ok(())
+        }
     }
 
     mod skip_specials_tests {

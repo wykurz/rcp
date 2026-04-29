@@ -470,7 +470,23 @@ async fn expand_missing_tree(
         let log = log.clone();
         let settings = settings.clone();
         let existing_root = existing_root.to_owned();
+        // for positively-known leaf entries (file/symlink/special), acquire
+        // the pending-meta permit BEFORE spawning so we don't create
+        // unbounded tasks. We deliberately skip pre-acquire when
+        // `entry_file_type` is None: the entry could actually be a directory,
+        // and chained unknown-typed directories holding permits while
+        // recursing would deadlock the pending-meta pool. Known directories
+        // also skip pre-acquire. We use the pending-meta semaphore (not
+        // open-files) because cmp doesn't hold fds; decoupling avoids
+        // contention with concurrent copy paths that hold open-files permits.
+        let known_leaf = entry_file_type.is_some_and(|ft| !ft.is_dir());
+        let pending_guard = if known_leaf {
+            Some(throttle::pending_meta_permit().await)
+        } else {
+            None
+        };
         join_set.spawn(async move {
+            let _pending_guard = pending_guard;
             expand_missing_tree(
                 prog_track,
                 &entry_path,
@@ -666,7 +682,23 @@ async fn cmp_internal(
         let settings = settings.clone();
         let source_root = source_root.to_owned();
         let dest_root = dest_root.to_owned();
+        // for positively-known leaf entries (file/symlink/special), acquire
+        // the pending-meta permit BEFORE spawning so we don't create
+        // unbounded tasks. We deliberately skip pre-acquire when
+        // `entry_file_type` is None: the entry could actually be a directory,
+        // and chained unknown-typed directories holding permits while
+        // recursing would deadlock the pending-meta pool. Known directories
+        // also skip pre-acquire. We use the pending-meta semaphore (not
+        // open-files) because cmp doesn't hold fds; decoupling avoids
+        // contention with concurrent copy paths that hold open-files permits.
+        let known_leaf = entry_file_type.is_some_and(|ft| !ft.is_dir());
+        let pending_guard = if known_leaf {
+            Some(throttle::pending_meta_permit().await)
+        } else {
+            None
+        };
         let do_cmp = || async move {
+            let _pending_guard = pending_guard;
             cmp_internal(
                 prog_track,
                 &entry_path,
@@ -1722,5 +1754,125 @@ mod cmp_tests {
         let raw = std::path::Path::new(OsStr::from_bytes(b"/tmp/bad\xffname.txt"));
         // these must produce different output
         assert_ne!(path_to_json_string(literal), path_to_json_string(raw));
+    }
+
+    /// Stress tests exercising max-open-files saturation during cmp.
+    mod max_open_files_tests {
+        use super::*;
+        use anyhow::Context;
+
+        /// deep + wide cmp: directory tree deeper than the open-files limit, with files
+        /// at every level. verifies no deadlock occurs (directories don't consume permits).
+        #[tokio::test]
+        #[traced_test]
+        async fn deep_tree_no_deadlock_under_open_files_saturation() -> Result<()> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+            let src = tmp_dir.join("src");
+            let dst = tmp_dir.join("dst");
+            let depth = 20;
+            let files_per_level = 5;
+            let limit = 4;
+            // create matching directory chains in src and dst, deeper than the permit limit
+            let mut src_dir = src.clone();
+            let mut dst_dir = dst.clone();
+            for level in 0..depth {
+                tokio::fs::create_dir_all(&src_dir).await?;
+                tokio::fs::create_dir_all(&dst_dir).await?;
+                for f in 0..files_per_level {
+                    let name = format!("f{}_{}.txt", level, f);
+                    let content = format!("L{}F{}", level, f);
+                    tokio::fs::write(src_dir.join(&name), &content).await?;
+                    tokio::fs::write(dst_dir.join(&name), &content).await?;
+                }
+                src_dir = src_dir.join(format!("d{}", level));
+                dst_dir = dst_dir.join(format!("d{}", level));
+            }
+            throttle::set_max_open_files(limit);
+            let compare_settings = Settings {
+                fail_early: false,
+                exit_early: false,
+                expand_missing: false,
+                compare: enum_map::enum_map! {
+                    ObjType::File => filecmp::MetadataCmpSettings { size: true, ..Default::default() },
+                    ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                    ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                    ObjType::Other => filecmp::MetadataCmpSettings::default(),
+                },
+                filter: None,
+            };
+            let summary = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                cmp(
+                    &PROGRESS,
+                    &src,
+                    &dst,
+                    &LogWriter::silent().await?,
+                    &compare_settings,
+                ),
+            )
+            .await
+            .context("cmp timed out — possible deadlock")?
+            .context("cmp failed")?;
+            assert_eq!(
+                summary.mismatch[ObjType::File][CompareResult::Same],
+                depth * files_per_level
+            );
+            Ok(())
+        }
+
+        /// expand_missing under saturation: dst is empty, src is a deep tree.
+        /// verifies expand_missing_tree's recursion bounds tasks under the permit cap.
+        #[tokio::test]
+        #[traced_test]
+        async fn expand_missing_under_open_files_saturation() -> Result<()> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+            let src = tmp_dir.join("src");
+            let dst = tmp_dir.join("dst");
+            let depth = 10;
+            let files_per_level = 5;
+            let limit = 4;
+            // create a deep tree in src; dst stays empty
+            let mut dir = src.clone();
+            for level in 0..depth {
+                tokio::fs::create_dir_all(&dir).await?;
+                for f in 0..files_per_level {
+                    tokio::fs::write(dir.join(format!("f{}_{}.txt", level, f)), "x").await?;
+                }
+                dir = dir.join(format!("d{}", level));
+            }
+            tokio::fs::create_dir(&dst).await?;
+            throttle::set_max_open_files(limit);
+            let compare_settings = Settings {
+                fail_early: false,
+                exit_early: false,
+                expand_missing: true,
+                compare: enum_map::enum_map! {
+                    ObjType::File => filecmp::MetadataCmpSettings::default(),
+                    ObjType::Dir => filecmp::MetadataCmpSettings::default(),
+                    ObjType::Symlink => filecmp::MetadataCmpSettings::default(),
+                    ObjType::Other => filecmp::MetadataCmpSettings::default(),
+                },
+                filter: None,
+            };
+            let summary = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                cmp(
+                    &PROGRESS,
+                    &src,
+                    &dst,
+                    &LogWriter::silent().await?,
+                    &compare_settings,
+                ),
+            )
+            .await
+            .context("cmp timed out — possible deadlock")?
+            .context("cmp failed")?;
+            // every file under src is missing on dst
+            assert_eq!(
+                summary.mismatch[ObjType::File][CompareResult::DstMissing],
+                depth * files_per_level
+            );
+            Ok(())
+        }
     }
 }
