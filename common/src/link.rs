@@ -205,9 +205,12 @@ pub async fn link(
             }
         }
     }
-    link_internal(prog_track, cwd, src, dst, src, update, settings, is_fresh).await
+    link_internal(
+        prog_track, cwd, src, dst, src, update, settings, is_fresh, None,
+    )
+    .await
 }
-#[instrument(skip(prog_track, settings))]
+#[instrument(skip(prog_track, settings, open_file_guard))]
 #[async_recursion]
 #[allow(clippy::too_many_arguments)]
 async fn link_internal(
@@ -219,6 +222,7 @@ async fn link_internal(
     update: &Option<std::path::PathBuf>,
     settings: &Settings,
     mut is_fresh: bool,
+    open_file_guard: Option<throttle::OpenFileGuard>,
 ) -> Result<Summary, Error> {
     let _prog_guard = prog_track.ops.guard();
     tracing::debug!("reading source metadata");
@@ -268,6 +272,15 @@ async fn link_internal(
                 update,
                 update_metadata.file_type()
             );
+            // release any caller-supplied open-files permit before delegating
+            // to copy::copy. The permit was acquired for the src entry's file
+            // type at the spawn site, but here `update` has a *different* file
+            // type (we just checked `!is_file_type_same`), so the permit is
+            // mismatched. More importantly, copy::copy → copy_internal will
+            // acquire its own open-files permit for any file it copies; if we
+            // were still holding one here, a saturated pool would deadlock the
+            // inner acquire.
+            drop(open_file_guard);
             let copy_summary = copy::copy(
                 prog_track,
                 update,
@@ -301,7 +314,14 @@ async fn link_internal(
                 src,
                 update
             );
-            let _open_file_guard = throttle::open_file_permit().await;
+            // use the caller's pre-acquired permit (the spawn loop pre-acquires
+            // for regular-file entries so this is the common path); fall back to
+            // acquiring a new one for callers that don't pre-acquire (top-level
+            // `link` and the file-type-changed path above).
+            let _guard = match open_file_guard {
+                Some(g) => g,
+                None => throttle::open_file_permit().await,
+            };
             return Ok(Summary {
                 copy_summary: copy::copy_file(
                     prog_track,
@@ -614,6 +634,7 @@ async fn link_internal(
                         &update_path,
                         &settings,
                         true,
+                        None,
                     )
                     .await
                 };
@@ -629,6 +650,17 @@ async fn link_internal(
         }
         let settings = settings.clone();
         let source_root = source_root.to_owned();
+        // for regular-file entries, acquire the open file permit BEFORE spawning so
+        // we don't create unbounded tasks. mirrors the pattern in copy.rs.
+        // directories must NOT pre-acquire because they recurse and would deadlock
+        // against a saturated semaphore. symlinks aren't pre-acquired because they
+        // can pass through to copy::copy which handles permits internally.
+        let entry_is_regular_file = entry_file_type.as_ref().is_some_and(|ft| ft.is_file());
+        let open_file_guard = if entry_is_regular_file {
+            Some(throttle::open_file_permit().await)
+        } else {
+            None
+        };
         let do_link = || async move {
             link_internal(
                 prog_track,
@@ -639,6 +671,7 @@ async fn link_internal(
                 &update_path,
                 &settings,
                 is_fresh,
+                open_file_guard,
             )
             .await
         };
@@ -655,7 +688,21 @@ async fn link_internal(
             .await
             .with_context(|| format!("cannot open directory {:?} for reading", &update))
             .map_err(|err| Error::new(err, link_summary))?;
-        // iterate through update entries and for each one that's not present in src call "copy"
+        // Iterate through update entries and for each one that's not present in src call "copy".
+        //
+        // We deliberately do NOT pre-acquire any permit here. Two cycles rule out the
+        // straightforward options:
+        //   * `open_file_permit`: copy::copy → copy_internal re-acquires open-files for
+        //     each file; a saturated pool would deadlock the inner acquire if we held one
+        //     across the call.
+        //   * `pending_meta_permit`: with --overwrite, copy::copy → copy_file → rm::rm
+        //     drains pending_meta for child entries (rm.rs spawn loop). N tasks here each
+        //     holding a pending_meta permit would deadlock waiting on each other's inner rm.
+        //
+        // The spawn count at this site is naturally bounded by the number of update-only
+        // entries (user input — typically modest) and per-task tokio overhead is small.
+        // Each spawned task's actual work is throttled by copy::copy's own internal
+        // open-files backpressure inside copy_internal's spawn loop.
         loop {
             let Some((update_entry, _entry_file_type)) = crate::walk::next_entry_probed(
                 &mut update_entries,
@@ -2439,5 +2486,249 @@ mod link_tests {
         assert_eq!(summary.hard_links_created, 0);
         assert!(!dst.exists());
         Ok(())
+    }
+
+    /// Stress tests exercising max-open-files saturation during link.
+    mod max_open_files_tests {
+        use super::*;
+
+        /// deep + wide link: directory tree deeper than the open-files limit, with files
+        /// at every level. verifies no deadlock occurs (directories don't consume permits).
+        #[tokio::test]
+        #[traced_test]
+        async fn deep_tree_no_deadlock_under_open_files_saturation() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+            let src = tmp_dir.join("src");
+            let dst = tmp_dir.join("dst");
+            let depth = 20;
+            let files_per_level = 5;
+            let limit = 4;
+            // create a directory chain deeper than the permit limit, with files at each level
+            let mut dir = src.clone();
+            for level in 0..depth {
+                tokio::fs::create_dir_all(&dir).await?;
+                for f in 0..files_per_level {
+                    tokio::fs::write(
+                        dir.join(format!("f{}_{}.txt", level, f)),
+                        format!("L{}F{}", level, f),
+                    )
+                    .await?;
+                }
+                dir = dir.join(format!("d{}", level));
+            }
+            throttle::set_max_open_files(limit);
+            let summary = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                link(
+                    &PROGRESS,
+                    tmp_dir.as_path(),
+                    &src,
+                    &dst,
+                    &None,
+                    &common_settings(false, false),
+                    false,
+                ),
+            )
+            .await
+            .context("link timed out — possible deadlock")?
+            .context("link failed")?;
+            assert_eq!(summary.hard_links_created, depth * files_per_level);
+            assert_eq!(summary.copy_summary.directories_created, depth);
+            // spot-check that hard links work by reading content at a few levels
+            let mut check_dir = dst.clone();
+            for level in 0..depth {
+                let content =
+                    tokio::fs::read_to_string(check_dir.join(format!("f{}_0.txt", level))).await?;
+                assert_eq!(content, format!("L{}F0", level));
+                check_dir = check_dir.join(format!("d{}", level));
+            }
+            Ok(())
+        }
+
+        /// Regression: link_internal's spawn-time guard must be released before
+        /// delegating to copy::copy on the file-type-changed path.
+        ///
+        /// Scenario: many src entries are regular files (so the spawn loop
+        /// pre-acquires open-files permits for them), but the corresponding
+        /// `update` entries are directories (file types differ). link_internal
+        /// then calls copy::copy on the update directory, which enters
+        /// copy_internal. If the spawn-time permit were still held while
+        /// copy::copy ran, copy_internal's own open-files acquire for any
+        /// inner file would deadlock against a saturated pool.
+        #[tokio::test]
+        #[traced_test]
+        async fn parallel_update_filetype_change_no_deadlock() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+            let src = tmp_dir.join("src");
+            let update = tmp_dir.join("update");
+            let dst = tmp_dir.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&update).await?;
+            let n = 8;
+            // src/eN: regular files. update/eN: directories with inner files.
+            // file types differ -> link takes the !is_file_type_same branch
+            // -> calls copy::copy(update/eN, dst/eN).
+            for i in 0..n {
+                tokio::fs::write(src.join(format!("e{}", i)), format!("src-{}", i)).await?;
+                let upd_subdir = update.join(format!("e{}", i));
+                tokio::fs::create_dir(&upd_subdir).await?;
+                for j in 0..3 {
+                    tokio::fs::write(
+                        upd_subdir.join(format!("inner_{}.txt", j)),
+                        format!("upd-{}-{}", i, j),
+                    )
+                    .await?;
+                }
+            }
+            // saturate the open-files pool: spawn-time permits held by every
+            // outer link task would block copy::copy's inner permit acquires.
+            throttle::set_max_open_files(2);
+            let summary = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                link(
+                    &PROGRESS,
+                    tmp_dir.as_path(),
+                    &src,
+                    &dst,
+                    &Some(update.clone()),
+                    &common_settings(false, false),
+                    false,
+                ),
+            )
+            .await
+            .context(
+                "link timed out — caller-supplied open-files guard not released before copy::copy",
+            )?
+            .context("link failed")?;
+            // every entry was a type-mismatch -> copied from update.
+            // copy::copy on a directory creates the dir and copies inner files.
+            assert_eq!(summary.copy_summary.directories_created, n + 1); // +1 for dst itself
+            assert_eq!(summary.copy_summary.files_copied, n * 3);
+            // verify content came from update, not src
+            for i in 0..n {
+                for j in 0..3 {
+                    let content =
+                        tokio::fs::read_to_string(dst.join(format!("e{}/inner_{}.txt", i, j)))
+                            .await?;
+                    assert_eq!(content, format!("upd-{}-{}", i, j));
+                }
+            }
+            Ok(())
+        }
+
+        /// Regression: the "update-only entries" spawn loop must not deadlock
+        /// against copy::copy's open-files OR against rm::rm's pending-meta.
+        ///
+        /// Scenario: update has many regular files that don't exist in src.
+        /// The loop at site 3 spawns a copy::copy task per entry under a
+        /// saturated open-files pool. copy::copy's internal acquires must
+        /// proceed normally — site 3 must not be holding open-files.
+        #[tokio::test]
+        #[traced_test]
+        async fn update_only_entries_bounded_no_deadlock() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+            let src = tmp_dir.join("src");
+            let update = tmp_dir.join("update");
+            let dst = tmp_dir.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&update).await?;
+            // src is empty; update has many regular files. Every update entry
+            // is "missing in src" -> hits the site-3 spawn loop.
+            let n = 50;
+            for i in 0..n {
+                tokio::fs::write(update.join(format!("u{}", i)), format!("upd-{}", i)).await?;
+            }
+            throttle::set_max_open_files(2);
+            let summary = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                link(
+                    &PROGRESS,
+                    tmp_dir.as_path(),
+                    &src,
+                    &dst,
+                    &Some(update.clone()),
+                    &common_settings(false, false),
+                    false,
+                ),
+            )
+            .await
+            .context("link timed out — site-3 spawn loop deadlock")?
+            .context("link failed")?;
+            // dst gets the src directory plus a copy of every update file
+            assert_eq!(summary.copy_summary.directories_created, 1);
+            assert_eq!(summary.copy_summary.files_copied, n);
+            for i in 0..n {
+                let content = tokio::fs::read_to_string(dst.join(format!("u{}", i))).await?;
+                assert_eq!(content, format!("upd-{}", i));
+            }
+            Ok(())
+        }
+
+        /// Regression for the link site-3 ↔ rm pending-meta self-deadlock.
+        ///
+        /// Scenario: update has many entries not in src; dst already has
+        /// directories at those same names; the user passes --overwrite. Each
+        /// site-3 task runs copy::copy → copy_file → rm::rm to remove the
+        /// preexisting dst directory before placing the regular-file copy.
+        /// rm::rm draws from the pending-meta pool. If site 3 also held
+        /// pending-meta across copy::copy, every running task would hold a
+        /// permit while waiting on inner rm to acquire one — classic
+        /// self-deadlock once the pool is saturated.
+        #[tokio::test]
+        #[traced_test]
+        async fn update_only_overwrite_preexisting_dirs_no_deadlock() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+            let src = tmp_dir.join("src");
+            let update = tmp_dir.join("update");
+            let dst = tmp_dir.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&update).await?;
+            tokio::fs::create_dir(&dst).await?;
+            let n = 12;
+            for i in 0..n {
+                // update/uN is a regular file (site 3 will copy it).
+                tokio::fs::write(update.join(format!("u{}", i)), format!("upd-{}", i)).await?;
+                // dst/uN is a preexisting directory with inner files. With
+                // --overwrite, copy_file calls rm::rm to wipe it, which
+                // recurses into pending-meta.
+                let dst_subdir = dst.join(format!("u{}", i));
+                tokio::fs::create_dir(&dst_subdir).await?;
+                for j in 0..3 {
+                    tokio::fs::write(
+                        dst_subdir.join(format!("inner_{}.txt", j)),
+                        format!("old-{}-{}", i, j),
+                    )
+                    .await?;
+                }
+            }
+            // saturate both pools to force the deadlock if the cycle existed.
+            throttle::set_max_open_files(2);
+            let summary = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                link(
+                    &PROGRESS,
+                    tmp_dir.as_path(),
+                    &src,
+                    &dst,
+                    &Some(update.clone()),
+                    &common_settings(false, true), // overwrite=true
+                    false,
+                ),
+            )
+            .await
+            .context("link timed out — pending-meta self-deadlock between site 3 and inner rm")?
+            .context("link failed")?;
+            // each preexisting dst/uN directory gets removed and replaced
+            // with a regular-file copy from update/uN.
+            assert_eq!(summary.copy_summary.files_copied, n);
+            assert_eq!(summary.copy_summary.rm_summary.files_removed, n * 3);
+            assert_eq!(summary.copy_summary.rm_summary.directories_removed, n);
+            // verify content came from update
+            for i in 0..n {
+                let content = tokio::fs::read_to_string(dst.join(format!("u{}", i))).await?;
+                assert_eq!(content, format!("upd-{}", i));
+            }
+            Ok(())
+        }
     }
 }

@@ -168,6 +168,15 @@ pub enum Resource {
 
 static OPEN_FILES_LIMIT: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
+// Spawn-time backpressure for operations that don't actually hold open
+// file descriptors but still benefit from a bound on in-flight tasks
+// (rm, cmp). Kept separate from OPEN_FILES_LIMIT so that an inner rm
+// triggered by a copy/link path that already holds an OPEN_FILES_LIMIT
+// permit cannot deadlock against itself when the outer permit pool is
+// saturated. Both semaphores are sized to the same configured limit by
+// `set_max_open_files`.
+static PENDING_META_LIMIT: std::sync::LazyLock<semaphore::Semaphore> =
+    std::sync::LazyLock::new(semaphore::Semaphore::new);
 static OPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
 static IOPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
@@ -187,8 +196,23 @@ fn ops_in_flight_limit(resource: Resource) -> &'static semaphore::Semaphore {
     }
 }
 
+/// Configure the spawn-time concurrency caps from a single knob.
+///
+/// Despite the name, this sizes **two** independent semaphores:
+///
+/// * [`open_file_permit`] — actual file-descriptor backpressure for
+///   paths that hold open fds (copy/link).
+/// * [`pending_meta_permit`] — task-spawn backpressure for recursive
+///   metadata-only walks (rm/cmp) that don't hold fds. Sized
+///   separately so paths that compose these operations
+///   (e.g. `copy_file → rm` for an overwrite of a directory
+///   destination) cannot deadlock against the open-files pool.
+///
+/// Pass `0` to disable both caps; `setup` is idempotent and intended
+/// for startup or test reset.
 pub fn set_max_open_files(max_open_files: usize) {
     OPEN_FILES_LIMIT.setup(max_open_files);
+    PENDING_META_LIMIT.setup(max_open_files);
 }
 
 pub struct OpenFileGuard {
@@ -198,6 +222,24 @@ pub struct OpenFileGuard {
 pub async fn open_file_permit() -> OpenFileGuard {
     OpenFileGuard {
         _permit: OPEN_FILES_LIMIT.acquire().await,
+    }
+}
+
+/// Backpressure guard for in-flight metadata-only operations (rm, cmp).
+///
+/// Held across a spawned task to bound the live task count under
+/// recursive walk operations that don't hold open file descriptors.
+/// Kept distinct from [`OpenFileGuard`] so that paths which compose
+/// these operations (e.g. `copy_file → rm` for an overwrite of a
+/// directory destination) don't deadlock against a saturated
+/// `OPEN_FILES_LIMIT`.
+pub struct PendingMetaGuard {
+    _permit: Option<semaphore::Permit<'static>>,
+}
+
+pub async fn pending_meta_permit() -> PendingMetaGuard {
+    PendingMetaGuard {
+        _permit: PENDING_META_LIMIT.acquire().await,
     }
 }
 
