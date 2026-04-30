@@ -138,7 +138,7 @@ pub use config::{
 // (rcp, rrm, …) and integration tests can pass `common::Side::Source` /
 // `common::Side::Destination` to `walk::next_entry_probed` and friends
 // without taking a direct dependency on `congestion`.
-pub use congestion::Side;
+pub use congestion::{MetadataOp, Side};
 pub use progress::{RcpdProgressPrinter, SerializableProgress};
 
 // Define RcpdType in common since remote depends on common
@@ -1095,20 +1095,75 @@ fn spawn_throttle_replenishers(runtime: &tokio::runtime::Runtime, throttle: &Thr
     }
 }
 
-/// Wire up the adaptive metadata-ops control loops — one per
-/// [`throttle::Resource`] (source and destination metadata):
+/// Stable label for a `(Side, MetadataOp)` controller.
 ///
-/// 1. Seed both per-resource `OPS_IN_FLIGHT_LIMIT_*` semaphores with the
+/// Naming rule:
+/// - **Lookups** (`Stat`, `ReadLink`) happen on either filesystem, so
+///   the label always carries an explicit `src-` / `dst-` prefix to
+///   disambiguate. Example: `src-stat`, `dst-read-link`.
+/// - **Mutations and `open(O_CREAT)`** only ever occur on the
+///   destination side (sources are immutable in copy/cmp/link/rm).
+///   These labels drop the side prefix entirely. Example: `mkdir`,
+///   `unlink`, `rmdir`, `hard-link`, `symlink`, `chmod`, `open-create`.
+///
+/// The result: single-filesystem tools like `rrm` show clean labels
+/// (`src-stat`, `unlink`, `rmdir`) instead of the prior misleading
+/// `meta-src` / `meta-dst` framing — there is no second filesystem to
+/// distinguish from. Dual-filesystem tools (rcp, rcmp, rlink) still
+/// disambiguate the two stat / read-link controllers cleanly.
+///
+/// Implemented as a `const fn` over a fixed match table so the label
+/// set is a compile-time constant — no allocation, no `Box::leak`, and
+/// no per-`run()` accumulation when callers invoke the runtime more
+/// than once in a single process.
+const fn unit_label(side: congestion::Side, op: congestion::MetadataOp) -> &'static str {
+    use congestion::MetadataOp::*;
+    use congestion::Side::*;
+    match (side, op) {
+        // Lookups: prefix with side because both sides exercise them.
+        (Source, Stat) => "src-stat",
+        (Destination, Stat) => "dst-stat",
+        (Source, ReadLink) => "src-read-link",
+        (Destination, ReadLink) => "dst-read-link",
+        // Destination-only ops: no prefix in the active case. The
+        // (Source, op) slot is wired but never sees a sample under
+        // normal operation; the renderer hides it. The `src-` label is
+        // kept so any debugging surface still disambiguates the slot
+        // from the active destination one if it ever fires.
+        (Destination, MkDir) => "mkdir",
+        (Source, MkDir) => "src-mkdir",
+        (Destination, RmDir) => "rmdir",
+        (Source, RmDir) => "src-rmdir",
+        (Destination, Unlink) => "unlink",
+        (Source, Unlink) => "src-unlink",
+        (Destination, HardLink) => "hard-link",
+        (Source, HardLink) => "src-hard-link",
+        (Destination, Symlink) => "symlink",
+        (Source, Symlink) => "src-symlink",
+        (Destination, Chmod) => "chmod",
+        (Source, Chmod) => "src-chmod",
+        (Destination, OpenCreate) => "open-create",
+        (Source, OpenCreate) => "src-open-create",
+    }
+}
+
+/// Wire up the adaptive metadata-ops control loops — one per
+/// `(Side, MetadataOp)` pair (18 in total):
+///
+/// 1. Seed every resource's `OPS_IN_FLIGHT_LIMIT_*` semaphore with the
 ///    controller's initial cwnd so the first probe on any resource
 ///    finds a permit available.
-/// 2. Install one `RoutingSink` that fans metadata samples out to two
-///    independent `ControlUnit<VegasController>`s — one per
-///    [`congestion::Side`]. Splitting source vs. destination keeps a
-///    saturated source from dragging the destination's cwnd down.
-/// 3. Spawn one combined adapter/monitor task per resource. Only the
-///    destination metadata controller drives the global ops-throttle
-///    rate gate — the global `OPS_THROTTLE` is shared, so multiple
-///    writers would fight. The other applies only its concurrency cap.
+/// 2. Install one `RoutingSink` that fans metadata samples out to per-
+///    `(side, op)` channels, each consumed by its own
+///    `ControlUnit<VegasController>`. Each syscall on each side gets
+///    an independent latency baseline and an independent cwnd, so a
+///    saturated `unlink` path doesn't drag down `stat` (or vice versa).
+/// 3. Spawn one combined adapter/monitor task per resource. By
+///    convention `(Destination, Stat)` is the rate-driver — the global
+///    `OPS_THROTTLE` is shared, so only one adapter may translate rate
+///    decisions; all others apply concurrency only. The current
+///    `VegasController` doesn't emit rate decisions, so the choice is
+///    forward-looking.
 /// 4. Each adapter exits cleanly when its control unit stops
 ///    publishing decisions, so they don't leak as unbounded background
 ///    loops.
@@ -1119,49 +1174,50 @@ fn spawn_auto_meta_throttle(runtime: &tokio::runtime::Runtime, auto: AutoMetaThr
     let initial_cwnd = auto
         .initial_cwnd
         .clamp(auto.min_cwnd.max(1), auto.max_cwnd.max(1));
-    // Seed every resource with the same initial cwnd; each then adapts
-    // independently from there.
-    for resource in [throttle::Resource::SrcMeta, throttle::Resource::DstMeta] {
-        throttle::set_max_ops_in_flight(resource, initial_cwnd as usize);
-    }
     let mut builder = congestion::RoutingSinkBuilder::new();
-    let metadata_src_rx = builder.metadata_receiver(congestion::Side::Source);
-    let metadata_dst_rx = builder.metadata_receiver(congestion::Side::Destination);
-    let sink = std::sync::Arc::new(builder.build());
-    congestion::install_sample_sink(sink.clone());
-    // Two controllers — one per resource. Only the DstMeta adapter
-    // drives the global rate gate to avoid two writers fighting over a
-    // single shared `OPS_THROTTLE`.
-    let resources: [(
+    // Materialize one receiver per (side, op) so every resource has a
+    // dedicated sample channel. Order matches the canonical iteration
+    // below; collected into a Vec rather than the inferred 18-element
+    // array literal for legibility.
+    let mut receivers: Vec<(
         &'static str,
-        throttle::Resource,
+        congestion::Side,
+        congestion::MetadataOp,
         tokio::sync::mpsc::Receiver<congestion::Sample>,
         bool,
-    ); 2] = [
-        (
-            "meta-src",
-            throttle::Resource::SrcMeta,
-            metadata_src_rx,
-            false,
-        ),
-        (
-            "meta-dst",
-            throttle::Resource::DstMeta,
-            metadata_dst_rx,
-            true,
-        ),
-    ];
-    for (label, resource, sample_rx, apply_rate) in resources {
+    )> = Vec::with_capacity(congestion::N_META_RESOURCES);
+    for &side in &congestion::Side::ALL {
+        for &op in &congestion::MetadataOp::ALL {
+            // Seed the throttle resource so the first probe finds a
+            // permit available; controllers grow / shrink from here.
+            let resource = walk::meta_resource(side, op);
+            throttle::set_max_ops_in_flight(resource, initial_cwnd as usize);
+            let rx = builder.metadata_receiver(side, op);
+            // (Destination, Stat) is the rate-driver convention — see
+            // the function-level doc comment for why exactly one
+            // controller may own the global OPS_THROTTLE.
+            let apply_rate = matches!(
+                (side, op),
+                (congestion::Side::Destination, congestion::MetadataOp::Stat),
+            );
+            receivers.push((unit_label(side, op), side, op, rx, apply_rate));
+        }
+    }
+    let sink = std::sync::Arc::new(builder.build());
+    congestion::install_sample_sink(sink.clone());
+    for (label, side, op, sample_rx, apply_rate) in receivers {
+        let resource = walk::meta_resource(side, op);
         let vegas = congestion::VegasController::new(congestion::VegasConfig {
             initial_cwnd: auto.initial_cwnd,
             min_cwnd: auto.min_cwnd,
             max_cwnd: auto.max_cwnd,
             alpha: auto.alpha,
             beta: auto.beta,
-            ewma_alpha: auto.ewma_alpha,
             increase_step: auto.increase_step,
             decrease_step: auto.decrease_step,
-            min_latency_max_age: auto.min_latency_max_age,
+            percentile: auto.percentile,
+            long_window: auto.long_window,
+            short_window: auto.short_window,
         });
         let (unit, decision_rx, snapshot_rx) =
             congestion::ControlUnit::new(label, vegas, sample_rx, auto.tick_interval);
@@ -1175,12 +1231,17 @@ fn spawn_auto_meta_throttle(runtime: &tokio::runtime::Runtime, auto: AutoMetaThr
         ));
     }
     tracing::info!(
-        "auto-meta-throttle enabled (per-resource controllers: meta-src, meta-dst): \
-         initial_cwnd={}, max_cwnd={}, alpha={}, beta={}, tick={:?}",
+        "auto-meta-throttle enabled (per-(side, op) controllers, {} total): \
+         initial_cwnd={}, max_cwnd={}, alpha={}, beta={}, percentile={}, \
+         long_window={:?}, short_window={:?}, tick={:?}",
+        congestion::N_META_RESOURCES,
         auto.initial_cwnd,
         auto.max_cwnd,
         auto.alpha,
         auto.beta,
+        auto.percentile,
+        auto.long_window,
+        auto.short_window,
         auto.tick_interval,
     );
 }
@@ -1268,8 +1329,10 @@ where
 fn reset_process_throttle_state() {
     congestion::clear_sample_sink();
     observability::clear();
-    for resource in [throttle::Resource::SrcMeta, throttle::Resource::DstMeta] {
-        throttle::set_max_ops_in_flight(resource, 0);
+    for &side in &throttle::Side::ALL {
+        for &op in &throttle::MetadataOp::ALL {
+            throttle::set_max_ops_in_flight(throttle::Resource::meta(side, op), 0);
+        }
     }
     throttle::disable_ops_throttle();
     // Without these resets, a second run() in the same process inherits
@@ -1280,6 +1343,76 @@ fn reset_process_throttle_state() {
     // either re-init with a fresh value or stay disabled.
     throttle::set_max_open_files(0);
     throttle::init_iops_tokens(0);
+}
+
+#[cfg(test)]
+mod unit_label_tests {
+    use super::unit_label;
+    use congestion::{MetadataOp, Side};
+
+    #[test]
+    fn lookup_ops_carry_side_prefix() {
+        // Stat and ReadLink can be on either side, so disambiguate.
+        assert_eq!(unit_label(Side::Source, MetadataOp::Stat), "src-stat");
+        assert_eq!(unit_label(Side::Destination, MetadataOp::Stat), "dst-stat");
+        assert_eq!(
+            unit_label(Side::Source, MetadataOp::ReadLink),
+            "src-read-link",
+        );
+        assert_eq!(
+            unit_label(Side::Destination, MetadataOp::ReadLink),
+            "dst-read-link",
+        );
+    }
+
+    #[test]
+    fn destination_only_ops_drop_prefix() {
+        // Mutations + open-create only fire on the destination, so the
+        // active label has no side prefix — single-FS tools like rrm
+        // see "unlink", "rmdir" instead of "dst-unlink".
+        assert_eq!(unit_label(Side::Destination, MetadataOp::MkDir), "mkdir");
+        assert_eq!(unit_label(Side::Destination, MetadataOp::RmDir), "rmdir");
+        assert_eq!(unit_label(Side::Destination, MetadataOp::Unlink), "unlink");
+        assert_eq!(
+            unit_label(Side::Destination, MetadataOp::HardLink),
+            "hard-link",
+        );
+        assert_eq!(
+            unit_label(Side::Destination, MetadataOp::Symlink),
+            "symlink"
+        );
+        assert_eq!(unit_label(Side::Destination, MetadataOp::Chmod), "chmod");
+        assert_eq!(
+            unit_label(Side::Destination, MetadataOp::OpenCreate),
+            "open-create",
+        );
+    }
+
+    #[test]
+    fn unused_source_side_mutation_slots_keep_src_prefix() {
+        // The wiring registers a controller for every (side, op) pair,
+        // including the unused (Source, mutation) slots. Those stay
+        // idle and are hidden by the renderer, but if they ever fired
+        // a probe (regression / wiring mistake) the label distinguishes
+        // them from the active destination-side variant.
+        assert_eq!(unit_label(Side::Source, MetadataOp::Unlink), "src-unlink");
+        assert_eq!(unit_label(Side::Source, MetadataOp::MkDir), "src-mkdir");
+    }
+
+    #[test]
+    fn labels_are_unique_across_all_resources() {
+        // Sanity: 18 distinct (Side, MetadataOp) pairs must produce 18
+        // distinct labels — otherwise observability::register_unit would
+        // create ambiguous panel rows.
+        let mut seen = std::collections::HashSet::new();
+        for &side in &Side::ALL {
+            for &op in &MetadataOp::ALL {
+                let label = unit_label(side, op);
+                assert!(seen.insert(label), "duplicate label: {label}");
+            }
+        }
+        assert_eq!(seen.len(), congestion::N_META_RESOURCES);
+    }
 }
 
 #[cfg(test)]

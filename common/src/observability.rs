@@ -75,8 +75,10 @@ const SEPARATOR: &str = "-----------------------";
 /// either (a) no units are registered (non-adaptive run) or (b) every
 /// registered unit has zero samples — typically a brief startup window
 /// before the first probe lands, or a unit class that the current tool
-/// never exercises (e.g. `meta-src` for `filegen`, which only ever
-/// touches the destination side).
+/// never exercises (e.g. `mkdir` for `rcmp`, which only stats both
+/// sides). With per-syscall controllers we register up to 18 units
+/// (Side × MetadataOp); per-tool only a handful actually fire probes
+/// and the rest stay hidden via this `samples_seen > 0` filter.
 ///
 /// The format is one fixed-width line per unit, prefixed by a dashed
 /// separator so the panel sits visually apart from the COPIED/REMOVED/
@@ -84,12 +86,14 @@ const SEPARATOR: &str = "-----------------------";
 ///
 /// ```text
 /// -----------------------
-/// meta-src  cwnd=  42  base=  0.8ms  ewma=  2.1ms  ratio=   2.6×  samples=   1.2k
+/// src-stat   cwnd=  42  base=  0.8ms  curr=  2.1ms  ratio=   2.6×  samples=   1.2k
+/// unlink     cwnd=  18  base=  1.2ms  curr=  3.0ms  ratio=   2.5×  samples= 980.0
+/// rmdir      cwnd=   4  base=  2.4ms  curr=  6.1ms  ratio=   2.5×  samples=  80.0
 /// ```
 ///
 /// Unit labels are padded to a uniform width so columns align even
-/// when the registry grows beyond `meta-src` / `meta-dst`. Numeric
-/// columns are right-aligned to a uniform fixed width.
+/// across labels of varying length (`stat`, `dst-read-link`, `open-create`).
+/// Numeric columns are right-aligned to a uniform fixed width.
 #[must_use]
 pub fn render_lines() -> String {
     let units = registered_units();
@@ -121,23 +125,28 @@ pub fn render_lines() -> String {
 }
 
 fn format_unit_line(label: &str, label_width: usize, snap: ControllerSnapshot) -> String {
-    let ratio = if snap.min_latency.is_zero() {
-        // No baseline yet — no meaningful ratio to display. Match the
-        // "—" convention used elsewhere when a metric isn't yet
-        // populated.
+    let ratio = if snap.baseline_latency.is_zero() || snap.current_latency.is_zero() {
+        // Either statistic missing → no meaningful ratio. The
+        // controller surfaces both as `Duration::ZERO` in the snapshot
+        // when its underlying `Option<u64>` was `None` (e.g. an empty
+        // short window holds cwnd but leaves the current statistic
+        // unset). Treat both as the unset sentinel and emit "—" rather
+        // than rendering `ratio=0.0×`, which would imply an actual
+        // faster-than-baseline reading.
         String::from("—")
     } else {
-        let ratio = snap.ewma_latency.as_nanos() as f64 / snap.min_latency.as_nanos() as f64;
+        let ratio =
+            snap.current_latency.as_nanos() as f64 / snap.baseline_latency.as_nanos() as f64;
         format!("{ratio:.1}×")
     };
     format!(
-        "{label:<lwidth$}  cwnd={cwnd:>4}  base={base:>fwidth$}  ewma={ewma:>fwidth$}  ratio={ratio:>fwidth$}  samples={samples:>fwidth$}",
+        "{label:<lwidth$}  cwnd={cwnd:>4}  base={base:>fwidth$}  curr={curr:>fwidth$}  ratio={ratio:>fwidth$}  samples={samples:>fwidth$}",
         label = label,
         lwidth = label_width,
         fwidth = FIELD_WIDTH,
         cwnd = snap.cwnd,
-        base = format_duration(snap.min_latency),
-        ewma = format_duration(snap.ewma_latency),
+        base = format_duration(snap.baseline_latency),
+        curr = format_duration(snap.current_latency),
         ratio = ratio,
         samples = format_count(snap.samples_seen),
     )
@@ -235,14 +244,14 @@ mod tests {
         clear();
         let (_tx_a, rx_a) = tokio::sync::watch::channel(ControllerSnapshot {
             cwnd: 8,
-            min_latency: std::time::Duration::from_micros(800),
-            ewma_latency: std::time::Duration::from_millis(2),
+            baseline_latency: std::time::Duration::from_micros(800),
+            current_latency: std::time::Duration::from_millis(2),
             samples_seen: 1234,
         });
         let (_tx_b, rx_b) = tokio::sync::watch::channel(ControllerSnapshot {
             cwnd: 16,
-            min_latency: std::time::Duration::from_millis(1),
-            ewma_latency: std::time::Duration::from_millis(3),
+            baseline_latency: std::time::Duration::from_millis(1),
+            current_latency: std::time::Duration::from_millis(3),
             samples_seen: 5678,
         });
         register_unit("walk-src", rx_a);
@@ -255,7 +264,7 @@ mod tests {
         assert!(lines[1].contains("walk-src"));
         // cwnd is right-aligned to 4 chars; numeric columns to FIELD_WIDTH.
         assert!(lines[1].contains("cwnd=   8"));
-        // EWMA / min_latency = 2ms / 800µs = 2.5×
+        // current / baseline = 2ms / 800µs = 2.5×
         assert!(lines[1].contains("ratio=   2.5×"));
         assert!(lines[1].contains("samples=   1.2k"));
         assert!(lines[2].contains("meta-dst"));
@@ -274,14 +283,14 @@ mod tests {
         clear();
         let (_tx_a, rx_a) = tokio::sync::watch::channel(ControllerSnapshot {
             cwnd: 8,
-            min_latency: std::time::Duration::from_micros(800),
-            ewma_latency: std::time::Duration::from_millis(2),
+            baseline_latency: std::time::Duration::from_micros(800),
+            current_latency: std::time::Duration::from_millis(2),
             samples_seen: 1234,
         });
         let (_tx_b, rx_b) = tokio::sync::watch::channel(ControllerSnapshot {
             cwnd: 1,
-            min_latency: std::time::Duration::ZERO,
-            ewma_latency: std::time::Duration::ZERO,
+            baseline_latency: std::time::Duration::ZERO,
+            current_latency: std::time::Duration::ZERO,
             samples_seen: 0,
         });
         register_unit("walk-src", rx_a);
@@ -308,22 +317,54 @@ mod tests {
     #[test]
     fn render_lines_shows_em_dash_when_baseline_unset() {
         // It's possible (briefly) for a unit to have samples_seen > 0
-        // but the published snapshot's min_latency still at zero, if the
-        // snapshot was captured between on_sample and the first
+        // but the published snapshot's baseline_latency still at zero, if
+        // the snapshot was captured between on_sample and the first
         // sample-bearing on_tick. Guard against the resulting 0/0 by
         // emitting "—" for ratio.
         let _g = GUARD.lock().unwrap();
         clear();
         let (_tx, rx) = tokio::sync::watch::channel(ControllerSnapshot {
             cwnd: 1,
-            min_latency: std::time::Duration::ZERO,
-            ewma_latency: std::time::Duration::ZERO,
+            baseline_latency: std::time::Duration::ZERO,
+            current_latency: std::time::Duration::ZERO,
             samples_seen: 1,
         });
         register_unit("walk-src", rx);
         let out = render_lines();
         assert!(out.contains("ratio="));
         assert!(out.contains("—"));
+        clear();
+    }
+
+    #[test]
+    fn render_lines_shows_em_dash_when_only_current_unset() {
+        // Regression: when the long window has samples but the short
+        // window is empty (a common state on ticks where the activity
+        // gap exceeds short_window), the controller publishes a
+        // populated baseline_latency and `current_latency =
+        // Duration::ZERO`. The renderer must treat that as the unset
+        // sentinel and emit "—"; computing
+        // `ratio = current / baseline = 0.0×` would falsely imply a
+        // faster-than-baseline reading.
+        let _g = GUARD.lock().unwrap();
+        clear();
+        let (_tx, rx) = tokio::sync::watch::channel(ControllerSnapshot {
+            cwnd: 5,
+            baseline_latency: std::time::Duration::from_millis(2),
+            current_latency: std::time::Duration::ZERO,
+            samples_seen: 42,
+        });
+        register_unit("idle-short-window", rx);
+        let out = render_lines();
+        assert!(out.contains("ratio="));
+        assert!(
+            out.contains("—"),
+            "expected '—' for unset current, got {out:?}"
+        );
+        assert!(
+            !out.contains("ratio=   0.0×"),
+            "ratio must not render as 0.0× when current is unset: {out}",
+        );
         clear();
     }
 
@@ -339,14 +380,14 @@ mod tests {
         clear();
         let (_tx_a, rx_a) = tokio::sync::watch::channel(ControllerSnapshot {
             cwnd: 1,
-            min_latency: std::time::Duration::from_nanos(58),
-            ewma_latency: std::time::Duration::from_micros(33),
+            baseline_latency: std::time::Duration::from_nanos(58),
+            current_latency: std::time::Duration::from_micros(33),
             samples_seen: 629_000,
         });
         let (_tx_b, rx_b) = tokio::sync::watch::channel(ControllerSnapshot {
             cwnd: 1,
-            min_latency: std::time::Duration::from_micros(1700),
-            ewma_latency: std::time::Duration::from_micros(3500),
+            baseline_latency: std::time::Duration::from_micros(1700),
+            current_latency: std::time::Duration::from_micros(3500),
             samples_seen: 64_600,
         });
         register_unit("walk-src", rx_a);
@@ -361,7 +402,7 @@ mod tests {
             let byte = row.find(key)?;
             Some(row[..byte].chars().count())
         };
-        for key in ["cwnd=", "base=", "ewma=", "ratio=", "samples="] {
+        for key in ["cwnd=", "base=", "curr=", "ratio=", "samples="] {
             let col_a = char_offset(row_lines[0], key);
             let col_b = char_offset(row_lines[1], key);
             assert_eq!(col_a, col_b, "{key} column misaligned: {row_lines:?}");

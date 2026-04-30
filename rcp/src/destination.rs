@@ -129,6 +129,7 @@ async fn process_single_file(
     // check if destination exists and handle overwrite logic
     let dst_exists = common::walk::run_metadata_probed(
         common::Side::Destination,
+        common::MetadataOp::Stat,
         tokio::fs::symlink_metadata(&file_header.dst),
     )
     .await
@@ -148,6 +149,7 @@ async fn process_single_file(
             tracing::debug!("file exists, check if it's identical");
             let dst_metadata = common::walk::run_metadata_probed(
                 common::Side::Destination,
+                common::MetadataOp::Stat,
                 tokio::fs::symlink_metadata(&file_header.dst),
             )
             .await
@@ -190,6 +192,7 @@ async fn process_single_file(
                 let removed_file_size = dst_metadata.len();
                 common::walk::run_metadata_probed(
                     common::Side::Destination,
+                    common::MetadataOp::Unlink,
                     tokio::fs::remove_file(&file_header.dst),
                 )
                 .await
@@ -228,6 +231,7 @@ async fn process_single_file(
         .await;
     let mut file = common::walk::run_metadata_probed(
         common::Side::Destination,
+        common::MetadataOp::OpenCreate,
         tokio::fs::File::create(&file_header.dst).instrument(tracing::trace_span!("file_create")),
     )
     .await
@@ -505,8 +509,12 @@ async fn create_directory(
     dst: &std::path::Path,
 ) -> anyhow::Result<DirectoryCreateResult> {
     let prog = progress();
-    match common::walk::run_metadata_probed(common::Side::Destination, tokio::fs::create_dir(dst))
-        .await
+    match common::walk::run_metadata_probed(
+        common::Side::Destination,
+        common::MetadataOp::MkDir,
+        tokio::fs::create_dir(dst),
+    )
+    .await
     {
         Ok(()) => {
             // don't increment counter here - will be done in complete_directory
@@ -517,6 +525,7 @@ async fn create_directory(
             // something exists at destination - check what it is
             let dst_metadata = common::walk::run_metadata_probed(
                 common::Side::Destination,
+                common::MetadataOp::Stat,
                 tokio::fs::symlink_metadata(dst),
             )
             .await?;
@@ -548,6 +557,7 @@ async fn create_directory(
                 .await?;
                 common::walk::run_metadata_probed(
                     common::Side::Destination,
+                    common::MetadataOp::MkDir,
                     tokio::fs::create_dir(dst),
                 )
                 .await?;
@@ -579,6 +589,7 @@ async fn create_symlink(
     let prog = progress();
     match common::walk::run_metadata_probed(
         common::Side::Destination,
+        common::MetadataOp::Symlink,
         tokio::fs::symlink(target, dst),
     )
     .await
@@ -598,6 +609,7 @@ async fn create_symlink(
         Err(error) if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists => {
             let dst_metadata = common::walk::run_metadata_probed(
                 common::Side::Destination,
+                common::MetadataOp::Stat,
                 tokio::fs::symlink_metadata(dst),
             )
             .await
@@ -605,6 +617,7 @@ async fn create_symlink(
             if dst_metadata.is_symlink() {
                 let dst_link = common::walk::run_metadata_probed(
                     common::Side::Destination,
+                    common::MetadataOp::ReadLink,
                     tokio::fs::read_link(dst),
                 )
                 .await
@@ -637,11 +650,13 @@ async fn create_symlink(
                     );
                     common::walk::run_metadata_probed(
                         common::Side::Destination,
+                        common::MetadataOp::Unlink,
                         tokio::fs::remove_file(dst),
                     )
                     .await?;
                     common::walk::run_metadata_probed(
                         common::Side::Destination,
+                        common::MetadataOp::Symlink,
                         tokio::fs::symlink(target, dst),
                     )
                     .await?;
@@ -665,6 +680,7 @@ async fn create_symlink(
                 .map_err(|err| anyhow::anyhow!("Failed to remove destination: {err}"))?;
                 common::walk::run_metadata_probed(
                     common::Side::Destination,
+                    common::MetadataOp::Symlink,
                     tokio::fs::symlink(target, dst),
                 )
                 .await?;

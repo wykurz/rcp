@@ -138,28 +138,32 @@ async fn set_owner<Meta: Metadata + std::fmt::Debug>(
     let dst = path.to_owned();
     let uid = metadata.uid();
     let gid = metadata.gid();
-    crate::walk::run_metadata_probed(congestion::Side::Destination, async {
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            tracing::debug!("setting uid and gid");
-            let uid_val = if settings.uid { Some(uid.into()) } else { None };
-            let gid_val = if settings.gid { Some(gid.into()) } else { None };
-            nix::unistd::fchownat(
-                nix::fcntl::AT_FDCWD,
-                &dst,
-                uid_val,
-                gid_val,
-                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
-            )
-            .with_context(|| {
-                format!(
-                    "cannot set {:?} owner to {:?} and/or group id to {:?}",
-                    &dst, &uid_val, &gid_val
+    crate::walk::run_metadata_probed(
+        congestion::Side::Destination,
+        congestion::MetadataOp::Chmod,
+        async {
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                tracing::debug!("setting uid and gid");
+                let uid_val = if settings.uid { Some(uid.into()) } else { None };
+                let gid_val = if settings.gid { Some(gid.into()) } else { None };
+                nix::unistd::fchownat(
+                    nix::fcntl::AT_FDCWD,
+                    &dst,
+                    uid_val,
+                    gid_val,
+                    nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
                 )
-            })?;
-            Ok(())
-        })
-        .await?
-    })
+                .with_context(|| {
+                    format!(
+                        "cannot set {:?} owner to {:?} and/or group id to {:?}",
+                        &dst, &uid_val, &gid_val
+                    )
+                })?;
+                Ok(())
+            })
+            .await?
+        },
+    )
     .await
 }
 
@@ -177,23 +181,27 @@ async fn set_time<Meta: Metadata + std::fmt::Debug>(
     let atime_nsec = metadata.atime_nsec();
     let mtime = metadata.mtime();
     let mtime_nsec = metadata.mtime_nsec();
-    crate::walk::run_metadata_probed(congestion::Side::Destination, async {
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            tracing::debug!("setting timestamps");
-            let atime_spec = nix::sys::time::TimeSpec::new(atime, atime_nsec);
-            let mtime_spec = nix::sys::time::TimeSpec::new(mtime, mtime_nsec);
-            nix::sys::stat::utimensat(
-                nix::fcntl::AT_FDCWD,
-                &dst,
-                &atime_spec,
-                &mtime_spec,
-                nix::sys::stat::UtimensatFlags::NoFollowSymlink,
-            )
-            .with_context(|| format!("failed setting timestamps for {:?}", &dst))?;
-            Ok(())
-        })
-        .await?
-    })
+    crate::walk::run_metadata_probed(
+        congestion::Side::Destination,
+        congestion::MetadataOp::Chmod,
+        async {
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                tracing::debug!("setting timestamps");
+                let atime_spec = nix::sys::time::TimeSpec::new(atime, atime_nsec);
+                let mtime_spec = nix::sys::time::TimeSpec::new(mtime, mtime_nsec);
+                nix::sys::stat::utimensat(
+                    nix::fcntl::AT_FDCWD,
+                    &dst,
+                    &atime_spec,
+                    &mtime_spec,
+                    nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+                )
+                .with_context(|| format!("failed setting timestamps for {:?}", &dst))?;
+                Ok(())
+            })
+            .await?
+        },
+    )
     .await
 }
 
@@ -221,11 +229,13 @@ pub async fn set_file_metadata<Meta: Metadata + std::fmt::Debug>(
     set_owner(&settings.file.user_and_time, path, metadata).await?;
     let file = crate::walk::run_metadata_probed(
         congestion::Side::Destination,
+        congestion::MetadataOp::Stat,
         tokio::fs::File::open(path),
     )
     .await?;
     crate::walk::run_metadata_probed(
         congestion::Side::Destination,
+        congestion::MetadataOp::Chmod,
         file.set_permissions(permissions.clone()),
     )
     .await
@@ -251,6 +261,7 @@ pub async fn set_dir_metadata<Meta: Metadata + std::fmt::Debug>(
     set_owner(&settings.dir.user_and_time, path, metadata).await?;
     crate::walk::run_metadata_probed(
         congestion::Side::Destination,
+        congestion::MetadataOp::Chmod,
         tokio::fs::set_permissions(path, permissions.clone()),
     )
     .await

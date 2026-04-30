@@ -164,6 +164,7 @@ pub async fn copy_file(
         && settings.ignore_existing
         && crate::walk::run_metadata_probed(
             congestion::Side::Destination,
+            congestion::MetadataOp::Stat,
             tokio::fs::symlink_metadata(dst),
         )
         .await
@@ -200,6 +201,7 @@ pub async fn copy_file(
             tracing::debug!("file exists, check if it's identical");
             let dst_metadata = crate::walk::run_metadata_probed(
                 congestion::Side::Destination,
+                congestion::MetadataOp::Stat,
                 tokio::fs::symlink_metadata(dst),
             )
             .await
@@ -368,6 +370,7 @@ pub async fn copy(
         if let Some(name) = src_name {
             let src_metadata = crate::walk::run_metadata_probed(
                 congestion::Side::Source,
+                congestion::MetadataOp::Stat,
                 tokio::fs::symlink_metadata(src),
             )
             .await
@@ -411,6 +414,7 @@ async fn copy_internal(
     tracing::debug!("reading source metadata");
     let src_metadata = crate::walk::run_metadata_probed(
         congestion::Side::Source,
+        congestion::MetadataOp::Stat,
         tokio::fs::symlink_metadata(src),
     )
     .await
@@ -423,6 +427,7 @@ async fn copy_internal(
         );
         let link = crate::walk::run_metadata_probed(
             congestion::Side::Source,
+            congestion::MetadataOp::Stat,
             tokio::fs::canonicalize(&src),
         )
         .await
@@ -458,6 +463,7 @@ async fn copy_internal(
             && settings.ignore_existing
             && crate::walk::run_metadata_probed(
                 congestion::Side::Destination,
+                congestion::MetadataOp::Stat,
                 tokio::fs::symlink_metadata(dst),
             )
             .await
@@ -486,14 +492,18 @@ async fn copy_internal(
             });
         }
         let mut rm_summary = RmSummary::default();
-        let link =
-            crate::walk::run_metadata_probed(congestion::Side::Source, tokio::fs::read_link(src))
-                .await
-                .with_context(|| format!("failed reading symlink {:?}", &src))
-                .map_err(|err| Error::new(err, Default::default()))?;
+        let link = crate::walk::run_metadata_probed(
+            congestion::Side::Source,
+            congestion::MetadataOp::ReadLink,
+            tokio::fs::read_link(src),
+        )
+        .await
+        .with_context(|| format!("failed reading symlink {:?}", &src))
+        .map_err(|err| Error::new(err, Default::default()))?;
         // try creating a symlink, if dst path exists and overwrite is set - remove and try again
         if let Err(error) = crate::walk::run_metadata_probed(
             congestion::Side::Destination,
+            congestion::MetadataOp::Symlink,
             tokio::fs::symlink(&link, dst),
         )
         .await
@@ -509,6 +519,7 @@ async fn copy_internal(
             if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
                 let dst_metadata = crate::walk::run_metadata_probed(
                     congestion::Side::Destination,
+                    congestion::MetadataOp::Stat,
                     tokio::fs::symlink_metadata(dst),
                 )
                 .await
@@ -517,6 +528,7 @@ async fn copy_internal(
                 if is_file_type_same(&src_metadata, &dst_metadata) {
                     let dst_link = crate::walk::run_metadata_probed(
                         congestion::Side::Destination,
+                        congestion::MetadataOp::ReadLink,
                         tokio::fs::read_link(dst),
                     )
                     .await
@@ -530,6 +542,7 @@ async fn copy_internal(
                             // do we need to update the metadata for this symlink?
                             let dst_metadata = crate::walk::run_metadata_probed(
                                 congestion::Side::Destination,
+                                congestion::MetadataOp::Stat,
                                 tokio::fs::symlink_metadata(dst),
                             )
                             .await
@@ -590,6 +603,7 @@ async fn copy_internal(
                 })?;
                 crate::walk::run_metadata_probed(
                     congestion::Side::Destination,
+                    congestion::MetadataOp::Symlink,
                     tokio::fs::symlink(&link, dst),
                 )
                 .await
@@ -666,6 +680,7 @@ async fn copy_internal(
             && !is_fresh
             && crate::walk::run_metadata_probed(
                 congestion::Side::Destination,
+                congestion::MetadataOp::Stat,
                 tokio::fs::symlink_metadata(dst),
             )
             .await
@@ -701,9 +716,12 @@ async fn copy_internal(
             directories_created: 1, // report as would be created
             ..Default::default()
         }
-    } else if let Err(error) =
-        crate::walk::run_metadata_probed(congestion::Side::Destination, tokio::fs::create_dir(dst))
-            .await
+    } else if let Err(error) = crate::walk::run_metadata_probed(
+        congestion::Side::Destination,
+        congestion::MetadataOp::MkDir,
+        tokio::fs::create_dir(dst),
+    )
+    .await
     {
         assert!(
             !is_fresh,
@@ -718,6 +736,7 @@ async fn copy_internal(
             // while we're writing to it which isn't safe
             let dst_metadata = crate::walk::run_metadata_probed(
                 congestion::Side::Destination,
+                congestion::MetadataOp::Stat,
                 tokio::fs::symlink_metadata(dst),
             )
             .await
@@ -764,6 +783,7 @@ async fn copy_internal(
                 })?;
                 crate::walk::run_metadata_probed(
                     congestion::Side::Destination,
+                    congestion::MetadataOp::MkDir,
                     tokio::fs::create_dir(dst),
                 )
                 .await
@@ -946,6 +966,7 @@ async fn copy_internal(
             );
             match crate::walk::run_metadata_probed(
                 congestion::Side::Destination,
+                congestion::MetadataOp::RmDir,
                 tokio::fs::remove_dir(dst),
             )
             .await

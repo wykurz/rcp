@@ -91,13 +91,41 @@ impl EntryKind {
     }
 }
 
-/// Resolve the [`throttle::Resource`] for a single per-file metadata
-/// syscall (`stat`, `mkdir`, `unlink`, …) on the given [`congestion::Side`].
-fn meta_resource(side: congestion::Side) -> throttle::Resource {
+/// Resolve the `throttle::Side` from the matching `congestion::Side`.
+///
+/// The two crates carry independent enum definitions to keep `throttle`
+/// free of any congestion dependency; this is the canonical bridge
+/// (paired with [`throttle_op`]) reused everywhere a congestion-side
+/// signal needs to address a throttle resource.
+pub(crate) fn throttle_side(side: congestion::Side) -> throttle::Side {
     match side {
-        congestion::Side::Source => throttle::Resource::SrcMeta,
-        congestion::Side::Destination => throttle::Resource::DstMeta,
+        congestion::Side::Source => throttle::Side::Source,
+        congestion::Side::Destination => throttle::Side::Destination,
     }
+}
+
+/// Resolve the `throttle::MetadataOp` from the matching `congestion::MetadataOp`.
+pub(crate) fn throttle_op(op: congestion::MetadataOp) -> throttle::MetadataOp {
+    match op {
+        congestion::MetadataOp::Stat => throttle::MetadataOp::Stat,
+        congestion::MetadataOp::ReadLink => throttle::MetadataOp::ReadLink,
+        congestion::MetadataOp::MkDir => throttle::MetadataOp::MkDir,
+        congestion::MetadataOp::RmDir => throttle::MetadataOp::RmDir,
+        congestion::MetadataOp::Unlink => throttle::MetadataOp::Unlink,
+        congestion::MetadataOp::HardLink => throttle::MetadataOp::HardLink,
+        congestion::MetadataOp::Symlink => throttle::MetadataOp::Symlink,
+        congestion::MetadataOp::Chmod => throttle::MetadataOp::Chmod,
+        congestion::MetadataOp::OpenCreate => throttle::MetadataOp::OpenCreate,
+    }
+}
+
+/// Resolve the [`throttle::Resource`] for a single per-file metadata
+/// syscall on the given side.
+pub(crate) fn meta_resource(
+    side: congestion::Side,
+    op: congestion::MetadataOp,
+) -> throttle::Resource {
+    throttle::Resource::meta(throttle_side(side), throttle_op(op))
 }
 
 /// Pull the next directory entry, gated only by the static ops rate
@@ -142,19 +170,18 @@ where
 }
 
 /// Bracket a single metadata-producing future with the full per-op
-/// gating prologue: the static ops rate gate, the cwnd permit, and a
-/// congestion probe on the given [`congestion::Side`]. The probe
-/// completes successfully when `op` returns `Ok`, and is discarded on
-/// error so error paths don't skew the controller's latency baseline.
+/// gating prologue: the static ops rate gate, the cwnd permit for the
+/// matching `(side, op_kind)` resource, and a congestion probe. The
+/// probe completes successfully when `fut` returns `Ok`, and is
+/// discarded on error so error paths don't skew the controller's
+/// latency baseline.
 ///
-/// Use this at sites that perform one isolated metadata op:
-///
-/// - Source-side first-touch reads on a path that wasn't surfaced by a
-///   prior tree walk (e.g. the top-of-function `metadata` lookups in
-///   `rcp/source.rs`).
-/// - Destination-side mutations: `create_dir` for new dst directories,
-///   `hard_link` / `symlink` / `remove_file` / `remove_dir` /
-///   `set_permissions`, etc.
+/// `op_kind` selects which per-syscall controller this call is
+/// reported to and gated by — `Stat`, `MkDir`, `Unlink`, etc. Pick the
+/// variant that matches the underlying syscall (`metadata` /
+/// `symlink_metadata` / `File::open(read)` / `canonicalize` all map to
+/// `Stat`; `create_dir` to `MkDir`; `remove_file` to `Unlink`; and so
+/// on — see [`congestion::MetadataOp`] for the full mapping).
 ///
 /// `--ops-throttle` is the shared metadata rate gate, so this helper
 /// acquires it on every call — same as [`next_entry_probed`]. Callers
@@ -162,12 +189,16 @@ where
 /// per-task spawn time so we don't fan out an unbounded task queue
 /// before any token is consumed) must use
 /// [`run_metadata_probed_no_rate`] instead to avoid double-counting.
-pub async fn run_metadata_probed<F, T, E>(side: congestion::Side, op: F) -> Result<T, E>
+pub async fn run_metadata_probed<F, T, E>(
+    side: congestion::Side,
+    op_kind: congestion::MetadataOp,
+    fut: F,
+) -> Result<T, E>
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
     throttle::get_ops_token().await;
-    run_metadata_probed_no_rate(side, op).await
+    run_metadata_probed_no_rate(side, op_kind, fut).await
 }
 
 /// Variant of [`run_metadata_probed`] that skips the static ops rate
@@ -179,13 +210,17 @@ where
 /// The `OpenOptions::open(O_CREAT)` inside the spawned task is the only
 /// metadata syscall in that path; rate-gating it again would halve the
 /// effective rate.
-pub async fn run_metadata_probed_no_rate<F, T, E>(side: congestion::Side, op: F) -> Result<T, E>
+pub async fn run_metadata_probed_no_rate<F, T, E>(
+    side: congestion::Side,
+    op_kind: congestion::MetadataOp,
+    fut: F,
+) -> Result<T, E>
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
-    let ops_permit = throttle::ops_in_flight_permit(meta_resource(side)).await;
-    let probe = congestion::Probe::start_metadata(side);
-    let result = op.await;
+    let ops_permit = throttle::ops_in_flight_permit(meta_resource(side, op_kind)).await;
+    let probe = congestion::Probe::start_metadata(side, op_kind);
+    let result = fut.await;
     match &result {
         Ok(_) => probe.complete_ok(0),
         Err(_) => probe.discard(),

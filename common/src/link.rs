@@ -103,6 +103,7 @@ async fn hard_link_helper(
     let mut link_summary = Summary::default();
     match crate::walk::run_metadata_probed(
         congestion::Side::Destination,
+        congestion::MetadataOp::HardLink,
         tokio::fs::hard_link(src, dst),
     )
     .await
@@ -115,6 +116,7 @@ async fn hard_link_helper(
             tracing::debug!("'dst' already exists, check if we need to update");
             let dst_metadata = crate::walk::run_metadata_probed(
                 congestion::Side::Destination,
+                congestion::MetadataOp::Stat,
                 tokio::fs::symlink_metadata(dst),
             )
             .await
@@ -148,6 +150,7 @@ async fn hard_link_helper(
             link_summary.copy_summary.rm_summary = rm_summary;
             crate::walk::run_metadata_probed(
                 congestion::Side::Destination,
+                congestion::MetadataOp::HardLink,
                 tokio::fs::hard_link(src, dst),
             )
             .await
@@ -185,6 +188,7 @@ pub async fn link(
         if let Some(name) = src_name {
             let src_metadata = crate::walk::run_metadata_probed(
                 congestion::Side::Source,
+                congestion::MetadataOp::Stat,
                 tokio::fs::symlink_metadata(src),
             )
             .await
@@ -228,6 +232,7 @@ async fn link_internal(
     tracing::debug!("reading source metadata");
     let src_metadata = crate::walk::run_metadata_probed(
         congestion::Side::Source,
+        congestion::MetadataOp::Stat,
         tokio::fs::symlink_metadata(src),
     )
     .await
@@ -238,6 +243,7 @@ async fn link_internal(
             tracing::debug!("reading 'update' metadata");
             let update_metadata_res = crate::walk::run_metadata_probed(
                 congestion::Side::Source,
+                congestion::MetadataOp::Stat,
                 tokio::fs::symlink_metadata(update),
             )
             .await;
@@ -465,9 +471,12 @@ async fn link_internal(
             directories_created: 1,
             ..Default::default()
         }
-    } else if let Err(error) =
-        crate::walk::run_metadata_probed(congestion::Side::Destination, tokio::fs::create_dir(dst))
-            .await
+    } else if let Err(error) = crate::walk::run_metadata_probed(
+        congestion::Side::Destination,
+        congestion::MetadataOp::MkDir,
+        tokio::fs::create_dir(dst),
+    )
+    .await
     {
         assert!(!is_fresh, "unexpected error creating directory: {:?}", &dst);
         if settings.copy_settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -477,6 +486,7 @@ async fn link_internal(
             // while we're writing to it which isn't safe
             let dst_metadata = crate::walk::run_metadata_probed(
                 congestion::Side::Destination,
+                congestion::MetadataOp::Stat,
                 tokio::fs::metadata(dst),
             )
             .await
@@ -515,6 +525,7 @@ async fn link_internal(
                 })?;
                 crate::walk::run_metadata_probed(
                     congestion::Side::Destination,
+                    congestion::MetadataOp::MkDir,
                     tokio::fs::create_dir(dst),
                 )
                 .await
@@ -813,6 +824,7 @@ async fn link_internal(
             );
             match crate::walk::run_metadata_probed(
                 congestion::Side::Destination,
+                congestion::MetadataOp::RmDir,
                 tokio::fs::remove_dir(dst),
             )
             .await

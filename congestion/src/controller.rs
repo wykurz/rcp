@@ -86,7 +86,7 @@ impl Decision {
 ///
 /// Snapshots are sampled — never authoritative for enforcement. They
 /// expose the same fields a Vegas-style controller reasons about
-/// (`cwnd`, baseline, smoothed observed latency, sample count) so a
+/// (`cwnd`, baseline, current observed latency, sample count) so a
 /// renderer can show *why* the current `cwnd` is what it is. Controllers
 /// without a meaningful internal state (e.g. `Noop`) return
 /// [`ControllerSnapshot::default`]; controllers without a latency
@@ -94,21 +94,22 @@ impl Decision {
 /// fields at zero.
 ///
 /// `latency_ratio` is intentionally not pre-computed — the renderer
-/// derives it from `ewma_latency / min_latency` so there is one source
-/// of truth.
+/// derives it from `current_latency / baseline_latency` so there is one
+/// source of truth.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ControllerSnapshot {
     /// Current concurrency window the controller would emit on its
     /// next tick. `0` means "no cap configured."
     pub cwnd: u32,
-    /// Uncongested baseline latency (p10 of the recent sample window).
-    /// Retains the historical `min_latency` field name for backwards
-    /// compatibility with renderers; the value is no longer a strict
-    /// minimum. `Duration::ZERO` if no signal yet.
-    pub min_latency: std::time::Duration,
-    /// EWMA-smoothed observed latency. `Duration::ZERO` if no
-    /// sample-bearing tick has fired yet.
-    pub ewma_latency: std::time::Duration,
+    /// Long-horizon baseline latency. For matched-percentile controllers
+    /// this is the configured percentile over the long sample window;
+    /// the renderer treats it as the "uncongested floor" reference.
+    /// `Duration::ZERO` if no signal yet.
+    pub baseline_latency: std::time::Duration,
+    /// Short-horizon current latency. For matched-percentile controllers
+    /// this is the same percentile computed over the short sample
+    /// window. `Duration::ZERO` if no fresh samples have been observed.
+    pub current_latency: std::time::Duration,
     /// Cumulative number of samples the controller has consumed.
     pub samples_seen: u64,
 }

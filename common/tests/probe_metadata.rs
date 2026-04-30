@@ -150,7 +150,13 @@ async fn auto_meta_pipeline_propagates_probes_to_controller() {
     // which channel we tap; pick the one with the most samples to keep
     // this assertion robust.)
     let mut builder = congestion::RoutingSinkBuilder::new();
-    let metadata_rx = builder.metadata_receiver(congestion::Side::Destination);
+    // Per-op routing: rm fires Unlink + RmDir on the destination side.
+    // Tap Unlink — the test only asserts samples_seen > 0, which any
+    // exercised op kind satisfies; picking one keeps the assertion simple.
+    let metadata_rx = builder.metadata_receiver(
+        congestion::Side::Destination,
+        congestion::MetadataOp::Unlink,
+    );
     congestion::install_sample_sink(std::sync::Arc::new(builder.build()));
     let controller = congestion::VegasController::new(congestion::VegasConfig {
         initial_cwnd: 5,

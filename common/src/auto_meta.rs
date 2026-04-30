@@ -508,8 +508,11 @@ mod tests {
         /// Reset the global throttle + sample-sink state after a test so
         /// a subsequent test sees a clean slate regardless of ordering.
         async fn reset_globals() {
-            throttle::set_max_ops_in_flight(throttle::Resource::SrcMeta, 0);
-            throttle::set_max_ops_in_flight(throttle::Resource::DstMeta, 0);
+            for &side in &throttle::Side::ALL {
+                for &op in &throttle::MetadataOp::ALL {
+                    throttle::set_max_ops_in_flight(throttle::Resource::meta(side, op), 0);
+                }
+            }
             throttle::disable_ops_throttle();
             congestion::clear_sample_sink();
         }
@@ -520,12 +523,13 @@ mod tests {
         /// resource.
         async fn wire_adapter<C: congestion::Controller + 'static>(
             side: Side,
+            op: congestion::MetadataOp,
             resource: throttle::Resource,
             controller: C,
             tick: std::time::Duration,
         ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
             let mut builder = RoutingSinkBuilder::new();
-            let metadata_rx = builder.metadata_receiver(side);
+            let metadata_rx = builder.metadata_receiver(side, op);
             let sink = std::sync::Arc::new(builder.build());
             congestion::install_sample_sink(sink.clone());
             let (unit, decision_rx, _snapshot_rx) =
@@ -544,9 +548,12 @@ mod tests {
             // OPS_IN_FLIGHT_LIMIT — proving unit -> adapter -> throttle
             // wiring on that side.
             let side = Side::Source;
-            let resource = throttle::Resource::SrcMeta;
+            let op = congestion::MetadataOp::Stat;
+            let resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             let (unit, adapter) = wire_adapter(
                 side,
+                op,
                 resource,
                 FixedController::with_concurrency(42),
                 std::time::Duration::from_millis(10),
@@ -608,7 +615,9 @@ mod tests {
             // transition through the sequence proves the decision -> action
             // pipeline is wired end-to-end.
             let side = Side::Source;
-            let resource = throttle::Resource::SrcMeta;
+            let op = congestion::MetadataOp::Stat;
+            let resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             let tick = std::time::Duration::from_millis(20);
             let controller = ScriptedController {
                 script: vec![
@@ -618,7 +627,7 @@ mod tests {
                 ],
                 idx: 0,
             };
-            let (unit, adapter) = wire_adapter(side, resource, controller, tick).await;
+            let (unit, adapter) = wire_adapter(side, op, resource, controller, tick).await;
             // Observe each target cwnd in sequence. The controller's
             // on_tick produces one per tick, so after ~N ticks each value
             // in the script should land. Allow slack for interleaving.
@@ -650,13 +659,15 @@ mod tests {
             // so the semaphore disables its cap, matching the Decision
             // "None means no limit" contract.
             let side = Side::Source;
-            let resource = throttle::Resource::SrcMeta;
+            let op = congestion::MetadataOp::Stat;
+            let resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             let tick = std::time::Duration::from_millis(20);
             let controller = ScriptedController {
                 script: vec![Decision::with_concurrency(15), Decision::UNLIMITED],
                 idx: 0,
             };
-            let (unit, adapter) = wire_adapter(side, resource, controller, tick).await;
+            let (unit, adapter) = wire_adapter(side, op, resource, controller, tick).await;
             // First, observe 15 land.
             let deadline = std::time::Instant::now() + tick * 10;
             while throttle::current_ops_in_flight_limit(resource) != 15 {
@@ -689,9 +700,11 @@ mod tests {
             // its sample channel closes) must cause the adapter task to
             // exit. We set this up with a tight tick + short-lived unit.
             let side = Side::Source;
-            let resource = throttle::Resource::SrcMeta;
+            let op = congestion::MetadataOp::Stat;
+            let resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             let mut builder = RoutingSinkBuilder::new();
-            let metadata_rx = builder.metadata_receiver(side);
+            let metadata_rx = builder.metadata_receiver(side, op);
             let sink = std::sync::Arc::new(builder.build());
             congestion::install_sample_sink(sink.clone());
             let (unit, decision_rx, _snapshot_rx) = ControlUnit::new(

@@ -38,10 +38,14 @@ pub struct AutoMetaThrottleConfig {
     pub max_cwnd: u32,
     pub alpha: f64,
     pub beta: f64,
-    pub ewma_alpha: f64,
     pub increase_step: u32,
     pub decrease_step: u32,
-    pub min_latency_max_age: std::time::Duration,
+    /// Percentile (in `(0.0, 1.0)`) used to summarize each window.
+    pub percentile: f64,
+    /// Long-horizon window age. Drives the baseline statistic.
+    pub long_window: std::time::Duration,
+    /// Short-horizon window age. Drives the current statistic.
+    pub short_window: std::time::Duration,
     pub tick_interval: std::time::Duration,
 }
 
@@ -87,14 +91,15 @@ impl ThrottleConfig {
             if auto.min_cwnd > auto.max_cwnd {
                 return Err("auto-meta-min-cwnd must be <= auto-meta-max-cwnd".to_string());
             }
-            if !(0.0..=1.0).contains(&auto.ewma_alpha) {
-                return Err("auto-meta-ewma-alpha must be in [0.0, 1.0]".to_string());
+            if !(0.0..1.0).contains(&auto.percentile) {
+                return Err("auto-meta-percentile must be in [0.0, 1.0)".to_string());
             }
-            // alpha and beta are latency-inflation ratios; values <= 1.0 are
-            // nonsensical since the EWMA-to-baseline ratio normally rides at
-            // or above 1.0 (baseline = p10 of recent samples, EWMA = mean of
-            // all recent samples; mean >= p10 by definition modulo sample
-            // ordering effects).
+            // alpha and beta are matched-percentile ratios. At steady
+            // state both windows estimate the same population statistic
+            // so the ratio sits near 1.0; alpha < 1.0 would mean "shrink
+            // when current is faster than baseline", which is
+            // nonsensical, and beta < 1.0 would shrink the controller at
+            // its operating point.
             if auto.alpha <= 1.0 {
                 return Err("auto-meta-alpha must be > 1.0".to_string());
             }
@@ -106,6 +111,15 @@ impl ThrottleConfig {
             }
             if auto.tick_interval.is_zero() {
                 return Err("auto-meta-tick-interval must be > 0".to_string());
+            }
+            if auto.long_window.is_zero() {
+                return Err("auto-meta-long-window must be > 0".to_string());
+            }
+            if auto.short_window.is_zero() {
+                return Err("auto-meta-short-window must be > 0".to_string());
+            }
+            if auto.short_window >= auto.long_window {
+                return Err("auto-meta-short-window must be < auto-meta-long-window".to_string());
             }
             if self.ops_throttle > 0 && self.ops_throttle < AUTO_META_MIN_OPS_THROTTLE {
                 return Err(format!(
@@ -251,12 +265,13 @@ mod auto_meta_validation_tests {
             initial_cwnd: 1,
             min_cwnd: 1,
             max_cwnd: 4096,
-            alpha: 1.3,
-            beta: 2.5,
-            ewma_alpha: 0.3,
+            alpha: 1.1,
+            beta: 1.5,
             increase_step: 1,
             decrease_step: 1,
-            min_latency_max_age: std::time::Duration::from_secs(10),
+            percentile: 0.5,
+            long_window: std::time::Duration::from_secs(10),
+            short_window: std::time::Duration::from_secs(1),
             tick_interval: std::time::Duration::from_millis(50),
         }
     }
