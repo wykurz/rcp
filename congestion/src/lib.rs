@@ -51,7 +51,8 @@ pub use control_loop::{ControlUnit, DEFAULT_TICK_INTERVAL, RoutingSink, RoutingS
 pub use controller::{Controller, ControllerSnapshot, Decision, Outcome, Sample};
 pub use fixed::FixedController;
 pub use measurement::{
-    Probe, ResourceKind, SampleSink, Side, clear_sample_sink, install_sample_sink,
+    MetadataOp, N_META_OPS, N_META_RESOURCES, N_SIDES, Probe, ResourceKind, SampleSink, Side,
+    clear_sample_sink, install_sample_sink,
 };
 pub use noop::NoopController;
 pub use vegas::{VegasConfig, VegasController};

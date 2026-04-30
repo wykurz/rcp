@@ -1,38 +1,55 @@
-//! Vegas-style latency-based adaptive controller.
+//! Latency-based adaptive controller using matched-window percentile statistics.
 //!
-//! Maintains a windowed p10-percentile of recent operation latencies as the
-//! uncongested baseline and an EWMA-smoothed recent latency (`ewma_latency`)
-//! as the current estimate. On every tick, the ratio
-//! `ewma_latency / baseline` is compared to the configured thresholds:
+//! The controller maintains a single sliding window of recent operation
+//! latencies and, on every tick, derives two summary statistics from it:
 //!
-//! - `ratio < alpha` → the queue is shallow; grow concurrency.
-//! - `ratio > beta`  → the queue is building; shrink concurrency.
+//! - **Baseline** — the configured percentile (default p50) over the full
+//!   long-horizon window (default 10s).
+//! - **Current** — the same percentile computed over a subset of the most
+//!   recent samples (default 1s).
+//!
+//! Their ratio drives the control law:
+//!
+//! - `ratio < alpha` → the recent distribution looks at least as fast as
+//!   the long-horizon one; grow concurrency.
+//! - `ratio > beta`  → the recent distribution has shifted to slower
+//!   latencies, indicating queue build-up; shrink concurrency.
 //! - otherwise       → hold.
 //!
-//! ## Why p10 over a sliding window
+//! ## Why matched percentiles
 //!
 //! Real metadata syscalls on networked filesystems (Weka, Lustre, NFS) have
-//! natural per-op latency variance much wider than 50% — even with a fixed
-//! `cwnd` and a steady offered load, individual stat/open latencies routinely
-//! span an order of magnitude. A strict running minimum would latch onto a
-//! single fast outlier and treat ordinary variance as queueing, ratcheting
-//! `cwnd` down indefinitely. The p10 of the recent sample window is robust
-//! to a single fast outlier (the floor moves only when ten percent of recent
-//! samples beat it), naturally weighted toward recent samples (older entries
-//! age out of the window), and gracefully accommodates the natural latency
-//! variance of real filesystems.
+//! per-op latency variance that routinely spans an order of magnitude even
+//! at fixed `cwnd` and steady offered load. Comparing a baseline percentile
+//! (e.g. p10) against the *mean* of recent latencies — the original Vegas
+//! shape — produces a ratio that sits naturally above 1.0 even at idle,
+//! purely because of the heavy-tailed shape of the distribution. The
+//! controller would then need very loose `alpha` / `beta` thresholds to
+//! avoid mistaking that natural inflation for queueing, and the loose
+//! thresholds in turn left a wide hold band where genuine load growth
+//! could not be distinguished from variance.
 //!
-//! This is simpler than classic TCP Vegas (which compares expected vs. actual
-//! rates), but carries the same signal. It is a starting point for adaptive
-//! filesystem control; more sophisticated schemes (periodic drains, BBR) can
-//! be layered on top in their own `impl Controller`s.
+//! Comparing the *same* percentile across two time windows cancels the
+//! distribution-shape contribution: at steady state both windows estimate
+//! the same population statistic, so the ratio approaches 1.0 regardless
+//! of how heavy-tailed the distribution is. A non-1.0 ratio reflects an
+//! actual shift in the latency distribution between the two horizons —
+//! exactly the queue-build-up signal we want to act on.
+//!
+//! ## Why a single window holding all samples
+//!
+//! Both statistics come from the same `VecDeque<(latency, observed_at)>`
+//! buffer. The "short" window is computed as a filter over that buffer —
+//! samples whose `observed_at` is within the last `short_window` of the
+//! current tick. This keeps the on_sample hot path trivial (one push,
+//! one capped pop) and makes age-out a single retain pass per tick.
 
 use crate::controller::{Controller, ControllerSnapshot, Decision, Sample};
 
-/// Maximum number of samples retained in the sliding window used to
-/// compute the p10 baseline. Older samples are evicted FIFO once this
-/// cap is reached, bounding memory under sustained high sample rates
-/// while still leaving plenty of resolution for the percentile.
+/// Maximum number of samples retained in the sliding window. Older samples
+/// are evicted FIFO once this cap is reached, bounding memory under
+/// sustained high sample rates while still leaving plenty of resolution
+/// for the percentile computation.
 const SAMPLE_WINDOW_CAP: usize = 4096;
 
 /// Tunable parameters for [`VegasController`].
@@ -48,36 +65,43 @@ pub struct VegasConfig {
     pub min_cwnd: u32,
     /// Ceiling on concurrency. Caps adaptive growth.
     pub max_cwnd: u32,
-    /// If `ewma_latency / baseline < alpha`, cwnd is increased.
+    /// If `current / baseline < alpha`, cwnd is increased.
     ///
-    /// Defaulted at `1.3` to leave breathing room for the natural latency
-    /// variance of real filesystems: ordinary per-op jitter can briefly
-    /// push the EWMA above the p10 baseline without indicating queueing,
-    /// and a tighter alpha would misread that variance as lack of
-    /// headroom — `ratio < alpha` is rarely satisfied, so `cwnd` stalls
-    /// at the floor even when the filesystem has plenty of capacity.
+    /// With matched-percentile signal, the ratio sits near 1.0 at steady
+    /// state regardless of distribution shape, so `alpha` can be set
+    /// tightly — default 1.1 — which means "grow whenever the recent
+    /// distribution is at most 10% slower than the long-horizon one".
     pub alpha: f64,
-    /// If `ewma_latency / baseline > beta`, cwnd is decreased.
+    /// If `current / baseline > beta`, cwnd is decreased.
     ///
-    /// Defaulted at `2.5` for the same natural-variance reason as `alpha`:
-    /// real-world metadata syscalls routinely show ratios in the 1.5–2.0×
-    /// band even at modest concurrency without the filesystem actually
-    /// being congested, and a tighter beta would misread that variance as
-    /// queueing and ratchet `cwnd` toward the floor.
+    /// Default 1.5 — a 50% inflation of the recent percentile relative to
+    /// the long-horizon one is a clear distribution-shift signal that
+    /// queueing is building.
     pub beta: f64,
-    /// EWMA smoothing factor in `[0.0, 1.0]`. Higher = more responsive.
-    pub ewma_alpha: f64,
     /// How much to grow cwnd on each under-shoot tick.
     pub increase_step: u32,
     /// How much to shrink cwnd on each over-shoot tick.
     pub decrease_step: u32,
-    /// Maximum age of samples retained in the baseline window. Each tick,
-    /// samples older than this are evicted; if the eviction empties the
-    /// window, the EWMA is reset alongside it so the next tick re-runs
-    /// the cold-start path. Prevents stale samples from anchoring the
-    /// baseline against a workload that has changed shape since they
-    /// were collected.
-    pub min_latency_max_age: std::time::Duration,
+    /// Percentile (in `(0.0, 1.0)`) used to summarize each window.
+    ///
+    /// The same percentile is applied to both the long-horizon window
+    /// (baseline) and the short-horizon subset (current) so the natural
+    /// distribution shape cancels in the ratio. Default 0.5 (median).
+    /// Lower values (e.g. 0.1) bias toward the fast end of the
+    /// distribution and produce an earlier congestion signal at the cost
+    /// of more sensitivity to occasional fast outliers; higher values
+    /// (e.g. 0.9) react only when the slow tail itself shifts.
+    pub percentile: f64,
+    /// Long-horizon window age. Samples older than this are evicted on
+    /// every tick. Sets the memory of the baseline statistic — too short
+    /// and the baseline drifts up under sustained load, losing the anchor;
+    /// too long and the baseline is slow to forget transient slow phases.
+    pub long_window: std::time::Duration,
+    /// Short-horizon window age. The "current" statistic is the percentile
+    /// of samples observed within this window. Must be strictly less than
+    /// [`long_window`][Self::long_window] for the matched-window comparison
+    /// to be meaningful. Default 1s.
+    pub short_window: std::time::Duration,
 }
 
 impl Default for VegasConfig {
@@ -86,44 +110,51 @@ impl Default for VegasConfig {
             initial_cwnd: 1,
             min_cwnd: 1,
             max_cwnd: 4096,
-            alpha: 1.3,
-            beta: 2.5,
-            ewma_alpha: 0.3,
+            alpha: 1.1,
+            beta: 1.5,
             increase_step: 1,
             decrease_step: 1,
-            min_latency_max_age: std::time::Duration::from_secs(10),
+            percentile: 0.5,
+            long_window: std::time::Duration::from_secs(10),
+            short_window: std::time::Duration::from_secs(1),
         }
     }
 }
 
-/// Adaptive controller driven by latency inflation relative to the
-/// uncongested baseline.
+/// Adaptive controller driven by matched-percentile latency comparison.
 ///
-/// The baseline is the p10-percentile of recent samples held in a
-/// sliding window — robust to a single fast outlier, naturally weighted
-/// toward recent samples (older entries age out of the window), and
-/// gracefully accommodating the natural latency variance of real
-/// filesystems.
+/// The same percentile is computed over a long-horizon sample window
+/// (baseline) and a short-horizon subset (current). The ratio of the two
+/// is the congestion signal: at steady state both estimates converge on
+/// the same population statistic so the ratio approaches 1.0; a recent
+/// distribution shift toward slower latencies pushes the ratio above 1.0.
 pub struct VegasController {
     config: VegasConfig,
     cwnd: u32,
-    /// Sliding window of recent samples, used to compute the p10
-    /// baseline each tick. Capped at [`SAMPLE_WINDOW_CAP`] entries:
-    /// when full, oldest is evicted FIFO on push. Each entry is
+    /// Sliding window of recent samples, used to derive both baseline and
+    /// current percentiles each tick. Capped at [`SAMPLE_WINDOW_CAP`]
+    /// entries: when full, oldest is evicted FIFO on push. Each entry is
     /// `(latency_ns, observed_at)`; the timestamp drives age-out so a
-    /// stale window can be discarded after `min_latency_max_age`.
+    /// stale window can be discarded after `long_window`.
     samples: std::collections::VecDeque<(u64, std::time::Instant)>,
-    ewma_latency_ns: Option<f64>,
-    /// p10 baseline (in ns) recomputed each tick from `samples`.
-    /// `None` if the window is empty.
+    /// Baseline percentile (in ns) over the long-horizon window, recomputed
+    /// each tick from `samples`. `None` when the window is empty.
     baseline_latency_ns: Option<u64>,
-    tick_sum_latency_ns: u128,
-    tick_sample_count: u64,
+    /// Current percentile (in ns) over the short-horizon subset, recomputed
+    /// each tick from `samples`. `None` when no samples fall inside the
+    /// short window.
+    current_latency_ns: Option<u64>,
     /// Cumulative number of samples consumed across the controller's
     /// lifetime. Surfaced via [`ControllerSnapshot::samples_seen`] for
-    /// observability — distinct from `tick_sample_count`, which resets
-    /// each tick.
+    /// observability.
     total_samples: u64,
+    /// `total_samples` as of the previous tick. Used to detect ticks
+    /// that fire without any new sample arriving since the last
+    /// decision — those must hold `cwnd` rather than re-applying the
+    /// same matched-percentile decision over and over. With a
+    /// short-window of 1s and a tick cadence of 50ms, a single sample
+    /// otherwise drives ~20 grow / shrink steps before it ages out.
+    last_tick_total_samples: u64,
 }
 
 impl VegasController {
@@ -135,29 +166,48 @@ impl VegasController {
             config,
             cwnd,
             samples: std::collections::VecDeque::with_capacity(SAMPLE_WINDOW_CAP),
-            ewma_latency_ns: None,
             baseline_latency_ns: None,
-            tick_sum_latency_ns: 0,
-            tick_sample_count: 0,
+            current_latency_ns: None,
             total_samples: 0,
+            last_tick_total_samples: 0,
         }
     }
     /// Current concurrency target. Useful for tests and metrics.
     pub fn cwnd(&self) -> u32 {
         self.cwnd
     }
-    /// p10-percentile baseline latency over the recent sample window,
-    /// or `None` if the window is empty.
-    pub fn min_latency(&self) -> Option<std::time::Duration> {
+    /// Most recently computed long-horizon percentile, or `None` if the
+    /// window is empty.
+    pub fn baseline_latency(&self) -> Option<std::time::Duration> {
         self.baseline_latency_ns
             .map(std::time::Duration::from_nanos)
     }
-    /// EWMA latency estimate over recent ticks, or `None` if no
-    /// sample-bearing tick has fired yet.
-    pub fn ewma_latency(&self) -> Option<std::time::Duration> {
-        self.ewma_latency_ns
-            .map(|ns| std::time::Duration::from_nanos(ns as u64))
+    /// Most recently computed short-horizon percentile, or `None` if no
+    /// samples fell within the short window on the last tick.
+    pub fn current_latency(&self) -> Option<std::time::Duration> {
+        self.current_latency_ns.map(std::time::Duration::from_nanos)
     }
+}
+
+/// Pick the entry at the given percentile from an unsorted slice.
+///
+/// Uses `select_nth_unstable` to partition the slice in O(n) average
+/// time rather than the O(n log n) of a full sort — meaningful when
+/// many controllers tick at sub-second cadence over thousands of
+/// samples each. The slice is reordered in place but no total order is
+/// imposed, which is fine: callers throw the slice away after the
+/// percentile is read.
+///
+/// Returns the value at index `floor(len * percentile)`, clamped into
+/// bounds. `percentile` must be in `[0.0, 1.0]`; values outside that
+/// range produce the floor or ceiling element, which keeps the
+/// function total under unexpected config.
+fn percentile_via_select(samples: &mut [u64], percentile: f64) -> u64 {
+    debug_assert!(!samples.is_empty());
+    let p = percentile.clamp(0.0, 1.0);
+    let idx = ((samples.len() as f64) * p) as usize;
+    let idx = idx.min(samples.len() - 1);
+    *samples.select_nth_unstable(idx).1
 }
 
 impl Controller for VegasController {
@@ -165,12 +215,12 @@ impl Controller for VegasController {
         // u64 nanos fit any realistic latency; saturate defensively.
         // Clamp to >= 1 so a 0-duration sample (possible when `Instant::now()`
         // resolution coarsely groups back-to-back probes) never lands as
-        // `baseline = 0` — that would make the ratio below divide by zero
+        // baseline = 0 — that would make the ratio below divide by zero
         // and collapse cwnd to the floor.
         let latency_ns = u64::try_from(sample.latency().as_nanos())
             .unwrap_or(u64::MAX)
             .max(1);
-        // bound memory under sustained high sample rates. Pop *before*
+        // Bound memory under sustained high sample rates. Pop *before*
         // push when at the cap: `VecDeque::push_back` reallocates if at
         // capacity, and `VecDeque` never shrinks its underlying buffer,
         // so a post-push pop would leave the allocation grown past the
@@ -179,64 +229,76 @@ impl Controller for VegasController {
             self.samples.pop_front();
         }
         self.samples.push_back((latency_ns, sample.completed_at));
-        self.tick_sum_latency_ns = self
-            .tick_sum_latency_ns
-            .saturating_add(u128::from(latency_ns));
-        self.tick_sample_count = self.tick_sample_count.saturating_add(1);
         self.total_samples = self.total_samples.saturating_add(1);
     }
     fn on_tick(&mut self, now: std::time::Instant) -> Decision {
-        // discard samples older than the window's max age. The EWMA must
-        // be reset alongside an empty window: an EWMA frozen during a
-        // congested period carries forward a "current latency" that is
-        // not comparable to the new baseline the next samples will draw,
-        // and would otherwise produce a spurious growth burst on the
-        // first tick after the window emptied under sustained congestion.
-        //
-        // We use `retain` rather than a `pop_front while front is old`
-        // loop because samples arrive in mpsc-receive order, not sorted
-        // by `completed_at`: under concurrent producers a sample with an
-        // older completion time can land in the deque after a newer one,
-        // so the front isn't guaranteed to be the oldest. `retain` is
-        // O(N) per tick, but N <= SAMPLE_WINDOW_CAP, negligible at the
-        // 50ms tick cadence. `checked_sub` because `now - max_age` can
-        // underflow for very early `Instant`s in tests with mocked clocks.
-        if let Some(cutoff) = now.checked_sub(self.config.min_latency_max_age) {
+        // Discard samples older than the long-horizon window. Use `retain`
+        // rather than `pop_front while old` because samples arrive in
+        // mpsc-receive order, not sorted by `completed_at`: under
+        // concurrent producers a sample with an older completion time can
+        // land in the deque after a newer one, so the front isn't
+        // guaranteed to be the oldest. `retain` is O(N) per tick, but
+        // N <= SAMPLE_WINDOW_CAP, negligible at the 50ms tick cadence.
+        // `checked_sub` because `now - long_window` can underflow for
+        // very early `Instant`s in tests with mocked clocks.
+        if let Some(cutoff) = now.checked_sub(self.config.long_window) {
             self.samples
                 .retain(|&(_, observed_at)| observed_at >= cutoff);
         }
         if self.samples.is_empty() {
             self.baseline_latency_ns = None;
-            self.ewma_latency_ns = None;
-        } else {
-            // p10 baseline: collect, sort, pick the 10th-percentile entry.
-            // the window is bounded at SAMPLE_WINDOW_CAP, so this is
-            // O(N log N) on at most a few thousand u64s — negligible at
-            // tick cadence (50ms by default).
-            let mut latencies: Vec<u64> = self.samples.iter().map(|&(ns, _)| ns).collect();
-            latencies.sort_unstable();
-            let idx = ((latencies.len() as f64) * 0.1) as usize;
-            self.baseline_latency_ns = Some(latencies[idx.min(latencies.len() - 1)]);
-        }
-        if self.tick_sample_count == 0 {
+            self.current_latency_ns = None;
             return Decision::with_concurrency(self.cwnd);
         }
-        let mean_ns = (self.tick_sum_latency_ns / u128::from(self.tick_sample_count)) as f64;
-        // the very first sample-bearing tick establishes the baseline —
-        // EWMA equals baseline by construction so ratio is always 1.0.
-        // skipping the adjustment on that tick prevents an unconditional
-        // cwnd bump from a cold start.
-        let is_first_sample_tick = self.ewma_latency_ns.is_none();
-        self.ewma_latency_ns = Some(match self.ewma_latency_ns {
-            Some(prev) => self.config.ewma_alpha * mean_ns + (1.0 - self.config.ewma_alpha) * prev,
-            None => mean_ns,
-        });
-        self.tick_sum_latency_ns = 0;
-        self.tick_sample_count = 0;
-        if !is_first_sample_tick
-            && let (Some(ewma), Some(baseline)) = (self.ewma_latency_ns, self.baseline_latency_ns)
-        {
-            let ratio = ewma / (baseline as f64);
+        // Baseline: percentile over the full long-horizon window.
+        // Materialize a local copy because the deque must stay
+        // time-ordered for age-out, but `select_nth_unstable` reorders
+        // the slice in place.
+        let mut all_lat: Vec<u64> = self.samples.iter().map(|&(ns, _)| ns).collect();
+        let baseline = percentile_via_select(&mut all_lat, self.config.percentile);
+        self.baseline_latency_ns = Some(baseline);
+        // Current: same percentile over the short-horizon subset.
+        // `checked_sub` underflows when `short_window` exceeds the
+        // duration since the `Instant` epoch (only seen in tests with
+        // freshly minted clocks). Fall back to the oldest retained
+        // sample's timestamp so every sample qualifies — deterministic
+        // and dependent only on caller-visible state, unlike a fresh
+        // `Instant::now()` which would mix wall-clock with the supplied
+        // `now`.
+        let short_cutoff = now
+            .checked_sub(self.config.short_window)
+            .unwrap_or_else(|| {
+                self.samples
+                    .front()
+                    .map(|&(_, observed_at)| observed_at)
+                    .unwrap_or(now)
+            });
+        let mut short_lat: Vec<u64> = self
+            .samples
+            .iter()
+            .filter(|&&(_, observed_at)| observed_at >= short_cutoff)
+            .map(|&(ns, _)| ns)
+            .collect();
+        if short_lat.is_empty() {
+            // No fresh samples — hold cwnd. The baseline above is still
+            // updated so a renderer can show the current long-horizon
+            // estimate even during a brief activity gap.
+            self.current_latency_ns = None;
+            return Decision::with_concurrency(self.cwnd);
+        }
+        let current = percentile_via_select(&mut short_lat, self.config.percentile);
+        self.current_latency_ns = Some(current);
+        // Adjust `cwnd` only on ticks that consumed at least one fresh
+        // sample. Without this guard, a single sample observed late in
+        // the short window drives one decision per tick — ~20
+        // grow / shrink steps over the 1s window at the default 50ms
+        // tick cadence — even though the underlying signal hasn't
+        // changed. Snapshots above are still updated every tick so the
+        // progress bar reflects the latest baseline / current values.
+        let saw_fresh_sample = self.total_samples > self.last_tick_total_samples;
+        self.last_tick_total_samples = self.total_samples;
+        if saw_fresh_sample {
+            let ratio = (current as f64) / (baseline as f64);
             if ratio < self.config.alpha {
                 self.cwnd = self
                     .cwnd
@@ -257,8 +319,8 @@ impl Controller for VegasController {
     fn snapshot(&self) -> ControllerSnapshot {
         ControllerSnapshot {
             cwnd: self.cwnd,
-            min_latency: self.min_latency().unwrap_or_default(),
-            ewma_latency: self.ewma_latency().unwrap_or_default(),
+            baseline_latency: self.baseline_latency().unwrap_or_default(),
+            current_latency: self.current_latency().unwrap_or_default(),
             samples_seen: self.total_samples,
         }
     }
@@ -309,26 +371,42 @@ mod tests {
     }
 
     #[test]
-    fn tracks_baseline_latency_across_samples() {
-        // p10 over a small window: index = (len * 0.1) as usize. with 3
-        // samples that is index 0, the smallest value after sorting.
-        let mut c = VegasController::new(VegasConfig::default());
-        let start = std::time::Instant::now();
-        c.on_sample(&sample(start, std::time::Duration::from_millis(10)));
-        c.on_sample(&sample(start, std::time::Duration::from_millis(2)));
-        c.on_sample(&sample(start, std::time::Duration::from_millis(5)));
-        // the baseline is computed inside on_tick; trigger one to populate.
-        c.on_tick(start);
-        assert_eq!(c.min_latency(), Some(std::time::Duration::from_millis(2)));
+    fn baseline_picks_configured_percentile() {
+        // 100 samples: 90 fast (1ms) + 10 slow (100ms). At p10 the
+        // baseline is in the fast bucket; at p50 it's still fast (median
+        // of 100 = 50th smallest, which is in the fast 90); at p95 it's
+        // the slow bucket because the upper 10% is all slow.
+        let mut c = VegasController::new(VegasConfig {
+            percentile: 0.95,
+            ..VegasConfig::default()
+        });
+        let t0 = std::time::Instant::now();
+        for i in 0..90 {
+            c.on_sample(&sample(
+                t0 + std::time::Duration::from_micros(i),
+                std::time::Duration::from_millis(1),
+            ));
+        }
+        for i in 0..10 {
+            c.on_sample(&sample(
+                t0 + std::time::Duration::from_micros(90 + i),
+                std::time::Duration::from_millis(100),
+            ));
+        }
+        c.on_tick(t0 + std::time::Duration::from_millis(200));
+        // p95 of 90×1ms + 10×100ms lands in the slow bucket (idx 95).
+        assert_eq!(
+            c.baseline_latency(),
+            Some(std::time::Duration::from_millis(100)),
+            "p95 of 90×1ms + 10×100ms must be 100ms",
+        );
     }
 
     #[test]
-    fn baseline_picks_p10_not_strict_min() {
-        // pin down the percentile semantics: 90 fast samples + 10 slow
-        // samples at 100× the fast latency. the strict min would be the
-        // single fastest sample; the p10 admits the lower 10% of the
-        // window, which here is uniformly the fast bucket — so the
-        // baseline lands at 1ms regardless of the slow tail.
+    fn baseline_p50_is_robust_to_outliers() {
+        // The reason we picked matched percentiles in the first place:
+        // outliers don't pin the baseline. p50 of 90 fast + 10 slow is
+        // squarely in the fast bucket.
         let mut c = VegasController::new(VegasConfig::default());
         let t0 = std::time::Instant::now();
         for i in 0..90 {
@@ -345,47 +423,80 @@ mod tests {
         }
         c.on_tick(t0 + std::time::Duration::from_millis(200));
         assert_eq!(
-            c.min_latency(),
+            c.baseline_latency(),
             Some(std::time::Duration::from_millis(1)),
-            "p10 of 90×1ms + 10×100ms must be 1ms",
+            "p50 of 90×1ms + 10×100ms must be 1ms",
         );
     }
 
     #[test]
-    fn grows_cwnd_when_latency_matches_baseline() {
+    fn matched_windows_at_steady_state_yield_unit_ratio_and_grow() {
+        // Steady state: identical latency across long and short windows.
+        // The matched-percentile ratio is ~1.0, which is < alpha (1.1) so
+        // cwnd grows. This is exactly the regime the new design wants —
+        // no false "queueing" signal from natural variance.
         let mut c = VegasController::new(VegasConfig {
-            initial_cwnd: 2,
+            initial_cwnd: 5,
             increase_step: 1,
-            max_cwnd: 100,
+            max_cwnd: 1000,
+            short_window: std::time::Duration::from_millis(500),
+            long_window: std::time::Duration::from_secs(5),
             ..VegasConfig::default()
         });
-        let start = std::time::Instant::now();
-        // consistent baseline latency over many ticks should grow cwnd
-        for _ in 0..5 {
-            c.on_sample(&sample(start, std::time::Duration::from_millis(2)));
-            c.on_tick(start);
+        let t0 = std::time::Instant::now();
+        // Spread samples across the long window so both short and long
+        // subsets are populated; latency identical means the matched
+        // percentile is the same in both.
+        for i in 0..200 {
+            let observed_at = t0 + std::time::Duration::from_millis(i * 20);
+            c.on_sample(&sample(observed_at, std::time::Duration::from_millis(2)));
         }
-        assert!(c.cwnd() > 2, "expected growth, got {}", c.cwnd());
+        // Tick at the end of the spread; the last 500ms of samples land
+        // inside the short window, the rest inside the long window.
+        let cwnd_before = c.cwnd();
+        c.on_tick(t0 + std::time::Duration::from_millis(199 * 20));
+        assert!(
+            c.cwnd() > cwnd_before,
+            "matched-percentile ratio at steady state must drive growth, got {} → {}",
+            cwnd_before,
+            c.cwnd(),
+        );
     }
 
     #[test]
-    fn shrinks_cwnd_when_latency_exceeds_beta() {
+    fn shrinks_cwnd_when_short_window_distribution_shifts_up() {
+        // Long window contains a mix of historical fast (2ms) and recent
+        // slow (10ms) samples; short window holds only the slow recent
+        // samples. The matched percentile in the short window is much
+        // higher, ratio > beta, so cwnd shrinks.
         let mut c = VegasController::new(VegasConfig {
             initial_cwnd: 50,
             decrease_step: 2,
             beta: 1.5,
+            short_window: std::time::Duration::from_millis(500),
+            long_window: std::time::Duration::from_secs(10),
             ..VegasConfig::default()
         });
-        let start = std::time::Instant::now();
-        // first sample establishes the baseline at 2ms
-        c.on_sample(&sample(start, std::time::Duration::from_millis(2)));
-        c.on_tick(start);
-        // subsequent samples at 10ms are 5× baseline — well above beta
-        for _ in 0..5 {
-            c.on_sample(&sample(start, std::time::Duration::from_millis(10)));
-            c.on_tick(start);
+        let t0 = std::time::Instant::now();
+        // Phase 1: fast historical samples spread over 5 seconds.
+        for i in 0..500 {
+            let observed_at = t0 + std::time::Duration::from_millis(i * 10);
+            c.on_sample(&sample(observed_at, std::time::Duration::from_millis(2)));
         }
-        assert!(c.cwnd() < 50, "expected shrink, got {}", c.cwnd());
+        // Phase 2: a burst of slow samples in the last 200ms.
+        let burst_start = t0 + std::time::Duration::from_millis(5_000);
+        for i in 0..100 {
+            let observed_at = burst_start + std::time::Duration::from_millis(i * 2);
+            c.on_sample(&sample(observed_at, std::time::Duration::from_millis(10)));
+        }
+        let cwnd_before = c.cwnd();
+        c.on_tick(burst_start + std::time::Duration::from_millis(200));
+        assert!(
+            c.cwnd() < cwnd_before,
+            "expected shrink under burst at p50 ratio > beta, got {} → {}",
+            cwnd_before,
+            c.cwnd(),
+        );
     }
 
     #[test]
@@ -394,21 +505,32 @@ mod tests {
             initial_cwnd: 10,
             alpha: 1.1,
             beta: 1.5,
-            ewma_alpha: 1.0,
+            short_window: std::time::Duration::from_millis(500),
+            long_window: std::time::Duration::from_secs(5),
             ..VegasConfig::default()
         });
-        let start = std::time::Instant::now();
-        // the first tick always sees ratio=1.0 (baseline == mean) and grows,
-        // so snapshot cwnd after baseline is established
-        c.on_sample(&sample(start, std::time::Duration::from_millis(2)));
-        c.on_tick(start);
-        let cwnd_after_baseline = c.cwnd();
-        // subsequent ticks at 1.3× baseline sit between alpha and beta, so hold
-        for _ in 0..5 {
-            c.on_sample(&sample(start, std::time::Duration::from_micros(2600)));
-            c.on_tick(start);
+        let t0 = std::time::Instant::now();
+        // 4500ms of historical samples at 2ms.
+        for i in 0..450 {
+            let observed_at = t0 + std::time::Duration::from_millis(i * 10);
+            c.on_sample(&sample(observed_at, std::time::Duration::from_millis(2)));
         }
-        assert_eq!(c.cwnd(), cwnd_after_baseline);
+        // 500ms of samples at 2.6ms — ratio = 2.6 / 2.0 = 1.3, between alpha and beta.
+        let burst_start = t0 + std::time::Duration::from_millis(4_500);
+        for i in 0..50 {
+            let observed_at = burst_start + std::time::Duration::from_millis(i * 10);
+            c.on_sample(&sample(
+                observed_at,
+                std::time::Duration::from_micros(2_600),
+            ));
+        }
+        let cwnd_before = c.cwnd();
+        c.on_tick(burst_start + std::time::Duration::from_millis(500));
+        assert_eq!(
+            c.cwnd(),
+            cwnd_before,
+            "ratio in [alpha, beta] must hold cwnd",
+        );
     }
 
     #[test]
@@ -418,147 +540,112 @@ mod tests {
             min_cwnd: 2,
             decrease_step: 10,
             beta: 1.1,
+            short_window: std::time::Duration::from_millis(200),
+            long_window: std::time::Duration::from_millis(2_000),
             ..VegasConfig::default()
         });
-        let start = std::time::Instant::now();
-        c.on_sample(&sample(start, std::time::Duration::from_millis(2)));
-        c.on_tick(start);
-        c.on_sample(&sample(start, std::time::Duration::from_millis(20)));
-        c.on_tick(start);
+        let t0 = std::time::Instant::now();
+        // Establish a fast baseline.
+        for i in 0..100 {
+            let observed_at = t0 + std::time::Duration::from_millis(i * 10);
+            c.on_sample(&sample(observed_at, std::time::Duration::from_millis(2)));
+        }
+        c.on_tick(t0 + std::time::Duration::from_millis(1_000));
+        // Then a burst of slow samples — ratio rockets, but cwnd cannot
+        // drop below the floor.
+        let burst_start = t0 + std::time::Duration::from_millis(1_900);
+        for i in 0..20 {
+            let observed_at = burst_start + std::time::Duration::from_millis(i * 5);
+            c.on_sample(&sample(observed_at, std::time::Duration::from_millis(50)));
+        }
+        c.on_tick(burst_start + std::time::Duration::from_millis(200));
         assert_eq!(c.cwnd(), 2);
     }
 
     #[test]
-    fn first_sample_tick_does_not_adjust_cwnd() {
-        // with baseline == mean by construction, the naive ratio
-        // calculation returns 1.0 on the first sample-bearing tick and
-        // would always grow cwnd. The controller must skip the
-        // adjustment on this tick to avoid a baseline-inflation bias.
+    fn cwnd_respects_max_ceiling() {
         let mut c = VegasController::new(VegasConfig {
-            initial_cwnd: 5,
+            initial_cwnd: 4,
+            max_cwnd: 6,
+            increase_step: 10,
+            short_window: std::time::Duration::from_millis(200),
+            long_window: std::time::Duration::from_secs(2),
             ..VegasConfig::default()
         });
-        let start = std::time::Instant::now();
-        c.on_sample(&sample(start, std::time::Duration::from_millis(2)));
-        assert_eq!(c.on_tick(start).max_in_flight, Some(5));
+        let t0 = std::time::Instant::now();
+        for i in 0..200 {
+            let observed_at = t0 + std::time::Duration::from_millis(i * 10);
+            c.on_sample(&sample(observed_at, std::time::Duration::from_millis(2)));
+        }
+        c.on_tick(t0 + std::time::Duration::from_millis(2_000));
+        assert_eq!(c.cwnd(), 6);
     }
 
     #[test]
     fn baseline_window_ages_out_and_is_re_established() {
         let mut c = VegasController::new(VegasConfig {
             initial_cwnd: 10,
-            min_latency_max_age: std::time::Duration::from_millis(100),
+            long_window: std::time::Duration::from_millis(100),
+            short_window: std::time::Duration::from_millis(50),
             ..VegasConfig::default()
         });
         let t0 = std::time::Instant::now();
         c.on_sample(&sample(t0, std::time::Duration::from_micros(500)));
-        // a tick before the age expires preserves the window contents
+        // Tick before age-out preserves the window.
         c.on_tick(t0 + std::time::Duration::from_millis(50));
         assert_eq!(c.samples.len(), 1);
-        assert_eq!(c.min_latency(), Some(std::time::Duration::from_micros(500)));
-        // after the max age, on_tick discards the stale window
+        assert_eq!(
+            c.baseline_latency(),
+            Some(std::time::Duration::from_micros(500)),
+        );
+        // Tick after the long_window has elapsed evicts the stale window.
         c.on_tick(t0 + std::time::Duration::from_millis(200));
         assert!(c.samples.is_empty(), "stale samples must be evicted");
-        assert_eq!(c.min_latency(), None);
-        // a fresh, much larger sample becomes the new baseline
+        assert_eq!(c.baseline_latency(), None);
+        assert_eq!(c.current_latency(), None);
+        // A fresh sample re-establishes the baseline.
         let t_new = t0 + std::time::Duration::from_millis(201);
         c.on_sample(&sample(t_new, std::time::Duration::from_millis(3)));
         c.on_tick(t_new);
-        assert_eq!(c.min_latency(), Some(std::time::Duration::from_millis(3)));
+        assert_eq!(
+            c.baseline_latency(),
+            Some(std::time::Duration::from_millis(3)),
+        );
     }
 
     #[test]
-    fn baseline_age_out_under_persistent_congestion_does_not_trigger_growth() {
-        // sustained congestion: window populated with samples whose mean
-        // is well above the baseline. when the window ages out and the
-        // EWMA is reset alongside, the very next sample-bearing tick is
-        // a first-sample-tick — the controller must not interpret the
-        // freshly-reset state as headroom and grow `cwnd`. the original
-        // strict-min controller had the same invariant; the percentile
-        // version preserves it via the empty-deque EWMA reset.
+    fn empty_short_window_holds_cwnd_without_resetting_baseline() {
+        // If a tick arrives with no recent samples — but older samples are
+        // still inside the long window — the baseline is still valid;
+        // we just have nothing fresh to compare against. The controller
+        // must hold cwnd rather than fabricating a comparison.
         let mut c = VegasController::new(VegasConfig {
-            initial_cwnd: 30,
-            min_latency_max_age: std::time::Duration::from_millis(100),
-            // no smoothing, so ewma = mean each tick — makes the scenario
-            // crisp to reason about.
-            ewma_alpha: 1.0,
+            initial_cwnd: 10,
+            long_window: std::time::Duration::from_secs(10),
+            short_window: std::time::Duration::from_millis(500),
             ..VegasConfig::default()
         });
         let t0 = std::time::Instant::now();
-        // phase 1: establish a low baseline at 2ms
         c.on_sample(&sample(t0, std::time::Duration::from_millis(2)));
-        c.on_tick(t0);
-        // phase 2: sustained congestion at 8ms — 4× baseline, > beta=2.5
-        let cwnd_before_congestion = c.cwnd();
-        for i in 1..=5 {
-            let now = t0 + std::time::Duration::from_millis(10 * i);
-            c.on_sample(&sample(now, std::time::Duration::from_millis(8)));
-            c.on_tick(now);
-        }
-        assert!(
-            c.cwnd() < cwnd_before_congestion,
-            "expected shrink under congestion, got {} (from {})",
-            c.cwnd(),
-            cwnd_before_congestion,
-        );
-        let cwnd_during_congestion = c.cwnd();
-        // phase 3: a tick after the window's max-age elapses with no
-        // new sample drives the age-out path: every entry in the deque
-        // is older than the cutoff, the deque is emptied, and the EWMA
-        // is reset. cwnd is unchanged at this tick because there are no
-        // new samples to act on.
-        let t_expired = t0 + std::time::Duration::from_millis(200);
-        c.on_tick(t_expired);
-        assert!(c.samples.is_empty(), "stale samples must be evicted");
+        // Tick well past the short window but inside the long window.
+        c.on_tick(t0 + std::time::Duration::from_secs(2));
+        assert_eq!(c.cwnd(), 10, "cwnd must hold when short window is empty");
         assert_eq!(
-            c.ewma_latency(),
-            None,
-            "EWMA must reset when window empties"
+            c.baseline_latency(),
+            Some(std::time::Duration::from_millis(2)),
+            "baseline still derived from long-horizon samples",
         );
-        assert_eq!(c.cwnd(), cwnd_during_congestion);
-        // phase 4: a new sample arrives — congestion persists. because
-        // the EWMA was reset, this is a first-sample-tick: ratio is 1.0
-        // by construction and the controller must not adjust cwnd.
-        let t_next = t_expired + std::time::Duration::from_millis(1);
-        c.on_sample(&sample(t_next, std::time::Duration::from_millis(8)));
-        c.on_tick(t_next);
-        assert_eq!(
-            c.cwnd(),
-            cwnd_during_congestion,
-            "cwnd must not grow on the first sample-bearing tick after window age-out",
-        );
-    }
-
-    #[test]
-    fn empty_ticks_between_samples_preserve_ewma() {
-        // if a tick arrives with no new samples, the controller must hold
-        // its current EWMA and cwnd rather than reset either — otherwise a
-        // brief workload pause would discard hard-won state.
-        let mut c = VegasController::new(VegasConfig {
-            initial_cwnd: 10,
-            ewma_alpha: 1.0,
-            ..VegasConfig::default()
-        });
-        let start = std::time::Instant::now();
-        c.on_sample(&sample(start, std::time::Duration::from_millis(2)));
-        c.on_tick(start);
-        let baseline_ewma = c.ewma_latency();
-        // several empty ticks within the age-out window
-        for i in 0..5 {
-            c.on_tick(start + std::time::Duration::from_millis(i * 10));
-        }
-        assert_eq!(c.ewma_latency(), baseline_ewma);
-        assert_eq!(c.cwnd(), 10);
+        assert_eq!(c.current_latency(), None);
     }
 
     #[test]
     fn zero_latency_samples_do_not_collapse_cwnd() {
         // Regression: a 0-duration sample (possible when Instant::now()
         // resolution groups back-to-back probes) previously set
-        // baseline=0, making the ewma/baseline ratio divide by zero or
-        // turn into NaN — and either way not drive a principled cwnd
-        // decision. `on_sample` now clamps latency to >= 1ns, so the
-        // ratio stays finite and cwnd follows the normal trajectory.
+        // baseline=0, making the ratio divide by zero or turn into NaN
+        // — and either way not drive a principled cwnd decision.
+        // `on_sample` clamps latency to >= 1ns, so the ratio stays
+        // finite and cwnd follows the normal trajectory.
         let mut c = VegasController::new(VegasConfig {
             initial_cwnd: 10,
             min_cwnd: 1,
@@ -566,7 +653,6 @@ mod tests {
             ..VegasConfig::default()
         });
         let start = std::time::Instant::now();
-        // feed many zero-duration samples across multiple ticks.
         for i in 0..10 {
             let zero_sample = Sample {
                 started_at: start,
@@ -577,9 +663,6 @@ mod tests {
             c.on_sample(&zero_sample);
             c.on_tick(start + std::time::Duration::from_millis(i * 10));
         }
-        // The exact trajectory depends on the clamped ratio behavior;
-        // the invariant we care about is that cwnd stays within the
-        // configured bounds (did not collapse to 0 or diverge).
         assert!(
             c.cwnd() >= 1 && c.cwnd() <= 100,
             "cwnd {} out of configured bounds under 0-latency samples",
@@ -589,15 +672,12 @@ mod tests {
 
     #[test]
     fn sample_window_is_capped_to_prevent_unbounded_growth() {
-        // push far more samples than the cap; len must stay at the cap on
+        // Push far more samples than the cap; len must stay at the cap on
         // every observation, and the underlying allocation must not grow
-        // past its post-construction capacity — `VecDeque::push_back`
-        // reallocates if the buffer is at capacity, and `VecDeque` never
-        // shrinks, so a post-push pop pattern would leak the allocation
-        // even though `len` is brought back down immediately. Pinning to
-        // the initial capacity (rather than a looser `<= 2× cap` bound)
-        // catches that regression: at the cap a post-push push_back would
-        // round up to the next power of two, doubling capacity.
+        // past its post-construction capacity. Pinning to the initial
+        // capacity (rather than a looser `<= 2× cap` bound) catches the
+        // post-push pop regression: at the cap a post-push push_back
+        // would round up to the next power of two, doubling capacity.
         let mut c = VegasController::new(VegasConfig::default());
         let initial_capacity = c.samples.capacity();
         let start = std::time::Instant::now();
@@ -627,24 +707,16 @@ mod tests {
     fn age_out_evicts_old_samples_regardless_of_deque_order() {
         // Samples arrive in mpsc-receive order, not sorted by
         // `completed_at`: under concurrent producers a sample with an
-        // older completion time can land in the deque *after* a newer
-        // one. The age-out path must still evict every stale entry —
-        // not just a contiguous prefix at the front — and the empty-
-        // deque-after-age-out path (EWMA reset, first-sample-tick
-        // semantics) must still fire.
+        // older completion time can land in the deque after a newer one.
+        // The age-out path must still evict every stale entry — not just
+        // a contiguous prefix at the front.
         let mut c = VegasController::new(VegasConfig {
             initial_cwnd: 10,
-            min_latency_max_age: std::time::Duration::from_millis(100),
-            ewma_alpha: 1.0,
+            long_window: std::time::Duration::from_millis(100),
+            short_window: std::time::Duration::from_millis(50),
             ..VegasConfig::default()
         });
         let t0 = std::time::Instant::now();
-        // Push samples in *interleaved* order: [newer, old, newer, old, ...].
-        // The "newer" entries sit at the front of the deque and the "old"
-        // entries sit immediately behind them. A `pop_front while front
-        // is old` loop would inspect the front (newer, not stale at the
-        // first tick), break, and leave every buried "old" entry behind.
-        // `retain` correctly drops the old ones from arbitrary positions.
         let old_offset = std::time::Duration::from_millis(10);
         let newer_offset = std::time::Duration::from_millis(80);
         for i in 0..10 {
@@ -652,12 +724,9 @@ mod tests {
             c.on_sample(&sample(t0 + offset, std::time::Duration::from_millis(1)));
         }
         assert_eq!(c.samples.len(), 10);
-        // First tick at t0 + 130ms, max_age = 100ms → cutoff = t0 + 30ms.
-        //   - "newer" entries: observed_at ≈ t0 + 81ms (>= cutoff) → retain
-        //   - "old"   entries: observed_at ≈ t0 + 11ms (<  cutoff) → evict
-        // The buggy front-only loop sees a non-stale front and breaks
-        // immediately, leaving all 10. `retain` evicts exactly the 5 old
-        // ones.
+        // Tick at t0 + 130ms with long_window = 100ms → cutoff = t0 + 30ms.
+        // 5 newer entries (~t0+81ms) are retained; 5 old entries (~t0+11ms)
+        // are evicted.
         let t_first = t0 + std::time::Duration::from_millis(130);
         c.on_tick(t_first);
         assert_eq!(
@@ -669,37 +738,86 @@ mod tests {
         for &(_, observed_at) in &c.samples {
             assert!(observed_at >= cutoff);
         }
-        // EWMA was established by the first tick (5 retained samples
-        // produced a non-empty window). Now tick well past every
-        // observed_at — every remaining entry ages out, the deque
-        // empties, and the EWMA must reset alongside it so the next
-        // sample-bearing tick re-runs first-sample-tick semantics.
-        assert!(c.ewma_latency().is_some());
+        // Ticking past every retained sample empties the deque entirely;
+        // both summary statistics reset to None.
         let t_all_expired = t0 + std::time::Duration::from_millis(300);
         c.on_tick(t_all_expired);
         assert!(c.samples.is_empty(), "every stale sample must age out");
-        assert_eq!(
-            c.ewma_latency(),
-            None,
-            "EWMA must reset when age-out empties the window",
-        );
-        assert_eq!(c.min_latency(), None);
+        assert_eq!(c.baseline_latency(), None);
+        assert_eq!(c.current_latency(), None);
     }
 
     #[test]
-    fn cwnd_respects_max_ceiling() {
+    fn cwnd_does_not_drift_on_ticks_without_fresh_samples() {
+        // Regression: with short_window = 1s and tick = 50ms, a single
+        // sample is visible to ~20 consecutive ticks. Each tick was
+        // re-applying the same matched-percentile decision and adjusting
+        // cwnd, so one sample in the right phase drove cwnd by ~20
+        // steps even though no new operation completed. Only ticks
+        // that consumed a new sample may adjust cwnd.
         let mut c = VegasController::new(VegasConfig {
-            initial_cwnd: 4,
-            max_cwnd: 6,
-            increase_step: 10,
-            alpha: 1.5,
+            initial_cwnd: 10,
+            increase_step: 1,
+            short_window: std::time::Duration::from_secs(1),
+            long_window: std::time::Duration::from_secs(10),
             ..VegasConfig::default()
         });
-        let start = std::time::Instant::now();
-        for _ in 0..10 {
-            c.on_sample(&sample(start, std::time::Duration::from_millis(2)));
-            c.on_tick(start);
+        let t0 = std::time::Instant::now();
+        // Single sample. Both baseline and current percentiles agree
+        // on this value, so ratio = 1.0 — under alpha, normally a
+        // grow signal.
+        c.on_sample(&sample(t0, std::time::Duration::from_millis(2)));
+        // First sample-bearing tick may grow once.
+        c.on_tick(t0 + std::time::Duration::from_millis(50));
+        let cwnd_after_first_tick = c.cwnd();
+        // Subsequent ticks within the short window arrive without any
+        // new sample. Each one would previously have re-grown cwnd by
+        // increase_step.
+        for i in 2..=20 {
+            c.on_tick(t0 + std::time::Duration::from_millis(50 * i));
         }
-        assert_eq!(c.cwnd(), 6);
+        assert_eq!(
+            c.cwnd(),
+            cwnd_after_first_tick,
+            "cwnd must not drift on ticks that consumed no new samples",
+        );
+    }
+
+    #[test]
+    fn snapshot_published_on_every_tick_with_samples() {
+        // Empty short window holds cwnd but baseline is still reported
+        // so the progress bar can show the live long-horizon estimate.
+        // Once the short-window subset is non-empty, the snapshot must
+        // include the current percentile too — even if no fresh sample
+        // arrived since the last tick (in which case cwnd holds, but
+        // the current value is still observable in the snapshot).
+        let mut c = VegasController::new(VegasConfig {
+            initial_cwnd: 5,
+            short_window: std::time::Duration::from_secs(1),
+            long_window: std::time::Duration::from_secs(10),
+            ..VegasConfig::default()
+        });
+        let t0 = std::time::Instant::now();
+        c.on_sample(&sample(t0, std::time::Duration::from_millis(3)));
+        // First tick consumes the fresh sample.
+        c.on_tick(t0 + std::time::Duration::from_millis(50));
+        assert!(c.baseline_latency().is_some());
+        assert!(c.current_latency().is_some());
+        // A later tick (still within the short window) sees no new
+        // sample, but the snapshot fields stay populated.
+        c.on_tick(t0 + std::time::Duration::from_millis(500));
+        assert!(c.baseline_latency().is_some());
+        assert!(c.current_latency().is_some());
+    }
+
+    #[test]
+    fn snapshot_reports_total_samples_seen() {
+        let mut c = VegasController::new(VegasConfig::default());
+        assert_eq!(c.snapshot().samples_seen, 0);
+        let start = std::time::Instant::now();
+        for _ in 0..7 {
+            c.on_sample(&sample(start, std::time::Duration::from_millis(2)));
+        }
+        assert_eq!(c.snapshot().samples_seen, 7);
     }
 }

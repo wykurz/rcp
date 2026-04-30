@@ -101,6 +101,7 @@ pub async fn write_file(
     // would consume two tokens per file and halve the effective rate.
     let mut file = crate::walk::run_metadata_probed_no_rate(
         congestion::Side::Destination,
+        congestion::MetadataOp::OpenCreate,
         tokio::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -167,6 +168,7 @@ pub async fn filegen(
             // loop as copy/rm/link.
             crate::walk::run_metadata_probed(
                 congestion::Side::Destination,
+                congestion::MetadataOp::MkDir,
                 tokio::fs::create_dir(&path),
             )
             .await

@@ -279,6 +279,7 @@ impl DirectoryTracker {
             // try to remove if empty (best effort - may fail if not empty due to races)
             match common::walk::run_metadata_probed(
                 common::Side::Destination,
+                common::MetadataOp::RmDir,
                 tokio::fs::remove_dir(dst),
             )
             .await

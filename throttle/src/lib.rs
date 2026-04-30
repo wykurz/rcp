@@ -150,20 +150,90 @@
 
 mod semaphore;
 
+/// Which filesystem side a metadata syscall touches.
+///
+/// Mirrors the congestion crate's `Side`; this enum is intentionally
+/// independent so `throttle` has no dependency on `congestion`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Side {
+    Source = 0,
+    Destination = 1,
+}
+
+/// Which metadata syscall a permit / cap belongs to.
+///
+/// Mirrors `congestion::MetadataOp` variant-for-variant. Each crate
+/// indexes its own flat array using its own enum, so the per-crate
+/// discriminants drive routing inside that crate; the cross-crate
+/// translation goes through name-based bridge functions in
+/// `common::walk`. Adding a variant here without a matching one in
+/// `congestion` (or vice versa) is caught at compile time by the
+/// exhaustive matches in those bridges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum MetadataOp {
+    Stat = 0,
+    ReadLink = 1,
+    MkDir = 2,
+    RmDir = 3,
+    Unlink = 4,
+    HardLink = 5,
+    Symlink = 6,
+    Chmod = 7,
+    OpenCreate = 8,
+}
+
+/// Number of [`MetadataOp`] variants. Keep in sync when adding variants.
+pub const N_META_OPS: usize = 9;
+/// Number of [`Side`] variants.
+pub const N_SIDES: usize = 2;
+/// Total number of distinct (Side, MetadataOp) controllers.
+pub const N_META_RESOURCES: usize = N_META_OPS * N_SIDES;
+
+impl MetadataOp {
+    /// All op variants, in discriminant order.
+    pub const ALL: [Self; N_META_OPS] = [
+        Self::Stat,
+        Self::ReadLink,
+        Self::MkDir,
+        Self::RmDir,
+        Self::Unlink,
+        Self::HardLink,
+        Self::Symlink,
+        Self::Chmod,
+        Self::OpenCreate,
+    ];
+}
+
+impl Side {
+    /// All side variants, in discriminant order.
+    pub const ALL: [Self; N_SIDES] = [Self::Source, Self::Destination];
+}
+
 /// Which throttled metadata resource a permit / cap belongs to.
 ///
-/// One variant per filesystem side (source vs destination); each gets its
-/// own concurrency cap so a saturated source doesn't drag the destination
-/// down or vice versa. Mirrors the congestion crate's `ResourceKind` for
-/// metadata kinds; this enum is intentionally independent so `throttle`
-/// has no dependency on `congestion`.
+/// Each `(Side, MetadataOp)` pair gets its own independent concurrency
+/// cap so the controller for one syscall on one filesystem can adjust
+/// without dragging others along — for example, `(Source, Stat)` and
+/// `(Destination, Unlink)` are completely independent enforcement gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Resource {
-    /// Source-side per-file metadata syscall (`stat`, `read_link`, `open`).
-    SrcMeta,
-    /// Destination-side per-file metadata syscall — both lookups and
-    /// mutations (`create_dir`, `hard_link`, `unlink`, `chmod`, …).
-    DstMeta,
+pub struct Resource {
+    pub side: Side,
+    pub op: MetadataOp,
+}
+
+impl Resource {
+    /// Construct a metadata resource for the given side + op.
+    pub const fn meta(side: Side, op: MetadataOp) -> Self {
+        Self { side, op }
+    }
+    /// Map the resource to its slot in the per-resource semaphore array.
+    /// Side is the major axis, op the minor — matches the corresponding
+    /// fan-out layout in `congestion::RoutingSink`.
+    fn index(self) -> usize {
+        (self.side as usize) * N_META_OPS + (self.op as usize)
+    }
 }
 
 static OPEN_FILES_LIMIT: std::sync::LazyLock<semaphore::Semaphore> =
@@ -181,19 +251,19 @@ static OPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
 static IOPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
-// Per-op concurrency caps driven by the congestion controller. One
-// semaphore per [`Resource`] so each side is throttled independently.
-// Distinct from OPS_THROTTLE (rate) and OPEN_FILES_LIMIT (FDs).
-static OPS_IN_FLIGHT_LIMIT_SRC_META: std::sync::LazyLock<semaphore::Semaphore> =
-    std::sync::LazyLock::new(semaphore::Semaphore::new);
-static OPS_IN_FLIGHT_LIMIT_DST_META: std::sync::LazyLock<semaphore::Semaphore> =
-    std::sync::LazyLock::new(semaphore::Semaphore::new);
+// Per-(Side, MetadataOp) concurrency caps driven by the congestion
+// controller. One semaphore per [`Resource`] so each syscall on each
+// side is throttled independently. Distinct from OPS_THROTTLE (rate)
+// and OPEN_FILES_LIMIT (FDs).
+//
+// `[const { ... }; N]` initializes each slot independently — without
+// the inline-const block the array repeat syntax would require `Copy`,
+// which `LazyLock` is not.
+static OPS_IN_FLIGHT_LIMITS: [std::sync::LazyLock<semaphore::Semaphore>; N_META_RESOURCES] =
+    [const { std::sync::LazyLock::new(semaphore::Semaphore::new) }; N_META_RESOURCES];
 
 fn ops_in_flight_limit(resource: Resource) -> &'static semaphore::Semaphore {
-    match resource {
-        Resource::SrcMeta => &OPS_IN_FLIGHT_LIMIT_SRC_META,
-        Resource::DstMeta => &OPS_IN_FLIGHT_LIMIT_DST_META,
-    }
+    &OPS_IN_FLIGHT_LIMITS[resource.index()]
 }
 
 /// Configure the spawn-time concurrency caps from a single knob.

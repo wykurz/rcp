@@ -249,9 +249,10 @@ actually observes.
 
 **Tuning knobs** (all listed under `--help-all` on each binary): the
 initial / minimum / maximum `cwnd`, the grow/shrink ratio thresholds
-(`alpha`, `beta`), the EWMA smoothing factor, per-tick step sizes, the
-baseline-age-out interval, and the control-loop tick cadence. Defaults
-are conservative and a good starting point.
+(`alpha`, `beta`), the percentile used to summarize each window, the
+long / short window durations, per-tick step sizes, and the
+control-loop tick cadence. Defaults are conservative and a good
+starting point.
 
 For the design rationale (why concurrency is the lever, what
 `cwnd` is, the exact control law including worked ratio→action

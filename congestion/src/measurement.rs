@@ -21,28 +21,115 @@ use crate::controller::{Outcome, Sample};
 /// (`Source`) from writes/mutations (`Destination`) since those have
 /// different latency profiles even on the same filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum Side {
     /// Reads of the source filesystem — directory walks, source-side stats.
-    Source,
+    Source = 0,
     /// Writes/mutations of the destination filesystem — `create_dir`,
     /// `hard_link`, `unlink`, `open(O_CREAT)`, etc.
-    Destination,
+    Destination = 1,
+}
+
+/// Which metadata syscall is being measured.
+///
+/// Separate ops feed independent controllers because their service-time
+/// distributions differ — `stat` (pure lookup) and `unlink` (mutation
+/// plus parent-directory write) hit different code paths on the
+/// metadata server and converge on very different baselines. Mixing
+/// them in one controller pollutes the per-op latency signal and makes
+/// the matched-percentile baseline drift with operation-mix changes
+/// that have nothing to do with congestion.
+///
+/// The variants are ordered so they index a fixed-size array when paired
+/// with a [`Side`]; see [`N_META_OPS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum MetadataOp {
+    /// `stat` / `lstat` / `symlink_metadata`. Also covers
+    /// `canonicalize` and read-only `File::open` — both are dominated
+    /// by lookup work on the metadata path.
+    Stat = 0,
+    /// `readlink`. Distinct from `Stat` because it pulls the symlink's
+    /// target body, not just the inode header.
+    ReadLink = 1,
+    /// `mkdir` / `create_dir`. Allocates a directory inode and wires
+    /// it into the parent.
+    MkDir = 2,
+    /// `rmdir` / `remove_dir`. Verifies emptiness then removes the dir.
+    RmDir = 3,
+    /// `unlink` / `remove_file`. Decrements link count, frees inode at
+    /// zero.
+    Unlink = 4,
+    /// `link` / `hard_link`. Bumps an existing inode's link count.
+    HardLink = 5,
+    /// `symlink` (creation). Allocates an inode whose body is the
+    /// target path.
+    Symlink = 6,
+    /// Permission / ownership / timestamp updates: `chmod` /
+    /// `set_permissions`, `chown` / `fchownat`, `utimes` / `utimensat`.
+    /// Bucketed together because they're all single inode writes.
+    Chmod = 7,
+    /// `open(O_CREAT)` / `File::create`. Allocates a regular-file
+    /// inode and wires it into the parent.
+    OpenCreate = 8,
+}
+
+/// Number of [`MetadataOp`] variants. Keep in sync when adding variants.
+pub const N_META_OPS: usize = 9;
+
+/// Number of [`Side`] variants.
+pub const N_SIDES: usize = 2;
+
+/// Number of distinct (Side, MetadataOp) controllers.
+pub const N_META_RESOURCES: usize = N_META_OPS * N_SIDES;
+
+impl MetadataOp {
+    /// Short identifier suitable for the progress-bar label and tracing
+    /// `unit` field. Kept as kebab-case so it composes cleanly with side
+    /// prefixes (`src-stat`, `dst-mkdir`, etc.).
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Stat => "stat",
+            Self::ReadLink => "read-link",
+            Self::MkDir => "mkdir",
+            Self::RmDir => "rmdir",
+            Self::Unlink => "unlink",
+            Self::HardLink => "hard-link",
+            Self::Symlink => "symlink",
+            Self::Chmod => "chmod",
+            Self::OpenCreate => "open-create",
+        }
+    }
+    /// All op variants, in discriminant order. Useful when wiring up a
+    /// controller for every op kind without having to spell out each.
+    pub const ALL: [Self; N_META_OPS] = [
+        Self::Stat,
+        Self::ReadLink,
+        Self::MkDir,
+        Self::RmDir,
+        Self::Unlink,
+        Self::HardLink,
+        Self::Symlink,
+        Self::Chmod,
+        Self::OpenCreate,
+    ];
+}
+
+impl Side {
+    /// All side variants, in discriminant order.
+    pub const ALL: [Self; N_SIDES] = [Self::Source, Self::Destination];
 }
 
 /// Which resource a probe is measuring.
 ///
 /// Separate kinds feed independent controllers in the control loop.
-/// Metadata kinds are split by [`Side`]: different filesystems typically
-/// have different service-time profiles, so one cap per side prevents a
-/// saturated source from dragging down the destination's `cwnd` and vice
-/// versa.
+/// Metadata kinds are split by [`Side`] (filesystems with different
+/// service-time profiles) and by [`MetadataOp`] (syscalls within a
+/// single filesystem that hit different code paths).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResourceKind {
-    /// Single per-file metadata syscall: `stat`, `symlink_metadata`,
-    /// `mkdir`, `unlink`, `hard_link`, `symlink`, `chmod`,
-    /// `open(O_CREAT)`, `read_link`, etc. Real round-trip work each
-    /// time, lookup or mutation alike.
-    Metadata(Side),
+    /// Single per-file metadata syscall on the given side.
+    Metadata(Side, MetadataOp),
     /// Individual read chunks in a copy pipeline. Reserved for future
     /// data-path controllers; not currently routed to any sink channel.
     DataRead,
@@ -94,10 +181,10 @@ fn emit(kind: ResourceKind, sample: &Sample) {
 /// # Lifecycle
 ///
 /// ```no_run
-/// use congestion::{Probe, Side};
+/// use congestion::{MetadataOp, Probe, Side};
 ///
 /// # async fn example() {
-/// let probe = Probe::start_metadata(Side::Source);
+/// let probe = Probe::start_metadata(Side::Source, MetadataOp::Stat);
 /// // ... perform the syscall or operation ...
 /// probe.complete_ok(0);
 /// # }
@@ -120,11 +207,10 @@ impl Probe {
             started_at: std::time::Instant::now(),
         }
     }
-    /// Shorthand for `Probe::start(ResourceKind::Metadata(side))`. Use
-    /// this to bracket a single per-file metadata syscall (lookup or
-    /// mutation).
-    pub fn start_metadata(side: Side) -> Self {
-        Self::start(ResourceKind::Metadata(side))
+    /// Shorthand for `Probe::start(ResourceKind::Metadata(side, op))`.
+    /// Use this to bracket a single per-file metadata syscall.
+    pub fn start_metadata(side: Side, op: MetadataOp) -> Self {
+        Self::start(ResourceKind::Metadata(side, op))
     }
     /// Shorthand for `Probe::start(ResourceKind::DataRead)`.
     pub fn start_read() -> Self {
@@ -176,7 +262,7 @@ mod tests {
     fn probe_without_sink_is_a_no_op() {
         let _guard = SINK_GUARD.blocking_lock();
         clear_sample_sink();
-        let probe = Probe::start_metadata(Side::Source);
+        let probe = Probe::start_metadata(Side::Source, MetadataOp::Stat);
         probe.complete_ok(0);
     }
 
@@ -185,8 +271,8 @@ mod tests {
         let _guard = SINK_GUARD.blocking_lock();
         let sink = std::sync::Arc::new(CollectingSink::new());
         install_sample_sink(sink.clone());
-        Probe::start_metadata(Side::Source).complete_ok(0);
-        Probe::start_metadata(Side::Source).complete_ok(0);
+        Probe::start_metadata(Side::Source, MetadataOp::Stat).complete_ok(0);
+        Probe::start_metadata(Side::Source, MetadataOp::Stat).complete_ok(0);
         assert_eq!(sink.metadata_count(), 2);
         clear_sample_sink();
     }
@@ -196,7 +282,7 @@ mod tests {
         let _guard = SINK_GUARD.blocking_lock();
         let sink = std::sync::Arc::new(CollectingSink::new());
         install_sample_sink(sink.clone());
-        Probe::start_metadata(Side::Source).complete_ok(0);
+        Probe::start_metadata(Side::Source, MetadataOp::Stat).complete_ok(0);
         Probe::start_read().complete_ok(4096);
         Probe::start_write().complete_ok(8192);
         assert_eq!(sink.metadata_count(), 1);
@@ -210,7 +296,7 @@ mod tests {
         let _guard = SINK_GUARD.blocking_lock();
         let sink = std::sync::Arc::new(CollectingSink::new());
         install_sample_sink(sink.clone());
-        let probe = Probe::start_metadata(Side::Source);
+        let probe = Probe::start_metadata(Side::Source, MetadataOp::Stat);
         std::thread::sleep(std::time::Duration::from_millis(5));
         probe.complete_ok(0);
         let samples = sink.metadata_samples();
@@ -224,7 +310,7 @@ mod tests {
         let _guard = SINK_GUARD.blocking_lock();
         let sink = std::sync::Arc::new(CollectingSink::new());
         install_sample_sink(sink.clone());
-        Probe::start_metadata(Side::Source).discard();
+        Probe::start_metadata(Side::Source, MetadataOp::Stat).discard();
         assert_eq!(sink.metadata_count(), 0);
         clear_sample_sink();
     }
@@ -238,7 +324,7 @@ mod tests {
         let sink = std::sync::Arc::new(CollectingSink::new());
         install_sample_sink(sink.clone());
         {
-            let _probe = Probe::start_metadata(Side::Source);
+            let _probe = Probe::start_metadata(Side::Source, MetadataOp::Stat);
             // _probe falls out of scope here without complete or discard
         }
         assert_eq!(sink.metadata_count(), 0);
@@ -250,11 +336,11 @@ mod tests {
         let _guard = SINK_GUARD.blocking_lock();
         let first = std::sync::Arc::new(CollectingSink::new());
         install_sample_sink(first.clone());
-        Probe::start_metadata(Side::Source).complete_ok(0);
+        Probe::start_metadata(Side::Source, MetadataOp::Stat).complete_ok(0);
         let second = std::sync::Arc::new(CollectingSink::new());
         install_sample_sink(second.clone());
-        Probe::start_metadata(Side::Source).complete_ok(0);
-        Probe::start_metadata(Side::Source).complete_ok(0);
+        Probe::start_metadata(Side::Source, MetadataOp::Stat).complete_ok(0);
+        Probe::start_metadata(Side::Source, MetadataOp::Stat).complete_ok(0);
         assert_eq!(first.metadata_count(), 1);
         assert_eq!(second.metadata_count(), 2);
         clear_sample_sink();

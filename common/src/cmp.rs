@@ -384,10 +384,13 @@ async fn expand_missing_tree(
         CompareResult::SrcMissing => congestion::Side::Destination,
         CompareResult::Same | CompareResult::Different => congestion::Side::Source,
     };
-    let metadata =
-        crate::walk::run_metadata_probed(side, tokio::fs::symlink_metadata(existing_path))
-            .await
-            .with_context(|| format!("failed reading metadata from {:?}", &existing_path))?;
+    let metadata = crate::walk::run_metadata_probed(
+        side,
+        congestion::MetadataOp::Stat,
+        tokio::fs::symlink_metadata(existing_path),
+    )
+    .await
+    .with_context(|| format!("failed reading metadata from {:?}", &existing_path))?;
     let existing_obj_type = obj_type(&metadata);
     let mut summary = Summary::default();
     summary.mismatch[existing_obj_type][result] += 1;
@@ -538,6 +541,7 @@ async fn cmp_internal(
     // it is impossible for src not exist other than user passing invalid path (which is an error)
     let src_metadata = crate::walk::run_metadata_probed(
         congestion::Side::Source,
+        congestion::MetadataOp::Stat,
         tokio::fs::symlink_metadata(src),
     )
     .await
@@ -568,6 +572,7 @@ async fn cmp_internal(
     let dst_metadata = {
         let probed = crate::walk::run_metadata_probed(
             congestion::Side::Destination,
+            congestion::MetadataOp::Stat,
             tokio::fs::symlink_metadata(dst),
         )
         .await;
@@ -760,6 +765,7 @@ async fn cmp_internal(
         let dst_path = dst.join(entry_name);
         let dst_entry_metadata = crate::walk::run_metadata_probed(
             congestion::Side::Destination,
+            congestion::MetadataOp::Stat,
             tokio::fs::symlink_metadata(&dst_path),
         )
         .await

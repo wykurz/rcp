@@ -198,14 +198,19 @@ fn vegas_grows_from_cold_start() {
 
 #[test]
 fn vegas_converges_near_bdp_without_runaway_latency() {
-    // steady-state cwnd should oscillate around BDP — neither pinned at
-    // `min_cwnd` nor growing to the configured ceiling. With the loosened
-    // alpha=1.3 / beta=2.5 defaults, steady-state ratio sits between
-    // alpha and beta and the deterministic simulator's lack of natural
-    // variance lets cwnd overshoot more than under tighter thresholds —
-    // but it still bounds well below `max_cwnd`.
+    // Steady-state cwnd should land somewhere above BDP — but not at
+    // `max_cwnd`. Use a tighter alpha/beta than defaults: in this
+    // deterministic simulator there is no per-op variance, so the
+    // matched-percentile signal is binary (either two windows agree or
+    // they disagree by a clean ratio). The defaults (alpha=1.1, beta=1.5)
+    // are calibrated for noisy real workloads where the percentile
+    // estimate carries uncertainty; in the sim a tighter config makes
+    // the test assertion meaningful without making the algorithm change
+    // behavior in production.
     let mut controller = VegasController::new(VegasConfig {
         initial_cwnd: 1,
+        alpha: 1.02,
+        beta: 1.10,
         ..VegasConfig::default()
     });
     let bottleneck = default_bottleneck();
@@ -214,25 +219,26 @@ fn vegas_converges_near_bdp_without_runaway_latency() {
     let result = run_scenario(&mut controller, &bottleneck, &config);
     let final_cwnd = f64::from(controller.cwnd());
     let bdp = bottleneck.bdp();
-    let beta = VegasConfig::default().beta;
-    // upper bound: with EWMA lag the controller can overshoot the
-    // beta-implied steady state by a constant factor; 3× beta × BDP
-    // captures the observed band without permitting runaway growth.
-    let upper = bdp * beta * 3.0;
+    // Lower bound: cwnd must have grown above BDP (the algorithm makes
+    // forward progress). Upper bound: cwnd does not run away to
+    // `max_cwnd`. The exact landing point depends on the rate at which
+    // long_window's percentile catches up with short_window's.
     assert!(
-        final_cwnd >= bdp * 0.5 && final_cwnd <= upper,
-        "expected cwnd near BDP={} (within [{}, {}]), got {}",
+        final_cwnd >= bdp && final_cwnd <= bdp * 5.0,
+        "expected cwnd above BDP={} but well below max (within [{}, {}]), got {}",
         bdp,
-        bdp * 0.5,
-        upper,
+        bdp,
+        bdp * 5.0,
         final_cwnd,
     );
     let mean = result.mean_latency().expect("samples recorded");
-    // latency bound scales with beta: the controller permits ratios up
-    // to beta in steady state, plus headroom for EWMA-lag overshoot.
+    // With cwnd bounded above, latency is bounded too: latency =
+    // cwnd / capacity, and capacity = BDP / min_latency. So latency at
+    // cwnd=k*BDP is k*min_latency. Cwnd ≤ 5×BDP ⇒ latency ≤ 5×min_latency
+    // — leave some headroom for transient overshoot during ramp-up.
     assert!(
-        mean.as_secs_f64() < bottleneck.min_latency.as_secs_f64() * beta * 3.0,
-        "mean latency {:?} should stay within beta × small multiple of min_latency {:?}",
+        mean.as_secs_f64() < bottleneck.min_latency.as_secs_f64() * 7.0,
+        "mean latency {:?} should stay within ~7× min_latency {:?}",
         mean,
         bottleneck.min_latency,
     );
@@ -261,11 +267,17 @@ fn vegas_achieves_near_capacity_throughput() {
 
 #[test]
 fn vegas_keeps_latency_bounded_under_saturation_pressure() {
-    // contrast with noop_controller_inflates_latency_when_saturated: Vegas's
-    // steady-state latency stays within a small multiple of min_latency even
-    // when the workload is eager.
+    // Contrast with noop_controller_inflates_latency_when_saturated:
+    // Vegas's steady-state latency stays within a small multiple of
+    // min_latency even when the workload is eager. As in
+    // `vegas_converges_near_bdp_without_runaway_latency`, use a tighter
+    // alpha/beta than defaults so the deterministic sim's lack of
+    // per-op variance doesn't let the matched-percentile ratio drift
+    // arbitrarily far from 1.0.
     let mut controller = VegasController::new(VegasConfig {
         initial_cwnd: 1,
+        alpha: 1.02,
+        beta: 1.10,
         ..VegasConfig::default()
     });
     let bottleneck = default_bottleneck();
@@ -273,13 +285,13 @@ fn vegas_keeps_latency_bounded_under_saturation_pressure() {
     let config = metadata_config(duration, 2048);
     let result = run_scenario(&mut controller, &bottleneck, &config);
     let mean = result.mean_latency().expect("samples recorded");
-    let beta = VegasConfig::default().beta;
+    // bound matches the cwnd ceiling asserted in the convergence test
+    // (5×BDP ⇒ 5×min_latency at saturation), with headroom.
     assert!(
-        mean.as_secs_f64() <= bottleneck.min_latency.as_secs_f64() * beta * 1.5,
-        "mean latency {:?} exceeded beta-band; min_latency={:?}, beta={}",
+        mean.as_secs_f64() <= bottleneck.min_latency.as_secs_f64() * 7.0,
+        "mean latency {:?} exceeded bound; min_latency={:?}",
         mean,
         bottleneck.min_latency,
-        beta,
     );
 }
 

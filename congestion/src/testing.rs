@@ -102,8 +102,12 @@ impl SampleSink for CollectingSink {
     fn record(&self, kind: ResourceKind, sample: &Sample) {
         let mut inner = self.inner.lock().expect("collecting sink mutex poisoned");
         match kind {
-            ResourceKind::Metadata(Side::Source) => inner.metadata_src.push(*sample),
-            ResourceKind::Metadata(Side::Destination) => inner.metadata_dst.push(*sample),
+            // op kind is intentionally collapsed in CollectingSink: most
+            // tests assert per-side counts, and a per-op accessor would
+            // multiply the surface for little gain. Tests that need per-op
+            // bucketing can use the RoutingSink directly.
+            ResourceKind::Metadata(Side::Source, _) => inner.metadata_src.push(*sample),
+            ResourceKind::Metadata(Side::Destination, _) => inner.metadata_dst.push(*sample),
             ResourceKind::DataRead => inner.read.push(*sample),
             ResourceKind::DataWrite => inner.write.push(*sample),
         }

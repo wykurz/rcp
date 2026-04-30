@@ -122,6 +122,7 @@ pub async fn rm(
         if let Some(name) = path_name {
             let path_metadata = crate::walk::run_metadata_probed(
                 congestion::Side::Source,
+                congestion::MetadataOp::Stat,
                 tokio::fs::symlink_metadata(path),
             )
             .await
@@ -158,6 +159,7 @@ async fn rm_internal(
     tracing::debug!("read path metadata");
     let src_metadata = crate::walk::run_metadata_probed(
         congestion::Side::Source,
+        congestion::MetadataOp::Stat,
         tokio::fs::symlink_metadata(path),
     )
     .await
@@ -235,6 +237,7 @@ async fn rm_internal(
         }
         crate::walk::run_metadata_probed(
             congestion::Side::Destination,
+            congestion::MetadataOp::Unlink,
             tokio::fs::remove_file(path),
         )
         .await
@@ -485,6 +488,7 @@ async fn rm_internal(
     let any_filter_active = settings.filter.is_some() || settings.time_filter.is_some();
     match crate::walk::run_metadata_probed(
         congestion::Side::Destination,
+        congestion::MetadataOp::RmDir,
         tokio::fs::remove_dir(path),
     )
     .await

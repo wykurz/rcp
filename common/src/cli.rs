@@ -98,30 +98,35 @@ pub struct CommonArgs {
         help_heading = "Congestion control"
     )]
     pub auto_meta_max_cwnd: u32,
-    /// Latency inflation ratio below which cwnd grows (ewma / baseline)
+    /// Latency ratio below which cwnd grows (current / baseline).
+    /// Default 1.1: with matched-percentile signal, ratio sits near 1.0
+    /// at steady state, so a tight alpha is the right scale.
     #[arg(
         long,
-        default_value = "1.3",
+        default_value = "1.1",
         value_name = "F",
         help_heading = "Congestion control (advanced)"
     )]
     pub auto_meta_alpha: f64,
-    /// Latency inflation ratio above which cwnd shrinks
+    /// Latency ratio above which cwnd shrinks. Default 1.5.
     #[arg(
         long,
-        default_value = "2.5",
+        default_value = "1.5",
         value_name = "F",
         help_heading = "Congestion control (advanced)"
     )]
     pub auto_meta_beta: f64,
-    /// EWMA smoothing factor in [0.0, 1.0]; higher is more responsive
+    /// Percentile (in `(0.0, 1.0)`) used to summarize each sample window.
+    /// The same percentile is used for both long-horizon (baseline) and
+    /// short-horizon (current) statistics — see `--auto-meta-long-window`
+    /// and `--auto-meta-short-window`.
     #[arg(
         long,
-        default_value = "0.3",
+        default_value = "0.5",
         value_name = "F",
         help_heading = "Congestion control (advanced)"
     )]
-    pub auto_meta_ewma_alpha: f64,
+    pub auto_meta_percentile: f64,
     /// How much to grow cwnd on each under-shoot tick
     #[arg(
         long,
@@ -138,15 +143,24 @@ pub struct CommonArgs {
         help_heading = "Congestion control (advanced)"
     )]
     pub auto_meta_decrease_step: u32,
-    /// Max age (e.g. "10s") of samples in the baseline window before
-    /// they are discarded and the baseline is re-established from new samples
+    /// Long-horizon sample window (e.g. "10s"). Drives the baseline
+    /// percentile; samples older than this are evicted on every tick.
     #[arg(
         long,
         default_value = "10s",
         value_name = "DUR",
         help_heading = "Congestion control (advanced)"
     )]
-    pub auto_meta_min_latency_max_age: humantime::Duration,
+    pub auto_meta_long_window: humantime::Duration,
+    /// Short-horizon sample window (e.g. "1s"). Drives the current-state
+    /// percentile; must be strictly less than `--auto-meta-long-window`.
+    #[arg(
+        long,
+        default_value = "1s",
+        value_name = "DUR",
+        help_heading = "Congestion control (advanced)"
+    )]
+    pub auto_meta_short_window: humantime::Duration,
     /// Control-loop tick interval (e.g. "50ms")
     #[arg(
         long,
@@ -195,10 +209,11 @@ impl CommonArgs {
                 max_cwnd: self.auto_meta_max_cwnd,
                 alpha: self.auto_meta_alpha,
                 beta: self.auto_meta_beta,
-                ewma_alpha: self.auto_meta_ewma_alpha,
                 increase_step: self.auto_meta_increase_step,
                 decrease_step: self.auto_meta_decrease_step,
-                min_latency_max_age: self.auto_meta_min_latency_max_age.into(),
+                percentile: self.auto_meta_percentile,
+                long_window: self.auto_meta_long_window.into(),
+                short_window: self.auto_meta_short_window.into(),
                 tick_interval: self.auto_meta_tick_interval.into(),
             });
         crate::ThrottleConfig {

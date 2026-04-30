@@ -13,11 +13,11 @@ scope here is conceptual; specific flag names are covered in
 - [Architecture](#architecture)
 - [Why Concurrency Is the Lever](#why-concurrency-is-the-lever)
 - [The Control Signal](#the-control-signal)
-- [Why Our Own Load Doesn't Skew the Baseline](#why-our-own-load-doesnt-skew-the-baseline)
+- [Why Our Own Load Doesn't Skew the Signal](#why-our-own-load-doesnt-skew-the-signal)
 - [The Control Law](#the-control-law)
 - [Enforcement Model](#enforcement-model)
 - [What Counts as a Metadata Op](#what-counts-as-a-metadata-op)
-- [Two Controllers: One per Filesystem Side](#two-controllers-one-per-filesystem-side)
+- [One Controller per (Side, Syscall)](#one-controller-per-side-syscall)
 - [Interaction with Static Throttles](#interaction-with-static-throttles)
 - [Remote Copy](#remote-copy)
 - [Tuning and Observability](#tuning-and-observability)
@@ -107,8 +107,8 @@ drive any algorithm through synthetic workloads for regression testing.
 instance, running as a lightweight task. It drains a bounded sample
 queue, calls the algorithm's tick on a configurable cadence, and
 publishes each emitted decision to the enforcement layer. We run one
-controller per filesystem side (source vs destination) — see
-[Two Controllers: One per Filesystem Side](#two-controllers-one-per-filesystem-side).
+controller per `(filesystem-side, metadata-syscall)` pair — see
+[One Controller per (Side, Syscall)](#one-controller-per-side-syscall).
 
 **Enforcement.** The hot-path gates — semaphores and token buckets that
 the filesystem-op callers wait on. These existed before congestion
@@ -152,27 +152,29 @@ same number, just expressed in TCP terminology vs. systems terminology.
 ## The Control Signal
 
 The algorithm's job is to find a `cwnd` that saturates the bottleneck
-without queueing. It reasons about two derived quantities, both
-collected from the same per-op latency probes:
+without queueing. It reasons about two derived quantities computed
+from the same per-op latency probes — at the *same percentile* in two
+different time windows:
 
-- **Baseline latency** — the p10 percentile of recent operation
-  latencies, computed each tick over a sliding window of the last
-  ~4096 samples. This is the *uncongested floor*: most samples in the
-  window are at least this fast.
-- **Smoothed current latency** — an EWMA of recent operation latencies.
-  Smoothing absorbs single-sample noise so a brief slow op doesn't kick
-  the controller off course.
+- **Baseline latency** — the configured percentile (default p50) over
+  a long-horizon sample window (default 10s). This is the long-memory
+  reference: the typical fast / median latency over recent history.
+- **Current latency** — the same percentile computed over a short-
+  horizon subset (default 1s) of the same buffer. This is the recent
+  estimate.
 
 Their ratio is the congestion signal:
 
 ```
-  ratio  =  smoothed_current / baseline
+  ratio  =  current / baseline
 ```
 
-In normal operation `ratio >= 1.0` (the smoothed mean of the same
-window is bounded below by the lower decile, modulo sample-ordering
-noise). So the regime we care about is the strip between 1.0 and
-"very large":
+When the offered load is steady the two windows estimate the same
+population statistic, and the ratio sits at ~1.0 *regardless* of how
+heavy-tailed the per-op latency distribution is. A non-1.0 ratio means
+the recent-sample distribution has shifted — exactly the queue
+build-up signal we want to act on. So the regime we care about is the
+strip between 1.0 and "very large":
 
 ```
        latency ratio
@@ -188,64 +190,52 @@ noise). So the regime we care about is the strip between 1.0 and
               └───────────────────────────────── time
 ```
 
-## Why Our Own Load Doesn't Skew the Baseline
+## Why Our Own Load Doesn't Skew the Signal
 
-A reasonable worry when reading the previous section: if the controller
-is generating the load it's measuring, every sample collected at high
-`cwnd` is inflated by our own queueing. Won't the baseline itself drift
-up to match — leaving us with a controller that treats the inflated
-latency as the new normal and never shrinks?
+A reasonable worry: if the controller is generating the load it's
+measuring, every sample collected at high `cwnd` is inflated by our
+own queueing. Won't the baseline itself drift up to match — leaving us
+with a controller that treats the inflated latency as the new normal
+and never shrinks?
 
-Three design choices keep the baseline trustworthy:
+The matched-window design addresses this directly:
 
-1. **The baseline is the p10 of the recent sample window, not a strict
-   minimum or an average.** Every per-op latency goes into a sliding
-   window capped at ~4096 samples; on each tick the controller takes
-   the value at the 10th percentile of that window as the uncongested
-   floor. The p10 is robust to a single fast outlier (the floor only
-   moves when the lower decile of the window moves with it), naturally
-   weighted toward recent samples (older entries fall out of the
-   window), and tolerant of the natural per-op variance of real
-   filesystems — variance that on a Weka or Lustre mount routinely
-   spans an order of magnitude even on an idle metadata path. A strict
-   running minimum, in contrast, would latch onto the single fastest
-   sample (which may be a kernel cache hit unrepresentative of typical
-   service time) and read ordinary variance as queueing.
+1. **Baseline and current are the same statistic over different time
+   horizons.** Each tick the controller takes the configured percentile
+   (p50 by default) of the long sample window (10s) as the baseline
+   and the same percentile of the short window (1s) as the current
+   estimate. When the per-op latency distribution is stationary, both
+   estimates converge on the same population value and the ratio sits
+   at exactly 1.0. The natural per-op variance of real filesystems —
+   variance that routinely spans an order of magnitude on a Weka or
+   Lustre mount even on an idle metadata path — cancels out because
+   it's present in both windows in the same proportion.
 
-   What the p10 admits and rejects, concretely: a workload that
-   alternates between fast and slow phases will see the p10 follow
-   the fast phase as long as roughly 10% of recent samples come from
-   it; if the slow phase becomes overwhelmingly dominant, the p10
-   drifts up too — but only after the fast phase has actually fallen
-   out of representation, not on the strength of a single anomaly.
-   Conversely, one freakishly fast outlier at the top of the window
-   doesn't pin the baseline; the p10 absorbs it without moving.
+   This is the key contrast with a baseline-vs-mean shape (the prior
+   p10 / EWMA design): mean and p10 of a heavy-tailed distribution
+   differ by a constant factor that is *purely a property of the
+   distribution shape*, not of load. A baseline-vs-mean ratio
+   therefore rides above 1.0 even at idle, forcing loose `alpha` /
+   `beta` thresholds to avoid mistaking shape for queueing — and the
+   loose thresholds left a wide hold band where genuine load growth
+   could not be distinguished from variance.
 
-2. **The control law shrinks `cwnd` long before samples age out.**
-   When `ratio > beta`, the very next tick (50 ms by default) shrinks
-   `cwnd` by one step. Continued inflation keeps shrinking it. Once
-   `cwnd` has dropped enough for the queue to drain, fresh low-latency
-   samples enter the window and the p10 tracks the true uncongested
-   floor. So in any healthy operating regime the baseline is
-   continuously re-validated long before sample age-out matters.
+2. **The control law shrinks `cwnd` as soon as the recent distribution
+   shifts.** When the offered load increases, the short window
+   captures the shift before the long window does. Even if both
+   eventually equilibrate, the transient `ratio > beta` shrinks `cwnd`
+   on the very next tick. Continued inflation keeps shrinking. Once
+   `cwnd` has dropped enough for the queue to drain, fresh low-
+   latency samples enter the short window and the ratio drops back —
+   the next tick can grow again.
 
-3. **If the window does empty under sustained saturation, the
-   smoothed estimate is reset alongside it.** The case left open is
-   *persistent* overload — e.g. `min_cwnd` is configured high and the
-   filesystem is genuinely overloaded for more than the
-   `min_latency_max_age` window (default 10s). When every sample in
-   the window has aged out, the next sample establishes a new
-   (inflated) floor. To prevent that newly-bad baseline from making
-   the next tick look "uncongested" and grow `cwnd` further, the EWMA
-   is reset at the same instant. The first sample-bearing tick after
-   a reset replays the cold-start path and never adjusts `cwnd`,
-   buying a full smoothing window for the controller to reconverge
-   before any growth decision.
-
-The only state the controller carries across a window reset is `cwnd`
-itself — intentionally. The next ratio is computed from a fresh
-baseline and a fresh smoothed current, so "current latency is normal"
-can't be inferred from a window of uniformly inflated samples.
+3. **The window is bounded.** Samples older than `long_window` (default
+   10s) are evicted on every tick, so a one-time spike doesn't pin
+   the baseline forever. If the long window empties entirely under
+   sustained saturation, both the baseline and the current statistic
+   reset to `None` and the controller holds `cwnd` until fresh samples
+   arrive — preventing a window of uniformly inflated samples from
+   reading as "uncongested" via the matched-percentile cancellation.
 
 ## The Control Law
 
@@ -260,56 +250,53 @@ regions and applies a fixed step to `cwnd`:
        ratio  >  beta       cwnd -= decrease_step    (shrink)
 ```
 
-Defaults: `alpha = 1.30`, `beta = 2.50`, `increase_step =
+Defaults: `alpha = 1.10`, `beta = 1.50`, `increase_step =
 decrease_step = 1`. Each step is then clamped to `[min_cwnd,
-max_cwnd]`. The thresholds are deliberately loose: real metadata
-syscalls on a networked filesystem routinely show ewma-to-baseline
-ratios in the 1.5–2.0× band even when the filesystem is *not*
-congested, simply because per-op latency variance on these mounts is
-naturally large. Tighter thresholds would misread that variance as
-queueing and ratchet `cwnd` toward the floor.
+max_cwnd]`. The thresholds sit close to 1.0 because the matched-
+percentile signal cancels distribution shape: at steady state the
+ratio rides at ~1.0 regardless of how heavy-tailed the per-op latency
+distribution is, so `alpha = 1.10` cleanly says "grow whenever the
+recent distribution is at most 10% slower than the long-horizon one"
+and `beta = 1.50` says "shrink when the recent distribution is at
+least 50% slower" — both genuine queue-build-up signals rather than
+noise-floor artifacts.
 
-A few worked examples make the shape concrete. Assume a 0.5ms baseline,
-default thresholds, and `cwnd = 20` going into the tick:
+A few worked examples make the shape concrete. Assume a 0.5ms baseline
+percentile, default thresholds, and `cwnd = 20` going into the tick:
 
-| Smoothed current | Ratio | Decision | New `cwnd` |
-|------------------|-------|----------|------------|
-| 0.50 ms          | 1.00  | grow     | 21         |
-| 0.60 ms          | 1.20  | grow     | 21         |
-| 0.65 ms          | 1.30  | hold     | 20 (1.30 == alpha; not below) |
-| 1.00 ms          | 2.00  | hold     | 20         |
-| 1.25 ms          | 2.50  | hold     | 20 (2.50 == beta; not above) |
-| 1.50 ms          | 3.00  | shrink   | 19         |
-| 2.50 ms          | 5.00  | shrink   | 19         |
-| 0.40 ms          | 0.80  | —        | unusual (see below) |
+| Current percentile | Ratio | Decision | New `cwnd` |
+|--------------------|-------|----------|------------|
+| 0.50 ms            | 1.00  | grow     | 21         |
+| 0.54 ms            | 1.08  | grow     | 21         |
+| 0.55 ms            | 1.10  | hold     | 20 (1.10 == alpha; not below) |
+| 0.65 ms            | 1.30  | hold     | 20         |
+| 0.75 ms            | 1.50  | hold     | 20 (1.50 == beta; not above) |
+| 0.80 ms            | 1.60  | shrink   | 19         |
+| 2.50 ms            | 5.00  | shrink   | 19         |
+| 0.40 ms            | 0.80  | grow     | 21 (current is faster than baseline) |
 
 **Two things to notice in this table.** First, the law is a
 *binary trigger*, not a proportional response: a ratio of 5.0 shrinks
-by exactly the same one step as a ratio of 2.51. Sustained inflation
+by exactly the same one step as a ratio of 1.51. Sustained inflation
 drives faster *effective* shrinkage because the ratio stays above
 `beta` over many consecutive ticks — but each individual tick still
 takes one step. This is the classic Vegas shape: simpler control law,
 less prone to oscillation under noisy latency than a gain-tuned PID.
 
-Second, **a ratio below 1.0 is unusual.** In the typical case the
-smoothed current is the EWMA of samples whose lower decile is the p10
-baseline, so the mean is bounded below by p10 modulo sample-ordering
-noise. A brief excursion under 1.0 is possible if the EWMA's
-exponential weight is dominated by an unusually-fast burst that has
-not yet diluted into the broader window's percentile — this is benign
-and the next tick treats `ratio < alpha` as growth headroom anyway.
-The window-empty path preserves the rest of the invariants: when the
-window is exhausted by age-out, the smoothed current is reset
-alongside it so the next tick re-establishes both from the same fresh
-sample stream.
+Second, **`ratio < 1.0` is benign and treated as growth headroom.**
+When the recent samples are *faster* than the long-horizon ones the
+filesystem just got less loaded; the controller pushes `cwnd` up to
+take advantage of it.
 
-The "responsiveness" of the controller is shaped by three knobs in
+The "responsiveness" of the controller is shaped by these knobs in
 combination:
 
 - `--auto-meta-tick-interval` (how often the binning above is
   evaluated; default 50 ms);
-- `--auto-meta-ewma-alpha` (how much weight a single tick's mean gives
-  to the smoothed current; default 0.3);
+- `--auto-meta-percentile` (the percentile used in both windows;
+  default 0.5 / median);
+- `--auto-meta-long-window` / `--auto-meta-short-window` (how much
+  history is used for each estimate; defaults 10s / 1s);
 - `--auto-meta-increase-step` / `--auto-meta-decrease-step` (the per-
   tick step magnitudes).
 
@@ -367,50 +354,78 @@ What "wide coverage" means concretely:
   bound, not service-time-bound; a Vegas-style controller doesn't fit.
   See [Pluggability](#pluggability) for the BBR direction.
 
-## Two Controllers: One per Filesystem Side
+## One Controller per (Side, Syscall)
 
-Filesystems vary enormously. A copy from a saturated NFS mount to a
-local SSD has two completely independent service-time profiles, and
-forcing them onto a single controller pessimizes both.
+Filesystems vary enormously, and so do individual metadata syscalls.
+A copy from a saturated NFS mount to a local SSD has two completely
+independent service-time profiles for the two sides; within each side,
+`stat` (a pure lookup), `unlink` (a parent-directory write), and
+`mkdir` (an inode allocation) hit different code paths on the metadata
+server and have different baseline latencies. Mixing them in a single
+controller pollutes the per-op signal and makes the matched-
+percentile baseline drift with operation-mix changes that have
+nothing to do with congestion.
 
-Following the guideline *one controller per filesystem*, we run two
-metadata controllers per process — one per [`Side`]:
+So we run **one controller per `(Side, MetadataOp)` pair** — up to 18
+in total. Each carries its own sample window, its own baseline /
+current percentiles, its own `cwnd`, and its own enforcement
+semaphore. A probe site is annotated with both the side and the op
+kind (`Metadata(Source, Stat)`, `Metadata(Destination, Unlink)`, …);
+the control loop and enforcement gate are picked accordingly.
 
-|              | **Source-side**                   | **Destination-side**                  |
-|--------------|-----------------------------------|---------------------------------------|
-| **Metadata** | source single-stat, `read_link`, source-side `File::open` | destination create / unlink / chmod / `hard_link` / `set_permissions` |
+The covered op kinds:
 
-Each controller runs the same algorithm with its own independent state
-(its own p10 baseline window, EWMA, `cwnd`) and its own enforcement
-semaphore. A probe site is annotated with the side
-(`Metadata(Source)`, `Metadata(Destination)`); the control loop and
-enforcement gate are picked accordingly.
+| Op            | Used for                                                   |
+|---------------|------------------------------------------------------------|
+| `Stat`        | `symlink_metadata`, `metadata`, `canonicalize`, read-only `File::open` |
+| `ReadLink`    | `read_link`                                                |
+| `MkDir`       | `create_dir`                                               |
+| `RmDir`       | `remove_dir`                                               |
+| `Unlink`      | `remove_file`                                              |
+| `HardLink`    | `hard_link`                                                |
+| `Symlink`     | `symlink` (creation)                                       |
+| `Chmod`       | `set_permissions`, `chown`/`fchownat`, `utimes`/`utimensat` |
+| `OpenCreate`  | `File::create`, `OpenOptions::open(create=true, …)`        |
+
+Sources are immutable in copy/cmp/link/rm, so the mutation ops
+(`MkDir`, `RmDir`, `Unlink`, `HardLink`, `Symlink`, `Chmod`,
+`OpenCreate`) only ever fire on the destination side. The lookup ops
+(`Stat`, `ReadLink`) can fire on either side. The progress-bar
+labelling reflects this: lookup labels carry an explicit `src-` /
+`dst-` prefix to disambiguate (`src-stat`, `dst-stat`,
+`dst-read-link`); mutation labels drop the prefix entirely
+(`mkdir`, `unlink`, `rmdir`, `hard-link`, `symlink`, `chmod`,
+`open-create`).
 
 How tools map onto this:
 
-| Tool      | meta-src                                       | meta-dst                                       |
-|-----------|------------------------------------------------|------------------------------------------------|
-| `rcp`     | top-level / dereferenced stats, `read_link`, file open | `create_dir`, `symlink`, file create, `set_permissions`, `chown`, `utimens` |
-| `rrm`     | top-level stat                                 | `remove_file`, `remove_dir`, pre-unlink `set_permissions` |
-| `rlink`   | top-level stats                                | `hard_link`, `create_dir`, `set_permissions`   |
-| `rcmp`    | per-entry `symlink_metadata` on the src tree   | per-entry `symlink_metadata` on the dst tree (compare-only — no writes) |
-| `filegen` | —                                              | `create_dir`, `open(create:true)`, `set_permissions` |
+| Tool      | Active controllers (typical)                                                          |
+|-----------|---------------------------------------------------------------------------------------|
+| `rcp`     | `src-stat`, `src-read-link`, `dst-stat`, `mkdir`, `symlink`, `open-create`, `chmod`, `rmdir`, `unlink` |
+| `rrm`     | `src-stat`, `unlink`, `rmdir`                                                         |
+| `rlink`   | `src-stat`, `src-read-link`, `dst-stat`, `mkdir`, `hard-link`, `symlink`, `chmod`     |
+| `rcmp`    | `src-stat`, `dst-stat` (compare-only — no writes)                                     |
+| `filegen` | `mkdir`, `open-create`, `chmod`                                                       |
 
-Single-path tools (rrm, filegen) still get both controllers. rrm
-exercises meta-src + meta-dst; filegen exercises only meta-dst; the
-unused controller stays idle (harmless). Carrying both uniformly
-keeps the wiring identical across tools.
+Every tool registers all 18 controllers uniformly; controllers it
+doesn't exercise stay at `samples_seen = 0` and the renderer hides
+them, so users only see the labels their workload actually drove.
 
-A note on the rate dimension: both controllers gate their own
+A note on the rate dimension: each controller gates its own
 in-flight concurrency independently, but the global ops-throttle
-(rate-per-second) is shared across the process. Only one controller —
-destination metadata, by convention — drives that single rate gate;
-the other applies concurrency only.
+(rate-per-second) is shared across the process. Only the
+`(Destination, Stat)` controller drives that single rate gate by
+convention; the others apply concurrency only. The current
+`VegasController` doesn't emit rate decisions, so this choice is
+forward-looking — if a rate-aware controller (BBR-style, …) is
+swapped in later, exactly one of them must own the global rate gate.
 
-In remote copy, this layout maps cleanly: `rcpd-source` exercises
-meta-src (only ever reads its local source filesystem), and
-`rcpd-destination` exercises meta-dst (only ever mutates its local
-destination filesystem). The unused channel stays idle on each side.
+In remote copy, this layout maps cleanly: `rcpd-source` exercises only
+the source-side stat / read-link controllers (only ever reads its
+local source filesystem), and `rcpd-destination` exercises the
+destination-side stat / read-link controllers plus all the mutation
+controllers (only ever mutates its local destination filesystem). The
+unused channels stay idle on each side.
 
 At the call site, each syscall is bracketed by permit acquisition and a
 *probe* that measures its wall-clock duration:
@@ -504,14 +519,16 @@ responses on each side.
 ## Tuning and Observability
 
 The controller exposes every tunable as a CLI flag — initial, minimum,
-and maximum cwnd, the grow/shrink thresholds, the EWMA smoothing factor,
-per-tick step sizes, the baseline-age-out interval, and the control-loop
-tick cadence. Defaults are conservative; aggressive-but-sensible tuning
-comes from field measurements.
+and maximum cwnd, the grow/shrink thresholds, the percentile applied
+to each window, the long / short window durations, per-tick step sizes,
+and the control-loop tick cadence. Defaults are conservative;
+aggressive-but-sensible tuning comes from field measurements.
 
 The control loop emits structured `tracing` events on a few channels —
-each tagged with a `unit` field so the two controllers can be told
-apart in mixed logs (`meta-src`, `meta-dst`):
+each tagged with a `unit` field so the per-syscall controllers can be
+told apart in mixed logs (`src-stat`, `dst-stat`, `mkdir`, `unlink`,
+…; see [One Controller per (Side, Syscall)](#one-controller-per-side-syscall)
+for the full mapping):
 
 - **`tracing::info!`** at startup, describing the effective auto-meta
   configuration.
