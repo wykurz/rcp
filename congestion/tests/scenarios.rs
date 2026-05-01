@@ -2,7 +2,7 @@
 //! through the simulator and assert aggregate throughput/latency behavior.
 
 use congestion::sim::{BottleneckModel, ScenarioConfig, run_scenario};
-use congestion::{FixedController, NoopController, VegasConfig, VegasController};
+use congestion::{FixedController, NoopController, RatioConfig, RatioController};
 
 /// 10k ops/sec capacity, 2ms min latency → BDP = 20 in-flight. These are
 /// the numbers every scenario below reuses unless it overrides them.
@@ -175,12 +175,12 @@ fn scenario_emits_one_decision_per_tick_plus_initial() {
 }
 
 #[test]
-fn vegas_grows_from_cold_start() {
-    // Vegas starts at cwnd=1 and should grow toward BDP when latency stays
+fn ratio_grows_from_cold_start() {
+    // The ratio controller starts at cwnd=1 and should grow toward BDP when latency stays
     // near the baseline.
-    let mut controller = VegasController::new(VegasConfig {
+    let mut controller = RatioController::new(RatioConfig {
         initial_cwnd: 1,
-        ..VegasConfig::default()
+        ..RatioConfig::default()
     });
     let bottleneck = default_bottleneck();
     let duration = std::time::Duration::from_secs(3);
@@ -197,7 +197,7 @@ fn vegas_grows_from_cold_start() {
 }
 
 #[test]
-fn vegas_converges_near_bdp_without_runaway_latency() {
+fn ratio_converges_near_bdp_without_runaway_latency() {
     // Steady-state cwnd should land somewhere above BDP — but not at
     // `max_cwnd`. Use a tighter alpha/beta than defaults: in this
     // deterministic simulator there is no per-op variance, so the
@@ -207,11 +207,11 @@ fn vegas_converges_near_bdp_without_runaway_latency() {
     // estimate carries uncertainty; in the sim a tighter config makes
     // the test assertion meaningful without making the algorithm change
     // behavior in production.
-    let mut controller = VegasController::new(VegasConfig {
+    let mut controller = RatioController::new(RatioConfig {
         initial_cwnd: 1,
         alpha: 1.02,
         beta: 1.10,
-        ..VegasConfig::default()
+        ..RatioConfig::default()
     });
     let bottleneck = default_bottleneck();
     let duration = std::time::Duration::from_secs(5);
@@ -245,18 +245,18 @@ fn vegas_converges_near_bdp_without_runaway_latency() {
 }
 
 #[test]
-fn vegas_achieves_near_capacity_throughput() {
-    // once converged, Vegas should keep the bottleneck well-utilized.
-    let mut controller = VegasController::new(VegasConfig {
+fn ratio_achieves_near_capacity_throughput() {
+    // once converged, the ratio controller should keep the bottleneck well-utilized.
+    let mut controller = RatioController::new(RatioConfig {
         initial_cwnd: 1,
-        ..VegasConfig::default()
+        ..RatioConfig::default()
     });
     let bottleneck = default_bottleneck();
     let duration = std::time::Duration::from_secs(10);
     let config = metadata_config(duration, 2048);
     let result = run_scenario(&mut controller, &bottleneck, &config);
     let throughput = result.throughput_ops_per_sec(duration);
-    // Vegas is conservative compared to Noop; expect at least 70% of capacity
+    // The ratio controller is conservative compared to Noop; expect at least 70% of capacity
     // over a long enough run.
     assert!(
         throughput >= bottleneck.capacity_per_sec * 0.7,
@@ -266,19 +266,19 @@ fn vegas_achieves_near_capacity_throughput() {
 }
 
 #[test]
-fn vegas_keeps_latency_bounded_under_saturation_pressure() {
+fn ratio_keeps_latency_bounded_under_saturation_pressure() {
     // Contrast with noop_controller_inflates_latency_when_saturated:
-    // Vegas's steady-state latency stays within a small multiple of
-    // min_latency even when the workload is eager. As in
-    // `vegas_converges_near_bdp_without_runaway_latency`, use a tighter
+    // the ratio controller's steady-state latency stays within a small
+    // multiple of min_latency even when the workload is eager. As in
+    // `ratio_converges_near_bdp_without_runaway_latency`, use a tighter
     // alpha/beta than defaults so the deterministic sim's lack of
     // per-op variance doesn't let the matched-percentile ratio drift
     // arbitrarily far from 1.0.
-    let mut controller = VegasController::new(VegasConfig {
+    let mut controller = RatioController::new(RatioConfig {
         initial_cwnd: 1,
         alpha: 1.02,
         beta: 1.10,
-        ..VegasConfig::default()
+        ..RatioConfig::default()
     });
     let bottleneck = default_bottleneck();
     let duration = std::time::Duration::from_secs(5);

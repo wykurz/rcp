@@ -40,8 +40,12 @@ pub struct AutoMetaThrottleConfig {
     pub beta: f64,
     pub increase_step: u32,
     pub decrease_step: u32,
-    /// Percentile (in `(0.0, 1.0)`) used to summarize each window.
-    pub percentile: f64,
+    /// Percentile (in `[0.0, 1.0)`) applied to the long-horizon window
+    /// to derive the baseline statistic. Must be `<= current_percentile`.
+    pub baseline_percentile: f64,
+    /// Percentile (in `[0.0, 1.0)`) applied to the short-horizon window
+    /// to derive the current statistic. Must be `>= baseline_percentile`.
+    pub current_percentile: f64,
     /// Long-horizon window age. Drives the baseline statistic.
     pub long_window: std::time::Duration,
     /// Short-horizon window age. Drives the current statistic.
@@ -91,20 +95,34 @@ impl ThrottleConfig {
             if auto.min_cwnd > auto.max_cwnd {
                 return Err("auto-meta-min-cwnd must be <= auto-meta-max-cwnd".to_string());
             }
-            if !(0.0..1.0).contains(&auto.percentile) {
-                return Err("auto-meta-percentile must be in [0.0, 1.0)".to_string());
+            if !(0.0..1.0).contains(&auto.baseline_percentile) {
+                return Err("auto-meta-baseline-percentile must be in [0.0, 1.0)".to_string());
             }
-            // alpha and beta are matched-percentile ratios. At steady
-            // state both windows estimate the same population statistic
-            // so the ratio sits near 1.0; alpha < 1.0 would mean "shrink
-            // when current is faster than baseline", which is
-            // nonsensical, and beta < 1.0 would shrink the controller at
-            // its operating point.
-            if auto.alpha <= 1.0 {
-                return Err("auto-meta-alpha must be > 1.0".to_string());
+            if !(0.0..1.0).contains(&auto.current_percentile) {
+                return Err("auto-meta-current-percentile must be in [0.0, 1.0)".to_string());
             }
-            if auto.beta <= 1.0 {
-                return Err("auto-meta-beta must be > 1.0".to_string());
+            if auto.baseline_percentile > auto.current_percentile {
+                return Err(
+                    "auto-meta-baseline-percentile must be <= auto-meta-current-percentile"
+                        .to_string(),
+                );
+            }
+            // alpha and beta gate the ratio = current / baseline:
+            // ratio < alpha → grow, ratio > beta → shrink. The only
+            // hard invariant is `0 < alpha < beta`. The "natural" placement
+            // of alpha and beta relative to 1.0 depends on the percentile
+            // pair: matched percentiles produce a steady-state ratio
+            // near 1.0, while cross percentiles produce a steady-state
+            // ratio above 1.0 set by the inter-quantile spread of the
+            // latency distribution. Either case may want alpha below or
+            // above 1.0 depending on whether the operator wants the
+            // controller to actively probe past the knee or sit passively
+            // until queueing crosses the beta threshold.
+            if !auto.alpha.is_finite() || auto.alpha <= 0.0 {
+                return Err("auto-meta-alpha must be a finite value > 0".to_string());
+            }
+            if !auto.beta.is_finite() || auto.beta <= 0.0 {
+                return Err("auto-meta-beta must be a finite value > 0".to_string());
             }
             if auto.alpha >= auto.beta {
                 return Err("auto-meta-alpha must be < auto-meta-beta".to_string());
@@ -269,7 +287,8 @@ mod auto_meta_validation_tests {
             beta: 1.5,
             increase_step: 1,
             decrease_step: 1,
-            percentile: 0.5,
+            baseline_percentile: 0.5,
+            current_percentile: 0.5,
             long_window: std::time::Duration::from_secs(10),
             short_window: std::time::Duration::from_secs(1),
             tick_interval: std::time::Duration::from_millis(50),
@@ -300,25 +319,94 @@ mod auto_meta_validation_tests {
     }
 
     #[test]
-    fn alpha_at_or_below_one_is_rejected() {
+    fn alpha_at_or_below_zero_is_rejected() {
         let mut auto = valid_auto_meta();
-        auto.alpha = 1.0;
+        auto.alpha = 0.0;
         assert!(config_with(auto).validate().is_err());
         let mut auto = valid_auto_meta();
-        auto.alpha = 0.9;
+        auto.alpha = -0.5;
         assert!(config_with(auto).validate().is_err());
     }
 
     #[test]
-    fn beta_at_or_below_one_is_rejected() {
+    fn alpha_below_one_is_accepted() {
+        // Passive-controller mode: alpha < 1.0 means "grow only when
+        // recent is meaningfully faster than baseline" — the explicit
+        // use case for relaxing the previous alpha > 1.0 constraint.
         let mut auto = valid_auto_meta();
-        // alpha must be > 1.0 so the earlier alpha check passes and we
-        // isolate the beta branch. (alpha < beta is checked after the
-        // individual-bound checks, so 1.05 / 1.0 falls to the beta check.)
-        auto.alpha = 1.05;
-        auto.beta = 1.0;
+        auto.alpha = 0.9;
+        auto.beta = 1.1;
+        assert!(config_with(auto).validate().is_ok());
+    }
+
+    #[test]
+    fn beta_at_or_below_zero_is_rejected() {
+        let mut auto = valid_auto_meta();
+        auto.alpha = 0.5;
+        auto.beta = 0.0;
         let err = config_with(auto).validate().unwrap_err();
         assert!(err.contains("beta"), "got: {err}");
+    }
+
+    #[test]
+    fn cross_percentile_config_validates() {
+        // Cross-percentile mode: baseline at p40, current at p60, with
+        // alpha/beta straddling the steady-state ratio. The validator
+        // accepts both percentiles in (0, 1) with baseline <= current.
+        let mut auto = valid_auto_meta();
+        auto.baseline_percentile = 0.4;
+        auto.current_percentile = 0.6;
+        assert!(config_with(auto).validate().is_ok());
+    }
+
+    #[test]
+    fn baseline_percentile_above_current_is_rejected() {
+        let mut auto = valid_auto_meta();
+        auto.baseline_percentile = 0.6;
+        auto.current_percentile = 0.4;
+        let err = config_with(auto).validate().unwrap_err();
+        assert!(
+            err.contains("baseline-percentile") && err.contains("current-percentile"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn baseline_percentile_out_of_range_is_rejected() {
+        let mut auto = valid_auto_meta();
+        auto.baseline_percentile = 1.0;
+        let err = config_with(auto).validate().unwrap_err();
+        assert!(err.contains("baseline-percentile"), "got: {err}");
+    }
+
+    #[test]
+    fn non_finite_alpha_or_beta_is_rejected() {
+        // NaN comparisons return false in either direction, so a plain
+        // `auto.alpha <= 0.0` check would silently pass NaN through and
+        // the controller would freeze in the hold band forever. The
+        // `is_finite()` guard catches that.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut auto = valid_auto_meta();
+            auto.alpha = bad;
+            assert!(
+                config_with(auto).validate().is_err(),
+                "alpha={bad} must be rejected",
+            );
+            let mut auto = valid_auto_meta();
+            auto.beta = bad;
+            assert!(
+                config_with(auto).validate().is_err(),
+                "beta={bad} must be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn current_percentile_out_of_range_is_rejected() {
+        let mut auto = valid_auto_meta();
+        auto.current_percentile = 1.0;
+        let err = config_with(auto).validate().unwrap_err();
+        assert!(err.contains("current-percentile"), "got: {err}");
     }
 
     #[test]

@@ -222,7 +222,7 @@ filesystem latency and adjusts concurrency on the fly.
 
 ### Adaptive metadata throttling (`--auto-meta-throttle`)
 
-Pass `--auto-meta-throttle` to enable a Vegas-style latency controller
+Pass `--auto-meta-throttle` to enable a latency-ratio controller
 that watches per-op latency and grows or shrinks the in-flight
 concurrency cap (`cwnd`) on the fly. The controller stays just below
 the saturation point of whatever metadata path the tool is hitting —
@@ -249,10 +249,10 @@ actually observes.
 
 **Tuning knobs** (all listed under `--help-all` on each binary): the
 initial / minimum / maximum `cwnd`, the grow/shrink ratio thresholds
-(`alpha`, `beta`), the percentile used to summarize each window, the
-long / short window durations, per-tick step sizes, and the
-control-loop tick cadence. Defaults are conservative and a good
-starting point.
+(`alpha`, `beta`), the baseline / current percentiles used to
+summarize the long and short windows, the long / short window
+durations, per-tick step sizes, and the control-loop tick cadence.
+Defaults are conservative and a good starting point.
 
 For the design rationale (why concurrency is the lever, what
 `cwnd` is, the exact control law including worked ratio→action

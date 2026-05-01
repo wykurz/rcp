@@ -1155,14 +1155,14 @@ const fn unit_label(side: congestion::Side, op: congestion::MetadataOp) -> &'sta
 ///    finds a permit available.
 /// 2. Install one `RoutingSink` that fans metadata samples out to per-
 ///    `(side, op)` channels, each consumed by its own
-///    `ControlUnit<VegasController>`. Each syscall on each side gets
+///    `ControlUnit<RatioController>`. Each syscall on each side gets
 ///    an independent latency baseline and an independent cwnd, so a
 ///    saturated `unlink` path doesn't drag down `stat` (or vice versa).
 /// 3. Spawn one combined adapter/monitor task per resource. By
 ///    convention `(Destination, Stat)` is the rate-driver — the global
 ///    `OPS_THROTTLE` is shared, so only one adapter may translate rate
 ///    decisions; all others apply concurrency only. The current
-///    `VegasController` doesn't emit rate decisions, so the choice is
+///    `RatioController` doesn't emit rate decisions, so the choice is
 ///    forward-looking.
 /// 4. Each adapter exits cleanly when its control unit stops
 ///    publishing decisions, so they don't leak as unbounded background
@@ -1207,7 +1207,7 @@ fn spawn_auto_meta_throttle(runtime: &tokio::runtime::Runtime, auto: AutoMetaThr
     congestion::install_sample_sink(sink.clone());
     for (label, side, op, sample_rx, apply_rate) in receivers {
         let resource = walk::meta_resource(side, op);
-        let vegas = congestion::VegasController::new(congestion::VegasConfig {
+        let controller = congestion::RatioController::new(congestion::RatioConfig {
             initial_cwnd: auto.initial_cwnd,
             min_cwnd: auto.min_cwnd,
             max_cwnd: auto.max_cwnd,
@@ -1215,12 +1215,13 @@ fn spawn_auto_meta_throttle(runtime: &tokio::runtime::Runtime, auto: AutoMetaThr
             beta: auto.beta,
             increase_step: auto.increase_step,
             decrease_step: auto.decrease_step,
-            percentile: auto.percentile,
+            baseline_percentile: auto.baseline_percentile,
+            current_percentile: auto.current_percentile,
             long_window: auto.long_window,
             short_window: auto.short_window,
         });
         let (unit, decision_rx, snapshot_rx) =
-            congestion::ControlUnit::new(label, vegas, sample_rx, auto.tick_interval);
+            congestion::ControlUnit::new(label, controller, sample_rx, auto.tick_interval);
         observability::register_unit(label, snapshot_rx);
         runtime.spawn(unit.run());
         runtime.spawn(auto_meta::run_adapter(
@@ -1232,14 +1233,16 @@ fn spawn_auto_meta_throttle(runtime: &tokio::runtime::Runtime, auto: AutoMetaThr
     }
     tracing::info!(
         "auto-meta-throttle enabled (per-(side, op) controllers, {} total): \
-         initial_cwnd={}, max_cwnd={}, alpha={}, beta={}, percentile={}, \
+         initial_cwnd={}, max_cwnd={}, alpha={}, beta={}, \
+         baseline_percentile={}, current_percentile={}, \
          long_window={:?}, short_window={:?}, tick={:?}",
         congestion::N_META_RESOURCES,
         auto.initial_cwnd,
         auto.max_cwnd,
         auto.alpha,
         auto.beta,
-        auto.percentile,
+        auto.baseline_percentile,
+        auto.current_percentile,
         auto.long_window,
         auto.short_window,
         auto.tick_interval,
