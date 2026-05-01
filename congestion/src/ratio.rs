@@ -1,40 +1,51 @@
-//! Latency-based adaptive controller using matched-window percentile statistics.
+//! Latency-based adaptive controller using two-window percentile statistics.
 //!
 //! The controller maintains a single sliding window of recent operation
 //! latencies and, on every tick, derives two summary statistics from it:
 //!
-//! - **Baseline** — the configured percentile (default p50) over the full
-//!   long-horizon window (default 10s).
-//! - **Current** — the same percentile computed over a subset of the most
-//!   recent samples (default 1s).
+//! - **Baseline** — the `baseline_percentile` over the full long-horizon
+//!   window (default 10s).
+//! - **Current** — the `current_percentile` computed over a subset of the
+//!   most recent samples (default 1s).
 //!
-//! Their ratio drives the control law:
+//! Their ratio (`current / baseline`) drives the control law,
+//! parameterized by two thresholds `alpha < beta`:
 //!
-//! - `ratio < alpha` → the recent distribution looks at least as fast as
-//!   the long-horizon one; grow concurrency.
-//! - `ratio > beta`  → the recent distribution has shifted to slower
-//!   latencies, indicating queue build-up; shrink concurrency.
+//! - `ratio < alpha` → grow concurrency. The recent distribution sits
+//!   below the alpha threshold relative to baseline; with `alpha > 1.0`
+//!   that includes "recent slightly slower than baseline" (active mode
+//!   probing for headroom), with `alpha < 1.0` it requires the recent
+//!   distribution to be meaningfully *faster* than baseline (passive
+//!   mode).
+//! - `ratio > beta`  → shrink. Recent is meaningfully slower than
+//!   baseline (or, in cross mode, the inter-quantile spread has widened
+//!   past the beta threshold) — queue build-up signal.
 //! - otherwise       → hold.
 //!
-//! ## Why matched percentiles
+//! ## Choosing the two percentiles
 //!
 //! Real metadata syscalls on networked filesystems (Weka, Lustre, NFS) have
 //! per-op latency variance that routinely spans an order of magnitude even
-//! at fixed `cwnd` and steady offered load. Comparing a baseline percentile
-//! (e.g. p10) against the *mean* of recent latencies — the original Vegas
-//! shape — produces a ratio that sits naturally above 1.0 even at idle,
-//! purely because of the heavy-tailed shape of the distribution. The
-//! controller would then need very loose `alpha` / `beta` thresholds to
-//! avoid mistaking that natural inflation for queueing, and the loose
-//! thresholds in turn left a wide hold band where genuine load growth
-//! could not be distinguished from variance.
+//! at fixed `cwnd` and steady offered load.
 //!
-//! Comparing the *same* percentile across two time windows cancels the
-//! distribution-shape contribution: at steady state both windows estimate
-//! the same population statistic, so the ratio approaches 1.0 regardless
-//! of how heavy-tailed the distribution is. A non-1.0 ratio reflects an
-//! actual shift in the latency distribution between the two horizons —
-//! exactly the queue-build-up signal we want to act on.
+//! - **Matched percentiles** (`baseline_percentile == current_percentile`,
+//!   e.g. both at p50): at steady state both windows estimate the same
+//!   population statistic, so the ratio sits near 1.0 regardless of
+//!   how heavy-tailed the distribution is. Distribution shape cancels;
+//!   defaults travel cleanly across filesystems. The trade-off: matched
+//!   percentiles cancel the *level* of queueing once both windows have
+//!   equilibrated to it, so the controller can only see *changes* in load,
+//!   not steady-state queueing.
+//! - **Cross percentiles** (`baseline_percentile < current_percentile`,
+//!   e.g. p40 baseline / p60 current): the ratio measures the inter-quantile
+//!   spread of the recent distribution, which is a direct queueing signal —
+//!   queueing fattens the upper tail asymmetrically, so the spread grows
+//!   with offered load even at steady state. The trade-off: the steady-state
+//!   ratio depends on the per-syscall distribution shape, so `alpha` and
+//!   `beta` may need per-filesystem tuning.
+//!
+//! Defaults ship matched (both percentiles at 0.5); cross-percentile mode
+//! is reachable by setting the two flags differently.
 //!
 //! ## Why a single window holding all samples
 //!
@@ -52,13 +63,13 @@ use crate::controller::{Controller, ControllerSnapshot, Decision, Sample};
 /// for the percentile computation.
 const SAMPLE_WINDOW_CAP: usize = 4096;
 
-/// Tunable parameters for [`VegasController`].
+/// Tunable parameters for [`RatioController`].
 ///
 /// All fields are public to make controller behavior fully observable in
-/// tests; most users should start from [`VegasConfig::default`] and override
+/// tests; most users should start from [`RatioConfig::default`] and override
 /// only the knobs they care about.
 #[derive(Debug, Clone, Copy)]
-pub struct VegasConfig {
+pub struct RatioConfig {
     /// Concurrency the controller starts at, before any samples are seen.
     pub initial_cwnd: u32,
     /// Floor on concurrency. Must be >= 1 to make progress.
@@ -67,31 +78,40 @@ pub struct VegasConfig {
     pub max_cwnd: u32,
     /// If `current / baseline < alpha`, cwnd is increased.
     ///
-    /// With matched-percentile signal, the ratio sits near 1.0 at steady
-    /// state regardless of distribution shape, so `alpha` can be set
-    /// tightly — default 1.1 — which means "grow whenever the recent
-    /// distribution is at most 10% slower than the long-horizon one".
+    /// Interpretation depends on the percentile pair: with matched
+    /// percentiles the steady-state ratio sits near 1.0, so `alpha < 1.0`
+    /// means "grow only when recent is meaningfully faster than baseline"
+    /// (a passive controller that doesn't push past the knee), while
+    /// `alpha > 1.0` means "grow even at steady state" (an active explorer
+    /// that climbs to the saturation point). With cross percentiles the
+    /// steady-state ratio sits above 1.0, set by the inter-quantile
+    /// spread of the latency distribution, and `alpha` is placed around
+    /// that ratio.
     pub alpha: f64,
     /// If `current / baseline > beta`, cwnd is decreased.
     ///
-    /// Default 1.5 — a 50% inflation of the recent percentile relative to
-    /// the long-horizon one is a clear distribution-shift signal that
-    /// queueing is building.
+    /// `beta` should be set wide enough to absorb ordinary variance and
+    /// tight enough to react to genuine queueing. Default 1.5.
     pub beta: f64,
     /// How much to grow cwnd on each under-shoot tick.
     pub increase_step: u32,
     /// How much to shrink cwnd on each over-shoot tick.
     pub decrease_step: u32,
-    /// Percentile (in `(0.0, 1.0)`) used to summarize each window.
+    /// Percentile (in `(0.0, 1.0)`) applied to the long-horizon window
+    /// to derive the baseline statistic.
     ///
-    /// The same percentile is applied to both the long-horizon window
-    /// (baseline) and the short-horizon subset (current) so the natural
-    /// distribution shape cancels in the ratio. Default 0.5 (median).
-    /// Lower values (e.g. 0.1) bias toward the fast end of the
-    /// distribution and produce an earlier congestion signal at the cost
-    /// of more sensitivity to occasional fast outliers; higher values
-    /// (e.g. 0.9) react only when the slow tail itself shifts.
-    pub percentile: f64,
+    /// Matched mode (`baseline_percentile == current_percentile`) cancels
+    /// distribution shape so the steady-state ratio sits near 1.0 across
+    /// any latency distribution. Cross mode
+    /// (`baseline_percentile < current_percentile`) measures the
+    /// inter-quantile spread, which grows under queueing — preserving a
+    /// signal at steady-state heavy load that matched mode loses once
+    /// both windows equilibrate.
+    pub baseline_percentile: f64,
+    /// Percentile (in `(0.0, 1.0)`) applied to the short-horizon window
+    /// to derive the current statistic. Must be `>= baseline_percentile`
+    /// so the steady-state ratio is `>= 1.0`.
+    pub current_percentile: f64,
     /// Long-horizon window age. Samples older than this are evicted on
     /// every tick. Sets the memory of the baseline statistic — too short
     /// and the baseline drifts up under sustained load, losing the anchor;
@@ -104,7 +124,7 @@ pub struct VegasConfig {
     pub short_window: std::time::Duration,
 }
 
-impl Default for VegasConfig {
+impl Default for RatioConfig {
     fn default() -> Self {
         Self {
             initial_cwnd: 1,
@@ -114,22 +134,30 @@ impl Default for VegasConfig {
             beta: 1.5,
             increase_step: 1,
             decrease_step: 1,
-            percentile: 0.5,
+            baseline_percentile: 0.5,
+            current_percentile: 0.5,
             long_window: std::time::Duration::from_secs(10),
             short_window: std::time::Duration::from_secs(1),
         }
     }
 }
 
-/// Adaptive controller driven by matched-percentile latency comparison.
+/// Adaptive controller driven by a two-window latency-percentile ratio.
 ///
-/// The same percentile is computed over a long-horizon sample window
-/// (baseline) and a short-horizon subset (current). The ratio of the two
-/// is the congestion signal: at steady state both estimates converge on
-/// the same population statistic so the ratio approaches 1.0; a recent
-/// distribution shift toward slower latencies pushes the ratio above 1.0.
-pub struct VegasController {
-    config: VegasConfig,
+/// The configured `baseline_percentile` is computed over the long-horizon
+/// sample window and the configured `current_percentile` over a
+/// short-horizon subset. The ratio (`current / baseline`) is the
+/// congestion signal. With matched percentiles
+/// (`baseline_percentile == current_percentile`) both windows estimate
+/// the same population statistic, so the ratio sits near 1.0 at steady
+/// state and a recent distribution shift toward slower latencies pushes
+/// it above 1.0. With cross percentiles
+/// (`baseline_percentile < current_percentile`) the ratio measures the
+/// inter-quantile spread of the recent distribution, which grows with
+/// queueing — a level signal rather than a change signal. See the
+/// module-level docstring for the trade-offs between the two modes.
+pub struct RatioController {
+    config: RatioConfig,
     cwnd: u32,
     /// Sliding window of recent samples, used to derive both baseline and
     /// current percentiles each tick. Capped at [`SAMPLE_WINDOW_CAP`]
@@ -151,14 +179,14 @@ pub struct VegasController {
     /// `total_samples` as of the previous tick. Used to detect ticks
     /// that fire without any new sample arriving since the last
     /// decision — those must hold `cwnd` rather than re-applying the
-    /// same matched-percentile decision over and over. With a
-    /// short-window of 1s and a tick cadence of 50ms, a single sample
-    /// otherwise drives ~20 grow / shrink steps before it ages out.
+    /// same ratio decision over and over. With a short-window of 1s
+    /// and a tick cadence of 50ms, a single sample otherwise drives
+    /// ~20 grow / shrink steps before it ages out.
     last_tick_total_samples: u64,
 }
 
-impl VegasController {
-    pub fn new(config: VegasConfig) -> Self {
+impl RatioController {
+    pub fn new(config: RatioConfig) -> Self {
         let cwnd = config
             .initial_cwnd
             .clamp(config.min_cwnd.max(1), config.max_cwnd.max(1));
@@ -210,7 +238,7 @@ fn percentile_via_select(samples: &mut [u64], percentile: f64) -> u64 {
     *samples.select_nth_unstable(idx).1
 }
 
-impl Controller for VegasController {
+impl Controller for RatioController {
     fn on_sample(&mut self, sample: &Sample) {
         // u64 nanos fit any realistic latency; saturate defensively.
         // Clamp to >= 1 so a 0-duration sample (possible when `Instant::now()`
@@ -250,14 +278,14 @@ impl Controller for VegasController {
             self.current_latency_ns = None;
             return Decision::with_concurrency(self.cwnd);
         }
-        // Baseline: percentile over the full long-horizon window.
+        // Baseline: `baseline_percentile` over the full long-horizon window.
         // Materialize a local copy because the deque must stay
         // time-ordered for age-out, but `select_nth_unstable` reorders
         // the slice in place.
         let mut all_lat: Vec<u64> = self.samples.iter().map(|&(ns, _)| ns).collect();
-        let baseline = percentile_via_select(&mut all_lat, self.config.percentile);
+        let baseline = percentile_via_select(&mut all_lat, self.config.baseline_percentile);
         self.baseline_latency_ns = Some(baseline);
-        // Current: same percentile over the short-horizon subset.
+        // Current: `current_percentile` over the short-horizon subset.
         // `checked_sub` underflows when `short_window` exceeds the
         // duration since the `Instant` epoch (only seen in tests with
         // freshly minted clocks). Fall back to the oldest retained
@@ -286,7 +314,7 @@ impl Controller for VegasController {
             self.current_latency_ns = None;
             return Decision::with_concurrency(self.cwnd);
         }
-        let current = percentile_via_select(&mut short_lat, self.config.percentile);
+        let current = percentile_via_select(&mut short_lat, self.config.current_percentile);
         self.current_latency_ns = Some(current);
         // Adjust `cwnd` only on ticks that consumed at least one fresh
         // sample. Without this guard, a single sample observed late in
@@ -314,7 +342,7 @@ impl Controller for VegasController {
         Decision::with_concurrency(self.cwnd)
     }
     fn name(&self) -> &'static str {
-        "vegas"
+        "ratio"
     }
     fn snapshot(&self) -> ControllerSnapshot {
         ControllerSnapshot {
@@ -342,27 +370,27 @@ mod tests {
 
     #[test]
     fn initial_cwnd_is_clamped_into_bounds() {
-        let c = VegasController::new(VegasConfig {
+        let c = RatioController::new(RatioConfig {
             initial_cwnd: 1000,
             min_cwnd: 1,
             max_cwnd: 64,
-            ..VegasConfig::default()
+            ..RatioConfig::default()
         });
         assert_eq!(c.cwnd(), 64);
-        let c = VegasController::new(VegasConfig {
+        let c = RatioController::new(RatioConfig {
             initial_cwnd: 0,
             min_cwnd: 4,
             max_cwnd: 64,
-            ..VegasConfig::default()
+            ..RatioConfig::default()
         });
         assert_eq!(c.cwnd(), 4);
     }
 
     #[test]
     fn without_samples_tick_holds_cwnd() {
-        let mut c = VegasController::new(VegasConfig {
+        let mut c = RatioController::new(RatioConfig {
             initial_cwnd: 10,
-            ..VegasConfig::default()
+            ..RatioConfig::default()
         });
         let now = std::time::Instant::now();
         for _ in 0..5 {
@@ -376,9 +404,10 @@ mod tests {
         // baseline is in the fast bucket; at p50 it's still fast (median
         // of 100 = 50th smallest, which is in the fast 90); at p95 it's
         // the slow bucket because the upper 10% is all slow.
-        let mut c = VegasController::new(VegasConfig {
-            percentile: 0.95,
-            ..VegasConfig::default()
+        let mut c = RatioController::new(RatioConfig {
+            baseline_percentile: 0.95,
+            current_percentile: 0.95,
+            ..RatioConfig::default()
         });
         let t0 = std::time::Instant::now();
         for i in 0..90 {
@@ -407,7 +436,7 @@ mod tests {
         // The reason we picked matched percentiles in the first place:
         // outliers don't pin the baseline. p50 of 90 fast + 10 slow is
         // squarely in the fast bucket.
-        let mut c = VegasController::new(VegasConfig::default());
+        let mut c = RatioController::new(RatioConfig::default());
         let t0 = std::time::Instant::now();
         for i in 0..90 {
             c.on_sample(&sample(
@@ -435,13 +464,13 @@ mod tests {
         // The matched-percentile ratio is ~1.0, which is < alpha (1.1) so
         // cwnd grows. This is exactly the regime the new design wants —
         // no false "queueing" signal from natural variance.
-        let mut c = VegasController::new(VegasConfig {
+        let mut c = RatioController::new(RatioConfig {
             initial_cwnd: 5,
             increase_step: 1,
             max_cwnd: 1000,
             short_window: std::time::Duration::from_millis(500),
             long_window: std::time::Duration::from_secs(5),
-            ..VegasConfig::default()
+            ..RatioConfig::default()
         });
         let t0 = std::time::Instant::now();
         // Spread samples across the long window so both short and long
@@ -469,13 +498,13 @@ mod tests {
         // slow (10ms) samples; short window holds only the slow recent
         // samples. The matched percentile in the short window is much
         // higher, ratio > beta, so cwnd shrinks.
-        let mut c = VegasController::new(VegasConfig {
+        let mut c = RatioController::new(RatioConfig {
             initial_cwnd: 50,
             decrease_step: 2,
             beta: 1.5,
             short_window: std::time::Duration::from_millis(500),
             long_window: std::time::Duration::from_secs(10),
-            ..VegasConfig::default()
+            ..RatioConfig::default()
         });
         let t0 = std::time::Instant::now();
         // Phase 1: fast historical samples spread over 5 seconds.
@@ -501,13 +530,13 @@ mod tests {
 
     #[test]
     fn holds_cwnd_when_ratio_between_alpha_and_beta() {
-        let mut c = VegasController::new(VegasConfig {
+        let mut c = RatioController::new(RatioConfig {
             initial_cwnd: 10,
             alpha: 1.1,
             beta: 1.5,
             short_window: std::time::Duration::from_millis(500),
             long_window: std::time::Duration::from_secs(5),
-            ..VegasConfig::default()
+            ..RatioConfig::default()
         });
         let t0 = std::time::Instant::now();
         // 4500ms of historical samples at 2ms.
@@ -535,14 +564,14 @@ mod tests {
 
     #[test]
     fn cwnd_respects_min_floor() {
-        let mut c = VegasController::new(VegasConfig {
+        let mut c = RatioController::new(RatioConfig {
             initial_cwnd: 3,
             min_cwnd: 2,
             decrease_step: 10,
             beta: 1.1,
             short_window: std::time::Duration::from_millis(200),
             long_window: std::time::Duration::from_millis(2_000),
-            ..VegasConfig::default()
+            ..RatioConfig::default()
         });
         let t0 = std::time::Instant::now();
         // Establish a fast baseline.
@@ -564,13 +593,13 @@ mod tests {
 
     #[test]
     fn cwnd_respects_max_ceiling() {
-        let mut c = VegasController::new(VegasConfig {
+        let mut c = RatioController::new(RatioConfig {
             initial_cwnd: 4,
             max_cwnd: 6,
             increase_step: 10,
             short_window: std::time::Duration::from_millis(200),
             long_window: std::time::Duration::from_secs(2),
-            ..VegasConfig::default()
+            ..RatioConfig::default()
         });
         let t0 = std::time::Instant::now();
         for i in 0..200 {
@@ -583,11 +612,11 @@ mod tests {
 
     #[test]
     fn baseline_window_ages_out_and_is_re_established() {
-        let mut c = VegasController::new(VegasConfig {
+        let mut c = RatioController::new(RatioConfig {
             initial_cwnd: 10,
             long_window: std::time::Duration::from_millis(100),
             short_window: std::time::Duration::from_millis(50),
-            ..VegasConfig::default()
+            ..RatioConfig::default()
         });
         let t0 = std::time::Instant::now();
         c.on_sample(&sample(t0, std::time::Duration::from_micros(500)));
@@ -619,11 +648,11 @@ mod tests {
         // still inside the long window — the baseline is still valid;
         // we just have nothing fresh to compare against. The controller
         // must hold cwnd rather than fabricating a comparison.
-        let mut c = VegasController::new(VegasConfig {
+        let mut c = RatioController::new(RatioConfig {
             initial_cwnd: 10,
             long_window: std::time::Duration::from_secs(10),
             short_window: std::time::Duration::from_millis(500),
-            ..VegasConfig::default()
+            ..RatioConfig::default()
         });
         let t0 = std::time::Instant::now();
         c.on_sample(&sample(t0, std::time::Duration::from_millis(2)));
@@ -646,11 +675,11 @@ mod tests {
         // — and either way not drive a principled cwnd decision.
         // `on_sample` clamps latency to >= 1ns, so the ratio stays
         // finite and cwnd follows the normal trajectory.
-        let mut c = VegasController::new(VegasConfig {
+        let mut c = RatioController::new(RatioConfig {
             initial_cwnd: 10,
             min_cwnd: 1,
             max_cwnd: 100,
-            ..VegasConfig::default()
+            ..RatioConfig::default()
         });
         let start = std::time::Instant::now();
         for i in 0..10 {
@@ -678,7 +707,7 @@ mod tests {
         // capacity (rather than a looser `<= 2× cap` bound) catches the
         // post-push pop regression: at the cap a post-push push_back
         // would round up to the next power of two, doubling capacity.
-        let mut c = VegasController::new(VegasConfig::default());
+        let mut c = RatioController::new(RatioConfig::default());
         let initial_capacity = c.samples.capacity();
         let start = std::time::Instant::now();
         let n = SAMPLE_WINDOW_CAP + 10_000;
@@ -710,11 +739,11 @@ mod tests {
         // older completion time can land in the deque after a newer one.
         // The age-out path must still evict every stale entry — not just
         // a contiguous prefix at the front.
-        let mut c = VegasController::new(VegasConfig {
+        let mut c = RatioController::new(RatioConfig {
             initial_cwnd: 10,
             long_window: std::time::Duration::from_millis(100),
             short_window: std::time::Duration::from_millis(50),
-            ..VegasConfig::default()
+            ..RatioConfig::default()
         });
         let t0 = std::time::Instant::now();
         let old_offset = std::time::Duration::from_millis(10);
@@ -751,16 +780,16 @@ mod tests {
     fn cwnd_does_not_drift_on_ticks_without_fresh_samples() {
         // Regression: with short_window = 1s and tick = 50ms, a single
         // sample is visible to ~20 consecutive ticks. Each tick was
-        // re-applying the same matched-percentile decision and adjusting
-        // cwnd, so one sample in the right phase drove cwnd by ~20
-        // steps even though no new operation completed. Only ticks
-        // that consumed a new sample may adjust cwnd.
-        let mut c = VegasController::new(VegasConfig {
+        // re-applying the same ratio decision and adjusting cwnd, so
+        // one sample in the right phase drove cwnd by ~20 steps even
+        // though no new operation completed. Only ticks that consumed
+        // a new sample may adjust cwnd.
+        let mut c = RatioController::new(RatioConfig {
             initial_cwnd: 10,
             increase_step: 1,
             short_window: std::time::Duration::from_secs(1),
             long_window: std::time::Duration::from_secs(10),
-            ..VegasConfig::default()
+            ..RatioConfig::default()
         });
         let t0 = std::time::Instant::now();
         // Single sample. Both baseline and current percentiles agree
@@ -791,11 +820,11 @@ mod tests {
         // include the current percentile too — even if no fresh sample
         // arrived since the last tick (in which case cwnd holds, but
         // the current value is still observable in the snapshot).
-        let mut c = VegasController::new(VegasConfig {
+        let mut c = RatioController::new(RatioConfig {
             initial_cwnd: 5,
             short_window: std::time::Duration::from_secs(1),
             long_window: std::time::Duration::from_secs(10),
-            ..VegasConfig::default()
+            ..RatioConfig::default()
         });
         let t0 = std::time::Instant::now();
         c.on_sample(&sample(t0, std::time::Duration::from_millis(3)));
@@ -812,7 +841,7 @@ mod tests {
 
     #[test]
     fn snapshot_reports_total_samples_seen() {
-        let mut c = VegasController::new(VegasConfig::default());
+        let mut c = RatioController::new(RatioConfig::default());
         assert_eq!(c.snapshot().samples_seen, 0);
         let start = std::time::Instant::now();
         for _ in 0..7 {

@@ -71,7 +71,7 @@ pub struct CommonArgs {
     )]
     pub max_blocking_threads: usize,
     // Congestion control (experimental, opt-in)
-    /// Enable adaptive metadata-ops throttling (Vegas-style latency controller)
+    /// Enable adaptive metadata-ops throttling (latency-ratio controller)
     #[arg(long, help_heading = "Congestion control")]
     pub auto_meta_throttle: bool,
     /// Initial concurrency window for adaptive metadata throttle
@@ -99,8 +99,12 @@ pub struct CommonArgs {
     )]
     pub auto_meta_max_cwnd: u32,
     /// Latency ratio below which cwnd grows (current / baseline).
-    /// Default 1.1: with matched-percentile signal, ratio sits near 1.0
-    /// at steady state, so a tight alpha is the right scale.
+    /// Default 1.1. `alpha` may be set below 1.0 in passive mode (grow
+    /// only when recent is meaningfully faster than baseline). The
+    /// natural scale depends on the percentile pair: matched percentiles
+    /// produce a steady-state ratio of 1.0; cross percentiles produce a
+    /// ratio above 1.0 set by the inter-quantile spread of the latency
+    /// distribution.
     #[arg(
         long,
         default_value = "1.1",
@@ -116,17 +120,29 @@ pub struct CommonArgs {
         help_heading = "Congestion control (advanced)"
     )]
     pub auto_meta_beta: f64,
-    /// Percentile (in `(0.0, 1.0)`) used to summarize each sample window.
-    /// The same percentile is used for both long-horizon (baseline) and
-    /// short-horizon (current) statistics — see `--auto-meta-long-window`
-    /// and `--auto-meta-short-window`.
+    /// Percentile (in `[0.0, 1.0)`) applied to the long-horizon window
+    /// to derive the baseline statistic. With matched percentiles
+    /// (`baseline == current`) the steady-state ratio sits near 1.0;
+    /// with cross percentiles (`baseline < current`) the ratio
+    /// measures the inter-quantile spread of the latency distribution
+    /// and grows under queueing.
     #[arg(
         long,
         default_value = "0.5",
         value_name = "F",
         help_heading = "Congestion control (advanced)"
     )]
-    pub auto_meta_percentile: f64,
+    pub auto_meta_baseline_percentile: f64,
+    /// Percentile (in `[0.0, 1.0)`) applied to the short-horizon window
+    /// to derive the current statistic. Must be `>= baseline percentile`.
+    /// See `--auto-meta-baseline-percentile`.
+    #[arg(
+        long,
+        default_value = "0.5",
+        value_name = "F",
+        help_heading = "Congestion control (advanced)"
+    )]
+    pub auto_meta_current_percentile: f64,
     /// How much to grow cwnd on each under-shoot tick
     #[arg(
         long,
@@ -211,7 +227,8 @@ impl CommonArgs {
                 beta: self.auto_meta_beta,
                 increase_step: self.auto_meta_increase_step,
                 decrease_step: self.auto_meta_decrease_step,
-                percentile: self.auto_meta_percentile,
+                baseline_percentile: self.auto_meta_baseline_percentile,
+                current_percentile: self.auto_meta_current_percentile,
                 long_window: self.auto_meta_long_window.into(),
                 short_window: self.auto_meta_short_window.into(),
                 tick_interval: self.auto_meta_tick_interval.into(),

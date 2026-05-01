@@ -24,9 +24,10 @@
 //! - [`FixedController`] — honors a static concurrency/rate budget. Mirrors
 //!   the existing manual `--ops-throttle` / `--iops-throttle` knobs and is
 //!   the regression baseline for adaptive algorithms.
-//! - [`VegasController`] — adaptive controller that tracks queueing-delay
-//!   inflation (ratio of smoothed current latency to observed minimum)
-//!   and adjusts the concurrency cap to stay at the onset of inflation.
+//! - [`RatioController`] — adaptive controller that tracks queueing-delay
+//!   inflation by comparing two windowed latency percentiles (current vs
+//!   baseline) and adjusts the concurrency cap to stay at the onset of
+//!   inflation. Inspired by TCP Vegas.
 //!
 //! Additional adaptive variants (for example BBR-style) can be layered
 //! on the same trait without changes to the enforcement or control-loop
@@ -43,9 +44,9 @@ mod controller;
 mod fixed;
 mod measurement;
 mod noop;
+mod ratio;
 pub mod sim;
 pub mod testing;
-mod vegas;
 
 pub use control_loop::{ControlUnit, DEFAULT_TICK_INTERVAL, RoutingSink, RoutingSinkBuilder};
 pub use controller::{Controller, ControllerSnapshot, Decision, Outcome, Sample};
@@ -55,4 +56,4 @@ pub use measurement::{
     clear_sample_sink, install_sample_sink,
 };
 pub use noop::NoopController;
-pub use vegas::{VegasConfig, VegasController};
+pub use ratio::{RatioConfig, RatioController};

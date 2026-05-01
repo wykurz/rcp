@@ -37,8 +37,18 @@ The observation is that the filesystem itself tells us how hard we can
 push: its response latency inflates when we approach saturation. If we
 watch that signal in real time and adjust our concurrency to stay at the
 onset of inflation, we stay near peak throughput without overshooting.
-This is the same idea TCP Vegas uses for network congestion control,
-adapted to filesystem metadata operations.
+The design draws on a lineage of latency-based congestion control
+from networking — TCP Vegas (Brakmo & Peterson, 1995), CoDel (Nichols
+& Jacobson, 2012), and BBR (Cardwell et al, 2017) all watch some
+form of latency-vs-baseline signal and adjust an outbound rate or
+window in response. The controller here adapts that idea to
+filesystem metadata operations, with two notable differences from
+the classical Vegas shape covered in the [The Control Signal][cs]
+section: it summarizes each window with a configurable percentile
+rather than min/mean, and it allows the baseline and current
+percentiles to differ to encode the inter-quantile spread directly.
+
+[cs]: #the-control-signal
 
 ## Goals and Non-Goals
 
@@ -49,8 +59,8 @@ adapted to filesystem metadata operations.
 - Keep the default behavior unchanged — congestion control is opt-in.
 - Expose every tuning knob so the feature can be evaluated and tuned in
   the field without recompiling.
-- Make the control algorithm swappable; do not bake Vegas-specific
-  assumptions into the rest of the stack.
+- Make the control algorithm swappable; do not bake controller-
+  specific assumptions into the rest of the stack.
 
 **Non-goals (for this release):**
 
@@ -143,8 +153,8 @@ So:
   unpredictably. Latency moves continuously and is cheaper to read:
   every op produces one sample.
 
-The single control knob throughout this document — **`cwnd`** (Vegas's
-"congestion window") — is exactly the maximum number of in-flight
+The single control knob throughout this document — **`cwnd`** (the
+TCP "congestion window") — is exactly the maximum number of in-flight
 operations the controller will permit at any instant. We use `cwnd`,
 "concurrency cap", and "max in-flight" interchangeably; they are the
 same number, just expressed in TCP terminology vs. systems terminology.
@@ -153,42 +163,80 @@ same number, just expressed in TCP terminology vs. systems terminology.
 
 The algorithm's job is to find a `cwnd` that saturates the bottleneck
 without queueing. It reasons about two derived quantities computed
-from the same per-op latency probes — at the *same percentile* in two
-different time windows:
+from the same per-op latency probes — a *baseline* percentile over a
+long time window and a *current* percentile over a short subset:
 
-- **Baseline latency** — the configured percentile (default p50) over
-  a long-horizon sample window (default 10s). This is the long-memory
-  reference: the typical fast / median latency over recent history.
-- **Current latency** — the same percentile computed over a short-
-  horizon subset (default 1s) of the same buffer. This is the recent
+- **Baseline latency** — `baseline_percentile` (default p50) over a
+  long-horizon sample window (default 10s). The long-memory reference.
+- **Current latency** — `current_percentile` (default p50) over a
+  short-horizon subset (default 1s) of the same buffer. The recent
   estimate.
 
-Their ratio is the congestion signal:
+The two percentiles are independent knobs. Their ratio is the
+congestion signal:
 
 ```
   ratio  =  current / baseline
 ```
 
-When the offered load is steady the two windows estimate the same
-population statistic, and the ratio sits at ~1.0 *regardless* of how
-heavy-tailed the per-op latency distribution is. A non-1.0 ratio means
-the recent-sample distribution has shifted — exactly the queue
-build-up signal we want to act on. So the regime we care about is the
-strip between 1.0 and "very large":
+There are two natural operating modes, depending on whether the
+percentiles are equal or staggered.
+
+### Matched percentiles (`baseline == current`)
+
+Default. Both windows summarize the same statistic (e.g. p50). When
+the offered load is steady the two windows estimate the same
+population statistic and the ratio stays near 1.0 *regardless* of
+how heavy-tailed the per-op latency distribution is (with finite
+windows the ratio fluctuates around 1.0 within sampling noise; the
+larger the window relative to per-op variance, the tighter the
+fluctuation). Sustained deviations away from 1.0 reflect a shift
+in the recent distribution relative to history — which is what we
+want to act on.
+
+Strength: distribution shape cancels, so default `alpha` / `beta` are
+universal — they don't need to be retuned per filesystem or per
+syscall. Weakness: once both windows have equilibrated to a heavily-
+loaded distribution, the ratio is back at 1.0 and the controller has
+no signal that it's currently overloading the filesystem — it can
+only see *changes* in load, not steady-state queueing.
+
+### Cross percentiles (`baseline < current`)
+
+Set the two percentiles asymmetrically (e.g. baseline at p40, current
+at p60). At steady state both windows still estimate the same
+population, but the ratio now compares two different points on that
+distribution — the inter-quantile spread. Queueing fattens the upper
+tail asymmetrically, so spread grows with offered load even at steady
+state. The ratio rides above 1.0 by an amount that tracks the level
+of congestion, not just changes in it.
+
+Strength: preserves a signal at steady-state heavy load that matched
+mode loses. Weakness: the steady-state ratio depends on the specific
+syscall's latency distribution shape, so `alpha` / `beta` may need
+per-filesystem or per-syscall tuning.
+
+### The hold band
+
+Either way, the control law treats the strip around the steady-state
+ratio as the hold band:
 
 ```
        latency ratio
               │
-   beta ──────┤              ┌── shrink cwnd ──┐
-              │              │                 │
-              │              │                 │
-   alpha ─────┤   ┌── hold ──┤
-              │   │
-     1.0  ────┤───┘
-              │     grow cwnd
+   beta ──────┤                       ┌── shrink cwnd ──┐
+              │                       │                 │
+              │                       │                 │
+   alpha ─────┤    ┌─── hold ─────────┤
+              │    │
+              │    │   grow cwnd
               │
               └───────────────────────────────── time
 ```
+
+For matched percentiles `alpha` typically straddles 1.0; for cross
+percentiles both `alpha` and `beta` typically sit above 1.0, set by
+the natural inter-quantile spread of the distribution.
 
 ## Why Our Own Load Doesn't Skew the Signal
 
@@ -198,18 +246,20 @@ own queueing. Won't the baseline itself drift up to match — leaving us
 with a controller that treats the inflated latency as the new normal
 and never shrinks?
 
-The matched-window design addresses this directly:
+The two-window design addresses this from two complementary angles
+depending on which mode is active:
 
-1. **Baseline and current are the same statistic over different time
-   horizons.** Each tick the controller takes the configured percentile
-   (p50 by default) of the long sample window (10s) as the baseline
-   and the same percentile of the short window (1s) as the current
-   estimate. When the per-op latency distribution is stationary, both
-   estimates converge on the same population value and the ratio sits
-   at exactly 1.0. The natural per-op variance of real filesystems —
-   variance that routinely spans an order of magnitude on a Weka or
-   Lustre mount even on an idle metadata path — cancels out because
-   it's present in both windows in the same proportion.
+1. **In matched mode, the distribution shape cancels.** Each tick the
+   controller takes the configured percentile of the long window
+   (10s) as the baseline and the same percentile of the short window
+   (1s) as the current estimate. When the per-op latency distribution
+   is stationary, both estimates converge on the same population
+   value and the ratio stays near 1.0 (finite-window noise gives
+   small per-tick fluctuations). The natural per-op
+   variance of real filesystems — variance that routinely spans an
+   order of magnitude on a Weka or Lustre mount even on an idle
+   metadata path — cancels out because it's present in both windows
+   in the same proportion.
 
    This is the key contrast with a baseline-vs-mean shape (the prior
    p10 / EWMA design): mean and p10 of a heavy-tailed distribution
@@ -220,7 +270,18 @@ The matched-window design addresses this directly:
    loose thresholds left a wide hold band where genuine load growth
    could not be distinguished from variance.
 
-2. **The control law shrinks `cwnd` as soon as the recent distribution
+2. **In cross mode, the inter-quantile spread tracks queueing
+   directly.** Setting baseline at a lower percentile and current at
+   a higher one (e.g. p40 / p60) makes the ratio a measure of the
+   spread of the recent distribution. Saturation broadens the upper
+   tail more than the lower decile — the lower decile sits near the
+   bare service time even at high `cwnd` because the fastest paths
+   through the metadata server still hit cache, while the upper tail
+   grows with queue depth. So the spread, and therefore the ratio,
+   rises with offered load and stays elevated until `cwnd` is pulled
+   back enough to drain the queue.
+
+3. **The control law shrinks `cwnd` as soon as the recent distribution
    shifts.** When the offered load increases, the short window
    captures the shift before the long window does. Even if both
    eventually equilibrate, the transient `ratio > beta` shrinks `cwnd`
@@ -229,13 +290,13 @@ The matched-window design addresses this directly:
    latency samples enter the short window and the ratio drops back —
    the next tick can grow again.
 
-3. **The window is bounded.** Samples older than `long_window` (default
+4. **The window is bounded.** Samples older than `long_window` (default
    10s) are evicted on every tick, so a one-time spike doesn't pin
    the baseline forever. If the long window empties entirely under
    sustained saturation, both the baseline and the current statistic
    reset to `None` and the controller holds `cwnd` until fresh samples
    arrive — preventing a window of uniformly inflated samples from
-   reading as "uncongested" via the matched-percentile cancellation.
+   reading as "uncongested" via cancellation.
 
 ## The Control Law
 
@@ -251,15 +312,33 @@ regions and applies a fixed step to `cwnd`:
 ```
 
 Defaults: `alpha = 1.10`, `beta = 1.50`, `increase_step =
-decrease_step = 1`. Each step is then clamped to `[min_cwnd,
-max_cwnd]`. The thresholds sit close to 1.0 because the matched-
-percentile signal cancels distribution shape: at steady state the
-ratio rides at ~1.0 regardless of how heavy-tailed the per-op latency
-distribution is, so `alpha = 1.10` cleanly says "grow whenever the
-recent distribution is at most 10% slower than the long-horizon one"
-and `beta = 1.50` says "shrink when the recent distribution is at
-least 50% slower" — both genuine queue-build-up signals rather than
-noise-floor artifacts.
+decrease_step = 1`, with both percentiles at 0.5 (matched p50). Each
+step is clamped to `[min_cwnd, max_cwnd]`.
+
+The only hard invariant on the thresholds is `0 < alpha < beta`. The
+*natural* placement of `alpha` and `beta` relative to 1.0 depends on
+the percentile pair:
+
+- **Matched percentiles** produce a steady-state ratio near 1.0
+  (modulo finite-window noise). With `alpha > 1.0` the controller
+  is in *active* mode — at steady state it sits in the grow region,
+  climbing until queueing pushes the ratio past `beta`. With
+  `alpha < 1.0 < beta` it is in *passive* mode — at steady state
+  it holds, growing only when the recent distribution is
+  meaningfully *faster* than baseline (which happens during
+  transient improvements, e.g. when other clients drop off).
+- **Cross percentiles** produce a steady-state ratio above 1.0 set
+  by the inter-quantile spread of the per-syscall latency
+  distribution. Both `alpha` and `beta` typically sit above 1.0,
+  bracketing the workload's natural spread.
+
+The defaults — `alpha = 1.10`, `beta = 1.50`, both percentiles at
+p50 — put the controller in active matched mode: at steady state
+it climbs until queueing inflates the ratio past 1.5. That makes it
+fast at finding the saturation knee but inherently overshoots; for
+"good neighbor" deployments either lower `alpha` below 1.0 (passive
+matched mode) or stagger the percentiles (cross mode) and re-bracket
+`alpha` / `beta` around the workload's idle spread.
 
 A few worked examples make the shape concrete. Assume a 0.5ms baseline
 percentile, default thresholds, and `cwnd = 20` going into the tick:
@@ -280,21 +359,24 @@ percentile, default thresholds, and `cwnd = 20` going into the tick:
 by exactly the same one step as a ratio of 1.51. Sustained inflation
 drives faster *effective* shrinkage because the ratio stays above
 `beta` over many consecutive ticks — but each individual tick still
-takes one step. This is the classic Vegas shape: simpler control law,
-less prone to oscillation under noisy latency than a gain-tuned PID.
+takes one step. This binary-trigger shape, inherited from TCP Vegas,
+keeps the control law simple and less prone to oscillation under
+noisy latency than a gain-tuned PID.
 
-Second, **`ratio < 1.0` is benign and treated as growth headroom.**
-When the recent samples are *faster* than the long-horizon ones the
-filesystem just got less loaded; the controller pushes `cwnd` up to
-take advantage of it.
+Second, with the active defaults `ratio < 1.0` is treated as growth
+headroom. When `alpha` is set below 1.0 (passive matched mode) the
+table flips at that point: a ratio of 0.80 becomes hold rather than
+grow, because the recent distribution is faster than baseline but
+not by enough to clear the passive growth threshold.
 
 The "responsiveness" of the controller is shaped by these knobs in
 combination:
 
 - `--auto-meta-tick-interval` (how often the binning above is
   evaluated; default 50 ms);
-- `--auto-meta-percentile` (the percentile used in both windows;
-  default 0.5 / median);
+- `--auto-meta-baseline-percentile` /
+  `--auto-meta-current-percentile` (the percentiles used in the
+  long and short windows; defaults 0.5 / 0.5 — matched median);
 - `--auto-meta-long-window` / `--auto-meta-short-window` (how much
   history is used for each estimate; defaults 10s / 1s);
 - `--auto-meta-increase-step` / `--auto-meta-decrease-step` (the per-
@@ -351,8 +433,8 @@ What "wide coverage" means concretely:
   walk-side load on a fragile NAS, reach for `--ops-throttle`.
 - **Not probed by design — data path.** The read-loop and write-loop
   inside the copy pipeline, and `tokio::fs::copy` itself. Bandwidth-
-  bound, not service-time-bound; a Vegas-style controller doesn't fit.
-  See [Pluggability](#pluggability) for the BBR direction.
+  bound, not service-time-bound; a latency-ratio controller doesn't
+  fit. See [Pluggability](#pluggability) for the BBR direction.
 
 ## One Controller per (Side, Syscall)
 
@@ -416,7 +498,7 @@ in-flight concurrency independently, but the global ops-throttle
 (rate-per-second) is shared across the process. Only the
 `(Destination, Stat)` controller drives that single rate gate by
 convention; the others apply concurrency only. The current
-`VegasController` doesn't emit rate decisions, so this choice is
+`RatioController` doesn't emit rate decisions, so this choice is
 forward-looking — if a rate-aware controller (BBR-style, …) is
 swapped in later, exactly one of them must own the global rate gate.
 
@@ -519,8 +601,8 @@ responses on each side.
 ## Tuning and Observability
 
 The controller exposes every tunable as a CLI flag — initial, minimum,
-and maximum cwnd, the grow/shrink thresholds, the percentile applied
-to each window, the long / short window durations, per-tick step sizes,
+and maximum cwnd, the grow/shrink thresholds, the baseline and current
+percentiles, the long / short window durations, per-tick step sizes,
 and the control-loop tick cadence. Defaults are conservative;
 aggressive-but-sensible tuning comes from field measurements.
 
@@ -565,7 +647,15 @@ The algorithm layer is behind a single trait. Shipping today:
 - **Fixed**: emits a constant cap. Regression baseline when comparing
   adaptive algorithms; also useful as an explicit "concurrency ceiling"
   knob.
-- **Vegas-style**: the adaptive controller described above.
+- **Latency-ratio** (`RatioController`): the adaptive controller
+  described above. Inspired by TCP Vegas's
+  current-vs-baseline-RTT signal, with two extensions: each window
+  is summarized by a configurable percentile rather than by min/mean,
+  and the baseline and current percentiles can differ to encode the
+  inter-quantile spread of the latency distribution as the queueing
+  signal. Adjacent precedents in the wider literature: CoDel uses
+  a single-percentile (min) target detector; BBR tracks windowed
+  max bandwidth and min RTT.
 
 New algorithms plug into the same enforcement machinery and the same
 simulator. BBR-style estimators (tracking bottleneck bandwidth and

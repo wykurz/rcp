@@ -4,23 +4,23 @@
 
 use congestion::sim::{BottleneckModel, ScenarioConfig, run_scenario};
 use congestion::{
-    Controller, Decision, FixedController, NoopController, Outcome, Sample, VegasConfig,
-    VegasController,
+    Controller, Decision, FixedController, NoopController, Outcome, RatioConfig, RatioController,
+    Sample,
 };
 use proptest::prelude::*;
 
-/// Strategy: a `VegasConfig` whose `min_cwnd <= max_cwnd`, with bounds
+/// Strategy: a `RatioConfig` whose `min_cwnd <= max_cwnd`, with bounds
 /// drawn from ranges that make bugs observable (broad enough to explore
 /// clamping, narrow enough to stay fast).
-fn valid_vegas_config() -> impl Strategy<Value = VegasConfig> {
+fn valid_ratio_config() -> impl Strategy<Value = RatioConfig> {
     (1u32..50, 1u32..2000, 1u32..5000).prop_map(|(min_raw, max_raw, initial_raw)| {
         let min = min_raw;
         let max = min.saturating_add(max_raw);
-        VegasConfig {
+        RatioConfig {
             initial_cwnd: initial_raw,
             min_cwnd: min,
             max_cwnd: max,
-            ..VegasConfig::default()
+            ..RatioConfig::default()
         }
     })
 }
@@ -52,7 +52,7 @@ fn sample(start: std::time::Instant, latency_ns: u64, offset_ns: u64) -> Sample 
 }
 
 proptest! {
-    /// Core invariant: a `VegasController`'s emitted cwnd is always within
+    /// Core invariant: a `RatioController`'s emitted cwnd is always within
     /// the configured `[min_cwnd.max(1), max_cwnd]` band, across any
     /// sample/tick sequence — no matter how pathological the latencies.
     ///
@@ -60,11 +60,11 @@ proptest! {
     /// overflow in `saturating_add`/`saturating_sub`, and any code path
     /// that bypasses the clamp on initial_cwnd.
     #[test]
-    fn vegas_cwnd_always_within_configured_bounds(
-        config in valid_vegas_config(),
+    fn ratio_cwnd_always_within_configured_bounds(
+        config in valid_ratio_config(),
         latencies in prop::collection::vec(latency_ns_strategy(), 1..50),
     ) {
-        let mut c = VegasController::new(config);
+        let mut c = RatioController::new(config);
         let start = std::time::Instant::now();
         let expected_min = config.min_cwnd.max(1);
         let expected_max = config.max_cwnd.max(1);
@@ -78,10 +78,10 @@ proptest! {
             // intersperse ticks so the controller has chances to adjust.
             if i % 3 == 2 {
                 let decision = c.on_tick(s.completed_at);
-                // Vegas must always emit concurrency (never rate) and the
-                // value must be within bounds.
+                // The ratio controller must always emit concurrency (never
+                // rate) and the value must be within bounds.
                 prop_assert!(decision.rate_per_sec.is_none());
-                let cwnd = decision.max_in_flight.expect("vegas emits max_in_flight");
+                let cwnd = decision.max_in_flight.expect("ratio emits max_in_flight");
                 prop_assert!(
                     cwnd >= expected_min,
                     "cwnd {cwnd} below min {expected_min} (config={config:?})",
@@ -94,17 +94,17 @@ proptest! {
         }
     }
 
-    /// Vegas must never emit a `rate_per_sec` decision — it's a
-    /// concurrency-based controller, and the Decision contract requires
-    /// the adapter to differentiate rate-only vs concurrency-only
+    /// The ratio controller must never emit a `rate_per_sec` decision —
+    /// it's a concurrency-based controller, and the Decision contract
+    /// requires the adapter to differentiate rate-only vs concurrency-only
     /// controllers by which dimension is `Some`.
     #[test]
-    fn vegas_never_emits_rate_per_sec(
-        config in valid_vegas_config(),
+    fn ratio_never_emits_rate_per_sec(
+        config in valid_ratio_config(),
         latency_ns in latency_ns_strategy(),
         tick_count in 1usize..20,
     ) {
-        let mut c = VegasController::new(config);
+        let mut c = RatioController::new(config);
         let start = std::time::Instant::now();
         for i in 0..tick_count {
             let s = sample(start, latency_ns, i as u64 * 1_000_000);

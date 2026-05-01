@@ -380,7 +380,14 @@ impl RcpdConfig {
             args.push(format!("--auto-meta-max-cwnd={}", auto.max_cwnd));
             args.push(format!("--auto-meta-alpha={}", auto.alpha));
             args.push(format!("--auto-meta-beta={}", auto.beta));
-            args.push(format!("--auto-meta-percentile={}", auto.percentile));
+            args.push(format!(
+                "--auto-meta-baseline-percentile={}",
+                auto.baseline_percentile,
+            ));
+            args.push(format!(
+                "--auto-meta-current-percentile={}",
+                auto.current_percentile,
+            ));
             args.push(format!("--auto-meta-increase-step={}", auto.increase_step));
             args.push(format!("--auto-meta-decrease-step={}", auto.decrease_step));
             args.push(format!(
@@ -546,7 +553,8 @@ mod tests {
             beta: 1.6,
             increase_step: 2,
             decrease_step: 3,
-            percentile: 0.4,
+            baseline_percentile: 0.4,
+            current_percentile: 0.6,
             long_window: std::time::Duration::from_secs(20),
             short_window: std::time::Duration::from_secs(2),
             tick_interval: std::time::Duration::from_millis(75),
@@ -560,7 +568,8 @@ mod tests {
         assert!(has("--auto-meta-max-cwnd=128"));
         assert!(has_prefix("--auto-meta-alpha=1.2"));
         assert!(has_prefix("--auto-meta-beta=1.6"));
-        assert!(has_prefix("--auto-meta-percentile=0.4"));
+        assert!(has_prefix("--auto-meta-baseline-percentile=0.4"));
+        assert!(has_prefix("--auto-meta-current-percentile=0.6"));
         assert!(has("--auto-meta-increase-step=2"));
         assert!(has("--auto-meta-decrease-step=3"));
         assert!(has_prefix("--auto-meta-long-window="));

@@ -135,7 +135,7 @@ async fn copy_emits_one_metadata_sample_per_tree_entry() {
 }
 
 /// End-to-end integration test for the auto-meta-throttle pipeline:
-/// Probe -> RoutingSink -> ControlUnit<VegasController> -> Decision watch.
+/// Probe -> RoutingSink -> ControlUnit<RatioController> -> Decision watch.
 ///
 /// Doesn't drive throttle::set_max_ops_in_flight (that's validated in the
 /// congestion unit tests). Asserts that the full pipeline flows: running
@@ -158,9 +158,9 @@ async fn auto_meta_pipeline_propagates_probes_to_controller() {
         congestion::MetadataOp::Unlink,
     );
     congestion::install_sample_sink(std::sync::Arc::new(builder.build()));
-    let controller = congestion::VegasController::new(congestion::VegasConfig {
+    let controller = congestion::RatioController::new(congestion::RatioConfig {
         initial_cwnd: 5,
-        ..congestion::VegasConfig::default()
+        ..congestion::RatioConfig::default()
     });
     let (unit, decision_rx, mut snapshot_rx) = congestion::ControlUnit::new(
         "pipeline-test",

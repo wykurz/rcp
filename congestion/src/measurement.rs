@@ -36,9 +36,11 @@ pub enum Side {
 /// distributions differ — `stat` (pure lookup) and `unlink` (mutation
 /// plus parent-directory write) hit different code paths on the
 /// metadata server and converge on very different baselines. Mixing
-/// them in one controller pollutes the per-op latency signal and makes
-/// the matched-percentile baseline drift with operation-mix changes
-/// that have nothing to do with congestion.
+/// them in one controller pollutes the per-op latency signal: the
+/// resulting ratio drifts with operation-mix changes that have nothing
+/// to do with congestion (the long-window baseline percentile shifts
+/// as the mix changes, and in cross mode the inter-quantile spread
+/// becomes a function of the mix rather than the load).
 ///
 /// The variants are ordered so they index a fixed-size array when paired
 /// with a [`Side`]; see [`N_META_OPS`].

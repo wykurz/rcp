@@ -85,7 +85,7 @@ impl Decision {
 /// progress bar and other observability surfaces.
 ///
 /// Snapshots are sampled — never authoritative for enforcement. They
-/// expose the same fields a Vegas-style controller reasons about
+/// expose the same fields a ratio-based controller reasons about
 /// (`cwnd`, baseline, current observed latency, sample count) so a
 /// renderer can show *why* the current `cwnd` is what it is. Controllers
 /// without a meaningful internal state (e.g. `Noop`) return
@@ -101,14 +101,15 @@ pub struct ControllerSnapshot {
     /// Current concurrency window the controller would emit on its
     /// next tick. `0` means "no cap configured."
     pub cwnd: u32,
-    /// Long-horizon baseline latency. For matched-percentile controllers
-    /// this is the configured percentile over the long sample window;
-    /// the renderer treats it as the "uncongested floor" reference.
-    /// `Duration::ZERO` if no signal yet.
+    /// Long-horizon baseline latency. For ratio-based controllers
+    /// this is the configured baseline percentile over the long sample
+    /// window; the renderer treats it as the "uncongested floor"
+    /// reference. `Duration::ZERO` if no signal yet.
     pub baseline_latency: std::time::Duration,
-    /// Short-horizon current latency. For matched-percentile controllers
-    /// this is the same percentile computed over the short sample
-    /// window. `Duration::ZERO` if no fresh samples have been observed.
+    /// Short-horizon current latency. For ratio-based controllers
+    /// this is the configured current percentile computed over the
+    /// short sample window. `Duration::ZERO` if no fresh samples have
+    /// been observed.
     pub current_latency: std::time::Duration,
     /// Cumulative number of samples the controller has consumed.
     pub samples_seen: u64,
@@ -134,7 +135,7 @@ pub trait Controller: Send {
     /// layer. The controller must return an absolute limit (not a delta).
     fn on_tick(&mut self, now: std::time::Instant) -> Decision;
     /// Short, stable identifier used in logs and metrics (e.g. "noop",
-    /// "fixed", "vegas").
+    /// "fixed", "ratio").
     fn name(&self) -> &'static str;
     /// Snapshot of the controller's observable state for diagnostics
     /// and progress display. Default returns an empty snapshot, which
