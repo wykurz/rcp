@@ -536,7 +536,16 @@ async fn send_file_tcp(
                 .send_batch_message(&skip_msg)
                 .await?;
             if settings.fail_early {
-                return Err(e.into());
+                // Defense-in-depth: also push to error_collector so
+                // run_source's take_error() catches this even when the
+                // Err return below loses a race against the destination's
+                // DestinationDone (which causes the shutdown drain in
+                // dispatch_control_messages_tcp to swallow this task's
+                // Err). anyhow::Error isn't Clone, so push a formatted
+                // copy and keep the original chain in the Err return.
+                let err: anyhow::Error = e.into();
+                error_collector.push(anyhow::anyhow!("{err:#}"));
+                return Err(err);
             }
             error_collector.push(e.into());
             return Ok(());
@@ -629,7 +638,16 @@ async fn send_files_in_directory_tcp(
                     .await?;
             }
             if settings.fail_early {
-                return Err(e.into());
+                // Same defense-in-depth as the file-open branch in
+                // send_file_tcp: the FileSkipped messages above let the
+                // destination tally to zero and emit DestinationDone,
+                // which can race with the Err return below and cause the
+                // shutdown drain in dispatch_control_messages_tcp to
+                // swallow this task's error. Push a copy into the
+                // collector so run_source's take_error() catches it.
+                let err: anyhow::Error = e.into();
+                error_collector.push(anyhow::anyhow!("{err:#}"));
+                return Err(err);
             }
             error_collector.push(e.into());
             return Ok(());
