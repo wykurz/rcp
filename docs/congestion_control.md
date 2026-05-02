@@ -166,7 +166,7 @@ without queueing. It reasons about two derived quantities computed
 from the same per-op latency probes — a *baseline* percentile over a
 long time window and a *current* percentile over a short subset:
 
-- **Baseline latency** — `baseline_percentile` (default p50) over a
+- **Baseline latency** — `baseline_percentile` (default p10) over a
   long-horizon sample window (default 10s). The long-memory reference.
 - **Current latency** — `current_percentile` (default p50) over a
   short-horizon subset (default 1s) of the same buffer. The recent
@@ -180,11 +180,13 @@ congestion signal:
 ```
 
 There are two natural operating modes, depending on whether the
-percentiles are equal or staggered.
+percentiles are equal or staggered. The shipped defaults stagger them
+(baseline at p10, current at p50) — see the cross-percentile section
+below for why.
 
 ### Matched percentiles (`baseline == current`)
 
-Default. Both windows summarize the same statistic (e.g. p50). When
+Both windows summarize the same statistic (e.g. p50). When
 the offered load is steady the two windows estimate the same
 population statistic and the ratio stays near 1.0 *regardless* of
 how heavy-tailed the per-op latency distribution is (with finite
@@ -203,17 +205,20 @@ only see *changes* in load, not steady-state queueing.
 
 ### Cross percentiles (`baseline < current`)
 
-Set the two percentiles asymmetrically (e.g. baseline at p40, current
-at p60). At steady state both windows still estimate the same
-population, but the ratio now compares two different points on that
-distribution — the inter-quantile spread. Queueing fattens the upper
-tail asymmetrically, so spread grows with offered load even at steady
-state. The ratio rides above 1.0 by an amount that tracks the level
-of congestion, not just changes in it.
+Default. The shipped defaults stagger the two percentiles (baseline
+at p10, current at p50). At steady state both windows still estimate
+the same population, but the ratio now compares two different points
+on that distribution — the inter-quantile spread. Queueing fattens
+the upper tail asymmetrically, so spread grows with offered load even
+at steady state. The ratio rides above 1.0 by an amount that tracks
+the level of congestion, not just changes in it.
 
 Strength: preserves a signal at steady-state heavy load that matched
 mode loses. Weakness: the steady-state ratio depends on the specific
-syscall's latency distribution shape, so `alpha` / `beta` may need
+syscall's latency distribution shape, so `alpha` / `beta` are placed
+relative to that shape rather than around 1.0 — the shipped defaults
+(`alpha = 1.3`, `beta = 1.8`) bracket the typical p10/p50 spread of
+metadata syscalls, but unusually skewed distributions may want
 per-filesystem or per-syscall tuning.
 
 ### The hold band
@@ -234,9 +239,10 @@ ratio as the hold band:
               └───────────────────────────────── time
 ```
 
-For matched percentiles `alpha` typically straddles 1.0; for cross
-percentiles both `alpha` and `beta` typically sit above 1.0, set by
-the natural inter-quantile spread of the distribution.
+For cross percentiles (the default p10/p50) both `alpha` and `beta`
+typically sit above 1.0, set by the natural inter-quantile spread of
+the distribution. For matched percentiles `alpha` typically straddles
+1.0 instead.
 
 ## Why Our Own Load Doesn't Skew the Signal
 
@@ -249,7 +255,26 @@ and never shrinks?
 The two-window design addresses this from two complementary angles
 depending on which mode is active:
 
-1. **In matched mode, the distribution shape cancels.** Each tick the
+1. **In cross mode (the default), the inter-quantile spread tracks
+   queueing directly.** Setting baseline at a lower percentile and
+   current at a higher one (the shipped defaults are p10 / p50)
+   makes the ratio a measure of the spread of the recent
+   distribution. Saturation broadens the upper tail more than the
+   lower decile — the lower decile sits near the bare service time
+   even at high `cwnd` because the fastest paths through the
+   metadata server still hit cache, while the upper tail grows with
+   queue depth. So the spread, and therefore the ratio, rises with
+   offered load and stays elevated until `cwnd` is pulled back enough
+   to drain the queue. This is the key advantage over a baseline-
+   vs-mean shape (the prior p10 / EWMA design): mean and p10 of a
+   heavy-tailed distribution differ by a constant factor that is
+   *purely a property of the distribution shape*, not of load —
+   wasting threshold headroom on shape rather than spending it on
+   the queueing signal. A p10-vs-p50 ratio carries the queueing
+   signal directly because both points move with offered load but
+   the upper one moves faster.
+
+2. **In matched mode, the distribution shape cancels.** Each tick the
    controller takes the configured percentile of the long window
    (10s) as the baseline and the same percentile of the short window
    (1s) as the current estimate. When the per-op latency distribution
@@ -259,27 +284,11 @@ depending on which mode is active:
    variance of real filesystems — variance that routinely spans an
    order of magnitude on a Weka or Lustre mount even on an idle
    metadata path — cancels out because it's present in both windows
-   in the same proportion.
-
-   This is the key contrast with a baseline-vs-mean shape (the prior
-   p10 / EWMA design): mean and p10 of a heavy-tailed distribution
-   differ by a constant factor that is *purely a property of the
-   distribution shape*, not of load. A baseline-vs-mean ratio
-   therefore rides above 1.0 even at idle, forcing loose `alpha` /
-   `beta` thresholds to avoid mistaking shape for queueing — and the
-   loose thresholds left a wide hold band where genuine load growth
-   could not be distinguished from variance.
-
-2. **In cross mode, the inter-quantile spread tracks queueing
-   directly.** Setting baseline at a lower percentile and current at
-   a higher one (e.g. p40 / p60) makes the ratio a measure of the
-   spread of the recent distribution. Saturation broadens the upper
-   tail more than the lower decile — the lower decile sits near the
-   bare service time even at high `cwnd` because the fastest paths
-   through the metadata server still hit cache, while the upper tail
-   grows with queue depth. So the spread, and therefore the ratio,
-   rises with offered load and stays elevated until `cwnd` is pulled
-   back enough to drain the queue.
+   in the same proportion. The trade-off relative to cross mode is
+   that matched mode loses the level signal once both windows have
+   equilibrated to a saturated distribution: the ratio is back at
+   1.0 and the controller can only see *changes* in load, not
+   sustained queueing.
 
 3. **The control law shrinks `cwnd` as soon as the recent distribution
    shifts.** When the offered load increases, the short window
@@ -311,9 +320,9 @@ regions and applies a fixed step to `cwnd`:
        ratio  >  beta       cwnd -= decrease_step    (shrink)
 ```
 
-Defaults: `alpha = 1.10`, `beta = 1.50`, `increase_step =
-decrease_step = 1`, with both percentiles at 0.5 (matched p50). Each
-step is clamped to `[min_cwnd, max_cwnd]`.
+Defaults: `alpha = 1.30`, `beta = 1.80`, `increase_step =
+decrease_step = 1`, with the percentiles staggered at 0.1 / 0.5
+(cross p10/p50). Each step is clamped to `[min_cwnd, max_cwnd]`.
 
 The only hard invariant on the thresholds is `0 < alpha < beta`. The
 *natural* placement of `alpha` and `beta` relative to 1.0 depends on
@@ -332,42 +341,46 @@ the percentile pair:
   distribution. Both `alpha` and `beta` typically sit above 1.0,
   bracketing the workload's natural spread.
 
-The defaults — `alpha = 1.10`, `beta = 1.50`, both percentiles at
-p50 — put the controller in active matched mode: at steady state
-it climbs until queueing inflates the ratio past 1.5. That makes it
-fast at finding the saturation knee but inherently overshoots; for
-"good neighbor" deployments either lower `alpha` below 1.0 (passive
-matched mode) or stagger the percentiles (cross mode) and re-bracket
-`alpha` / `beta` around the workload's idle spread.
+The defaults — `alpha = 1.30`, `beta = 1.80`, baseline at p10 and
+current at p50 — put the controller in cross mode with the hold band
+straddling the typical p10/p50 spread of metadata syscalls. At steady
+state the ratio sits inside `[alpha, beta]` and `cwnd` holds; the
+controller grows when the spread compresses (the recent distribution
+is unusually concentrated near its lower decile, i.e. headroom) and
+shrinks when queueing fattens the upper tail past `beta`. Workloads
+whose idle p10/p50 spread sits well outside this range — extremely
+flat distributions or unusually skewed metadata paths — should
+re-bracket `alpha` / `beta` around the observed idle ratio.
 
-A few worked examples make the shape concrete. Assume a 0.5ms baseline
-percentile, default thresholds, and `cwnd = 20` going into the tick:
+A few worked examples make the shape concrete. Assume a 0.5 ms
+baseline percentile (p10), default thresholds, and `cwnd = 20`
+going into the tick:
 
-| Current percentile | Ratio | Decision | New `cwnd` |
-|--------------------|-------|----------|------------|
-| 0.50 ms            | 1.00  | grow     | 21         |
-| 0.54 ms            | 1.08  | grow     | 21         |
-| 0.55 ms            | 1.10  | hold     | 20 (1.10 == alpha; not below) |
-| 0.65 ms            | 1.30  | hold     | 20         |
-| 0.75 ms            | 1.50  | hold     | 20 (1.50 == beta; not above) |
-| 0.80 ms            | 1.60  | shrink   | 19         |
-| 2.50 ms            | 5.00  | shrink   | 19         |
-| 0.40 ms            | 0.80  | grow     | 21 (current is faster than baseline) |
+| Current percentile (p50) | Ratio | Decision | New `cwnd` |
+|--------------------------|-------|----------|------------|
+| 0.50 ms                  | 1.00  | grow     | 21 (degenerate distribution; spread has compressed) |
+| 0.60 ms                  | 1.20  | grow     | 21         |
+| 0.65 ms                  | 1.30  | hold     | 20 (1.30 == alpha; not below) |
+| 0.75 ms                  | 1.50  | hold     | 20         |
+| 0.90 ms                  | 1.80  | hold     | 20 (1.80 == beta; not above) |
+| 1.00 ms                  | 2.00  | shrink   | 19         |
+| 2.50 ms                  | 5.00  | shrink   | 19         |
+| 0.45 ms                  | 0.90  | grow     | 21 (recent median below long-horizon decile — strong improvement) |
 
 **Two things to notice in this table.** First, the law is a
 *binary trigger*, not a proportional response: a ratio of 5.0 shrinks
-by exactly the same one step as a ratio of 1.51. Sustained inflation
+by exactly the same one step as a ratio of 1.81. Sustained inflation
 drives faster *effective* shrinkage because the ratio stays above
 `beta` over many consecutive ticks — but each individual tick still
 takes one step. This binary-trigger shape, inherited from TCP Vegas,
 keeps the control law simple and less prone to oscillation under
 noisy latency than a gain-tuned PID.
 
-Second, with the active defaults `ratio < 1.0` is treated as growth
-headroom. When `alpha` is set below 1.0 (passive matched mode) the
-table flips at that point: a ratio of 0.80 becomes hold rather than
-grow, because the recent distribution is faster than baseline but
-not by enough to clear the passive growth threshold.
+Second, the natural steady-state ratio is well above 1.0 because the
+defaults are cross (p10 baseline, p50 current). A ratio below 1.0 is
+unusual — it means the recent median is faster than the long-horizon
+p10, which only happens during a clear improvement (e.g. a competing
+client dropped off). The controller treats it as growth headroom.
 
 The "responsiveness" of the controller is shaped by these knobs in
 combination:
@@ -376,7 +389,7 @@ combination:
   evaluated; default 50 ms);
 - `--auto-meta-baseline-percentile` /
   `--auto-meta-current-percentile` (the percentiles used in the
-  long and short windows; defaults 0.5 / 0.5 — matched median);
+  long and short windows; defaults 0.1 / 0.5 — cross p10/p50);
 - `--auto-meta-long-window` / `--auto-meta-short-window` (how much
   history is used for each estimate; defaults 10s / 1s);
 - `--auto-meta-increase-step` / `--auto-meta-decrease-step` (the per-
@@ -444,9 +457,9 @@ independent service-time profiles for the two sides; within each side,
 `stat` (a pure lookup), `unlink` (a parent-directory write), and
 `mkdir` (an inode allocation) hit different code paths on the metadata
 server and have different baseline latencies. Mixing them in a single
-controller pollutes the per-op signal and makes the matched-
-percentile baseline drift with operation-mix changes that have
-nothing to do with congestion.
+controller pollutes the per-op signal and makes the percentile-ratio
+baseline drift with operation-mix changes that have nothing to do
+with congestion.
 
 So we run **one controller per `(Side, MetadataOp)` pair** — up to 18
 in total. Each carries its own sample window, its own baseline /

@@ -201,12 +201,12 @@ fn ratio_converges_near_bdp_without_runaway_latency() {
     // Steady-state cwnd should land somewhere above BDP — but not at
     // `max_cwnd`. Use a tighter alpha/beta than defaults: in this
     // deterministic simulator there is no per-op variance, so the
-    // matched-percentile signal is binary (either two windows agree or
-    // they disagree by a clean ratio). The defaults (alpha=1.1, beta=1.5)
-    // are calibrated for noisy real workloads where the percentile
-    // estimate carries uncertainty; in the sim a tighter config makes
-    // the test assertion meaningful without making the algorithm change
-    // behavior in production.
+    // percentile-ratio signal is binary (either two windows agree or
+    // they disagree by a clean ratio). The defaults (alpha=1.3, beta=1.8)
+    // are calibrated for noisy real workloads where the p10/p50 spread
+    // carries uncertainty; in the sim a tighter config makes the test
+    // assertion meaningful without making the algorithm change behavior
+    // in production.
     let mut controller = RatioController::new(RatioConfig {
         initial_cwnd: 1,
         alpha: 1.02,
@@ -270,10 +270,13 @@ fn ratio_keeps_latency_bounded_under_saturation_pressure() {
     // Contrast with noop_controller_inflates_latency_when_saturated:
     // the ratio controller's steady-state latency stays within a small
     // multiple of min_latency even when the workload is eager. As in
-    // `ratio_converges_near_bdp_without_runaway_latency`, use a tighter
-    // alpha/beta than defaults so the deterministic sim's lack of
-    // per-op variance doesn't let the matched-percentile ratio drift
-    // arbitrarily far from 1.0.
+    // `ratio_converges_near_bdp_without_runaway_latency`, override the
+    // shipped cross-percentile defaults with a tighter matched-style
+    // hold band straddling 1.0: in this deterministic sim the
+    // distribution is degenerate, so any percentile pair collapses to
+    // ratio = 1.0 — the explicit alpha/beta keep the hold band tight
+    // enough that finite-window noise doesn't push cwnd past the
+    // bound this test asserts.
     let mut controller = RatioController::new(RatioConfig {
         initial_cwnd: 1,
         alpha: 1.02,

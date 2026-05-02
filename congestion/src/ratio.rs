@@ -44,8 +44,11 @@
 //!   ratio depends on the per-syscall distribution shape, so `alpha` and
 //!   `beta` may need per-filesystem tuning.
 //!
-//! Defaults ship matched (both percentiles at 0.5); cross-percentile mode
-//! is reachable by setting the two flags differently.
+//! Defaults ship cross (baseline p10, current p50) with `alpha = 1.3` and
+//! `beta = 1.8` bracketing the steady-state inter-quantile spread of
+//! typical metadata syscalls. Matched mode is reachable by setting the
+//! two percentiles to the same value (and tightening `alpha` / `beta`
+//! around 1.0).
 //!
 //! ## Why a single window holding all samples
 //!
@@ -91,7 +94,10 @@ pub struct RatioConfig {
     /// If `current / baseline > beta`, cwnd is decreased.
     ///
     /// `beta` should be set wide enough to absorb ordinary variance and
-    /// tight enough to react to genuine queueing. Default 1.5.
+    /// tight enough to react to genuine queueing. Default 1.8, sized
+    /// to sit above the steady-state p10/p50 spread of typical
+    /// metadata syscalls so only queueing-driven tail growth shrinks
+    /// cwnd.
     pub beta: f64,
     /// How much to grow cwnd on each under-shoot tick.
     pub increase_step: u32,
@@ -119,8 +125,8 @@ pub struct RatioConfig {
     pub long_window: std::time::Duration,
     /// Short-horizon window age. The "current" statistic is the percentile
     /// of samples observed within this window. Must be strictly less than
-    /// [`long_window`][Self::long_window] for the matched-window comparison
-    /// to be meaningful. Default 1s.
+    /// [`long_window`][Self::long_window] for the long-vs-short window
+    /// comparison to be meaningful. Default 1s.
     pub short_window: std::time::Duration,
 }
 
@@ -130,11 +136,11 @@ impl Default for RatioConfig {
             initial_cwnd: 1,
             min_cwnd: 1,
             max_cwnd: 4096,
-            alpha: 1.1,
-            beta: 1.5,
+            alpha: 1.3,
+            beta: 1.8,
             increase_step: 1,
             decrease_step: 1,
-            baseline_percentile: 0.5,
+            baseline_percentile: 0.1,
             current_percentile: 0.5,
             long_window: std::time::Duration::from_secs(10),
             short_window: std::time::Duration::from_secs(1),
@@ -432,10 +438,9 @@ mod tests {
     }
 
     #[test]
-    fn baseline_p50_is_robust_to_outliers() {
-        // The reason we picked matched percentiles in the first place:
-        // outliers don't pin the baseline. p50 of 90 fast + 10 slow is
-        // squarely in the fast bucket.
+    fn default_baseline_is_robust_to_outliers() {
+        // Default baseline percentile (p10) sits well inside the fast
+        // bucket of 90 fast + 10 slow, so outliers don't pin it.
         let mut c = RatioController::new(RatioConfig::default());
         let t0 = std::time::Instant::now();
         for i in 0..90 {
@@ -454,16 +459,17 @@ mod tests {
         assert_eq!(
             c.baseline_latency(),
             Some(std::time::Duration::from_millis(1)),
-            "p50 of 90×1ms + 10×100ms must be 1ms",
+            "default-percentile baseline of 90×1ms + 10×100ms must be 1ms",
         );
     }
 
     #[test]
-    fn matched_windows_at_steady_state_yield_unit_ratio_and_grow() {
-        // Steady state: identical latency across long and short windows.
-        // The matched-percentile ratio is ~1.0, which is < alpha (1.1) so
-        // cwnd grows. This is exactly the regime the new design wants —
-        // no false "queueing" signal from natural variance.
+    fn degenerate_distribution_at_steady_state_yields_unit_ratio_and_grows() {
+        // Steady state: identical latency across every sample, so any
+        // percentile pair (matched or cross) collapses to the same
+        // value and the ratio is exactly 1.0 — well below the default
+        // alpha, so cwnd grows. No false "queueing" signal from natural
+        // variance.
         let mut c = RatioController::new(RatioConfig {
             initial_cwnd: 5,
             increase_step: 1,
@@ -474,8 +480,8 @@ mod tests {
         });
         let t0 = std::time::Instant::now();
         // Spread samples across the long window so both short and long
-        // subsets are populated; latency identical means the matched
-        // percentile is the same in both.
+        // subsets are populated; latency identical means the percentile
+        // pair (whichever it is) reads the same value in each.
         for i in 0..200 {
             let observed_at = t0 + std::time::Duration::from_millis(i * 20);
             c.on_sample(&sample(observed_at, std::time::Duration::from_millis(2)));
@@ -486,7 +492,7 @@ mod tests {
         c.on_tick(t0 + std::time::Duration::from_millis(199 * 20));
         assert!(
             c.cwnd() > cwnd_before,
-            "matched-percentile ratio at steady state must drive growth, got {} → {}",
+            "ratio at steady state must drive growth, got {} → {}",
             cwnd_before,
             c.cwnd(),
         );
@@ -496,8 +502,9 @@ mod tests {
     fn shrinks_cwnd_when_short_window_distribution_shifts_up() {
         // Long window contains a mix of historical fast (2ms) and recent
         // slow (10ms) samples; short window holds only the slow recent
-        // samples. The matched percentile in the short window is much
-        // higher, ratio > beta, so cwnd shrinks.
+        // samples. The current percentile in the short window is much
+        // higher than the baseline percentile in the long window, so the
+        // ratio crosses beta and cwnd shrinks.
         let mut c = RatioController::new(RatioConfig {
             initial_cwnd: 50,
             decrease_step: 2,
@@ -522,7 +529,7 @@ mod tests {
         c.on_tick(burst_start + std::time::Duration::from_millis(200));
         assert!(
             c.cwnd() < cwnd_before,
-            "expected shrink under burst at p50 ratio > beta, got {} → {}",
+            "expected shrink under burst (current/baseline > beta), got {} → {}",
             cwnd_before,
             c.cwnd(),
         );
