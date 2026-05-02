@@ -252,7 +252,10 @@ initial / minimum / maximum `cwnd`, the grow/shrink ratio thresholds
 (`alpha`, `beta`), the baseline / current percentiles used to
 summarize the long and short windows, the long / short window
 durations, per-tick step sizes, and the control-loop tick cadence.
-Defaults are conservative and a good starting point.
+The defaults ship a cross-percentile signal (baseline `p10`, current
+`p50`) with `alpha = 1.3` and `beta = 1.8` bracketing the typical
+inter-quantile spread of metadata syscalls, and are a good starting
+point.
 
 For the design rationale (why concurrency is the lever, what
 `cwnd` is, the exact control law including worked ratio→action

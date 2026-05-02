@@ -99,43 +99,48 @@ pub struct CommonArgs {
     )]
     pub auto_meta_max_cwnd: u32,
     /// Latency ratio below which cwnd grows (current / baseline).
-    /// Default 1.1. `alpha` may be set below 1.0 in passive mode (grow
-    /// only when recent is meaningfully faster than baseline). The
-    /// natural scale depends on the percentile pair: matched percentiles
-    /// produce a steady-state ratio of 1.0; cross percentiles produce a
-    /// ratio above 1.0 set by the inter-quantile spread of the latency
-    /// distribution.
+    /// Default 1.3, sized to sit just below the steady-state p10/p50
+    /// inter-quantile spread of typical metadata syscalls so the
+    /// controller climbs only when the spread compresses. `alpha` may
+    /// be set below 1.0 in passive matched mode (grow only when recent
+    /// is meaningfully faster than baseline). The natural scale depends
+    /// on the percentile pair: matched percentiles produce a steady-
+    /// state ratio of 1.0; cross percentiles produce a ratio above 1.0
+    /// set by the inter-quantile spread of the latency distribution.
     #[arg(
         long,
-        default_value = "1.1",
+        default_value = "1.3",
         value_name = "F",
         help_heading = "Congestion control (advanced)"
     )]
     pub auto_meta_alpha: f64,
-    /// Latency ratio above which cwnd shrinks. Default 1.5.
+    /// Latency ratio above which cwnd shrinks. Default 1.8, sized to
+    /// sit above the steady-state p10/p50 spread so only genuine
+    /// queueing-driven tail growth triggers a backoff.
     #[arg(
         long,
-        default_value = "1.5",
+        default_value = "1.8",
         value_name = "F",
         help_heading = "Congestion control (advanced)"
     )]
     pub auto_meta_beta: f64,
     /// Percentile (in `[0.0, 1.0)`) applied to the long-horizon window
-    /// to derive the baseline statistic. With matched percentiles
-    /// (`baseline == current`) the steady-state ratio sits near 1.0;
-    /// with cross percentiles (`baseline < current`) the ratio
-    /// measures the inter-quantile spread of the latency distribution
-    /// and grows under queueing.
+    /// to derive the baseline statistic. Default 0.1 (p10): paired with
+    /// the p50 current percentile this gives a cross-percentile ratio
+    /// whose steady-state level tracks the lower-half spread of the
+    /// per-syscall latency distribution and rises with queueing. With
+    /// matched percentiles (`baseline == current`) the steady-state
+    /// ratio sits near 1.0 instead.
     #[arg(
         long,
-        default_value = "0.5",
+        default_value = "0.1",
         value_name = "F",
         help_heading = "Congestion control (advanced)"
     )]
     pub auto_meta_baseline_percentile: f64,
     /// Percentile (in `[0.0, 1.0)`) applied to the short-horizon window
-    /// to derive the current statistic. Must be `>= baseline percentile`.
-    /// See `--auto-meta-baseline-percentile`.
+    /// to derive the current statistic. Default 0.5 (p50). Must be
+    /// `>= baseline percentile`. See `--auto-meta-baseline-percentile`.
     #[arg(
         long,
         default_value = "0.5",
