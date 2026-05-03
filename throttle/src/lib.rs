@@ -358,8 +358,8 @@ async fn get_iops_tokens(tokens: u32) {
 }
 
 pub async fn get_file_iops_tokens(chunk_size: u64, file_size: u64) {
-    if chunk_size > 0 {
-        let tokens = 1 + (std::cmp::max(1, file_size) - 1) / chunk_size;
+    if let Some(div) = (std::cmp::max(1, file_size) - 1).checked_div(chunk_size) {
+        let tokens = 1 + div;
         if tokens > u64::from(u32::MAX) {
             tracing::error!(
                 "chunk size: {} is too small to limit throughput for files this big, size: {}",
