@@ -774,22 +774,40 @@ the rcp binary gates `auto_meta` propagation on the *explicit* flags:
   purely observational; propagating it would silently change remote
   concurrency while giving the user no histogram surface at all.
 
-The master's own `auto_meta` (from `throttle_config()`) is unaffected by
-this gating: the throttle pipeline runs locally on the master in all
-cases where any histogram flag is set, which is correct for local copies
-and harmless for remote copies (master has no metadata probes to throttle
-in remote mode).
+**The master's `ThrottleConfig` is stripped of both histogram fields in
+remote mode.** Specifically, after building the master's `ThrottleConfig`
+via `throttle_config()`, the rcp binary sets `histogram_log_path = None`
+and `histogram_enabled = false` whenever the copy is remote. This has
+three effects:
+
+1. **No local path validation.** `--auto-meta-histogram-log <PATH>` is
+   intended for the rcpd hosts; the directory at `<PATH>` may not exist
+   on the master's filesystem at all. Stripping the field prevents the
+   master from probing it.
+2. **No junk empty log on the master.** Without the strip the master would
+   open `<PATH>.rcp-master.<ext>` on its local filesystem, write a
+   header, and produce an empty record stream — a misleading artifact
+   when the user's intent is per-rcpd logs on remote hosts.
+3. **No spurious accumulator or logger task spawn.** The master in remote
+   mode runs no metadata controllers (all probes fire inside rcpd), so
+   accumulators that never receive a sample are wasteful. Stripping
+   `histogram_enabled` prevents them from being constructed.
+
+The `RcpdConfig` sent to each rcpd still carries the original path. Each
+rcpd validates the path locally against its own filesystem and writes its
+own log there. The split is exact: the master validates and writes nothing;
+each rcpd validates and writes independently.
 
 For distributed-run diagnostics, use `--auto-meta-histogram-log`
 instead: it captures per-rcpd distributions on each host and is the
 reliable surface for remote-copy histogram analysis.
 
 `--auto-meta-histogram-log` is forwarded to rcpd because it produces a
-concrete artifact. The master's path `/path/to/foo.hdr` becomes
-`foo.rcp-master.hdr` on the master, `foo.rcpd-source.hdr` on the
-source rcpd, and `foo.rcpd-destination.hdr` on the destination rcpd,
-mirroring the chrome-trace prefixing convention. Users on shared
-filesystems can collect all three from a single mountpoint; users on
+concrete artifact. The log path `foo.rcpd-source.hdr` is written on the
+source rcpd's host and `foo.rcpd-destination.hdr` on the destination
+rcpd's host, mirroring the chrome-trace prefixing convention. No
+corresponding `foo.rcp-master.hdr` is produced. Users on shared
+filesystems can collect both rcpd logs from a single mountpoint; users on
 per-host paths collect them after the run.
 
 ## Pluggability
