@@ -58,6 +58,50 @@ pub fn clear() {
         .write()
         .expect("observability registry poisoned")
         .clear();
+    HIST_REGISTRY
+        .write()
+        .expect("histogram registry poisoned")
+        .clear();
+}
+
+/// One entry in the histogram registry.
+#[derive(Clone)]
+pub struct RegisteredHistogram {
+    pub label: &'static str,
+    pub snapshot_rx: tokio::sync::watch::Receiver<hdrhistogram::Histogram<u64>>,
+    /// The configured snapshot interval — used by the panel renderer to
+    /// label its "(last X.Xs)" header so the label matches the actual
+    /// cadence even when the user overrode the default.
+    pub interval: std::time::Duration,
+}
+
+static HIST_REGISTRY: std::sync::LazyLock<std::sync::RwLock<Vec<RegisteredHistogram>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(Vec::new()));
+
+/// Register a per-(side, op) histogram snapshot stream. Called once per
+/// active unit by the auto-meta setup when histograms are enabled.
+pub fn register_histogram(
+    label: &'static str,
+    snapshot_rx: tokio::sync::watch::Receiver<hdrhistogram::Histogram<u64>>,
+    interval: std::time::Duration,
+) {
+    HIST_REGISTRY
+        .write()
+        .expect("histogram registry poisoned")
+        .push(RegisteredHistogram {
+            label,
+            snapshot_rx,
+            interval,
+        });
+}
+
+/// Cheap clone of the current histogram registry.
+#[must_use]
+pub fn registered_histograms() -> Vec<RegisteredHistogram> {
+    HIST_REGISTRY
+        .read()
+        .expect("histogram registry poisoned")
+        .clone()
 }
 
 /// Width (in display chars) of every right-aligned numeric column in
@@ -409,5 +453,40 @@ mod tests {
             assert!(col_a.is_some(), "{key} missing from row: {row_lines:?}");
         }
         clear();
+    }
+
+    #[test]
+    fn histogram_registry_starts_empty() {
+        let _g = GUARD.lock().unwrap();
+        clear();
+        assert!(registered_histograms().is_empty());
+    }
+
+    #[test]
+    fn registered_histograms_preserve_order() {
+        let _g = GUARD.lock().unwrap();
+        clear();
+        let h_empty = hdrhistogram::Histogram::<u64>::new_with_bounds(1, 1_000_000, 3).unwrap();
+        let (_tx_a, rx_a) = tokio::sync::watch::channel(h_empty.clone());
+        let (_tx_b, rx_b) = tokio::sync::watch::channel(h_empty);
+        register_histogram("first", rx_a, std::time::Duration::from_secs(1));
+        register_histogram("second", rx_b, std::time::Duration::from_secs(1));
+        let units = registered_histograms();
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].label, "first");
+        assert_eq!(units[1].label, "second");
+        clear();
+    }
+
+    #[test]
+    fn clear_removes_histogram_registrations_too() {
+        let _g = GUARD.lock().unwrap();
+        clear();
+        let h_empty = hdrhistogram::Histogram::<u64>::new_with_bounds(1, 1_000_000, 3).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(h_empty);
+        register_histogram("only", rx, std::time::Duration::from_secs(1));
+        assert_eq!(registered_histograms().len(), 1);
+        clear();
+        assert!(registered_histograms().is_empty());
     }
 }

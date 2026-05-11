@@ -42,6 +42,8 @@
 mod control_loop;
 mod controller;
 mod fixed;
+pub mod format;
+mod histogram;
 mod measurement;
 mod noop;
 mod ratio;
@@ -51,6 +53,10 @@ pub mod testing;
 pub use control_loop::{ControlUnit, DEFAULT_TICK_INTERVAL, RoutingSink, RoutingSinkBuilder};
 pub use controller::{Controller, ControllerSnapshot, Decision, Outcome, Sample};
 pub use fixed::FixedController;
+pub use histogram::{
+    HDR_HIGHEST_TRACKABLE_MICROS, HDR_LOWEST_DISCERNIBLE_MICROS, HDR_SIGNIFICANT_FIGURES,
+    HistogramAccumulator,
+};
 pub use measurement::{
     MetadataOp, N_META_OPS, N_META_RESOURCES, N_SIDES, Probe, ResourceKind, SampleSink, Side,
     clear_sample_sink, install_sample_sink,

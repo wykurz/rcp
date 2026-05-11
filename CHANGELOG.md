@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Add `--auto-meta-histogram`, `--auto-meta-histogram-log <PATH>`, and
+  `--auto-meta-histogram-interval <DUR>` for per-(side, op) HDR latency
+  histograms with live distribution panel and binary log file. See
+  `docs/congestion_control.md` for the format reference.
+
 ### Changed
 - Upgrade workspace to Rust 2024 edition; modernize code to use `let` chains and 2024 idioms
 

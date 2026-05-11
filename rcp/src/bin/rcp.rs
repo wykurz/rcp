@@ -400,10 +400,36 @@ async fn run_rcpd_master(
         ops_throttle: args.common.ops_throttle,
         iops_throttle: args.common.iops_throttle,
         chunk_size: args.chunk_size.0 as usize,
-        auto_meta: args
+        // Gate rcpd's auto_meta on explicit throttle or log path.
+        //
+        // `throttle_config()` always enables auto_meta when any histogram flag
+        // is set (including the panel-only `--auto-meta-histogram`), which is
+        // correct for the master's local copy path.  But for remote copies we
+        // must not propagate the throttle pipeline to rcpd unless the user
+        // explicitly asked for it:
+        //
+        //   - `--auto-meta-throttle`: user explicitly wants throttle → propagate.
+        //   - `--auto-meta-histogram-log <PATH>`: user wants per-rcpd log files,
+        //     which require the throttle pipeline to fire on rcpd → propagate.
+        //   - `--auto-meta-histogram` alone: panel-only flag.  The master's
+        //     panel is empty in remote mode (master runs no controllers); rcpd's
+        //     panel never reaches the user; rcpd behavior should be unchanged.
+        auto_meta: if args.common.auto_meta_throttle
+            || args.common.auto_meta_histogram_log.is_some()
+        {
+            args.common
+                .throttle_config(args.max_open_files, args.chunk_size.0)
+                .auto_meta
+        } else {
+            None
+        },
+        auto_meta_histogram: args.common.auto_meta_histogram,
+        auto_meta_histogram_log: args
             .common
-            .throttle_config(args.max_open_files, args.chunk_size.0)
-            .auto_meta,
+            .auto_meta_histogram_log
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string()),
+        auto_meta_histogram_interval: args.common.auto_meta_histogram_interval.into(),
         dereference: args.dereference,
         overwrite: args.overwrite,
         overwrite_compare: args.overwrite_compare.clone(),

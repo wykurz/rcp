@@ -118,6 +118,8 @@ pub mod error;
 pub mod error_collector;
 pub mod filegen;
 pub mod filter;
+pub mod histogram_logger;
+pub mod histogram_panel;
 pub mod link;
 pub mod observability;
 pub mod preserve;
@@ -207,6 +209,40 @@ static PBAR: std::sync::LazyLock<indicatif::ProgressBar> =
     std::sync::LazyLock::new(indicatif::ProgressBar::new_spinner);
 static REMOTE_RUNTIME_STATS: std::sync::LazyLock<std::sync::Mutex<Option<RemoteRuntimeStats>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+static HISTOGRAM_LOGGER_CANCEL: std::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>> =
+    std::sync::Mutex::new(None);
+static HISTOGRAM_LOGGER_HANDLE: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+fn store_logger_cancel(tx: tokio::sync::watch::Sender<bool>) {
+    *HISTOGRAM_LOGGER_CANCEL
+        .lock()
+        .expect("histogram logger cancel mutex poisoned") = Some(tx);
+}
+
+fn store_logger_handle(handle: tokio::task::JoinHandle<()>) {
+    *HISTOGRAM_LOGGER_HANDLE
+        .lock()
+        .expect("histogram logger handle mutex poisoned") = Some(handle);
+}
+
+fn take_logger_handle() -> Option<tokio::task::JoinHandle<()>> {
+    HISTOGRAM_LOGGER_HANDLE
+        .lock()
+        .expect("histogram logger handle mutex poisoned")
+        .take()
+}
+
+fn signal_logger_cancel() {
+    if let Some(tx) = HISTOGRAM_LOGGER_CANCEL
+        .lock()
+        .expect("histogram logger cancel mutex poisoned")
+        .take()
+        && let Err(err) = tx.send(true)
+    {
+        tracing::debug!("histogram-logger cancel send failed (already gone): {err:#}");
+    }
+}
 
 #[must_use]
 pub fn get_progress() -> &'static progress::Progress {
@@ -301,6 +337,7 @@ fn progress_bar(
         PBAR.set_position(PBAR.position() + 1); // do we need to update?
         let mut msg = prog_printer.print().unwrap();
         msg.push_str(&observability::render_lines());
+        msg.push_str(&render_panel_from_registry());
         PBAR.set_message(msg);
         let result = cvar.wait_timeout(is_done, delay).unwrap();
         is_done = result.0;
@@ -329,10 +366,11 @@ fn text_updates(
     loop {
         eprintln!("=======================");
         eprintln!(
-            "{}\n--{}{}",
+            "{}\n--{}{}{}",
             get_datetime_prefix(),
             prog_printer.print().unwrap(),
             observability::render_lines(),
+            render_panel_from_registry(),
         );
         let result = cvar.wait_timeout(is_done, delay).unwrap();
         is_done = result.0;
@@ -393,11 +431,11 @@ fn remote_master_updates<F>(
             let source_progress = &progress_map[RcpdType::Source];
             let destination_progress = &progress_map[RcpdType::Destination];
             PBAR.set_position(PBAR.position() + 1); // do we need to update?
-            PBAR.set_message(
-                printer
-                    .print(source_progress, destination_progress)
-                    .unwrap(),
-            );
+            let mut msg = printer
+                .print(source_progress, destination_progress)
+                .unwrap();
+            msg.push_str(&render_panel_from_registry());
+            PBAR.set_message(msg);
             let result = cvar.wait_timeout(is_done, delay).unwrap();
             is_done = result.0;
             if *is_done {
@@ -415,11 +453,12 @@ fn remote_master_updates<F>(
             let destination_progress = &progress_map[RcpdType::Destination];
             eprintln!("=======================");
             eprintln!(
-                "{}\n--{}",
+                "{}\n--{}{}",
                 get_datetime_prefix(),
                 printer
                     .print(source_progress, destination_progress)
-                    .unwrap()
+                    .unwrap(),
+                render_panel_from_registry(),
             );
             let result = cvar.wait_timeout(is_done, delay).unwrap();
             is_done = result.0;
@@ -1054,7 +1093,11 @@ fn build_tokio_runtime(
 /// 2. the adapter's 100ms conversion assumption matches the thread's
 ///    real interval, regardless of the user's static `--ops-throttle`
 ///    value.
-fn spawn_throttle_replenishers(runtime: &tokio::runtime::Runtime, throttle: &ThrottleConfig) {
+fn spawn_throttle_replenishers(
+    runtime: &tokio::runtime::Runtime,
+    throttle: &ThrottleConfig,
+    trace_identifier: &str,
+) {
     fn get_replenish_interval(replenish: usize) -> (usize, std::time::Duration) {
         let mut replenish = replenish;
         let mut interval = std::time::Duration::from_secs(1);
@@ -1091,7 +1134,101 @@ fn spawn_throttle_replenishers(runtime: &tokio::runtime::Runtime, throttle: &Thr
         runtime.spawn(throttle::run_iops_replenish_thread(replenish, interval));
     }
     if let Some(auto) = throttle.auto_meta {
-        spawn_auto_meta_throttle(runtime, auto);
+        spawn_auto_meta_throttle(
+            runtime,
+            auto,
+            throttle.histogram_enabled,
+            throttle.histogram_log_path.clone(),
+            throttle.histogram_interval,
+            trace_identifier,
+        );
+    }
+}
+
+/// Compute the per-tool resolved log path by inserting `trace_identifier`
+/// between the user-supplied stem and extension. Mirrors the
+/// chrome_trace_prefix convention so master and rcpds don't collide on
+/// localhost runs.
+///
+/// Handles three edge cases consistently with the validator:
+/// - bare filename (`foo.hdr`): parent → `.`
+/// - no extension (`foo`): extension → `hdr`
+/// - no stem (`.hidden`): stem → `auto-meta`
+///
+/// Non-UTF-8 stem and extension components (valid on Unix) are preserved
+/// unchanged; only genuinely absent components fall back to defaults.
+fn resolve_log_path(path: &std::path::Path, trace_identifier: &str) -> std::path::PathBuf {
+    let parent = match path.parent() {
+        Some(p) if p.as_os_str().is_empty() => std::path::Path::new("."),
+        Some(p) => p,
+        None => std::path::Path::new("."),
+    };
+    let mut name: std::ffi::OsString = path
+        .file_stem()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("auto-meta"));
+    name.push(".");
+    name.push(trace_identifier);
+    name.push(".");
+    match path.extension() {
+        Some(e) => name.push(e),
+        None => name.push("hdr"),
+    }
+    parent.join(name)
+}
+
+/// Verify the resolved histogram log path can actually be opened for
+/// writing. Called from [`run`] before any work begins so a typo or
+/// permission issue surfaces as a configuration error rather than a
+/// silent warning at runtime.
+///
+/// The check creates+truncates the file (matching what the logger
+/// task does later) so it catches "exists as a directory", "exists
+/// as an unwritable file", and most permission issues. The logger's
+/// own open later in startup will reuse the same path; the double-
+/// open is harmless (the logger truncates again).
+fn validate_histogram_log_target(
+    throttle: &ThrottleConfig,
+    trace_identifier: &str,
+) -> Result<(), String> {
+    let Some(path) = &throttle.histogram_log_path else {
+        return Ok(());
+    };
+    if path.is_dir() {
+        return Err(format!(
+            "--auto-meta-histogram-log {path:?} is a directory; expected a file path",
+        ));
+    }
+    if path.file_name().is_none() {
+        return Err(format!(
+            "--auto-meta-histogram-log {path:?} has no filename component",
+        ));
+    }
+    let resolved = resolve_log_path(path, trace_identifier);
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_options.custom_flags(libc::O_NOFOLLOW);
+    }
+    match open_options.open(&resolved) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            // ELOOP from O_NOFOLLOW reads as "too many levels of symbolic links"
+            // — make it explicit that this rejection is intentional security.
+            #[cfg(unix)]
+            let context = if err.raw_os_error() == Some(libc::ELOOP) {
+                " (resolved path is a symlink, which would let a local attacker hijack the write)"
+            } else {
+                ""
+            };
+            #[cfg(not(unix))]
+            let context = "";
+            Err(format!(
+                "--auto-meta-histogram-log cannot create resolved path {resolved:?}: {err:#}{context}",
+            ))
+        }
     }
 }
 
@@ -1147,6 +1284,82 @@ const fn unit_label(side: congestion::Side, op: congestion::MetadataOp) -> &'sta
     }
 }
 
+fn build_histogram_header(
+    auto: &AutoMetaThrottleConfig,
+    tool_name: &str,
+    snapshot_interval: std::time::Duration,
+) -> congestion::format::LogHeader {
+    use congestion::format::{AutoMetaSnapshot, HdrSnapshot, LogHeader, UnitLabel};
+    let hostname = nix::unistd::gethostname()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "unknown".into());
+    let mut unit_labels = Vec::with_capacity(congestion::N_META_RESOURCES);
+    for &side in &congestion::Side::ALL {
+        for &op in &congestion::MetadataOp::ALL {
+            unit_labels.push(UnitLabel {
+                side: side as u8,
+                op: op as u8,
+                label: unit_label(side, op).to_string(),
+            });
+        }
+    }
+    LogHeader {
+        format_version: 1,
+        tool: tool_name.to_string(),
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        hostname,
+        pid: std::process::id(),
+        start_unix_micros: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+            .unwrap_or(0),
+        snapshot_interval_micros: u64::try_from(snapshot_interval.as_micros()).unwrap_or(u64::MAX),
+        auto_meta: AutoMetaSnapshot {
+            initial_cwnd: auto.initial_cwnd,
+            min_cwnd: auto.min_cwnd,
+            max_cwnd: auto.max_cwnd,
+            alpha: auto.alpha,
+            beta: auto.beta,
+            increase_step: auto.increase_step,
+            decrease_step: auto.decrease_step,
+            baseline_percentile: auto.baseline_percentile,
+            current_percentile: auto.current_percentile,
+            long_window_micros: u64::try_from(auto.long_window.as_micros()).unwrap_or(u64::MAX),
+            short_window_micros: u64::try_from(auto.short_window.as_micros()).unwrap_or(u64::MAX),
+            tick_interval_micros: u64::try_from(auto.tick_interval.as_micros()).unwrap_or(u64::MAX),
+        },
+        hdr: HdrSnapshot {
+            lowest_discernible_micros: congestion::HDR_LOWEST_DISCERNIBLE_MICROS,
+            highest_trackable_micros: congestion::HDR_HIGHEST_TRACKABLE_MICROS,
+            significant_figures: congestion::HDR_SIGNIFICANT_FIGURES,
+            unit: "microseconds".into(),
+        },
+        unit_labels,
+    }
+}
+
+fn render_panel_from_registry() -> String {
+    let entries = observability::registered_histograms();
+    if entries.is_empty() {
+        return String::new();
+    }
+    let snapshots: Vec<hdrhistogram::Histogram<u64>> = entries
+        .iter()
+        .map(|e| (*e.snapshot_rx.borrow()).clone())
+        .collect();
+    let units: Vec<histogram_panel::PanelUnit> = entries
+        .iter()
+        .zip(snapshots.iter())
+        .map(|(e, snap)| histogram_panel::PanelUnit {
+            label: e.label,
+            histogram: snap,
+            interval: e.interval,
+        })
+        .collect();
+    histogram_panel::render_histogram_panel(&units)
+}
+
 /// Wire up the adaptive metadata-ops control loops — one per
 /// `(Side, MetadataOp)` pair (18 in total):
 ///
@@ -1170,43 +1383,72 @@ const fn unit_label(side: congestion::Side, op: congestion::MetadataOp) -> &'sta
 ///
 /// Only one auto-meta config is supported per process. If a sample sink
 /// was already installed, it is silently replaced.
-fn spawn_auto_meta_throttle(runtime: &tokio::runtime::Runtime, auto: AutoMetaThrottleConfig) {
+fn spawn_auto_meta_throttle(
+    runtime: &tokio::runtime::Runtime,
+    auto: AutoMetaThrottleConfig,
+    histogram_enabled: bool,
+    histogram_log_path: Option<std::path::PathBuf>,
+    histogram_interval: std::time::Duration,
+    trace_identifier: &str,
+) {
     let initial_cwnd = auto
         .initial_cwnd
         .clamp(auto.min_cwnd.max(1), auto.max_cwnd.max(1));
+    let histogram_active = histogram_enabled || histogram_log_path.is_some();
+    // Per-tool log path: each rcpd / master writes to its own file by
+    // suffixing trace_identifier on the user-supplied path, mirroring
+    // chrome_trace_prefix's convention.
+    let resolved_log_path = histogram_log_path
+        .as_ref()
+        .map(|p| resolve_log_path(p, trace_identifier));
+
+    // Build receivers + accumulators in parallel arrays so we can pass
+    // each accumulator both to a ControlUnit and to a LoggerUnit.
     let mut builder = congestion::RoutingSinkBuilder::new();
-    // Materialize one receiver per (side, op) so every resource has a
-    // dedicated sample channel. Order matches the canonical iteration
-    // below; collected into a Vec rather than the inferred 18-element
-    // array literal for legibility.
-    let mut receivers: Vec<(
-        &'static str,
-        congestion::Side,
-        congestion::MetadataOp,
-        tokio::sync::mpsc::Receiver<congestion::Sample>,
-        bool,
-    )> = Vec::with_capacity(congestion::N_META_RESOURCES);
+    struct Slot {
+        label: &'static str,
+        side: congestion::Side,
+        op: congestion::MetadataOp,
+        sample_rx: tokio::sync::mpsc::Receiver<congestion::Sample>,
+        apply_rate: bool,
+        accumulator: Option<std::sync::Arc<std::sync::Mutex<congestion::HistogramAccumulator>>>,
+    }
+    let mut slots: Vec<Slot> = Vec::with_capacity(congestion::N_META_RESOURCES);
     for &side in &congestion::Side::ALL {
         for &op in &congestion::MetadataOp::ALL {
-            // Seed the throttle resource so the first probe finds a
-            // permit available; controllers grow / shrink from here.
             let resource = walk::meta_resource(side, op);
             throttle::set_max_ops_in_flight(resource, initial_cwnd as usize);
             let rx = builder.metadata_receiver(side, op);
-            // (Destination, Stat) is the rate-driver convention — see
-            // the function-level doc comment for why exactly one
-            // controller may own the global OPS_THROTTLE.
             let apply_rate = matches!(
                 (side, op),
                 (congestion::Side::Destination, congestion::MetadataOp::Stat),
             );
-            receivers.push((unit_label(side, op), side, op, rx, apply_rate));
+            let accumulator = if histogram_active {
+                let acc = std::sync::Arc::new(std::sync::Mutex::new(
+                    congestion::HistogramAccumulator::new(),
+                ));
+                builder.metadata_histogram(side, op, acc.clone());
+                Some(acc)
+            } else {
+                None
+            };
+            slots.push(Slot {
+                label: unit_label(side, op),
+                side,
+                op,
+                sample_rx: rx,
+                apply_rate,
+                accumulator,
+            });
         }
     }
     let sink = std::sync::Arc::new(builder.build());
     congestion::install_sample_sink(sink.clone());
-    for (label, side, op, sample_rx, apply_rate) in receivers {
-        let resource = walk::meta_resource(side, op);
+
+    // Per-unit watch senders for the live histogram panel; collected into
+    // a parallel vec so we can also build the logger's `LoggerUnit` list.
+    let mut logger_units: Vec<histogram_logger::LoggerUnit> = Vec::new();
+    for slot in slots {
         let controller = congestion::RatioController::new(congestion::RatioConfig {
             initial_cwnd: auto.initial_cwnd,
             min_cwnd: auto.min_cwnd,
@@ -1220,22 +1462,62 @@ fn spawn_auto_meta_throttle(runtime: &tokio::runtime::Runtime, auto: AutoMetaThr
             long_window: auto.long_window,
             short_window: auto.short_window,
         });
-        let (unit, decision_rx, snapshot_rx) =
-            congestion::ControlUnit::new(label, controller, sample_rx, auto.tick_interval);
-        observability::register_unit(label, snapshot_rx);
+        let (unit, decision_rx, snapshot_rx) = congestion::ControlUnit::new(
+            slot.label,
+            controller,
+            slot.sample_rx,
+            auto.tick_interval,
+        );
+        observability::register_unit(slot.label, snapshot_rx);
+        if let Some(acc) = slot.accumulator.as_ref() {
+            let (snap_tx, snap_rx) = tokio::sync::watch::channel(
+                hdrhistogram::Histogram::<u64>::new_with_bounds(
+                    congestion::HDR_LOWEST_DISCERNIBLE_MICROS,
+                    congestion::HDR_HIGHEST_TRACKABLE_MICROS,
+                    congestion::HDR_SIGNIFICANT_FIGURES,
+                )
+                .expect("histogram bounds valid"),
+            );
+            observability::register_histogram(slot.label, snap_rx, histogram_interval);
+            logger_units.push(histogram_logger::LoggerUnit {
+                label: slot.label,
+                side: slot.side,
+                op: slot.op,
+                accumulator: acc.clone(),
+                snapshot_tx: snap_tx,
+            });
+        }
         runtime.spawn(unit.run());
         runtime.spawn(auto_meta::run_adapter(
-            resource,
-            apply_rate,
+            walk::meta_resource(slot.side, slot.op),
+            slot.apply_rate,
             decision_rx,
             sink.clone(),
         ));
     }
+
+    if histogram_active {
+        let header = build_histogram_header(&auto, trace_identifier, histogram_interval);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        store_logger_cancel(cancel_tx);
+        let handle = runtime.spawn(histogram_logger::run_logger(
+            histogram_logger::LoggerConfig {
+                interval: histogram_interval,
+                log_path: resolved_log_path,
+                header,
+            },
+            logger_units,
+            cancel_rx,
+        ));
+        store_logger_handle(handle);
+    }
+
     tracing::info!(
         "auto-meta-throttle enabled (per-(side, op) controllers, {} total): \
          initial_cwnd={}, max_cwnd={}, alpha={}, beta={}, \
          baseline_percentile={}, current_percentile={}, \
-         long_window={:?}, short_window={:?}, tick={:?}",
+         long_window={:?}, short_window={:?}, tick={:?}, \
+         histograms={}",
         congestion::N_META_RESOURCES,
         auto.initial_cwnd,
         auto.max_cwnd,
@@ -1246,6 +1528,7 @@ fn spawn_auto_meta_throttle(runtime: &tokio::runtime::Runtime, auto: AutoMetaThr
         auto.long_window,
         auto.short_window,
         auto.tick_interval,
+        histogram_active,
     );
 }
 
@@ -1279,10 +1562,16 @@ where
         suppress_runtime_stats,
     } = output;
     // tracing guards must outlive the runtime so chrome/flame traces flush
+    // extract trace_identifier before install_tracing_subscriber consumes tracing_config
+    let trace_identifier = tracing_config.trace_identifier.clone();
+    if let Err(e) = validate_histogram_log_target(&throttle_config, &trace_identifier) {
+        eprintln!("Configuration error: {e}");
+        return None;
+    }
     let _tracing_guards = install_tracing_subscriber(quiet, verbose, tracing_config);
     let res = {
         let runtime = build_tokio_runtime(&runtime_config, &throttle_config);
-        spawn_throttle_replenishers(&runtime, &throttle_config);
+        spawn_throttle_replenishers(&runtime, &throttle_config, &trace_identifier);
         let res = {
             let _progress_tracker = progress.map(|settings| {
                 tracing::debug!("Requesting progress updates {settings:?}");
@@ -1311,6 +1600,17 @@ where
             && let Err(err) = print_runtime_stats()
         {
             println!("Failed to print runtime stats: {err:?}");
+        }
+        // Signal the histogram logger to exit cleanly so its final
+        // snapshot is written before the runtime drops and aborts it.
+        // No-op when histograms are disabled.
+        signal_logger_cancel();
+        if let Some(handle) = take_logger_handle() {
+            // Bound the wait so a stuck logger can't hang shutdown — 1s is
+            // generous: the logger only does a snapshot+flush on cancel.
+            let _ = runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(1), handle).await
+            });
         }
         res
         // runtime drops here, cancelling all spawned tasks (control
@@ -1608,5 +1908,152 @@ mod validate_update_compare_vs_preserve_tests {
         let result = validate_update_compare_vs_preserve(&compare, &preserve);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("mode"));
+    }
+}
+
+#[cfg(test)]
+mod resolve_log_path_tests {
+    use super::*;
+
+    #[test]
+    fn full_path_with_extension() {
+        let p = std::path::Path::new("/tmp/foo.hdr");
+        assert_eq!(
+            resolve_log_path(p, "rcp"),
+            std::path::PathBuf::from("/tmp/foo.rcp.hdr"),
+        );
+    }
+
+    #[test]
+    fn bare_filename_resolves_to_current_dir() {
+        let p = std::path::Path::new("foo.hdr");
+        assert_eq!(
+            resolve_log_path(p, "rcp"),
+            std::path::PathBuf::from("./foo.rcp.hdr"),
+        );
+    }
+
+    #[test]
+    fn no_extension_defaults_to_hdr() {
+        let p = std::path::Path::new("/tmp/foo");
+        assert_eq!(
+            resolve_log_path(p, "rcp"),
+            std::path::PathBuf::from("/tmp/foo.rcp.hdr"),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preserves_non_utf8_stem() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        // Build a path with an invalid-UTF-8 stem: /tmp/<0xFF><0xFE>.hdr
+        let mut raw_name = vec![b'/', b't', b'm', b'p', b'/'];
+        raw_name.extend_from_slice(&[0xFF, 0xFE]);
+        raw_name.extend_from_slice(b".hdr");
+        let p = std::path::PathBuf::from(std::ffi::OsString::from_vec(raw_name));
+        let resolved = resolve_log_path(&p, "rcp");
+        // The non-UTF-8 stem must be preserved; the suffix and extension
+        // append cleanly.
+        let bytes = resolved.as_os_str().as_bytes();
+        assert!(
+            bytes.windows(2).any(|w| w == [0xFF, 0xFE]),
+            "non-UTF-8 bytes must survive resolution; got bytes: {bytes:?}",
+        );
+        assert!(
+            bytes.ends_with(b".rcp.hdr"),
+            "expected .rcp.hdr suffix; got bytes: {bytes:?}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod validate_histogram_log_target_tests {
+    use super::*;
+
+    fn throttle_with_log_path(path: Option<std::path::PathBuf>) -> ThrottleConfig {
+        ThrottleConfig {
+            histogram_enabled: path.is_some(),
+            histogram_log_path: path,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_log_path_is_ok() {
+        let throttle = throttle_with_log_path(None);
+        assert!(validate_histogram_log_target(&throttle, "rcp").is_ok());
+    }
+
+    #[test]
+    fn writable_resolved_path_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let throttle = throttle_with_log_path(Some(dir.path().join("foo.hdr")));
+        assert!(validate_histogram_log_target(&throttle, "rcp").is_ok());
+    }
+
+    #[test]
+    fn resolved_path_existing_as_directory_is_rejected() {
+        // Create a directory at the exact resolved path; OpenOptions::open
+        // with create+truncate fails when target is a directory.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("foo.rcp.hdr");
+        std::fs::create_dir(&blocker).unwrap();
+        let throttle = throttle_with_log_path(Some(dir.path().join("foo.hdr")));
+        let err = validate_histogram_log_target(&throttle, "rcp").unwrap_err();
+        assert!(
+            err.contains("histogram-log") && err.contains("foo.rcp.hdr"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn resolved_path_in_missing_parent_is_rejected() {
+        let throttle = throttle_with_log_path(Some("/nonexistent-dir-67890/foo.hdr".into()));
+        let err = validate_histogram_log_target(&throttle, "rcp").unwrap_err();
+        assert!(err.contains("histogram-log"), "got: {err}");
+    }
+
+    #[test]
+    fn log_path_pointing_at_existing_directory_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let throttle = throttle_with_log_path(Some(dir.path().to_path_buf()));
+        let err = validate_histogram_log_target(&throttle, "rcp").unwrap_err();
+        assert!(err.contains("directory"), "got: {err}");
+    }
+
+    #[test]
+    fn log_path_with_no_filename_is_rejected() {
+        // PathBuf::from("/") has parent() == None and file_name() == None.
+        let throttle = throttle_with_log_path(Some(std::path::PathBuf::from("/")));
+        let err = validate_histogram_log_target(&throttle, "rcp").unwrap_err();
+        assert!(
+            err.contains("filename") || err.contains("directory"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolved_path_existing_as_symlink_is_rejected() {
+        // Defense against symlink-based hijacking: a local attacker who
+        // can pre-create the predictable suffixed path as a symlink must
+        // not be able to redirect the truncating open to a victim file.
+        let dir = tempfile::tempdir().unwrap();
+        // The resolved path will be `<dir>/foo.rcp.hdr`. Pre-create it as
+        // a symlink pointing somewhere else (in this test, just to a
+        // sibling file we don't care about).
+        let target = dir.path().join("victim.txt");
+        std::fs::write(&target, b"do not clobber").unwrap();
+        let resolved_path = dir.path().join("foo.rcp.hdr");
+        std::os::unix::fs::symlink(&target, &resolved_path).unwrap();
+        let throttle = throttle_with_log_path(Some(dir.path().join("foo.hdr")));
+        let err = validate_histogram_log_target(&throttle, "rcp").unwrap_err();
+        assert!(
+            err.contains("symlink") || err.contains("ELOOP") || err.contains("Too many levels"),
+            "got: {err}",
+        );
+        // Victim file content is preserved (the truncating open never reached it).
+        let preserved = std::fs::read(&target).unwrap();
+        assert_eq!(preserved, b"do not clobber");
     }
 }

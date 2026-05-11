@@ -219,6 +219,13 @@ pub struct RoutingSink {
     /// [`metadata_index`]. `None` slots are silently dropped — that's
     /// how a tool that doesn't exercise a particular op opts out.
     metadata: [Option<tokio::sync::mpsc::Sender<Sample>>; N_META_RESOURCES],
+    /// Parallel to `metadata`: optional histogram accumulator per
+    /// `(Side, MetadataOp)` pair. Recorded synchronously inside
+    /// [`SampleSink::record`] so every probe completion lands in the
+    /// accumulator before the function returns — eliminating the drain
+    /// race on shutdown.
+    histograms: [Option<std::sync::Arc<std::sync::Mutex<crate::histogram::HistogramAccumulator>>>;
+        N_META_RESOURCES],
     read: Option<tokio::sync::mpsc::Sender<Sample>>,
     write: Option<tokio::sync::mpsc::Sender<Sample>>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -233,7 +240,37 @@ impl RoutingSink {
 }
 
 impl SampleSink for RoutingSink {
+    /// Records a sample into the histogram accumulator and forwards it to
+    /// the controller's mpsc channel.
+    ///
+    /// The histogram update happens SYNCHRONOUSLY before the `try_send` to
+    /// the controller. This is intentional: the histogram is the source of
+    /// truth for "what probes completed", which must include every probe
+    /// regardless of whether the controller's queue drained. The
+    /// controller's own `samples_seen` counter (visible in
+    /// [`ControllerSnapshot`]) reflects what the controller actually acted
+    /// on, which may be less when the per-resource mpsc is saturated; the
+    /// difference is the count surfaced via [`RoutingSink::dropped_samples`]
+    /// and the periodic warning log. By design, n (histogram) >=
+    /// samples_seen (controller); their difference is the queue-saturation
+    /// signal. Recording only on `try_send` success would cause histogram
+    /// data loss precisely when the user most needs it: under heavy load,
+    /// the controller's queue can saturate, and that's exactly when the
+    /// distribution is most informative.
     fn record(&self, kind: ResourceKind, sample: &Sample) {
+        // Synchronously update the histogram accumulator (if any) before
+        // the async hop to the control unit. This way every probe that
+        // completes is reflected in the accumulator immediately, so the
+        // logger's final snapshot at shutdown captures every sample —
+        // even ones that haven't yet been drained from the per-resource
+        // mpsc by the control-unit task.
+        if let ResourceKind::Metadata(side, op) = kind
+            && let Some(acc) = &self.histograms[metadata_index(side, op)]
+        {
+            acc.lock()
+                .expect("histogram accumulator mutex poisoned")
+                .record(sample.latency());
+        }
         let tx = match kind {
             ResourceKind::Metadata(side, op) => self.metadata[metadata_index(side, op)].as_ref(),
             ResourceKind::DataRead => self.read.as_ref(),
@@ -247,7 +284,7 @@ impl SampleSink for RoutingSink {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    // the ControlUnit exited; nothing to do.
+                    // ControlUnit exited; nothing to do.
                 }
             }
         }
@@ -259,6 +296,8 @@ impl SampleSink for RoutingSink {
 /// returns the receiver the caller must hand to a [`ControlUnit`].
 pub struct RoutingSinkBuilder {
     metadata: [Option<tokio::sync::mpsc::Sender<Sample>>; N_META_RESOURCES],
+    histograms: [Option<std::sync::Arc<std::sync::Mutex<crate::histogram::HistogramAccumulator>>>;
+        N_META_RESOURCES],
     read: Option<tokio::sync::mpsc::Sender<Sample>>,
     write: Option<tokio::sync::mpsc::Sender<Sample>>,
     capacity: usize,
@@ -269,6 +308,7 @@ impl Default for RoutingSinkBuilder {
     fn default() -> Self {
         Self {
             metadata: [const { None }; N_META_RESOURCES],
+            histograms: [const { None }; N_META_RESOURCES],
             read: None,
             write: None,
             capacity: DEFAULT_CHANNEL_CAPACITY,
@@ -299,6 +339,20 @@ impl RoutingSinkBuilder {
         self.metadata[metadata_index(side, op)] = Some(tx);
         rx
     }
+
+    /// Register a histogram accumulator for the given `(Side, MetadataOp)`
+    /// pair. Synchronous: every probe completion will record into this
+    /// accumulator before `record` returns — eliminating the drain race on
+    /// shutdown that arises when the accumulator lives in the `ControlUnit`
+    /// task instead.
+    pub fn metadata_histogram(
+        &mut self,
+        side: Side,
+        op: MetadataOp,
+        accumulator: std::sync::Arc<std::sync::Mutex<crate::histogram::HistogramAccumulator>>,
+    ) {
+        self.histograms[metadata_index(side, op)] = Some(accumulator);
+    }
     /// Register a channel for read-throughput samples and return its receiver.
     pub fn read_receiver(&mut self) -> tokio::sync::mpsc::Receiver<Sample> {
         let (tx, rx) = tokio::sync::mpsc::channel(self.capacity);
@@ -314,6 +368,7 @@ impl RoutingSinkBuilder {
     pub fn build(self) -> RoutingSink {
         RoutingSink {
             metadata: self.metadata,
+            histograms: self.histograms,
             read: self.read,
             write: self.write,
             dropped: self.dropped,
@@ -491,5 +546,30 @@ mod tests {
             .await
             .expect("control loop exits within timeout")
             .expect("control loop joins without panic");
+    }
+
+    #[tokio::test]
+    async fn routing_sink_records_to_histogram_synchronously() {
+        // Synchronous histogram capture: a sample sent to the sink must
+        // land in the accumulator before record() returns, regardless of
+        // whether the corresponding ControlUnit's mpsc has been drained.
+        use crate::histogram::HistogramAccumulator;
+        let mut builder = RoutingSinkBuilder::new();
+        let _meta_rx = builder.metadata_receiver(Side::Source, MetadataOp::Stat);
+        let acc = std::sync::Arc::new(std::sync::Mutex::new(HistogramAccumulator::new()));
+        builder.metadata_histogram(Side::Source, MetadataOp::Stat, acc.clone());
+        let sink = builder.build();
+        sink.record(
+            ResourceKind::Metadata(Side::Source, MetadataOp::Stat),
+            &make_sample(5),
+        );
+        sink.record(
+            ResourceKind::Metadata(Side::Source, MetadataOp::Stat),
+            &make_sample(7),
+        );
+        // Synchronous capture: the accumulator already has both samples,
+        // even though the control-unit task (if any) has not been polled.
+        let snap = acc.lock().unwrap().snapshot_and_reset();
+        assert_eq!(snap.len(), 2);
     }
 }
