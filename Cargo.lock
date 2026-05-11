@@ -1774,6 +1774,7 @@ dependencies = [
  "filetime",
  "futures",
  "globset",
+ "hdrhistogram",
  "humantime",
  "indicatif",
  "libc",
@@ -1786,6 +1787,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -1799,7 +1801,11 @@ dependencies = [
 name = "rcp-tools-congestion"
 version = "0.32.0"
 dependencies = [
+ "hdrhistogram",
  "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
  "tokio",
  "tracing",
 ]

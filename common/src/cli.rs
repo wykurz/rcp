@@ -190,6 +190,28 @@ pub struct CommonArgs {
         help_heading = "Congestion control (advanced)"
     )]
     pub auto_meta_tick_interval: humantime::Duration,
+    /// Enable in-memory HDR latency histograms per (side, op). Implies
+    /// `--auto-meta-throttle`. Adds a distribution panel beneath the
+    /// existing one-line-per-controller summary in the progress display.
+    #[arg(long, help_heading = "Congestion control")]
+    pub auto_meta_histogram: bool,
+    /// Write a binary log of per-(side, op) HDR histograms to the given
+    /// path. The file is truncated if it already exists — rename or move
+    /// logs you want to keep across runs. Format documented in
+    /// `docs/congestion_control.md`. Implies `--auto-meta-histogram` and
+    /// `--auto-meta-throttle`.
+    #[arg(long, value_name = "PATH", help_heading = "Congestion control")]
+    pub auto_meta_histogram_log: Option<std::path::PathBuf>,
+    /// Snapshot cadence for the histogram logger (e.g. "1s"). Drives both
+    /// the panel refresh rate and the log-file record interval. Range
+    /// `[100ms, 60s]`.
+    #[arg(
+        long,
+        default_value = "1s",
+        value_name = "DUR",
+        help_heading = "Congestion control"
+    )]
+    pub auto_meta_histogram_interval: humantime::Duration,
 }
 
 impl CommonArgs {
@@ -222,28 +244,32 @@ impl CommonArgs {
         max_open_files: Option<usize>,
         chunk_size: u64,
     ) -> crate::ThrottleConfig {
-        let auto_meta = self
-            .auto_meta_throttle
-            .then(|| crate::AutoMetaThrottleConfig {
-                initial_cwnd: self.auto_meta_initial_cwnd,
-                min_cwnd: self.auto_meta_min_cwnd,
-                max_cwnd: self.auto_meta_max_cwnd,
-                alpha: self.auto_meta_alpha,
-                beta: self.auto_meta_beta,
-                increase_step: self.auto_meta_increase_step,
-                decrease_step: self.auto_meta_decrease_step,
-                baseline_percentile: self.auto_meta_baseline_percentile,
-                current_percentile: self.auto_meta_current_percentile,
-                long_window: self.auto_meta_long_window.into(),
-                short_window: self.auto_meta_short_window.into(),
-                tick_interval: self.auto_meta_tick_interval.into(),
-            });
+        let auto_meta_implied = self.auto_meta_throttle
+            || self.auto_meta_histogram
+            || self.auto_meta_histogram_log.is_some();
+        let auto_meta = auto_meta_implied.then(|| crate::AutoMetaThrottleConfig {
+            initial_cwnd: self.auto_meta_initial_cwnd,
+            min_cwnd: self.auto_meta_min_cwnd,
+            max_cwnd: self.auto_meta_max_cwnd,
+            alpha: self.auto_meta_alpha,
+            beta: self.auto_meta_beta,
+            increase_step: self.auto_meta_increase_step,
+            decrease_step: self.auto_meta_decrease_step,
+            baseline_percentile: self.auto_meta_baseline_percentile,
+            current_percentile: self.auto_meta_current_percentile,
+            long_window: self.auto_meta_long_window.into(),
+            short_window: self.auto_meta_short_window.into(),
+            tick_interval: self.auto_meta_tick_interval.into(),
+        });
         crate::ThrottleConfig {
             max_open_files,
             ops_throttle: self.ops_throttle,
             iops_throttle: self.iops_throttle,
             chunk_size,
             auto_meta,
+            histogram_enabled: self.auto_meta_histogram || self.auto_meta_histogram_log.is_some(),
+            histogram_log_path: self.auto_meta_histogram_log.clone(),
+            histogram_interval: self.auto_meta_histogram_interval.into(),
         }
     }
     /// Returns true if any progress-related flag was set.
@@ -251,6 +277,7 @@ impl CommonArgs {
     pub fn progress_requested(&self) -> bool {
         self.progress || self.progress_type.is_some() || self.progress_delay.is_some()
     }
+
     /// Build user-facing [`crate::ProgressSettings`] when any progress flag was
     /// set, else `None`. `kind` selects the tool-specific printer. For `rcp`'s
     /// remote-master and `rcpd`'s remote progress modes, build `ProgressSettings`
@@ -270,5 +297,71 @@ impl CommonArgs {
             },
             progress_delay: self.progress_delay.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod implies_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        common: CommonArgs,
+    }
+
+    #[test]
+    fn auto_meta_histogram_implies_throttle_at_cli() {
+        let cli = TestCli::parse_from(["test", "--auto-meta-histogram"]);
+        let throttle = cli.common.throttle_config(None, 0);
+        assert!(
+            throttle.auto_meta.is_some(),
+            "histogram flag must imply auto_meta"
+        );
+        assert!(throttle.histogram_enabled);
+    }
+
+    #[test]
+    fn auto_meta_histogram_log_implies_throttle_at_cli() {
+        let cli = TestCli::parse_from(["test", "--auto-meta-histogram-log", "/tmp/x.hdr"]);
+        let throttle = cli.common.throttle_config(None, 0);
+        assert!(
+            throttle.auto_meta.is_some(),
+            "histogram-log flag must imply auto_meta"
+        );
+        assert!(throttle.histogram_log_path.is_some());
+    }
+
+    #[test]
+    fn no_auto_meta_flags_means_no_throttle() {
+        let cli = TestCli::parse_from(["test"]);
+        let throttle = cli.common.throttle_config(None, 0);
+        assert!(throttle.auto_meta.is_none());
+        assert!(!throttle.histogram_enabled);
+    }
+
+    /// `--auto-meta-histogram` (panel-only) sets `auto_meta_throttle = false`.
+    ///
+    /// The rcp binary uses this distinction when building `RcpdConfig`: it
+    /// gates `RcpdConfig::auto_meta` on `auto_meta_throttle || histogram_log
+    /// .is_some()`, so that the panel-only flag does NOT silently enable the
+    /// throttle pipeline on remote daemons.  This test pins that distinction
+    /// at the `CommonArgs` level so a future refactor cannot accidentally
+    /// collapse the two flags.
+    #[test]
+    fn panel_flag_does_not_set_explicit_throttle_field() {
+        let cli = TestCli::parse_from(["test", "--auto-meta-histogram"]);
+        // `throttle_config()` returns `auto_meta = Some(...)` because the
+        // panel needs the throttle pipeline locally — that's intentional.
+        assert!(cli.common.throttle_config(None, 0).auto_meta.is_some());
+        // But the *explicit* throttle field must stay false so the rcp binary
+        // can distinguish "panel only" from "user explicitly asked for throttle".
+        assert!(
+            !cli.common.auto_meta_throttle,
+            "--auto-meta-histogram must not set auto_meta_throttle"
+        );
+        // And no log path either.
+        assert!(cli.common.auto_meta_histogram_log.is_none());
     }
 }

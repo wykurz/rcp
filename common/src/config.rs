@@ -54,7 +54,7 @@ pub struct AutoMetaThrottleConfig {
 }
 
 /// Throttling configuration for resource control
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone)]
 pub struct ThrottleConfig {
     /// Maximum number of open files (None = 80% of system limit)
     pub max_open_files: Option<usize>,
@@ -66,6 +66,32 @@ pub struct ThrottleConfig {
     pub chunk_size: u64,
     /// Adaptive metadata-ops throttle, if enabled via `--auto-meta-throttle`.
     pub auto_meta: Option<AutoMetaThrottleConfig>,
+    /// Enables in-memory HDR histograms for the auto-meta probes (live
+    /// display panel + driver for the optional log file). Implied by
+    /// `histogram_log_path.is_some()`.
+    pub histogram_enabled: bool,
+    /// When set, the auto-meta histogram logger appends a binary record
+    /// stream to this path on each snapshot tick. See
+    /// `docs/congestion_control.md` for the format.
+    pub histogram_log_path: Option<std::path::PathBuf>,
+    /// Snapshot cadence for the histogram logger. Drives both the live
+    /// panel and the log file. Range `[100ms, 60s]`.
+    pub histogram_interval: std::time::Duration,
+}
+
+impl Default for ThrottleConfig {
+    fn default() -> Self {
+        Self {
+            max_open_files: None,
+            ops_throttle: 0,
+            iops_throttle: 0,
+            chunk_size: 0,
+            auto_meta: None,
+            histogram_enabled: false,
+            histogram_log_path: None,
+            histogram_interval: std::time::Duration::from_secs(1),
+        }
+    }
 }
 
 /// Minimum static `--ops-throttle` when `--auto-meta-throttle` is on.
@@ -149,6 +175,72 @@ impl ThrottleConfig {
                      interval.",
                     self.ops_throttle, AUTO_META_MIN_OPS_THROTTLE, AUTO_META_MIN_OPS_THROTTLE,
                 ));
+            }
+        }
+        let histogram_active = self.histogram_enabled || self.histogram_log_path.is_some();
+        if histogram_active && self.auto_meta.is_none() {
+            return Err(
+                "--auto-meta-histogram and --auto-meta-histogram-log require \
+                 --auto-meta-throttle to be enabled"
+                    .into(),
+            );
+        }
+        if histogram_active {
+            let min = std::time::Duration::from_millis(100);
+            let max = std::time::Duration::from_secs(60);
+            if self.histogram_interval < min || self.histogram_interval > max {
+                return Err(format!(
+                    "--auto-meta-histogram-interval must be in [{}ms, {}s]",
+                    min.as_millis(),
+                    max.as_secs(),
+                ));
+            }
+            if let Some(path) = &self.histogram_log_path {
+                // Path::parent() of "foo.hdr" returns Some("") — empty path,
+                // not None. Treat that the same as None (i.e. current dir).
+                let parent = match path.parent() {
+                    Some(p) if p.as_os_str().is_empty() => std::path::Path::new("."),
+                    Some(p) => p,
+                    None => std::path::Path::new("."),
+                };
+                if !parent.exists() {
+                    return Err(format!(
+                        "--auto-meta-histogram-log parent directory does not exist: {parent:?}",
+                    ));
+                }
+                if !parent.is_dir() {
+                    return Err(format!(
+                        "--auto-meta-histogram-log parent is not a directory: {parent:?}",
+                    ));
+                }
+                // Probe writability: try to create a tiny temp file in the parent.
+                // We don't pre-create the actual log file because the spawn step
+                // adds a trace-identifier suffix.
+                //
+                // Use create_new (O_EXCL) and a random suffix so:
+                //   1. a pre-created symlink with the predictable probe name
+                //      can't redirect the create to an attacker-chosen path, and
+                //   2. two concurrent validations never collide on the probe name.
+                let suffix: u64 = rand::random();
+                let probe = parent.join(format!(
+                    ".rcp-auto-meta-probe-{}-{:016x}",
+                    std::process::id(),
+                    suffix,
+                ));
+                match std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&probe)
+                {
+                    Ok(_) => {
+                        let _ = std::fs::remove_file(&probe);
+                    }
+                    Err(err) => {
+                        return Err(format!(
+                            "--auto-meta-histogram-log parent {parent:?} is not writable: {err:#}",
+                        ));
+                    }
+                }
             }
         }
         Ok(())
@@ -302,6 +394,9 @@ mod auto_meta_validation_tests {
             iops_throttle: 0,
             chunk_size: 0,
             auto_meta: Some(auto),
+            histogram_enabled: false,
+            histogram_log_path: None,
+            histogram_interval: std::time::Duration::from_secs(1),
         }
     }
 
@@ -440,6 +535,9 @@ mod auto_meta_validation_tests {
             iops_throttle: 0,
             chunk_size: 0,
             auto_meta: None,
+            histogram_enabled: false,
+            histogram_log_path: None,
+            histogram_interval: std::time::Duration::from_secs(1),
         };
         assert!(config.validate().is_ok());
     }
@@ -451,5 +549,117 @@ mod auto_meta_validation_tests {
         auto.beta = 1.5;
         let err = config_with(auto).validate().unwrap_err();
         assert!(err.contains("alpha") && err.contains("beta"), "got: {err}");
+    }
+
+    #[test]
+    fn histogram_log_without_throttle_is_rejected() {
+        // Recording a log requires the throttle pipeline to be live.
+        let config = ThrottleConfig {
+            max_open_files: None,
+            ops_throttle: 0,
+            iops_throttle: 0,
+            chunk_size: 0,
+            auto_meta: None,
+            histogram_log_path: Some("/tmp/x.hdr".into()),
+            histogram_enabled: false,
+            histogram_interval: std::time::Duration::from_secs(1),
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("histogram") && err.contains("auto-meta-throttle"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn histogram_enabled_without_throttle_is_rejected() {
+        // --auto-meta-histogram alone (no log path) without --auto-meta-throttle
+        // is rejected for the same reason: nothing to histogram.
+        let config = ThrottleConfig {
+            max_open_files: None,
+            ops_throttle: 0,
+            iops_throttle: 0,
+            chunk_size: 0,
+            auto_meta: None,
+            histogram_enabled: true,
+            histogram_log_path: None,
+            histogram_interval: std::time::Duration::from_secs(1),
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("histogram") && err.contains("auto-meta-throttle"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn histogram_interval_below_floor_is_rejected() {
+        let mut config = config_with(valid_auto_meta());
+        config.histogram_enabled = true;
+        config.histogram_interval = std::time::Duration::from_millis(50);
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("histogram-interval"), "got: {err}");
+    }
+
+    #[test]
+    fn histogram_interval_above_ceiling_is_rejected() {
+        let mut config = config_with(valid_auto_meta());
+        config.histogram_enabled = true;
+        config.histogram_interval = std::time::Duration::from_secs(120);
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("histogram-interval"), "got: {err}");
+    }
+
+    #[test]
+    fn histogram_defaults_pass_validation() {
+        let mut config = config_with(valid_auto_meta());
+        config.histogram_enabled = true;
+        config.histogram_interval = std::time::Duration::from_secs(1);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn histogram_log_with_missing_parent_is_rejected() {
+        let mut config = config_with(valid_auto_meta());
+        config.histogram_log_path = Some("/nonexistent-dir-12345/foo.hdr".into());
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("histogram-log") && err.contains("parent"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn histogram_log_with_writable_parent_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with(valid_auto_meta());
+        config.histogram_log_path = Some(dir.path().join("foo.hdr"));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn histogram_log_with_bare_filename_is_accepted() {
+        // Path::parent() of "foo.hdr" returns Some("") — empty path, not
+        // None. The validator must treat that as the current directory,
+        // not as a missing parent.
+        let mut config = config_with(valid_auto_meta());
+        config.histogram_log_path = Some("bare-filename.hdr".into());
+        assert!(
+            config.validate().is_ok(),
+            "validate err: {:?}",
+            config.validate(),
+        );
+    }
+
+    #[test]
+    fn histogram_log_validation_uses_unique_probe_per_call() {
+        // Two consecutive validations with the same path must succeed —
+        // proving the probe file is removed cleanly and the filename
+        // doesn't collide with itself.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with(valid_auto_meta());
+        config.histogram_log_path = Some(dir.path().join("log.hdr"));
+        assert!(config.validate().is_ok());
+        assert!(config.validate().is_ok());
     }
 }

@@ -652,6 +652,146 @@ operator run a candidate controller through a configured scenario
 entirely deterministically, without touching a real filesystem. This is
 how new algorithms should be evaluated before shipping.
 
+### Per-(side, op) latency histograms
+
+Beyond the per-tick controller summary above, the auto-meta pipeline can
+emit full per-(side, op) latency *distributions* — both as a live
+in-terminal panel and as a binary log file. Both surfaces are
+independently toggleable:
+
+- **`--auto-meta-histogram`** turns on per-controller HDR accumulators
+  and renders an ASCII distribution panel beneath the existing
+  one-line-per-controller summary in the progress display. The panel
+  refreshes at the snapshot interval (default 1s) so bars stay
+  monotonic within an interval rather than shrinking mid-fill.
+- **`--auto-meta-histogram-log <PATH>`** writes a binary record
+  stream to `<PATH>` containing the same snapshots the panel reads.
+  Each record is a length-prefixed envelope around a standard
+  `hdrhistogram` v2 binary blob, so existing HDR tooling can read
+  the body after the 18-byte fixed prefix. If `<PATH>` already
+  exists it is truncated at the start of the run — rename or move
+  prior logs you want to keep.
+- **`--auto-meta-histogram-interval <DUR>`** controls both the panel
+  refresh and the per-record snapshot cadence. Range `[100ms, 60s]`,
+  default `1s`.
+
+The log file is self-describing — its header captures every tunable
+in effect plus host/PID/timestamp, so a record stream is meaningful
+in isolation.
+
+When neither flag is set, the histogram code is bypassed entirely:
+no accumulator construction, no extra task, no extra hot-path lock.
+
+#### Log file layout
+
+One log file per run, written in a fixed framing:
+
+```
+"RCP-AUTOMETA-HIST-V1\n"      21 ASCII bytes (magic, includes \n)
+<hdr_len: u32 LE>             byte length of the JSON header
+<hdr_bytes: hdr_len bytes>    JSON document, UTF-8
+
+loop {                        zero or more records, time-ordered
+  <rec_len: u32 LE>           byte length of the rest of the record
+  <unix_micros: u64 LE>       Unix epoch microseconds at snapshot end
+  <side: u8>                  0 = Source, 1 = Destination
+  <op: u8>                    MetadataOp discriminant
+  <samples_count: u64 LE>     count of samples in this snapshot
+  <hdr_blob: rec_len - 18>    HDR v2 serialized histogram
+}
+```
+
+All multi-byte integers are little-endian. The 4-byte length prefix
+plus 18-byte fixed-field section let a reader scan records without
+parsing the HDR blob. Empty snapshots (`samples_count == 0`) are
+omitted — most (side, op) slots are inactive on any real workload,
+and absence of records in a time range means "no samples", never
+"data lost".
+
+The writer flushes after every record; if the process is killed
+mid-record the tail can be partial, and readers detect that via the
+length prefix and stop cleanly. Format version 1; readers should
+check the magic exactly and reject unknown versions. Writers may add
+new top-level keys to the JSON header — readers ignore unknown keys
+to stay forward-compatible.
+
+#### Header schema
+
+The JSON header captures everything needed to interpret the records
+in isolation. Durations are encoded as microseconds in
+`*_micros`-suffixed fields:
+
+- `format_version` — currently `1`.
+- `tool`, `tool_version`, `hostname`, `pid`, `start_unix_micros` —
+  provenance: which process produced this log, on which host, when.
+- `snapshot_interval_micros` — record cadence.
+- `auto_meta` — the controller tunables in effect (initial / min /
+  max `cwnd`, `alpha`, `beta`, increase and decrease steps, baseline
+  and current percentiles, long and short window durations, tick
+  interval).
+- `hdr` — the HDR configuration: lowest discernible value (1 µs),
+  highest trackable value (1 hour), three significant figures, unit
+  (`microseconds`).
+- `unit_labels` — enumeration of all 18 (side, op) pairs paired with
+  their human-readable label (`src-stat`, `dst-stat`, `mkdir`, …).
+
+#### Reconstructing any window
+
+To recover the distribution over `[T - W, T]` for any window `W`:
+filter records by their `unix_micros` and the `(side, op)` of
+interest, deserialize each HDR blob with a v2 deserializer, and fold
+them all into one histogram via the merge operation. That's exactly
+how the controller's own baseline (10s) and current (1s) windows are
+recovered offline from a single record stream.
+
+**Scoping in remote copy.**
+
+`--auto-meta-histogram` (the panel-only flag) is **local to the master
+process and does not change rcpd behavior**. The remote-progress renderer
+calls `render_panel_from_registry()` in both its interactive and
+non-interactive branches, so the panel wiring is in place. In current
+remote mode the master runs no controllers of its own (rcpd processes
+handle all metadata work), so the master's registry is empty and the
+panel shows nothing. The panel is rendered at no extra cost when empty,
+and will show real data automatically once a future feature plumbs rcpd
+histogram snapshots back to master via the existing tracing/progress
+protocol. The panel flag is deliberately not forwarded to rcpd, to
+avoid paying the synchronous accumulator lock cost on every remote
+metadata probe with no visible benefit today.
+
+Critically, `--auto-meta-histogram` alone does **not** enable the
+adaptive throttle pipeline on rcpd. At the CLI layer,
+`throttle_config()` implies `auto_meta` from the panel flag (so the
+master can run a local throttle loop when the panel is visible in a
+local copy). But when constructing the `RcpdConfig` for a remote copy,
+the rcp binary gates `auto_meta` propagation on the *explicit* flags:
+
+- `--auto-meta-throttle` (user asked for throttle) → propagated to rcpd.
+- `--auto-meta-histogram-log <PATH>` (user wants per-rcpd log files, which
+  require the throttle pipeline on rcpd to produce data) → propagated to
+  rcpd.
+- `--auto-meta-histogram` alone → **not** propagated. The panel flag is
+  purely observational; propagating it would silently change remote
+  concurrency while giving the user no histogram surface at all.
+
+The master's own `auto_meta` (from `throttle_config()`) is unaffected by
+this gating: the throttle pipeline runs locally on the master in all
+cases where any histogram flag is set, which is correct for local copies
+and harmless for remote copies (master has no metadata probes to throttle
+in remote mode).
+
+For distributed-run diagnostics, use `--auto-meta-histogram-log`
+instead: it captures per-rcpd distributions on each host and is the
+reliable surface for remote-copy histogram analysis.
+
+`--auto-meta-histogram-log` is forwarded to rcpd because it produces a
+concrete artifact. The master's path `/path/to/foo.hdr` becomes
+`foo.rcp-master.hdr` on the master, `foo.rcpd-source.hdr` on the
+source rcpd, and `foo.rcpd-destination.hdr` on the destination rcpd,
+mirroring the chrome-trace prefixing convention. Users on shared
+filesystems can collect all three from a single mountpoint; users on
+per-host paths collect them after the run.
+
 ## Pluggability
 
 The algorithm layer is behind a single trait. Shipping today:

@@ -246,6 +246,14 @@ pub struct RcpdConfig {
     /// master's `--auto-meta-*` flags. `None` means the feature is off on
     /// this rcpd instance.
     pub auto_meta: Option<common::AutoMetaThrottleConfig>,
+    /// Mirror of master's --auto-meta-histogram flag.
+    pub auto_meta_histogram: bool,
+    /// Mirror of master's --auto-meta-histogram-log path. Each rcpd
+    /// suffixes its own trace identifier so the master and rcpds don't
+    /// collide on a localhost run.
+    pub auto_meta_histogram_log: Option<String>,
+    /// Mirror of master's --auto-meta-histogram-interval.
+    pub auto_meta_histogram_interval: std::time::Duration,
     // common::copy::Settings
     pub dereference: bool,
     pub overwrite: bool,
@@ -403,6 +411,20 @@ impl RcpdConfig {
                 humantime::format_duration(auto.tick_interval),
             ));
         }
+        // Only forward histogram flags when there's a log path: the panel-
+        // only flag (--auto-meta-histogram) makes rcpd pay the synchronous
+        // accumulator lock cost on every probe, but rcpd's panel never
+        // reaches the user (the master's remote-progress renderer doesn't
+        // read the rcpd histogram registry). The log path is different —
+        // it produces a concrete artifact on the rcpd's host that the user
+        // can collect after the run.
+        if let Some(path) = &self.auto_meta_histogram_log {
+            args.push(format!("--auto-meta-histogram-log={path}"));
+            args.push(format!(
+                "--auto-meta-histogram-interval={}",
+                humantime::format_duration(self.auto_meta_histogram_interval),
+            ));
+        }
         args
     }
 }
@@ -508,6 +530,9 @@ mod tests {
             iops_throttle: 0,
             chunk_size: 0,
             auto_meta: None,
+            auto_meta_histogram: false,
+            auto_meta_histogram_log: None,
+            auto_meta_histogram_interval: std::time::Duration::from_secs(1),
             dereference: false,
             overwrite: false,
             overwrite_compare: "size,mtime".to_string(),
@@ -534,12 +559,37 @@ mod tests {
     }
 
     #[test]
-    fn to_args_omits_auto_meta_when_none() {
+    fn to_args_omits_auto_meta_throttle_when_none() {
         let args = minimal_rcpd_config().to_args();
-        assert!(
-            !args.iter().any(|a| a.starts_with("--auto-meta")),
-            "no auto-meta flags should be emitted when auto_meta is None: {args:?}",
-        );
+        // throttle-specific flags must be absent when auto_meta is None
+        let throttle_flags = [
+            "--auto-meta-throttle",
+            "--auto-meta-initial-cwnd",
+            "--auto-meta-min-cwnd",
+            "--auto-meta-max-cwnd",
+            "--auto-meta-alpha",
+            "--auto-meta-beta",
+            "--auto-meta-baseline-percentile",
+            "--auto-meta-current-percentile",
+            "--auto-meta-increase-step",
+            "--auto-meta-decrease-step",
+            "--auto-meta-long-window",
+            "--auto-meta-short-window",
+            "--auto-meta-tick-interval",
+        ];
+        for flag in throttle_flags {
+            assert!(
+                !args.iter().any(|a| a.starts_with(flag)),
+                "throttle flag {flag} should not be emitted when auto_meta is None: {args:?}",
+            );
+        }
+        // histogram flag, log, and interval must all be absent when histograms are off
+        for arg in &args {
+            assert!(
+                !arg.starts_with("--auto-meta-histogram"),
+                "must not emit any histogram flag when histograms are off, found: {arg}",
+            );
+        }
     }
 
     #[test]
@@ -575,5 +625,62 @@ mod tests {
         assert!(has_prefix("--auto-meta-long-window="));
         assert!(has_prefix("--auto-meta-short-window="));
         assert!(has_prefix("--auto-meta-tick-interval="));
+    }
+
+    #[test]
+    fn to_args_omits_histogram_flags_when_disabled() {
+        // Critical for backward compatibility: existing rcpd binaries
+        // built without histogram support reject --auto-meta-histogram-*
+        // flags, so we must not emit them on every remote copy.
+        let mut config = minimal_rcpd_config();
+        config.auto_meta_histogram = false;
+        config.auto_meta_histogram_log = None;
+        let args = config.to_args();
+        for arg in &args {
+            assert!(
+                !arg.starts_with("--auto-meta-histogram"),
+                "must not emit histogram flag when disabled, found: {arg}",
+            );
+        }
+    }
+
+    #[test]
+    fn to_args_omits_panel_only_flag_when_no_log_path() {
+        // Panel-only --auto-meta-histogram is intentionally NOT forwarded
+        // to rcpd: the panel never reaches the user (no plumbing in remote
+        // progress), and forwarding would just add per-probe lock cost.
+        let mut config = minimal_rcpd_config();
+        config.auto_meta_histogram = true;
+        config.auto_meta_histogram_log = None;
+        let args = config.to_args();
+        for arg in &args {
+            assert!(
+                !arg.starts_with("--auto-meta-histogram"),
+                "panel-only flag must not be forwarded to rcpd, found: {arg}",
+            );
+        }
+    }
+
+    #[test]
+    fn to_args_forwards_histogram_log_and_interval_when_log_path_set() {
+        let mut config = minimal_rcpd_config();
+        config.auto_meta_histogram = false; // panel-only off
+        config.auto_meta_histogram_log = Some("/tmp/foo.hdr".into());
+        config.auto_meta_histogram_interval = std::time::Duration::from_millis(500);
+        let args = config.to_args();
+        assert!(
+            args.iter()
+                .any(|a| a == "--auto-meta-histogram-log=/tmp/foo.hdr")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("--auto-meta-histogram-interval="))
+        );
+        // The bare panel flag is NOT pushed; the log flag at parse time on
+        // rcpd already implies the accumulator pipeline.
+        assert!(
+            !args.iter().any(|a| a == "--auto-meta-histogram"),
+            "panel-only flag must not be forwarded; the log flag implies the pipeline",
+        );
     }
 }
