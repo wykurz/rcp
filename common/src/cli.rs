@@ -273,9 +273,18 @@ impl CommonArgs {
         }
     }
     /// Returns true if any progress-related flag was set.
+    ///
+    /// `--auto-meta-histogram` implies progress because its sole purpose is
+    /// to render a live distribution panel. `--auto-meta-histogram-log` does
+    /// NOT imply progress — it writes to a file regardless of progress mode,
+    /// and forcing a display would be worse UX for users who only want the
+    /// file.
     #[must_use]
     pub fn progress_requested(&self) -> bool {
-        self.progress || self.progress_type.is_some() || self.progress_delay.is_some()
+        self.progress
+            || self.progress_type.is_some()
+            || self.progress_delay.is_some()
+            || self.auto_meta_histogram
     }
 
     /// Build user-facing [`crate::ProgressSettings`] when any progress flag was
@@ -363,5 +372,25 @@ mod implies_tests {
         );
         // And no log path either.
         assert!(cli.common.auto_meta_histogram_log.is_none());
+    }
+
+    #[test]
+    fn auto_meta_histogram_implies_progress() {
+        let cli = TestCli::parse_from(["test", "--auto-meta-histogram"]);
+        assert!(
+            cli.common.progress_requested(),
+            "--auto-meta-histogram alone must imply progress so the panel actually renders",
+        );
+    }
+
+    #[test]
+    fn auto_meta_histogram_log_does_not_imply_progress() {
+        // the log file writes regardless of progress; user can opt in to
+        // progress separately. don't force it on them.
+        let cli = TestCli::parse_from(["test", "--auto-meta-histogram-log", "/tmp/x.hdr"]);
+        assert!(
+            !cli.common.progress_requested(),
+            "--auto-meta-histogram-log alone should NOT imply progress",
+        );
     }
 }
