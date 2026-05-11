@@ -1104,9 +1104,25 @@ fn main() -> Result<(), anyhow::Error> {
         .common
         .output_config(args.quiet, !is_dry_run && args.summary);
     let runtime = args.common.runtime_config();
-    let throttle = args
+    let mut throttle = args
         .common
         .throttle_config(args.max_open_files, args.chunk_size.0);
+    if is_remote_operation {
+        // In remote mode the master runs no metadata controllers — all probes
+        // fire inside rcpd on the remote hosts. Clear both histogram fields so
+        // that:
+        //   1. The master does not validate --auto-meta-histogram-log locally
+        //      against a path that may only exist on the remote hosts.
+        //   2. The master does not spawn a logger task that would write an empty
+        //      header-only log file at <PATH>.rcp-master.<ext> on the master's
+        //      filesystem.
+        //   3. The master does not spawn accumulators that will never receive a
+        //      sample (master has no controllers in remote mode).
+        // The RcpdConfig still carries the original path; each rcpd validates
+        // and writes its own log locally.
+        throttle.histogram_log_path = None;
+        throttle.histogram_enabled = false;
+    }
     let tracing = common::TracingConfig {
         remote_layer: None,
         debug_log_file: None,
