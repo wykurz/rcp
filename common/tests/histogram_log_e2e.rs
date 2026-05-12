@@ -1,7 +1,8 @@
 //! End-to-end: spawn auto-meta with histogram logging, generate a few
 //! probes, terminate, parse the resulting log, assert structure.
 
-use congestion::format::{read_file_header, read_record};
+use common::SerializableProgress;
+use congestion::format::{FORMAT_VERSION, Record, read_file_header, read_record};
 use std::io::BufReader;
 
 #[test]
@@ -70,16 +71,34 @@ fn auto_meta_histogram_log_records_real_probes() {
         .unwrap_or_else(|e| panic!("expected log at {actual_path:?}: {e}"));
     let mut reader = BufReader::new(f);
     let header = read_file_header(&mut reader).expect("header parses");
-    assert_eq!(header.format_version, 1);
+    assert_eq!(header.format_version, FORMAT_VERSION);
     assert_eq!(header.tool, "rcp");
     assert_eq!(header.snapshot_interval_micros, 150_000);
 
     let mut total_samples = 0u64;
+    let mut progress_records = 0u64;
+    let mut last_progress: Option<SerializableProgress> = None;
     while let Some(rec) = read_record(&mut reader).expect("reads cleanly") {
-        total_samples += rec.samples_count;
+        match rec {
+            Record::Histogram(h) => total_samples += h.samples_count,
+            Record::Progress(p) => {
+                progress_records += 1;
+                // Each progress record must carry a SerializableProgress
+                // payload — the offline-correlation contract is that the
+                // same shape the progress bar consumes is what readers
+                // see in the log. This deserialization is the test.
+                last_progress =
+                    Some(serde_json::from_slice(&p.json).expect("progress JSON parses"));
+            }
+        }
     }
     assert!(
         total_samples > 0,
         "expected at least one sample recorded; got 0"
     );
+    assert!(
+        progress_records > 0,
+        "expected at least one progress record; got 0"
+    );
+    let _ = last_progress.expect("progress record must carry a valid snapshot");
 }

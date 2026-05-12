@@ -1305,7 +1305,7 @@ fn build_histogram_header(
         }
     }
     LogHeader {
-        format_version: 1,
+        format_version: congestion::format::FORMAT_VERSION,
         tool: tool_name.to_string(),
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
         hostname,
@@ -1500,11 +1500,29 @@ fn spawn_auto_meta_throttle(
         let header = build_histogram_header(&auto, trace_identifier, histogram_interval);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         store_logger_cancel(cancel_tx);
+        // Snapshot the global PROGRESS counters into JSON each tick so
+        // the binary log carries throughput/files-copied alongside the
+        // latency distributions — readers can time-align them via the
+        // shared unix_micros field. Encoding can't realistically fail
+        // for this struct shape, but on the off chance it does we log
+        // and return an empty Vec — the logger treats empty as "skip
+        // this tick" rather than writing a record readers can't parse.
+        let progress_source: histogram_logger::ProgressSource = Box::new(|| {
+            let snapshot = progress::SerializableProgress::from(&*PROGRESS);
+            serde_json::to_vec(&snapshot).unwrap_or_else(|err| {
+                tracing::warn!(
+                    "histogram-logger: SerializableProgress JSON encode failed: {err:#}; \
+                     dropping this tick's progress record"
+                );
+                Vec::new()
+            })
+        });
         let handle = runtime.spawn(histogram_logger::run_logger(
             histogram_logger::LoggerConfig {
                 interval: histogram_interval,
                 log_path: resolved_log_path,
                 header,
+                progress_source: Some(progress_source),
             },
             logger_units,
             cancel_rx,
