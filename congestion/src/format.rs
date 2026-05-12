@@ -1,34 +1,59 @@
-//! Binary log file format for auto-meta histogram recordings.
+//! Binary log file format for auto-meta recordings.
 //!
 //! See `docs/congestion_control.md` for the canonical format reference.
 //! The short version:
 //!
 //! ```text
-//!   "RCP-AUTOMETA-HIST-V1\n"  // 21 ASCII bytes (magic, includes \n)
+//!   "RCP-AUTOMETA-HIST-V2\n"  // 21 ASCII bytes (magic, includes \n)
 //!   <hdr_len: u32 LE>
 //!   <hdr_bytes: JSON, hdr_len bytes>
 //!   loop {
 //!       <rec_len: u32 LE>
-//!       <unix_micros: u64 LE>
-//!       <side: u8>            // 0 = Source, 1 = Destination
-//!       <op: u8>              // MetadataOp discriminant
-//!       <samples_count: u64 LE>
-//!       <hdr_v2_blob: rec_len - 18 bytes>
+//!       <kind: u8>                // 0 = Histogram, 1 = Progress
+//!       if kind == Histogram:
+//!         <unix_micros: u64 LE>
+//!         <side: u8>              // 0 = Source, 1 = Destination
+//!         <op: u8>                // MetadataOp discriminant
+//!         <samples_count: u64 LE>
+//!         <hdr_v2_blob: remaining bytes>
+//!       if kind == Progress:
+//!         <unix_micros: u64 LE>
+//!         <json_bytes: remaining bytes>   // SerializableProgress as JSON
 //!   }
 //! ```
 //!
 //! Multi-byte integers are little-endian. Records are length-prefixed so
 //! readers can detect partial writes (process killed mid-record) and stop
-//! cleanly at the last full record.
+//! cleanly at the last full record. The single `kind` byte after the
+//! length prefix lets one file carry multiple record types in
+//! time-ordered interleave.
 
 use crate::measurement::{MetadataOp, Side};
 
 /// Magic bytes at the start of every log file. Includes a trailing
 /// newline so `head -1 file.hdr` shows the version on a clean line.
-pub const MAGIC: &[u8; 21] = b"RCP-AUTOMETA-HIST-V1\n";
+pub const MAGIC: &[u8; 21] = b"RCP-AUTOMETA-HIST-V2\n";
 
-/// The fixed (non-blob) bytes per record: u64 timestamp + u8 side + u8 op + u64 count.
-pub const RECORD_FIXED_BYTES: usize = 8 + 1 + 1 + 8;
+/// On-disk format version. Bumped from 1 → 2 when the per-record
+/// `kind` byte and the `Progress` record variant were introduced.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// Discriminant byte used as the first byte of every record body.
+/// Stable; new variants append. Readers reject unknown values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RecordKind {
+    Histogram = 0,
+    Progress = 1,
+}
+
+/// Fixed-prefix size of a Histogram record body, *including* the kind
+/// byte: kind(1) + unix_micros(8) + side(1) + op(1) + samples_count(8).
+pub const HISTOGRAM_RECORD_FIXED_BYTES: usize = 1 + 8 + 1 + 1 + 8;
+
+/// Fixed-prefix size of a Progress record body, *including* the kind
+/// byte: kind(1) + unix_micros(8). The JSON payload occupies the rest.
+pub const PROGRESS_RECORD_FIXED_BYTES: usize = 1 + 8;
 
 /// Maximum accepted size of the JSON header in bytes. Real headers
 /// are a few hundred bytes; this cap is generous enough that any
@@ -37,8 +62,9 @@ pub const RECORD_FIXED_BYTES: usize = 8 + 1 + 1 + 8;
 pub const MAX_HEADER_BYTES: u32 = 1 << 20; // 1 MiB
 
 /// Maximum accepted size of a single record in bytes. HDR v2 blobs
-/// at the configured range and precision are ~few KiB; this cap
-/// catches obvious corruption while leaving generous headroom.
+/// at the configured range and precision are ~few KiB; progress JSON
+/// payloads are a few hundred bytes; this cap catches obvious
+/// corruption while leaving generous headroom.
 pub const MAX_RECORD_BYTES: u32 = 1 << 20; // 1 MiB
 
 /// Top-level header captured at file start. Mirrors the fields a reader
@@ -89,19 +115,44 @@ pub struct UnitLabel {
     pub label: String,
 }
 
-/// One record's worth of decoded data after parsing the binary frame.
-///
-/// `histogram` is the deserialized HDR; `samples_count` is what the
-/// writer recorded in the fixed prefix (it equals `histogram.len()`
-/// for valid records and is exposed redundantly for tools that want to
-/// scan a log without parsing each blob).
+/// One decoded histogram record.
 #[derive(Debug)]
-pub struct Record {
+pub struct HistogramRecord {
     pub unix_micros: u64,
     pub side: Side,
     pub op: MetadataOp,
+    /// What the writer recorded in the fixed prefix; equals
+    /// `histogram.len()` for valid records and is exposed redundantly
+    /// for tools that want to scan a log without parsing each blob.
     pub samples_count: u64,
     pub histogram: hdrhistogram::Histogram<u64>,
+}
+
+/// One decoded progress record. `json` is the raw `SerializableProgress`
+/// payload bytes — the format crate does not depend on the snapshot
+/// type, so the caller deserializes with the structure it expects.
+#[derive(Debug)]
+pub struct ProgressRecord {
+    pub unix_micros: u64,
+    pub json: Vec<u8>,
+}
+
+/// One record's worth of decoded data after parsing the binary frame.
+#[derive(Debug)]
+pub enum Record {
+    Histogram(HistogramRecord),
+    Progress(ProgressRecord),
+}
+
+impl Record {
+    /// Convenience accessor: the timestamp on the record, regardless of variant.
+    #[must_use]
+    pub fn unix_micros(&self) -> u64 {
+        match self {
+            Record::Histogram(h) => h.unix_micros,
+            Record::Progress(p) => p.unix_micros,
+        }
+    }
 }
 
 /// Errors returned by the binary format reader.
@@ -117,6 +168,8 @@ pub enum ReadError {
     BadSide(u8),
     #[error("invalid MetadataOp discriminant {0}")]
     BadOp(u8),
+    #[error("invalid record kind {0}")]
+    BadRecordKind(u8),
     #[error("hdr deserialization failed: {0}")]
     Hdr(String),
     #[error("json: {0:#}")]
@@ -168,17 +221,17 @@ pub fn read_file_header<R: std::io::Read>(input: &mut R) -> Result<LogHeader, Re
     let mut json = vec![0u8; len];
     input.read_exact(&mut json)?;
     let header: LogHeader = serde_json::from_slice(&json)?;
-    if header.format_version != 1 {
+    if header.format_version != FORMAT_VERSION {
         return Err(ReadError::UnsupportedVersion(header.format_version));
     }
     Ok(header)
 }
 
-/// Append one record to `out`, encoding `histogram` as HDR v2 binary.
-///
-/// The record body's fixed prefix (unix_micros + side + op + samples_count)
-/// occupies [`RECORD_FIXED_BYTES`] bytes; the rest is the HDR blob.
-pub fn write_record<W: std::io::Write>(
+/// Append one histogram record to `out`, encoding `histogram` as HDR v2
+/// binary. The record body's fixed prefix (kind + unix_micros + side +
+/// op + samples_count) occupies [`HISTOGRAM_RECORD_FIXED_BYTES`] bytes;
+/// the rest is the HDR blob.
+pub fn write_histogram_record<W: std::io::Write>(
     out: &mut W,
     unix_micros: u64,
     side: Side,
@@ -191,13 +244,30 @@ pub fn write_record<W: std::io::Write>(
     serializer
         .serialize(histogram, &mut blob)
         .map_err(|e| WriteError::Hdr(format!("{e:?}")))?;
-    let rec_len = u32::try_from(RECORD_FIXED_BYTES + blob.len()).expect("record < 4GB");
+    let rec_len = u32::try_from(HISTOGRAM_RECORD_FIXED_BYTES + blob.len()).expect("record < 4GB");
     out.write_all(&rec_len.to_le_bytes())?;
+    out.write_all(&[RecordKind::Histogram as u8])?;
     out.write_all(&unix_micros.to_le_bytes())?;
     out.write_all(&[side as u8])?;
     out.write_all(&[op as u8])?;
     out.write_all(&histogram.len().to_le_bytes())?;
     out.write_all(&blob)?;
+    Ok(())
+}
+
+/// Append one progress record to `out`. The body is the kind byte plus
+/// an 8-byte timestamp followed by an opaque JSON payload — readers
+/// pass `json` through to a `serde_json::from_slice` of their choice.
+pub fn write_progress_record<W: std::io::Write>(
+    out: &mut W,
+    unix_micros: u64,
+    json: &[u8],
+) -> Result<(), WriteError> {
+    let rec_len = u32::try_from(PROGRESS_RECORD_FIXED_BYTES + json.len()).expect("record < 4GB");
+    out.write_all(&rec_len.to_le_bytes())?;
+    out.write_all(&[RecordKind::Progress as u8])?;
+    out.write_all(&unix_micros.to_le_bytes())?;
+    out.write_all(json)?;
     Ok(())
 }
 
@@ -216,10 +286,10 @@ pub fn read_record<R: std::io::Read>(input: &mut R) -> Result<Option<Record>, Re
         return Err(ReadError::RecordTooLarge(rec_len));
     }
     let rec_len = rec_len as usize;
-    if rec_len < RECORD_FIXED_BYTES {
-        // Length too small to even fit the fixed prefix → corrupt or
-        // truncated; bail rather than erroring so callers preserve any
-        // earlier good records.
+    // every record body starts with at least kind(1) + unix_micros(8); a
+    // shorter prefix is either truncation or corruption — bail without
+    // erroring so callers preserve any earlier good records.
+    if rec_len < 1 + 8 {
         return Ok(None);
     }
     let mut body = vec![0u8; rec_len];
@@ -229,38 +299,51 @@ pub fn read_record<R: std::io::Read>(input: &mut R) -> Result<Option<Record>, Re
         }
         return Err(ReadError::Io(e));
     }
-    let unix_micros = u64::from_le_bytes(body[0..8].try_into().unwrap());
-    let side = match body[8] {
-        0 => Side::Source,
-        1 => Side::Destination,
-        x => return Err(ReadError::BadSide(x)),
-    };
-    let op = match body[9] {
-        0 => MetadataOp::Stat,
-        1 => MetadataOp::ReadLink,
-        2 => MetadataOp::MkDir,
-        3 => MetadataOp::RmDir,
-        4 => MetadataOp::Unlink,
-        5 => MetadataOp::HardLink,
-        6 => MetadataOp::Symlink,
-        7 => MetadataOp::Chmod,
-        8 => MetadataOp::OpenCreate,
-        x => return Err(ReadError::BadOp(x)),
-    };
-    let samples_count = u64::from_le_bytes(body[10..18].try_into().unwrap());
-    let blob = &body[18..];
-    let mut deserializer = hdrhistogram::serialization::Deserializer::new();
-    let mut blob_cursor = std::io::Cursor::new(blob);
-    let histogram: hdrhistogram::Histogram<u64> = deserializer
-        .deserialize(&mut blob_cursor)
-        .map_err(|e| ReadError::Hdr(format!("{e:?}")))?;
-    Ok(Some(Record {
-        unix_micros,
-        side,
-        op,
-        samples_count,
-        histogram,
-    }))
+    let kind = body[0];
+    let unix_micros = u64::from_le_bytes(body[1..9].try_into().unwrap());
+    match kind {
+        k if k == RecordKind::Histogram as u8 => {
+            if rec_len < HISTOGRAM_RECORD_FIXED_BYTES {
+                return Ok(None);
+            }
+            let side = match body[9] {
+                0 => Side::Source,
+                1 => Side::Destination,
+                x => return Err(ReadError::BadSide(x)),
+            };
+            let op = match body[10] {
+                0 => MetadataOp::Stat,
+                1 => MetadataOp::ReadLink,
+                2 => MetadataOp::MkDir,
+                3 => MetadataOp::RmDir,
+                4 => MetadataOp::Unlink,
+                5 => MetadataOp::HardLink,
+                6 => MetadataOp::Symlink,
+                7 => MetadataOp::Chmod,
+                8 => MetadataOp::OpenCreate,
+                x => return Err(ReadError::BadOp(x)),
+            };
+            let samples_count = u64::from_le_bytes(body[11..19].try_into().unwrap());
+            let blob = &body[HISTOGRAM_RECORD_FIXED_BYTES..];
+            let mut deserializer = hdrhistogram::serialization::Deserializer::new();
+            let mut blob_cursor = std::io::Cursor::new(blob);
+            let histogram: hdrhistogram::Histogram<u64> = deserializer
+                .deserialize(&mut blob_cursor)
+                .map_err(|e| ReadError::Hdr(format!("{e:?}")))?;
+            Ok(Some(Record::Histogram(HistogramRecord {
+                unix_micros,
+                side,
+                op,
+                samples_count,
+                histogram,
+            })))
+        }
+        k if k == RecordKind::Progress as u8 => {
+            let json = body[PROGRESS_RECORD_FIXED_BYTES..].to_vec();
+            Ok(Some(Record::Progress(ProgressRecord { unix_micros, json })))
+        }
+        x => Err(ReadError::BadRecordKind(x)),
+    }
 }
 
 #[cfg(test)]
@@ -269,7 +352,7 @@ mod tests {
 
     fn sample_header() -> LogHeader {
         LogHeader {
-            format_version: 1,
+            format_version: FORMAT_VERSION,
             tool: "rcp".to_string(),
             tool_version: "0.32.0".to_string(),
             hostname: "test-host".to_string(),
@@ -311,6 +394,20 @@ mod tests {
         }
     }
 
+    fn unwrap_histogram(record: Record) -> HistogramRecord {
+        match record {
+            Record::Histogram(h) => h,
+            Record::Progress(_) => panic!("expected Histogram, got Progress"),
+        }
+    }
+
+    fn unwrap_progress(record: Record) -> ProgressRecord {
+        match record {
+            Record::Histogram(_) => panic!("expected Progress, got Histogram"),
+            Record::Progress(p) => p,
+        }
+    }
+
     #[test]
     fn header_serde_roundtrip() {
         let h = sample_header();
@@ -325,7 +422,7 @@ mod tests {
         // break older readers. serde's default is to error on unknown
         // fields; we explicitly need the lenient behavior.
         let json = r#"{
-            "format_version": 1,
+            "format_version": 2,
             "tool": "rcp",
             "tool_version": "0.32.0",
             "hostname": "h",
@@ -349,20 +446,18 @@ mod tests {
             "extra": { "future_key": 42 }
         }"#;
         let parsed: LogHeader = serde_json::from_str(json).expect("must tolerate unknown keys");
-        assert_eq!(parsed.format_version, 1);
+        assert_eq!(parsed.format_version, FORMAT_VERSION);
     }
 
     #[test]
-    fn write_and_read_file_with_two_records_roundtrips() {
-        // Build a small file: header + two records + truncate. Read it back;
-        // both records present, both decode cleanly.
+    fn write_and_read_file_with_two_histogram_records_roundtrips() {
         let mut buf: Vec<u8> = Vec::new();
         let header = sample_header();
         write_file_header(&mut buf, &header).unwrap();
         let mut h1 = hdrhistogram::Histogram::<u64>::new_with_bounds(1, 1_000_000, 3).unwrap();
         h1.record(100).unwrap();
         h1.record(200).unwrap();
-        write_record(
+        write_histogram_record(
             &mut buf,
             1_700_000_000_500_000,
             Side::Source,
@@ -372,7 +467,7 @@ mod tests {
         .unwrap();
         let mut h2 = hdrhistogram::Histogram::<u64>::new_with_bounds(1, 1_000_000, 3).unwrap();
         h2.record(300).unwrap();
-        write_record(
+        write_histogram_record(
             &mut buf,
             1_700_000_001_500_000,
             Side::Destination,
@@ -384,17 +479,79 @@ mod tests {
         let mut cursor = std::io::Cursor::new(&buf);
         let parsed_header = read_file_header(&mut cursor).unwrap();
         assert_eq!(parsed_header, header);
-        let r1 = read_record(&mut cursor).unwrap().expect("first record");
+        let r1 = unwrap_histogram(read_record(&mut cursor).unwrap().expect("first record"));
         assert_eq!(r1.unix_micros, 1_700_000_000_500_000);
         assert_eq!(r1.side, Side::Source);
         assert_eq!(r1.op, MetadataOp::Stat);
         assert_eq!(r1.samples_count, 2);
-        let r2 = read_record(&mut cursor).unwrap().expect("second record");
+        let r2 = unwrap_histogram(read_record(&mut cursor).unwrap().expect("second record"));
         assert_eq!(r2.side, Side::Destination);
         assert_eq!(r2.op, MetadataOp::MkDir);
         assert_eq!(r2.samples_count, 1);
         // EOF after last record returns Ok(None).
         assert!(read_record(&mut cursor).unwrap().is_none());
+    }
+
+    #[test]
+    fn write_and_read_progress_record_roundtrips() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_file_header(&mut buf, &sample_header()).unwrap();
+        let payload = br#"{"ops_started":3,"ops_finished":2,"bytes_copied":1024}"#;
+        write_progress_record(&mut buf, 1_700_000_002_000_000, payload).unwrap();
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let _ = read_file_header(&mut cursor).unwrap();
+        let rec = unwrap_progress(read_record(&mut cursor).unwrap().expect("progress record"));
+        assert_eq!(rec.unix_micros, 1_700_000_002_000_000);
+        assert_eq!(rec.json, payload);
+        assert!(read_record(&mut cursor).unwrap().is_none());
+    }
+
+    #[test]
+    fn mixed_record_stream_preserves_order() {
+        // Interleave histogram + progress + histogram records and verify
+        // that read_record returns them in write order with the right
+        // variants. This is the offline-correlation contract: each
+        // record's timestamp + variant lets a reader reconstruct what
+        // was happening at any point in the run.
+        let mut buf: Vec<u8> = Vec::new();
+        write_file_header(&mut buf, &sample_header()).unwrap();
+        let mut h = hdrhistogram::Histogram::<u64>::new_with_bounds(1, 1_000_000, 3).unwrap();
+        h.record(50).unwrap();
+        write_histogram_record(&mut buf, 10, Side::Source, MetadataOp::Stat, &h).unwrap();
+        write_progress_record(&mut buf, 20, br#"{"files_copied":7}"#).unwrap();
+        write_histogram_record(&mut buf, 30, Side::Destination, MetadataOp::MkDir, &h).unwrap();
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let _ = read_file_header(&mut cursor).unwrap();
+        let r1 = unwrap_histogram(read_record(&mut cursor).unwrap().unwrap());
+        assert_eq!(r1.unix_micros, 10);
+        assert_eq!(r1.side, Side::Source);
+        let r2 = unwrap_progress(read_record(&mut cursor).unwrap().unwrap());
+        assert_eq!(r2.unix_micros, 20);
+        assert_eq!(r2.json, br#"{"files_copied":7}"#);
+        let r3 = unwrap_histogram(read_record(&mut cursor).unwrap().unwrap());
+        assert_eq!(r3.unix_micros, 30);
+        assert_eq!(r3.side, Side::Destination);
+        assert!(read_record(&mut cursor).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_record_rejects_unknown_kind() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_file_header(&mut buf, &sample_header()).unwrap();
+        // hand-craft a record with kind byte 99
+        let body: [u8; 9] = [99, 1, 0, 0, 0, 0, 0, 0, 0]; // kind=99, ts=1
+        let rec_len = u32::try_from(body.len()).unwrap();
+        buf.extend_from_slice(&rec_len.to_le_bytes());
+        buf.extend_from_slice(&body);
+        let mut cursor = std::io::Cursor::new(&buf);
+        let _ = read_file_header(&mut cursor).unwrap();
+        let err = read_record(&mut cursor).unwrap_err();
+        assert!(
+            matches!(err, ReadError::BadRecordKind(99)),
+            "expected BadRecordKind(99), got: {err:?}",
+        );
     }
 
     #[test]
@@ -407,7 +564,7 @@ mod tests {
         write_file_header(&mut buf, &header).unwrap();
         let mut h = hdrhistogram::Histogram::<u64>::new_with_bounds(1, 1_000_000, 3).unwrap();
         h.record(100).unwrap();
-        write_record(&mut buf, 0, Side::Source, MetadataOp::Stat, &h).unwrap();
+        write_histogram_record(&mut buf, 0, Side::Source, MetadataOp::Stat, &h).unwrap();
         // Truncate: drop the last 5 bytes.
         buf.truncate(buf.len() - 5);
         let mut cursor = std::io::Cursor::new(&buf);
@@ -426,13 +583,24 @@ mod tests {
     }
 
     #[test]
+    fn read_file_header_rejects_v1_magic() {
+        // Regression: the V1 magic must not be silently accepted now
+        // that we've bumped to V2 — record layouts differ.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"RCP-AUTOMETA-HIST-V1\n");
+        let mut cursor = std::io::Cursor::new(&buf);
+        let err = read_file_header(&mut cursor).unwrap_err();
+        assert!(matches!(err, ReadError::BadMagic(_)), "got: {err:?}");
+    }
+
+    #[test]
     fn read_file_header_rejects_excessive_length() {
         let mut buf: Vec<u8> = Vec::new();
         buf.extend_from_slice(MAGIC);
         // pretend the header is 100 MiB
         buf.extend_from_slice(&(100u32 * 1024 * 1024).to_le_bytes());
         // append a few bytes of "header" so the read doesn't simply EOF
-        buf.extend_from_slice(b"{ \"format_version\": 1 }");
+        buf.extend_from_slice(b"{ \"format_version\": 2 }");
         let mut cursor = std::io::Cursor::new(&buf);
         let err = read_file_header(&mut cursor).unwrap_err();
         assert!(

@@ -666,11 +666,13 @@ independently toggleable:
   monotonic within an interval rather than shrinking mid-fill.
 - **`--auto-meta-histogram-log <PATH>`** writes a binary record
   stream to `<PATH>` containing the same snapshots the panel reads.
-  Each record is a length-prefixed envelope around a standard
-  `hdrhistogram` v2 binary blob, so existing HDR tooling can read
-  the body after the 18-byte fixed prefix. If `<PATH>` already
-  exists it is truncated at the start of the run — rename or move
-  prior logs you want to keep.
+  Each record is a length-prefixed envelope tagged with a kind byte;
+  histogram records wrap a standard `hdrhistogram` v2 binary blob,
+  and progress records wrap a JSON `SerializableProgress` payload —
+  the same struct the progress bar consumes — so latency
+  distributions and throughput counters share one time-ordered
+  stream. If `<PATH>` already exists it is truncated at the start
+  of the run — rename or move prior logs you want to keep.
 - **`--auto-meta-histogram-interval <DUR>`** controls both the panel
   refresh and the per-record snapshot cadence. Range `[100ms, 60s]`,
   default `1s`.
@@ -684,36 +686,48 @@ no accumulator construction, no extra task, no extra hot-path lock.
 
 #### Log file layout
 
-One log file per run, written in a fixed framing:
+One log file per run, written in a fixed framing. The file carries two
+kinds of records — latency histograms and progress snapshots —
+interleaved in time order so readers can correlate distribution shape
+with the throughput / files-copied counters the progress bar shows:
 
 ```
-"RCP-AUTOMETA-HIST-V1\n"      21 ASCII bytes (magic, includes \n)
+"RCP-AUTOMETA-HIST-V2\n"      21 ASCII bytes (magic, includes \n)
 <hdr_len: u32 LE>             byte length of the JSON header
 <hdr_bytes: hdr_len bytes>    JSON document, UTF-8
 
 loop {                        zero or more records, time-ordered
   <rec_len: u32 LE>           byte length of the rest of the record
-  <unix_micros: u64 LE>       Unix epoch microseconds at snapshot end
-  <side: u8>                  0 = Source, 1 = Destination
-  <op: u8>                    MetadataOp discriminant
-  <samples_count: u64 LE>     count of samples in this snapshot
-  <hdr_blob: rec_len - 18>    HDR v2 serialized histogram
+  <kind: u8>                  0 = Histogram, 1 = Progress
+  if kind == 0:               Histogram record body
+    <unix_micros: u64 LE>     Unix epoch microseconds at snapshot end
+    <side: u8>                0 = Source, 1 = Destination
+    <op: u8>                  MetadataOp discriminant
+    <samples_count: u64 LE>   count of samples in this snapshot
+    <hdr_blob: remaining>     HDR v2 serialized histogram
+  if kind == 1:               Progress record body
+    <unix_micros: u64 LE>     Unix epoch microseconds at tick end
+    <json_bytes: remaining>   SerializableProgress as UTF-8 JSON
 }
 ```
 
 All multi-byte integers are little-endian. The 4-byte length prefix
-plus 18-byte fixed-field section let a reader scan records without
-parsing the HDR blob. Empty snapshots (`samples_count == 0`) are
-omitted — most (side, op) slots are inactive on any real workload,
-and absence of records in a time range means "no samples", never
-"data lost".
+plus single-byte `kind` plus per-variant fixed prefix let a reader
+scan records without parsing the variable-length payload. Empty
+histogram snapshots (`samples_count == 0`) are omitted — most (side,
+op) slots are inactive on any real workload, and absence of records
+in a time range means "no samples", never "data lost". Progress
+records are emitted once per tick, including at run start (the
+counters are monotonic and zero is a meaningful state).
 
 The writer flushes after every record; if the process is killed
 mid-record the tail can be partial, and readers detect that via the
-length prefix and stop cleanly. Format version 1; readers should
-check the magic exactly and reject unknown versions. Writers may add
-new top-level keys to the JSON header — readers ignore unknown keys
-to stay forward-compatible.
+length prefix and stop cleanly. Format version 2 — record framing was
+extended from v1 (single record kind, no kind byte) to carry the
+`kind` discriminant and the Progress variant. Readers should check
+the magic exactly and reject unknown versions. Writers may add new
+top-level keys to the JSON header — readers ignore unknown keys to
+stay forward-compatible.
 
 #### Header schema
 
@@ -721,7 +735,7 @@ The JSON header captures everything needed to interpret the records
 in isolation. Durations are encoded as microseconds in
 `*_micros`-suffixed fields:
 
-- `format_version` — currently `1`.
+- `format_version` — currently `2`.
 - `tool`, `tool_version`, `hostname`, `pid`, `start_unix_micros` —
   provenance: which process produced this log, on which host, when.
 - `snapshot_interval_micros` — record cadence.
@@ -735,14 +749,44 @@ in isolation. Durations are encoded as microseconds in
 - `unit_labels` — enumeration of all 18 (side, op) pairs paired with
   their human-readable label (`src-stat`, `dst-stat`, `mkdir`, …).
 
+#### Progress record payload
+
+Progress records carry a UTF-8 JSON encoding of the same
+`SerializableProgress` struct sent over the rcpd → master tracing
+channel and rendered by the progress bar. Fields include:
+
+- `ops_started`, `ops_finished` — in-flight and completed op counts.
+- `bytes_copied`, `bytes_removed` — byte-level throughput counters.
+- `files_copied`, `symlinks_created`, `directories_created`,
+  `hard_links_created` — per-kind creation tallies.
+- `files_unchanged`, `symlinks_unchanged`, `directories_unchanged`,
+  `hard_links_unchanged` — unchanged tallies for incremental modes.
+- `files_removed`, `symlinks_removed`, `directories_removed` — removal
+  tallies for `rrm` and overwrite modes.
+- `files_skipped`, `symlinks_skipped`, `directories_skipped`,
+  `specials_skipped` — skip tallies.
+- `current_time` — RFC 3339 / `SystemTime` snapshot at write time
+  (redundant with the record's `unix_micros`; kept for parity with the
+  in-process wire encoding).
+
+Readers should treat the JSON payload as forward-compatible: future
+versions may add fields. Use `serde(deny_unknown_fields)` only on the
+writer side of your tool; readers should ignore unknown keys.
+
 #### Reconstructing any window
 
 To recover the distribution over `[T - W, T]` for any window `W`:
-filter records by their `unix_micros` and the `(side, op)` of
-interest, deserialize each HDR blob with a v2 deserializer, and fold
-them all into one histogram via the merge operation. That's exactly
-how the controller's own baseline (10s) and current (1s) windows are
-recovered offline from a single record stream.
+filter Histogram records by their `unix_micros` and the `(side, op)`
+of interest, deserialize each HDR blob with a v2 deserializer, and
+fold them all into one histogram via the merge operation. That's
+exactly how the controller's own baseline (10s) and current (1s)
+windows are recovered offline from a single record stream.
+
+To plot throughput-vs-latency-percentile, walk the same time-ordered
+stream and join each Progress record with the histogram(s) that
+share its tick: take the Progress record's `ops_finished` delta
+since the prior tick (giving ops/s) and the merged histogram's
+chosen percentile over the same window.
 
 **Scoping in remote copy.**
 
