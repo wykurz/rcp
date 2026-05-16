@@ -7,17 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-05-16
+
 ### Added
-- Add `--auto-meta-histogram`, `--auto-meta-histogram-log <PATH>`, and
-  `--auto-meta-histogram-interval <DUR>` for per-(side, op) HDR latency
-  histograms with live distribution panel and binary log file. The log
-  also carries per-tick progress snapshots (ops/s, files copied, bytes
-  copied, etc.) interleaved with histogram records, so offline tools
-  can correlate latency distributions with throughput. Format bumped
-  to v2; see `docs/congestion_control.md` for the layout.
+- Add `--auto-meta-throttle` adaptive congestion control for metadata operations, with per-side (source/destination) and per-syscall controllers that dynamically tune concurrency and rate based on observed latency. See `docs/congestion_control.md` for design.
+- Add `--auto-meta-histogram`, `--auto-meta-histogram-log <PATH>`, and `--auto-meta-histogram-interval <DUR>` for per-(side, op) HDR latency histograms with a live distribution panel and binary log file. The log carries per-tick progress snapshots (ops/s, files copied, bytes copied, etc.) interleaved with histogram records so offline tools can correlate latency distributions with throughput.
+- Add `--skip-specials` flag to skip non-copyable objects (sockets, FIFOs, devices) silently
+- Add age-based filtering to `rrm` via `--modified-before` / `--created-before`, applied to both files and directories
 
 ### Changed
 - Upgrade workspace to Rust 2024 edition; modernize code to use `let` chains and 2024 idioms
+- Surface remote stderr when rcpd deployment fails with broken pipe to aid diagnosis
+
+### Fixed
+- Fix `--fail-early` race in remote copy that swallowed file-level errors
+- Propagate non-`AlreadyExists` errors from hard-link helper instead of silently ignoring them
 
 ## [0.31.0] - 2026-04-02
 
@@ -190,7 +194,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See git history for changes in previous versions.
 
-[Unreleased]: https://github.com/wykurz/rcp/compare/v0.31.0...HEAD
+[Unreleased]: https://github.com/wykurz/rcp/compare/v0.32.0...HEAD
+[0.32.0]: https://github.com/wykurz/rcp/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/wykurz/rcp/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/wykurz/rcp/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/wykurz/rcp/compare/v0.28.0...v0.29.0
