@@ -1,0 +1,44 @@
+[package]
+name = "rcp-tools-rchm"
+version.workspace = true
+description = "Fast recursive chmod/chgrp/chown for large filesets (a dchmod replacement)"
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+readme = "../README.md"
+documentation = "https://docs.rs/rcp-tools-rchm"
+keywords = ["cli", "file", "chmod", "chown", "performance"]
+categories = ["command-line-utilities", "filesystem"]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+cargo-args = ["--config", "build.rustflags=[\"--cfg\", \"tokio_unstable\"]"]
+rustdoc-args = ["--cfg", "tokio_unstable"]
+
+[[bin]]
+name = "rchm"
+path = "src/main.rs"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+common = { workspace = true }
+humantime = "2.3"
+tokio = { version = "1.52", features = ["full", "parking_lot", "tracing"] }
+tracing = "0.1"
+
+[package.metadata.deb]
+maintainer = "Mateusz Wykurz <wykurz@gmail.com>"
+copyright = "2023, Mateusz Wykurz <wykurz@gmail.com>"
+depends = "libc6 (>= 2.27)"
+section = "utility"
+
+[package.metadata.generate-rpm]
+assets = [ { source = "target/release/rchm", dest = "/usr/bin/rchm", mode = "755" } ]

@@ -152,6 +152,9 @@ pub struct Progress {
     pub files_copied: TlsCounter,
     pub symlinks_created: TlsCounter,
     pub directories_created: TlsCounter,
+    pub files_changed: TlsCounter,
+    pub symlinks_changed: TlsCounter,
+    pub directories_changed: TlsCounter,
     pub files_unchanged: TlsCounter,
     pub symlinks_unchanged: TlsCounter,
     pub directories_unchanged: TlsCounter,
@@ -177,6 +180,9 @@ impl Progress {
             files_copied: Default::default(),
             symlinks_created: Default::default(),
             directories_created: Default::default(),
+            files_changed: Default::default(),
+            symlinks_changed: Default::default(),
+            directories_changed: Default::default(),
             files_unchanged: Default::default(),
             symlinks_unchanged: Default::default(),
             directories_unchanged: Default::default(),
@@ -300,6 +306,7 @@ pub enum LocalProgressKind {
     Link,
     Compare,
     Filegen,
+    Modify,
 }
 
 fn ops_rates(
@@ -499,6 +506,68 @@ impl<'a> LocalProgressReport for RemoveProgressPrinter<'a> {
             self.progress.files_removed.get(),
             self.progress.symlinks_removed.get(),
             self.progress.directories_removed.get(),
+            self.progress.files_skipped.get(),
+            self.progress.symlinks_skipped.get(),
+            self.progress.directories_skipped.get(),
+        ))
+    }
+}
+
+/// Progress printer for `rchm`. Reports CHANGED / UNCHANGED / SKIPPED counts per
+/// entry type; rchm performs only metadata ops, so there are no byte counters.
+pub struct ModifyProgressPrinter<'a> {
+    progress: &'a Progress,
+    last_ops: u64,
+    last_update: std::time::Instant,
+}
+
+impl<'a> ModifyProgressPrinter<'a> {
+    pub fn new(progress: &'a Progress) -> Self {
+        Self {
+            progress,
+            last_ops: progress.ops.get().finished,
+            last_update: std::time::Instant::now(),
+        }
+    }
+}
+
+impl<'a> LocalProgressReport for ModifyProgressPrinter<'a> {
+    fn print(&mut self) -> anyhow::Result<String> {
+        let now = std::time::Instant::now();
+        let (ops, avg_ops, cur_ops) =
+            ops_rates(self.progress, self.last_ops, self.last_update, now);
+        self.last_ops = ops.finished;
+        self.last_update = now;
+        Ok(format!(
+            "---------------------\n\
+            OPS:\n\
+            pending: {:>10}\n\
+            average: {:>10.2} items/s\n\
+            current: {:>10.2} items/s\n\
+            -----------------------\n\
+            CHANGED:\n\
+            files:       {:>10}\n\
+            symlinks:    {:>10}\n\
+            directories: {:>10}\n\
+            -----------------------\n\
+            UNCHANGED:\n\
+            files:       {:>10}\n\
+            symlinks:    {:>10}\n\
+            directories: {:>10}\n\
+            -----------------------\n\
+            SKIPPED:\n\
+            files:       {:>10}\n\
+            symlinks:    {:>10}\n\
+            directories: {:>10}",
+            ops.started - ops.finished,
+            avg_ops,
+            cur_ops,
+            self.progress.files_changed.get(),
+            self.progress.symlinks_changed.get(),
+            self.progress.directories_changed.get(),
+            self.progress.files_unchanged.get(),
+            self.progress.symlinks_unchanged.get(),
+            self.progress.directories_unchanged.get(),
             self.progress.files_skipped.get(),
             self.progress.symlinks_skipped.get(),
             self.progress.directories_skipped.get(),
@@ -708,6 +777,7 @@ pub fn make_local_printer<'a>(
         LocalProgressKind::Link => Box::new(LinkProgressPrinter::new(progress)),
         LocalProgressKind::Compare => Box::new(CompareProgressPrinter::new(progress)),
         LocalProgressKind::Filegen => Box::new(FilegenProgressPrinter::new(progress)),
+        LocalProgressKind::Modify => Box::new(ModifyProgressPrinter::new(progress)),
     }
 }
 
@@ -1228,5 +1298,17 @@ mod tests {
         assert!(!output.contains("SKIPPED:"));
         assert!(!output.contains("symlinks:"));
         Ok(())
+    }
+
+    #[test]
+    fn modify_printer_renders_changed_section() {
+        let progress = Progress::new();
+        progress.files_changed.inc();
+        progress.directories_unchanged.inc();
+        let mut printer = ModifyProgressPrinter::new(&progress);
+        let out = printer.print().unwrap();
+        assert!(out.contains("CHANGED:"));
+        assert!(out.contains("UNCHANGED:"));
+        assert!(out.contains("SKIPPED:"));
     }
 }

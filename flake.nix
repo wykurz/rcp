@@ -82,6 +82,11 @@
             binaryName = "rrm";
             description = "Fast file removal tool";
           };
+          rchm = mkRcpPackage {
+            packageName = "rcp-tools-rchm";
+            binaryName = "rchm";
+            description = "Fast recursive chmod/chgrp/chown tool";
+          };
           rlink = mkRcpPackage {
             packageName = "rcp-tools-rlink";
             binaryName = "rlink";
@@ -171,7 +176,7 @@
               echo "  just build      - Build all packages"
               echo "  just doc        - Check documentation"
               echo ""
-              echo "Individual tools: rcp, rrm, rlink, rcmp, filegen"
+              echo "Individual tools: rcp, rrm, rchm, rlink, rcmp, filegen"
               echo "Note: rcpd is included with rcp (rcp-tools-rcp package)"
               echo ""
               echo "Static musl target enabled by default (.cargo/config.toml):"

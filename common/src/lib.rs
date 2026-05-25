@@ -109,6 +109,7 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::prelude::*;
 
 mod auto_meta;
+pub mod chmod;
 pub mod cli;
 pub mod cmp;
 pub mod config;
@@ -689,6 +690,13 @@ pub async fn copy(
 
 pub async fn rm(path: &std::path::Path, settings: &rm::Settings) -> Result<rm::Summary, rm::Error> {
     rm::rm(&PROGRESS, path, settings).await
+}
+
+pub async fn chmod(
+    path: &std::path::Path,
+    settings: &chmod::Settings,
+) -> Result<chmod::Summary, chmod::Error> {
+    chmod::chmod(&PROGRESS, path, settings).await
 }
 
 pub async fn link(

@@ -22,6 +22,8 @@ This repo contains tools to efficiently copy, remove and link large filesets, bo
 
 - `rrm` is for removing large filesets.
 
+- `rchm` is for recursively changing permissions and ownership of large filesets; a fast replacement for `dchmod`(3).
+
 - `rlink` allows hard-linking filesets with optional update path; typically used for hard-linking datasets with a delta.
 
 - `rcmp` tool is for comparing filesets.
@@ -35,6 +37,7 @@ API documentation for the command-line tools is available on docs.rs:
 
 - [rcp-tools-rcp](https://docs.rs/rcp-tools-rcp) - File copying tool (rcp & rcpd)
 - [rcp-tools-rrm](https://docs.rs/rcp-tools-rrm) - File removal tool
+- [rcp-tools-rchm](https://docs.rs/rcp-tools-rchm) - Recursive chmod/chgrp/chown tool
 - [rcp-tools-rlink](https://docs.rs/rcp-tools-rlink) - Hard-linking tool
 - [rcp-tools-rcmp](https://docs.rs/rcp-tools-rcmp) - File comparison tool
 - [rcp-tools-filegen](https://docs.rs/rcp-tools-filegen) - Test file generation utility
@@ -103,6 +106,37 @@ Remove a path recursively:
 ```fish
 > rrm <bar> --progress --summary
 ```
+
+Recursively change group and permissions:
+```fish
+# join group 'data'; add group rwx + setgid to dirs, group rw to files
+> rchm --group data --mode "f:g+rw d:g+rwxs" <path> --progress --summary
+
+# dchmod-style: one mode for everything (bare value, no type prefix)
+> rchm --mode g+rwX <path> --progress
+```
+
+The `--group` and `--owner` options take a per-type DSL: a bare value applies to all
+entries (files, directories, and symlinks via `lchown`); `f:`/`d:`/`l:` prefixes target
+one type. `--mode` uses the same DSL but covers only files and directories (a bare value
+sets both) — symlink mode bits aren't settable on Linux, so `l:` is rejected for `--mode`.
+
+**Compatibility with `chmod`/`chown`/`chgrp`:** mode expressions are a subset of
+`chmod` (`[ugoa][+-=][rwxXst]`, octal, and conditional `X`), omitting who-copy
+references like `g=u`. Omitted-who clauses ignore umask (deliberate for a bulk
+tool). For ordinary operands `rchm` does not dereference symlinks (like `-h`): it
+applies group/owner to the symlink itself via `lchown` and never changes symlink mode
+bits. This is not a guarantee under concurrent path replacement when rchm runs with
+more privilege than an actor who can modify the tree being traversed (e.g. under
+`sudo` over attacker-writable directories) — the same path-based-operation limitation
+as the other rcp tools; see [docs/tocttou.md](docs/tocttou.md). `mtime` is preserved;
+`ctime` necessarily changes (the kernel stamps it on any metadata change) and cannot
+be preserved.
+
+Directories are changed **before** their contents by default (like `chmod -R`), so
+`--mode d:u+rwx` can repair an unreadable directory. Pass `--defer-dir-changes` to
+change directories **after** their contents — needed when recursively removing your
+own read/execute permission from directories, where the default would lock itself out.
 
 Hard-link contents of one path to another:
 ```fish
@@ -668,3 +702,4 @@ References
 ==========
 1) https://mpifileutils.readthedocs.io/en/v0.11.1/dsync.1.html
 2) https://github.com/wtsi-ssg/pcp
+3) https://mpifileutils.readthedocs.io/en/v0.11/dchmod.1.html
