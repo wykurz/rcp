@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Add `rchm`: a fast recursive chmod/chgrp/chown tool for large filesets (a `dchmod` replacement), with a per-type `--mode`/`--group`/`--owner` DSL, no-op skipping, pre-order directory changes by default (so `--mode d:u+rwx` can repair an unreadable directory; `--defer-dir-changes` applies directories after their contents), progress, filtering, and throttling.
+
 ## [0.32.0] - 2026-05-16
 
 ### Added

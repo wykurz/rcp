@@ -1,7 +1,11 @@
-# TOCTTOU Vulnerabilities in rcp
+# TOCTTOU Vulnerabilities in the RCP tools
 
 This document describes Time-of-Check-Time-of-Use (TOCTTOU) race condition vulnerabilities
-that affect rcp when used with elevated privileges, and discusses potential mitigations.
+that affect the RCP tools (`rcp`, `rchm`, `rrm`, `rlink`) when used with elevated
+privileges, and discusses potential mitigations. The examples below use `rcp`, but the
+same check-then-path-operate pattern applies to the other tools — e.g. `rchm` performs a
+path-based `chmod` after an `lstat`-based type check, so a concurrent symlink swap could
+redirect the mode change despite `rchm`'s otherwise non-dereferencing behavior.
 
 ## Table of Contents
 
@@ -24,6 +28,11 @@ same system may be able to exploit TOCTTOU race conditions to:
 **Important**: These attacks require local access to the system and the ability to modify
 files/directories in the path being copied. Remote network attackers cannot exploit these
 vulnerabilities directly.
+
+**The precise threat condition** is not merely "running as root": it is *running with more
+privilege than an actor who can modify the paths being traversed.* Root operating on
+trusted, root-owned trees is outside this threat; the risk arises specifically when a
+more-privileged run traverses a tree that a less-privileged actor can write to.
 
 ## What is TOCTTOU?
 

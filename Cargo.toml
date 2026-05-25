@@ -6,6 +6,7 @@ members = [
   "congestion",
   "filegen",
   "rcmp",
+  "rchm",
   "rcp",
   "remote",
   "rlink",
