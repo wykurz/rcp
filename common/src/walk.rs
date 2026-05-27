@@ -248,3 +248,20 @@ pub fn should_skip_entry(
         None
     }
 }
+
+/// Path of `entry` relative to `root` (typically `source_root` or `dest_root` at the call
+/// site), with the `unwrap_or(entry)` defensive fallback rcp uses when `entry` isn't
+/// actually under `root`. Naming the pattern lets call sites read "the entry's path inside
+/// the tree" instead of `entry.strip_prefix(root).unwrap_or(entry)` — and removes a class
+/// of "did I get strip_prefix the right way round?" regressions.
+///
+/// Use with `filter_base.join(...)` for a logical filter path inside a delegated subtree
+/// (`copy_with_filter_base`'s non-empty `filter_base` case), or on its own when filter_base
+/// is empty.
+#[must_use]
+pub fn relative_to_root<'a>(
+    entry: &'a std::path::Path,
+    root: &std::path::Path,
+) -> &'a std::path::Path {
+    entry.strip_prefix(root).unwrap_or(entry)
+}

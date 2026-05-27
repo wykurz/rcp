@@ -108,6 +108,53 @@ impl std::fmt::Display for Summary {
     }
 }
 
+/// RAII guard that restores a directory's original mode on drop.
+///
+/// `rm_internal` chmod-relaxes a read-only directory to `0o777` to clear its contents. If the
+/// directory is retained (filter-protected children, time-filter skip, ENOTEMPTY) or any error
+/// occurs after the relax, the original mode must be restored — otherwise a `--delete`/`rrm`
+/// run leaves a protected tree world-writable. Drop fires on every exit path (retain, error,
+/// panic-unwind) without callers having to remember it; the success-remove path calls
+/// [`Self::defuse`] because the directory no longer exists.
+///
+/// Drop runs synchronously (it can't be async), so it uses `std::fs::set_permissions`: one
+/// chmod syscall — negligible cost, no need to round-trip through the tokio blocking pool just
+/// for cleanup. Best-effort: a restore failure is logged, not fatal.
+struct RelaxedDirGuard<'a> {
+    path: &'a std::path::Path,
+    /// Original mode to restore on drop. `None` means defused (no restore).
+    mode: Option<u32>,
+}
+
+impl<'a> RelaxedDirGuard<'a> {
+    fn new(path: &'a std::path::Path) -> Self {
+        Self { path, mode: None }
+    }
+    /// Record the original mode so it's restored on drop.
+    fn arm(&mut self, original_mode: u32) {
+        self.mode = Some(original_mode);
+    }
+    /// Cancel the pending restore (call after successfully removing the directory).
+    fn defuse(&mut self) {
+        self.mode = None;
+    }
+}
+
+impl Drop for RelaxedDirGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(mode) = self.mode.take()
+            && let Err(err) =
+                std::fs::set_permissions(self.path, std::fs::Permissions::from_mode(mode))
+        {
+            tracing::warn!(
+                "failed to restore original permissions on retained directory {:?}: {:#}",
+                self.path,
+                err
+            );
+        }
+    }
+}
+
 /// Public entry point for remove operations.
 /// Internally delegates to rm_internal with source_root tracking for proper filter matching.
 #[instrument(skip(prog_track, settings))]
@@ -146,6 +193,21 @@ pub async fn rm(
     // note: the time filter (applied to files, symlinks, and directories) is handled
     // inside rm_internal, so we don't duplicate the check here.
     rm_internal(prog_track, path, path, settings).await
+}
+
+/// Like [`rm`], but evaluates the include/exclude filter relative to `filter_root` instead of
+/// `path`. Used by `--delete` pruning: when removing an extraneous destination subtree,
+/// descendant excludes must be matched against their full destination-root-relative paths
+/// (which mirror the source-relative paths the filter targets), so path/anchored patterns
+/// like `cache/*.log` protect the right entries. The caller is responsible for the top-level
+/// filter decision on `path`.
+pub async fn rm_with_filter_root(
+    prog_track: &'static progress::Progress,
+    path: &std::path::Path,
+    filter_root: &std::path::Path,
+    settings: &Settings,
+) -> Result<Summary, Error> {
+    rm_internal(prog_track, path, filter_root, settings).await
 }
 #[instrument(skip(prog_track, settings))]
 #[async_recursion]
@@ -235,14 +297,16 @@ async fn rm_internal(
                 ..Default::default()
             });
         }
-        crate::walk::run_metadata_probed(
+        if let Err(err) = crate::walk::run_metadata_probed(
             congestion::Side::Destination,
             congestion::MetadataOp::Unlink,
             tokio::fs::remove_file(path),
         )
         .await
         .with_context(|| format!("failed removing {:?}", &path))
-        .map_err(|err| Error::new(err, Default::default()))?;
+        {
+            return Err(Error::new(err, Default::default()));
+        }
         if is_symlink {
             prog_track.symlinks_removed.inc();
             return Ok(Summary {
@@ -259,9 +323,16 @@ async fn rm_internal(
         });
     }
     tracing::debug!("remove contents of the directory first");
-    // only change permissions if not in dry-run mode
+    // When the directory is read-only we relax it to 0o777 so its contents can be cleared.
+    // `relaxed_guard` records the original mode and restores it on Drop — covering every
+    // retain branch (filter-protected children, time-filter skip, ENOTEMPTY) AND every error
+    // path that returns before the directory is removed. The success-remove path calls
+    // `defuse()` because the directory no longer exists. Dry-run skips the relax entirely,
+    // so the guard stays unarmed.
+    let mut relaxed_guard = RelaxedDirGuard::new(path);
     if settings.dry_run.is_none() && src_metadata.permissions().readonly() {
         tracing::debug!("directory is read-only - change the permissions");
+        let original_mode = src_metadata.permissions().mode() & 0o7777;
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
             .await
             .with_context(|| {
@@ -271,31 +342,41 @@ async fn rm_internal(
                 )
             })
             .map_err(|err| Error::new(err, Default::default()))?;
+        relaxed_guard.arm(original_mode);
     }
-    let mut entries = tokio::fs::read_dir(path)
-        .await
-        .with_context(|| format!("failed reading directory {:?}", &path))
-        .map_err(|err| Error::new(err, Default::default()))?;
+    let mut entries = match tokio::fs::read_dir(path).await {
+        Ok(entries) => entries,
+        Err(err) => {
+            return Err(Error::new(
+                anyhow::Error::new(err).context(format!("failed reading directory {:?}", &path)),
+                Default::default(),
+            ));
+        }
+    };
     let mut join_set = tokio::task::JoinSet::new();
     let errors = crate::error_collector::ErrorCollector::default();
     let mut skipped_files = 0;
     let mut skipped_symlinks = 0;
     let mut skipped_dirs = 0;
     loop {
-        let Some((entry, entry_file_type)) =
+        let next_entry =
             crate::walk::next_entry_probed(&mut entries, congestion::Side::Source, || {
                 format!("failed traversing directory {:?}", &path)
             })
-            .await
-            .map_err(|err| Error::new(err, Default::default()))?
-        else {
+            .await;
+        let Some((entry, entry_file_type)) = (match next_entry {
+            Ok(opt) => opt,
+            Err(err) => {
+                return Err(Error::new(err, Default::default()));
+            }
+        }) else {
             break;
         };
         let entry_path = entry.path();
         let entry_kind = EntryKind::from_file_type(entry_file_type.as_ref());
         let entry_is_dir = entry_kind == EntryKind::Dir;
         // compute relative path from source_root for filter matching
-        let relative_path = entry_path.strip_prefix(source_root).unwrap_or(&entry_path);
+        let relative_path = walk::relative_to_root(&entry_path, source_root);
         // apply filter if configured
         if let Some(skip_result) =
             walk::should_skip_entry(&settings.filter, relative_path, entry_is_dir)
@@ -386,7 +467,7 @@ async fn rm_internal(
     // left intact. directories that directly match an include pattern (e.g. --include target/)
     // should be removed even if empty. exclude-only filters never produce traversed-only
     // directories because directly_matches_include returns true when no includes exist.
-    let relative_path = path.strip_prefix(source_root).unwrap_or(path);
+    let relative_path = walk::relative_to_root(path, source_root);
     let traversed_only = !anything_removed
         && settings
             .filter
@@ -496,6 +577,8 @@ async fn rm_internal(
         Ok(()) => {
             prog_track.directories_removed.inc();
             rm_summary.directories_removed += 1;
+            // the directory is gone, so there's nothing to restore on drop.
+            relaxed_guard.defuse();
         }
         Err(err) if any_filter_active => {
             // with filtering, it's expected that directories may not be empty because we only
@@ -569,6 +652,60 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
+    async fn relaxed_dir_mode_restored_on_error_exit() -> Result<(), anyhow::Error> {
+        // Regression: when rm_internal chmod-relaxes a read-only directory to 0o777 to clear
+        // its contents, it must restore the original mode on ERROR paths too — not just on the
+        // retain paths (traversed-only, time-filtered skip, ENOTEMPTY under filter). Without
+        // that, a partial failure leaves the directory world-writable.
+        //
+        // We trigger the remove_dir error path by making the dst's PARENT non-writable: rm can
+        // chmod-relax dst and successfully unlink its contents (write on dst is granted by the
+        // relax), but the final remove_dir(dst) needs write permission on the parent, which it
+        // doesn't have → EACCES. The fix's inline restore at that error site must put dst back
+        // to 0o555 before propagating.
+        let tmp = tempfile::tempdir()?;
+        let parent = tmp.path().join("parent");
+        let dst = parent.join("dst");
+        tokio::fs::create_dir(&parent).await?;
+        tokio::fs::create_dir(&dst).await?;
+        tokio::fs::write(dst.join("inside.txt"), b"x").await?;
+        // dst is read-only → rm relaxes it.
+        tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o555)).await?;
+        // parent is read-only (still traversable via the execute bit) → remove_dir(dst) fails.
+        tokio::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).await?;
+
+        let result = rm(
+            &PROGRESS,
+            &dst,
+            &Settings {
+                fail_early: false,
+                filter: None,
+                dry_run: None,
+                time_filter: None,
+            },
+        )
+        .await;
+
+        // restore parent writability so we can stat dst and clean up regardless of the assertion.
+        tokio::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).await?;
+
+        assert!(
+            result.is_err(),
+            "rm must fail when its dst can be emptied but the parent dir blocks remove_dir"
+        );
+        let mode = tokio::fs::metadata(&dst).await?.permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o555,
+            "relaxed-then-erroring directory must be restored to its original mode (got {mode:o}o); leaving it 0o777 leaks permissions on partial failure"
+        );
+
+        // cleanup
+        tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
     async fn parent_dir_no_write_permission() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
@@ -601,6 +738,7 @@ mod tests {
         );
         Ok(())
     }
+
     mod filter_tests {
         use super::*;
         use crate::filter::FilterSettings;

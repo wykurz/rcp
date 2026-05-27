@@ -307,6 +307,7 @@ where
                 remote_copy_buffer_size: tcp_config.effective_buffer_size(),
                 filter,
                 dry_run,
+                delete: None,
             };
             tracing::info!("Starting source");
             let shared_send = std::sync::Arc::new(tokio::sync::Mutex::new(master_send_stream));
@@ -376,6 +377,7 @@ where
                 remote_copy_buffer_size: tcp_config.effective_buffer_size(),
                 filter: None,
                 dry_run: None,
+                delete: None,
             };
             tracing::info!("Starting destination");
             match destination::run_destination(

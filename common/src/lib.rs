@@ -67,6 +67,7 @@
 //!     remote_copy_buffer_size: 0,
 //!     filter: None,
 //!     dry_run: None,
+//!     delete: None,
 //! };
 //! let preserve = common::preserve::preserve_none();
 //!
@@ -114,6 +115,7 @@ pub mod cli;
 pub mod cmp;
 pub mod config;
 pub mod copy;
+pub mod delete;
 pub mod dry_run;
 pub mod error;
 pub mod error_collector;

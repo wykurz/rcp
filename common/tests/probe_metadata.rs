@@ -56,6 +56,7 @@ fn default_copy_settings() -> copy::Settings {
         remote_copy_buffer_size: 0,
         filter: None,
         dry_run: None,
+        delete: None,
     }
 }
 
