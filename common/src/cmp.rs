@@ -663,7 +663,7 @@ async fn cmp_internal(
         // apply filter if configured
         if let Some(ref filter) = settings.filter {
             // compute relative path from source_root for filter matching
-            let relative_path = entry_path.strip_prefix(source_root).unwrap_or(&entry_path);
+            let relative_path = crate::walk::relative_to_root(&entry_path, source_root);
             let is_dir = entry_file_type.map(|ft| ft.is_dir()).unwrap_or(false);
             if !matches!(
                 filter.should_include(relative_path, is_dir),
@@ -743,7 +743,7 @@ async fn cmp_internal(
         // apply filter if configured - if this entry would be filtered, don't report as missing
         if let Some(ref filter) = settings.filter {
             // compute relative path from dest_root for filter matching
-            let relative_path = entry_path.strip_prefix(dest_root).unwrap_or(&entry_path);
+            let relative_path = crate::walk::relative_to_root(&entry_path, dest_root);
             let is_dir = entry_file_type.map(|ft| ft.is_dir()).unwrap_or(false);
             if !matches!(
                 filter.should_include(relative_path, is_dir),
@@ -873,6 +873,7 @@ mod cmp_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             if preserve {
                 &DO_PRESERVE_SETTINGS

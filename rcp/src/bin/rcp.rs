@@ -63,12 +63,7 @@ struct Args {
     ///
     /// Available filters: "newer" (skip if destination mtime is strictly newer than source).
     /// Requires --overwrite.
-    #[arg(
-        long,
-        value_name = "FILTER",
-        requires = "overwrite",
-        help_heading = "Copy options"
-    )]
+    #[arg(long, value_name = "FILTER", help_heading = "Copy options")]
     overwrite_filter: Option<common::copy::OverwriteFilter>,
 
     /// Do not overwrite existing files
@@ -78,6 +73,22 @@ struct Args {
     /// Skip special files (sockets, FIFOs, devices) without error
     #[arg(long, help_heading = "Copy options")]
     skip_specials: bool,
+
+    /// Delete extraneous files from destination directories (mirror the source)
+    ///
+    /// Removes entries under the destination that have no counterpart in the
+    /// source. Implies --overwrite. Excluded files are protected from deletion
+    /// unless --delete-excluded is given. Requires a single source.
+    #[arg(
+        long,
+        conflicts_with_all = ["ignore_existing", "dereference"],
+        help_heading = "Copy options"
+    )]
+    delete: bool,
+
+    /// With --delete, also remove destination entries matching an exclude pattern
+    #[arg(long, requires = "delete", help_heading = "Copy options")]
+    delete_excluded: bool,
 
     /// Exit on first error
     #[arg(short = 'e', long = "fail-early", help_heading = "Copy options")]
@@ -821,6 +832,16 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
             ));
         }
     }
+    if args.delete && src_strings.len() > 1 {
+        return Err(anyhow!(
+            "--delete requires a single source; mirroring multiple sources into one destination is not supported"
+        ));
+    }
+    if args.overwrite_filter.is_some() && !(args.overwrite || args.delete) {
+        return Err(anyhow!(
+            "--overwrite-filter requires --overwrite (or --delete, which implies it)"
+        ));
+    }
     // choose parser based on --force-remote flag
     let parse_fn = if args.force_remote {
         path::parse_path_force_remote
@@ -856,6 +877,9 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         return Err(anyhow!(
             "Multiple sources are currently not supported when using remote paths!"
         ));
+    }
+    if has_remote_paths && args.delete {
+        return Err(anyhow!("--delete is not yet supported for remote copies"));
     }
     // if any of the src/dst paths are remote, we'll be using the rcpd
     let remote_src_dst = if has_remote_paths {
@@ -970,7 +994,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
                 }
             };
             // check for existing destination only when not using trailing slash (single source case)
-            if src_strings.len() == 1 && !dst_string.ends_with('/') && dst_path.exists() && !args.overwrite {
+            if src_strings.len() == 1 && !dst_string.ends_with('/') && dst_path.exists() && !(args.overwrite || args.delete) {
                 return Err(anyhow!(
                     "Destination path {dst_path:?} already exists! \n\
                     If you want to copy INTO it, then follow the destination path with a trailing slash (/). Use \
@@ -987,10 +1011,17 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         &args.exclude,
     )
     .map_err(|err| common::copy::Error::new(err, Default::default()))?;
+    let delete = if args.delete {
+        Some(common::copy::DeleteSettings {
+            delete_excluded: args.delete_excluded,
+        })
+    } else {
+        None
+    };
     let settings = common::copy::Settings {
         dereference: args.dereference,
         fail_early: args.fail_early,
-        overwrite: args.overwrite,
+        overwrite: args.overwrite || args.delete,
         overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)
             .map_err(|err| common::copy::Error::new(err, Default::default()))?,
         overwrite_filter: args.overwrite_filter,
@@ -1001,6 +1032,7 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         remote_copy_buffer_size: 0,
         filter,
         dry_run: args.dry_run,
+        delete,
     };
     tracing::debug!("copy settings: {:?}", &settings);
     let fail_early = settings.fail_early;

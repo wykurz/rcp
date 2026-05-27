@@ -42,6 +42,18 @@ struct Args {
     #[arg(long, help_heading = "Linking options")]
     skip_specials: bool,
 
+    /// Delete extraneous files from the destination (mirror the source)
+    ///
+    /// Removes entries under the destination that have no counterpart in the
+    /// source (or, with --update, in the source or update directory). Implies
+    /// --overwrite. Excluded files are protected unless --delete-excluded.
+    #[arg(long, help_heading = "Linking options")]
+    delete: bool,
+
+    /// With --delete, also remove destination entries matching an exclude pattern
+    #[arg(long, requires = "delete", help_heading = "Linking options")]
+    delete_excluded: bool,
+
     /// Directory with updated contents of `link`
     #[arg(long, value_name = "PATH", help_heading = "Linking options")]
     update: Option<std::path::PathBuf>,
@@ -177,7 +189,7 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
         dst_dir.join(src_file)
     } else {
         let dst_path = std::path::PathBuf::from(args.dst);
-        if dst_path.exists() && !args.overwrite {
+        if dst_path.exists() && !(args.overwrite || args.delete) {
             return Err(anyhow!(
                 "Destination path {dst_path:?} already exists! \n\
                 If you want to copy INTO it then follow the destination path with a trailing slash (/) or use \
@@ -208,11 +220,18 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
         &args.include,
         &args.exclude,
     )?;
+    let delete = if args.delete {
+        Some(common::copy::DeleteSettings {
+            delete_excluded: args.delete_excluded,
+        })
+    } else {
+        None
+    };
     let settings = common::link::Settings {
         copy_settings: common::copy::Settings {
             dereference: false, // currently not supported
             fail_early: args.fail_early,
-            overwrite: args.overwrite,
+            overwrite: args.overwrite || args.delete,
             overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
             overwrite_filter: None,
             ignore_existing: false,
@@ -221,6 +240,7 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
             remote_copy_buffer_size: 0, // not used for local operations
             filter: filter.clone(),
             dry_run: args.dry_run,
+            delete,
         },
         update_compare,
         update_exclusive: args.update_exclusive,

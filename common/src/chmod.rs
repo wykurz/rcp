@@ -742,7 +742,7 @@ async fn chmod_internal(
     // a directory may have been entered only because it *could contain* include-matches,
     // not because it directly matches an include pattern. such "traversed-only" dirs are
     // not modified themselves (mirrors rm.rs) -- only entries the filter directly selects.
-    let relative_path = path.strip_prefix(source_root).unwrap_or(path);
+    let relative_path = walk::relative_to_root(path, source_root);
     let traversed_only = settings
         .filter
         .as_ref()
@@ -789,7 +789,7 @@ async fn chmod_internal(
                     };
                 let entry_path = entry.path();
                 let entry_kind = EntryKind::from_file_type(entry_file_type.as_ref());
-                let relative_path = entry_path.strip_prefix(source_root).unwrap_or(&entry_path);
+                let relative_path = walk::relative_to_root(&entry_path, source_root);
                 if let Some(skip_result) = walk::should_skip_entry(
                     &settings.filter,
                     relative_path,

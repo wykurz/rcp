@@ -36,6 +36,18 @@ impl std::fmt::Display for OverwriteFilter {
     }
 }
 
+/// Settings controlling rsync-style `--delete` (mirror) behavior.
+///
+/// Present (`Some`) only when `--delete` was requested. `None` means the
+/// destination is never enumerated and no pruning work is done, so the default
+/// copy path pays nothing for this feature.
+#[derive(Debug, Clone)]
+pub struct DeleteSettings {
+    /// Also remove destination entries that match an exclude pattern
+    /// (rsync `--delete-excluded`). When false, excluded entries are protected.
+    pub delete_excluded: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub dereference: bool,
@@ -57,6 +69,8 @@ pub struct Settings {
     pub filter: Option<crate::filter::FilterSettings>,
     /// dry-run mode for previewing operations
     pub dry_run: Option<crate::config::DryRunMode>,
+    /// rsync-style `--delete` settings; `None` disables deletion entirely.
+    pub delete: Option<DeleteSettings>,
 }
 
 /// Summary with the appropriate `*_skipped` counter set to 1 for the given entry kind.
@@ -364,6 +378,33 @@ pub async fn copy(
     preserve: &preserve::Settings,
     is_fresh: bool,
 ) -> Result<Summary, Error> {
+    copy_with_filter_base(
+        prog_track,
+        src,
+        dst,
+        settings,
+        preserve,
+        is_fresh,
+        std::path::Path::new(""),
+    )
+    .await
+}
+
+/// Like [`copy`], but treats `src` as living at `filter_base` relative to the original filter
+/// root. Used when `rlink` delegates an update-only entry to `copy`: `--delete` pruning inside
+/// the delegated subtree then matches the include/exclude filter at the entry's true relative
+/// path (e.g. `cache/*.log`) instead of relative to the delegated root.
+#[instrument(skip(prog_track, settings, preserve))]
+#[allow(clippy::too_many_arguments)]
+pub async fn copy_with_filter_base(
+    prog_track: &'static progress::Progress,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    settings: &Settings,
+    preserve: &preserve::Settings,
+    is_fresh: bool,
+    filter_base: &std::path::Path,
+) -> Result<Summary, Error> {
     // check filter for top-level source (files, directories, and symlinks)
     if let Some(ref filter) = settings.filter {
         let src_name = src.file_name().map(std::path::Path::new);
@@ -377,7 +418,14 @@ pub async fn copy(
             .with_context(|| format!("failed reading metadata from src: {:?}", &src))
             .map_err(|err| Error::new(err, Default::default()))?;
             let is_dir = src_metadata.is_dir();
-            let result = filter.should_include_root_item(name, is_dir);
+            // for a delegated subtree (non-empty filter_base) the source is not the true filter
+            // root, so match it at its logical path with nested semantics; for a normal copy use
+            // root-item semantics (anchored patterns don't apply to the root itself).
+            let result = if filter_base.as_os_str().is_empty() {
+                filter.should_include_root_item(name, is_dir)
+            } else {
+                filter.should_include(filter_base, is_dir)
+            };
             match result {
                 crate::filter::FilterResult::Included => {}
                 result => {
@@ -392,7 +440,15 @@ pub async fn copy(
         }
     }
     copy_internal(
-        prog_track, src, dst, src, settings, preserve, is_fresh, None,
+        prog_track,
+        src,
+        dst,
+        src,
+        settings,
+        preserve,
+        is_fresh,
+        None,
+        filter_base,
     )
     .await
 }
@@ -409,6 +465,7 @@ async fn copy_internal(
     preserve: &preserve::Settings,
     mut is_fresh: bool,
     open_file_guard: Option<throttle::OpenFileGuard>,
+    filter_base: &std::path::Path,
 ) -> Result<Summary, Error> {
     let _ops_guard = prog_track.ops.guard();
     tracing::debug!("reading source metadata");
@@ -824,6 +881,12 @@ async fn copy_internal(
     // this is used later to decide if we should clean up an empty directory
     let we_created_this_dir = copy_summary.directories_created == 1;
     let mut join_set = tokio::task::JoinSet::new();
+    // names of source entries that pass the filter; used by --delete to decide
+    // which destination entries are extraneous. only populated when --delete is
+    // active; an empty HashSet has zero heap cost until the first insert, so the
+    // default path pays only a stack word.
+    let mut keep_set: std::collections::HashSet<std::ffi::OsString> =
+        std::collections::HashSet::new();
     let errors = crate::error_collector::ErrorCollector::default();
     loop {
         let Some((entry, entry_file_type)) =
@@ -840,11 +903,13 @@ async fn copy_internal(
         let dst_path = dst.join(entry_name);
         let entry_kind = EntryKind::from_file_type(entry_file_type.as_ref());
         let entry_is_dir = entry_kind == EntryKind::Dir;
-        // compute relative path from source_root for filter matching
-        let relative_path = entry_path.strip_prefix(source_root).unwrap_or(&entry_path);
+        // compute the path relative to the original filter root: `filter_base` is empty for a
+        // normal copy and non-empty for an rlink-delegated update subtree, so copy-side filtering
+        // matches the same logical path that delete pruning uses (e.g. `cache/keep.txt`).
+        let relative_path = filter_base.join(walk::relative_to_root(&entry_path, source_root));
         // apply filter if configured
         if let Some(skip_result) =
-            walk::should_skip_entry(&settings.filter, relative_path, entry_is_dir)
+            walk::should_skip_entry(&settings.filter, &relative_path, entry_is_dir)
         {
             if let Some(mode) = settings.dry_run {
                 crate::dry_run::report_skip(&entry_path, &skip_result, mode, entry_kind.label());
@@ -853,6 +918,12 @@ async fn copy_internal(
             copy_summary = copy_summary + skipped_summary_for(entry_kind);
             entry_kind.inc_skipped(prog_track);
             continue;
+        }
+        // record this name as authoritative for --delete: it has a source counterpart, so its
+        // destination counterpart must not be pruned — even when --skip-specials skips copying
+        // it (computed before the skip-specials check below for exactly that reason).
+        if settings.delete.is_some() {
+            keep_set.insert(entry_name.to_owned());
         }
         // skip special files (sockets, FIFOs, devices) when --skip-specials is set
         if settings.skip_specials && entry_kind == EntryKind::Special {
@@ -892,6 +963,7 @@ async fn copy_internal(
         let settings = settings.clone();
         let preserve = *preserve;
         let source_root = source_root.to_owned();
+        let filter_base = filter_base.to_owned();
         let do_copy = || async move {
             copy_internal(
                 prog_track,
@@ -902,6 +974,7 @@ async fn copy_internal(
                 &preserve,
                 is_fresh,
                 open_file_guard,
+                &filter_base,
             )
             .await
         };
@@ -931,6 +1004,43 @@ async fn copy_internal(
             }
         }
     }
+    // rsync-style --delete: remove destination entries with no source counterpart.
+    // runs only when --delete was requested; reaching here means the full set of
+    // source children for this directory is known (all spawned tasks have joined).
+    if let Some(delete_settings) = &settings.delete {
+        if errors.has_errors() {
+            // rsync-style safety: skip pruning when this subtree's copy reported errors —
+            // deleting based on a run that did not fully succeed could remove data
+            // unexpectedly. (rsync likewise skips --delete on I/O errors.)
+            tracing::warn!(
+                "skipping --delete pruning of {:?} because the copy reported errors",
+                dst
+            );
+        } else {
+            let relative_dir = filter_base.join(walk::relative_to_root(src, source_root));
+            match crate::delete::prune_extraneous(
+                prog_track,
+                dst,
+                &relative_dir,
+                &keep_set,
+                settings.filter.as_ref(),
+                delete_settings,
+                settings.fail_early,
+                settings.dry_run,
+            )
+            .await
+            {
+                Ok(rm_summary) => copy_summary.rm_summary = copy_summary.rm_summary + rm_summary,
+                Err(err) => {
+                    copy_summary.rm_summary = copy_summary.rm_summary + err.summary;
+                    if settings.fail_early {
+                        return Err(Error::new(err.source, copy_summary));
+                    }
+                    errors.push(err.source);
+                }
+            }
+        }
+    }
     // when filtering is active and we created this directory, check if anything was actually
     // copied into it. if nothing was copied, we may need to clean up the empty directory.
     let this_dir_count = usize::from(we_created_this_dir);
@@ -940,13 +1050,13 @@ async fn copy_internal(
     let anything_copied = copy_summary.files_copied > 0
         || copy_summary.symlinks_created > 0
         || child_dirs_created > 0;
-    let relative_path = src.strip_prefix(source_root).unwrap_or(src);
+    let relative_path = filter_base.join(walk::relative_to_root(src, source_root));
     let is_root = src == source_root;
     match check_empty_dir_cleanup(
         settings.filter.as_ref(),
         we_created_this_dir,
         anything_copied,
-        relative_path,
+        &relative_path,
         is_root,
         settings.dry_run.is_some(),
     ) {
@@ -1032,6 +1142,240 @@ mod copy_tests {
     static DO_PRESERVE_SETTINGS: std::sync::LazyLock<preserve::Settings> =
         std::sync::LazyLock::new(preserve::preserve_all);
 
+    fn settings_with_delete(delete: Option<DeleteSettings>) -> Settings {
+        Settings {
+            dereference: false,
+            fail_early: false,
+            overwrite: delete.is_some(), // --delete implies --overwrite
+            overwrite_compare: filecmp::MetadataCmpSettings {
+                size: true,
+                mtime: true,
+                ..Default::default()
+            },
+            overwrite_filter: None,
+            ignore_existing: false,
+            chunk_size: 0,
+            skip_specials: false,
+            remote_copy_buffer_size: 0,
+            filter: None,
+            dry_run: None,
+            delete,
+        }
+    }
+
+    fn delete_on() -> Option<DeleteSettings> {
+        Some(DeleteSettings {
+            delete_excluded: false,
+        })
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn delete_protects_skipped_special_name() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let src = test_path.join("src_dir");
+        let dst = test_path.join("dst_dir");
+        tokio::fs::create_dir(&src).await?;
+        tokio::fs::write(src.join("file.txt"), "hello").await?;
+        // a special file in the source that --skip-specials will skip copying
+        nix::unistd::mkfifo(
+            &src.join("pipe"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        // pre-existing destination: a counterpart for the skipped special, plus a genuine extra
+        tokio::fs::create_dir(&dst).await?;
+        tokio::fs::write(dst.join("pipe"), "old").await?;
+        tokio::fs::write(dst.join("stale.txt"), "junk").await?;
+
+        let mut settings = settings_with_delete(delete_on());
+        settings.skip_specials = true;
+        let summary = copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings,
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+
+        assert_eq!(summary.specials_skipped, 1);
+        assert!(dst.join("file.txt").exists());
+        assert!(
+            dst.join("pipe").exists(),
+            "a destination entry matching a skipped special must not be pruned (it has a source counterpart)"
+        );
+        assert!(!dst.join("stale.txt").exists()); // genuine extra removed
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn delete_removes_extraneous_destination_entries() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let src = test_path.join("foo");
+        let dst = test_path.join("bar");
+        // initial copy (no delete)
+        copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings_with_delete(None),
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        // introduce extraneous entries at the destination
+        tokio::fs::write(dst.join("extraneous.txt"), b"junk").await?;
+        tokio::fs::create_dir(dst.join("extra_dir")).await?;
+        tokio::fs::write(dst.join("extra_dir").join("nested.txt"), b"junk").await?;
+        // re-copy with --delete
+        let summary = copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings_with_delete(delete_on()),
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        assert_eq!(summary.rm_summary.files_removed, 2); // extraneous.txt + extra_dir/nested.txt
+        assert_eq!(summary.rm_summary.directories_removed, 1); // extra_dir
+        assert!(!dst.join("extraneous.txt").exists());
+        assert!(!dst.join("extra_dir").exists());
+        testutils::check_dirs_identical(&src, &dst, testutils::FileEqualityCheck::Basic).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn delete_prunes_extraneous_at_depth() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let src = test_path.join("foo");
+        let dst = test_path.join("bar");
+        copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings_with_delete(None),
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        // foo/bar is a common subdirectory; place a stale file inside the dst copy of it
+        let nested = dst.join("bar");
+        assert!(
+            nested.is_dir(),
+            "expected common subdirectory bar/ to exist at destination"
+        );
+        tokio::fs::write(nested.join("stale_nested.txt"), b"junk").await?;
+        let summary = copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings_with_delete(delete_on()),
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        assert!(
+            !nested.join("stale_nested.txt").exists(),
+            "stale entry inside a common subdirectory must be pruned"
+        );
+        assert!(summary.rm_summary.files_removed >= 1);
+        testutils::check_dirs_identical(&src, &dst, testutils::FileEqualityCheck::Basic).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn delete_removes_extraneous_symlink() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let src = test_path.join("foo");
+        let dst = test_path.join("bar");
+        copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings_with_delete(None),
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        // an extraneous symlink at the destination root (no source counterpart)
+        tokio::fs::symlink("/nonexistent/target", dst.join("stale_link")).await?;
+        let summary = copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings_with_delete(delete_on()),
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        assert!(
+            tokio::fs::symlink_metadata(dst.join("stale_link"))
+                .await
+                .is_err(),
+            "extraneous symlink must be removed"
+        );
+        assert_eq!(summary.rm_summary.symlinks_removed, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn delete_skips_pruning_when_copy_has_errors() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let src = test_path.join("foo");
+        let dst = test_path.join("bar");
+        // baseline copy establishes the destination
+        copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings_with_delete(None),
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        // an extraneous file that --delete would normally prune
+        tokio::fs::write(dst.join("extraneous.txt"), b"junk").await?;
+        // make a source sub-directory unreadable so traversal fails (fail_early is false).
+        // a directory (not a file) is used because --overwrite with mtime-equal files skips
+        // copying identical files; a directory's read_dir fails unconditionally when mode is 0o000.
+        let unreadable = src.join("baz");
+        let original = tokio::fs::metadata(&unreadable).await?.permissions();
+        tokio::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).await?;
+
+        let result = copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings_with_delete(delete_on()),
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await;
+
+        tokio::fs::set_permissions(&unreadable, original).await?;
+
+        assert!(
+            result.is_err(),
+            "copy of the unreadable directory should fail"
+        );
+        assert!(
+            dst.join("extraneous.txt").exists(),
+            "pruning must be skipped when the copy reported errors"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     #[traced_test]
     async fn check_basic_copy() -> Result<(), anyhow::Error> {
@@ -1057,6 +1401,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -1107,6 +1452,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -1184,6 +1530,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -1253,6 +1600,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -1302,6 +1650,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -1399,6 +1748,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             false,
         )
@@ -1427,6 +1777,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             true,
         )
@@ -1455,6 +1806,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             false,
         )
@@ -1483,6 +1835,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             true,
         )
@@ -1513,6 +1866,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1586,6 +1940,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1671,6 +2026,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1755,6 +2111,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1842,6 +2199,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1890,6 +2248,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &NO_PRESERVE_SETTINGS, // we want timestamps to differ!
             false,
@@ -1938,6 +2297,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -1994,6 +2354,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -2042,6 +2403,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -2089,6 +2451,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -2137,6 +2500,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -2175,6 +2539,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -2215,6 +2580,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -2252,6 +2618,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -2305,6 +2672,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &NO_PRESERVE_SETTINGS,
             false,
@@ -2377,6 +2745,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -2438,6 +2807,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &DO_PRESERVE_SETTINGS, // <- important!
             false,
@@ -2459,6 +2829,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -2516,6 +2887,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -2576,6 +2948,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -2617,6 +2990,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -2661,6 +3035,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -2711,6 +3086,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -2868,6 +3244,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -2936,6 +3313,7 @@ mod copy_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             &DO_PRESERVE_SETTINGS,
             false,
@@ -2993,6 +3371,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3049,6 +3428,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3109,6 +3489,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3146,6 +3527,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3189,6 +3571,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3236,6 +3619,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3283,6 +3667,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3341,6 +3726,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3400,6 +3786,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3465,6 +3852,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3527,6 +3915,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: Some(crate::config::DryRunMode::Explain),
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3589,6 +3978,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3653,6 +4043,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: Some(crate::config::DryRunMode::Brief),
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3709,6 +4100,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3758,6 +4150,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: Some(filter),
                     dry_run: Some(crate::config::DryRunMode::Explain),
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3811,6 +4204,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -3868,6 +4262,7 @@ mod copy_tests {
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
+                        delete: None,
                     },
                     &NO_PRESERVE_SETTINGS,
                     false,
@@ -3944,6 +4339,7 @@ mod copy_tests {
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
+                        delete: None,
                     },
                     &NO_PRESERVE_SETTINGS,
                     false,
@@ -3996,6 +4392,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -4038,6 +4435,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -4076,6 +4474,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -4115,6 +4514,7 @@ mod copy_tests {
                     remote_copy_buffer_size: 0,
                     filter: None,
                     dry_run: None,
+                    delete: None,
                 },
                 &NO_PRESERVE_SETTINGS,
                 false,
@@ -4125,5 +4525,145 @@ mod copy_tests {
             assert!(!dst.exists());
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn delete_protects_excluded_then_removes_with_delete_excluded()
+    -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let src = test_path.join("foo");
+        let dst = test_path.join("bar");
+        copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings_with_delete(None),
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        // a destination-only file that matches an exclude pattern
+        tokio::fs::write(dst.join("keep.log"), b"protected").await?;
+
+        let mut filter = crate::filter::FilterSettings::new();
+        filter.add_exclude("*.log")?;
+
+        // default --delete: keep.log is protected
+        let mut settings = settings_with_delete(delete_on());
+        settings.filter = Some(filter.clone());
+        copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings,
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        assert!(
+            dst.join("keep.log").exists(),
+            "*.log must be protected by default"
+        );
+
+        // --delete-excluded: keep.log is removed
+        let mut settings = settings_with_delete(Some(DeleteSettings {
+            delete_excluded: true,
+        }));
+        settings.filter = Some(filter);
+        copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings,
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        assert!(!dst.join("keep.log").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn delete_dry_run_reports_without_removing() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let src = test_path.join("foo");
+        let dst = test_path.join("bar");
+        copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings_with_delete(None),
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        tokio::fs::write(dst.join("stale.txt"), b"junk").await?;
+
+        let mut settings = settings_with_delete(delete_on());
+        settings.dry_run = Some(crate::config::DryRunMode::Brief);
+        let summary = copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings,
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+
+        // the key invariant: dry-run must NOT remove anything
+        assert!(
+            dst.join("stale.txt").exists(),
+            "dry-run must not remove anything"
+        );
+        // rm's dry-run does count would-be removals in files_removed
+        assert_eq!(summary.rm_summary.files_removed, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn delete_does_not_prune_when_source_unreadable() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let src = test_path.join("foo");
+        let dst = test_path.join("bar");
+        copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings_with_delete(None),
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        tokio::fs::write(dst.join("stale.txt"), b"junk").await?;
+        // make the source directory unreadable so enumeration fails
+        let original = tokio::fs::metadata(&src).await?.permissions();
+        tokio::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o000)).await?;
+
+        let result = copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings_with_delete(delete_on()),
+            &DO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await;
+
+        // restore permissions before asserting (so the temp dir cleans up)
+        tokio::fs::set_permissions(&src, original).await?;
+
+        assert!(result.is_err(), "unreadable source must error");
+        assert!(
+            dst.join("stale.txt").exists(),
+            "destination must not be pruned when source enumeration fails"
+        );
+        Ok(())
     }
 }

@@ -471,6 +471,34 @@ Preview what would happen without making changes:
 
 `rcp` tools will not-overwrite pre-existing data unless used with the `--overwrite` flag.
 
+## Delete (mirror)
+
+`rcp --delete` makes the destination a mirror of the source: any entry under the
+destination with no counterpart in the source is removed. `--delete` implies
+`--overwrite`, requires a single source, and cannot be combined with
+`--dereference` (`-L`). `rlink --delete` works the same way for hard-linked trees.
+
+```fish
+# make dst an exact mirror of src (removing anything in dst not present in src)
+> rcp --delete src dst --progress --summary
+```
+
+Excluded files are protected from deletion by default; pass `--delete-excluded`
+to remove them too. `--dry-run` previews deletions without performing them. `--delete` is
+supported for local operations (remote support is planned).
+
+Exclude-protection applies to pruning *extraneous* entries — those
+with no source counterpart. When `--overwrite` (implied by `--delete`) replaces a destination
+entry whose source counterpart changed type — e.g. a directory that is now a file in the source
+— removing the old destination entry is part of that overwrite, not an exclude-filtered
+deletion.
+
+Pruning happens incrementally as the parallel copy proceeds, and a directory's extraneous
+entries are removed only once that directory's subtree has been processed without error — so
+deletions never act on an incomplete source listing. Unlike rsync, rcp/rlink do not cancel
+*all* deletions when a single error occurs elsewhere: subtrees that were processed cleanly are
+still mirrored.
+
 Performance Tuning
 ==================
 

@@ -182,6 +182,48 @@ pub async fn link(
     settings: &Settings,
     is_fresh: bool,
 ) -> Result<Summary, Error> {
+    // A missing --update root is destructive under both --update-exclusive (materialized set =
+    // update set, so nothing materializes) AND --delete (the source-only keep_set makes any dst
+    // entry the missing update tree WOULD have protected look extraneous, and prune wipes it).
+    // In either case `link_internal` hits the recursive early-return / silent `None` fallback
+    // before that destruction would happen, so rlink reports success — silently preserving
+    // stale dst (--update-exclusive) or silently pruning would-be-protected entries (--delete).
+    // Reject at the public entry so a typo'd --update can't quietly do the wrong thing. The
+    // plain "--update without --delete or --update-exclusive" case still falls back to no-update
+    // mode (long-standing behavior), and recursive child-level "update missing" cases stay
+    // handled inside link_internal — they correctly no-op so the parent's prune removes their
+    // dst counterpart per the documented semantics.
+    if let Some(update_path) = update.as_ref()
+        && (settings.update_exclusive || settings.copy_settings.delete.is_some())
+    {
+        match crate::walk::run_metadata_probed(
+            congestion::Side::Source,
+            congestion::MetadataOp::Stat,
+            tokio::fs::symlink_metadata(update_path),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::new(
+                    anyhow!(
+                        "--update path {:?} does not exist (rejected under --delete or --update-exclusive to avoid silently pruning destination entries the update tree would otherwise have preserved)",
+                        update_path
+                    ),
+                    Default::default(),
+                ));
+            }
+            Err(err) => {
+                return Err(Error::new(
+                    anyhow::Error::new(err).context(format!(
+                        "failed reading metadata from update {:?}",
+                        update_path
+                    )),
+                    Default::default(),
+                ));
+            }
+        }
+    }
     // check filter for top-level source (files, directories, and symlinks)
     if let Some(ref filter) = settings.filter {
         let src_name = src.file_name().map(std::path::Path::new);
@@ -214,6 +256,65 @@ pub async fn link(
     )
     .await
 }
+/// Tracks which child names will be materialized at the destination for a single directory
+/// pass, used by `--delete` to decide what to prune. Operations are named after their
+/// semantic intent so the call sites don't repeat the gating conditions (delete-on-vs-off,
+/// `--update-exclusive` carve-out, skip-special-vs-real materialization).
+///
+/// When `--delete` is off the inner set is `None` and every method is a no-op — zero heap
+/// cost in the hot path.
+struct DeleteKeepSet {
+    inner: Option<std::collections::HashSet<std::ffi::OsString>>,
+    /// Under `--update-exclusive` with an active update tree, the source loop must NOT
+    /// register source-only entries — only the update set materializes.
+    src_records_disabled: bool,
+}
+
+impl DeleteKeepSet {
+    fn new(
+        delete: Option<&copy::DeleteSettings>,
+        update_exclusive: bool,
+        update_present: bool,
+    ) -> Self {
+        Self {
+            inner: delete.is_some().then(std::collections::HashSet::new),
+            src_records_disabled: update_exclusive && update_present,
+        }
+    }
+    /// Source loop: this src entry passed the filter. Called even when `--skip-specials`
+    /// will skip materialization — the dst counterpart still needs to be retained.
+    fn record_src(&mut self, name: &std::ffi::OsStr) {
+        if let Some(set) = &mut self.inner
+            && !self.src_records_disabled
+        {
+            set.insert(name.to_owned());
+        }
+    }
+    /// Update loop: this update entry passed the filter at its logical path.
+    fn record_update(&mut self, name: &std::ffi::OsStr) {
+        if let Some(set) = &mut self.inner {
+            set.insert(name.to_owned());
+        }
+    }
+    /// Update loop, filtered-out branch: an update entry at this name is filtered out, so
+    /// nothing materializes from the update side. Drop a src-side registration ONLY if the
+    /// source loop actually materialized something (caller tracks this via `processed_files`).
+    /// Skipped specials stay registered — their `record_src` happened, but `processed_files`
+    /// was not populated, so their dst counterpart is retained per `--skip-specials` semantics.
+    fn drop_src_when_update_filtered(&mut self, name: &std::ffi::OsStr, src_materialized: bool) {
+        if let Some(set) = &mut self.inner
+            && src_materialized
+        {
+            set.remove(name);
+        }
+    }
+    /// Borrow the underlying set for `prune_extraneous`. `None` means `--delete` is off and
+    /// the caller should skip the prune entirely.
+    fn as_set(&self) -> Option<&std::collections::HashSet<std::ffi::OsString>> {
+        self.inner.as_ref()
+    }
+}
+
 #[instrument(skip(prog_track, settings, open_file_guard))]
 #[async_recursion]
 #[allow(clippy::too_many_arguments)]
@@ -287,13 +388,20 @@ async fn link_internal(
             // were still holding one here, a saturated pool would deadlock the
             // inner acquire.
             drop(open_file_guard);
-            let copy_summary = copy::copy(
+            // delegate at this entry's logical path (relative to the link root) so that, under
+            // --delete, pruning inside the delegated subtree matches include/exclude descendants
+            // at the correct filter root (e.g. `node/*.log`) — mirroring the update-only
+            // delegation. With an empty base, a path-anchored exclude would fail to protect a
+            // descendant like `node/keep.log` and delete it.
+            let filter_base = walk::relative_to_root(src, source_root);
+            let copy_summary = copy::copy_with_filter_base(
                 prog_track,
                 update,
                 dst,
                 &settings.copy_settings,
                 &settings.preserve,
                 is_fresh,
+                filter_base,
             )
             .await
             .map_err(|err| {
@@ -352,14 +460,20 @@ async fn link_internal(
         }
         if update_metadata.is_symlink() {
             tracing::debug!("'update' is a symlink so just symlink that");
-            // use "copy" function to handle the overwrite logic
-            let copy_summary = copy::copy(
+            // delegate at this entry's logical path (relative to the link root) so the inner
+            // filter re-check in copy_with_filter_base uses nested semantics. With an empty
+            // filter_base it would fall back to should_include_root_item on the bare basename
+            // and reject a path-anchored include like `dir/link`, leaving the entry unmaterialized
+            // while the outer loop's keep_set entry still shielded the stale dst from pruning.
+            let filter_base = walk::relative_to_root(src, source_root);
+            let copy_summary = copy::copy_with_filter_base(
                 prog_track,
                 update,
                 dst,
                 &settings.copy_settings,
                 &settings.preserve,
                 is_fresh,
+                filter_base,
             )
             .await
             .map_err(|err| {
@@ -391,14 +505,17 @@ async fn link_internal(
         }
         if src_metadata.is_symlink() {
             tracing::debug!("'src' is a symlink so just symlink that");
-            // use "copy" function to handle the overwrite logic
-            let copy_summary = copy::copy(
+            // delegate at this entry's logical path so the inner filter re-check uses nested
+            // semantics — see the matching comment above on the update-symlink branch.
+            let filter_base = walk::relative_to_root(src, source_root);
+            let copy_summary = copy::copy_with_filter_base(
                 prog_track,
                 src,
                 dst,
                 &settings.copy_settings,
                 &settings.preserve,
                 is_fresh,
+                filter_base,
             )
             .await
             .map_err(|err| {
@@ -487,7 +604,11 @@ async fn link_internal(
             let dst_metadata = crate::walk::run_metadata_probed(
                 congestion::Side::Destination,
                 congestion::MetadataOp::Stat,
-                tokio::fs::metadata(dst),
+                // symlink_metadata (not metadata): do not follow a destination symlink. A
+                // symlinked directory is then treated as "not a directory" below and replaced,
+                // rather than copied/pruned *through* — which under --delete could delete files
+                // outside the destination tree. Mirrors copy.rs.
+                tokio::fs::symlink_metadata(dst),
             )
             .await
             .with_context(|| format!("failed reading metadata from {:?}", &dst))
@@ -572,6 +693,15 @@ async fn link_internal(
     let errors = crate::error_collector::ErrorCollector::default();
     // create a set of all the files we already processed
     let mut processed_files = std::collections::HashSet::new();
+    // Keep-set for --delete: names that will be materialized at the destination. See
+    // `DeleteKeepSet` for the semantics of `record_src` / `record_update` /
+    // `drop_src_when_update_filtered`. No-op when --delete is off, so the call sites stay
+    // unconditional in the hot path.
+    let mut keep_set = DeleteKeepSet::new(
+        settings.copy_settings.delete.as_ref(),
+        settings.update_exclusive,
+        update.is_some(),
+    );
     // iterate through src entries and recursively call "link" on each one
     loop {
         let Some((src_entry, entry_file_type)) =
@@ -590,7 +720,7 @@ async fn link_internal(
         let entry_is_dir = entry_kind == EntryKind::Dir;
         let entry_is_symlink = entry_kind == EntryKind::Symlink;
         // compute relative path from source_root for filter matching
-        let relative_path = entry_path.strip_prefix(source_root).unwrap_or(&entry_path);
+        let relative_path = walk::relative_to_root(&entry_path, source_root);
         // apply filter if configured
         if let Some(skip_result) =
             walk::should_skip_entry(&settings.filter, relative_path, entry_is_dir)
@@ -603,6 +733,9 @@ async fn link_internal(
             entry_kind.inc_skipped(prog_track);
             continue;
         }
+        // keep-set: a source entry has a destination counterpart that must not be pruned, even
+        // when --skip-specials skips copying it (computed before the skip-specials check below).
+        keep_set.record_src(entry_name);
         // skip special files (sockets, FIFOs, devices) when --skip-specials is set
         if settings.copy_settings.skip_specials && entry_kind == EntryKind::Special {
             tracing::debug!("skipping special file {:?}", &entry_path);
@@ -715,7 +848,7 @@ async fn link_internal(
         // Each spawned task's actual work is throttled by copy::copy's own internal
         // open-files backpressure inside copy_internal's spawn loop.
         loop {
-            let Some((update_entry, _entry_file_type)) = crate::walk::next_entry_probed(
+            let Some((update_entry, entry_file_type)) = crate::walk::next_entry_probed(
                 &mut update_entries,
                 congestion::Side::Source,
                 || format!("failed traversing directory {:?}", &update),
@@ -727,6 +860,33 @@ async fn link_internal(
             };
             let entry_path = update_entry.path();
             let entry_name = entry_path.file_name().unwrap();
+            // keep-set: every filter-passing update entry is materialized at the destination
+            // (entries also in `src` are linked, update-only entries are copied). Computed
+            // before the dedup `continue` so entries also present in `src` are covered — this
+            // is what makes --update-exclusive mirror the update set exactly.
+            if settings.copy_settings.delete.is_some() {
+                let entry_kind = EntryKind::from_file_type(entry_file_type.as_ref());
+                let relative_path = walk::relative_to_root(src, source_root).join(entry_name);
+                let filtered_out = walk::should_skip_entry(
+                    &settings.filter,
+                    &relative_path,
+                    entry_kind == EntryKind::Dir,
+                )
+                .is_some();
+                if filtered_out {
+                    // The update entry at this name is filtered out, so nothing materializes
+                    // from the update side. `drop_src_when_update_filtered` undoes a src-side
+                    // registration ONLY when the source loop actually materialized something —
+                    // a `--skip-specials` source special stays registered (its dst counterpart
+                    // must be retained per --skip-specials semantics).
+                    keep_set.drop_src_when_update_filtered(
+                        entry_name,
+                        processed_files.contains(entry_name),
+                    );
+                } else {
+                    keep_set.record_update(entry_name);
+                }
+            }
             if processed_files.contains(entry_name) {
                 // we already must have considered this file, skip it
                 continue;
@@ -734,15 +894,20 @@ async fn link_internal(
             tracing::debug!("found a new entry in the 'update' directory");
             let dst_path = dst.join(entry_name);
             let update_path = update.join(entry_name);
+            // filter-base for the delegated copy: this update entry's path relative to the
+            // source root, so any --delete pruning inside it matches the include/exclude filter
+            // at the entry's true relative path (e.g. cache/*.log), not relative to the entry.
+            let filter_base = walk::relative_to_root(src, source_root).join(entry_name);
             let settings = settings.clone();
             let do_copy = || async move {
-                let copy_summary = copy::copy(
+                let copy_summary = copy::copy_with_filter_base(
                     prog_track,
                     &update_path,
                     &dst_path,
                     &settings.copy_settings,
                     &settings.preserve,
                     is_fresh,
+                    &filter_base,
                 )
                 .await
                 .map_err(|err| {
@@ -787,6 +952,50 @@ async fn link_internal(
             }
         }
     }
+    // rsync-style --delete for rlink: remove destination entries the link operation did not
+    // materialize. `keep_set` holds exactly the materialized names: src ∪ update normally, or
+    // just the update set under --update-exclusive (where source-only entries are not
+    // materialized and so are pruned, matching `rsync --link-dest --delete`).
+    if let Some(delete_settings) = &settings.copy_settings.delete {
+        if errors.has_errors() {
+            // rsync-style safety: skip pruning when this subtree's link/update pass reported
+            // errors — deleting based on a run that did not fully succeed could remove data
+            // unexpectedly. (rsync likewise skips --delete on I/O errors.)
+            tracing::warn!(
+                "skipping --delete pruning of {:?} because the link/update pass reported errors",
+                dst
+            );
+        } else {
+            let relative_dir = walk::relative_to_root(src, source_root);
+            match crate::delete::prune_extraneous(
+                prog_track,
+                dst,
+                relative_dir,
+                keep_set
+                    .as_set()
+                    .expect("--delete is on, so DeleteKeepSet is active"),
+                settings.filter.as_ref(),
+                delete_settings,
+                settings.copy_settings.fail_early,
+                settings.dry_run,
+            )
+            .await
+            {
+                Ok(rm_summary) => {
+                    link_summary.copy_summary.rm_summary =
+                        link_summary.copy_summary.rm_summary + rm_summary;
+                }
+                Err(err) => {
+                    link_summary.copy_summary.rm_summary =
+                        link_summary.copy_summary.rm_summary + err.summary;
+                    if settings.copy_settings.fail_early {
+                        return Err(Error::new(err.source, link_summary));
+                    }
+                    errors.push(err.source);
+                }
+            }
+        }
+    }
     // when filtering is active and we created this directory, check if anything was actually
     // linked/copied into it. if nothing was linked, we may need to clean up the empty directory.
     let this_dir_count = usize::from(we_created_this_dir);
@@ -798,7 +1007,7 @@ async fn link_internal(
         || link_summary.copy_summary.files_copied > 0
         || link_summary.copy_summary.symlinks_created > 0
         || child_dirs_created > 0;
-    let relative_path = src.strip_prefix(source_root).unwrap_or(src);
+    let relative_path = walk::relative_to_root(src, source_root);
     let is_root = src == source_root;
     match check_empty_dir_cleanup(
         settings.filter.as_ref(),
@@ -890,6 +1099,132 @@ mod link_tests {
     static PROGRESS: std::sync::LazyLock<progress::Progress> =
         std::sync::LazyLock::new(progress::Progress::new);
 
+    mod delete_keep_set_tests {
+        //! Pure-logic unit tests for `DeleteKeepSet`. No filesystem needed — these pin the
+        //! src-vs-update materialization rules so a future refactor can't silently break them.
+
+        use super::super::DeleteKeepSet;
+        use crate::copy::DeleteSettings;
+        use std::ffi::{OsStr, OsString};
+
+        fn delete_on() -> DeleteSettings {
+            DeleteSettings {
+                delete_excluded: false,
+            }
+        }
+
+        #[test]
+        fn record_src_no_op_when_delete_off() {
+            let mut k = DeleteKeepSet::new(None, false, false);
+            k.record_src(OsStr::new("foo"));
+            assert!(k.as_set().is_none());
+        }
+
+        #[test]
+        fn record_src_no_op_under_update_exclusive_with_update() {
+            // `--update-exclusive` with an active update tree means the materialized set is
+            // the update set; source-only entries must NOT be retained.
+            let d = delete_on();
+            let mut k = DeleteKeepSet::new(Some(&d), true, true);
+            k.record_src(OsStr::new("src_only"));
+            assert!(!k.as_set().unwrap().contains(OsStr::new("src_only")));
+        }
+
+        #[test]
+        fn record_src_records_when_update_exclusive_without_update() {
+            // `--update-exclusive` is a no-op (carve-out doesn't apply) when no `--update`
+            // path is given.
+            let d = delete_on();
+            let mut k = DeleteKeepSet::new(Some(&d), true, false);
+            k.record_src(OsStr::new("foo"));
+            assert!(k.as_set().unwrap().contains(OsStr::new("foo")));
+        }
+
+        #[test]
+        fn record_src_records_in_normal_delete_mode() {
+            let d = delete_on();
+            let mut k = DeleteKeepSet::new(Some(&d), false, false);
+            k.record_src(OsStr::new("foo"));
+            assert!(k.as_set().unwrap().contains(OsStr::new("foo")));
+        }
+
+        #[test]
+        fn record_update_always_records_when_delete_on() {
+            // The update loop registers ALL filter-passing update entries, irrespective of
+            // `--update-exclusive` — the update set IS the materialized set in that mode.
+            let d = delete_on();
+            let mut k = DeleteKeepSet::new(Some(&d), true, true);
+            k.record_update(OsStr::new("from_update"));
+            assert!(k.as_set().unwrap().contains(OsStr::new("from_update")));
+        }
+
+        #[test]
+        fn record_update_no_op_when_delete_off() {
+            let mut k = DeleteKeepSet::new(None, false, false);
+            k.record_update(OsStr::new("from_update"));
+            assert!(k.as_set().is_none());
+        }
+
+        #[test]
+        fn drop_src_when_update_filtered_drops_materialized_src_entry() {
+            // The type-change case: src had a regular file at `node`, update has an excluded
+            // dir at `node/`. Source materialized — drop the keep-set entry so the stale dst
+            // is pruned.
+            let d = delete_on();
+            let mut k = DeleteKeepSet::new(Some(&d), false, true);
+            k.record_src(OsStr::new("node"));
+            assert!(k.as_set().unwrap().contains(OsStr::new("node")));
+            k.drop_src_when_update_filtered(OsStr::new("node"), /* src_materialized */ true);
+            assert!(!k.as_set().unwrap().contains(OsStr::new("node")));
+        }
+
+        #[test]
+        fn drop_src_when_update_filtered_keeps_skipped_special() {
+            // The skip-special case: source loop ran `record_src` but never reached
+            // `processed_files.insert` (it `continue`d on the skip-special branch). The dst
+            // counterpart must be retained per --skip-specials semantics.
+            let d = delete_on();
+            let mut k = DeleteKeepSet::new(Some(&d), false, true);
+            k.record_src(OsStr::new("pipe"));
+            k.drop_src_when_update_filtered(OsStr::new("pipe"), /* src_materialized */ false);
+            assert!(k.as_set().unwrap().contains(OsStr::new("pipe")));
+        }
+
+        #[test]
+        fn drop_src_when_update_filtered_no_op_when_delete_off() {
+            let mut k = DeleteKeepSet::new(None, false, false);
+            // Should not panic, and as_set stays None.
+            k.drop_src_when_update_filtered(OsStr::new("foo"), true);
+            assert!(k.as_set().is_none());
+        }
+
+        #[test]
+        fn full_directory_pass_matches_old_keep_set_semantics() {
+            // Models the union of src + update under plain `--delete --update` (no
+            // --update-exclusive). Names: src has `keep`, `pipe` (special, skipped),
+            // `node` (file). update has `from_upd`, `node` (excluded dir).
+            let d = delete_on();
+            let mut k = DeleteKeepSet::new(Some(&d), false, true);
+
+            // source loop
+            k.record_src(OsStr::new("keep"));
+            k.record_src(OsStr::new("pipe")); // --skip-specials: continues, processed_files NOT populated
+            k.record_src(OsStr::new("node"));
+
+            // update loop
+            k.record_update(OsStr::new("from_upd"));
+            // `node` filtered out in update; processed_files HAS `node` (source materialized it).
+            k.drop_src_when_update_filtered(OsStr::new("node"), true);
+
+            let set: std::collections::HashSet<OsString> = k.as_set().unwrap().clone();
+            let expected: std::collections::HashSet<OsString> = ["keep", "pipe", "from_upd"]
+                .into_iter()
+                .map(OsString::from)
+                .collect();
+            assert_eq!(set, expected);
+        }
+    }
+
     fn common_settings(dereference: bool, overwrite: bool) -> Settings {
         Settings {
             copy_settings: CopySettings {
@@ -908,6 +1243,7 @@ mod link_tests {
                 remote_copy_buffer_size: 0,
                 filter: None,
                 dry_run: None,
+                delete: None,
             },
             update_compare: filecmp::MetadataCmpSettings {
                 size: true,
@@ -1629,6 +1965,7 @@ mod link_tests {
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
+                        delete: None,
                     },
                     update_compare: Default::default(),
                     update_exclusive: false,
@@ -1692,6 +2029,7 @@ mod link_tests {
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
+                        delete: None,
                     },
                     update_compare: Default::default(),
                     update_exclusive: false,
@@ -1743,6 +2081,7 @@ mod link_tests {
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
+                        delete: None,
                     },
                     update_compare: Default::default(),
                     update_exclusive: false,
@@ -1798,6 +2137,7 @@ mod link_tests {
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
+                        delete: None,
                     },
                     update_compare: Default::default(),
                     update_exclusive: false,
@@ -1853,6 +2193,7 @@ mod link_tests {
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
+                        delete: None,
                     },
                     update_compare: Default::default(),
                     update_exclusive: false,
@@ -1918,6 +2259,7 @@ mod link_tests {
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
+                        delete: None,
                     },
                     update_compare: Default::default(),
                     update_exclusive: false,
@@ -1985,6 +2327,7 @@ mod link_tests {
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
+                        delete: None,
                     },
                     update_compare: Default::default(),
                     update_exclusive: false,
@@ -2058,6 +2401,7 @@ mod link_tests {
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
+                        delete: None,
                     },
                     update_compare: Default::default(),
                     update_exclusive: false,
@@ -2128,6 +2472,7 @@ mod link_tests {
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
+                        delete: None,
                     },
                     update_compare: Default::default(),
                     update_exclusive: false,
@@ -2198,6 +2543,7 @@ mod link_tests {
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
+                        delete: None,
                     },
                     update_compare: Default::default(),
                     update_exclusive: false,
@@ -2269,6 +2615,7 @@ mod link_tests {
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
+                        delete: None,
                     },
                     update_compare: Default::default(),
                     update_exclusive: false,
@@ -2319,6 +2666,7 @@ mod link_tests {
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
+                        delete: None,
                     },
                     update_compare: Default::default(),
                     update_exclusive: false,
@@ -2374,6 +2722,7 @@ mod link_tests {
                         remote_copy_buffer_size: 0,
                         filter: None,
                         dry_run: None,
+                        delete: None,
                     },
                     update_compare: Default::default(),
                     update_exclusive: false,
@@ -2471,6 +2820,68 @@ mod link_tests {
         assert_eq!(summary.copy_summary.specials_skipped, 1);
         assert!(dst.join("file.txt").exists());
         assert!(!dst.join("test.sock").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn delete_skips_pruning_when_link_has_errors() -> Result<(), anyhow::Error> {
+        let tmp_dir = testutils::setup_test_dir().await?;
+        let test_path = tmp_dir.as_path();
+        let src = test_path.join("foo");
+        let dst = test_path.join("bar");
+        // baseline link establishes the destination (no delete)
+        link(
+            &PROGRESS,
+            test_path,
+            &src,
+            &dst,
+            &None,
+            &common_settings(false, false),
+            false,
+        )
+        .await?;
+        // an extraneous file that --delete would normally prune
+        tokio::fs::write(dst.join("extraneous.txt"), b"junk").await?;
+        // make a source sub-directory unreadable so traversal fails (fail_early is false).
+        // a directory is used because --overwrite with mtime-equal files skips copying
+        // identical files; a directory's read_dir fails unconditionally when mode is 0o000.
+        let unreadable = src.join("baz");
+        let original = tokio::fs::metadata(&unreadable).await?.permissions();
+        tokio::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).await?;
+
+        let delete_settings = Settings {
+            copy_settings: CopySettings {
+                overwrite: true,
+                fail_early: false,
+                delete: Some(copy::DeleteSettings {
+                    delete_excluded: false,
+                }),
+                ..common_settings(false, true).copy_settings
+            },
+            ..common_settings(false, true)
+        };
+        let result = link(
+            &PROGRESS,
+            test_path,
+            &src,
+            &dst,
+            &None,
+            &delete_settings,
+            false,
+        )
+        .await;
+
+        tokio::fs::set_permissions(&unreadable, original).await?;
+
+        assert!(
+            result.is_err(),
+            "link of the unreadable directory should fail"
+        );
+        assert!(
+            dst.join("extraneous.txt").exists(),
+            "pruning must be skipped when the link/update pass reported errors"
+        );
         Ok(())
     }
 

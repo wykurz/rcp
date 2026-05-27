@@ -470,15 +470,19 @@ fn test_overwrite_filter_newer_with_overwrite() {
         .success();
 }
 
-/// Test that --overwrite-filter without --overwrite fails
+/// Test that --overwrite-filter without --overwrite (or --delete) fails
 #[test]
 fn test_overwrite_filter_requires_overwrite() {
+    // The error is now a runtime check (stdout) rather than a clap parse error (stderr),
+    // because --overwrite-filter also works with --delete. Check any output for the message.
     Command::cargo_bin("rcp")
         .unwrap()
         .args(["--overwrite-filter", "newer", "/tmp/src", "/tmp/dst"])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("--overwrite"));
+        .stdout(predicates::str::contains(
+            "--overwrite-filter requires --overwrite",
+        ));
 }
 
 /// Test that --overwrite-filter rejects invalid values
