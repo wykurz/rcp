@@ -11,6 +11,21 @@ Runs on every push and pull request to `main`:
 - **documentation**: Builds documentation with strict warnings
 - **test**: Runs the full test suite using cargo-nextest
 
+### codex-review.yml
+Runs on pull request open, reopen, ready-for-review, and synchronize events for `main`.
+The synchronize event fires when new commits are pushed to the pull request branch.
+
+The workflow runs `openai/codex-action@v1` with `gpt-5.5`, `xhigh` effort, a
+read-only Codex sandbox, and `drop-sudo` runner hardening. The Codex job checks out
+the pull request merge commit with read-only repository permissions and does not
+persist checkout credentials. A separate posting job uses the GitHub token only to
+add the review result as a pull request comment. The workflow intentionally runs only
+for non-draft pull requests from this repository so repository secrets are not
+exposed to forked pull requests.
+
+**Setup:** add an `OPENAI_API_KEY` repository secret under Settings -> Secrets and
+variables -> Actions.
+
 ### release.yml
 Builds, publishes binary packages, and publishes to crates.io when a tag is pushed. Triggered by `v*` tag pushes.
 

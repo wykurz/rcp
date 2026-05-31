@@ -1,0 +1,71 @@
+name: Codex review
+
+on:
+  pull_request:
+    branches: [ "main" ]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  codex:
+    name: Run Codex review
+    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      final_message: ${{ steps.run_codex.outputs.final-message }}
+    steps:
+    - name: Check out pull request
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      with:
+        ref: refs/pull/${{ github.event.pull_request.number }}/merge
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Run Codex
+      id: run_codex
+      uses: openai/codex-action@a26d2d4d8b78a694338b8e3715c3630254340b2c # v1
+      env:
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      with:
+        openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+        prompt-file: .github/codex/prompts/review.md
+        model: gpt-5.5
+        effort: xhigh
+        sandbox: read-only
+        safety-strategy: drop-sudo
+
+  post-feedback:
+    name: Post Codex feedback
+    needs: codex
+    if: needs.codex.outputs.final_message != ''
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+    - name: Post pull request comment
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        CODEX_FINAL_MESSAGE: ${{ needs.codex.outputs.final_message }}
+      run: |
+        review_file="$RUNNER_TEMP/codex-review.md"
+        {
+          printf '## Codex review for `%s`\n\n' "$PR_HEAD_SHA"
+          printf '%s\n' "$CODEX_FINAL_MESSAGE"
+        } > "$review_file"
+
+        gh pr comment "$PR_NUMBER" --body-file "$review_file"
