@@ -110,6 +110,23 @@ struct Args {
     #[command(flatten)]
     common: common::cli::CommonArgs,
 
+    // TOCTOU safety
+    /// Print TOCTOU-safety verdict for this invocation and exit (0 = safe, 1 = not safe)
+    ///
+    /// Analyzes whether the invocation is hardened against symlink/path-swap races
+    /// and exits without performing the removal operation.
+    #[arg(long, help_heading = "Security")]
+    toctou_check: bool,
+
+    /// Refuse to run unless the invocation uses the TOCTOU-hardened walk
+    ///
+    /// Refuses non-Linux builds (rrm has no --dereference). It does NOT verify the trust
+    /// of the operand path's prefix — that is the caller's responsibility (lock paths down
+    /// in the sudo rule). See "Scope of TOCTOU safety" in docs/tocttou.md. Intended for
+    /// sudo rules: `NOPASSWD: /usr/bin/rrm --require-toctou-safe *`.
+    #[arg(long, conflicts_with = "toctou_check", help_heading = "Security")]
+    require_toctou_safe: bool,
+
     // ARGUMENTS
     /// Path(s) to remove
     #[arg()]
@@ -209,6 +226,14 @@ fn main() -> Result<()> {
              rrm against glibc."
         ));
     }
+
+    // TOCTOU linter: must run before the async runtime starts.
+    // rrm has no --dereference flag; dereference is always false. The linter
+    // does NOT inspect the operand paths — the trust of a path's prefix is the
+    // caller's responsibility (see the "Scope of TOCTOU safety" section of
+    // docs/tocttou.md).
+    common::toctou_check::enforce_or_exit(false, args.toctou_check, args.require_toctou_safe);
+
     let dry_run_warnings = args.dry_run.map(|_| {
         common::DryRunWarnings::new(
             args.common.progress_requested(),

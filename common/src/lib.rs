@@ -115,6 +115,7 @@ pub mod cli;
 pub mod cmp;
 pub mod config;
 pub mod copy;
+pub mod copy_data;
 pub mod delete;
 pub mod dry_run;
 pub mod error;
@@ -128,12 +129,15 @@ pub mod observability;
 pub mod preserve;
 pub mod remote_tracing;
 pub mod rm;
+pub mod safedir;
 pub mod version;
 
 pub mod filecmp;
 pub mod progress;
 mod testutils;
+pub mod toctou_check;
 pub mod walk;
+pub mod walk_driver;
 
 pub use config::{
     AutoMetaThrottleConfig, DryRunMode, DryRunWarnings, OutputConfig, RuntimeConfig,

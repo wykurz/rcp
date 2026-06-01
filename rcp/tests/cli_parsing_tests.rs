@@ -671,3 +671,133 @@ fn test_remote_copy_timeout() {
         .assert()
         .success();
 }
+
+// ============================================================================
+// TOCTOU Safety Flag Tests
+// ============================================================================
+
+/// Test that --toctou-check exits without performing the copy
+#[test]
+fn toctou_check_exits_without_operating() {
+    // should exit (with any code) without needing valid src/dst
+    let output = Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--toctou-check", "/nonexistent-src", "/nonexistent-dst"])
+        .output()
+        .expect("failed to run rcp");
+    // must not hang and must produce output about TOCTOU
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("TOCTOU"),
+        "expected TOCTOU verdict in stdout, got: {stdout}"
+    );
+    // prove it stopped at the linter and did NOT proceed into the copy: a
+    // --toctou-check verdict prints to stdout and exits before operating, so there
+    // is no operation-side error (e.g. about the nonexistent source) on stderr.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.is_empty(),
+        "--toctou-check must not proceed into operation (stderr should be empty), got: {stderr}"
+    );
+}
+
+/// Test that --toctou-check -L reports not safe
+#[test]
+fn toctou_check_with_dereference_reports_not_safe() {
+    let output = Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["-L", "--toctou-check", "/tmp/src", "/tmp/dst"])
+        .output()
+        .expect("failed to run rcp");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("NOT SAFE"),
+        "expected NOT SAFE with -L, got: {stdout}"
+    );
+    assert!(
+        !output.status.success(),
+        "--toctou-check -L should exit non-zero"
+    );
+}
+
+/// Test that --toctou-check without -L reports safe on Linux
+#[cfg(target_os = "linux")]
+#[test]
+fn toctou_check_without_dereference_reports_safe_on_linux() {
+    let output = Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--toctou-check", "/tmp/src", "/tmp/dst"])
+        .output()
+        .expect("failed to run rcp");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // on Linux without -L the verdict should be SAFE
+    assert!(
+        stdout.contains("SAFE") && !stdout.contains("NOT SAFE"),
+        "expected SAFE (without NOT SAFE) on Linux without -L, got: {stdout}"
+    );
+    assert!(
+        output.status.success(),
+        "--toctou-check without -L should exit 0 on Linux"
+    );
+}
+
+/// Test that --require-toctou-safe -L refuses to run
+#[test]
+fn require_toctou_safe_refuses_with_dereference() {
+    let output = Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["-L", "--require-toctou-safe", "/tmp/src", "/tmp/dst"])
+        .output()
+        .expect("failed to run rcp");
+    assert!(
+        !output.status.success(),
+        "--require-toctou-safe -L should exit non-zero"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Refusing") || stdout.contains("not TOCTOU-safe"),
+        "expected refusal message, got: {stdout}"
+    );
+}
+
+/// Test that --toctou-check and --require-toctou-safe conflict
+#[test]
+fn toctou_check_and_require_toctou_safe_conflict() {
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args([
+            "--toctou-check",
+            "--require-toctou-safe",
+            "/tmp/src",
+            "/tmp/dst",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--require-toctou-safe"));
+}
+
+/// `--max-connections=0` must be rejected: a zero-size connection pool / zero
+/// pending-file budget (`max_connections * multiplier`) would deadlock the remote
+/// source. Regression for PR #247 review — the nonzero parser was previously wired
+/// only to `--pending-writes-multiplier`, not `--max-connections`.
+#[test]
+fn test_max_connections_zero_rejected() {
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--max-connections=0", "/tmp/src", "/tmp/dst"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("at least 1"));
+}
+
+/// `--pending-writes-multiplier=0` is likewise rejected (the sibling nonzero
+/// validation that was already wired — locked in here alongside max-connections).
+#[test]
+fn test_pending_writes_multiplier_zero_rejected() {
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--pending-writes-multiplier=0", "/tmp/src", "/tmp/dst"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("at least 1"));
+}

@@ -268,3 +268,67 @@ fn test_preserve_settings_custom_value() {
         .assert()
         .success();
 }
+
+// ============================================================================
+// TOCTOU Safety Flag Tests
+// ============================================================================
+
+/// Test that --toctou-check exits without performing the link operation
+#[test]
+fn toctou_check_exits_without_operating() {
+    let output = Command::cargo_bin("rlink")
+        .unwrap()
+        .args(["--toctou-check", "/nonexistent-src", "/nonexistent-dst"])
+        .output()
+        .expect("failed to run rlink");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("TOCTOU"),
+        "expected TOCTOU verdict in stdout, got: {stdout}"
+    );
+    // prove it stopped at the linter and did NOT proceed into the link operation:
+    // a --toctou-check verdict prints to stdout and exits before operating, so
+    // there is no operation-side error (e.g. about the nonexistent source) on
+    // stderr.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.is_empty(),
+        "--toctou-check must not proceed into operation (stderr should be empty), got: {stderr}"
+    );
+}
+
+/// Test that --toctou-check reports safe on Linux (rlink has no --dereference)
+#[cfg(target_os = "linux")]
+#[test]
+fn toctou_check_reports_safe_on_linux() {
+    let output = Command::cargo_bin("rlink")
+        .unwrap()
+        .args(["--toctou-check", "/tmp/src", "/tmp/dst"])
+        .output()
+        .expect("failed to run rlink");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("SAFE") && !stdout.contains("NOT SAFE"),
+        "expected SAFE on Linux for rlink, got: {stdout}"
+    );
+    assert!(
+        output.status.success(),
+        "--toctou-check should exit 0 on Linux"
+    );
+}
+
+/// Test that --toctou-check and --require-toctou-safe conflict
+#[test]
+fn toctou_check_and_require_toctou_safe_conflict() {
+    Command::cargo_bin("rlink")
+        .unwrap()
+        .args([
+            "--toctou-check",
+            "--require-toctou-safe",
+            "/tmp/src",
+            "/tmp/dst",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--require-toctou-safe"));
+}

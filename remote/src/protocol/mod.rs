@@ -123,6 +123,25 @@ impl From<&std::fs::Metadata> for Metadata {
     }
 }
 
+impl From<&common::safedir::FileMeta> for Metadata {
+    /// Build a wire `Metadata` from an fd-pinned [`common::safedir::FileMeta`]
+    /// snapshot (obtained via `fstat`/`fstatat` during a TOCTOU-safe walk),
+    /// reading every field through the shared `preserve::Metadata` trait so it
+    /// stays in lock-step with the `&std::fs::Metadata` conversion above.
+    fn from(meta: &common::safedir::FileMeta) -> Self {
+        use common::preserve::Metadata as _;
+        Metadata {
+            mode: meta.permissions().mode(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+            atime: meta.atime(),
+            mtime: meta.mtime(),
+            atime_nsec: meta.atime_nsec(),
+            mtime_nsec: meta.mtime_nsec(),
+        }
+    }
+}
+
 /// File header sent on unidirectional streams, followed by raw file data.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct File {
@@ -180,8 +199,6 @@ pub enum SourceMessage {
         is_root: bool,
         /// total child entries (files + directories + symlinks) for completion tracking
         entry_count: usize,
-        /// number of child files, echoed back via `DirectoryCreated` for file sending
-        file_count: usize,
         /// whether to keep this directory if it ends up empty after filtering
         keep_if_empty: bool,
     },
@@ -219,13 +236,29 @@ pub struct SrcDst {
 /// Messages sent from destination to source on the control stream.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum DestinationMessage {
-    /// Confirm directory created, request file transfers.
-    /// `file_count` is echoed back from the `Directory` message so source knows
-    /// how many files to send from this directory.
+    /// Confirm directory created, request file transfers. This is purely the
+    /// Pass-2 trigger: it tells the source the destination created the directory
+    /// and is ready to receive its files. The source already retains the
+    /// authoritative Pass-1 file count for the directory (in its fd-map entry under
+    /// hardened reads, or in a path→count map under `-L`), so no count is echoed
+    /// back here.
     DirectoryCreated {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
-        file_count: usize,
+    },
+    /// Acknowledge a `Directory` message the destination did NOT create (create
+    /// failed, ancestor failed, or `--ignore-existing` skipped a non-directory).
+    /// No files will be requested for it. The destination sends exactly one of
+    /// `DirectoryCreated` / `DirectorySkipped` per `Directory` message so the
+    /// source can release the matching held directory fd (see the source-side
+    /// fd-map / dir-fd budget in `rcp::source`): without this nack a skipped
+    /// directory's Pass-1 permit would never be released, hanging large no-ack
+    /// subtrees. `src` keys the source-side fd-map entry to release (the map is
+    /// inserted under `src`; see `take_for_skipped`); `dst` is carried for
+    /// symmetry/logging.
+    DirectorySkipped {
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
     },
     /// Signal destination has finished all operations.
     /// Initiates graceful shutdown via stream closure.

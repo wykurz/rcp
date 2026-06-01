@@ -117,21 +117,32 @@ async fn copy_emits_one_metadata_sample_per_tree_entry() {
     .await
     .expect("copy succeeds");
     congestion::clear_sample_sink();
-    // Source-side metadata: one symlink_metadata per copy_internal call —
-    // 6 entries (root + a + b + 3 .txt files) = 6 src probes.
+    // The local copy walk is fd-based (`common::safedir`), so the probe counts reflect
+    // fd-relative `openat`/`fstatat`/`mkdirat` syscalls rather than the old path-based
+    // `symlink_metadata`/`create_dir`/`File::open`. The data copy (`copy_file_range`) stays
+    // unprobed, like the `tokio::fs::copy` it replaced.
+    //
+    // Source-side metadata (16 total):
+    //   - 1 open_root_dir(src parent)                                          = 1
+    //   - root dir:  child(stat) + open_dir(stat) + meta(fstat)                = 3
+    //   - 2 subdirs: child(stat) + open_dir(stat) + meta(fstat)    × 2         = 6
+    //   - 3 files:   child(stat) + open_file_read(fstat)           × 3         = 6
+    //   (read_entries / getdents is deliberately unprobed; each directory's applied metadata is
+    //    read from its own opened fd via `Dir::meta` — read-side fidelity, one fstat per dir)
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Source),
-        6,
-        "expected 6 src metadata probes (one symlink_metadata per entry)",
+        16,
+        "expected 16 src metadata probes for the fd-based walk",
     );
-    // Destination-side metadata for the 6 entries:
-    //   - 3 dirs:  1 create_dir + 3 preserve (chown + chmod + utimens) = 4 each
-    //   - 3 files: 4 preserve (chown + open + chmod + utimens)         = 4 each
-    // tokio::fs::copy itself is unprobed (data-path), so 6 × 4 = 24 dst.
+    // Destination-side metadata (28 total):
+    //   - 1 open_root_dir(dst parent)                                          = 1
+    //   - 3 dirs:  make_dir(mkdir + open_dir) + 3 preserve (chown/chmod/utimens) = 5 each = 15
+    //   - 3 files: create_file + 3 preserve (chown/chmod/utimens)              = 4 each = 12
+    //   (copy_file_range is the data path, unprobed)
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Destination),
-        24,
-        "expected 24 dst metadata probes (4 per entry × 6 entries)",
+        28,
+        "expected 28 dst metadata probes for the fd-based walk",
     );
 }
 
@@ -342,25 +353,38 @@ async fn link_update_path_emits_probes_for_update_tree() {
     .await
     .expect("link succeeds");
     congestion::clear_sample_sink();
-    // Source-side: 6 link_internal symlink_metadata(src) calls (root + a +
-    // b + 3 .txt) + 1 top-level symlink_metadata(update) (succeeds, dirs
-    // only at top level — recursive update lookups for src/{a,b,*.txt}
-    // are NotFound, so their probes are discarded) + 3 copy_internal
-    // symlink_metadata calls (one per u*.txt under update) = 10.
+    // The link walk is fd-based, and update-only entries are delegated to the fd-based
+    // `copy::copy_child` using the HELD update/destination parent `Dir`s (so the delegation opens
+    // no root dir of its own). read_entries/getdents is unprobed; failed (NotFound) probes are
+    // discarded by `run_metadata_probed`.
+    //
+    // Source-side (22 total):
+    //   - open_root_dir(src parent) + open_root_dir(update parent)               = 2
+    //   - root dir: src child + src open_dir + update child + update open_dir
+    //               + meta(fstat, from the update dir)                            = 5
+    //   - a/, b/:   src child + src open_dir + meta(fstat, from src dir) (× 2); the update
+    //               lookups are NotFound and discarded                            = 6
+    //   - 3 src .txt files: src child only (hard link reads src via linkat)       = 3
+    //   - 3 update-only files via copy_child: child + open_file_read (× 3)        = 6
+    //   2 + 5 + 6 + 3 + 6 = 22. (Drops if the update-walk path stops spawning copies for u*.txt.)
+    //   (each directory's applied metadata is read from its own opened fd via `Dir::meta`.)
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Source),
-        10,
-        "expected 10 src metadata probes — drops to 7 if the update-walk \
-         path stops spawning copies for u*.txt",
+        22,
+        "expected 22 src metadata probes — drops if the update-walk path stops spawning copies \
+         for u*.txt",
     );
-    // Destination-side: 15 from the small-tree link (see
-    // link_emits_one_metadata_sample_per_tree_entry) + 12 for the 3
-    // update-only files (4 preserve probes per file via copy_file) = 27.
+    // Destination-side (31 total):
+    //   - open_root_dir(dst parent)                                              = 1
+    //   - 3 dirs (root + a + b): make_dir(mkdir + open_dir) + 3 preserve         = 5 each = 15
+    //   - 3 src .txt files hard-linked: linkat only (no metadata)                = 1 each = 3
+    //   - 3 update-only files via copy_child: create_file + 3 preserve           = 4 each = 12
+    //   1 + 15 + 3 + 12 = 31. (Drops if the update-walk path stops spawning copies for u*.txt.)
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Destination),
-        27,
-        "expected 27 dst metadata probes — drops to 15 if the update-walk \
-         path stops spawning copies for u*.txt",
+        31,
+        "expected 31 dst metadata probes — drops if the update-walk path stops spawning copies \
+         for u*.txt",
     );
 }
 
@@ -391,20 +415,29 @@ async fn link_emits_one_metadata_sample_per_tree_entry() {
     .await
     .expect("link succeeds");
     congestion::clear_sample_sink();
-    // Source-side metadata: one symlink_metadata per link_internal call —
-    // 6 entries (root + a + b + 3 .txt files) = 6 src probes.
+    // The link walk is now fd-based (`common::safedir`), so the probe counts reflect fd-relative
+    // `openat`/`fstatat`/`mkdirat`/`linkat` syscalls rather than the old path-based
+    // `symlink_metadata`/`create_dir`/`hard_link`. read_entries/getdents is deliberately unprobed.
+    //
+    // Source-side metadata (13 total):
+    //   - 1 open_root_dir(src parent)                                  = 1
+    //   - root dir:  child(stat) + open_dir(stat) + meta(fstat)        = 3
+    //   - 2 subdirs: child(stat) + open_dir(stat) + meta(fstat) × 2    = 6
+    //   - 3 files:   child(stat) only — a hard link reads the src via `linkat` (no open_file_read)
+    //                                                  × 3             = 3
+    //   (each directory's applied metadata is read from its own opened fd via `Dir::meta`)
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Source),
-        6,
-        "expected 6 src metadata probes (one symlink_metadata per entry)",
+        13,
+        "expected 13 src metadata probes for the fd-based link walk",
     );
-    // Destination-side metadata for the 6 entries:
-    //   - 3 dirs:  1 create_dir + 3 preserve (chown + chmod + utimens) = 4 each
-    //   - 3 files: 1 hard_link (no preserve in hard_link_helper)       = 1 each
-    // Total: 12 + 3 = 15 dst.
+    // Destination-side metadata (19 total):
+    //   - 1 open_root_dir(dst parent)                                            = 1
+    //   - 3 dirs:  make_dir(mkdir + open_dir) + 3 preserve (chown/chmod/utimens) = 5 each = 15
+    //   - 3 files: hard_link_at (linkat) only — a hard link copies no metadata   = 1 each = 3
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Destination),
-        15,
-        "expected 15 dst metadata probes (4 per dir × 3 + 1 per file × 3)",
+        19,
+        "expected 19 dst metadata probes for the fd-based link walk",
     );
 }

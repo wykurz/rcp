@@ -29,9 +29,33 @@
 //!
 //! When a directory fails to be created:
 //! - It's added to `failed_directories`
-//! - No `DirectoryCreated` is sent (source won't send files)
+//! - A `DirectorySkipped` nack is sent instead of `DirectoryCreated`, so the source releases the
+//!   directory's held fd and sends no files for it (exactly one of `DirectoryCreated`/
+//!   `DirectorySkipped` is sent per `Directory`)
 //! - Descendant directories/symlinks are skipped via `has_failed_ancestor()`
 //! - Skipped entries still call `process_child_entry()` on the parent
+//!
+//! # Directory fd-map (TOCTOU-safe destination writes)
+//!
+//! Every successfully created/reused directory also has its open [`Dir`] handle
+//! (an `O_NOFOLLOW|O_DIRECTORY` fd) stored in the tracker, keyed by its destination
+//! path. Because directories are created **top-down** (a parent's `DirectoryCreated`
+//! precedes any message for its children), a parent's `Dir` is always present in the
+//! tracker before its child files/dirs/symlinks are processed. All destination writes
+//! are then fd-relative on the held parent `Dir`: file/symlink/subdirectory creation,
+//! overwrite removal, directory-metadata application, and empty-directory cleanup. A
+//! privileged `rcpd` destination therefore cannot be redirected by a concurrent
+//! symlink swap of an intermediate destination directory into writing/creating/
+//! deleting outside the destination tree — the `openat`/`mkdirat`/`unlinkat`/… resolve
+//! relative to the pinned fd, never re-walking the path from the root.
+//!
+//! The map holds `Arc<Dir>`: callers clone the Arc out under the tracker lock, release
+//! the lock, then perform the (possibly slow) fd syscall — the lock is never held
+//! across a syscall, and the cloned Arc keeps the fd alive for the operation even if
+//! the directory completes and is dropped from the map concurrently.
+
+use common::safedir::Dir;
+use std::sync::Arc;
 
 /// State for a single directory waiting for child entries.
 #[derive(Debug)]
@@ -52,6 +76,16 @@ pub struct DirectoryTracker {
     failed_directories: std::collections::HashSet<std::path::PathBuf>,
     /// directories that we created (vs reused existing) - used for empty dir cleanup
     created_directories: std::collections::HashSet<std::path::PathBuf>,
+    /// open `Dir` fd for each tracked directory, keyed by destination path. All
+    /// destination writes for a directory's children resolve relative to the parent's
+    /// fd held here (see the module-level "Directory fd-map" docs). Dropped when the
+    /// directory completes.
+    dirs: std::collections::HashMap<std::path::PathBuf, Arc<Dir>>,
+    /// open `Dir` fd for the root directory's PARENT (the trusted user-specified
+    /// destination parent, opened once via `open_parent_dir`). Held so the root
+    /// directory's own empty-directory cleanup can `rmdir_at` it through a pinned
+    /// parent fd, since the root's parent is itself never a tracked directory.
+    root_parent_dir: Option<Arc<Dir>>,
     /// stored metadata for each directory (applied when complete)
     metadata: std::collections::HashMap<std::path::PathBuf, remote::protocol::Metadata>,
     /// have we received DirStructureComplete?
@@ -83,6 +117,8 @@ impl DirectoryTracker {
             pending_directories: std::collections::HashMap::new(),
             failed_directories: std::collections::HashSet::new(),
             created_directories: std::collections::HashSet::new(),
+            dirs: std::collections::HashMap::new(),
+            root_parent_dir: None,
             metadata: std::collections::HashMap::new(),
             structure_complete: false,
             root_complete: false,
@@ -105,29 +141,77 @@ impl DirectoryTracker {
         }
         false
     }
+    /// Send `DirectorySkipped` to the source for a `Directory` message the
+    /// destination did NOT create (create failed, ancestor failed, or
+    /// `--ignore-existing` skipped a non-directory). The source releases the
+    /// matching held directory fd from its fd-map; no files are requested for a
+    /// skipped directory. This balances the one-response-per-`Directory`-message
+    /// contract that keeps the source's dir-fd budget effective and deadlock-free.
+    ///
+    /// Skipped directories are never inserted into `pending_directories`, so this
+    /// does not affect `DestinationDone`/done-detection accounting.
+    pub async fn send_directory_skipped(
+        &self,
+        src: &std::path::Path,
+        dst: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let message = remote::protocol::DestinationMessage::DirectorySkipped {
+            src: src.to_path_buf(),
+            dst: dst.to_path_buf(),
+        };
+        let mut stream = self.control_send_stream.lock().await;
+        stream.send_control_message(&message).await?;
+        tracing::debug!("Sent DirectorySkipped: {:?} -> {:?}", src, dst);
+        Ok(())
+    }
+    /// Look up a tracked directory's held `Arc<Dir>` by destination path.
+    ///
+    /// The returned Arc is a clone (a refcount bump under the tracker lock); the
+    /// caller releases the lock and then performs the fd-relative syscall, so the
+    /// lock is never held across a syscall and the fd stays alive for the operation
+    /// even if the directory completes and is dropped from the map meanwhile.
+    pub fn get_dir(&self, dst: &std::path::Path) -> Option<Arc<Dir>> {
+        self.dirs.get(dst).cloned()
+    }
+    /// The root directory's PARENT `Dir`, if it has been opened.
+    ///
+    /// This is the trusted user-specified destination parent (opened via
+    /// `open_parent_dir`), used to create the root directory itself and to `rmdir_at`
+    /// it during empty-directory cleanup.
+    pub fn root_parent_dir(&self) -> Option<Arc<Dir>> {
+        self.root_parent_dir.clone()
+    }
+    /// Record the root directory's PARENT `Dir` (opened once via `open_parent_dir`).
+    pub fn set_root_parent_dir(&mut self, dir: Arc<Dir>) {
+        self.root_parent_dir = Some(dir);
+    }
     /// Add a successfully created directory to tracking.
-    /// Sends `DirectoryCreated` to source with the `file_count`.
+    /// Sends `DirectoryCreated` to source (the Pass-2 trigger; no count is echoed —
+    /// the source retains its own authoritative Pass-1 file count).
     /// If `entry_count` is 0, the directory completes immediately.
     ///
     /// # Arguments
+    /// * `dir` - the open `Dir` fd for this directory (stored in the fd-map so its
+    ///   children's writes resolve relative to it)
     /// * `was_created` - true if we created this directory, false if it already existed
     /// * `entry_count` - total child entries (files + dirs + symlinks)
-    /// * `file_count` - number of child files, echoed back to source
     /// * `keep_if_empty` - whether to keep this directory if empty
     #[allow(clippy::too_many_arguments)]
     pub async fn add_directory(
         &mut self,
         src: &std::path::Path,
         dst: &std::path::Path,
+        dir: Arc<Dir>,
         metadata: remote::protocol::Metadata,
         is_root: bool,
         was_created: bool,
         entry_count: usize,
-        file_count: usize,
         keep_if_empty: bool,
     ) -> anyhow::Result<()> {
         // store metadata for later application
         self.metadata.insert(dst.to_path_buf(), metadata);
+        // store the open dir fd so children resolve relative to it (fd-map).
+        self.dirs.insert(dst.to_path_buf(), dir);
         // track root directory path
         if is_root {
             self.root_directory = Some(dst.to_path_buf());
@@ -145,22 +229,21 @@ impl DirectoryTracker {
                 keep_if_empty,
             },
         );
-        // send DirectoryCreated with file_count to trigger file sending
+        // send DirectoryCreated to trigger file sending (Pass-2 trigger only; the
+        // source retains the authoritative Pass-1 file count, so none is echoed).
         let message = remote::protocol::DestinationMessage::DirectoryCreated {
             src: src.to_path_buf(),
             dst: dst.to_path_buf(),
-            file_count,
         };
         {
             let mut stream = self.control_send_stream.lock().await;
             stream.send_control_message(&message).await?;
         }
         tracing::info!(
-            "Sent DirectoryCreated: {:?} -> {:?} (entries={}, files={})",
+            "Sent DirectoryCreated: {:?} -> {:?} (entries={})",
             src,
             dst,
-            entry_count,
-            file_count
+            entry_count
         );
         // if entry_count is 0, directory is immediately complete
         if entry_count == 0 {
@@ -168,8 +251,8 @@ impl DirectoryTracker {
         }
         Ok(())
     }
-    /// Mark a directory as failed (creation error).
-    /// Does NOT send DirectoryCreated - source won't send files.
+    /// Mark a directory as failed (creation error). Records the failure only; the caller sends a
+    /// `DirectorySkipped` nack (not `DirectoryCreated`), so the source won't send files for it.
     pub fn mark_directory_failed(&mut self, dst: &std::path::Path) {
         self.failed_directories.insert(dst.to_path_buf());
         tracing::info!("Directory marked as failed: {:?}", dst);
@@ -178,10 +261,14 @@ impl DirectoryTracker {
     /// Increments entries_processed and checks completion.
     /// Returns true if directory is now complete.
     pub async fn process_file(&mut self, dst_dir: &std::path::Path) -> anyhow::Result<bool> {
-        let state = self
-            .pending_directories
-            .get_mut(dst_dir)
-            .ok_or_else(|| anyhow::anyhow!("directory {:?} not being tracked", dst_dir))?;
+        // no-op if the parent is not tracked (e.g. a FAILED directory whose counted
+        // children are still being accounted via `FileSkipped`, or the root). Nothing
+        // waits on an untracked directory's completion, so tolerating it is safe and
+        // mirrors `process_child_entry` — without this, a `FileSkipped` (or `File`)
+        // received under a failed ancestor would abort the whole destination.
+        let Some(state) = self.pending_directories.get_mut(dst_dir) else {
+            return Ok(false);
+        };
         state.entries_processed += 1;
         tracing::debug!(
             "Directory {:?} entries processed: {}/{}",
@@ -261,6 +348,15 @@ impl DirectoryTracker {
     /// Complete a single directory: apply metadata and remove from pending.
     /// Uses `keep_if_empty` from the directory state to decide whether to remove
     /// empty directories that were only created for traversal purposes.
+    ///
+    /// All filesystem operations are fd-relative on held `Dir` handles: the empty-
+    /// directory cleanup `rmdir_at`s the directory through its PARENT's pinned fd
+    /// (the parent is still tracked when a child completes, since completion is
+    /// bottom-up), and metadata is applied through the directory's OWN pinned fd via
+    /// `set_dir_metadata_fd`. The directory's `Dir` is dropped from the fd-map on
+    /// completion. Neither the parent fd nor the own fd is re-resolved by path, so a
+    /// concurrent symlink swap of the destination path cannot redirect the cleanup or
+    /// metadata application outside the destination tree.
     async fn complete_directory_single(
         &mut self,
         dst: &std::path::Path,
@@ -272,33 +368,56 @@ impl DirectoryTracker {
         if state.is_none() {
             tracing::warn!("directory {:?} was not in pending when completing", dst);
         }
+        // drop this directory's own fd from the fd-map: it is completing, no more
+        // children will be created under it. The own fd is kept locally below for the
+        // metadata application (the clone keeps it alive even though it's now out of
+        // the map).
+        let own_dir = self.dirs.remove(dst);
+        // resolve the PARENT's held Dir (and this entry's name) for fd-relative
+        // empty-dir cleanup. For a nested directory the parent is still tracked
+        // (bottom-up completion); for the root directory the parent is the trusted
+        // root_parent_dir opened via open_parent_dir.
+        let parent_dir = if is_root {
+            self.root_parent_dir.clone()
+        } else {
+            dst.parent().and_then(|p| self.dirs.get(p).cloned())
+        };
+        let entry_name = dst.file_name();
         // check if we created this directory (vs reused existing)
         let was_created = self.created_directories.remove(dst);
         // handle empty directory cleanup for directories we created
         if was_created && !keep_if_empty {
-            // try to remove if empty (best effort - may fail if not empty due to races)
-            match common::walk::run_metadata_probed(
-                common::Side::Destination,
-                common::MetadataOp::RmDir,
-                tokio::fs::remove_dir(dst),
-            )
-            .await
-            {
-                Ok(()) => {
-                    tracing::info!("Removed empty directory: {:?}", dst);
-                    // don't apply metadata or increment counter for removed directories
-                    self.metadata.remove(dst);
-                    if is_root {
-                        self.set_root_complete();
+            // try to remove if empty (best effort - may fail if not empty due to races).
+            // fd-relative rmdir_at on the parent fd: never re-resolves dst by path, so a
+            // swapped intermediate dir cannot redirect the removal. ENOTEMPTY (the common
+            // "directory has content" case) is handled by keeping the directory below.
+            match (parent_dir.as_ref(), entry_name) {
+                (Some(parent), Some(name)) => match parent.rmdir_at(name).await {
+                    Ok(()) => {
+                        tracing::info!("Removed empty directory: {:?}", dst);
+                        // don't apply metadata or increment counter for removed directories
+                        self.metadata.remove(dst);
+                        if is_root {
+                            self.set_root_complete();
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-                Err(e) => {
-                    // not empty or other error - keep it and proceed normally
-                    tracing::debug!(
-                        "Could not remove empty directory {:?} (keeping): {:#}",
-                        dst,
-                        e
+                    Err(e) => {
+                        // not empty or other error - keep it and proceed normally
+                        tracing::debug!(
+                            "Could not remove empty directory {:?} (keeping): {:#}",
+                            dst,
+                            e
+                        );
+                    }
+                },
+                _ => {
+                    // parent fd missing (shouldn't happen: parent is tracked until the
+                    // child completes) — keep the directory rather than fall back to a
+                    // path-based removal that could be redirected.
+                    tracing::warn!(
+                        "No parent fd for empty-directory cleanup of {:?}; keeping it",
+                        dst
                     );
                 }
             }
@@ -307,14 +426,33 @@ impl DirectoryTracker {
         if was_created {
             common::get_progress().directories_created.inc();
         }
-        // apply stored metadata
+        // apply stored metadata through the directory's OWN held fd (fd-relative).
         if let Some(metadata) = self.metadata.remove(dst) {
-            match common::preserve::set_dir_metadata(&self.preserve, &metadata, dst).await {
-                Ok(()) => {
-                    tracing::info!("Directory complete, metadata applied: {:?}", dst);
+            match own_dir.as_ref() {
+                Some(dir) => {
+                    match common::safedir::set_dir_metadata_fd(&self.preserve, &metadata, dir).await
+                    {
+                        Ok(()) => {
+                            tracing::info!("Directory complete, metadata applied: {:?}", dst);
+                        }
+                        Err(e) => {
+                            let err = anyhow::Error::new(e)
+                                .context(format!("failed to set metadata on directory {:?}", dst));
+                            tracing::error!("{:#}", err);
+                            if self.fail_early {
+                                return Err(err);
+                            }
+                            self.error_collector.push(err);
+                        }
+                    }
                 }
-                Err(e) => {
-                    let err = e.context(format!("failed to set metadata on directory {:?}", dst));
+                None => {
+                    // no held fd for this directory (shouldn't happen for a tracked
+                    // directory) — fail closed rather than re-resolve dst by path.
+                    let err = anyhow::anyhow!(
+                        "no held directory fd for {:?} when applying metadata",
+                        dst
+                    );
                     tracing::error!("{:#}", err);
                     if self.fail_early {
                         return Err(err);

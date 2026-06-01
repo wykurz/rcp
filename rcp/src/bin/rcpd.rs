@@ -156,6 +156,7 @@ struct Args {
         long,
         default_value = "100",
         value_name = "N",
+        value_parser = parse_nonzero_usize,
         help_heading = "Remote copy options"
     )]
     max_connections: usize,

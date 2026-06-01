@@ -299,11 +299,18 @@ fn delete_does_not_prune_through_dst_symlink() {
 }
 
 #[test]
-fn delete_excluded_update_type_change_to_excluded_dir_prunes_dst() {
+fn delete_excluded_update_type_change_to_excluded_dir_materializes_src_file() {
     // rlink --delete --delete-excluded --update where an update turns an included source FILE into
-    // an excluded DIRECTORY (`node/`). Nothing is materialized at dst/node, so a stale pre-existing
-    // dst/node must be pruned — the keep-set must reflect the materialized (update) type, not the
-    // source file type.
+    // a DIRECTORY excluded by `node/`. Under union (`--update`, not `--update-exclusive`) the
+    // update's excluded version of the name does NOT displace the src: an excluded update entry is
+    // treated as "no update at this name", so the src `node` FILE (which passed its own filter)
+    // stands and is materialized. The materialized `node` is in the keep-set, so --delete (even
+    // with --delete-excluded) must NOT prune it — pruning would delete the file we just linked.
+    //
+    // This is the corrected behavior from the PR #247 re-review: previously the type-mismatch
+    // branch unconditionally copied the excluded update directory (filter not re-checked against
+    // the update type), and the keep-set dropped `node`. Now the excluded update is dropped and the
+    // src file wins.
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("src");
     let upd = tmp.path().join("upd");
@@ -314,7 +321,7 @@ fn delete_excluded_update_type_change_to_excluded_dir_prunes_dst() {
     std::fs::create_dir(upd.join("node")).unwrap(); // update/node is a DIRECTORY (excluded by node/)
     std::fs::write(upd.join("node").join("inner.txt"), b"x").unwrap();
     std::fs::create_dir(&dst).unwrap();
-    std::fs::write(dst.join("node"), b"stale").unwrap(); // pre-existing dst/node
+    std::fs::write(dst.join("node"), b"stale").unwrap(); // pre-existing dst/node (overwritten)
 
     let status = Command::new(rlink_bin())
         .arg("--delete")
@@ -329,9 +336,15 @@ fn delete_excluded_update_type_change_to_excluded_dir_prunes_dst() {
         .unwrap();
     assert!(status.success());
 
+    // the src FILE stands (union); the excluded update directory leaves no leftover.
     assert!(
-        !dst.join("node").exists(),
-        "stale dst/node must be pruned: its materialized (update) type is an excluded directory"
+        dst.join("node").is_file(),
+        "src `node` file must be materialized when the update directory is excluded (union)"
+    );
+    assert_eq!(std::fs::read(dst.join("node")).unwrap(), b"file");
+    assert!(
+        !dst.join("node").join("inner.txt").exists(),
+        "the excluded update directory must not be copied"
     );
 }
 
@@ -548,4 +561,74 @@ fn missing_update_path_without_delete_or_exclusive_falls_back() {
         .unwrap();
     assert!(status.success());
     assert!(dst.join("a.txt").exists());
+}
+
+#[test]
+fn missing_update_path_with_absent_parent_without_delete_or_exclusive_falls_back() {
+    // Regression for PR #247 review: when the update path's PARENT directory is also absent
+    // (e.g. `rlink --update /tmp/no/such src dst` where `/tmp/no` doesn't exist), the prior code
+    // would fail with ENOENT from open_parent_dir before link_internal could apply the missing-
+    // update fallback. Verify that rlink proceeds by linking from src (no error) even when the
+    // update path's entire ancestor chain is missing.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dst = tmp.path().join("dst");
+    // update path whose PARENT directory does not exist (two levels deep into non-existent space)
+    let missing_upd_deep = tmp.path().join("nonexistent_parent").join("also_missing");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"x").unwrap();
+    // intentionally do NOT pre-create dst (same reason as the sibling test above).
+
+    let output = Command::new(rlink_bin())
+        .arg("--update")
+        .arg(&missing_upd_deep)
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "rlink --update <path-with-absent-parent> should succeed (no-update fallback); stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        dst.join("a.txt").exists(),
+        "dst/a.txt must be linked from src when update falls back to no-update mode"
+    );
+}
+
+#[test]
+fn require_toctou_safe_with_missing_update_path_proceeds() {
+    // `--require-toctou-safe` must not reject a plain `--update` run whose update path (and its
+    // parent) is absent. The rationale shifted with the scope reframe (docs/tocttou.md "Scope of
+    // TOCTOU safety"): the linter now operates purely on the verdict (`!dereference && linux`) and
+    // no longer inspects operand paths at all, so a missing update path can never cause a refusal —
+    // this passes trivially. (It originally guarded against the removed trusted-prefix check, which
+    // would fail on the missing ancestor before the operation could apply its no-update fallback.)
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dst = tmp.path().join("dst");
+    let missing_upd_deep = tmp.path().join("nonexistent_parent").join("also_missing");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"x").unwrap();
+
+    let output = Command::new(rlink_bin())
+        .arg("--require-toctou-safe")
+        .arg("--update")
+        .arg(&missing_upd_deep)
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "--require-toctou-safe --update <path-with-absent-parent> must not be rejected by the \
+         linter (the update tree isn't traversed; plain --update falls back to no-update); \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        dst.join("a.txt").exists(),
+        "dst/a.txt must be linked from src when the missing update falls back to no-update mode"
+    );
 }
