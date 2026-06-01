@@ -1,4 +1,8 @@
 use anyhow::Context;
+use common::safedir::Dir;
+use std::ffi::OsStr;
+use std::os::fd::AsFd;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::{Instrument, instrument};
 
@@ -8,11 +12,81 @@ fn progress() -> &'static common::progress::Progress {
     common::get_progress()
 }
 
+/// Resolve the open `Dir` of `dst`'s parent for a fd-relative destination write.
+///
+/// The destination tracks every created directory's `Dir` in the fd-map, top-down
+/// (a parent's `DirectoryCreated` precedes any message for its children), so for a
+/// non-root entry the parent is always already tracked. For the root entry — whose
+/// parent is the trusted user-specified destination parent and is itself never a
+/// tracked directory — the parent is opened once via `open_parent_dir` and cached in
+/// the tracker as `root_parent_dir` (so a root *directory* and its later empty-dir
+/// cleanup share the same pinned parent fd).
+///
+/// Returns the parent `Dir` plus the entry's final-component name (validated to be a
+/// single component by the fd-relative `Dir` methods). Fails closed if a non-root
+/// parent is not tracked (it should always be) — never falls back to a path-based
+/// open that a concurrent symlink swap could redirect.
+async fn resolve_parent_dir(
+    directory_tracker: &directory_tracker::SharedDirectoryTracker,
+    dst: &std::path::Path,
+    is_root: bool,
+) -> anyhow::Result<(Arc<Dir>, std::ffi::OsString)> {
+    let parent_path = dst
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("destination {:?} has no parent directory", dst))?;
+    let name = dst
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("destination {:?} has no file name", dst))?
+        .to_owned();
+    if is_root {
+        // the root's parent is the trusted user-specified destination parent. Open it
+        // once and cache it; reuse on a subsequent call (root dir create + cleanup).
+        {
+            let tracker = directory_tracker.lock().await;
+            if let Some(parent) = tracker.root_parent_dir() {
+                return Ok((parent, name));
+            }
+        }
+        // the root's parent is the TRUSTED user-specified destination parent prefix; resolve it
+        // following symlinks normally (a symlinked destination container must be followed into the
+        // real dir). Only entries strictly below the named root are O_NOFOLLOW-hardened.
+        let parent = Dir::open_parent_dir(parent_path, common::Side::Destination)
+            .await
+            .with_context(|| {
+                format!("failed opening destination root parent directory {parent_path:?}")
+            })?;
+        // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
+        let parent = Arc::new(parent.into_tree());
+        directory_tracker
+            .lock()
+            .await
+            .set_root_parent_dir(parent.clone());
+        Ok((parent, name))
+    } else {
+        // non-root: the parent must already be tracked (top-down creation guarantees
+        // it). Fail closed if it is missing rather than re-resolving the path.
+        let parent = {
+            let tracker = directory_tracker.lock().await;
+            tracker.get_dir(parent_path)
+        };
+        let parent = parent.ok_or_else(|| {
+            anyhow::anyhow!(
+                "parent directory {:?} of {:?} is not tracked (fd-map miss)",
+                parent_path,
+                dst
+            )
+        })?;
+        Ok((parent, name))
+    }
+}
+
 /// Pool of outbound TCP connections to source's data port.
 ///
 /// Destination opens connections to source's data port to receive file data.
-/// Each connection receives one file then is closed (no reuse since there's
-/// no framing for multiple files on same connection).
+/// A connection carries MULTIPLE files: each file is length-prefixed by its
+/// `File` header (the `size` field delimits its bytes), and a worker keeps
+/// reading files from the connection until the source closes the stream (EOF).
+/// See `handle_file_stream` and the source-side reuse note in `rcp::source`.
 struct DataConnectionPool {
     data_addr: std::net::SocketAddr,
     network_profile: remote::NetworkProfile,
@@ -88,6 +162,19 @@ enum StreamState {
     Corrupted,
 }
 
+/// Drain `size` bytes of a file's data off the stream into a sink, without writing it.
+///
+/// Used when a file is skipped (already exists, identical, dest-newer) so the next file's header
+/// lands at a clean stream boundary. A failure here means the stream position is now unknown.
+async fn drain_file_data(
+    stream: &mut remote::streams::BoxedRecvStream,
+    size: u64,
+) -> anyhow::Result<()> {
+    let mut sink = tokio::io::sink();
+    stream.copy_exact_to_buffered(&mut sink, size, 8192).await?;
+    Ok(())
+}
+
 /// Error from processing a single file, with stream recovery information.
 struct ProcessFileError {
     /// The underlying error.
@@ -103,12 +190,14 @@ struct ProcessFileError {
 /// - `NeedsDrain`: no data was read yet, drain `file_header.size` bytes to recover
 /// - `DataConsumed`: all data consumed, stream at clean boundary, can continue
 /// - `Corrupted`: mid-read error, stream position unknown, must close
-#[instrument(skip(file_recv_stream))]
+#[instrument(skip(file_recv_stream, dst_parent))]
 async fn process_single_file(
     settings: &common::copy::Settings,
     preserve: &common::preserve::Settings,
     file_recv_stream: &mut remote::streams::BoxedRecvStream,
     file_header: &remote::protocol::File,
+    dst_parent: &Arc<Dir>,
+    dst_name: &OsStr,
 ) -> Result<(), ProcessFileError> {
     let prog = progress();
     // errors before we start reading data - stream can be recovered by draining
@@ -126,102 +215,63 @@ async fn process_single_file(
         source: e,
         stream_state: StreamState::DataConsumed,
     };
-    // check if destination exists and handle overwrite logic
-    let dst_exists = common::walk::run_metadata_probed(
-        common::Side::Destination,
-        common::MetadataOp::Stat,
-        tokio::fs::symlink_metadata(&file_header.dst),
-    )
-    .await
-    .is_ok();
-    if dst_exists {
+    // classify any existing destination entry through the parent's pinned fd (O_NOFOLLOW),
+    // never re-resolving file_header.dst by path. handle overwrite/--ignore-existing.
+    if let Ok(dst_handle) = dst_parent.child(dst_name).await {
         if settings.ignore_existing {
             tracing::debug!("destination exists, skipping (--ignore-existing)");
             prog.files_unchanged.inc();
-            let mut sink = tokio::io::sink();
-            file_recv_stream
-                .copy_exact_to_buffered(&mut sink, file_header.size, 8192)
+            drain_file_data(file_recv_stream, file_header.size)
                 .await
                 .map_err(err_corrupted)?;
             return Ok(());
         }
-        if settings.overwrite {
-            tracing::debug!("file exists, check if it's identical");
-            let dst_metadata = common::walk::run_metadata_probed(
-                common::Side::Destination,
-                common::MetadataOp::Stat,
-                tokio::fs::symlink_metadata(&file_header.dst),
-            )
-            .await
-            .map_err(|e| err_needs_drain(e.into()))?;
-            let is_file = dst_metadata.is_file();
-            if is_file {
-                let src_file_metadata = remote::protocol::FileMetadata {
-                    metadata: &file_header.metadata,
-                    size: file_header.size,
-                };
-                let same_metadata = common::filecmp::metadata_equal(
-                    &settings.overwrite_compare,
-                    &src_file_metadata,
-                    &dst_metadata,
-                );
-                if same_metadata {
-                    tracing::debug!("file is identical, skipping");
-                    prog.files_unchanged.inc();
-                    // drain this file's data without writing - if this fails, stream is corrupted
-                    let mut sink = tokio::io::sink();
-                    file_recv_stream
-                        .copy_exact_to_buffered(&mut sink, file_header.size, 8192)
-                        .await
-                        .map_err(err_corrupted)?;
-                    return Ok(());
-                }
-                if let Some(common::copy::OverwriteFilter::Newer) = settings.overwrite_filter
-                    && common::filecmp::dest_is_newer(&src_file_metadata, &dst_metadata)
-                {
-                    tracing::debug!("dest is newer than source, skipping");
-                    prog.files_unchanged.inc();
-                    let mut sink = tokio::io::sink();
-                    file_recv_stream
-                        .copy_exact_to_buffered(&mut sink, file_header.size, 8192)
-                        .await
-                        .map_err(err_corrupted)?;
-                    return Ok(());
-                }
-                tracing::debug!("file exists but is different, removing");
-                let removed_file_size = dst_metadata.len();
-                common::walk::run_metadata_probed(
-                    common::Side::Destination,
-                    common::MetadataOp::Unlink,
-                    tokio::fs::remove_file(&file_header.dst),
-                )
-                .await
-                .map_err(|e| err_needs_drain(e.into()))?;
-                prog.files_removed.inc();
-                prog.bytes_removed.add(removed_file_size);
-            } else {
-                tracing::info!("destination is not a file, removing");
-                common::rm::rm(
-                    common::get_progress(),
-                    &file_header.dst,
-                    &common::rm::Settings {
-                        fail_early: settings.fail_early,
-                        filter: None,
-                        dry_run: None,
-                        time_filter: None,
-                    },
-                )
-                .await
-                .map_err(|err| {
-                    err_needs_drain(anyhow::anyhow!("Failed to remove destination: {err}"))
-                })?;
-            }
-        } else {
+        if !settings.overwrite {
             return Err(err_needs_drain(anyhow::anyhow!(
                 "destination {:?} already exists, did you intend to specify --overwrite?",
                 file_header.dst
             )));
         }
+        tracing::debug!("file exists, check if it's identical");
+        if dst_handle.kind() == common::walk::EntryKind::File {
+            let src_file_metadata = remote::protocol::FileMetadata {
+                metadata: &file_header.metadata,
+                size: file_header.size,
+            };
+            if common::filecmp::metadata_equal(
+                &settings.overwrite_compare,
+                &src_file_metadata,
+                dst_handle.meta(),
+            ) {
+                tracing::debug!("file is identical, skipping");
+                prog.files_unchanged.inc();
+                drain_file_data(file_recv_stream, file_header.size)
+                    .await
+                    .map_err(err_corrupted)?;
+                return Ok(());
+            }
+            if let Some(common::copy::OverwriteFilter::Newer) = settings.overwrite_filter
+                && common::filecmp::dest_is_newer(&src_file_metadata, dst_handle.meta())
+            {
+                tracing::debug!("dest is newer than source, skipping");
+                prog.files_unchanged.inc();
+                drain_file_data(file_recv_stream, file_header.size)
+                    .await
+                    .map_err(err_corrupted)?;
+                return Ok(());
+            }
+        }
+        tracing::debug!("destination differs, removing existing entry");
+        // recheck-guarded, fd-relative removal contained to dst_parent (mirrors copy.rs:1.3).
+        remove_existing_dst(
+            dst_parent,
+            dst_name,
+            &file_header.dst,
+            &dst_handle,
+            settings,
+        )
+        .await
+        .map_err(err_needs_drain)?;
     }
     throttle::get_file_iops_tokens(settings.chunk_size, file_header.size)
         .instrument(tracing::trace_span!(
@@ -229,13 +279,18 @@ async fn process_single_file(
             size = file_header.size
         ))
         .await;
-    let mut file = common::walk::run_metadata_probed(
-        common::Side::Destination,
-        common::MetadataOp::OpenCreate,
-        tokio::fs::File::create(&file_header.dst).instrument(tracing::trace_span!("file_create")),
-    )
-    .await
-    .map_err(|e| err_needs_drain(e.into()))?;
+    // create the destination file fresh through the parent's pinned fd (O_CREAT|O_EXCL|
+    // O_NOFOLLOW): never follows a symlink, never escapes dst_parent. the creation mode
+    // matches the metadata applier's chmod target, mirroring copy.rs.
+    let create_mode = common::preserve::masked_file_mode(&preserve.file, &file_header.metadata);
+    let std_file = dst_parent
+        .create_file(dst_name, create_mode)
+        .await
+        .with_context(|| format!("failed creating {:?}", file_header.dst))
+        .map_err(err_needs_drain)?;
+    // wrap the std file for async writes; the underlying fd is retained so its metadata
+    // can be applied through the held fd (no path re-open).
+    let mut file = tokio::fs::File::from_std(std_file);
     // buffer size is set by tcp_config.effective_remote_copy_buffer_size() based on network profile,
     // but capped at file size to avoid over-allocation for small files
     let file_size = file_header.size.min(usize::MAX as u64) as usize;
@@ -257,26 +312,124 @@ async fn process_single_file(
             copied
         )));
     }
-    // flush before drop to ensure all data reaches the kernel before we set metadata.
+    // flush before metadata to ensure all data reaches the kernel before we set mtime.
     // tokio::fs::File hands writes to a threadpool - without flush, the threadpool
     // may complete after we set mtime, causing the file to appear modified.
     file.flush()
         .await
         .map_err(|e| err_data_consumed(e.into()))?;
-    drop(file);
     tracing::info!(
         "File {} -> {} created, size: {} bytes, setting metadata...",
         file_header.src.display(),
         file_header.dst.display(),
         file_header.size
     );
-    // metadata errors happen after all bytes consumed - stream is at clean boundary
-    common::preserve::set_file_metadata(preserve, &file_header.metadata, &file_header.dst)
-        .await
-        .map_err(err_data_consumed)?;
+    // metadata errors happen after all bytes consumed - stream is at clean boundary.
+    // apply through the file's OWN fd (fd-relative): no path re-resolution of dst.
+    common::safedir::set_file_metadata_fd(
+        preserve,
+        &file_header.metadata,
+        file.as_fd(),
+        common::Side::Destination,
+    )
+    .await
+    .with_context(|| format!("failed setting metadata on {:?}", file_header.dst))
+    .map_err(err_data_consumed)?;
+    drop(file);
     prog.files_copied.inc();
     prog.bytes_copied.add(file_header.size);
     Ok(())
+}
+
+/// Remove an existing destination entry (file / symlink / directory) so a fresh entry can take
+/// its place, fd-relative and recheck-guarded — the destination counterpart of
+/// [`common::copy::remove_existing`].
+///
+/// The entry was already classified into `dst_handle` (via `dst_parent.child(name)`). Removal is:
+/// 1. [`Dir::recheck`] re-opens `name` and confirms it is STILL the same inode (`dev`/`ino`). If a
+///    concurrent symlink swap changed the entry's identity, `recheck` returns `ESTALE` and we fail
+///    closed, removing nothing.
+/// 2. The entry is removed through the held `dst_parent` fd by kind: file/symlink/special via
+///    `unlink_at` (never follows a symlink), empty directory via `rmdir_at`, and a non-empty
+///    directory subtree via [`common::rm::rm_child`] (fd-relative recursive removal on the held
+///    parent). All removal is contained to `dst_parent` — it cannot escape the destination tree.
+async fn remove_existing_dst(
+    dst_parent: &Arc<Dir>,
+    dst_name: &OsStr,
+    dst_path: &std::path::Path,
+    dst_handle: &common::safedir::Handle,
+    settings: &common::copy::Settings,
+) -> anyhow::Result<()> {
+    let prog = progress();
+    // recheck: confirm the entry is still the same inode we classified; fail closed on a swap.
+    dst_parent
+        .recheck(dst_name, dst_handle)
+        .await
+        .with_context(|| {
+            format!(
+                "destination {dst_path:?} changed identity before removal (possible TOCTOU swap)"
+            )
+        })?;
+    match dst_handle.kind() {
+        common::walk::EntryKind::File
+        | common::walk::EntryKind::Symlink
+        | common::walk::EntryKind::Special => {
+            let removed_size = {
+                use common::preserve::Metadata as _;
+                dst_handle.meta().size()
+            };
+            dst_parent
+                .unlink_at(dst_name)
+                .await
+                .with_context(|| format!("failed removing existing destination {dst_path:?}"))?;
+            let is_symlink = dst_handle.kind() == common::walk::EntryKind::Symlink;
+            if is_symlink {
+                prog.symlinks_removed.inc();
+            } else {
+                prog.files_removed.inc();
+                prog.bytes_removed.add(removed_size);
+            }
+            Ok(())
+        }
+        common::walk::EntryKind::Dir => {
+            // fast path: an empty directory removes cleanly via rmdir_at.
+            match dst_parent.rmdir_at(dst_name).await {
+                Ok(()) => {
+                    prog.directories_removed.inc();
+                    Ok(())
+                }
+                // POSIX permits either ENOTEMPTY or EEXIST for a non-empty directory.
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+                    ) =>
+                {
+                    // fd-relative recursive removal of the subtree on the held parent.
+                    common::rm::rm_child(
+                        common::get_progress(),
+                        dst_parent,
+                        dst_name,
+                        dst_path,
+                        &common::rm::Settings {
+                            fail_early: settings.fail_early,
+                            filter: None,
+                            dry_run: None,
+                            time_filter: None,
+                        },
+                    )
+                    .await
+                    .map(|_summary| ())
+                    .map_err(|err| {
+                        err.source
+                            .context(format!("failed removing existing directory {dst_path:?}"))
+                    })
+                }
+                Err(error) => Err(anyhow::Error::new(error)
+                    .context(format!("failed removing existing directory {dst_path:?}"))),
+            }
+        }
+    }
 }
 
 /// Handle a stream that may contain multiple files.
@@ -317,9 +470,30 @@ async fn handle_file_stream(
             .await;
         throttle::get_ops_token().await;
         let _ops_guard = prog.ops.guard();
-        // process this file
+        // resolve the destination parent directory's held fd from the tracker (for the
+        // root file, open the trusted parent via open_parent_dir). all writes for this
+        // file are then fd-relative on that pinned parent. a resolution failure is a
+        // pre-data error: the stream can be recovered by draining this file's bytes.
         let file_result =
-            process_single_file(&settings, &preserve, &mut file_recv_stream, &file_header).await;
+            match resolve_parent_dir(&directory_tracker, &file_header.dst, file_header.is_root)
+                .await
+            {
+                Ok((dst_parent, dst_name)) => {
+                    process_single_file(
+                        &settings,
+                        &preserve,
+                        &mut file_recv_stream,
+                        &file_header,
+                        &dst_parent,
+                        &dst_name,
+                    )
+                    .await
+                }
+                Err(e) => Err(ProcessFileError {
+                    source: e.context("failed resolving destination parent directory"),
+                    stream_state: StreamState::NeedsDrain,
+                }),
+            };
         // track whether we need to close the stream and exit early
         let mut stream_corrupted = false;
         let mut fail_early_error: Option<anyhow::Error> = None;
@@ -332,10 +506,8 @@ async fn handle_file_stream(
             match e.stream_state {
                 StreamState::NeedsDrain => {
                     // no data was read yet, drain the file's data to stay in sync
-                    let mut sink = tokio::io::sink();
-                    if let Err(drain_err) = file_recv_stream
-                        .copy_exact_to_buffered(&mut sink, file_header.size, 8192)
-                        .await
+                    if let Err(drain_err) =
+                        drain_file_data(&mut file_recv_stream, file_header.size).await
                     {
                         tracing::error!("Failed to drain file data: {:#}", drain_err);
                         // drain failed, stream is now corrupted
@@ -444,7 +616,7 @@ async fn process_incoming_file_streams_tcp(
                         break;
                     }
                 };
-                // handle one file on this connection
+                // receive files from this connection until the source closes it (EOF)
                 if let Err(e) = handle_file_stream(
                     (*settings).clone(),
                     *preserve,
@@ -488,52 +660,64 @@ async fn process_incoming_file_streams_tcp(
 }
 
 /// Result of directory creation attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The `Created`/`AlreadyExisted` variants carry the open `Dir` fd for the resolved
+/// directory so the caller can store it in the tracker's fd-map (children's writes
+/// then resolve relative to it).
 enum DirectoryCreateResult {
-    /// directory was created by us (new)
-    Created,
-    /// directory already existed (reused)
-    AlreadyExisted,
+    /// directory was created by us (new), with its open fd
+    Created(Arc<Dir>),
+    /// directory already existed (reused), with its open fd
+    AlreadyExisted(Arc<Dir>),
     /// skipped due to --ignore-existing (destination is not a directory)
     Skipped,
     /// failed to create directory
     Failed,
 }
 
-/// Create a directory, handling overwrite logic.
-/// Returns the result indicating whether directory was created, reused, or failed.
-/// Note: does NOT increment progress counters - caller is responsible for that
-/// (so we can defer the increment until we know whether to keep the directory).
+/// Create a directory fd-relative on the PARENT's held `Dir`, handling overwrite logic.
+///
+/// All operations resolve relative to `dst_parent`'s pinned fd: classify an existing entry via
+/// `dst_parent.child(dst_name)`; create via `dst_parent.make_dir(dst_name, mode)` (`mkdirat`);
+/// reuse an existing directory via `dst_parent.open_dir(dst_name)` (`O_NOFOLLOW|O_DIRECTORY` — a
+/// directory→symlink swap fails closed with ELOOP/ENOTDIR); replace a non-directory via the
+/// recheck-guarded [`remove_existing_dst`] then `make_dir`. A privileged destination therefore
+/// cannot be redirected by a concurrent symlink swap of the parent into creating a directory
+/// outside the destination tree. The new directory is created mode `0o700` (writable so children
+/// can be populated); its real source mode is applied later by `complete_directory_single`,
+/// mirroring the path-based / local-copy behavior.
+///
+/// Returns the result; does NOT increment progress counters — the caller defers the increment
+/// until completion (when it knows whether the directory is kept).
 async fn create_directory(
     settings: &common::copy::Settings,
+    dst_parent: &Arc<Dir>,
+    dst_name: &OsStr,
     dst: &std::path::Path,
 ) -> anyhow::Result<DirectoryCreateResult> {
     let prog = progress();
-    match common::walk::run_metadata_probed(
-        common::Side::Destination,
-        common::MetadataOp::MkDir,
-        tokio::fs::create_dir(dst),
-    )
-    .await
-    {
-        Ok(()) => {
+    match dst_parent.make_dir(dst_name, 0o700).await {
+        Ok(dir) => {
             // don't increment counter here - will be done in complete_directory
             // when we know we're keeping this directory
-            Ok(DirectoryCreateResult::Created)
+            Ok(DirectoryCreateResult::Created(Arc::new(dir)))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            // something exists at destination - check what it is
-            let dst_metadata = common::walk::run_metadata_probed(
-                common::Side::Destination,
-                common::MetadataOp::Stat,
-                tokio::fs::symlink_metadata(dst),
-            )
-            .await?;
-            if dst_metadata.is_dir() {
-                // directory already exists - reuse it (no overwrite needed for directories)
+            // something exists at destination - classify it via the parent fd (O_NOFOLLOW).
+            let dst_handle = dst_parent
+                .child(dst_name)
+                .await
+                .with_context(|| format!("failed reading metadata from dst: {dst:?}"))?;
+            if dst_handle.kind() == common::walk::EntryKind::Dir {
+                // directory already exists - reuse it (no overwrite needed for directories).
+                // open_dir is O_NOFOLLOW|O_DIRECTORY, so a swap to a symlink fails closed here.
                 tracing::debug!("destination directory already exists, reusing it");
+                let dir = dst_parent
+                    .open_dir(dst_name)
+                    .await
+                    .with_context(|| format!("cannot open existing directory {dst:?}"))?;
                 prog.directories_unchanged.inc();
-                Ok(DirectoryCreateResult::AlreadyExisted)
+                Ok(DirectoryCreateResult::AlreadyExisted(Arc::new(dir)))
             } else if settings.ignore_existing {
                 // not a directory but ignore_existing is set - skip the subtree
                 tracing::debug!(
@@ -542,27 +726,16 @@ async fn create_directory(
                 prog.directories_unchanged.inc();
                 Ok(DirectoryCreateResult::Skipped)
             } else if settings.overwrite {
-                // not a directory but overwrite is enabled - remove and create
+                // not a directory but overwrite is enabled - remove (recheck-guarded, fd-relative)
+                // and create.
                 tracing::info!("destination is not a directory, removing and creating a new one");
-                common::rm::rm(
-                    common::get_progress(),
-                    dst,
-                    &common::rm::Settings {
-                        fail_early: settings.fail_early,
-                        filter: None,
-                        dry_run: None,
-                        time_filter: None,
-                    },
-                )
-                .await?;
-                common::walk::run_metadata_probed(
-                    common::Side::Destination,
-                    common::MetadataOp::MkDir,
-                    tokio::fs::create_dir(dst),
-                )
-                .await?;
+                remove_existing_dst(dst_parent, dst_name, dst, &dst_handle, settings).await?;
+                let dir = dst_parent
+                    .make_dir(dst_name, 0o700)
+                    .await
+                    .with_context(|| format!("cannot create directory {dst:?}"))?;
                 // don't increment counter here - will be done in complete_directory
-                Ok(DirectoryCreateResult::Created)
+                Ok(DirectoryCreateResult::Created(Arc::new(dir)))
             } else {
                 // not a directory and overwrite disabled
                 tracing::error!(
@@ -572,124 +745,120 @@ async fn create_directory(
             }
         }
         Err(error) => {
-            tracing::error!("Failed to create directory {dst:?}: {error}");
-            Err(error.into())
+            tracing::error!("Failed to create directory {dst:?}: {error:#}");
+            Err(anyhow::Error::new(error).context(format!("cannot create directory {dst:?}")))
         }
     }
 }
 
-/// Create a symlink, handling overwrite logic.
+/// Create a symlink fd-relative on the PARENT's held `Dir`, handling overwrite logic, and apply
+/// its metadata through the created link's own pinned handle.
+///
+/// Creation goes through `dst_parent.symlink_at(dst_name, target)` (`symlinkat` relative to the
+/// pinned parent fd), which fails with `EEXIST` on any pre-existing entry (never following it);
+/// the returned handle pins the link inode for race-free metadata application. Overwrite removal
+/// is recheck-guarded and fd-relative via [`remove_existing_dst`]. A privileged destination
+/// therefore cannot be redirected by a concurrent symlink swap of the parent into creating a link
+/// outside the destination tree.
 async fn create_symlink(
     settings: &common::copy::Settings,
     preserve: &common::preserve::Settings,
+    dst_parent: &Arc<Dir>,
+    dst_name: &OsStr,
     dst: &std::path::Path,
     target: &std::path::Path,
     metadata: &remote::protocol::Metadata,
 ) -> anyhow::Result<()> {
     let prog = progress();
-    match common::walk::run_metadata_probed(
-        common::Side::Destination,
-        common::MetadataOp::Symlink,
-        tokio::fs::symlink(target, dst),
-    )
-    .await
-    {
-        Ok(()) => {
-            common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
+    // fast path: the destination slot is empty, create the link directly.
+    match dst_parent.symlink_at(dst_name, target).await {
+        Ok(link_handle) => {
+            common::safedir::set_symlink_metadata_fd(
+                preserve,
+                metadata,
+                &link_handle,
+                common::Side::Destination,
+            )
+            .await
+            .with_context(|| format!("failed setting symlink metadata on {dst:?}"))?;
             prog.symlinks_created.inc();
             Ok(())
         }
-        Err(error)
-            if settings.ignore_existing && error.kind() == std::io::ErrorKind::AlreadyExists =>
-        {
-            tracing::debug!("destination exists, skipping symlink (--ignore-existing)");
-            prog.symlinks_unchanged.inc();
-            Ok(())
-        }
-        Err(error) if settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let dst_metadata = common::walk::run_metadata_probed(
-                common::Side::Destination,
-                common::MetadataOp::Stat,
-                tokio::fs::symlink_metadata(dst),
-            )
-            .await
-            .with_context(|| format!("failed reading metadata from dst: {dst:?}"))?;
-            if dst_metadata.is_symlink() {
-                let dst_link = common::walk::run_metadata_probed(
-                    common::Side::Destination,
-                    common::MetadataOp::ReadLink,
-                    tokio::fs::read_link(dst),
-                )
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if settings.ignore_existing {
+                tracing::debug!("destination exists, skipping symlink (--ignore-existing)");
+                prog.symlinks_unchanged.inc();
+                return Ok(());
+            }
+            if !settings.overwrite {
+                return Err(
+                    anyhow::Error::new(error).context(format!("failed creating symlink {dst:?}"))
+                );
+            }
+            // classify the existing entry through the parent fd (O_NOFOLLOW).
+            let dst_handle = dst_parent
+                .child(dst_name)
                 .await
-                .with_context(|| format!("failed reading dst symlink: {dst:?}"))?;
+                .with_context(|| format!("failed reading metadata from dst: {dst:?}"))?;
+            if dst_handle.kind() == common::walk::EntryKind::Symlink {
+                let dst_link = dst_parent
+                    .read_link_at(dst_name)
+                    .await
+                    .with_context(|| format!("failed reading dst symlink: {dst:?}"))?;
                 if *target == dst_link {
                     tracing::debug!(
                         "destination is a symlink and points to the same location as source"
                     );
-                    if preserve.symlink.any() {
-                        if common::filecmp::metadata_equal(
+                    if preserve.symlink.any()
+                        && !common::filecmp::metadata_equal(
                             &settings.overwrite_compare,
                             metadata,
-                            &dst_metadata,
-                        ) {
-                            tracing::debug!("destination symlink is identical, skipping");
-                            prog.symlinks_unchanged.inc();
-                        } else {
-                            tracing::debug!("destination metadata is different, updating");
-                            common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
-                            prog.symlinks_removed.inc();
-                            prog.symlinks_created.inc();
-                        }
-                    } else {
-                        tracing::debug!("destination symlink is identical, skipping");
-                        prog.symlinks_unchanged.inc();
+                            dst_handle.meta(),
+                        )
+                    {
+                        tracing::debug!("destination metadata is different, updating");
+                        common::safedir::set_symlink_metadata_fd(
+                            preserve,
+                            metadata,
+                            &dst_handle,
+                            common::Side::Destination,
+                        )
+                        .await
+                        .with_context(|| format!("failed setting symlink metadata on {dst:?}"))?;
+                        prog.symlinks_removed.inc();
+                        prog.symlinks_created.inc();
+                        return Ok(());
                     }
-                } else {
-                    tracing::info!(
-                        "destination is a symlink but points to a different location, removing"
-                    );
-                    common::walk::run_metadata_probed(
-                        common::Side::Destination,
-                        common::MetadataOp::Unlink,
-                        tokio::fs::remove_file(dst),
-                    )
-                    .await?;
-                    common::walk::run_metadata_probed(
-                        common::Side::Destination,
-                        common::MetadataOp::Symlink,
-                        tokio::fs::symlink(target, dst),
-                    )
-                    .await?;
-                    common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
-                    prog.symlinks_removed.inc();
-                    prog.symlinks_created.inc();
+                    tracing::debug!("destination symlink is identical, skipping");
+                    prog.symlinks_unchanged.inc();
+                    return Ok(());
                 }
+                tracing::info!(
+                    "destination is a symlink but points to a different location, removing"
+                );
             } else {
                 tracing::info!("destination is not a symlink, removing");
-                common::rm::rm(
-                    common::get_progress(),
-                    dst,
-                    &common::rm::Settings {
-                        fail_early: settings.fail_early,
-                        filter: None,
-                        dry_run: None,
-                        time_filter: None,
-                    },
-                )
-                .await
-                .map_err(|err| anyhow::anyhow!("Failed to remove destination: {err}"))?;
-                common::walk::run_metadata_probed(
-                    common::Side::Destination,
-                    common::MetadataOp::Symlink,
-                    tokio::fs::symlink(target, dst),
-                )
-                .await?;
-                common::preserve::set_symlink_metadata(preserve, metadata, dst).await?;
-                prog.symlinks_created.inc();
             }
+            // remove the conflicting entry (recheck-guarded, fd-relative) then create the link.
+            remove_existing_dst(dst_parent, dst_name, dst, &dst_handle, settings).await?;
+            let link_handle = dst_parent
+                .symlink_at(dst_name, target)
+                .await
+                .with_context(|| format!("failed creating symlink {dst:?}"))?;
+            common::safedir::set_symlink_metadata_fd(
+                preserve,
+                metadata,
+                &link_handle,
+                common::Side::Destination,
+            )
+            .await
+            .with_context(|| format!("failed setting symlink metadata on {dst:?}"))?;
+            prog.symlinks_created.inc();
             Ok(())
         }
-        Err(error) => Err(error.into()),
+        Err(error) => {
+            Err(anyhow::Error::new(error).context(format!("failed creating symlink {dst:?}")))
+        }
     }
 }
 
@@ -716,7 +885,6 @@ async fn process_control_stream(
                 ref metadata,
                 is_root,
                 entry_count,
-                file_count,
                 keep_if_empty,
             } => {
                 let _ops_guard = prog.ops.guard();
@@ -727,6 +895,15 @@ async fn process_control_stream(
                 };
                 if has_failed_ancestor {
                     tracing::warn!("Skipping directory {:?} - ancestor failed to create", dst);
+                    // nack so the source releases this directory's held fd (it was
+                    // never created, so no files will be requested for it).
+                    {
+                        let tracker = directory_tracker.lock().await;
+                        tracker
+                            .send_directory_skipped(src, dst)
+                            .await
+                            .context("Failed to send DirectorySkipped for skipped directory")?;
+                    }
                     // still count as a processed child entry for the parent
                     if !is_root && let Some(parent) = dst.parent() {
                         directory_tracker
@@ -738,35 +915,49 @@ async fn process_control_stream(
                     }
                     continue;
                 }
+                // resolve the destination parent directory's held fd (for the root, open
+                // the trusted parent via open_parent_dir). all creation is then fd-relative
+                // on that pinned parent.
+                let create_result = match resolve_parent_dir(&directory_tracker, dst, is_root).await
+                {
+                    Ok((dst_parent, dst_name)) => {
+                        create_directory(settings, &dst_parent, &dst_name, dst).await
+                    }
+                    Err(e) => Err(e.context("failed resolving destination parent directory")),
+                };
                 // try to create directory
-                let (create_result, error_already_pushed) =
-                    match create_directory(settings, dst).await {
-                        Ok(result) => (result, false),
-                        Err(e) => {
-                            tracing::error!("Failed to create directory {:?}: {:#}", dst, e);
-                            if settings.fail_early {
-                                return Err(e);
-                            }
-                            error_collector.push(e);
-                            (DirectoryCreateResult::Failed, true)
+                let (create_result, error_already_pushed) = match create_result {
+                    Ok(result) => (result, false),
+                    Err(e) => {
+                        tracing::error!("Failed to create directory {:?}: {:#}", dst, e);
+                        if settings.fail_early {
+                            return Err(e);
                         }
-                    };
+                        error_collector.push(e);
+                        (DirectoryCreateResult::Failed, true)
+                    }
+                };
+                // classify the outcome before the match consumes it: whether we created the
+                // directory (vs reused an existing one) and whether create reported a hard
+                // failure (vs an --ignore-existing skip).
+                let was_created = matches!(create_result, DirectoryCreateResult::Created(_));
+                let create_failed = matches!(create_result, DirectoryCreateResult::Failed);
                 match create_result {
-                    DirectoryCreateResult::Created | DirectoryCreateResult::AlreadyExisted => {
-                        // add to tracker (sends DirectoryCreated)
+                    DirectoryCreateResult::Created(dir)
+                    | DirectoryCreateResult::AlreadyExisted(dir) => {
+                        // add to tracker (sends DirectoryCreated, stores the dir fd in the fd-map)
                         // tracker handles root directory tracking internally
-                        let was_created = create_result == DirectoryCreateResult::Created;
                         directory_tracker
                             .lock()
                             .await
                             .add_directory(
                                 src,
                                 dst,
+                                dir,
                                 metadata.clone(),
                                 is_root,
                                 was_created,
                                 entry_count,
-                                file_count,
                                 keep_if_empty,
                             )
                             .await
@@ -778,13 +969,23 @@ async fn process_control_stream(
                         // for Failed, push the synthetic "not a directory" error when
                         // create_directory returned Ok(Failed). when it returned
                         // Err(e), the real error (e.g. EACCES) was already pushed.
-                        if create_result == DirectoryCreateResult::Failed && !error_already_pushed {
+                        if create_failed && !error_already_pushed {
                             error_collector.push(anyhow::anyhow!(
                                 "destination {dst:?} exists and is not a directory, use --overwrite to replace"
                             ));
                         }
                         let mut tracker = directory_tracker.lock().await;
                         tracker.mark_directory_failed(dst);
+                        // nack so the source releases this directory's held fd: it was
+                        // not created and no files will be requested for it. Without this
+                        // a no-ack subtree larger than the source's dir-fd budget hangs
+                        // the copy. (Sent even on the fail_early return path below — the
+                        // source's Pass 1 may still be mid-walk when the failure races
+                        // its DestinationDone; an extra nack is harmless there.)
+                        tracker
+                            .send_directory_skipped(src, dst)
+                            .await
+                            .context("Failed to send DirectorySkipped for failed directory")?;
                         // if root directory failed, mark root as complete to avoid hang
                         if is_root {
                             tracker.set_root_complete();
@@ -797,7 +998,7 @@ async fn process_control_stream(
                                 .await
                                 .context("Failed to update parent tracker for failed directory")?;
                         }
-                        if create_result == DirectoryCreateResult::Failed && settings.fail_early {
+                        if create_failed && settings.fail_early {
                             return Err(anyhow::anyhow!(
                                 "destination {dst:?} exists and is not a directory, use --overwrite to replace"
                             ));
@@ -833,8 +1034,23 @@ async fn process_control_stream(
                     }
                     continue;
                 }
-                // create symlink
-                let result = create_symlink(settings, preserve, dst, target, metadata).await;
+                // resolve the destination parent's held fd (for the root, open the trusted
+                // parent via open_parent_dir), then create the symlink fd-relative on it.
+                let result = match resolve_parent_dir(&directory_tracker, dst, is_root).await {
+                    Ok((dst_parent, dst_name)) => {
+                        create_symlink(
+                            settings,
+                            preserve,
+                            &dst_parent,
+                            &dst_name,
+                            dst,
+                            target,
+                            metadata,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e.context("failed resolving destination parent directory")),
+                };
                 if let Err(e) = result {
                     tracing::error!("Failed to create symlink {:?} -> {:?}: {:#}", src, dst, e);
                     if settings.fail_early {

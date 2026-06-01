@@ -91,6 +91,87 @@ impl EntryKind {
     }
 }
 
+/// Which backpressure pool a leaf's pre-acquired permit comes from.
+///
+/// The two pools are deliberately distinct (see [`LeafPermit`]) — this enum
+/// selects between them per tool, plus a `None` variant for metadata-only
+/// walks (e.g. rcmp-style traversals) that take no leaf permit at all.
+///
+/// Unifying the *choice* of pool here — alongside [`LeafPermit`] and
+/// [`preacquire_leaf_permit`] — is what lets the traversal driver own the
+/// "drop the leaf permit before recursing into a directory" invariant in a
+/// single place. Hand-coding that drop at every per-tool branch is the root
+/// cause of the hold-and-wait deadlock class this lifecycle eliminates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermitKind {
+    /// File-descriptor backpressure ([`throttle::open_file_permit`]) — for
+    /// tools that hold an open fd across leaf work (copy, link).
+    OpenFile,
+    /// Task-spawn backpressure ([`throttle::pending_meta_permit`]) — for
+    /// recursive metadata-only walks that don't hold an fd (chmod, rm).
+    PendingMeta,
+    /// The tool takes no leaf permit (it doesn't gate at the leaf).
+    None,
+}
+
+/// A pre-acquired leaf permit, type-erased over the two distinct backpressure
+/// pools so a single caller (the traversal driver) can hold either uniformly
+/// and drop it in exactly one place before recursing into a directory.
+///
+/// The two pools must stay distinct: [`throttle::OpenFileGuard`] gates open
+/// file descriptors while [`throttle::PendingMetaGuard`] gates in-flight
+/// metadata-only tasks. They are sized independently so a path that composes
+/// the two operations (e.g. `copy_file → rm` when overwriting a directory
+/// destination) cannot self-deadlock against a saturated open-files pool.
+/// This enum unifies only the *lifecycle*, never the pools themselves.
+///
+/// Neither guard is `Clone`; dropping a `LeafPermit` releases exactly the
+/// underlying permit it wraps. The driver drops it before descending so a
+/// directory entry never holds a leaf permit across its recursive walk —
+/// the single home for the invariant that previously lived at 4/7/1/1
+/// per-tool branch sites and shipped as a deadlock when a single-site tool
+/// forgot it.
+pub enum LeafPermit {
+    /// A permit from the open-files pool.
+    OpenFile(throttle::OpenFileGuard),
+    /// A permit from the pending-metadata pool.
+    PendingMeta(throttle::PendingMetaGuard),
+}
+
+/// Pre-acquire a leaf permit for a child about to be spawned, per the tool's
+/// policy.
+///
+/// Returns `None` when `kind == PermitKind::None` or when `!want(hint)` — the
+/// latter lets a tool opt out based on the cheap `getdents` `d_type` hint. The
+/// key case: when the hint says "directory", the tool passes a `want` that
+/// returns `false`, so no leaf permit is taken. That matters because a hinted
+/// directory must NOT hold a leaf permit across recursion (the hold-and-wait
+/// deadlock). Otherwise this acquires from the pool selected by `kind` and
+/// wraps it in [`LeafPermit`].
+///
+/// `want` receives the raw hint (`None` for `DT_UNKNOWN`); the authoritative
+/// type is only resolved later by the per-entry worker. A hint of `None`
+/// therefore takes a permit when the tool's `want` admits it (matching the
+/// historical "treat unknown as a leaf" behavior), and the worker re-classifies
+/// and drops it if the entry turns out to be a directory.
+pub async fn preacquire_leaf_permit(
+    kind: PermitKind,
+    hint: Option<EntryKind>,
+    want: impl Fn(Option<EntryKind>) -> bool,
+) -> Option<LeafPermit> {
+    if kind == PermitKind::None || !want(hint) {
+        return None;
+    }
+    match kind {
+        PermitKind::OpenFile => Some(LeafPermit::OpenFile(throttle::open_file_permit().await)),
+        PermitKind::PendingMeta => Some(LeafPermit::PendingMeta(
+            throttle::pending_meta_permit().await,
+        )),
+        // unreachable: the early return above already handled `None`.
+        PermitKind::None => None,
+    }
+}
+
 /// Resolve the `throttle::Side` from the matching `congestion::Side`.
 ///
 /// The two crates carry independent enum definitions to keep `throttle`
@@ -229,12 +310,70 @@ where
     result
 }
 
+/// Determine the `is_dir` value to feed an include/exclude FILTER decision for a
+/// directory entry, using the authoritative `fstat` type when the cheap
+/// `getdents` `d_type` hint is unavailable.
+///
+/// `read_entries` returns each entry's `d_type` as a best-effort hint; on
+/// filesystems that don't populate it (NFS, some FUSE mounts) the hint is `None`
+/// (`DT_UNKNOWN`). Treating `None` as "not a directory" for an `is_dir`-dependent
+/// filter (e.g. `--include '/sub/**'`) would wrongly EXCLUDE a real directory and
+/// omit its entire subtree. To match the old path-based walk (which fell back to
+/// an `lstat` via `DirEntry::file_type()`), this resolves the type
+/// AUTHORITATIVELY via `dir.child(name)`'s `fstat` — but ONLY when the hint is
+/// `None` AND the type is actually needed: either a filter is active, or the
+/// caller passes `force_authoritative` because its own control flow depends on
+/// the result (e.g. a dry-run recurse-vs-leaf decision). When the hint is
+/// reliable, or the type is unneeded, the cheap hint is used directly (no extra
+/// syscall), preserving the optimization.
+///
+/// `child(name)` uses `O_PATH|O_NOFOLLOW`, so this never follows a symlink (a
+/// symlink entry classifies as `Symlink`, not `Dir`) and never blocks: the
+/// hardening of the walk below the named root is unaffected. On a `child` error
+/// (e.g. the entry vanished mid-walk) the hint-derived value is used as a
+/// fallback — the entry's own per-entry worker will then surface the error
+/// authoritatively.
+pub async fn filter_is_dir(
+    filter: Option<&FilterSettings>,
+    dir: &crate::safedir::Dir,
+    name: &std::ffi::OsStr,
+    hint: Option<EntryKind>,
+    force_authoritative: bool,
+) -> bool {
+    match hint {
+        Some(kind) => kind == EntryKind::Dir,
+        // DT_UNKNOWN: only pay for the authoritative fstat when the type is actually
+        // needed — a filter needs it, or the caller's control flow depends on it
+        // (`force_authoritative`, e.g. a dry-run recurse-vs-leaf decision). Otherwise
+        // the value is unused, so default cheaply.
+        None if filter.is_some() || force_authoritative => match dir.child(name).await {
+            Ok(handle) => handle.kind() == EntryKind::Dir,
+            // entry changed/vanished: fall back to the historical non-dir default;
+            // the per-entry worker re-classifies and reports any real error.
+            Err(_) => false,
+        },
+        None => false,
+    }
+}
+
 /// Decide whether an entry should be skipped by the filter, returning the
 /// `FilterResult` that caused the skip. Returns `None` if there is no filter
 /// or the entry is included.
 #[must_use]
 pub fn should_skip_entry(
     filter: &Option<FilterSettings>,
+    relative_path: &std::path::Path,
+    is_dir: bool,
+) -> Option<FilterResult> {
+    should_skip_entry_ref(filter.as_ref(), relative_path, is_dir)
+}
+
+/// [`should_skip_entry`] taking the filter by `Option<&_>` rather than
+/// `&Option<_>`, so callers that already hold an `Option<&FilterSettings>` (the
+/// traversal driver) don't have to clone it. Identical semantics otherwise.
+#[must_use]
+pub fn should_skip_entry_ref(
+    filter: Option<&FilterSettings>,
     relative_path: &std::path::Path,
     is_dir: bool,
 ) -> Option<FilterResult> {
@@ -264,4 +403,254 @@ pub fn relative_to_root<'a>(
     root: &std::path::Path,
 ) -> &'a std::path::Path {
     entry.strip_prefix(root).unwrap_or(entry)
+}
+
+/// Strip trailing path separators from a root operand. A trailing slash forces the OS to resolve
+/// the final component as a directory, which would dereference a symlink root like `link/`
+/// (following it to its target). Stripping makes `link/` behave like `link` (the symlink itself),
+/// which is then classified/operated on `O_NOFOLLOW` relative to its parent fd.
+#[must_use]
+pub fn without_trailing_separators(path: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    let mut end = bytes.len();
+    while end > 1 && bytes[end - 1] == b'/' {
+        end -= 1;
+    }
+    std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..end]))
+}
+
+/// A root operand decomposed for the fd-relative walk entry point.
+pub struct RootOperand {
+    /// The operand's parent directory — opened TRUSTED (follows symlinks) via
+    /// [`crate::safedir::Dir::open_parent_dir`].
+    pub parent: std::path::PathBuf,
+    /// The operand's final component — classified `O_NOFOLLOW` via `child(name)` below the parent.
+    pub name: std::ffi::OsString,
+    /// The operand path for diagnostics / `real_path` reconstruction: the operand as typed (with
+    /// trailing slashes stripped) for a normal operand, or the canonicalized path for a `.`/`..`
+    /// operand that had to be resolved.
+    pub display: std::path::PathBuf,
+}
+
+/// Decompose a root operand into the `(parent, final_component)` the fd-relative walk needs (see
+/// [`RootOperand`]): the parent prefix is opened with [`crate::safedir::Dir::open_parent_dir`]
+/// (trusted, follows symlinks) and the final component is then classified `O_NOFOLLOW` via
+/// `child(name)` below it.
+///
+/// Most operands split directly via `parent()` / `file_name()` (an empty parent meaning the current
+/// directory). An operand whose final component is `.` or `..` (e.g. `.`, `tree/..`) has no
+/// `file_name()`, so it is first canonicalized to a concrete path — `.` becomes the current
+/// directory, `tree/..` its grandparent — restoring the behavior of the pre-fd-walk path code,
+/// where `rrm .` / `rchm -R … .` operated on the current tree. (Canonicalizing only this branch
+/// never touches a normal operand, so a symlinked final component on the normal path is still
+/// opened `O_NOFOLLOW`; `.`/`..` are themselves never symlinks.) The filesystem root `/` has no
+/// parent and cannot be expressed as parent + component, so it is rejected with a clear error.
+pub async fn split_root_operand(path: &std::path::Path) -> anyhow::Result<RootOperand> {
+    let stripped = without_trailing_separators(path);
+    if let Some(name) = stripped.file_name() {
+        let parent = match stripped.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            // empty parent (a single-component relative path) means the current directory.
+            _ => std::path::PathBuf::from("."),
+        };
+        let name = name.to_owned();
+        return Ok(RootOperand {
+            parent,
+            name,
+            display: stripped,
+        });
+    }
+    // final component is `.`/`..` (or the operand is `/`): canonicalize to a concrete path so it can
+    // be split into parent + component.
+    let canonical = tokio::fs::canonicalize(&stripped)
+        .await
+        .with_context(|| format!("cannot resolve operand {stripped:?}"))?;
+    let name = canonical.file_name().map(std::ffi::OsStr::to_owned);
+    let parent = canonical.parent().map(std::path::Path::to_path_buf);
+    let (Some(parent), Some(name)) = (parent, name) else {
+        anyhow::bail!("cannot operate on the filesystem root {canonical:?}");
+    };
+    Ok(RootOperand {
+        parent,
+        name,
+        display: canonical,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::safedir::Dir;
+    use crate::testutils;
+    use std::ffi::OsStr;
+
+    fn include_filter(pattern: &str) -> Option<FilterSettings> {
+        let mut f = FilterSettings::new();
+        f.add_include(pattern).unwrap();
+        Some(f)
+    }
+
+    // FIX B (PR #247 review): when the getdents `d_type` hint is unavailable (DT_UNKNOWN -> None)
+    // AND a filter is active, the filter `is_dir` decision must come from the AUTHORITATIVE fstat,
+    // not default to non-dir. Otherwise a real directory reported as DT_UNKNOWN would be wrongly
+    // excluded by an is_dir-dependent include filter, omitting its whole subtree. We can't force
+    // DT_UNKNOWN on a normal local fs, so we drive `filter_is_dir` with `hint = None` directly —
+    // exactly the value `read_entries` would yield on NFS/FUSE — to exercise the authoritative path.
+    #[tokio::test]
+    async fn filter_is_dir_authoritatively_classifies_dt_unknown_directory() -> anyhow::Result<()> {
+        let tmp = testutils::setup_test_dir().await?;
+        // fixture: tmp/foo holds `bar` (a real directory) and `0.txt` (a real file).
+        let dir = Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Source).await?;
+        let filter = include_filter("/bar/**");
+        // DT_UNKNOWN + active filter on a real DIRECTORY -> must resolve to `true` via fstat, so an
+        // include filter does NOT omit its subtree (the regression this fix closes).
+        assert!(
+            filter_is_dir(filter.as_ref(), &dir, OsStr::new("bar"), None, false).await,
+            "a real directory reported as DT_UNKNOWN must classify as a directory for the filter"
+        );
+        // DT_UNKNOWN + active filter on a real FILE -> resolves to `false` authoritatively.
+        assert!(
+            !filter_is_dir(filter.as_ref(), &dir, OsStr::new("0.txt"), None, false).await,
+            "a real file reported as DT_UNKNOWN must classify as a non-directory"
+        );
+        Ok(())
+    }
+
+    // FIX B: a reliable hint is used directly (no fstat), and with no filter active the value is
+    // the cheap default — the optimization is preserved (we never pay an fstat we don't need).
+    #[tokio::test]
+    async fn filter_is_dir_uses_hint_when_available_and_skips_when_no_filter() -> anyhow::Result<()>
+    {
+        let tmp = testutils::setup_test_dir().await?;
+        let dir = Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Source).await?;
+        let filter = include_filter("/bar/**");
+        // reliable Dir hint -> true regardless of fstat.
+        assert!(
+            filter_is_dir(
+                filter.as_ref(),
+                &dir,
+                OsStr::new("bar"),
+                Some(EntryKind::Dir),
+                false
+            )
+            .await
+        );
+        // reliable File hint -> false.
+        assert!(
+            !filter_is_dir(
+                filter.as_ref(),
+                &dir,
+                OsStr::new("0.txt"),
+                Some(EntryKind::File),
+                false
+            )
+            .await
+        );
+        // DT_UNKNOWN, NO filter, and not forced -> cheap non-dir default (no authoritative fstat
+        // needed); the `name` is never resolved, so it need not even exist.
+        assert!(!filter_is_dir(None, &dir, OsStr::new("does_not_exist"), None, false).await);
+        Ok(())
+    }
+
+    // force_authoritative (e.g. rlink --dry-run, which uses is_dir for its recurse-vs-leaf
+    // branch): a DT_UNKNOWN hint with NO filter must still classify AUTHORITATIVELY when the
+    // caller's control flow depends on the result, so a dry-run on NFS/FUSE doesn't preview a
+    // real directory as a leaf and skip its subtree.
+    #[tokio::test]
+    async fn filter_is_dir_forces_authoritative_classification_when_requested() -> anyhow::Result<()>
+    {
+        let tmp = testutils::setup_test_dir().await?;
+        let dir = Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Source).await?;
+        // DT_UNKNOWN + NO filter, but force_authoritative -> a real directory must classify as dir.
+        assert!(
+            filter_is_dir(None, &dir, OsStr::new("bar"), None, true).await,
+            "force_authoritative must fstat a DT_UNKNOWN directory even with no filter"
+        );
+        // ...and a real file as non-dir.
+        assert!(
+            !filter_is_dir(None, &dir, OsStr::new("0.txt"), None, true).await,
+            "force_authoritative must fstat a DT_UNKNOWN file even with no filter"
+        );
+        Ok(())
+    }
+
+    // The leaf-permit lifecycle: `PermitKind::None` and a rejecting `want` both opt
+    // out (the basis for "a hinted directory takes no permit, so it can't deadlock
+    // by holding one across recursion"); a matching `want` acquires from the
+    // requested pool. The pools are process-global; configure a small cap so the
+    // OpenFile case exercises a real acquire rather than the disabled-pool no-op.
+    #[tokio::test]
+    async fn preacquire_leaf_permit_respects_kind_and_want() {
+        throttle::set_max_open_files(4);
+        // `None` kind never takes a permit, regardless of hint/want.
+        assert!(
+            preacquire_leaf_permit(PermitKind::None, Some(EntryKind::File), |_| true)
+                .await
+                .is_none()
+        );
+        // matching want on the OpenFile pool yields an OpenFile permit.
+        let permit = preacquire_leaf_permit(PermitKind::OpenFile, Some(EntryKind::File), |h| {
+            h == Some(EntryKind::File)
+        })
+        .await;
+        assert!(matches!(permit, Some(LeafPermit::OpenFile(_))));
+        drop(permit);
+        // a rejecting want (e.g. the hint says "directory") opts out even though the
+        // pool is configured — the hinted-dir-takes-no-permit case.
+        assert!(
+            preacquire_leaf_permit(PermitKind::OpenFile, Some(EntryKind::Dir), |_| false)
+                .await
+                .is_none()
+        );
+    }
+
+    // split_root_operand: a normal operand splits via parent()/file_name() (single component ->
+    // parent "."), a trailing slash is stripped, a trailing `/.` names the directory itself, and —
+    // the regression fix — a bare `.` or an operand ending in `..` (no file_name()) is canonicalized
+    // so it still names a directory instead of being rejected. The filesystem root `/` is rejected.
+    #[tokio::test]
+    async fn split_root_operand_handles_dot_and_normal_operands() -> anyhow::Result<()> {
+        use std::ffi::OsStr;
+        use std::path::Path;
+        // normal nested operand: split verbatim.
+        let op = split_root_operand(Path::new("a/b")).await?;
+        assert_eq!(op.parent, Path::new("a"));
+        assert_eq!(op.name, OsStr::new("b"));
+        assert_eq!(op.display, Path::new("a/b"));
+        // single component: parent defaults to the current directory.
+        let op = split_root_operand(Path::new("foo")).await?;
+        assert_eq!(op.parent, Path::new("."));
+        assert_eq!(op.name, OsStr::new("foo"));
+        // trailing slash stripped (so a symlink root is classified O_NOFOLLOW, not dereferenced).
+        let op = split_root_operand(Path::new("foo/")).await?;
+        assert_eq!(op.name, OsStr::new("foo"));
+        // trailing `/.` names the directory itself: `file_name()` normalizes the `.` away, so it
+        // splits verbatim (no canonicalize) — `dir/.` -> parent ".", name "dir"; `a/b/.` -> "a","b".
+        let op = split_root_operand(Path::new("dir/.")).await?;
+        assert_eq!(op.parent, Path::new("."));
+        assert_eq!(op.name, OsStr::new("dir"));
+        let op = split_root_operand(Path::new("a/b/.")).await?;
+        assert_eq!(op.parent, Path::new("a"));
+        assert_eq!(op.name, OsStr::new("b"));
+        // bare `.` (no file_name): canonicalized to the current directory.
+        let cwd = tokio::fs::canonicalize(".").await?;
+        let op = split_root_operand(Path::new(".")).await?;
+        assert_eq!(op.parent, cwd.parent().unwrap());
+        assert_eq!(op.name, cwd.file_name().unwrap());
+        assert_eq!(op.display, cwd);
+        // operand ending in `..` (no file_name): canonicalized so it still names a directory.
+        // tmp/sub/.. resolves to tmp — the `rrm .` / `rchm -R … .` regression this fix closes.
+        let tmp = testutils::create_temp_dir().await?;
+        let sub = tmp.join("sub");
+        tokio::fs::create_dir(&sub).await?;
+        let canonical_tmp = tokio::fs::canonicalize(&tmp).await?;
+        let op = split_root_operand(&sub.join("..")).await?;
+        assert_eq!(op.parent, canonical_tmp.parent().unwrap());
+        assert_eq!(op.name, canonical_tmp.file_name().unwrap());
+        assert_eq!(op.display, canonical_tmp);
+        // the filesystem root has no parent and is rejected with a clear error.
+        assert!(split_root_operand(Path::new("/")).await.is_err());
+        Ok(())
+    }
 }

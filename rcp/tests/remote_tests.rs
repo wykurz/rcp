@@ -1358,6 +1358,185 @@ fn test_remote_copy_nested_directories_with_unreadable_files() {
     assert!(!output.status.success());
 }
 
+/// Returns true if this process can read a freshly-created `chmod 000` directory.
+/// That only happens when running effectively as root (which bypasses the rwx
+/// permission bits), in which case the unreadable-directory tests cannot reproduce
+/// the EACCES they rely on and must be skipped.
+fn can_read_unreadable_dir() -> bool {
+    let probe = tempfile::tempdir().unwrap();
+    let dir = probe.path().join("probe_000");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = std::fs::read_dir(&dir).is_ok();
+    // restore perms so the tempdir can be cleaned up
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+    readable
+}
+
+/// A root directory that EXISTS but is unreadable (`chmod 000`) must, in hardened
+/// mode WITHOUT `--fail-early`, produce an EMPTY destination directory and SUCCEED
+/// at the protocol level (an empty dir landed, only its contents could not be
+/// read), rather than aborting with a fail-closed "no held directory fd" error.
+///
+/// This exercises Change A (the unreadable-directory tombstone): the source can't
+/// open the root dir, sends a 0-entry `Directory`, and registers a tombstone so the
+/// destination's `DirectoryCreated` ack is consumed instead of hitting the
+/// fail-closed miss path. Before the tombstone fix this aborted the copy.
+#[test]
+fn test_remote_copy_unreadable_root_directory_continues() {
+    require_local_ssh();
+    if can_read_unreadable_dir() {
+        eprintln!(
+            "skipping test_remote_copy_unreadable_root_directory_continues: running as root, \
+             chmod 000 directories remain readable so EACCES cannot be reproduced"
+        );
+        return;
+    }
+    let (src_dir, dst_dir) = setup_test_env();
+    // a directory we own that exists but cannot be opened for reading: symlink_metadata
+    // still reports it as a directory (the source commits to sending it), but
+    // open_root_dir gets EACCES.
+    let src_subdir = src_dir.path().join("unreadable_root");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("hidden.txt"), "cannot be read", 0o644);
+    std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let dst_subdir = dst_dir.path().join("unreadable_root");
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    // without --fail-early: the unreadable directory becomes an empty destination
+    // directory and the copy reports a (partial) error for the unreadable dir, but
+    // must NOT hang or abort with a fail-closed "no held directory fd" error.
+    let output = run_rcp_with_args(&["--summary", &src_remote, &dst_remote]);
+    print_command_output(&output);
+    // restore perms so the source tempdir cleans up
+    let _ = std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(0o755));
+    // the empty destination directory must have been created (the empty dir "landed").
+    // it inherits the source's 0o000 mode, so make it readable before inspecting it.
+    assert!(
+        dst_subdir.is_dir(),
+        "destination directory should exist as an empty directory"
+    );
+    std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        std::fs::read_dir(&dst_subdir).unwrap().count(),
+        0,
+        "destination directory should be empty (its contents were unreadable)"
+    );
+    // critically: the copy must not have hung / been killed by the timeout wrapper
+    // and must not have aborted with the fail-closed message. The unreadable dir is
+    // still reported as an error, so the exit code is non-zero, but the run completed.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("no held directory fd"),
+        "copy must not fail closed for a committed unreadable directory (tombstone should be consumed)"
+    );
+}
+
+/// A counted-child `FileSkipped` received under a FAILED (untracked) parent must be
+/// a no-op on the destination, not abort the whole copy with "not being tracked".
+///
+/// Reproduces PR #247 review: the destination cannot create directory `conflict`
+/// because a NON-DIRECTORY already exists there and `--overwrite` is NOT set, so
+/// `conflict` lands in `failed_directories` (NOT `pending_directories`). The source
+/// meanwhile fails to `open_dir` the counted child `conflict/sub` (it is `chmod 000`)
+/// and emits a counted-child `FileSkipped` for it. That `FileSkipped` routes to
+/// `process_file(conflict)` on the destination. Before the fix this hit the
+/// fail-closed "directory {:?} not being tracked" path and aborted the destination
+/// mid-protocol (manifesting as an abort/hang); after the fix it is tolerated and the
+/// copy completes (reporting the non-fatal `conflict` non-directory error, exit != 0).
+#[test]
+fn test_remote_copy_file_skipped_under_failed_parent_does_not_abort() {
+    require_local_ssh();
+    if can_read_unreadable_dir() {
+        eprintln!(
+            "skipping test_remote_copy_file_skipped_under_failed_parent_does_not_abort: \
+             running as root, chmod 000 directories remain readable so EACCES cannot be reproduced"
+        );
+        return;
+    }
+    let (src_dir, dst_dir) = setup_test_env();
+    // source: a directory `conflict` whose ONLY child is the subdirectory `sub`
+    // (so `conflict`'s entry_count == 1, file_count == 0). `sub` is chmod 000 so the
+    // source's `open_dir("sub")` from `conflict`'s held fd fails EACCES at Pass-1,
+    // emitting a counted-child `FileSkipped` for `sub` under parent `conflict`.
+    let src_conflict = src_dir.path().join("conflict");
+    std::fs::create_dir(&src_conflict).unwrap();
+    let src_sub = src_conflict.join("sub");
+    std::fs::create_dir(&src_sub).unwrap();
+    create_test_file(&src_sub.join("hidden.txt"), "cannot be read", 0o644);
+    std::fs::set_permissions(&src_sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // destination: pre-create `dst/` (a real directory) and `dst/conflict` as a FILE,
+    // so the destination's mkdir of `conflict` fails as a non-directory conflict and
+    // `conflict` is added to `failed_directories` (no `--overwrite`).
+    let dst_conflict = dst_dir.path().join("conflict");
+    create_test_file(&dst_conflict, "i am a file, not a directory", 0o644);
+    let src_remote = format!("localhost:{}", src_conflict.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_conflict.to_str().unwrap());
+    // default hardened mode (no --dereference), WITHOUT --overwrite, WITHOUT --fail-early.
+    let output = run_rcp_with_args(&["--summary", &src_remote, &dst_remote]);
+    print_command_output(&output);
+    // restore perms so the source tempdir cleans up
+    let _ = std::fs::set_permissions(&src_sub, std::fs::Permissions::from_mode(0o755));
+    // the run must have completed (not hung / killed by the timeout wrapper — already
+    // asserted in run_rcp_with_args_internal) and must NOT have aborted the destination
+    // mid-protocol with the pre-fix "not being tracked" message.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("not being tracked"),
+        "destination must tolerate a FileSkipped under a failed parent, not abort with \
+         'not being tracked'. Combined output:\n{combined}"
+    );
+    // the non-directory `conflict` conflict is still a (non-fatal) error, so exit != 0.
+    assert!(
+        !output.status.success(),
+        "the non-directory conflict should still be reported as an error (exit != 0)"
+    );
+}
+
+/// Dereference (`-L`) copy of a directory tree, exercising the source-side `-L`
+/// `path → file_count` map introduced in Change B (the destination no longer echoes
+/// the count, so `-L` must retain its own Pass-1 count for each directory). The
+/// directory is reached through a symlink and must be copied as a real directory
+/// with all files present.
+#[test]
+fn test_remote_copy_dereference_directory_tree() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // a real directory tree with nested files...
+    let target_dir = src_dir.path().join("real_tree");
+    std::fs::create_dir(&target_dir).unwrap();
+    create_test_file(&target_dir.join("a.txt"), "alpha", 0o644);
+    create_test_file(&target_dir.join("b.txt"), "bravo", 0o644);
+    let nested = target_dir.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    create_test_file(&nested.join("c.txt"), "charlie", 0o644);
+    // ...reached through a symlink, so -L must follow it and copy a directory.
+    let link = src_dir.path().join("tree_link");
+    std::os::unix::fs::symlink(&target_dir, &link).unwrap();
+    let dst_path = dst_dir.path().join("copied_tree");
+    let src_remote = format!("localhost:{}", link.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_path.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&["-L", "--summary", &src_remote, &dst_remote]);
+    // result is a real directory tree, not a symlink
+    assert!(dst_path.is_dir());
+    assert!(!dst_path.is_symlink());
+    assert_eq!(get_file_content(&dst_path.join("a.txt")), "alpha");
+    assert_eq!(get_file_content(&dst_path.join("b.txt")), "bravo");
+    assert_eq!(get_file_content(&dst_path.join("nested/c.txt")), "charlie");
+    // 3 files across 2 directories (root + nested) copied
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 3);
+    assert_eq!(summary.directories_created, 2);
+}
+
 #[test]
 fn test_remote_copy_mixed_success_with_symlink_errors() {
     require_local_ssh();
@@ -4765,4 +4944,460 @@ fn test_remote_auto_meta_throttle_flags_propagate_to_rcpd() {
             );
         }
     }
+}
+
+// ── TOCTOU source hardening (Phase 5a) ──────────────────────────────────────────
+
+/// The remote SOURCE must not dereference a nested symlink to read file DATA on
+/// the default (non-`-L`) path. A directory child that is a symlink to an
+/// out-of-tree sentinel regular file must be copied AS a symlink — its target's
+/// bytes must never be streamed into a destination regular file.
+///
+/// This exercises the source-side fd-map's classification: Pass 1 opens the child
+/// `O_NOFOLLOW` and `fstat`s it, so a symlink is a symlink (never a File), and the
+/// sentinel is never opened for data. (With `-L` the symlink would be followed —
+/// that path is intentionally not hardened and is covered by the dereference
+/// tests above.)
+#[test]
+fn test_remote_source_nested_symlink_not_dereferenced_for_data() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // out-of-tree sentinel: content that must never reach the destination as data.
+    let sentinel = src_dir.path().join("sentinel_secret.txt");
+    create_test_file(&sentinel, "TOP-SECRET-SENTINEL", 0o600);
+    // source subtree we actually copy
+    let src_subdir = src_dir.path().join("tree");
+    std::fs::create_dir(&src_subdir).unwrap();
+    let real_file = src_subdir.join("real.txt");
+    create_test_file(&real_file, "real data", 0o644);
+    // a child symlink pointing at the out-of-tree sentinel
+    let link = src_subdir.join("link_to_secret");
+    std::os::unix::fs::symlink(&sentinel, &link).unwrap();
+    let dst_subdir = dst_dir.path().join("tree");
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    run_rcp_and_expect_success(&[&src_remote, &dst_remote]);
+    // the real file copies through unchanged
+    let dst_real = dst_subdir.join("real.txt");
+    assert_eq!(get_file_content(&dst_real), "real data");
+    // the symlink is preserved as a symlink; the sentinel's bytes are NOT copied
+    // into a regular destination file.
+    let dst_link = dst_subdir.join("link_to_secret");
+    assert!(
+        dst_link.is_symlink(),
+        "nested symlink must be copied as a symlink, not dereferenced for data"
+    );
+    assert!(
+        !std::fs::symlink_metadata(&dst_link).unwrap().is_file(),
+        "sentinel content must never be written as a destination regular file"
+    );
+}
+
+/// Best-effort race test: while a remote copy runs, rapidly swap a source file
+/// between a real regular file and a symlink-to-sentinel. The source must never
+/// transfer the sentinel's content — either it reads the real file, or the
+/// fd-relative `O_NOFOLLOW` open fails closed and the entry is skipped.
+///
+/// NOTE: this is a best-effort race (the source runs as a separate subprocess over
+/// SSH, so we can't deterministically hit the Pass-2 open window). A leaked
+/// sentinel is a true-positive failure; a clean run is the expected outcome. The
+/// deterministic guarantee is covered by
+/// `test_remote_source_nested_symlink_not_dereferenced_for_data`.
+#[test]
+fn test_remote_source_file_swap_never_transfers_sentinel() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let sentinel = src_dir.path().join("sentinel_secret.txt");
+    create_test_file(&sentinel, "TOP-SECRET-SENTINEL", 0o600);
+    let src_subdir = src_dir.path().join("tree");
+    std::fs::create_dir(&src_subdir).unwrap();
+    // a bed of real files so the copy has work to do (widens the race window).
+    for i in 0..200 {
+        create_test_file(&src_subdir.join(format!("f{i}.txt")), "real data", 0o644);
+    }
+    // the entry we race: starts as a real file.
+    let target = src_subdir.join("racer.txt");
+    create_test_file(&target, "real racer", 0o644);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let target_thread = target.clone();
+    let sentinel_thread = sentinel.clone();
+    let swapper = std::thread::spawn(move || {
+        let mut as_link = false;
+        while !stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = std::fs::remove_file(&target_thread);
+            if as_link {
+                let _ = std::os::unix::fs::symlink(&sentinel_thread, &target_thread);
+            } else {
+                let _ = std::fs::write(&target_thread, "real racer");
+            }
+            as_link = !as_link;
+        }
+        // leave it as a real file for a clean final state
+        let _ = std::fs::remove_file(&target_thread);
+        let _ = std::fs::write(&target_thread, "real racer");
+    });
+    let dst_subdir = dst_dir.path().join("tree");
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    // run several iterations to widen the chance of hitting the swap window.
+    for _ in 0..3 {
+        let _ = std::fs::remove_dir_all(&dst_subdir);
+        let _ = run_rcp_with_args(&[&src_remote, &dst_remote]);
+        // whatever landed at the destination for `racer.txt`, it must not be the
+        // sentinel content. it may be the real content, a symlink, or absent.
+        let dst_racer = dst_subdir.join("racer.txt");
+        if let Ok(meta) = std::fs::symlink_metadata(&dst_racer)
+            && meta.is_file()
+            && let Ok(content) = std::fs::read_to_string(&dst_racer)
+        {
+            assert_ne!(
+                content, "TOP-SECRET-SENTINEL",
+                "source transferred out-of-tree sentinel content via a symlink swap"
+            );
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    swapper.join().unwrap();
+}
+
+/// The remote source must not dereference a ROOT symlink for data: a root operand that is a symlink
+/// to an out-of-tree sentinel is copied as a symlink (read fd-relative via its trusted parent),
+/// never followed to write the sentinel's bytes as a destination regular file. Deterministic
+/// companion to `test_remote_source_root_file_swap_never_transfers_sentinel`, exercising the
+/// hardened root-symlink read.
+#[test]
+fn test_remote_source_root_symlink_not_dereferenced_for_data() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let sentinel = src_dir.path().join("sentinel_secret.txt");
+    create_test_file(&sentinel, "TOP-SECRET-SENTINEL", 0o600);
+    // the ROOT operand itself is a symlink to the out-of-tree sentinel.
+    let root_link = src_dir.path().join("root_link");
+    std::os::unix::fs::symlink(&sentinel, &root_link).unwrap();
+    let dst = dst_dir.path().join("out");
+    let src_remote = format!("localhost:{}", root_link.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst.to_str().unwrap());
+    run_rcp_and_expect_success(&[&src_remote, &dst_remote]);
+    // copied as a symlink, NOT dereferenced into a destination regular file of sentinel bytes.
+    assert!(
+        dst.is_symlink(),
+        "root symlink must be copied as a symlink, not dereferenced for data"
+    );
+    assert!(
+        !std::fs::symlink_metadata(&dst).unwrap().is_file(),
+        "sentinel content must never be written as a destination regular file"
+    );
+}
+
+// NOTE: there is deliberately no best-effort root-FILE swap race test (analogous to
+// `test_remote_source_file_swap_never_transfers_sentinel` for nested files). When a swap lands
+// during the root open, the hardened `open_file_read` correctly fails closed — but a root failure
+// returns `Err` and the destination then waits for the never-arriving root data until a transport
+// timeout (the pre-existing "root failure → Err" design; nested failures skip fast instead). That
+// makes such a test slow and flaky under concurrent load without adding coverage: the root file now
+// uses the same `open_file_read` primitive as nested files (swap-tested above and unit-tested in
+// `safedir`), and every existing root-file copy test now exercises the hardened root read.
+
+/// Regression for the source fd-map deadlock: a no-ack destination subtree larger
+/// than the source's dir-fd budget must NOT hang the copy.
+///
+/// The source-side fd-map gates Pass 1 with a dir-fd-in-flight semaphore. Pass 2's
+/// `MapEntryGuard` releases a permit only for directories the destination acks with
+/// `DirectoryCreated`. A directory the destination skips (here: its destination path
+/// is blocked by a pre-existing non-directory, so `create_directory` fails and every
+/// descendant is skipped as a failed-ancestor) sends no `DirectoryCreated`. Before
+/// the fix those skipped directories held their Pass-1 permits forever, so once the
+/// no-ack subtree exceeded the budget, Pass 1 blocked on `insert().await`,
+/// `DirStructureComplete` was never sent, and the whole copy hung. The fix is the
+/// `DirectorySkipped` nack: the destination sends exactly one ack/nack per
+/// `Directory`, and the source releases the permit on nack too.
+///
+/// We shrink the budget with `--max-connections 2 --pending-writes-multiplier 2`
+/// (budget = 4) and make the blocked subtree 16 directories (> budget), so the
+/// deadlock is deterministic without the fix. Bounding: the test harness wraps rcp
+/// in `timeout 90`; a hang trips that (exit 124) and `assert_not_timeout` (inside
+/// `run_rcp_with_args`) fails the test, so an unfixed build FAILS rather than
+/// hanging the suite forever. A fixed build completes in ~1s.
+#[test]
+fn test_remote_source_no_ack_subtree_over_budget_does_not_hang() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // source: root/ with a real file, a copyable sibling subtree, and a `blocked`
+    // subtree holding > budget directories (budget below is 4).
+    let src_root = src_dir.path().join("root");
+    std::fs::create_dir(&src_root).unwrap();
+    create_test_file(&src_root.join("top.txt"), "top content", 0o644);
+    // sibling subtree that must copy fine
+    let src_ok = src_root.join("ok");
+    std::fs::create_dir(&src_ok).unwrap();
+    create_test_file(&src_ok.join("ok.txt"), "ok content", 0o644);
+    // blocked subtree: 16 directories (flat fan-out), each with a file so Pass 1
+    // definitely inserts a held fd per directory.
+    let src_blocked = src_root.join("blocked");
+    std::fs::create_dir(&src_blocked).unwrap();
+    let blocked_dir_count = 16usize;
+    for i in 0..blocked_dir_count {
+        let d = src_blocked.join(format!("d{i}"));
+        std::fs::create_dir(&d).unwrap();
+        create_test_file(&d.join("inner.txt"), "inner", 0o644);
+    }
+    // destination: pre-create root/ as a real dir, but block root/blocked with a
+    // pre-existing REGULAR FILE so the destination cannot create it (no --overwrite).
+    let dst_root = dst_dir.path().join("root");
+    std::fs::create_dir(&dst_root).unwrap();
+    create_test_file(&dst_root.join("blocked"), "i am a file, not a dir", 0o644);
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // shrink the dir-fd budget to 4 (2 * 2) so 16 no-ack dirs exceed it.
+    // default mode (no -L); fail_early off so the copy proceeds past the blocked dir.
+    let output = run_rcp_with_args(&[
+        "--max-connections",
+        "2",
+        "--pending-writes-multiplier",
+        "2",
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output);
+    // the copy must COMPLETE (the harness already failed us on a 90s timeout/hang).
+    // it exits non-zero because the blocked dir is a real error, but it must not hang.
+    // the sibling subtree and the top-level file must have copied.
+    assert_eq!(get_file_content(&dst_root.join("top.txt")), "top content");
+    assert_eq!(get_file_content(&dst_root.join("ok/ok.txt")), "ok content");
+    // the blocked path stays the pre-existing regular file (subtree skipped).
+    assert!(
+        dst_root.join("blocked").is_file(),
+        "blocked destination path should remain the pre-existing file"
+    );
+    assert!(
+        !dst_root.join("blocked").join("d0").exists(),
+        "blocked subtree must not have been copied"
+    );
+}
+
+/// Regression for the SOURCE skip-accounting deadlock (PR #247 review): a counted
+/// child directory that the source FAILS TO OPEN mid fd-walk must not hang the copy.
+///
+/// On the hardened (non-`-L`) remote source walk, `send_directory_fd_walk`
+/// pre-reads each directory's children and tallies every child (including
+/// subdirectories) into the parent's `Directory { entry_count }`. A subdirectory is
+/// classified via the parent's fd (`fstatat`, which succeeds even for a `0o000`
+/// child), so it IS counted — but the later `dir.open_dir(child)` fails with EACCES
+/// for a `0o000` directory. Before the fix that failure only recorded an error and
+/// `continue`d, emitting NO protocol message for the counted child, so the
+/// destination's `DirectoryTracker` for the parent waited forever for that entry →
+/// `complete_directory` never fired → `DestinationDone` was never sent → the copy
+/// HUNG. The fix emits a `FileSkipped` for the unprocessable child so the parent's
+/// expected-entry count still reaches zero.
+///
+/// Here `blocked/` holds 16 subdirectories all mode `0o000`: each is counted in
+/// `blocked/`'s `entry_count` but every `open_dir` fails. Bounding/determinism is
+/// the same as the budget test: the harness wraps rcp in `timeout 90`, so an
+/// unfixed build trips the timeout (exit 124) and `assert_not_timeout` fails the
+/// test rather than hanging the suite; a fixed build completes in ~1s with the rest
+/// of the tree copied.
+#[test]
+fn test_remote_source_counted_child_open_failure_does_not_hang() {
+    require_local_ssh();
+    // root bypasses directory permission bits, so a `0o000` dir would still open and
+    // the counted-child-open-failure path would not be exercised. Skip under root.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: running as root, cannot make a directory unopenable to self");
+        return;
+    }
+    let (src_dir, dst_dir) = setup_test_env();
+    // source: root/ with a top-level file, a sibling subtree that must copy fine,
+    // and `blocked/` whose children are all counted but un-openable.
+    let src_root = src_dir.path().join("root");
+    std::fs::create_dir(&src_root).unwrap();
+    create_test_file(&src_root.join("top.txt"), "top content", 0o644);
+    let src_ok = src_root.join("ok");
+    std::fs::create_dir(&src_ok).unwrap();
+    create_test_file(&src_ok.join("ok.txt"), "ok content", 0o644);
+    // `blocked/` is itself readable (so the source enumerates and counts its
+    // children), but each child directory is mode 0o000 so `open_dir` fails EACCES.
+    let src_blocked = src_root.join("blocked");
+    std::fs::create_dir(&src_blocked).unwrap();
+    let blocked_dir_count = 16usize;
+    let mut unopenable: Vec<std::path::PathBuf> = Vec::new();
+    for i in 0..blocked_dir_count {
+        let d = src_blocked.join(format!("d{i}"));
+        std::fs::create_dir(&d).unwrap();
+        // put a file inside so, were the dir openable, there'd be content to send —
+        // it must never be reached because the dir itself cannot be opened.
+        create_test_file(&d.join("inner.txt"), "inner", 0o644);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o000)).unwrap();
+        unopenable.push(d);
+    }
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!(
+        "localhost:{}",
+        dst_dir.path().join("root").to_str().unwrap()
+    );
+    // default mode (no -L → hardened fd-walk); fail_early off so the copy proceeds
+    // past the un-openable children and must still COMPLETE.
+    let output = run_rcp_with_args(&[&src_remote, &dst_remote]);
+    print_command_output(&output);
+    // restore permissions so the TempDir cleanup can remove the 0o000 directories.
+    for d in &unopenable {
+        let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755));
+    }
+    // the copy must COMPLETE (the harness already failed us on a 90s timeout/hang).
+    // it exits non-zero because the un-openable dirs are real errors, but it must not
+    // hang. The top-level file and the sibling subtree must have copied.
+    let dst_root = dst_dir.path().join("root");
+    assert_eq!(get_file_content(&dst_root.join("top.txt")), "top content");
+    assert_eq!(get_file_content(&dst_root.join("ok/ok.txt")), "ok content");
+    // the un-openable children's contents must NOT have been transferred.
+    assert!(
+        !dst_root
+            .join("blocked")
+            .join("d0")
+            .join("inner.txt")
+            .exists(),
+        "contents of an un-openable source directory must not have been copied"
+    );
+    assert!(
+        !output.status.success(),
+        "copy should report a non-zero exit because some source dirs could not be opened"
+    );
+}
+
+/// TOCTOU hardening (Scenario 2 — destination write-escape): a symlink planted at an
+/// intermediate DESTINATION directory path must NOT be followed when the remote `rcpd`
+/// destination creates the subtree under it. The destination opens each tracked directory
+/// `O_NOFOLLOW|O_DIRECTORY` and creates children fd-relative on that pinned fd, so a
+/// directory-position-occupied-by-a-symlink fails closed (ELOOP/ENOTDIR) rather than letting
+/// the privileged destination write files into the symlink's out-of-tree target.
+///
+/// This is the deterministic, pre-planted-symlink form of the race (a live mid-copy swap is not
+/// reproducible through the subprocess harness): we plant the symlink before the copy, so the
+/// create path is guaranteed to encounter it. The assertion that matters is that NO file ever
+/// lands in the out-of-tree target directory.
+#[test]
+fn test_remote_dest_symlink_at_intermediate_dir_not_followed_out_of_tree() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // out-of-tree sentinel directory: nothing must ever be written here.
+    let out_of_tree = tempfile::tempdir().unwrap();
+    // source tree:  root/sub/file.txt  (sub is a real directory at the source).
+    let src_root = src_dir.path().join("root");
+    let src_sub = src_root.join("sub");
+    std::fs::create_dir_all(&src_sub).unwrap();
+    create_test_file(
+        &src_sub.join("file.txt"),
+        "must stay in the dst tree",
+        0o644,
+    );
+    // destination: pre-create root/, then plant a SYMLINK where root/sub must go,
+    // pointing at the out-of-tree directory. If the destination followed it, the file
+    // would be written to out_of_tree/file.txt.
+    let dst_root = dst_dir.path().join("root");
+    std::fs::create_dir(&dst_root).unwrap();
+    let dst_sub_link = dst_root.join("sub");
+    std::os::unix::fs::symlink(out_of_tree.path(), &dst_sub_link).unwrap();
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // no --overwrite: the destination must NOT replace the symlink, and crucially must
+    // not follow it. The copy fails (the symlinked dir position is a real error), but the
+    // harness already fails us on a hang/timeout, so a clean non-zero exit is fine.
+    let output = run_rcp_with_args(&[&src_remote, &dst_remote]);
+    print_command_output(&output);
+    // THE load-bearing assertion: the out-of-tree target was never written through.
+    assert!(
+        !out_of_tree.path().join("file.txt").exists(),
+        "file escaped the destination tree through a planted intermediate symlink \
+         (O_NOFOLLOW create was bypassed) — TOCTOU destination write-escape"
+    );
+    // the planted symlink itself must be untouched (not followed, not replaced without --overwrite).
+    assert!(
+        dst_sub_link.is_symlink(),
+        "planted intermediate symlink should remain a symlink (was not followed/replaced)"
+    );
+    // and no real file landed at the in-tree path either (the subtree was skipped, fail-closed).
+    assert!(
+        !dst_root.join("sub").join("file.txt").is_file()
+            || std::fs::symlink_metadata(dst_root.join("sub"))
+                .unwrap()
+                .is_symlink(),
+        "no regular file should have been created under the symlinked dst path"
+    );
+}
+
+/// Companion to the test above with `--overwrite`: even when the destination is allowed to
+/// REPLACE the planted intermediate symlink, the replacement is fd-relative and recheck-guarded
+/// (it removes the symlink itself via `unlink_at`, never following it), then creates a real
+/// directory in its place. The file must end up inside the destination tree, and NOTHING must
+/// ever be written to the symlink's out-of-tree target.
+#[test]
+fn test_remote_dest_overwrite_replaces_intermediate_symlink_in_tree() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let out_of_tree = tempfile::tempdir().unwrap();
+    let src_root = src_dir.path().join("root");
+    let src_sub = src_root.join("sub");
+    std::fs::create_dir_all(&src_sub).unwrap();
+    create_test_file(&src_sub.join("file.txt"), "lands in the dst tree", 0o644);
+    let dst_root = dst_dir.path().join("root");
+    std::fs::create_dir(&dst_root).unwrap();
+    let dst_sub_link = dst_root.join("sub");
+    std::os::unix::fs::symlink(out_of_tree.path(), &dst_sub_link).unwrap();
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&["--overwrite", &src_remote, &dst_remote]);
+    print_command_output(&output);
+    // out-of-tree target must remain empty — the symlink was unlinked, never followed.
+    assert!(
+        !out_of_tree.path().join("file.txt").exists(),
+        "file escaped the destination tree through a replaced intermediate symlink"
+    );
+    // the dst path is now a real directory containing the copied file, inside the tree.
+    let dst_sub = dst_root.join("sub");
+    assert!(
+        dst_sub.is_dir() && !dst_sub.symlink_metadata().unwrap().is_symlink(),
+        "dst/sub should be replaced with a real directory"
+    );
+    assert_eq!(
+        get_file_content(&dst_sub.join("file.txt")),
+        "lands in the dst tree",
+        "copied file should land inside the destination tree"
+    );
+}
+
+/// TOCTOU hardening: a symlink planted where a destination FILE must be created must not be
+/// followed — the file's bytes must not be written through the symlink to its out-of-tree target.
+/// The destination creates files with `O_CREAT|O_EXCL|O_NOFOLLOW` relative to the parent's pinned
+/// fd, so a symlink occupying the file's name fails closed (EEXIST) without `--overwrite`.
+#[test]
+fn test_remote_dest_symlink_at_file_path_not_followed_out_of_tree() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let out_of_tree = tempfile::tempdir().unwrap();
+    let out_of_tree_target = out_of_tree.path().join("victim.txt");
+    // source: a single file root/data.txt
+    let src_root = src_dir.path().join("root");
+    std::fs::create_dir(&src_root).unwrap();
+    create_test_file(&src_root.join("data.txt"), "secret payload", 0o644);
+    // destination: plant a symlink at root/data.txt -> out-of-tree victim path.
+    let dst_root = dst_dir.path().join("root");
+    std::fs::create_dir(&dst_root).unwrap();
+    let dst_file_link = dst_root.join("data.txt");
+    std::os::unix::fs::symlink(&out_of_tree_target, &dst_file_link).unwrap();
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    // no --overwrite: create must fail closed (EEXIST via O_EXCL), never following the symlink.
+    let output = run_rcp_with_args(&[&src_remote, &dst_remote]);
+    print_command_output(&output);
+    // the out-of-tree victim path must never be created/written through the symlink.
+    assert!(
+        !out_of_tree_target.exists(),
+        "file data was written through a planted symlink to an out-of-tree path \
+         (O_EXCL|O_NOFOLLOW create was bypassed) — TOCTOU destination write-escape"
+    );
+    // the planted symlink is left intact (no --overwrite, and never followed).
+    assert!(
+        dst_file_link.is_symlink(),
+        "planted file-path symlink should remain a symlink"
+    );
 }

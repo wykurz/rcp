@@ -43,6 +43,7 @@ common = { workspace = true }
 enum-map = "2.7"
 futures = "0.3"
 hex = "0.4"
+libc = "0.2"
 rand = "0.10"
 regex = "1.12"
 remote = { workspace = true }

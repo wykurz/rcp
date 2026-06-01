@@ -48,6 +48,15 @@ jobs:
     - name: Check remote test naming
       run: ./scripts/check-remote-test-naming.sh
 
+    - name: Check walk-driver usage
+      run: ./scripts/check-walk-driver-usage.sh
+
+    - name: Check source-read fidelity
+      run: ./scripts/check-source-read-fidelity.sh
+
+    - name: Check package metadata
+      run: ./scripts/check-package-metadata.sh
+
     - name: Lint
       run: cargo clippy --workspace --all-targets -- -D warnings
       env:

@@ -3,12 +3,27 @@
 //! The public entry point is [`chmod`]; it mirrors [`crate::rm()`] but transforms
 //! metadata in place (from a per-type rule) instead of removing entries.
 use crate::filter::TimeFilter;
+use crate::preserve::Metadata as _;
 use crate::progress::Progress;
-use crate::walk::{self, EntryKind};
+use crate::safedir::{self, Dir, FileMeta, Handle};
+use crate::walk::{EntryKind, LeafPermit, PermitKind};
+use crate::walk_driver::{
+    DirAction, DirPreResult, EntryCx, ProcessedChildren, WalkVisitor, process_entry,
+};
 use anyhow::{Context, anyhow};
-use async_recursion::async_recursion;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::ffi::OsStr;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::instrument;
+
+/// The full 12-bit (`0o7777`) mode of a metadata snapshot, including the
+/// setuid/setgid/sticky bits. [`FileMeta`] exposes its mode only through
+/// `permissions()`, so this is the canonical way `compute_plan`'s inputs are
+/// derived from an fd-pinned [`Handle`].
+fn mode_of(meta: &FileMeta) -> u32 {
+    meta.permissions().mode() & 0o7777
+}
 
 /// Error type for chmod operations. See [`crate::error::OperationError`].
 pub type Error = crate::error::OperationError<Summary>;
@@ -554,54 +569,72 @@ fn describe_change(cur_mode: u32, cur_uid: u32, cur_gid: u32, plan: &EntryPlan) 
     parts.join(", ")
 }
 
-async fn apply_plan(path: &std::path::Path, plan: &EntryPlan) -> anyhow::Result<()> {
+/// Apply a computed plan to a single entry through the `O_PATH` [`Handle`] we
+/// already hold, never re-resolving the entry by path.
+///
+/// The handle is pinned to the exact inode (opened `O_NOFOLLOW`), so both syscalls
+/// act on that inode rather than on a name: there is no TOCTOU window and no
+/// `recheck` is needed (unlike copy's name-based overwrite). A concurrent
+/// rename/symlink swap of the directory entry cannot redirect either operation to a
+/// different target.
+///
+/// Syscall choice, following the documented chown → chmod ordering:
+/// * **chown** — [`safedir::fchown_handle`] (inode-exact `fchownat` with
+///   `AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW`). Applies to files, dirs, AND symlinks.
+/// * **chmod** — [`safedir::chmod_via_proc_fd`] (chmod of the inode via its
+///   `/proc/self/fd` magic symlink). Used for both files and directories: `fchmod`
+///   is `EBADF` on the `O_PATH` handle, and the `/proc` path is inode-exact, works
+///   on all kernels, and crucially works even on a `0000`-mode directory we own
+///   (so a pre-order `d:u+rwx` can recover an unreadable directory before we open
+///   it to recurse). Symlinks are never chmod'd — [`compute_plan`] guarantees
+///   `plan.chmod` is `None` for a symlink.
+async fn apply_plan(handle: &Handle, plan: &EntryPlan) -> anyhow::Result<()> {
     if let Some((uid, gid)) = plan.chown {
-        let dst = path.to_owned();
-        walk::run_metadata_probed(
-            congestion::Side::Destination,
-            congestion::MetadataOp::Chmod,
-            async {
-                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    nix::unistd::fchownat(
-                        nix::fcntl::AT_FDCWD,
-                        &dst,
-                        uid.map(Into::into),
-                        gid.map(Into::into),
-                        nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
-                    )
-                    .with_context(|| format!("failed to chown {dst:?}"))?;
-                    Ok(())
-                })
-                .await?
-            },
-        )
-        .await?;
+        safedir::fchown_handle(handle, congestion::Side::Destination, uid, gid)
+            .await
+            .with_context(|| format!("failed to chown via fd (uid={uid:?}, gid={gid:?})"))?;
     }
     if let Some(mode) = plan.chmod {
-        // path-based chmod (only ever called on non-symlinks); follows the entry
-        // itself. avoids an extra open() vs fchmod and matches rm's dir path.
-        walk::run_metadata_probed(
-            congestion::Side::Destination,
-            congestion::MetadataOp::Chmod,
-            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)),
-        )
-        .await
-        .with_context(|| format!("failed to chmod {path:?} to {mode:04o}"))?;
+        safedir::chmod_via_proc_fd(handle, congestion::Side::Destination, mode)
+            .await
+            .with_context(|| format!("failed to chmod via fd to {mode:04o}"))?;
     }
     Ok(())
 }
 
 /// Apply the change to a single entry (a leaf, or a directory after its children
 /// were processed). Handles the time filter, dry-run, no-op skip, and counters.
-async fn process_entry(
+///
+/// `handle` is the entry's fd-pinned `O_PATH` [`Handle`]; its [`Handle::meta`]
+/// snapshot feeds [`compute_plan`] (replacing the old path-based `symlink_metadata`)
+/// and is the target of the inode-exact chown/chmod. `path` is the reconstructed
+/// display path used purely for dry-run output and diagnostics.
+async fn apply_entry_change(
     prog: &'static Progress,
     path: &std::path::Path,
-    metadata: &std::fs::Metadata,
+    handle: &Handle,
     kind: EntryKind,
     settings: &Settings,
 ) -> Result<Summary, Error> {
     if let Some(ref time_filter) = settings.time_filter {
-        match time_filter.matches(metadata) {
+        // the time filter needs full std metadata (btime for --created-before), which
+        // the fd snapshot does not carry; read it inode-exact through the pinned handle.
+        let metadata =
+            match safedir::stat_meta_via_proc_fd(handle, congestion::Side::Destination).await {
+                Ok(md) => md,
+                Err(err) => {
+                    let err = anyhow::Error::new(err).context(format!(
+                        "failed reading metadata for time filter on {path:?}"
+                    ));
+                    if settings.fail_early {
+                        return Err(Error::new(err, Default::default()));
+                    }
+                    tracing::warn!("time filter failed for {:?}, skipping: {:#}", path, &err);
+                    kind.inc_skipped(prog);
+                    return Ok(skipped_summary_for(kind));
+                }
+            };
+        match time_filter.matches(&metadata) {
             Ok(result) => {
                 if let Some(reason) = result.as_skip_reason() {
                     if let Some(mode) = settings.dry_run {
@@ -622,13 +655,9 @@ async fn process_entry(
             }
         }
     }
-    let plan = compute_plan(
-        metadata.mode(),
-        metadata.uid(),
-        metadata.gid(),
-        kind,
-        settings,
-    );
+    let meta = handle.meta();
+    let cur_mode = mode_of(meta);
+    let plan = compute_plan(cur_mode, meta.uid(), meta.gid(), kind, settings);
     if plan.is_noop() {
         if let Some(crate::config::DryRunMode::All) = settings.dry_run {
             println!("unchanged {} {:?}", kind.label(), path);
@@ -636,57 +665,66 @@ async fn process_entry(
         return Ok(inc_unchanged(prog, kind));
     }
     if settings.dry_run.is_some() {
-        let desc = describe_change(metadata.mode(), metadata.uid(), metadata.gid(), &plan);
+        let desc = describe_change(cur_mode, meta.uid(), meta.gid(), &plan);
         println!("would modify {} {:?}: {}", kind.label(), path, desc);
         return Ok(inc_changed(prog, kind));
     }
-    apply_plan(path, &plan)
+    apply_plan(handle, &plan)
         .await
         .map_err(|err| Error::new(err, Default::default()))?;
     Ok(inc_changed(prog, kind))
 }
 
-/// Strip trailing path separators from a root operand. A trailing slash forces the
-/// OS to resolve the final component as a directory, which would dereference a symlink
-/// root like `link/` (following it to its target) -- violating the non-dereference
-/// behavior. Stripping makes `link/` behave like `link` (the symlink itself).
-/// (This non-dereference behavior is not robust against concurrent path replacement
-/// under elevated privilege; see `docs/tocttou.md`.)
-fn without_trailing_separators(path: &std::path::Path) -> std::path::PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-    let bytes = path.as_os_str().as_bytes();
-    let mut end = bytes.len();
-    while end > 1 && bytes[end - 1] == b'/' {
-        end -= 1;
-    }
-    std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..end]))
-}
-
 /// Public entry point. Applies metadata changes to `path` and, recursively, its
 /// contents. Mirrors [`crate::rm::rm`] for the root-filter check.
+///
+/// The walk is fd-based (see [`crate::safedir`]): the root operand is opened
+/// relative to its parent directory and every entry is classified and mutated
+/// through file-descriptor-relative syscalls. A privileged `rchm` therefore cannot
+/// be redirected by a concurrent symlink swap into chmod/chown'ing a target outside
+/// the intended tree — the `O_NOFOLLOW` opens and the inode-pinned `O_PATH` handles
+/// catch the swap and fail closed.
 #[instrument(skip(prog_track, settings))]
 pub async fn chmod(
     prog_track: &'static Progress,
     path: &std::path::Path,
     settings: &Settings,
 ) -> Result<Summary, Error> {
-    let stripped = without_trailing_separators(path);
-    let path = stripped.as_path();
-    if let Some(ref filter) = settings.filter
-        && let Some(name) = path.file_name().map(std::path::Path::new)
-    {
-        let metadata = walk::run_metadata_probed(
-            congestion::Side::Source,
-            congestion::MetadataOp::Stat,
-            tokio::fs::symlink_metadata(path),
-        )
+    // decompose the operand into (parent dir, final component) so the root entry is opened and
+    // classified relative to a directory fd — the same fd-relative shape every nested entry takes.
+    // rchm mutates "the" tree in place, so the parent is opened on the Destination side. `.`/`..`
+    // operands (e.g. `rchm -R … .`) are canonicalized so they still name a directory; `/` is
+    // rejected.
+    let operand = crate::walk::split_root_operand(path)
         .await
-        .with_context(|| format!("failed reading metadata from {path:?}"))
         .map_err(|err| Error::new(err, Default::default()))?;
-        match filter.should_include_root_item(name, metadata.is_dir()) {
+    let parent_path = operand.parent.as_path();
+    let name = operand.name.as_os_str();
+    let path = operand.display.as_path();
+    // the operand's TRUSTED parent prefix is resolved following symlinks normally (the prefix is
+    // trusted up to and including the operand's container — only entries strictly below the named
+    // root are O_NOFOLLOW-hardened). a symlinked parent (e.g. `rchm symlinkdir/foo`) is followed; the
+    // operand itself is still classified via `child(name)` with O_NOFOLLOW (a symlink root is
+    // operated on as the link itself).
+    let parent = Dir::open_parent_dir(parent_path, congestion::Side::Destination)
+        .await
+        .with_context(|| format!("cannot open parent directory {parent_path:?}"))
+        .map_err(|err| Error::new(err, Default::default()))?;
+    // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
+    let parent = Arc::new(parent.into_tree());
+    if let Some(ref filter) = settings.filter {
+        // classify the root via its parent fd purely to evaluate the root filter; the driver
+        // re-classifies the root authoritatively in `process_entry`, so this handle is just a probe.
+        let root_handle = parent
+            .child(name)
+            .await
+            .with_context(|| format!("failed reading metadata from {path:?}"))
+            .map_err(|err| Error::new(err, Default::default()))?;
+        let name_path = std::path::Path::new(name);
+        match filter.should_include_root_item(name_path, root_handle.kind() == EntryKind::Dir) {
             crate::filter::FilterResult::Included => {}
             result => {
-                let kind = EntryKind::from_metadata(&metadata);
+                let kind = root_handle.kind();
                 if let Some(mode) = settings.dry_run {
                     crate::dry_run::report_skip(path, &result, mode, kind.label_long());
                 }
@@ -695,16 +733,296 @@ pub async fn chmod(
             }
         }
     }
-    chmod_internal(prog_track, path, path, settings).await
+    run_chmod_root(prog_track, &parent, name, path, settings).await
+}
+
+/// Build the [`ChmodVisitor`] and process the root entry through the generic
+/// [`crate::walk_driver`] driver. The root is processed exactly like a nested child: classified
+/// authoritatively, then dispatched to `visit_leaf` or `dir_pre`/recurse/`dir_post`.
+async fn run_chmod_root(
+    prog_track: &'static Progress,
+    parent: &Arc<Dir>,
+    name: &OsStr,
+    root: &std::path::Path,
+    settings: &Settings,
+) -> Result<Summary, Error> {
+    let visitor = Arc::new(ChmodVisitor {
+        prog_track,
+        settings: settings.clone(),
+    });
+    // the root entry's owned context: rel_path/filter_path empty (the root), real_path = the root
+    // operand. chmod has no filter base (no delegated subtree), so `filter_path == rel_path`.
+    let root_cx = EntryCx {
+        parent: Arc::clone(parent),
+        name: name.to_owned(),
+        rel_path: PathBuf::new(),
+        filter_path: PathBuf::new(),
+        real_path: root.to_path_buf(),
+        dry_run: settings.dry_run.is_some(),
+        prog_track,
+    };
+    process_entry(visitor, root_cx, (), None).await // chmod has no second tree → root context `()`
+}
+
+/// The chmod walk's [`WalkVisitor`]. The driver owns enumeration, the leaf-permit lifecycle,
+/// spawning, the single drop-before-recurse site, and the error fold; this visitor supplies
+/// chmod's per-entry bodies (`apply_entry_change` for leaves, `apply_dir_self` for the directory's
+/// own pre-/post-order change, `open_dir` for descent). chmod has no second tree, so
+/// [`Self::DirContext`] is `()`.
+struct ChmodVisitor {
+    prog_track: &'static Progress,
+    settings: Settings,
+}
+
+/// State threaded from [`WalkVisitor::dir_pre`] to [`WalkVisitor::dir_post`] (same task) — what
+/// `dir_post` needs to apply the directory's own change.
+struct ChmodDirState {
+    /// The directory's owned `O_PATH` handle; the post-order chmod goes through its `/proc/self/fd`
+    /// magic symlink, inode-exact (works even on a `0000`-mode directory).
+    handle: Handle,
+    /// Only traversed to find include-matches (not directly matched), so its own mode/owner is left
+    /// unchanged (mirrors rm.rs).
+    traversed_only: bool,
+    /// The directory's own pre-order contribution, folded into the final summary by `dir_post`.
+    base: Summary,
+    /// A pre-order change error captured in keep-going mode (the descent still proceeded, so
+    /// `dir_post` surfaces it). `None` when the pre-order change succeeded or was deferred —
+    /// mutually exclusive with the post-order change `dir_post` applies under `defer_dir_changes`.
+    pre_order_error: Option<anyhow::Error>,
+}
+
+impl WalkVisitor for ChmodVisitor {
+    type Summary = Summary;
+    type DirContext = ();
+    type DirState = ChmodDirState;
+
+    fn root_dir_context(&self) {}
+
+    fn permit_kind(&self) -> PermitKind {
+        // metadata-only walk: no open fd held across leaf work, so gate on the pending-meta pool.
+        PermitKind::PendingMeta
+    }
+
+    fn want_permit(&self, hint: Option<EntryKind>) -> bool {
+        // known non-directory hint only (a hinted dir recurses; DT_UNKNOWN might be a dir) —
+        // matches the old spawn loop's `known_leaf` pre-acquire policy.
+        hint.is_some_and(|k| k != EntryKind::Dir)
+    }
+
+    fn fail_early(&self) -> bool {
+        self.settings.fail_early
+    }
+
+    fn filter(&self) -> Option<&crate::filter::FilterSettings> {
+        self.settings.filter.as_ref()
+    }
+
+    fn on_skip(
+        &self,
+        cx: &EntryCx,
+        kind: EntryKind,
+        skip_result: &crate::filter::FilterResult,
+    ) -> Summary {
+        // mirror the old spawn loop's inline filter-skip: the dry-run "skip ..." line plus the
+        // matching `*_skipped` counter. the driver already did the shared progress increment.
+        if let Some(mode) = self.settings.dry_run {
+            crate::dry_run::report_skip(&cx.real_path, skip_result, mode, kind.label());
+        }
+        skipped_summary_for(kind)
+    }
+
+    async fn visit_leaf(
+        &self,
+        cx: &EntryCx,
+        _parent_ctx: &(),
+        handle: Handle,
+        kind: EntryKind,
+        permit: Option<LeafPermit>,
+    ) -> Result<Summary, Error> {
+        // the leaf change (time-filter + compute_plan + apply_plan), exactly as the old leaf branch.
+        // the permit is held across this non-recursive work and dropped on return (the driver drops
+        // it for directories, never here).
+        let _permit = permit;
+        apply_entry_change(
+            self.prog_track,
+            &cx.real_path,
+            &handle,
+            kind,
+            &self.settings,
+        )
+        .await
+    }
+
+    async fn dir_pre(&self, cx: &EntryCx, _parent_ctx: &(), handle: &Handle) -> DirPreResult<Self> {
+        let path = &cx.real_path;
+        // a "traversed-only" dir was entered only because it COULD contain include-matches; it does
+        // not directly match an include pattern, so its own mode/owner is left unchanged (mirrors
+        // rm.rs) — only directly-selected entries are modified.
+        let traversed_only = self.settings.filter.as_ref().is_some_and(|f| {
+            f.has_includes() && !f.directly_matches_include(&cx.filter_path, true)
+        });
+        let mut base = Summary::default();
+        let mut pre_order_error: Option<anyhow::Error> = None;
+        // pre-order (default, like `chmod -R`): change the dir BEFORE descending, via the O_PATH
+        // handle's /proc path (works even on a 0000 dir) — so `--mode d:u+rwx` recovers an
+        // unreadable dir before the open reads it, and a later child failure can't prevent it. a
+        // restrictive change (e.g. `d:a-rwx`) makes the open fail and is reported (like `chmod -R`).
+        if !self.settings.defer_dir_changes {
+            match apply_dir_self(
+                self.prog_track,
+                path,
+                handle,
+                traversed_only,
+                &self.settings,
+            )
+            .await
+            {
+                Ok(dir_summary) => base = base + dir_summary,
+                // fail-early: report now, never open or descend. keep-going: stash the error for
+                // `dir_post` to surface after the descent, and still open and recurse (old flow).
+                Err(error) if self.settings.fail_early => {
+                    return Err(Error::new(error.source, base + error.summary));
+                }
+                Err(error) => {
+                    tracing::error!("chmod: {:?} failed with: {:#}", path, &error);
+                    base = base + error.summary;
+                    pre_order_error = Some(error.source);
+                }
+            }
+        }
+        // dup the dir's O_PATH handle (a pure fd dup — no extra openat/fstatat) so `dir_post` can
+        // apply the deferred/post-order change inode-exact: the driver lends `&handle` only for
+        // `dir_pre`, so the post-order step needs its own owned handle to the same inode.
+        let dir_handle = handle
+            .try_clone()
+            .with_context(|| format!("cannot duplicate directory handle for {path:?}"))
+            .map_err(|err| Error::new(err, base))?;
+        // open the directory's real fd for the driver to enumerate. in post-order the dir still has
+        // its original mode, so the open succeeds and the held fd survives a later search-bit strip.
+        // an open failure (restrictive pre-order change, or a pre-existing unreadable dir) is reported.
+        match cx.parent.open_dir(&cx.name).await {
+            Ok(dir) => Ok(DirAction::Descend {
+                dir: Arc::new(dir),
+                child_ctx: (),
+                state: ChmodDirState {
+                    handle: dir_handle,
+                    traversed_only,
+                    base,
+                    pre_order_error,
+                },
+            }),
+            Err(error) => {
+                let error = anyhow::Error::new(error)
+                    .context(format!("cannot open directory {path:?} for reading"));
+                if self.settings.fail_early {
+                    return Err(Error::new(error, base));
+                }
+                // keep-going: no children to walk. fold the pre-order error (if any) + the open
+                // error, apply the deferred change (if any), and surface the combined error — the
+                // net result of the old open-failure path (empty join loop, then deferred change).
+                let errors = crate::error_collector::ErrorCollector::default();
+                if let Some(pre_order_error) = pre_order_error {
+                    errors.push(pre_order_error);
+                }
+                tracing::error!("chmod: {:#}", &error);
+                errors.push(error);
+                if self.settings.defer_dir_changes {
+                    match apply_dir_self(
+                        self.prog_track,
+                        path,
+                        handle,
+                        traversed_only,
+                        &self.settings,
+                    )
+                    .await
+                    {
+                        Ok(dir_summary) => base = base + dir_summary,
+                        Err(error) => {
+                            tracing::error!("chmod: {:?} failed with: {:#}", path, &error);
+                            base = base + error.summary;
+                            errors.push(error.source);
+                        }
+                    }
+                }
+                // `into_error()` is `Some` here: at least the open error was pushed.
+                Err(Error::new(errors.into_error().unwrap(), base))
+            }
+        }
+    }
+
+    async fn dir_post(
+        &self,
+        cx: &EntryCx,
+        state: ChmodDirState,
+        _processed: &ProcessedChildren,
+        child_result: Result<Summary, Error>,
+    ) -> Result<Summary, Error> {
+        let ChmodDirState {
+            handle,
+            traversed_only,
+            base,
+            pre_order_error,
+        } = state;
+        let path = &cx.real_path;
+        // seed with the dir's own pre-order contribution, then fold the children (the driver passes
+        // `Err` here only in keep-going mode — fail-early aborts before post-order).
+        let (child_summary, child_error) = match child_result {
+            Ok(summary) => (summary, None),
+            Err(err) => (err.summary, Some(err.source)),
+        };
+        let mut summary = base + child_summary;
+        // collect the deferred pre-order error and the child error (keep-going only).
+        let errors = crate::error_collector::ErrorCollector::default();
+        if let Some(pre_order_error) = pre_order_error {
+            errors.push(pre_order_error);
+        }
+        if let Some(child_error) = child_error {
+            errors.push(child_error);
+        }
+        // post-order (`--defer-dir-changes`): change the dir AFTER its contents (needed to remove
+        // the owner's own traversal permission). the contents were read through a fd opened before
+        // this change, so stripping the search bit here can't lock us out; the change is inode-exact
+        // through the O_PATH handle. (`pre_order_error` is always `None` here, so the two are
+        // mutually exclusive.)
+        if self.settings.defer_dir_changes {
+            match apply_dir_self(
+                self.prog_track,
+                path,
+                &handle,
+                traversed_only,
+                &self.settings,
+            )
+            .await
+            {
+                Ok(dir_summary) => summary = summary + dir_summary,
+                Err(error) => {
+                    if self.settings.fail_early {
+                        return Err(Error::new(error.source, summary + error.summary));
+                    }
+                    tracing::error!("chmod: {:?} failed with: {:#}", path, &error);
+                    summary = summary + error.summary;
+                    errors.push(error.source);
+                }
+            }
+        }
+        if let Some(error) = errors.into_error() {
+            return Err(Error::new(error, summary));
+        }
+        Ok(summary)
+    }
 }
 
 /// Apply the directory's own change, or skip it when the directory was only traversed to
 /// find include-matches. Factored out so the walk can run it before (pre-order, default)
 /// or after (post-order, `--defer-dir-changes`) descending into the contents.
+///
+/// `handle` is the directory's `O_PATH` handle; the chmod goes through its `/proc/self/fd`
+/// magic symlink, so the change applies inode-exact and works even on a `0000`-mode
+/// directory (a pre-order `d:u+rwx` recovers traversability before we open the dir to read).
 async fn apply_dir_self(
     prog_track: &'static Progress,
     path: &std::path::Path,
-    metadata: &std::fs::Metadata,
+    handle: &Handle,
     traversed_only: bool,
     settings: &Settings,
 ) -> Result<Summary, Error> {
@@ -715,171 +1033,7 @@ async fn apply_dir_self(
         prog_track.directories_skipped.inc();
         return Ok(skipped_summary_for(EntryKind::Dir));
     }
-    process_entry(prog_track, path, metadata, EntryKind::Dir, settings).await
-}
-
-#[instrument(skip(prog_track, settings))]
-#[async_recursion]
-async fn chmod_internal(
-    prog_track: &'static Progress,
-    path: &std::path::Path,
-    source_root: &std::path::Path,
-    settings: &Settings,
-) -> Result<Summary, Error> {
-    let _ops_guard = prog_track.ops.guard();
-    let metadata = walk::run_metadata_probed(
-        congestion::Side::Source,
-        congestion::MetadataOp::Stat,
-        tokio::fs::symlink_metadata(path),
-    )
-    .await
-    .with_context(|| format!("failed reading metadata from {path:?}"))
-    .map_err(|err| Error::new(err, Default::default()))?;
-    let kind = EntryKind::from_metadata(&metadata);
-    if kind != EntryKind::Dir {
-        return process_entry(prog_track, path, &metadata, kind, settings).await;
-    }
-    // a directory may have been entered only because it *could contain* include-matches,
-    // not because it directly matches an include pattern. such "traversed-only" dirs are
-    // not modified themselves (mirrors rm.rs) -- only entries the filter directly selects.
-    let relative_path = walk::relative_to_root(path, source_root);
-    let traversed_only = settings
-        .filter
-        .as_ref()
-        .is_some_and(|f| f.has_includes() && !f.directly_matches_include(relative_path, true));
-    let errors = crate::error_collector::ErrorCollector::default();
-    let mut summary = Summary::default();
-    // pre-order (default, like `chmod -R`): change the directory BEFORE descending, so
-    // `--mode d:u+rwx` can recover an unreadable directory and a child failure can't
-    // prevent the directory's own change.
-    if !settings.defer_dir_changes {
-        match apply_dir_self(prog_track, path, &metadata, traversed_only, settings).await {
-            Ok(dir_summary) => summary = summary + dir_summary,
-            Err(error) => {
-                if settings.fail_early {
-                    return Err(Error::new(error.source, summary + error.summary));
-                }
-                tracing::error!("chmod: {:?} failed with: {:#}", path, &error);
-                summary = summary + error.summary;
-                errors.push(error.source);
-            }
-        }
-    }
-    // descend into the directory's contents
-    match tokio::fs::read_dir(path).await {
-        Ok(mut entries) => {
-            let mut join_set = tokio::task::JoinSet::new();
-            loop {
-                let (entry, entry_file_type) =
-                    match walk::next_entry_probed(&mut entries, congestion::Side::Source, || {
-                        format!("failed traversing directory {path:?}")
-                    })
-                    .await
-                    {
-                        Ok(Some(entry)) => entry,
-                        Ok(None) => break,
-                        Err(error) => {
-                            if settings.fail_early {
-                                return Err(Error::new(error, summary));
-                            }
-                            tracing::error!("chmod: {:#}", &error);
-                            errors.push(error);
-                            break;
-                        }
-                    };
-                let entry_path = entry.path();
-                let entry_kind = EntryKind::from_file_type(entry_file_type.as_ref());
-                let relative_path = walk::relative_to_root(&entry_path, source_root);
-                if let Some(skip_result) = walk::should_skip_entry(
-                    &settings.filter,
-                    relative_path,
-                    entry_kind == EntryKind::Dir,
-                ) {
-                    if let Some(mode) = settings.dry_run {
-                        crate::dry_run::report_skip(
-                            &entry_path,
-                            &skip_result,
-                            mode,
-                            entry_kind.label(),
-                        );
-                    }
-                    entry_kind.inc_skipped(prog_track);
-                    summary = summary + skipped_summary_for(entry_kind);
-                    continue;
-                }
-                let settings = settings.clone();
-                let source_root = source_root.to_owned();
-                let known_leaf = entry_file_type.as_ref().is_some_and(|ft| !ft.is_dir());
-                let pending_guard = if known_leaf {
-                    Some(throttle::pending_meta_permit().await)
-                } else {
-                    None
-                };
-                join_set.spawn(async move {
-                    let _pending_guard = pending_guard;
-                    chmod_internal(prog_track, &entry_path, &source_root, &settings).await
-                });
-            }
-            drop(entries);
-            while let Some(res) = join_set.join_next().await {
-                match res {
-                    Ok(Ok(child)) => summary = summary + child,
-                    Ok(Err(error)) => {
-                        tracing::error!("chmod: {:?} failed with: {:#}", path, &error);
-                        summary = summary + error.summary;
-                        errors.push(error.source);
-                        if settings.fail_early {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        errors.push(error.into());
-                        if settings.fail_early {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        Err(read_error) => {
-            // couldn't read the directory -- e.g. owner r/x was just removed (a pre-order
-            // restrictive change) or it was already unreadable with no traversability-
-            // restoring rule. report it; unless --fail-early, keep going with the rest.
-            let error = anyhow::Error::new(read_error)
-                .context(format!("failed reading directory {path:?}"));
-            if settings.fail_early {
-                return Err(Error::new(error, summary));
-            }
-            tracing::error!("chmod: {:#}", &error);
-            errors.push(error);
-        }
-    }
-    // under --fail-early, a child failure broke the join loop above; stop here, before any
-    // deferred parent change -- never apply more changes after the error we were asked to
-    // stop on. (read_dir / next_entry failures already returned directly.)
-    if settings.fail_early && errors.has_errors() {
-        return Err(Error::new(errors.into_error().unwrap(), summary));
-    }
-    // post-order (`--defer-dir-changes`): change the directory AFTER its contents -- needed
-    // when recursively removing the owner's own traversal permission. in keep-going mode it
-    // is applied even after a child failure; fail-early returned just above.
-    if settings.defer_dir_changes {
-        match apply_dir_self(prog_track, path, &metadata, traversed_only, settings).await {
-            Ok(dir_summary) => summary = summary + dir_summary,
-            Err(error) => {
-                if settings.fail_early {
-                    return Err(Error::new(error.source, summary + error.summary));
-                }
-                tracing::error!("chmod: {:?} failed with: {:#}", path, &error);
-                summary = summary + error.summary;
-                errors.push(error.source);
-            }
-        }
-    }
-    if errors.has_errors() {
-        return Err(Error::new(errors.into_error().unwrap(), summary));
-    }
-    Ok(summary)
+    apply_entry_change(prog_track, path, handle, EntryKind::Dir, settings).await
 }
 
 #[cfg(test)]
@@ -1179,5 +1333,213 @@ mod tests {
         let plan = compute_plan(0o2770, 1000, 1000, EntryKind::Dir, &s);
         assert_eq!(plan.chown, Some((None, Some(2000))));
         assert_eq!(plan.chmod, Some(0o2770));
+    }
+
+    static RACE_PROGRESS: std::sync::LazyLock<Progress> = std::sync::LazyLock::new(Progress::new);
+
+    // Repeatedly swap `dir/entry` between a real regular file (mode 0644) and a symlink
+    // pointing at `sentinel`, using rename so each individual state is atomic. Two staging
+    // names live alongside `entry` and are renamed over it in a tight loop until `stop` is
+    // set. Runs on a dedicated OS thread so it makes progress regardless of the tokio
+    // runtime's scheduling. Mirrors copy's `spawn_file_symlink_swapper`.
+    fn spawn_file_symlink_swapper(
+        dir: std::path::PathBuf,
+        entry_name: &'static str,
+        sentinel: std::path::PathBuf,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::thread::spawn(move || {
+            let entry = dir.join(entry_name);
+            let staged_real = dir.join("__staged_real");
+            let staged_link = dir.join("__staged_link");
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // prepare a real file (mode 0644) at a staging name, then rename it over `entry`.
+                let _ = std::fs::remove_file(&staged_real);
+                if std::fs::write(&staged_real, b"REAL").is_err() {
+                    continue;
+                }
+                let _ =
+                    std::fs::set_permissions(&staged_real, std::fs::Permissions::from_mode(0o644));
+                let _ = std::fs::rename(&staged_real, &entry);
+                // prepare a symlink-to-sentinel at the other staging name, then rename it over.
+                let _ = std::fs::remove_file(&staged_link);
+                let _ = std::os::unix::fs::symlink(&sentinel, &staged_link);
+                let _ = std::fs::rename(&staged_link, &entry);
+            }
+        })
+    }
+
+    // TOCTOU race: while rchm runs `--mode g+w` over a directory, the entry inside it is
+    // rapidly flipped between a real file (0644) and a symlink to a SENTINEL file that lives
+    // OUTSIDE the tree with a distinctive mode (0600). rchm classifies each entry through an
+    // O_PATH/O_NOFOLLOW handle and chmods that exact pinned inode — so it may chmod the real
+    // file (0644 -> 0664), or see a symlink (which it never chmods), or fail closed, but it
+    // must NEVER follow the link and change the sentinel's mode. The sentinel staying 0600 on
+    // every iteration is the safety assertion. Also confirms the run terminates (timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn entry_symlink_swap_never_changes_sentinel_mode() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::testutils::create_temp_dir().await?;
+        let root = tmp.as_path();
+        // sentinel lives OUTSIDE the rchm target tree, with a distinctive mode we must not touch.
+        let sentinel = root.join("sentinel_secret");
+        tokio::fs::write(&sentinel, b"SENTINEL").await?;
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600))?;
+        let sentinel_uid_before =
+            std::os::unix::fs::MetadataExt::uid(&std::fs::symlink_metadata(&sentinel)?);
+        // the tree rchm operates on: a directory containing the entry that gets swapped.
+        let target_dir = root.join("tree");
+        tokio::fs::create_dir(&target_dir).await?;
+        let entry_path = target_dir.join("entry");
+        tokio::fs::write(&entry_path, b"REAL").await?;
+        std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o644))?;
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper =
+            spawn_file_symlink_swapper(target_dir.clone(), "entry", sentinel.clone(), stop.clone());
+
+        // g+w on a file would turn the sentinel 0600 -> 0620 if the link were ever followed.
+        let settings = settings_with("g+w", None, None);
+        let mut caught = 0usize;
+        let mut changed_real = 0usize;
+        for i in 0..300 {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                chmod(&RACE_PROGRESS, &target_dir, &settings),
+            )
+            .await
+            .expect("rchm must not hang under concurrent swapping");
+            match result {
+                Ok(summary) => changed_real += summary.files_changed,
+                Err(_) => caught += 1, // a swap was caught mid-run (failed closed for that entry)
+            }
+            // CORE SAFETY ASSERTION (holds on every iteration regardless of timing): the
+            // out-of-tree sentinel's mode and owner are never modified by rchm.
+            let sentinel_md = std::fs::symlink_metadata(&sentinel)?;
+            assert_eq!(
+                sentinel_md.permissions().mode() & 0o7777,
+                0o600,
+                "iteration {i}: sentinel mode changed — rchm followed the symlink to chmod it"
+            );
+            assert_eq!(
+                std::os::unix::fs::MetadataExt::uid(&sentinel_md),
+                sentinel_uid_before,
+                "iteration {i}: sentinel owner changed — rchm followed the symlink to chown it"
+            );
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        swapper.join().expect("swapper thread panicked");
+        // sanity (not the safety assertion): the run did observable work across the iterations.
+        tracing::info!("entry swap: caught={caught}, changed_real={changed_real}");
+        assert!(
+            caught + changed_real > 0,
+            "expected at least one observable outcome across the iterations"
+        );
+        Ok(())
+    }
+
+    /// Stress tests exercising `pending_meta` (max-open-files) saturation during rchm. The module
+    /// name carries the `max_open_files` substring so nextest's serial test-group isolates these
+    /// from anything else that mutates the process-wide throttle limit (see `.config/nextest.toml`).
+    mod max_open_files_tests {
+        use super::*;
+        use crate::walk_driver::process_entry;
+
+        static PROGRESS: std::sync::LazyLock<Progress> = std::sync::LazyLock::new(Progress::new);
+
+        /// Regression for the hold-and-wait deadlock when a getdents leaf-hint entry is actually a
+        /// directory (the DT_UNKNOWN edge, or a getdents-vs-`child()` swap). A `pending_meta` permit
+        /// is pre-acquired for hinted leaves only; if such an entry is really a directory, the
+        /// permit must be DROPPED before recursing, or it is held while its children block acquiring
+        /// one and a saturated pool hangs the walk.
+        ///
+        /// Reproduced deterministically by driving a directory entry through the driver's
+        /// [`process_entry`] with the real [`ChmodVisitor`] and the one-and-only permit pre-acquired
+        /// (as the spawn loop does for a hinted leaf): with the bug the held permit strands the
+        /// child's pre-acquire and the timeout fires; with the driver's single drop-before-recurse
+        /// site the child acquires it and the walk completes. (Runs the real `ChmodVisitor` through
+        /// the driver — the chmod-side coverage the old direct `chmod_entry` call gave, now that
+        /// `chmod_entry` no longer exists after the Phase E conversion.)
+        #[tokio::test]
+        async fn hinted_leaf_that_is_dir_drops_permit_before_recursion() -> anyhow::Result<()> {
+            let root = crate::testutils::create_temp_dir().await?;
+            // `d` is a directory (the authoritative type) holding one child file `c`.
+            let dir_path = root.join("d");
+            tokio::fs::create_dir(&dir_path).await?;
+            let child_path = dir_path.join("c");
+            tokio::fs::write(&child_path, b"x").await?;
+            std::fs::set_permissions(&child_path, std::fs::Permissions::from_mode(0o644))?;
+            // size the pending-meta pool to a single permit so a held-across-recursion permit
+            // strands the child's pre-acquire — the saturation the fd-walk must tolerate.
+            throttle::set_max_open_files(1);
+            // open the container of `d` and classify `d` itself: an authoritative directory handle.
+            let parent = Dir::open_parent_dir(&root, congestion::Side::Destination)
+                .await
+                .context("open parent dir")?;
+            let parent = Arc::new(parent.into_tree());
+            let name = std::ffi::OsStr::new("d");
+            let handle = parent.child(name).await.context("classify d")?;
+            assert_eq!(
+                handle.kind(),
+                EntryKind::Dir,
+                "fixture `d` must be a directory"
+            );
+            drop(handle);
+            // build the visitor + root context for `d`, pre-acquire the single permit as the spawn
+            // loop does for a hinted leaf, and hand it to `process_entry` (the fix drops it before
+            // recursing).
+            let visitor = Arc::new(ChmodVisitor {
+                prog_track: &PROGRESS,
+                settings: settings_with("g+w", None, None),
+            });
+            let cx = EntryCx {
+                parent: Arc::clone(&parent),
+                name: name.to_owned(),
+                rel_path: PathBuf::new(),
+                filter_path: PathBuf::new(),
+                real_path: dir_path.clone(),
+                dry_run: false,
+                prog_track: &PROGRESS,
+            };
+            let permit = crate::walk::preacquire_leaf_permit(
+                PermitKind::PendingMeta,
+                Some(EntryKind::File),
+                |_| true,
+            )
+            .await;
+            assert!(permit.is_some(), "the pre-acquire must take the one permit");
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                process_entry(visitor, cx, (), permit),
+            )
+            .await;
+            // restore the default (disabled) pool before asserting so a failure here can't strand
+            // the tiny limit for any concurrent test (the serial group already isolates us, but
+            // this keeps the process-global knob clean on the failure path too).
+            throttle::set_max_open_files(0);
+            let summary = result
+                .context(
+                    "process_entry hung — leaf permit held across directory recursion (deadlock)",
+                )?
+                .map_err(|e| e.source)
+                .context("process_entry failed")?;
+            // both the directory and its child get g+w (0644 -> 0664 on the file).
+            assert_eq!(
+                summary.files_changed, 1,
+                "child file should have its mode changed"
+            );
+            assert_eq!(
+                summary.directories_changed, 1,
+                "directory should have its mode changed"
+            );
+            assert_eq!(
+                std::fs::symlink_metadata(&child_path)?.permissions().mode() & 0o777,
+                0o664,
+                "child file mode should be g+w applied"
+            );
+            Ok(())
+        }
     }
 }

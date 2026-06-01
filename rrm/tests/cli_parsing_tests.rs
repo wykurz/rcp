@@ -286,3 +286,62 @@ fn rejects_created_before_on_musl() {
         ));
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+// ============================================================================
+// TOCTOU Safety Flag Tests
+// ============================================================================
+
+/// Test that --toctou-check exits without performing the removal
+#[test]
+fn toctou_check_exits_without_operating() {
+    let output = Command::cargo_bin("rrm")
+        .unwrap()
+        .args(["--toctou-check", "/nonexistent-path"])
+        .output()
+        .expect("failed to run rrm");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("TOCTOU"),
+        "expected TOCTOU verdict in stdout, got: {stdout}"
+    );
+    // prove it stopped at the linter and did NOT proceed into the removal: with a
+    // --toctou-check verdict the tool prints to stdout and exits before operating,
+    // so there is no operation-side error (e.g. "failed reading metadata" for the
+    // nonexistent path) on stderr.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.is_empty(),
+        "--toctou-check must not proceed into operation (stderr should be empty), got: {stderr}"
+    );
+}
+
+/// Test that --toctou-check reports safe on Linux (rrm has no --dereference)
+#[cfg(target_os = "linux")]
+#[test]
+fn toctou_check_reports_safe_on_linux() {
+    let output = Command::cargo_bin("rrm")
+        .unwrap()
+        .args(["--toctou-check", "/tmp"])
+        .output()
+        .expect("failed to run rrm");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("SAFE") && !stdout.contains("NOT SAFE"),
+        "expected SAFE on Linux for rrm, got: {stdout}"
+    );
+    assert!(
+        output.status.success(),
+        "--toctou-check should exit 0 on Linux"
+    );
+}
+
+/// Test that --toctou-check and --require-toctou-safe conflict
+#[test]
+fn toctou_check_and_require_toctou_safe_conflict() {
+    Command::cargo_bin("rrm")
+        .unwrap()
+        .args(["--toctou-check", "--require-toctou-safe", "/tmp"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--require-toctou-safe"));
+}

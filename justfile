@@ -5,7 +5,7 @@
 default:
     @just --list
 
-# Run all lints (fmt, clippy, error logging, anyhow error msg, rust version, remote test naming, package metadata)
+# Run all lints (fmt, clippy, error logging, anyhow error msg, rust version, remote test naming, package metadata, walk-driver usage, source-read fidelity)
 lint:
     @echo "🔍 Checking formatting..."
     cargo fmt --check
@@ -21,6 +21,10 @@ lint:
     ./scripts/check-remote-test-naming.sh
     @echo "🔍 Checking package metadata consistency..."
     ./scripts/check-package-metadata.sh
+    @echo "🔍 Checking walk-driver usage..."
+    ./scripts/check-walk-driver-usage.sh
+    @echo "🔍 Checking source-read fidelity..."
+    ./scripts/check-source-read-fidelity.sh
     @echo "✅ All lints passed!"
 
 # Format code

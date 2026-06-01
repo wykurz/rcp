@@ -155,6 +155,23 @@ struct Args {
     #[command(flatten)]
     common: common::cli::CommonArgs,
 
+    // TOCTOU safety
+    /// Print TOCTOU-safety verdict for this invocation and exit (0 = safe, 1 = not safe)
+    ///
+    /// Analyzes whether the invocation is hardened against symlink/path-swap races
+    /// and exits without performing the link operation.
+    #[arg(long, help_heading = "Security")]
+    toctou_check: bool,
+
+    /// Refuse to run unless the invocation uses the TOCTOU-hardened walk
+    ///
+    /// Refuses non-Linux builds (rlink has no --dereference). It does NOT verify the trust
+    /// of the operand path's prefix — that is the caller's responsibility (lock paths down
+    /// in the sudo rule). See "Scope of TOCTOU safety" in docs/tocttou.md. Intended for
+    /// sudo rules: `NOPASSWD: /usr/bin/rlink --require-toctou-safe *`.
+    #[arg(long, conflicts_with = "toctou_check", help_heading = "Security")]
+    require_toctou_safe: bool,
+
     // ARGUMENTS
     /// Directory with contents we want to update into `dst`
     #[arg()]
@@ -165,39 +182,38 @@ struct Args {
     dst: String, // must be a string to allow for parsing trailing slash
 }
 
-async fn async_main(args: Args) -> Result<common::link::Summary> {
-    for src in &args.src {
-        if src == "."
-            || src
-                .to_str()
-                .expect("input path cannot be converted to string?!")
-                .ends_with("/.")
-        {
-            return Err(anyhow!(
-                "expanding source directory ({:?}) using dot operator ('.') is not supported, please use absolute path or '*' instead",
-                std::path::PathBuf::from(src)
-            ));
-        }
-    }
-    let dst = if args.dst.ends_with('/') {
-        let src_file = args
-            .src
+/// Resolve the effective destination ROOT path that the link operation will
+/// create, applying the trailing-slash ("copy INTO this directory") rule: a `dst`
+/// ending in `/` means the source basename is appended (`dst/<src_basename>`),
+/// otherwise `dst` is used verbatim.
+///
+/// Resolve the destination root the operation writes to, applying the
+/// trailing-slash rule: for a trailing-slash invocation that root is
+/// `dst/<src_basename>`, otherwise it is `dst` itself.
+fn resolve_dst_root(src: &std::path::Path, dst: &str) -> Result<std::path::PathBuf> {
+    if dst.ends_with('/') {
+        let src_file = src
             .file_name()
-            .context(format!("source {:?} does not have a basename", &args.src))
-            .unwrap();
-        let dst_dir = std::path::PathBuf::from(args.dst);
-        dst_dir.join(src_file)
+            .context(format!("source {:?} does not have a basename", src))?;
+        Ok(std::path::PathBuf::from(dst).join(src_file))
     } else {
-        let dst_path = std::path::PathBuf::from(args.dst);
-        if dst_path.exists() && !(args.overwrite || args.delete) {
-            return Err(anyhow!(
-                "Destination path {dst_path:?} already exists! \n\
-                If you want to copy INTO it then follow the destination path with a trailing slash (/) or use \
-                --overwrite if you want to overwrite it"
-            ));
-        }
-        dst_path
-    };
+        Ok(std::path::PathBuf::from(dst))
+    }
+}
+
+async fn async_main(args: Args) -> Result<common::link::Summary> {
+    // `.`/`..` (and `dir/.`, `dir/..`) source operands are supported: `common::link` decomposes them
+    // via `split_root_operand` (canonicalizing `.`/`..`), so `rlink . dst` hard-links the current
+    // directory just like `rrm .`/`rchm .` already work. (`/` is rejected there.) Use a shell glob
+    // (`dir/*`) if you want to expand a directory's contents instead.
+    let dst = resolve_dst_root(&args.src, &args.dst)?;
+    if !args.dst.ends_with('/') && dst.exists() && !(args.overwrite || args.delete) {
+        return Err(anyhow!(
+            "Destination path {dst:?} already exists! \n\
+            If you want to copy INTO it then follow the destination path with a trailing slash (/) or use \
+            --overwrite if you want to overwrite it"
+        ));
+    }
     // parse preserve settings
     let preserve = if let Some(ref settings_str) = args.preserve_settings {
         common::parse_preserve_settings(settings_str)
@@ -263,6 +279,14 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // TOCTOU linter: must run before the async runtime starts.
+    // rlink has no --dereference flag; dereference is always false. The linter
+    // does NOT inspect the operand paths — the trust of a path's prefix is the
+    // caller's responsibility (see the "Scope of TOCTOU safety" section of
+    // docs/tocttou.md).
+    common::toctou_check::enforce_or_exit(false, args.toctou_check, args.require_toctou_safe);
+
     let dry_run_warnings = args.dry_run.map(|_| {
         common::DryRunWarnings::new(
             args.common.progress_requested(),

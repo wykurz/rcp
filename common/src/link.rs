@@ -1,6 +1,6 @@
 use anyhow::{Context, anyhow};
 use async_recursion::async_recursion;
-use std::os::linux::fs::MetadataExt as LinuxMetadataExt;
+use std::sync::Arc;
 use tracing::instrument;
 
 use crate::copy;
@@ -10,8 +10,8 @@ use crate::copy::{
 use crate::filecmp;
 use crate::preserve;
 use crate::progress;
-use crate::rm;
-use crate::walk::{self, EntryKind};
+use crate::safedir::Dir;
+use crate::walk::{self, EntryKind, LeafPermit, PermitKind};
 
 /// Error type for link operations. See [`crate::error::OperationError`] for
 /// logging conventions and rationale.
@@ -86,43 +86,52 @@ impl std::fmt::Display for Summary {
     }
 }
 
-fn is_hard_link(md1: &std::fs::Metadata, md2: &std::fs::Metadata) -> bool {
-    copy::is_file_type_same(md1, md2)
-        && md2.st_dev() == md1.st_dev()
-        && md2.st_ino() == md1.st_ino()
-}
-
+/// Hard-link the already-classified source entry (pinned by `src_handle`) to `dst_name` within
+/// `dst_dir`, fd-relative and inode-exact.
+///
+/// `dst_dir.hard_link_handle_at` links the EXACT inode `src_handle` pins (via its `O_PATH` fd,
+/// using `linkat(.., "/proc/self/fd/N", .., AT_SYMLINK_FOLLOW)`) rather than re-resolving the
+/// source by name. This closes a TOCTOU window the old by-name `linkat` had: on an actor-writable
+/// source, `name` could be swapped to a different inode (symlink, FIFO, another file) between
+/// classification and the link, so the by-name link would target the replacement while rlink
+/// reported a hard-linked file. Linking the pinned inode means we either hard-link the exact
+/// regular file we classified or fail closed (`ENOENT` when its last link was removed) — never the
+/// swapped-in replacement. `linkat` still refuses to hard-link a directory (`EPERM`).
+///
+/// On `EEXIST` under `--overwrite`, the existing destination is re-classified through `dst_dir`'s
+/// fd and, if it is an identical hard link (same dev+ino), left as is; otherwise it is removed via
+/// the recheck-guarded [`copy::remove_existing`] and the link is retried — mirroring copy's
+/// fd-relative overwrite branches.
 #[instrument(skip(prog_track, settings))]
-async fn hard_link_helper(
+#[allow(clippy::too_many_arguments)]
+async fn hard_link_entry_fd(
     prog_track: &'static progress::Progress,
-    src: &std::path::Path,
-    src_metadata: &std::fs::Metadata,
-    dst: &std::path::Path,
+    src_handle: &crate::safedir::Handle,
+    dst_dir: &Arc<Dir>,
+    dst_name: &std::ffi::OsStr,
+    dst_path: &std::path::Path,
     settings: &Settings,
 ) -> Result<Summary, Error> {
     let mut link_summary = Summary::default();
-    match crate::walk::run_metadata_probed(
-        congestion::Side::Destination,
-        congestion::MetadataOp::HardLink,
-        tokio::fs::hard_link(src, dst),
-    )
-    .await
-    {
+    match dst_dir.hard_link_handle_at(src_handle, dst_name).await {
         Ok(()) => {}
         Err(error)
             if settings.copy_settings.overwrite
                 && error.kind() == std::io::ErrorKind::AlreadyExists =>
         {
             tracing::debug!("'dst' already exists, check if we need to update");
-            let dst_metadata = crate::walk::run_metadata_probed(
-                congestion::Side::Destination,
-                congestion::MetadataOp::Stat,
-                tokio::fs::symlink_metadata(dst),
-            )
-            .await
-            .with_context(|| format!("cannot read {dst:?} metadata"))
-            .map_err(|err| Error::new(err, Default::default()))?;
-            if is_hard_link(src_metadata, &dst_metadata) {
+            let dst_handle = dst_dir
+                .child(dst_name)
+                .await
+                .with_context(|| format!("cannot read {dst_path:?} metadata"))
+                .map_err(|err| Error::new(err, Default::default()))?;
+            // identical hard link: same file type and same (dev, ino) as the source entry. Both
+            // handles pin their inodes (O_PATH), so a matching (dev, ino) genuinely proves the two
+            // names already resolve to the same inode — no change needed.
+            if dst_handle.kind() == src_handle.kind()
+                && dst_handle.dev() == src_handle.dev()
+                && dst_handle.ino() == src_handle.ino()
+            {
                 tracing::debug!("no change, leaving file as is");
                 prog_track.hard_links_unchanged.inc();
                 return Ok(Summary {
@@ -131,36 +140,30 @@ async fn hard_link_helper(
                 });
             }
             tracing::info!("'dst' file type changed, removing and hard-linking");
-            let rm_summary = rm::rm(
+            // recheck-guarded, fd-relative removal contained to dst_dir (mirrors copy.rs).
+            let rm_summary = copy::remove_existing(
                 prog_track,
-                dst,
-                &rm::Settings {
-                    fail_early: settings.copy_settings.fail_early,
-                    filter: None,
-                    dry_run: None,
-                    time_filter: None,
-                },
+                dst_dir,
+                dst_name,
+                dst_path,
+                &dst_handle,
+                &settings.copy_settings,
             )
             .await
             .map_err(|err| {
-                let rm_summary = err.summary;
-                link_summary.copy_summary.rm_summary = rm_summary;
+                link_summary.copy_summary.rm_summary = err.summary.rm_summary;
                 Error::new(err.source, link_summary)
             })?;
             link_summary.copy_summary.rm_summary = rm_summary;
-            crate::walk::run_metadata_probed(
-                congestion::Side::Destination,
-                congestion::MetadataOp::HardLink,
-                tokio::fs::hard_link(src, dst),
-            )
-            .await
-            .with_context(|| format!("failed to hard link {src:?} to {dst:?}"))
-            .map_err(|err| Error::new(err, link_summary))?;
+            dst_dir
+                .hard_link_handle_at(src_handle, dst_name)
+                .await
+                .with_context(|| format!("failed to hard link to {dst_path:?}"))
+                .map_err(|err| Error::new(err, link_summary))?;
         }
         Err(error) => {
             return Err(Error::new(
-                anyhow::Error::from(error)
-                    .context(format!("failed to hard link {src:?} to {dst:?}")),
+                anyhow::Error::from(error).context(format!("failed to hard link to {dst_path:?}")),
                 link_summary,
             ));
         }
@@ -171,7 +174,17 @@ async fn hard_link_helper(
 }
 
 /// Public entry point for link operations.
-/// Internally delegates to link_internal with source_root tracking for proper filter matching.
+///
+/// The dual-tree link walk is fd-based: the source, optional `update`, and destination roots are
+/// opened relative to their parent directories and every per-entry operation is performed through
+/// file-descriptor-relative syscalls (see [`crate::safedir`]). Hard links are made inode-exact
+/// through the already-classified source `Handle` (`linkat` via `/proc/self/fd/N` with
+/// `AT_SYMLINK_FOLLOW`), so the link targets the exact regular file that was classified, even if
+/// its directory entry is concurrently swapped — never a re-resolved name; entries that must be
+/// copied instead of hard-linked are delegated to `copy::copy_child` with the held parent `Dir`s —
+/// no path is re-resolved from a root. This closes the TOCTOU window the old path-based walk had
+/// between classifying an entry and acting on it. `--dereference` is the one exception — copy still
+/// resolves symlinks by path (`canonicalize`) and is not hardened.
 #[instrument(skip(prog_track, settings))]
 pub async fn link(
     prog_track: &'static progress::Progress,
@@ -182,6 +195,9 @@ pub async fn link(
     settings: &Settings,
     is_fresh: bool,
 ) -> Result<Summary, Error> {
+    // `cwd` is retained for API/signature parity (callers still pass it) but the fd-based walk
+    // reconstructs every path from the explicit roots, so it is no longer threaded into the walk.
+    let _ = cwd;
     // A missing --update root is destructive under both --update-exclusive (materialized set =
     // update set, so nothing materializes) AND --delete (the source-only keep_set makes any dst
     // entry the missing update tree WOULD have protected look extraneous, and prune wipes it).
@@ -224,35 +240,170 @@ pub async fn link(
             }
         }
     }
+    // Source: decompose via the shared helper so `.`/`..` operands (e.g. `rlink . dst`, `rlink
+    // tree/.. dst`) are canonicalized to a real directory + basename instead of being rejected; `/`
+    // is still rejected. (The destination and `--update` operands keep their direct split below.)
+    let src_operand = crate::walk::split_root_operand(src)
+        .await
+        .map_err(|err| Error::new(err, Default::default()))?;
+    let src = src_operand.display.as_path();
+    let src_name = src_operand.name.as_os_str();
     // check filter for top-level source (files, directories, and symlinks)
     if let Some(ref filter) = settings.filter {
-        let src_name = src.file_name().map(std::path::Path::new);
-        if let Some(name) = src_name {
-            let src_metadata = crate::walk::run_metadata_probed(
-                congestion::Side::Source,
-                congestion::MetadataOp::Stat,
-                tokio::fs::symlink_metadata(src),
-            )
-            .await
-            .with_context(|| format!("failed reading metadata from {:?}", &src))
-            .map_err(|err| Error::new(err, Default::default()))?;
-            let is_dir = src_metadata.is_dir();
-            let result = filter.should_include_root_item(name, is_dir);
-            match result {
-                crate::filter::FilterResult::Included => {}
-                result => {
-                    let kind = EntryKind::from_metadata(&src_metadata);
-                    if let Some(mode) = settings.dry_run {
-                        crate::dry_run::report_skip(src, &result, mode, kind.label_long());
-                    }
-                    kind.inc_skipped(prog_track);
-                    return Ok(skipped_summary_for(kind));
+        let src_metadata = crate::walk::run_metadata_probed(
+            congestion::Side::Source,
+            congestion::MetadataOp::Stat,
+            tokio::fs::symlink_metadata(src),
+        )
+        .await
+        .with_context(|| format!("failed reading metadata from {:?}", &src))
+        .map_err(|err| Error::new(err, Default::default()))?;
+        let is_dir = src_metadata.is_dir();
+        let result = filter.should_include_root_item(std::path::Path::new(src_name), is_dir);
+        match result {
+            crate::filter::FilterResult::Included => {}
+            result => {
+                let kind = EntryKind::from_metadata(&src_metadata);
+                if let Some(mode) = settings.dry_run {
+                    crate::dry_run::report_skip(src, &result, mode, kind.label_long());
                 }
+                kind.inc_skipped(prog_track);
+                return Ok(skipped_summary_for(kind));
             }
         }
     }
+    // Open the parent directories of the source, destination, and (optional) update roots so each
+    // root entry is opened and classified relative to a directory fd — the same fd-relative path
+    // every nested entry takes. The roots are then handed to `link_internal` by their basenames,
+    // exactly like child entries. The source was decomposed above (via `split_root_operand`, which
+    // canonicalizes `.`/`..` and rejects `/`); the destination keeps the direct split — a `.`/`..`
+    // destination is not a meaningful link target, and rejecting it avoids clobbering the cwd.
+    let (Some(dst_parent_path), Some(_dst_name)) = (dst.parent(), dst.file_name()) else {
+        return Err(Error::new(
+            anyhow!(
+                "link destination {:?} has no parent directory or file name",
+                dst
+            ),
+            Default::default(),
+        ));
+    };
+    // empty parent (relative path with a single component) means the current directory.
+    let resolve_parent = |p: &std::path::Path| -> std::path::PathBuf {
+        if p.as_os_str().is_empty() {
+            std::path::PathBuf::from(".")
+        } else {
+            p.to_path_buf()
+        }
+    };
+    // the helper already normalized the source's empty parent to ".".
+    let src_parent_path = src_operand.parent.clone();
+    let dst_parent_path = resolve_parent(dst_parent_path);
+    // open the operand's TRUSTED parent prefix following symlinks normally (the prefix is trusted
+    // up to and including the operand's container — only entries strictly below the named root are
+    // O_NOFOLLOW-hardened). a symlinked parent (e.g. `rlink symlinkdir/src dst`) is followed.
+    let src_parent = Dir::open_parent_dir(&src_parent_path, congestion::Side::Source)
+        .await
+        .with_context(|| format!("cannot open source parent directory {:?}", src_parent_path))
+        .map_err(|err| Error::new(err, Default::default()))?;
+    // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
+    let src_parent = Arc::new(src_parent.into_tree());
+    // In dry-run we never touch the destination, so we don't open its parent at all (it may not
+    // even exist). `dst_parent == None` is the signal throughout the walk that destination
+    // operations must be skipped.
+    let dst_parent = if settings.dry_run.is_some() {
+        None
+    } else {
+        // the destination's TRUSTED parent prefix is resolved following symlinks (see the source
+        // parent above): a symlinked destination container must be followed into the real dir.
+        let dir = Dir::open_parent_dir(&dst_parent_path, congestion::Side::Destination)
+            .await
+            .with_context(|| {
+                format!(
+                    "cannot open destination parent directory {:?}",
+                    dst_parent_path
+                )
+            })
+            .map_err(|err| Error::new(err, Default::default()))?;
+        // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
+        Some(Arc::new(dir.into_tree()))
+    };
+    // The update tree (if present) is rooted at `update`; open its parent and remember the root
+    // basename so `link_internal` can classify it via the held fd. A missing update root is handled
+    // inside `link_internal` (recursive early-return / silent None fallback) exactly as before.
+    //
+    // For plain `--update` (no `--delete`, no `--update-exclusive`) a missing parent is treated the
+    // same as a missing update root: fall back silently to no-update mode. This preserves the long-
+    // standing behavior where `rlink --update /tmp/no/such src dst` (with `/tmp/no` absent) proceeds
+    // by linking from `src` rather than erroring — the existing missing-update-root fallback already
+    // applies to that case; the parent-open merely must not ENOENT-fail before `link_internal` can
+    // apply it. Under `--delete` or `--update-exclusive` the missing-root is already rejected above,
+    // so those cases never reach here with a missing update; any open_parent_dir error there is
+    // unexpected and propagates as before.
+    let update_parent = match update.as_ref() {
+        Some(update_path) => {
+            // decompose the update operand the same way as the source: the update tree is a READ
+            // tree, so `.`/`..`/`dir/..` are meaningful and `split_root_operand` canonicalizes them
+            // (and rejects `/`). This makes `rlink --update . src dst` / `--update tree/.. src dst`
+            // work instead of erroring, matching the source-operand handling. The helper already
+            // normalizes an empty parent to ".", so no `resolve_parent` is needed here.
+            let update_operand = crate::walk::split_root_operand(update_path)
+                .await
+                .map_err(|err| Error::new(err, Default::default()))?;
+            let update_parent_path = update_operand.parent;
+            let update_name = update_operand.name;
+            // the update tree's TRUSTED parent prefix is resolved following symlinks (see the
+            // source parent above): a symlinked update container must be followed into the real dir.
+            let fallback_eligible =
+                !settings.update_exclusive && settings.copy_settings.delete.is_none();
+            match Dir::open_parent_dir(&update_parent_path, congestion::Side::Source).await {
+                // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below).
+                Ok(dir) => Some((Arc::new(dir.into_tree()), update_name)),
+                Err(err)
+                    if fallback_eligible
+                        && (matches!(
+                            err.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) || err.raw_os_error() == Some(libc::ENOTDIR)) =>
+                {
+                    // the update path's parent (or an ancestor) doesn't exist — treat the whole
+                    // update tree as absent and fall back to no-update mode, exactly as when the
+                    // update ROOT itself is missing (handled inside link_internal).
+                    tracing::debug!(
+                        "update parent {:?} not found ({:#}); falling back to no-update mode",
+                        update_parent_path,
+                        err
+                    );
+                    None
+                }
+                Err(err) => {
+                    return Err(Error::new(
+                        anyhow::Error::new(err).context(format!(
+                            "cannot open update parent directory {:?}",
+                            update_parent_path
+                        )),
+                        Default::default(),
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
+    let update_ref = update_parent
+        .as_ref()
+        .map(|(dir, name)| (dir, name.as_os_str()));
     link_internal(
-        prog_track, cwd, src, dst, src, update, settings, is_fresh, None,
+        prog_track,
+        &src_parent,
+        update_ref,
+        dst_parent.as_ref(),
+        src_name,
+        src,
+        dst,
+        update.as_deref(),
+        std::path::Path::new(""),
+        settings,
+        is_fresh,
+        None,
     )
     .await
 }
@@ -296,18 +447,6 @@ impl DeleteKeepSet {
             set.insert(name.to_owned());
         }
     }
-    /// Update loop, filtered-out branch: an update entry at this name is filtered out, so
-    /// nothing materializes from the update side. Drop a src-side registration ONLY if the
-    /// source loop actually materialized something (caller tracks this via `processed_files`).
-    /// Skipped specials stay registered — their `record_src` happened, but `processed_files`
-    /// was not populated, so their dst counterpart is retained per `--skip-specials` semantics.
-    fn drop_src_when_update_filtered(&mut self, name: &std::ffi::OsStr, src_materialized: bool) {
-        if let Some(set) = &mut self.inner
-            && src_materialized
-        {
-            set.remove(name);
-        }
-    }
     /// Borrow the underlying set for `prune_extraneous`. `None` means `--delete` is off and
     /// the caller should skip the prune entirely.
     fn as_set(&self) -> Option<&std::collections::HashSet<std::ffi::OsString>> {
@@ -315,239 +454,359 @@ impl DeleteKeepSet {
     }
 }
 
-#[instrument(skip(prog_track, settings, open_file_guard))]
+/// Per-entry worker of the fd-based dual-tree link walk.
+///
+/// `src_parent` is the open source directory holding `name`; `update` is `Some((dir, name))` when
+/// an update tree is present at this level (its directory handle plus the update root's basename
+/// for the root entry); `dst_parent` is the open destination directory (`None` in dry-run).
+/// `src_root`/`dst_root`/`update_root` are the user-specified roots and `rel_path` is this entry's
+/// path relative to those roots (empty for the root entry) — joined onto a root they reconstruct
+/// the real path used for diagnostics, `rm`, and `--dereference`. `rel_path` is also this entry's
+/// logical filter path.
+///
+/// The src entry is classified via `src_parent.child(name)` (fstat-authoritative; the getdents
+/// hint is only a spawn-loop heuristic). When an update entry exists at this name it is classified
+/// too, and the hard-link-vs-copy decision mirrors the old `--update` overlay logic exactly:
+/// a type-mismatch / changed file / symlink in the update tree is COPIED from the update version
+/// via [`copy::copy_child`]; an unchanged file is HARD-LINKED from the source; a directory recurses
+/// the dual tree. With no update tree, a source file is hard-linked, a source symlink is copied,
+/// and a directory recurses.
+///
+/// `permit` is the leaf permit the spawn loop pre-acquired for a regular-file src hint (via
+/// [`walk::preacquire_leaf_permit`]). It is USED only on the one path that copies a *changed*
+/// same-type regular file from the update tree (the data copy reuses it); on every other path it is
+/// dropped at the single consolidated drop site below — see that comment for why this is rlink's
+/// acknowledged dual-tree special case.
+#[instrument(skip(prog_track, src_parent, update, dst_parent, settings, permit))]
 #[async_recursion]
 #[allow(clippy::too_many_arguments)]
 async fn link_internal(
     prog_track: &'static progress::Progress,
-    cwd: &std::path::Path,
-    src: &std::path::Path,
-    dst: &std::path::Path,
-    source_root: &std::path::Path,
-    update: &Option<std::path::PathBuf>,
+    src_parent: &Arc<Dir>,
+    update: Option<(&Arc<Dir>, &std::ffi::OsStr)>,
+    dst_parent: Option<&Arc<Dir>>,
+    name: &std::ffi::OsStr,
+    src_root: &std::path::Path,
+    dst_root: &std::path::Path,
+    update_root: Option<&std::path::Path>,
+    rel_path: &std::path::Path,
     settings: &Settings,
-    mut is_fresh: bool,
-    open_file_guard: Option<throttle::OpenFileGuard>,
+    is_fresh: bool,
+    permit: Option<LeafPermit>,
 ) -> Result<Summary, Error> {
     let _prog_guard = prog_track.ops.guard();
-    tracing::debug!("reading source metadata");
-    let src_metadata = crate::walk::run_metadata_probed(
-        congestion::Side::Source,
-        congestion::MetadataOp::Stat,
-        tokio::fs::symlink_metadata(src),
-    )
-    .await
-    .with_context(|| format!("failed reading metadata from {:?}", &src))
-    .map_err(|err| Error::new(err, Default::default()))?;
-    let update_metadata_opt = match update {
-        Some(update) => {
-            tracing::debug!("reading 'update' metadata");
-            let update_metadata_res = crate::walk::run_metadata_probed(
-                congestion::Side::Source,
-                congestion::MetadataOp::Stat,
-                tokio::fs::symlink_metadata(update),
+    // real filesystem paths reconstructed from the roots + accumulated relative path. used for
+    // diagnostics, the path-based `--delete` prune scan / `rm`, the `--dereference` canonicalize
+    // fallback inside copy, and to derive `dst_name`. joining an empty `rel_path` (the root entry)
+    // would append a trailing separator, so use the root verbatim when `rel_path` is empty.
+    let (src_path, dst_path) = if rel_path.as_os_str().is_empty() {
+        (src_root.to_path_buf(), dst_root.to_path_buf())
+    } else {
+        (src_root.join(rel_path), dst_root.join(rel_path))
+    };
+    let update_path = update_root.map(|root| {
+        if rel_path.as_os_str().is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(rel_path)
+        }
+    });
+    // the destination entry's name within `dst_parent`. for nested entries this equals the source
+    // `name`, but for the root the source and destination basenames differ (e.g. linking `foo` to
+    // `bar`), so destination operations must use this name.
+    let dst_name = dst_path
+        .file_name()
+        .ok_or_else(|| {
+            Error::new(
+                anyhow!("link destination {:?} has no file name", &dst_path),
+                Default::default(),
             )
-            .await;
-            match update_metadata_res {
-                Ok(update_metadata) => Some(update_metadata),
-                Err(error) => {
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        if settings.update_exclusive {
-                            // the path is missing from update, we're done
-                            return Ok(Default::default());
-                        }
-                        None
-                    } else {
-                        return Err(Error::new(
-                            anyhow!("failed reading metadata from {:?}", &update),
-                            Default::default(),
-                        ));
+        })?
+        .to_owned();
+    tracing::debug!("classifying source entry");
+    let src_handle = src_parent
+        .child(name)
+        .await
+        .with_context(|| format!("failed reading metadata from {:?}", &src_path))
+        .map_err(|err| Error::new(err, Default::default()))?;
+    // classify the update entry at this name (if an update tree is present at this level). a
+    // NotFound is the "this path is missing from update" case; under --update-exclusive it means
+    // we're done (nothing materializes), otherwise we fall back to no-update mode for this entry.
+    let mut update_handle = match update {
+        Some((update_dir, update_name)) => {
+            tracing::debug!("classifying 'update' entry");
+            match update_dir.child(update_name).await {
+                Ok(handle) => Some(handle),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if settings.update_exclusive {
+                        // the path is missing from update, we're done
+                        return Ok(Default::default());
                     }
+                    None
+                }
+                Err(error) => {
+                    return Err(Error::new(
+                        anyhow::Error::new(error)
+                            .context(format!("failed reading metadata from {:?}", &update_path)),
+                        Default::default(),
+                    ));
                 }
             }
         }
         None => None,
     };
-    if let Some(update_metadata) = update_metadata_opt.as_ref() {
-        let update = update.as_ref().unwrap();
-        if !copy::is_file_type_same(&src_metadata, update_metadata) {
+    // Re-evaluate the filter using the UPDATE entry's authoritative type before letting it drive
+    // the materialization decision below. The spawn loop in `link_dir_contents` evaluated the
+    // filter against the SOURCE entry's type; when the same name is a TYPE MISMATCH (e.g. src
+    // `cache` is a file, update `cache` is a directory) a type-dependent pattern like the dir-only
+    // `cache/` can pass the src (a dir-only pattern doesn't match a file) yet exclude the update.
+    // Without this check the type-mismatch branch would `delegate_copy` the excluded update entry
+    // (`copy_child` does NOT re-apply the top-level filter to the delegated root), copying an
+    // excluded subtree. Note a filtered-out update reaching here is necessarily a type mismatch: if
+    // the pattern were type-independent it would have excluded the src too, so the src loop would
+    // not have spawned this worker.
+    if let Some(handle) = update_handle.as_ref() {
+        let update_is_dir = handle.kind() == EntryKind::Dir;
+        // For the ROOT entry (`rel_path` empty) judge the update side with root-item semantics —
+        // symmetric with how the source root was filtered (`should_include_root_item` at the top of
+        // `link`) and with how main's delegated copy filtered the update root — rather than the
+        // nested `should_include("")` path, which would judge the root by different rules than the
+        // source (e.g. a non-anchored `--include data` includes a root file `data` under root-item
+        // semantics but not under the nested empty-path check). Nested entries keep the accumulated
+        // `rel_path` with the normal nested filter.
+        let update_excluded = match settings.filter.as_ref() {
+            Some(filter) if rel_path.as_os_str().is_empty() => {
+                let (_, update_name) =
+                    update.expect("update_handle is Some only when update is Some");
+                !matches!(
+                    filter.should_include_root_item(
+                        std::path::Path::new(update_name),
+                        update_is_dir,
+                    ),
+                    crate::filter::FilterResult::Included
+                )
+            }
+            _ => walk::should_skip_entry(&settings.filter, rel_path, update_is_dir).is_some(),
+        };
+        if update_excluded {
+            if settings.update_exclusive {
+                // --update-exclusive materializes only the (filter-passing) update set, so an
+                // excluded update entry materializes nothing — exactly the NotFound case above.
+                // The src is not materialized; under --delete its keep-set entry was never recorded
+                // (`record_src` is a no-op when `src_records_disabled`), so the dst counterpart is
+                // pruned/exclude-protected by the prune scan, never materialized-then-pruned.
+                tracing::debug!(
+                    "update entry {:?} is filtered out under --update-exclusive; materializing nothing",
+                    update_path
+                );
+                return Ok(Default::default());
+            }
+            // Normal --update (union): the update's version of this name is excluded, so the src's
+            // version stands. Treat the update entry as absent and fall through to the no-update
+            // src handling (hard-link a src file, copy a src symlink, recurse a src dir). The src
+            // already passed its own filter in the spawn loop, so its --delete keep-set entry
+            // correctly stays recorded.
+            tracing::debug!(
+                "update entry {:?} is filtered out; falling back to source-only handling",
+                update_path
+            );
+            update_handle = None;
+        }
+    }
+    // ── rlink's acknowledged dual-tree special case (design spec §4): the single permit-drop site ──
+    //
+    // The spawn loop in `link_dir_contents` pre-acquired this leaf permit (open-files pool) for a
+    // regular-file src `hint`, but the authoritative dual-tree decision below may instead COPY
+    // (possibly recursing, when the update entry is a directory), HARD-LINK, SKIP, or recurse a
+    // directory. The permit is USED on exactly ONE path: copying a *changed* same-type regular file
+    // from the update tree (`copy_child` reuses it for the data copy). On every other path — both
+    // the recursing ones (a type-mismatch where the update side may be a directory, and a same-type
+    // directory) and the non-recursive leaf ones (hard-link, symlink copy, special, no-update) — the
+    // permit must NOT be held: a recursing path holding it across `copy_child`/`link_dir_entry` is
+    // the hold-and-wait deadlock the leaf-permit lifecycle eliminates, and a leaf path holding the
+    // mismatched permit across its own `.await` is pointless.
+    //
+    // So decide once, here, before any `.await` that isn't the intended copy: extract the open-files
+    // guard for the file-changed-copy path and drop the permit for everything else. Replacing the
+    // seven hand-maintained `drop(open_file_guard)` sites with this one is the Class-1 cleanup; this
+    // is the one site exempted from the Phase H no-manual-drop lint, because rlink's dual-tree walk
+    // is not a `WalkVisitor` and cannot use the driver's single drop-before-recurse home.
+    let is_file_changed_copy = match update_handle.as_ref() {
+        Some(update_handle) => {
+            update_handle.kind() == src_handle.kind()
+                && update_handle.kind() == EntryKind::File
+                && !filecmp::metadata_equal(
+                    &settings.update_compare,
+                    src_handle.meta(),
+                    update_handle.meta(),
+                )
+        }
+        None => false,
+    };
+    let copy_guard: Option<throttle::OpenFileGuard> = if is_file_changed_copy {
+        // keep the permit for the data copy: hand the inner open-files guard to `copy_child`.
+        match permit {
+            Some(LeafPermit::OpenFile(guard)) => Some(guard),
+            // a non-OpenFile permit can never reach rlink (its `want` only takes from the OpenFile
+            // pool), and `None` means the pool was disabled — either way there is nothing to pass.
+            _ => None,
+        }
+    } else {
+        // every non-copy / recursing branch: release the leaf permit now (the consolidated drop).
+        drop(permit);
+        None
+    };
+    if let Some(update_handle) = update_handle.as_ref() {
+        let (update_dir, update_name) = update.unwrap();
+        let update_path = update_path.as_deref().unwrap();
+        if update_handle.kind() != src_handle.kind() {
             // file type changed, just copy the updated one
             tracing::debug!(
                 "link: file type of {:?} ({:?}) and {:?} ({:?}) differs - copying from update",
-                src,
-                src_metadata.file_type(),
-                update,
-                update_metadata.file_type()
+                src_path,
+                src_handle.kind(),
+                update_path,
+                update_handle.kind()
             );
-            // release any caller-supplied open-files permit before delegating
-            // to copy::copy. The permit was acquired for the src entry's file
-            // type at the spawn site, but here `update` has a *different* file
-            // type (we just checked `!is_file_type_same`), so the permit is
-            // mismatched. More importantly, copy::copy → copy_internal will
-            // acquire its own open-files permit for any file it copies; if we
-            // were still holding one here, a saturated pool would deadlock the
-            // inner acquire.
-            drop(open_file_guard);
-            // delegate at this entry's logical path (relative to the link root) so that, under
-            // --delete, pruning inside the delegated subtree matches include/exclude descendants
-            // at the correct filter root (e.g. `node/*.log`) — mirroring the update-only
-            // delegation. With an empty base, a path-anchored exclude would fail to protect a
-            // descendant like `node/keep.log` and delete it.
-            let filter_base = walk::relative_to_root(src, source_root);
-            let copy_summary = copy::copy_with_filter_base(
+            // the leaf permit was already released at the consolidated drop site above (this is the
+            // type-mismatch path, where the update side may be a directory and we recurse via copy).
+            // delegate at this entry's logical path so that, under --delete, pruning inside the
+            // delegated subtree matches include/exclude descendants at the correct filter root
+            // (e.g. `node/*.log`). pass the HELD update parent + name, never a re-resolved path.
+            return delegate_copy(
                 prog_track,
-                update,
-                dst,
-                &settings.copy_settings,
-                &settings.preserve,
+                update_dir,
+                dst_parent,
+                update_name,
+                update_path,
+                &dst_path,
+                rel_path,
+                settings,
                 is_fresh,
-                filter_base,
+                None,
             )
-            .await
-            .map_err(|err| {
-                let copy_summary = err.summary;
-                let link_summary = Summary {
-                    copy_summary,
-                    ..Default::default()
-                };
-                Error::new(err.source, link_summary)
-            })?;
-            return Ok(Summary {
-                copy_summary,
-                ..Default::default()
-            });
+            .await;
         }
-        if update_metadata.is_file() {
+        if update_handle.kind() == EntryKind::File {
             // check if the file is unchanged and if so hard-link, otherwise copy from the updated one
-            if filecmp::metadata_equal(&settings.update_compare, &src_metadata, update_metadata) {
+            if filecmp::metadata_equal(
+                &settings.update_compare,
+                src_handle.meta(),
+                update_handle.meta(),
+            ) {
+                // unchanged file: hard-link from src. the permit was already dropped above (this is
+                // not the file-changed-copy path), so `copy_guard` is None and there is nothing held.
                 tracing::debug!("no change, hard link 'src'");
-                return hard_link_helper(prog_track, src, &src_metadata, dst, settings).await;
+                if settings.dry_run.is_some() {
+                    crate::dry_run::report_action("link", &src_path, Some(&dst_path), "file");
+                    return Ok(Summary {
+                        hard_links_created: 1,
+                        ..Default::default()
+                    });
+                }
+                let dst_dir =
+                    dst_parent.expect("destination parent must be open for a real hard link");
+                return hard_link_entry_fd(
+                    prog_track,
+                    &src_handle,
+                    dst_dir,
+                    &dst_name,
+                    &dst_path,
+                    settings,
+                )
+                .await;
             }
             tracing::debug!(
                 "link: {:?} metadata has changed, copying from {:?}",
-                src,
-                update
+                src_path,
+                update_path
             );
-            // use the caller's pre-acquired permit (the spawn loop pre-acquires
-            // for regular-file entries so this is the common path); fall back to
-            // acquiring a new one for callers that don't pre-acquire (top-level
-            // `link` and the file-type-changed path above).
-            let _guard = match open_file_guard {
-                Some(g) => g,
-                None => throttle::open_file_permit().await,
-            };
-            return Ok(Summary {
-                copy_summary: copy::copy_file(
-                    prog_track,
-                    update,
-                    dst,
-                    update_metadata,
-                    &settings.copy_settings,
-                    &settings.preserve,
-                    is_fresh,
-                )
-                .await
-                .map_err(|err| {
-                    let copy_summary = err.summary;
-                    let link_summary = Summary {
-                        copy_summary,
-                        ..Default::default()
-                    };
-                    Error::new(err.source, link_summary)
-                })?,
-                ..Default::default()
-            });
-        }
-        if update_metadata.is_symlink() {
-            tracing::debug!("'update' is a symlink so just symlink that");
-            // delegate at this entry's logical path (relative to the link root) so the inner
-            // filter re-check in copy_with_filter_base uses nested semantics. With an empty
-            // filter_base it would fall back to should_include_root_item on the bare basename
-            // and reject a path-anchored include like `dir/link`, leaving the entry unmaterialized
-            // while the outer loop's keep_set entry still shielded the stale dst from pruning.
-            let filter_base = walk::relative_to_root(src, source_root);
-            let copy_summary = copy::copy_with_filter_base(
+            // changed file: delegate to copy, reusing the pre-acquired permit (the common path: the
+            // spawn loop pre-acquires for regular-file hints). `copy_guard` is the open-files guard
+            // the consolidated decision above extracted for exactly this path. copy_child
+            // re-classifies and applies its own --overwrite/dry-run logic for a file.
+            return delegate_copy(
                 prog_track,
-                update,
-                dst,
-                &settings.copy_settings,
-                &settings.preserve,
+                update_dir,
+                dst_parent,
+                update_name,
+                update_path,
+                &dst_path,
+                rel_path,
+                settings,
                 is_fresh,
-                filter_base,
+                copy_guard,
             )
-            .await
-            .map_err(|err| {
-                let copy_summary = err.summary;
-                let link_summary = Summary {
-                    copy_summary,
-                    ..Default::default()
-                };
-                Error::new(err.source, link_summary)
-            })?;
-            return Ok(Summary {
-                copy_summary,
-                ..Default::default()
-            });
+            .await;
+        }
+        if update_handle.kind() == EntryKind::Symlink {
+            // update symlink: copy it. the permit was already dropped at the consolidated site.
+            tracing::debug!("'update' is a symlink so just symlink that");
+            return delegate_copy(
+                prog_track,
+                update_dir,
+                dst_parent,
+                update_name,
+                update_path,
+                &dst_path,
+                rel_path,
+                settings,
+                is_fresh,
+                None,
+            )
+            .await;
         }
     } else {
-        // update hasn't been specified, if this is a file just hard-link the source or symlink if it's a symlink
-        tracing::debug!("no 'update' specified");
-        if src_metadata.is_file() {
-            // handle dry-run mode for top-level files
+        // update hasn't been specified (or is absent at this name): hard-link a source file,
+        // copy a source symlink.
+        // the permit (if any) was already released at the consolidated drop site above, so the
+        // no-update hard-link / symlink-copy paths here hold nothing.
+        tracing::debug!("no 'update' entry");
+        if src_handle.kind() == EntryKind::File {
             if settings.dry_run.is_some() {
-                crate::dry_run::report_action("link", src, Some(dst), "file");
+                crate::dry_run::report_action("link", &src_path, Some(&dst_path), "file");
                 return Ok(Summary {
                     hard_links_created: 1,
                     ..Default::default()
                 });
             }
-            return hard_link_helper(prog_track, src, &src_metadata, dst, settings).await;
-        }
-        if src_metadata.is_symlink() {
-            tracing::debug!("'src' is a symlink so just symlink that");
-            // delegate at this entry's logical path so the inner filter re-check uses nested
-            // semantics — see the matching comment above on the update-symlink branch.
-            let filter_base = walk::relative_to_root(src, source_root);
-            let copy_summary = copy::copy_with_filter_base(
+            let dst_dir = dst_parent.expect("destination parent must be open for a real hard link");
+            return hard_link_entry_fd(
                 prog_track,
-                src,
-                dst,
-                &settings.copy_settings,
-                &settings.preserve,
-                is_fresh,
-                filter_base,
+                &src_handle,
+                dst_dir,
+                &dst_name,
+                &dst_path,
+                settings,
             )
-            .await
-            .map_err(|err| {
-                let copy_summary = err.summary;
-                let link_summary = Summary {
-                    copy_summary,
-                    ..Default::default()
-                };
-                Error::new(err.source, link_summary)
-            })?;
-            return Ok(Summary {
-                copy_summary,
-                ..Default::default()
-            });
+            .await;
+        }
+        if src_handle.kind() == EntryKind::Symlink {
+            tracing::debug!("'src' is a symlink so just symlink that");
+            return delegate_copy(
+                prog_track, src_parent, dst_parent, name, &src_path, &dst_path, rel_path, settings,
+                is_fresh, None,
+            )
+            .await;
         }
     }
-    if !src_metadata.is_dir() {
+    if src_handle.kind() != EntryKind::Dir {
+        // special file (or unsupported type): non-recursive; the permit is already released above.
         if settings.copy_settings.skip_specials {
             tracing::debug!(
-                "skipping special file {:?} (type: {:?})",
-                src,
-                src_metadata.file_type()
+                "skipping special file {:?} (kind: {:?})",
+                src_path,
+                src_handle.kind()
             );
             if let Some(mode) = settings.dry_run {
                 match mode {
                     crate::config::DryRunMode::Brief => {}
-                    crate::config::DryRunMode::All => println!("skip special {:?}", src),
+                    crate::config::DryRunMode::All => println!("skip special {:?}", src_path),
                     crate::config::DryRunMode::Explain => {
                         println!(
                             "skip special {:?} (unsupported file type: {:?})",
-                            src,
-                            src_metadata.file_type()
+                            src_path,
+                            src_handle.kind()
                         );
                     }
                 }
@@ -564,131 +823,266 @@ async fn link_internal(
         return Err(Error::new(
             anyhow!(
                 "copy: {:?} -> {:?} failed, unsupported src file type: {:?}",
-                src,
-                dst,
-                src_metadata.file_type()
+                src_path,
+                dst_path,
+                src_handle.kind()
             ),
             Default::default(),
         ));
     }
-    assert!(update_metadata_opt.is_none() || update_metadata_opt.as_ref().unwrap().is_dir());
-    tracing::debug!("process contents of 'src' directory");
-    let mut src_entries = tokio::fs::read_dir(src)
-        .await
-        .with_context(|| format!("cannot open directory {src:?} for reading"))
-        .map_err(|err| Error::new(err, Default::default()))?;
-    // handle dry-run mode for directories at the top level
-    if settings.dry_run.is_some() {
-        crate::dry_run::report_action("link", src, Some(dst), "dir");
-        // still need to recurse to show contents
-    }
-    let copy_summary = if settings.dry_run.is_some() {
-        // skip actual directory creation in dry-run mode
-        CopySummary {
-            directories_created: 1,
-            ..Default::default()
-        }
-    } else if let Err(error) = crate::walk::run_metadata_probed(
-        congestion::Side::Destination,
-        congestion::MetadataOp::MkDir,
-        tokio::fs::create_dir(dst),
+    // directory: recurse the dual tree. the leaf permit was released at the consolidated drop site
+    // above — this recursing path never holds it (the hold-and-wait deadlock invariant).
+    debug_assert!(
+        update_handle.is_none() || update_handle.as_ref().unwrap().kind() == EntryKind::Dir
+    );
+    // Only drive the dual-tree update walk when an update directory entry actually exists at this
+    // name. If `update_handle` is None (the update tree has no counterpart for this src dir, the
+    // recursive "update missing" case), process this subtree in no-update mode: hard-link the whole
+    // source subtree. Passing the parent update tuple here would make `link_dir_entry` try to
+    // `open_dir` a non-existent update child.
+    let update_for_dir = update.filter(|_| update_handle.is_some());
+    let update_root_for_dir = update_root.filter(|_| update_handle.is_some());
+    link_dir_entry(
+        prog_track,
+        src_parent,
+        &src_handle,
+        update_for_dir,
+        update_handle.as_ref().map(crate::safedir::Handle::meta),
+        dst_parent,
+        name,
+        &dst_name,
+        src_root,
+        dst_root,
+        update_root_for_dir,
+        rel_path,
+        &src_path,
+        &dst_path,
+        update_path.as_deref().filter(|_| update_handle.is_some()),
+        settings,
+        is_fresh,
     )
     .await
-    {
-        assert!(!is_fresh, "unexpected error creating directory: {:?}", &dst);
-        if settings.copy_settings.overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
-            // check if the destination is a directory - if so, leave it
-            //
-            // N.B. the permissions may prevent us from writing to it but the alternative is to open up the directory
-            // while we're writing to it which isn't safe
-            let dst_metadata = crate::walk::run_metadata_probed(
-                congestion::Side::Destination,
-                congestion::MetadataOp::Stat,
-                // symlink_metadata (not metadata): do not follow a destination symlink. A
-                // symlinked directory is then treated as "not a directory" below and replaced,
-                // rather than copied/pruned *through* — which under --delete could delete files
-                // outside the destination tree. Mirrors copy.rs.
-                tokio::fs::symlink_metadata(dst),
-            )
-            .await
-            .with_context(|| format!("failed reading metadata from {:?}", &dst))
-            .map_err(|err| Error::new(err, Default::default()))?;
-            if dst_metadata.is_dir() {
-                tracing::debug!("'dst' is a directory, leaving it as is");
-                CopySummary {
-                    directories_unchanged: 1,
-                    ..Default::default()
-                }
-            } else {
-                tracing::info!("'dst' is not a directory, removing and creating a new one");
-                let mut copy_summary = CopySummary::default();
-                let rm_summary = rm::rm(
-                    prog_track,
-                    dst,
-                    &rm::Settings {
-                        fail_early: settings.copy_settings.fail_early,
-                        filter: None,
-                        dry_run: None,
-                        time_filter: None,
-                    },
-                )
-                .await
-                .map_err(|err| {
-                    let rm_summary = err.summary;
-                    copy_summary.rm_summary = rm_summary;
-                    Error::new(
-                        err.source,
-                        Summary {
-                            copy_summary,
-                            ..Default::default()
-                        },
-                    )
-                })?;
-                crate::walk::run_metadata_probed(
-                    congestion::Side::Destination,
-                    congestion::MetadataOp::MkDir,
-                    tokio::fs::create_dir(dst),
-                )
-                .await
-                .with_context(|| format!("cannot create directory {dst:?}"))
-                .map_err(|err| {
-                    copy_summary.rm_summary = rm_summary;
-                    Error::new(
-                        err,
-                        Summary {
-                            copy_summary,
-                            ..Default::default()
-                        },
-                    )
-                })?;
-                // anything copied into dst may assume they don't need to check for conflicts
-                is_fresh = true;
-                CopySummary {
-                    rm_summary,
-                    directories_created: 1,
-                    ..Default::default()
-                }
-            }
-        } else {
-            return Err(error)
-                .with_context(|| format!("cannot create directory {dst:?}"))
-                .map_err(|err| Error::new(err, Default::default()))?;
-        }
-    } else {
-        // new directory created, anything copied into dst may assume they don't need to check for conflicts
-        is_fresh = true;
-        CopySummary {
-            directories_created: 1,
-            ..Default::default()
-        }
-    };
-    // track whether we created this directory (vs it already existing)
-    // this is used later to decide if we should clean up an empty directory
-    let we_created_this_dir = copy_summary.directories_created == 1;
-    let mut link_summary = Summary {
+}
+
+/// Delegate a single entry to the fd-based copy ([`copy::copy_child`]), passing the HELD parent
+/// directory handles plus the entry `name` — never re-resolving a path. `filter_base` for the
+/// delegation is the entry's logical relative path (so `--delete` pruning inside the subtree
+/// matches include/exclude patterns at the entry's true path). The returned copy summary is folded
+/// into a link `Summary`.
+#[allow(clippy::too_many_arguments)]
+async fn delegate_copy(
+    prog_track: &'static progress::Progress,
+    src_parent: &Arc<Dir>,
+    dst_parent: Option<&Arc<Dir>>,
+    name: &std::ffi::OsStr,
+    src_path: &std::path::Path,
+    dst_path: &std::path::Path,
+    filter_base: &std::path::Path,
+    settings: &Settings,
+    is_fresh: bool,
+    open_file_guard: Option<throttle::OpenFileGuard>,
+) -> Result<Summary, Error> {
+    let copy_summary = copy::copy_child(
+        prog_track,
+        src_parent,
+        dst_parent,
+        name,
+        src_path,
+        dst_path,
+        filter_base,
+        &settings.copy_settings,
+        &settings.preserve,
+        is_fresh,
+        open_file_guard,
+    )
+    .await
+    .map_err(|err| {
+        let copy_summary = err.summary;
+        Error::new(
+            err.source,
+            Summary {
+                copy_summary,
+                ..Default::default()
+            },
+        )
+    })?;
+    Ok(Summary {
         copy_summary,
         ..Default::default()
+    })
+}
+
+/// Resolve (create / reuse / overwrite) the destination directory fd-relative, open the source
+/// (and update) directories, then recurse via [`link_dir_contents`]. Mirrors copy's
+/// [`copy::resolve_dst_dir`] for the overwrite branches (recheck-guarded, fd-relative removal).
+#[allow(clippy::too_many_arguments)]
+async fn link_dir_entry(
+    prog_track: &'static progress::Progress,
+    src_parent: &Arc<Dir>,
+    src_handle: &crate::safedir::Handle,
+    update: Option<(&Arc<Dir>, &std::ffi::OsStr)>,
+    update_meta: Option<&crate::safedir::FileMeta>,
+    dst_parent: Option<&Arc<Dir>>,
+    name: &std::ffi::OsStr,
+    dst_name: &std::ffi::OsStr,
+    src_root: &std::path::Path,
+    dst_root: &std::path::Path,
+    update_root: Option<&std::path::Path>,
+    rel_path: &std::path::Path,
+    src_path: &std::path::Path,
+    dst_path: &std::path::Path,
+    update_path: Option<&std::path::Path>,
+    settings: &Settings,
+    is_fresh: bool,
+) -> Result<Summary, Error> {
+    let src_dir = src_parent
+        .open_dir(name)
+        .await
+        .with_context(|| format!("cannot open directory {:?} for reading", src_path))
+        .map_err(|err| Error::new(err, Default::default()))?;
+    let src_dir = Arc::new(src_dir);
+    // open the update directory too (it has the same file type as src here — both are dirs).
+    let update_dir = match update {
+        Some((update_parent, update_name)) => {
+            let dir = update_parent
+                .open_dir(update_name)
+                .await
+                .with_context(|| {
+                    format!("cannot open update directory {:?} for reading", update_path)
+                })
+                .map_err(|err| Error::new(err, Default::default()))?;
+            Some(Arc::new(dir))
+        }
+        None => None,
     };
+    // dry-run: report the directory and traverse its contents, but never create a destination dir.
+    if settings.dry_run.is_some() {
+        crate::dry_run::report_action("link", src_path, Some(dst_path), "dir");
+        let base = Summary {
+            copy_summary: CopySummary {
+                directories_created: 1, // report as would-be-created
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        return link_dir_contents(
+            prog_track,
+            &src_dir,
+            src_handle,
+            update_dir.as_ref(),
+            update_meta,
+            None, // dry-run: no destination dir
+            None, // dry-run: no destination parent
+            dst_name,
+            src_root,
+            dst_root,
+            update_root,
+            rel_path,
+            src_path,
+            dst_path,
+            true, // treat as "created" so empty-dir cleanup can suppress the dry-run count
+            is_fresh,
+            settings,
+            base,
+        )
+        .await;
+    }
+    // real link: dst_parent is Some.
+    let dst_parent = dst_parent.expect("destination parent must be open for a real link");
+    let copy::DirSlot {
+        dir: dst_dir,
+        summary: base,
+        is_fresh: child_is_fresh,
+        we_created,
+    } = match copy::resolve_dst_dir(
+        prog_track,
+        dst_parent,
+        dst_name,
+        dst_path,
+        &settings.copy_settings,
+        is_fresh,
+    )
+    .await
+    .map_err(|err| {
+        Error::new(
+            err.source,
+            Summary {
+                copy_summary: err.summary,
+                ..Default::default()
+            },
+        )
+    })? {
+        copy::DirResolution::Skip(summary) => {
+            return Ok(Summary {
+                copy_summary: summary,
+                ..Default::default()
+            });
+        }
+        copy::DirResolution::Proceed(slot) => slot,
+    };
+    link_dir_contents(
+        prog_track,
+        &src_dir,
+        src_handle,
+        update_dir.as_ref(),
+        update_meta,
+        Some(&dst_dir),
+        Some(dst_parent),
+        dst_name,
+        src_root,
+        dst_root,
+        update_root,
+        rel_path,
+        src_path,
+        dst_path,
+        we_created,
+        child_is_fresh,
+        settings,
+        Summary {
+            copy_summary: base,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// The dual-tree body of a directory link: enumerate the source entries (hard-linking unchanged
+/// files, delegating copies, recursing into subdirectories), then enumerate the update entries and
+/// copy those not present in the source, then run `--delete` pruning, empty-directory cleanup, and
+/// finally apply the directory's own metadata.
+///
+/// `dst_dir == None` / `dst_parent == None` means dry-run (no destination mutation). `base` carries
+/// the `directories_created`/`directories_unchanged` contribution from resolving this directory.
+#[allow(clippy::too_many_arguments)]
+async fn link_dir_contents(
+    prog_track: &'static progress::Progress,
+    src_dir: &Arc<Dir>,
+    // classify handles, retained for caller threading; directory metadata is now read from the
+    // opened `src_dir`/`update_dir` fds (read-side fidelity), so these are no longer read here.
+    _src_handle: &crate::safedir::Handle,
+    update_dir: Option<&Arc<Dir>>,
+    _update_meta: Option<&crate::safedir::FileMeta>,
+    dst_dir: Option<&Arc<Dir>>,
+    dst_parent: Option<&Arc<Dir>>,
+    dst_name: &std::ffi::OsStr,
+    src_root: &std::path::Path,
+    dst_root: &std::path::Path,
+    update_root: Option<&std::path::Path>,
+    rel_path: &std::path::Path,
+    src_path: &std::path::Path,
+    dst_path: &std::path::Path,
+    we_created_this_dir: bool,
+    is_fresh: bool,
+    settings: &Settings,
+    base: Summary,
+) -> Result<Summary, Error> {
+    tracing::debug!("process contents of 'src' directory");
+    let src_entries = src_dir
+        .read_entries()
+        .await
+        .with_context(|| format!("cannot open directory {src_path:?} for reading"))
+        .map_err(|err| Error::new(err, base))?;
+    let mut link_summary = base;
     let mut join_set = tokio::task::JoinSet::new();
     let errors = crate::error_collector::ErrorCollector::default();
     // create a set of all the files we already processed
@@ -700,30 +1094,36 @@ async fn link_internal(
     let mut keep_set = DeleteKeepSet::new(
         settings.copy_settings.delete.as_ref(),
         settings.update_exclusive,
-        update.is_some(),
+        update_dir.is_some(),
     );
     // iterate through src entries and recursively call "link" on each one
-    loop {
-        let Some((src_entry, entry_file_type)) =
-            crate::walk::next_entry_probed(&mut src_entries, congestion::Side::Source, || {
-                format!("failed traversing directory {:?}", &src)
-            })
-            .await
-            .map_err(|err| Error::new(err, link_summary))?
-        else {
-            break;
-        };
-        let cwd_path = cwd.to_owned();
-        let entry_path = src_entry.path();
-        let entry_name = entry_path.file_name().unwrap();
-        let entry_kind = EntryKind::from_file_type(entry_file_type.as_ref());
-        let entry_is_dir = entry_kind == EntryKind::Dir;
+    for (entry_name, hint) in src_entries {
+        // classification for the special-skip, symlink-dispatch, and permit pre-acquire decisions
+        // uses the cheap getdents hint; `link_internal` re-classifies authoritatively via fstat
+        // before acting. an unknown hint (DT_UNKNOWN) is treated as a regular file for those, the
+        // same default the old path-based walk used when `file_type()` was unavailable.
+        let entry_kind = hint.unwrap_or(EntryKind::File);
         let entry_is_symlink = entry_kind == EntryKind::Symlink;
-        // compute relative path from source_root for filter matching
-        let relative_path = walk::relative_to_root(&entry_path, source_root);
-        // apply filter if configured
+        let entry_rel = rel_path.join(&entry_name);
+        let entry_path = src_path.join(&entry_name);
+        // the dir-ness that drives the FILTER decision AND the dry-run recurse-vs-leaf branch
+        // below must be AUTHORITATIVE: on a DT_UNKNOWN entry, defaulting to non-dir would wrongly
+        // omit a real directory's whole subtree under an is_dir-dependent filter, or (in dry-run,
+        // even with NO filter) preview it as a leaf and never descend into it. `filter_is_dir`
+        // fstats when a filter is active OR — via force_authoritative — when dry-run needs the
+        // type for control flow. One extra fstat only in those DT_UNKNOWN cases (never follows
+        // symlinks).
+        let entry_is_dir = walk::filter_is_dir(
+            settings.filter.as_ref(),
+            src_dir,
+            &entry_name,
+            hint,
+            settings.dry_run.is_some(),
+        )
+        .await;
+        // apply filter if configured (logical path == entry_rel, since link's filter_base is empty)
         if let Some(skip_result) =
-            walk::should_skip_entry(&settings.filter, relative_path, entry_is_dir)
+            walk::should_skip_entry(&settings.filter, &entry_rel, entry_is_dir)
         {
             if let Some(mode) = settings.dry_run {
                 crate::dry_run::report_skip(&entry_path, &skip_result, mode, entry_kind.label());
@@ -735,7 +1135,7 @@ async fn link_internal(
         }
         // keep-set: a source entry has a destination counterpart that must not be pruned, even
         // when --skip-specials skips copying it (computed before the skip-specials check below).
-        keep_set.record_src(entry_name);
+        keep_set.record_src(&entry_name);
         // skip special files (sockets, FIFOs, devices) when --skip-specials is set
         if settings.copy_settings.skip_specials && entry_kind == EntryKind::Special {
             tracing::debug!("skipping special file {:?}", &entry_path);
@@ -748,8 +1148,7 @@ async fn link_internal(
                     crate::config::DryRunMode::Explain => {
                         println!(
                             "skip special {:?} (unsupported file type: {:?})",
-                            &entry_path,
-                            entry_file_type.unwrap()
+                            &entry_path, entry_kind
                         );
                     }
                 }
@@ -758,172 +1157,190 @@ async fn link_internal(
             prog_track.specials_skipped.inc();
             continue;
         }
-        processed_files.insert(entry_name.to_owned());
-        let dst_path = dst.join(entry_name);
-        let update_path = update.as_ref().map(|s| s.join(entry_name));
-        // handle dry-run mode for link operations
-        if let Some(_mode) = settings.dry_run {
-            crate::dry_run::report_action("link", &entry_path, Some(&dst_path), entry_kind.label());
-            // for directories in dry-run, still need to recurse to show all entries
-            if entry_is_dir {
-                let settings = settings.clone();
-                let source_root = source_root.to_owned();
-                let do_link = || async move {
-                    link_internal(
-                        prog_track,
-                        &cwd_path,
-                        &entry_path,
-                        &dst_path,
-                        &source_root,
-                        &update_path,
-                        &settings,
-                        true,
-                        None,
-                    )
-                    .await
-                };
-                join_set.spawn(do_link());
-            } else if entry_is_symlink {
+        processed_files.insert(entry_name.clone());
+        // dry-run for non-directory entries: report the would-be action without recursing.
+        if settings.dry_run.is_some() && !entry_is_dir {
+            let dst_entry_path = dst_path.join(&entry_name);
+            crate::dry_run::report_action(
+                "link",
+                &entry_path,
+                Some(&dst_entry_path),
+                entry_kind.label(),
+            );
+            if entry_is_symlink {
                 // for symlinks in dry-run, count as symlink (in copy_summary)
                 link_summary.copy_summary.symlinks_created += 1;
             } else {
-                // for files in dry-run, count the "would be created" hard link
+                // for files in dry-run, count the "would be created" hard link.
+                // N.B. when an update tree is present, link_internal decides file-vs-copy
+                // per-entry; the dry-run hint here counts a hard link, matching the old walk which
+                // likewise counted a hard link for a regular-file src entry in dry-run.
                 link_summary.hard_links_created += 1;
             }
             continue;
         }
+        // for regular-file entries, pre-acquire a leaf permit (open-files pool) BEFORE spawning so we
+        // don't create unbounded tasks. `preacquire_leaf_permit` is the shared lifecycle primitive:
+        // its `want` opts in only for a regular-file hint, so directories take none (they recurse and
+        // would deadlock against a saturated pool), symlinks take none (they pass through to copy,
+        // which handles permits internally), and a DT_UNKNOWN hint takes none for the same reason —
+        // exactly the original `hint == Some(File)` policy. `link_internal` re-classifies
+        // authoritatively and either uses the permit (changed-file copy) or drops it.
+        //
+        // Acquire-then-IMMEDIATELY-spawn (the permit is moved into `do_link` and spawned on the next
+        // line, in the same loop step) is load-bearing: collecting a Vec of pre-acquired permits and
+        // spawning later would hold N permits before any task runs and self-deadlock a saturated pool.
+        // This mirrors the single-tree driver's incremental acquire-then-spawn loop
+        // (`walk_driver::walk_dir_contents`, joined via `walk_driver::join_and_fold`).
+        let permit = walk::preacquire_leaf_permit(PermitKind::OpenFile, hint, |h| {
+            h == Some(EntryKind::File)
+        })
+        .await;
+        let src_parent = Arc::clone(src_dir);
+        let dst_parent = dst_dir.map(Arc::clone);
+        let update_parent = update_dir.map(Arc::clone);
         let settings = settings.clone();
-        let source_root = source_root.to_owned();
-        // for regular-file entries, acquire the open file permit BEFORE spawning so
-        // we don't create unbounded tasks. mirrors the pattern in copy.rs.
-        // directories must NOT pre-acquire because they recurse and would deadlock
-        // against a saturated semaphore. symlinks aren't pre-acquired because they
-        // can pass through to copy::copy which handles permits internally.
-        let entry_is_regular_file = entry_file_type.as_ref().is_some_and(|ft| ft.is_file());
-        let open_file_guard = if entry_is_regular_file {
-            Some(throttle::open_file_permit().await)
-        } else {
-            None
-        };
-        let do_link = || async move {
+        let src_root = src_root.to_owned();
+        let dst_root = dst_root.to_owned();
+        let update_root = update_root.map(std::path::Path::to_path_buf);
+        let do_link = move || async move {
+            let update_ref = update_parent
+                .as_ref()
+                .map(|dir| (dir, entry_name.as_os_str()));
             link_internal(
                 prog_track,
-                &cwd_path,
-                &entry_path,
-                &dst_path,
-                &source_root,
-                &update_path,
+                &src_parent,
+                update_ref,
+                dst_parent.as_ref(),
+                &entry_name,
+                &src_root,
+                &dst_root,
+                update_root.as_deref(),
+                &entry_rel,
                 &settings,
                 is_fresh,
-                open_file_guard,
+                permit,
             )
             .await
         };
         join_set.spawn(do_link());
     }
-    // unfortunately ReadDir is opening file-descriptors and there's not a good way to limit this,
-    // one thing we CAN do however is to drop it as soon as we're done with it
-    drop(src_entries);
     // only process update if the path was provided and the directory is present
-    if update_metadata_opt.is_some() {
-        let update = update.as_ref().unwrap();
+    if let Some(update_dir) = update_dir {
+        let update_root = update_root.expect("update_dir present implies update_root present");
         tracing::debug!("process contents of 'update' directory");
-        let mut update_entries = tokio::fs::read_dir(update)
+        let update_entries = update_dir
+            .read_entries()
             .await
-            .with_context(|| format!("cannot open directory {:?} for reading", &update))
+            .with_context(|| {
+                format!(
+                    "cannot open directory {:?} for reading",
+                    update_path_dbg(update_root, rel_path)
+                )
+            })
             .map_err(|err| Error::new(err, link_summary))?;
-        // Iterate through update entries and for each one that's not present in src call "copy".
+        // Iterate through update entries and for each one that's not present in src, copy it.
         //
         // We deliberately do NOT pre-acquire any permit here. Two cycles rule out the
         // straightforward options:
-        //   * `open_file_permit`: copy::copy → copy_internal re-acquires open-files for
-        //     each file; a saturated pool would deadlock the inner acquire if we held one
-        //     across the call.
-        //   * `pending_meta_permit`: with --overwrite, copy::copy → copy_file → rm::rm
-        //     drains pending_meta for child entries (rm.rs spawn loop). N tasks here each
-        //     holding a pending_meta permit would deadlock waiting on each other's inner rm.
+        //   * `open_file_permit`: copy_child → copy_internal re-acquires open-files for each file;
+        //     a saturated pool would deadlock the inner acquire if we held one across the call.
+        //   * `pending_meta_permit`: with --overwrite, copy_child → copy_file_fd → rm::rm drains
+        //     pending_meta for child entries (rm.rs spawn loop). N tasks here each holding a
+        //     pending_meta permit would deadlock waiting on each other's inner rm.
         //
-        // The spawn count at this site is naturally bounded by the number of update-only
-        // entries (user input — typically modest) and per-task tokio overhead is small.
-        // Each spawned task's actual work is throttled by copy::copy's own internal
-        // open-files backpressure inside copy_internal's spawn loop.
-        loop {
-            let Some((update_entry, entry_file_type)) = crate::walk::next_entry_probed(
-                &mut update_entries,
-                congestion::Side::Source,
-                || format!("failed traversing directory {:?}", &update),
+        // The spawn count at this site is naturally bounded by the number of update-only entries
+        // (user input — typically modest). Each spawned task's work is throttled by copy's own
+        // internal open-files backpressure inside copy_internal's spawn loop.
+        for (entry_name, hint) in update_entries {
+            let entry_kind = hint.unwrap_or(EntryKind::File);
+            let entry_rel = rel_path.join(&entry_name);
+            // the FILTER `is_dir` decision must use the AUTHORITATIVE type: on a DT_UNKNOWN update
+            // entry with an is_dir-dependent include filter, defaulting to non-dir would wrongly
+            // omit a real directory's whole subtree. one extra fstat only in that DT_UNKNOWN+filter
+            // case (never follows symlinks).
+            let entry_is_dir = walk::filter_is_dir(
+                settings.filter.as_ref(),
+                update_dir,
+                &entry_name,
+                hint,
+                // used only for the filter decision here — no dry-run recurse-vs-leaf shortcut
+                // (delegate_copy reclassifies authoritatively) — so no need to force an fstat.
+                false,
             )
-            .await
-            .map_err(|err| Error::new(err, link_summary))?
-            else {
-                break;
-            };
-            let entry_path = update_entry.path();
-            let entry_name = entry_path.file_name().unwrap();
+            .await;
+            // evaluate the filter for this update entry at its logical path. This MUST run
+            // regardless of `--delete`: `copy_child` wraps `copy_internal`, which (unlike the old
+            // path-based `copy_with_filter_base`) does NOT re-apply a top-level filter to the entry
+            // it is handed, so without this skip an `--exclude`'d update-only entry would be copied.
+            let skip_result = walk::should_skip_entry(&settings.filter, &entry_rel, entry_is_dir);
+            let filtered_out = skip_result.is_some();
             // keep-set: every filter-passing update entry is materialized at the destination
-            // (entries also in `src` are linked, update-only entries are copied). Computed
-            // before the dedup `continue` so entries also present in `src` are covered — this
-            // is what makes --update-exclusive mirror the update set exactly.
-            if settings.copy_settings.delete.is_some() {
-                let entry_kind = EntryKind::from_file_type(entry_file_type.as_ref());
-                let relative_path = walk::relative_to_root(src, source_root).join(entry_name);
-                let filtered_out = walk::should_skip_entry(
-                    &settings.filter,
-                    &relative_path,
-                    entry_kind == EntryKind::Dir,
-                )
-                .is_some();
-                if filtered_out {
-                    // The update entry at this name is filtered out, so nothing materializes
-                    // from the update side. `drop_src_when_update_filtered` undoes a src-side
-                    // registration ONLY when the source loop actually materialized something —
-                    // a `--skip-specials` source special stays registered (its dst counterpart
-                    // must be retained per --skip-specials semantics).
-                    keep_set.drop_src_when_update_filtered(
-                        entry_name,
-                        processed_files.contains(entry_name),
-                    );
-                } else {
-                    keep_set.record_update(entry_name);
-                }
+            // (entries also in `src` are linked, update-only entries are copied). Computed before
+            // the dedup `continue` so entries also present in `src` are covered — this is what
+            // makes --update-exclusive mirror the update set exactly.
+            //
+            // A filtered-out update entry contributes NOTHING here and never drops an existing
+            // src-side registration: when the src loop materialized a same-name entry it can only
+            // be a TYPE MISMATCH (a type-independent pattern would have excluded the src too), and
+            // the union semantics keep the src's version (`link_internal` falls back to source-only
+            // handling), so its keep-set entry must survive — pruning it would delete what we just
+            // materialized. Under --update-exclusive `record_src` was a no-op, so there is likewise
+            // nothing to keep. Either way the filtered-out branch leaves the keep-set untouched.
+            if settings.copy_settings.delete.is_some() && !filtered_out {
+                keep_set.record_update(&entry_name);
             }
-            if processed_files.contains(entry_name) {
+            if processed_files.contains(&entry_name) {
                 // we already must have considered this file, skip it
                 continue;
             }
+            // filtered-out update-only entry: skip the delegation entirely (matching the old
+            // `copy_with_filter_base`'s top-level filter), and record the skip in the summary /
+            // counters exactly as the source loop does for a filtered src entry.
+            if let Some(skip_result) = skip_result {
+                let update_entry_path = update_root.join(&entry_rel);
+                if let Some(mode) = settings.dry_run {
+                    crate::dry_run::report_skip(
+                        &update_entry_path,
+                        &skip_result,
+                        mode,
+                        entry_kind.label(),
+                    );
+                }
+                tracing::debug!(
+                    "skipping update entry {:?} due to filter",
+                    &update_entry_path
+                );
+                link_summary = link_summary + skipped_summary_for(entry_kind);
+                entry_kind.inc_skipped(prog_track);
+                continue;
+            }
             tracing::debug!("found a new entry in the 'update' directory");
-            let dst_path = dst.join(entry_name);
-            let update_path = update.join(entry_name);
-            // filter-base for the delegated copy: this update entry's path relative to the
-            // source root, so any --delete pruning inside it matches the include/exclude filter
-            // at the entry's true relative path (e.g. cache/*.log), not relative to the entry.
-            let filter_base = walk::relative_to_root(src, source_root).join(entry_name);
+            let update_entry_path = update_root.join(&entry_rel);
+            let dst_entry_path = dst_path.join(&entry_name);
+            let update_parent = Arc::clone(update_dir);
+            let dst_parent = dst_dir.map(Arc::clone);
             let settings = settings.clone();
-            let do_copy = || async move {
-                let copy_summary = copy::copy_with_filter_base(
+            let do_copy = move || async move {
+                // filter-base for the delegated copy: this update entry's path relative to the
+                // source root, so any --delete pruning inside it matches the include/exclude filter
+                // at the entry's true relative path (e.g. cache/*.log), not relative to the entry.
+                delegate_copy(
                     prog_track,
-                    &update_path,
-                    &dst_path,
-                    &settings.copy_settings,
-                    &settings.preserve,
+                    &update_parent,
+                    dst_parent.as_ref(),
+                    &entry_name,
+                    &update_entry_path,
+                    &dst_entry_path,
+                    &entry_rel,
+                    &settings,
                     is_fresh,
-                    &filter_base,
+                    None,
                 )
                 .await
-                .map_err(|err| {
-                    link_summary.copy_summary = link_summary.copy_summary + err.summary;
-                    Error::new(err.source, link_summary)
-                })?;
-                Ok(Summary {
-                    copy_summary,
-                    ..Default::default()
-                })
             };
             join_set.spawn(do_copy());
         }
-        // unfortunately ReadDir is opening file-descriptors and there's not a good way to limit this,
-        // one thing we CAN do however is to drop it as soon as we're done with it
-        drop(update_entries);
     }
     while let Some(res) = join_set.join_next().await {
         match res {
@@ -931,10 +1348,9 @@ async fn link_internal(
                 Ok(summary) => link_summary = link_summary + summary,
                 Err(error) => {
                     tracing::error!(
-                        "link: {:?} {:?} -> {:?} failed with: {:#}",
-                        src,
-                        update,
-                        dst,
+                        "link: {:?} -> {:?} failed with: {:#}",
+                        src_path,
+                        dst_path,
                         &error
                     );
                     link_summary = link_summary + error.summary;
@@ -953,45 +1369,81 @@ async fn link_internal(
         }
     }
     // rsync-style --delete for rlink: remove destination entries the link operation did not
-    // materialize. `keep_set` holds exactly the materialized names: src ∪ update normally, or
-    // just the update set under --update-exclusive (where source-only entries are not
-    // materialized and so are pruned, matching `rsync --link-dest --delete`).
+    // materialize. `keep_set` holds exactly the materialized names: src ∪ update normally, or just
+    // the update set under --update-exclusive (where source-only entries are not materialized and
+    // so are pruned, matching `rsync --link-dest --delete`).
     if let Some(delete_settings) = &settings.copy_settings.delete {
         if errors.has_errors() {
-            // rsync-style safety: skip pruning when this subtree's link/update pass reported
-            // errors — deleting based on a run that did not fully succeed could remove data
-            // unexpectedly. (rsync likewise skips --delete on I/O errors.)
+            // rsync-style safety: skip pruning when this subtree's link/update pass reported errors
+            // — deleting based on a run that did not fully succeed could remove data unexpectedly.
             tracing::warn!(
                 "skipping --delete pruning of {:?} because the link/update pass reported errors",
-                dst
+                dst_path
             );
         } else {
-            let relative_dir = walk::relative_to_root(src, source_root);
-            match crate::delete::prune_extraneous(
-                prog_track,
-                dst,
-                relative_dir,
-                keep_set
-                    .as_set()
-                    .expect("--delete is on, so DeleteKeepSet is active"),
-                settings.filter.as_ref(),
-                delete_settings,
-                settings.copy_settings.fail_early,
-                settings.dry_run,
-            )
-            .await
-            {
-                Ok(rm_summary) => {
-                    link_summary.copy_summary.rm_summary =
-                        link_summary.copy_summary.rm_summary + rm_summary;
-                }
-                Err(err) => {
-                    link_summary.copy_summary.rm_summary =
-                        link_summary.copy_summary.rm_summary + err.summary;
-                    if settings.copy_settings.fail_early {
-                        return Err(Error::new(err.source, link_summary));
+            // the prune scan runs through the destination directory's own pinned fd. In a real link
+            // we already hold it (`dst_dir`); in --dry-run the create-or-overwrite step is skipped,
+            // so open it `O_NOFOLLOW|O_DIRECTORY` (dereference=false) — a symlink or non-directory
+            // fails closed and prune is skipped, never following the symlink to delete a tree
+            // OUTSIDE the destination. A missing dir likewise skips.
+            let prune_dir: Option<Arc<Dir>> = match dst_dir {
+                Some(dir) => Some(Arc::clone(dir)),
+                None => {
+                    match Dir::open_root_dir(dst_path, false, congestion::Side::Destination).await {
+                        Ok(dir) => Some(Arc::new(dir)),
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                            ) || err.raw_os_error() == Some(libc::ELOOP)
+                                || err.raw_os_error() == Some(libc::ENOTDIR) =>
+                        {
+                            tracing::debug!(
+                                "skipping --delete pruning of {:?}: not a real directory",
+                                dst_path
+                            );
+                            None
+                        }
+                        Err(err) => {
+                            let err = anyhow::Error::new(err).context(format!(
+                                "cannot open destination {dst_path:?} for delete scan"
+                            ));
+                            if settings.copy_settings.fail_early {
+                                return Err(Error::new(err, link_summary));
+                            }
+                            errors.push(err);
+                            None
+                        }
                     }
-                    errors.push(err.source);
+                }
+            };
+            if let Some(prune_dir) = prune_dir {
+                match crate::delete::prune_extraneous(
+                    prog_track,
+                    &prune_dir,
+                    rel_path,
+                    keep_set
+                        .as_set()
+                        .expect("--delete is on, so DeleteKeepSet is active"),
+                    settings.filter.as_ref(),
+                    delete_settings,
+                    settings.copy_settings.fail_early,
+                    settings.dry_run,
+                )
+                .await
+                {
+                    Ok(rm_summary) => {
+                        link_summary.copy_summary.rm_summary =
+                            link_summary.copy_summary.rm_summary + rm_summary;
+                    }
+                    Err(err) => {
+                        link_summary.copy_summary.rm_summary =
+                            link_summary.copy_summary.rm_summary + err.summary;
+                        if settings.copy_settings.fail_early {
+                            return Err(Error::new(err.source, link_summary));
+                        }
+                        errors.push(err.source);
+                    }
                 }
             }
         }
@@ -1007,13 +1459,12 @@ async fn link_internal(
         || link_summary.copy_summary.files_copied > 0
         || link_summary.copy_summary.symlinks_created > 0
         || child_dirs_created > 0;
-    let relative_path = walk::relative_to_root(src, source_root);
-    let is_root = src == source_root;
+    let is_root = rel_path.as_os_str().is_empty();
     match check_empty_dir_cleanup(
         settings.filter.as_ref(),
         we_created_this_dir,
         anything_linked,
-        relative_path,
+        rel_path,
         is_root,
         settings.dry_run.is_some(),
     ) {
@@ -1021,7 +1472,7 @@ async fn link_internal(
         EmptyDirAction::DryRunSkip => {
             tracing::debug!(
                 "dry-run: directory {:?} would not be created (nothing to link inside)",
-                &dst
+                dst_path
             );
             link_summary.copy_summary.directories_created = 0;
             return Ok(link_summary);
@@ -1029,15 +1480,24 @@ async fn link_internal(
         EmptyDirAction::Remove => {
             tracing::debug!(
                 "directory {:?} has nothing to link inside, removing empty directory",
-                &dst
+                dst_path
             );
-            match crate::walk::run_metadata_probed(
-                congestion::Side::Destination,
-                congestion::MetadataOp::RmDir,
-                tokio::fs::remove_dir(dst),
-            )
-            .await
-            {
+            // remove the empty directory fd-relative, through its parent dir handle: `rmdir_at`
+            // operates on `dst_name` within the held `dst_parent` fd (never by path) and only
+            // succeeds on an empty directory, so it is contained to `dst_parent`. `dst_parent` is
+            // always Some here (None only in dry-run, where this arm is unreachable).
+            let rmdir_result = match dst_parent {
+                Some(dst_parent) => dst_parent.rmdir_at(dst_name).await,
+                None => {
+                    crate::walk::run_metadata_probed(
+                        congestion::Side::Destination,
+                        congestion::MetadataOp::RmDir,
+                        tokio::fs::remove_dir(dst_path),
+                    )
+                    .await
+                }
+            };
+            match rmdir_result {
                 Ok(()) => {
                     link_summary.copy_summary.directories_created = 0;
                     return Ok(link_summary);
@@ -1046,7 +1506,7 @@ async fn link_internal(
                     // removal failed (not empty, permission error, etc.) — keep directory
                     tracing::debug!(
                         "failed to remove empty directory {:?}: {:#}, keeping",
-                        &dst,
+                        dst_path,
                         &err
                     );
                     // fall through to apply metadata
@@ -1054,29 +1514,33 @@ async fn link_internal(
             }
         }
     }
-    // apply directory metadata regardless of whether all children linked successfully.
-    // the directory itself was created earlier in this function (we would have returned
-    // early if create_dir failed), so we should preserve the source metadata.
-    // skip metadata setting in dry-run mode since directory wasn't actually created
+    // apply directory metadata regardless of whether all children linked successfully. the
+    // directory itself was created/opened above. skipped in dry-run (no directory exists). prefer
+    // the update directory's metadata when an update tree is present at this level (it is the
+    // materialized version, matching the old `update_metadata_opt` preference), else the source
+    // directory's. The metadata is read from the SAME fd whose contents were enumerated (read-side
+    // fidelity, docs/tocttou.md), not the classify handles.
     tracing::debug!("set 'dst' directory metadata");
-    let metadata_result = if settings.dry_run.is_some() {
-        Ok(()) // skip metadata setting in dry-run mode
-    } else {
-        let preserve_metadata = if let Some(update_metadata) = update_metadata_opt.as_ref() {
-            update_metadata
-        } else {
-            &src_metadata
-        };
-        preserve::set_dir_metadata(&settings.preserve, preserve_metadata, dst).await
+    let metadata_result = match dst_dir {
+        Some(dst_dir) => {
+            let meta_dir = update_dir.unwrap_or(src_dir);
+            match meta_dir.meta().await {
+                Ok(preserve_meta) => {
+                    crate::safedir::set_dir_metadata_fd(&settings.preserve, &preserve_meta, dst_dir)
+                        .await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        None => Ok(()),
     };
     if errors.has_errors() {
         // child failures take precedence - log metadata error if it also failed
         if let Err(metadata_err) = metadata_result {
             tracing::error!(
-                "link: {:?} {:?} -> {:?} failed to set directory metadata: {:#}",
-                src,
-                update,
-                dst,
+                "link: {:?} -> {:?} failed to set directory metadata: {:#}",
+                src_path,
+                dst_path,
                 &metadata_err
             );
         }
@@ -1084,12 +1548,27 @@ async fn link_internal(
         return Err(Error::new(errors.into_error().unwrap(), link_summary));
     }
     // no child failures, so metadata error is the primary error
-    metadata_result.map_err(|err| Error::new(err, link_summary))?;
+    metadata_result
+        .with_context(|| format!("failed setting directory metadata on {:?}", dst_path))
+        .map_err(|err| Error::new(err, link_summary))?;
     Ok(link_summary)
+}
+
+/// Reconstruct an update entry's path purely for a diagnostic message.
+fn update_path_dbg(
+    update_root: &std::path::Path,
+    rel_path: &std::path::Path,
+) -> std::path::PathBuf {
+    if rel_path.as_os_str().is_empty() {
+        update_root.to_path_buf()
+    } else {
+        update_root.join(rel_path)
+    }
 }
 
 #[cfg(test)]
 mod link_tests {
+    use crate::rm;
     use crate::testutils;
     use std::os::unix::fs::PermissionsExt;
     use tracing_test::traced_test;
@@ -1166,43 +1645,45 @@ mod link_tests {
         }
 
         #[test]
-        fn drop_src_when_update_filtered_drops_materialized_src_entry() {
-            // The type-change case: src had a regular file at `node`, update has an excluded
-            // dir at `node/`. Source materialized — drop the keep-set entry so the stale dst
-            // is pruned.
+        fn filtered_out_update_keeps_materialized_src_entry_in_normal_mode() {
+            // Type-mismatch under normal `--update` (union): src had a regular file at `node`,
+            // update has a dir at `node/` excluded by the dir-only `node/` pattern. The src's
+            // version of the name stands (`link_internal` falls back to source-only handling), so
+            // the keep-set entry recorded by the source loop MUST survive — pruning it would
+            // delete the file we just materialized. The filtered-out update branch is therefore a
+            // no-op on the keep-set: `node` stays.
             let d = delete_on();
             let mut k = DeleteKeepSet::new(Some(&d), false, true);
             k.record_src(OsStr::new("node"));
-            assert!(k.as_set().unwrap().contains(OsStr::new("node")));
-            k.drop_src_when_update_filtered(OsStr::new("node"), /* src_materialized */ true);
-            assert!(!k.as_set().unwrap().contains(OsStr::new("node")));
+            // (the update loop's filtered-out branch records nothing and removes nothing)
+            assert!(
+                k.as_set().unwrap().contains(OsStr::new("node")),
+                "src entry must stay in the keep-set when its update counterpart is filtered out"
+            );
         }
 
         #[test]
-        fn drop_src_when_update_filtered_keeps_skipped_special() {
+        fn filtered_out_update_keeps_skipped_special() {
             // The skip-special case: source loop ran `record_src` but never reached
             // `processed_files.insert` (it `continue`d on the skip-special branch). The dst
-            // counterpart must be retained per --skip-specials semantics.
+            // counterpart must be retained per --skip-specials semantics, and a filtered-out
+            // update entry at the same name does not change that.
             let d = delete_on();
             let mut k = DeleteKeepSet::new(Some(&d), false, true);
             k.record_src(OsStr::new("pipe"));
-            k.drop_src_when_update_filtered(OsStr::new("pipe"), /* src_materialized */ false);
             assert!(k.as_set().unwrap().contains(OsStr::new("pipe")));
         }
 
         #[test]
-        fn drop_src_when_update_filtered_no_op_when_delete_off() {
-            let mut k = DeleteKeepSet::new(None, false, false);
-            // Should not panic, and as_set stays None.
-            k.drop_src_when_update_filtered(OsStr::new("foo"), true);
-            assert!(k.as_set().is_none());
-        }
-
-        #[test]
-        fn full_directory_pass_matches_old_keep_set_semantics() {
+        fn full_directory_pass_keep_set_union_semantics() {
             // Models the union of src + update under plain `--delete --update` (no
             // --update-exclusive). Names: src has `keep`, `pipe` (special, skipped),
-            // `node` (file). update has `from_upd`, `node` (excluded dir).
+            // `node` (file). update has `from_upd`, `node` (a dir excluded by the dir-only
+            // `node/` pattern). Under union semantics the excluded update `node/` does not
+            // displace the src `node` file: `link_internal` materializes the src version, so
+            // `node` STAYS in the keep-set (the filtered-out update branch records/removes
+            // nothing). This is the corrected behavior versus the old type-mismatch bug, where
+            // the excluded update dir was copied AND the src keep-set entry was dropped.
             let d = delete_on();
             let mut k = DeleteKeepSet::new(Some(&d), false, true);
 
@@ -1211,16 +1692,16 @@ mod link_tests {
             k.record_src(OsStr::new("pipe")); // --skip-specials: continues, processed_files NOT populated
             k.record_src(OsStr::new("node"));
 
-            // update loop
+            // update loop: only filter-passing update entries are recorded; `node` is filtered out
+            // and so contributes nothing (and does not drop the src `node`).
             k.record_update(OsStr::new("from_upd"));
-            // `node` filtered out in update; processed_files HAS `node` (source materialized it).
-            k.drop_src_when_update_filtered(OsStr::new("node"), true);
 
             let set: std::collections::HashSet<OsString> = k.as_set().unwrap().clone();
-            let expected: std::collections::HashSet<OsString> = ["keep", "pipe", "from_upd"]
-                .into_iter()
-                .map(OsString::from)
-                .collect();
+            let expected: std::collections::HashSet<OsString> =
+                ["keep", "pipe", "node", "from_upd"]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect();
             assert_eq!(set, expected);
         }
     }
@@ -1282,6 +1763,85 @@ mod link_tests {
             testutils::FileEqualityCheck::Timestamp,
         )
         .await?;
+        Ok(())
+    }
+
+    // Regression: a source operand whose final component is `.`/`..` (e.g. `rlink tree/.. dst`)
+    // must be linked, not rejected — `split_root_operand` canonicalizes it. Uses `tree/sub/..`
+    // (== `tree`) rather than `.` to avoid touching the process-wide cwd.
+    #[tokio::test]
+    async fn links_dot_dot_source_operand() -> Result<(), anyhow::Error> {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = testutils::create_temp_dir().await?;
+        let tree = tmp.join("tree");
+        tokio::fs::create_dir(&tree).await?;
+        tokio::fs::write(tree.join("a.txt"), "hello").await?;
+        tokio::fs::create_dir(tree.join("sub")).await?;
+        let src = tree.join("sub").join(".."); // == tree
+        let dst = tmp.join("dst");
+        let summary = link(
+            &PROGRESS,
+            &tmp,
+            &src,
+            &dst,
+            &None,
+            &common_settings(false, false),
+            false,
+        )
+        .await?;
+        assert_eq!(
+            summary.hard_links_created, 1,
+            "the dot-dot source's file must be hard-linked"
+        );
+        assert!(
+            dst.join("sub").is_dir(),
+            "the dot-dot source's subdir must be created"
+        );
+        // the dst file shares the src inode (a hard link, not a copy).
+        let src_ino = std::fs::metadata(tree.join("a.txt"))?.ino();
+        let dst_ino = std::fs::metadata(dst.join("a.txt"))?.ino();
+        assert_eq!(src_ino, dst_ino, "dst must be a hard link to the src inode");
+        Ok(())
+    }
+
+    // Regression: an `--update` operand whose final component is `.`/`..` (e.g.
+    // `rlink --update tree/.. src dst`) must be accepted, not rejected — the update tree is a READ
+    // tree, so `split_root_operand` canonicalizes it the same as the source. Uses `tree/sub/..`
+    // (== `tree`) rather than `.` to avoid touching the process-wide cwd; src == update == tree so
+    // the file links deterministically from the update tree.
+    #[tokio::test]
+    async fn links_dot_dot_update_operand() -> Result<(), anyhow::Error> {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = testutils::create_temp_dir().await?;
+        let tree = tmp.join("tree");
+        tokio::fs::create_dir(&tree).await?;
+        tokio::fs::write(tree.join("a.txt"), "hello").await?;
+        tokio::fs::create_dir(tree.join("sub")).await?;
+        let dst = tmp.join("dst");
+        // the --update operand spelled with a trailing `..` (== tree); it must be canonicalized and
+        // used, not rejected with "has no parent directory or file name".
+        let update_operand = tree.join("sub").join(".."); // == tree
+        let summary = link(
+            &PROGRESS,
+            &tmp,
+            &tree,
+            &dst,
+            &Some(update_operand),
+            &common_settings(false, false),
+            false,
+        )
+        .await?;
+        assert_eq!(
+            summary.hard_links_created, 1,
+            "the file must be hard-linked from the dot-dot update tree"
+        );
+        // the dst file shares the update tree's inode (linked from it, not copied).
+        let update_ino = std::fs::metadata(tree.join("a.txt"))?.ino();
+        let dst_ino = std::fs::metadata(dst.join("a.txt"))?.ino();
+        assert_eq!(
+            update_ino, dst_ino,
+            "dst must be hard-linked from the update tree inode"
+        );
         Ok(())
     }
 
@@ -2580,6 +3140,340 @@ mod link_tests {
             );
             Ok(())
         }
+
+        /// Regression: an update-only entry matching an `--exclude` pattern must NOT be copied to
+        /// the destination when `--delete` is OFF. The fd-based link delegates update-only entries
+        /// to `copy::copy_child` (which wraps `copy_internal` and does not re-apply a top-level
+        /// filter), so the update loop must evaluate the filter itself — independently of `--delete`
+        /// — and skip the delegation, matching the old path-based `copy_with_filter_base`.
+        #[tokio::test]
+        #[traced_test]
+        async fn update_only_excluded_entry_not_copied_without_delete() -> Result<(), anyhow::Error>
+        {
+            let test_path = testutils::create_temp_dir().await?;
+            // src has `keep.txt`; update has `keep.txt` (also in src) plus update-only `extra.txt`
+            // and `wanted.txt`. With `--exclude extra.txt` and NO `--delete`, `extra.txt` must be
+            // skipped while `wanted.txt` is copied.
+            let src = test_path.join("src");
+            let update = test_path.join("update");
+            let dst = test_path.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&update).await?;
+            tokio::fs::write(src.join("keep.txt"), "keep").await?;
+            tokio::fs::write(update.join("keep.txt"), "keep").await?;
+            tokio::fs::write(update.join("extra.txt"), "EXCLUDED").await?;
+            tokio::fs::write(update.join("wanted.txt"), "wanted").await?;
+
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("extra.txt").unwrap();
+            let mut settings = common_settings(false, false);
+            settings.filter = Some(filter);
+            // --delete is OFF (the bug only manifests with delete off).
+            assert!(settings.copy_settings.delete.is_none());
+
+            let summary = link(
+                &PROGRESS,
+                &test_path,
+                &src,
+                &dst,
+                &Some(update.clone()),
+                &settings,
+                false,
+            )
+            .await?;
+
+            assert!(
+                !dst.join("extra.txt").exists(),
+                "update-only entry matching --exclude must NOT be copied when --delete is off"
+            );
+            assert!(
+                dst.join("wanted.txt").exists(),
+                "non-excluded update-only entry should be copied"
+            );
+            assert!(dst.join("keep.txt").exists(), "shared entry should exist");
+            assert_eq!(
+                summary.copy_summary.files_skipped, 1,
+                "the excluded update-only file should be counted skipped"
+            );
+            Ok(())
+        }
+
+        /// Verify a hard-link relationship between two paths by inode + device identity.
+        fn are_hardlinked(a: &std::path::Path, b: &std::path::Path) -> bool {
+            use std::os::unix::fs::MetadataExt;
+            match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+                (Ok(ma), Ok(mb)) => ma.ino() == mb.ino() && ma.dev() == mb.dev(),
+                _ => false,
+            }
+        }
+
+        /// The chatgpt-codex re-review scenario (PR #247): in rlink's dual-tree walk the source
+        /// loop evaluates the filter against the SOURCE entry's type. When `src/cache` is a FILE
+        /// and `update/cache` is a DIRECTORY, a dir-only exclude `cache/` passes the src file (a
+        /// dir-only pattern doesn't match a file), so `link_internal` runs and hits its
+        /// type-mismatch branch. Before the fix that branch unconditionally delegated a copy of the
+        /// UPDATE entry — and `copy_child` does not re-apply the top-level filter to the delegated
+        /// root — so the excluded `cache/` directory was copied. The fix re-checks the filter using
+        /// the UPDATE entry's type; the excluded update is dropped and, under union (`--update`)
+        /// semantics, the src `cache` FILE is materialized instead.
+        ///
+        /// This test FAILS without the fix: `dst/cache` is created as the excluded update directory
+        /// (and the src file is not materialized).
+        #[tokio::test]
+        #[traced_test]
+        async fn type_mismatch_excluded_update_dir_not_copied_src_file_kept()
+        -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let src = test_path.join("src");
+            let update = test_path.join("update");
+            let dst = test_path.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&update).await?;
+            // src `cache` is a FILE; update `cache` is a DIRECTORY (the type mismatch).
+            tokio::fs::write(src.join("cache"), "SRC-FILE").await?;
+            tokio::fs::create_dir(update.join("cache")).await?;
+            tokio::fs::write(update.join("cache").join("inner.dat"), "EXCLUDED").await?;
+            // a non-conflicting shared file to confirm normal linking still happens.
+            tokio::fs::write(src.join("keep.txt"), "keep").await?;
+            tokio::fs::write(update.join("keep.txt"), "keep").await?;
+            // pin an identical mtime (incl. nsec) on both `keep.txt` copies so the
+            // size+mtime `update_compare` deterministically treats them as unchanged and
+            // hard-links from src. Two separate writes can otherwise land on different
+            // nanoseconds, flakily comparing as changed and copying instead (the bytes are
+            // identical either way) — see PR #247 CI flake on test-musl-debug.
+            let keep_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+            filetime::set_file_mtime(src.join("keep.txt"), keep_mtime)?;
+            filetime::set_file_mtime(update.join("keep.txt"), keep_mtime)?;
+
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("cache/").unwrap(); // dir-only: matches a dir `cache`, not a file
+            let mut settings = common_settings(false, false);
+            settings.filter = Some(filter);
+            assert!(settings.copy_settings.delete.is_none());
+
+            let summary = link(
+                &PROGRESS,
+                &test_path,
+                &src,
+                &dst,
+                &Some(update.clone()),
+                &settings,
+                false,
+            )
+            .await?;
+
+            // the excluded update directory must NOT be copied.
+            assert!(
+                !dst.join("cache").join("inner.dat").exists(),
+                "excluded update directory `cache/` must not be copied"
+            );
+            assert!(
+                !dst.join("cache").is_dir(),
+                "dst/cache must not be the excluded update directory"
+            );
+            // the src `cache` FILE stands (union semantics) and is hard-linked from src.
+            assert!(
+                dst.join("cache").is_file(),
+                "src `cache` file must be materialized when the update dir is excluded"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(dst.join("cache")).await?,
+                "SRC-FILE"
+            );
+            assert!(
+                are_hardlinked(&src.join("cache"), &dst.join("cache")),
+                "the src `cache` file must be hard-linked into the destination"
+            );
+            assert!(
+                dst.join("keep.txt").exists(),
+                "shared entry should still link"
+            );
+            // `cache` (src file, union) and `keep.txt` (unchanged) are both hard-linked from src;
+            // nothing is copied. Exactly one directory is created — the `dst` root — proving the
+            // excluded `cache/` subtree added no directory.
+            assert_eq!(summary.hard_links_created, 2);
+            assert_eq!(summary.copy_summary.files_copied, 0);
+            assert_eq!(
+                summary.copy_summary.directories_created, 1,
+                "only the dst root is created; the excluded `cache/` dir must not be"
+            );
+            Ok(())
+        }
+
+        /// The REVERSE type mismatch (the symmetric code path): `src/data` is a DIRECTORY and
+        /// `update/data` is a FILE. The dir-only include `data/` matches the directory form of the
+        /// name but not the file form, and `data/**` includes the directory's contents. So the src
+        /// `data` directory (and its `inner.txt`) passes the filter and the src loop spawns the
+        /// worker, while the update `data` FILE is `ExcludedByDefault` (no include matches a file
+        /// named `data`). The type-mismatch branch re-checks the filter using the update FILE's
+        /// type, finds it excluded, and (union semantics) materializes the src DIRECTORY instead of
+        /// copying the excluded update file. Without the fix the excluded update file would replace
+        /// the src directory at the destination.
+        #[tokio::test]
+        #[traced_test]
+        async fn reverse_type_mismatch_excluded_update_file_not_copied_src_dir_kept()
+        -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let src = test_path.join("src");
+            let update = test_path.join("update");
+            let dst = test_path.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&update).await?;
+            // src `data` is a DIRECTORY (with a file inside); update `data` is a FILE.
+            tokio::fs::create_dir(src.join("data")).await?;
+            tokio::fs::write(src.join("data").join("inner.txt"), "SRC-DIR-CONTENT").await?;
+            tokio::fs::write(update.join("data"), "UPDATE-FILE-EXCLUDED").await?;
+
+            // `data/` (dir-only) includes the directory form of the name; `data/**` includes its
+            // contents. The update FILE `data` matches neither and is excluded by type — the
+            // symmetric form of the bot's scenario.
+            let mut filter = FilterSettings::new();
+            filter.add_include("data/").unwrap();
+            filter.add_include("data/**").unwrap();
+            let mut settings = common_settings(false, false);
+            settings.filter = Some(filter);
+            assert!(settings.copy_settings.delete.is_none());
+
+            link(
+                &PROGRESS,
+                &test_path,
+                &src,
+                &dst,
+                &Some(update.clone()),
+                &settings,
+                false,
+            )
+            .await?;
+
+            // the excluded update FILE must NOT overwrite/replace the src directory.
+            assert!(
+                dst.join("data").is_dir(),
+                "src `data` directory must be materialized when the update file is excluded"
+            );
+            assert!(
+                dst.join("data").join("inner.txt").exists(),
+                "src directory contents must be linked through"
+            );
+            assert!(
+                are_hardlinked(
+                    &src.join("data").join("inner.txt"),
+                    &dst.join("data").join("inner.txt")
+                ),
+                "src directory's file must be hard-linked into the destination"
+            );
+            Ok(())
+        }
+
+        /// `--update-exclusive` + the type-mismatch scenario: src `cache` is a FILE, update `cache`
+        /// is a DIRECTORY excluded by `cache/`. Under exclusive mode only the (filter-passing)
+        /// update set materializes, so an EXCLUDED update entry materializes NOTHING — the src is
+        /// not materialized (it is not a fallback under exclusivity), and no stale src copy is left.
+        /// This mirrors the NotFound-under-exclusive case (`return Ok(Default::default())`).
+        #[tokio::test]
+        #[traced_test]
+        async fn type_mismatch_excluded_update_dir_update_exclusive_materializes_nothing()
+        -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let src = test_path.join("src");
+            let update = test_path.join("update");
+            let dst = test_path.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&update).await?;
+            tokio::fs::write(src.join("cache"), "SRC-FILE").await?;
+            tokio::fs::create_dir(update.join("cache")).await?;
+            tokio::fs::write(update.join("cache").join("inner.dat"), "EXCLUDED").await?;
+            // a filter-passing update-only file proves the rest of the exclusive copy still works.
+            tokio::fs::write(update.join("wanted.txt"), "wanted").await?;
+
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("cache/").unwrap();
+            let mut settings = common_settings(false, false);
+            settings.update_exclusive = true;
+            settings.filter = Some(filter);
+
+            link(
+                &PROGRESS,
+                &test_path,
+                &src,
+                &dst,
+                &Some(update.clone()),
+                &settings,
+                false,
+            )
+            .await?;
+
+            assert!(
+                !dst.join("cache").exists(),
+                "under --update-exclusive an excluded-update type-mismatch must materialize nothing \
+                 (no excluded dir, no stale src file)"
+            );
+            assert!(
+                dst.join("wanted.txt").exists(),
+                "filter-passing update-only entries are still copied under --update-exclusive"
+            );
+            Ok(())
+        }
+
+        /// `--delete` + the type-mismatch scenario under normal `--update`: the src `cache` FILE is
+        /// materialized (union) and MUST be retained by the keep-set — never materialized-then-pruned
+        /// — while a pre-existing extraneous dst entry is removed. Also confirms the excluded update
+        /// directory leaves no leftover. `prune_extraneous` would otherwise prune the dst `cache`
+        /// file (a dir-only `cache/` exclude does not protect a file), so correctness depends on
+        /// `cache` staying in the keep-set.
+        #[tokio::test]
+        #[traced_test]
+        async fn type_mismatch_excluded_update_dir_delete_keeps_src_file()
+        -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let src = test_path.join("src");
+            let update = test_path.join("update");
+            let dst = test_path.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&update).await?;
+            tokio::fs::create_dir(&dst).await?;
+            tokio::fs::write(src.join("cache"), "SRC-FILE").await?;
+            tokio::fs::create_dir(update.join("cache")).await?;
+            tokio::fs::write(update.join("cache").join("inner.dat"), "EXCLUDED").await?;
+            // pre-existing extraneous dst entry that --delete should prune.
+            tokio::fs::write(dst.join("stale.txt"), "stale").await?;
+
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("cache/").unwrap();
+            let mut settings = common_settings(false, true); // --delete implies --overwrite
+            settings.filter = Some(filter);
+            settings.copy_settings.delete = Some(copy::DeleteSettings {
+                delete_excluded: false,
+            });
+
+            link(
+                &PROGRESS,
+                &test_path,
+                &src,
+                &dst,
+                &Some(update.clone()),
+                &settings,
+                false,
+            )
+            .await?;
+
+            assert!(
+                dst.join("cache").is_file(),
+                "src `cache` file must survive --delete (kept in the keep-set, not pruned)"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(dst.join("cache")).await?,
+                "SRC-FILE"
+            );
+            assert!(
+                !dst.join("cache").is_dir(),
+                "the excluded update directory must leave no leftover"
+            );
+            assert!(
+                !dst.join("stale.txt").exists(),
+                "extraneous dst entry must be pruned by --delete"
+            );
+            Ok(())
+        }
     }
     mod dry_run_tests {
         use super::*;
@@ -3151,6 +4045,131 @@ mod link_tests {
                 let content = tokio::fs::read_to_string(dst.join(format!("u{}", i))).await?;
                 assert_eq!(content, format!("upd-{}", i));
             }
+            Ok(())
+        }
+    }
+
+    /// TOCTOU hardening: a source entry being hard-linked is concurrently swapped between a real
+    /// regular file and a symlink to a sentinel OUTSIDE the source tree. rlink classifies the entry
+    /// via `child` (fstat) before acting and links the pinned inode inode-exactly
+    /// (`hard_link_handle_at`), so a swap is either caught (the entry is linked/copied as a symlink,
+    /// or the op fails closed) or the real file is hard-linked. The sentinel's secret content must
+    /// NEVER appear at the destination as a regular file, and the sentinel inode must never gain a
+    /// new hard link.
+    mod race_tests {
+        use super::*;
+
+        // Repeatedly swap `dir/entry_name` between a real regular file (content `REAL_CONTENT`) and
+        // a symlink pointing at `sentinel`, using rename so each individual state is atomic. Runs on
+        // a dedicated OS thread so it makes progress regardless of the tokio runtime's scheduling.
+        fn spawn_file_symlink_swapper(
+            dir: std::path::PathBuf,
+            entry_name: &'static str,
+            sentinel: std::path::PathBuf,
+            stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> std::thread::JoinHandle<()> {
+            std::thread::spawn(move || {
+                let entry = dir.join(entry_name);
+                let staged_real = dir.join("__staged_real");
+                let staged_link = dir.join("__staged_link");
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&staged_real);
+                    if std::fs::write(&staged_real, b"REAL_CONTENT").is_err() {
+                        continue;
+                    }
+                    let _ = std::fs::rename(&staged_real, &entry);
+                    let _ = std::fs::remove_file(&staged_link);
+                    let _ = std::os::unix::fs::symlink(&sentinel, &staged_link);
+                    let _ = std::fs::rename(&staged_link, &entry);
+                }
+            })
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[traced_test]
+        async fn hard_link_entry_swap_never_leaks_sentinel() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+            let test_path = tmp_dir.as_path();
+            // sentinel lives OUTSIDE the source tree with distinctive content; we also track its
+            // hard-link count to prove `linkat(flags=0)` never gives it a new hard link.
+            let sentinel = test_path.join("sentinel_secret");
+            tokio::fs::write(&sentinel, "SENTINEL_SECRET_CONTENT").await?;
+            let sentinel_links_before = {
+                use std::os::unix::fs::MetadataExt;
+                tokio::fs::symlink_metadata(&sentinel).await?.nlink()
+            };
+            let src = test_path.join("src");
+            let sub = src.join("sub");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&sub).await?;
+            tokio::fs::write(sub.join("entry"), "REAL_CONTENT").await?;
+
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let swapper =
+                spawn_file_symlink_swapper(sub.clone(), "entry", sentinel.clone(), stop.clone());
+
+            // overwrite=true so each iteration's destination need not be empty; no update tree, so
+            // `src/sub/entry` takes the hard-link path (or copy-as-symlink when caught mid-swap).
+            let settings = common_settings(false, true);
+            let mut caught_swaps = 0usize;
+            let mut linked_real = 0usize;
+            for i in 0..200 {
+                let dst = test_path.join(format!("dst_{i}"));
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    link(&PROGRESS, test_path, &src, &dst, &None, &settings, false),
+                )
+                .await
+                .expect("link must not hang under concurrent swapping");
+                match result {
+                    Ok(_) => {}
+                    Err(_) => caught_swaps += 1, // a swap was caught mid-link (failed closed)
+                }
+                // CORE ASSERTION: if a regular file landed at the destination it holds the REAL
+                // content — never the sentinel's secret. The entry may instead be a symlink
+                // (linkat made a hard link to the symlink inode, or copy reproduced the symlink) or
+                // be absent. A symlink that resolves to the sentinel is fine: it is a link, not a
+                // copy of the secret bytes, and it did not give the sentinel a new hard link.
+                let entry_dst = dst.join("sub").join("entry");
+                if let Ok(md) = tokio::fs::symlink_metadata(&entry_dst).await
+                    && md.file_type().is_file()
+                {
+                    let content = tokio::fs::read_to_string(&entry_dst).await?;
+                    assert_ne!(
+                        content, "SENTINEL_SECRET_CONTENT",
+                        "iteration {i}: sentinel content leaked into the destination as a regular file"
+                    );
+                    assert_eq!(
+                        content, "REAL_CONTENT",
+                        "iteration {i}: a regular destination file must hold the real content"
+                    );
+                    linked_real += 1;
+                }
+                let _ = tokio::fs::remove_dir_all(&dst).await;
+            }
+
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            swapper.join().expect("swapper thread panicked");
+
+            // the sentinel must never have gained a hard link from a `linkat` that followed the
+            // swapped-in symlink (flags=0 links the symlink inode itself, not its target).
+            let sentinel_links_after = {
+                use std::os::unix::fs::MetadataExt;
+                tokio::fs::symlink_metadata(&sentinel).await?.nlink()
+            };
+            assert_eq!(
+                sentinel_links_after, sentinel_links_before,
+                "the sentinel file must never gain a hard link (linkat must not follow the symlink)"
+            );
+            // sanity: the run did observable work (this is not the safety assertion — the safety
+            // assertions above hold on every iteration regardless of timing).
+            tracing::info!(
+                "link file/symlink swap: caught_swaps={caught_swaps}, linked_real={linked_real}"
+            );
+            assert!(
+                caught_swaps + linked_real > 0,
+                "expected at least one observable outcome across 200 iterations"
+            );
             Ok(())
         }
     }

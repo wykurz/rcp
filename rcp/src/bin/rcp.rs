@@ -245,6 +245,7 @@ struct Args {
         long,
         default_value = "100",
         value_name = "N",
+        value_parser = parse_nonzero_usize,
         help_heading = "Remote copy options"
     )]
     max_connections: usize,
@@ -329,6 +330,23 @@ struct Args {
     /// Used to verify version compatibility with rcpd
     #[arg(long, help_heading = "Remote copy options")]
     protocol_version: bool,
+
+    // TOCTOU safety
+    /// Print TOCTOU-safety verdict for this invocation and exit (0 = safe, 1 = not safe)
+    ///
+    /// Analyzes whether the invocation is hardened against symlink/path-swap races
+    /// and exits without performing the copy operation.
+    #[arg(long, help_heading = "Security")]
+    toctou_check: bool,
+
+    /// Refuse to run unless the invocation uses the TOCTOU-hardened walk
+    ///
+    /// Refuses `--dereference`/`-L` (follows symlinks by design) and non-Linux builds. It
+    /// does NOT verify the trust of the operand path's prefix — that is the caller's
+    /// responsibility (lock paths down in the sudo rule). See "Scope of TOCTOU safety" in
+    /// docs/tocttou.md. Intended for sudo rules: `NOPASSWD: /usr/bin/rcp --require-toctou-safe *`.
+    #[arg(long, conflicts_with = "toctou_check", help_heading = "Security")]
+    require_toctou_safe: bool,
 
     /// Path to rcpd binary on remote hosts
     ///
@@ -823,15 +841,10 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         ));
     }
     let src_strings = &args.paths[0..args.paths.len() - 1];
-    for src in src_strings {
-        if src == "." || src.ends_with("/.") {
-            return Err(anyhow!(
-                "expanding source directory ({:?}) using dot operator ('.') is not supported, please use absolute \
-                path or '*' instead",
-                std::path::PathBuf::from(src)
-            ));
-        }
-    }
+    // `.`/`..` (and `dir/.`, `dir/..`) source operands are supported: `common::copy` decomposes them
+    // via `split_root_operand` (canonicalizing `.`/`..`), so `rcp . dst` copies the current
+    // directory just like `cp -r . dst` and like `rrm .`/`rchm .` already work. (`/` is rejected
+    // there.) Use a shell glob (`dir/*`) if you want to expand a directory's contents instead.
     if args.delete && src_strings.len() > 1 {
         return Err(anyhow!(
             "--delete requires a single source; mirroring multiple sources into one destination is not supported"
@@ -1115,6 +1128,18 @@ fn main() -> Result<(), anyhow::Error> {
     }
 
     let args = Args::parse();
+
+    // TOCTOU linter: must run before the async runtime starts. The verdict
+    // (dereference/Linux) applies to every operation, local or remote. The linter
+    // does NOT inspect the operand paths — the trust of a path's prefix is the
+    // caller's responsibility (see the "Scope of TOCTOU safety" section of
+    // docs/tocttou.md).
+    common::toctou_check::enforce_or_exit(
+        args.dereference,
+        args.toctou_check,
+        args.require_toctou_safe,
+    );
+
     let is_remote_operation = has_remote_paths(&args);
     let dry_run_warnings = args.dry_run.map(|_| {
         common::DryRunWarnings::new(

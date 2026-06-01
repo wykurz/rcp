@@ -175,8 +175,24 @@ User
 - **Compromised local machine**: Master machine is fully trusted
 - **Compromised remote hosts**: If host is compromised, attacker controls rcpd
 - **Side-channel attacks**: No specific mitigations for timing attacks, etc.
-- **Local TOCTTOU attacks**: See [TOCTTOU Vulnerabilities](tocttou.md) for details on
-  race condition attacks when rcp runs with elevated privileges
+- **TOCTTOU attacks with `--dereference`/`-L`**: Following symlinks is requested behavior
+  and cannot be hardened. See [TOCTTOU Vulnerabilities](tocttou.md) for details.
+- **TOCTTOU on non-Linux**: The hardened path is Linux-only; non-Linux builds use
+  path-based operations. See [TOCTTOU Vulnerabilities](tocttou.md).
+- **Trust of the operand path's prefix**: The hardening protects everything at or below the
+  named root, but the tools do not verify that the directories *above* it are free of
+  less-privileged control. `--require-toctou-safe` enforces the hardened walk (refusing
+  `-L`/non-Linux); the prefix trust is the caller's responsibility — see the
+  [Scope of TOCTOU safety](tocttou.md#scope-of-toctou-safety) section.
+
+On Linux, the default (non-`-L`) local hardening is implemented through a single shared
+safe-walk driver (`common/src/walk_driver.rs`): `rcp` (copy), `rchm`, and `rrm` are
+`WalkVisitor` implementations, so the recursive walk — and in particular the leaf-permit
+"drop before recursion" deadlock invariant — lives in one place rather than being
+hand-maintained per tool. The trusted/hardened boundary is type-enforced via `TrustedDir`,
+and `DT_UNKNOWN` filter classification goes through the single `filter_is_dir` path. `rlink`
+remains dual-tree (source plus `--update`) but shares the same substrate. See
+[TOCTTOU Vulnerabilities](tocttou.md) for the full mechanism.
 
 ## Threat Model
 
@@ -313,7 +329,13 @@ The rcp security model provides:
 
 **Limitations**:
 
-- ⚠️ **TOCTTOU**: No protection against local race conditions when running with elevated
-  privileges. See [TOCTTOU Vulnerabilities](tocttou.md) for details and mitigations.
+- ⚠️ **TOCTTOU with `--dereference`/`-L`**: Following symlinks is requested behavior and
+  is not hardened. On Linux, all other default paths (local copy/link/chmod/rm/delete,
+  remote copy source+destination) are fully TOCTOU-hardened. Non-Linux builds are not
+  hardened. Use `--require-toctou-safe` in sudo rules to enforce the hardened walk (it
+  refuses `-L`/non-Linux). The trust of the destination path's prefix is the caller's
+  responsibility, not verified in-tool — see the
+  [Scope of TOCTOU safety](tocttou.md#scope-of-toctou-safety) section of
+  [TOCTTOU Vulnerabilities](tocttou.md) for details.
 
 Use `--no-encryption` only on trusted networks where performance is critical.
