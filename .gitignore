@@ -4,3 +4,5 @@
 .codex
 .direnv/
 /codex-review*/
+# session working artifacts (specs/plans) — never checked in
+/docs/superpowers/

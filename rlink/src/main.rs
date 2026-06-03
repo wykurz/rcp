@@ -182,20 +182,20 @@ struct Args {
     dst: String, // must be a string to allow for parsing trailing slash
 }
 
-/// Resolve the effective destination ROOT path that the link operation will
-/// create, applying the trailing-slash ("copy INTO this directory") rule: a `dst`
-/// ending in `/` means the source basename is appended (`dst/<src_basename>`),
-/// otherwise `dst` is used verbatim.
-///
-/// Resolve the destination root the operation writes to, applying the
-/// trailing-slash rule: for a trailing-slash invocation that root is
-/// `dst/<src_basename>`, otherwise it is `dst` itself.
+/// Resolve the effective destination ROOT path that the link operation will create, applying the
+/// trailing-slash ("copy INTO this directory") rule: a `dst` ending in `/` means the source
+/// basename is appended (`dst/<src_basename>`), otherwise `dst` is used verbatim.
 fn resolve_dst_root(src: &std::path::Path, dst: &str) -> Result<std::path::PathBuf> {
     if dst.ends_with('/') {
-        let src_file = src
-            .file_name()
-            .context(format!("source {:?} does not have a basename", src))?;
-        Ok(std::path::PathBuf::from(dst).join(src_file))
+        // Derive the basename via the SAME decomposition the link operation uses:
+        // `root_operand_basename` (the sync twin of `split_root_operand`) canonicalizes
+        // `.`/`..`/`dir/..` — which have no `Path::file_name()` — so `dst/<name>` names exactly the
+        // entry the link will create: `rlink . out/` -> `out/<cwd-name>`, `rlink tree/.. out/` ->
+        // `out/<parent-name>`. A plain `file_name()` returns None for those operands and would
+        // reject them before the link operation could canonicalize the source.
+        let src_name = common::walk::root_operand_basename(src)
+            .context(format!("resolving source operand {src:?}"))?;
+        Ok(std::path::PathBuf::from(dst).join(src_name))
     } else {
         Ok(std::path::PathBuf::from(dst))
     }

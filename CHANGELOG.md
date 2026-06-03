@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `rcp host:~ dst/` (a bare remote home as source with a trailing-slash
+  destination) now errors instead of creating a directory literally named `~`
+  under `dst/`: the remote home's basename cannot be resolved locally. Use a
+  destination without a trailing slash to name the result explicitly.
+
+### Fixed
+- Fix `rcp`/`rlink` rejecting `.`/`..` source operands (`.`, `./`, `..`, `../`,
+  `tree/..`) when the destination ends with a slash, e.g. `rcp . out/` or
+  `rlink tree/.. out/` previously failed with "source ... does not have a
+  basename". The source basename for the trailing-slash form is now resolved
+  through the same canonicalization the copy/link operation uses, so `dst/<name>`
+  always matches the entry that gets created.
+
 ## [0.33.0] - 2026-05-28
 
 ### Added

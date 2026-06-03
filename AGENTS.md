@@ -26,7 +26,7 @@ cargo install cargo-nextest  # required for `just test`, `just test-release`, `j
 ### Common Commands
 
 - `just` or `just --list` — list all available commands
-- `just lint` — run lints (fmt, clippy, error logging, package metadata)
+- `just lint` — run lints (fmt, clippy, and the repo's CI check scripts)
 - `just fmt` — format code
 - `just test` — run tests in debug mode
 - `just test-release` — run tests in release mode
@@ -98,6 +98,16 @@ Enforced by `scripts/check-package-metadata.sh`.
 - Doc comments (`///`, `//!`): start with a capitalized sentence, read naturally.
 - Regular comments (`//`): start lowercase (see CONVENTIONS.md).
 
+### Structural Simplification
+
+Always look for structural simplifications in the area you touch. The goal is simplicity —
+de-duplication is a means to it, not an absolute rule. The most common smell: re-deriving a
+value from raw input that an earlier stage already computed (e.g. re-parsing a string the CLI
+already parsed into a typed value); re-derivation drifts from the source of truth and breeds
+inconsistency bugs. Thread the already-computed value through when that is the simpler shape;
+keep a small redundancy when *it* is. Apply low-risk simplifications as part of the change;
+describe larger restructurings in the PR rather than bundling them.
+
 ## Testing
 
 Name tests after observed behavior (e.g., `copies_directory_tree`, `fails_on_permission_denied`). Use the `filegen` crate for repeatable fixtures.
@@ -116,14 +126,15 @@ Before making any changes to remote copy operations, **always read [docs/remote_
 
 **Security**: Never commit SSH config or keys to the repository.
 
-## Agent Team Workflow
-
+## Pull Requests
 
 After creating a PR, check all review comments (including automated ones from Copilot). Evaluate each on its merit — address valid suggestions and respond to ones that aren't applicable.
 
 ## Commit Guidelines
 
 Keep commit subjects concise and imperative, matching the existing history style (e.g., "Fix how we manage dependencies"). Provide context and issue links in the body when applicable.
+
+Squash work-in-progress commits before opening a PR — land clean, reviewable commits. Never commit working specs or implementation plans (e.g. `docs/superpowers/`, which is gitignored); they are session artifacts.
 
 ## Shell Compatibility
 

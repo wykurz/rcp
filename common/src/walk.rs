@@ -478,6 +478,31 @@ pub async fn split_root_operand(path: &std::path::Path) -> anyhow::Result<RootOp
     })
 }
 
+/// The basename a root operand contributes to the trailing-slash "copy INTO directory" rule: the
+/// name of the entry the walk will create for `path`, so a CLI forming `dst/<name>` matches it
+/// exactly (`rcp . out/` / `rlink . out/` -> `out/<cwd-name>`; `… tree/.. out/` ->
+/// `out/<parent-name>`).
+///
+/// This is the synchronous twin of [`split_root_operand`]'s `name`, for the CLI path-resolution
+/// layer (which is not async): a normal operand uses [`std::path::Path::file_name`]; an operand
+/// with no `file_name()` (`.`/`..`/`dir/..`) is canonicalized first, exactly as
+/// [`split_root_operand`] does. The filesystem root has no basename and is rejected. The
+/// `root_operand_basename_matches_split_root_operand` test keeps the two in lock-step.
+pub fn root_operand_basename(path: &std::path::Path) -> anyhow::Result<std::ffi::OsString> {
+    let stripped = without_trailing_separators(path);
+    if let Some(name) = stripped.file_name() {
+        return Ok(name.to_owned());
+    }
+    // final component is `.`/`..` (or the operand is `/`): canonicalize to a concrete path so it
+    // has a real basename — the same resolution `split_root_operand` performs for the walk.
+    let canonical = std::fs::canonicalize(&stripped)
+        .with_context(|| format!("cannot resolve operand {stripped:?}"))?;
+    canonical
+        .file_name()
+        .map(std::ffi::OsStr::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("cannot operate on the filesystem root {canonical:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,6 +675,45 @@ mod tests {
         assert_eq!(op.name, canonical_tmp.file_name().unwrap());
         assert_eq!(op.display, canonical_tmp);
         // the filesystem root has no parent and is rejected with a clear error.
+        assert!(split_root_operand(Path::new("/")).await.is_err());
+        Ok(())
+    }
+
+    // `root_operand_basename` (the sync CLI helper) must return exactly `split_root_operand`'s
+    // `name` for every operand shape, so a `dst/<name>` the CLI builds always matches the entry the
+    // walk creates. This lock-step is what makes the trailing-slash result deterministic.
+    #[tokio::test]
+    async fn root_operand_basename_matches_split_root_operand() -> anyhow::Result<()> {
+        use std::path::Path;
+        // operands with a real `file_name()` (no canonicalize): both take the lexical basename.
+        for p in ["a/b", "foo", "foo/", "dir/.", "a/b/."] {
+            assert_eq!(
+                root_operand_basename(Path::new(p))?,
+                split_root_operand(Path::new(p)).await?.name,
+                "operand {p:?}"
+            );
+        }
+        // `.`/`..`/`dir/..` (no `file_name()`): both canonicalize to a real path first. Use real
+        // dirs so canonicalize succeeds; assert only that the two helpers agree (the concrete
+        // basename depends on the cwd / temp path).
+        let tmp = testutils::create_temp_dir().await?;
+        let sub = tmp.join("sub");
+        tokio::fs::create_dir(&sub).await?;
+        let dot_operands = [
+            std::path::PathBuf::from("."),
+            std::path::PathBuf::from(".."),
+            sub.join(".."),
+            sub.join("../.."),
+        ];
+        for p in &dot_operands {
+            assert_eq!(
+                root_operand_basename(p)?,
+                split_root_operand(p).await?.name,
+                "operand {p:?}"
+            );
+        }
+        // the filesystem root has no basename: both reject it.
+        assert!(root_operand_basename(Path::new("/")).is_err());
         assert!(split_root_operand(Path::new("/")).await.is_err());
         Ok(())
     }

@@ -1237,3 +1237,113 @@ fn test_preserve_settings_symlink_uses_symlink_settings() {
         "symlink mtime should be preserved with l:time (got recent mtime)"
     );
 }
+
+/// Build `<root>/proj/sub/file.txt` plus an empty sibling `<root>/dest`, returning
+/// `(root, sub, dest)`. Tests run the tool with cwd set to `sub` via `Command::current_dir`
+/// (child-process cwd only — no global state mutation), so a relative `.` resolves to `sub` and
+/// `..` to `proj`. `dest` is a sibling of `proj`, so copying `proj` into `dest` never self-copies.
+fn setup_dot_operand_tree() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let sub = root.path().join("proj").join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    create_test_file(&sub.join("file.txt"), "hello dot", 0o644);
+    let dest = root.path().join("dest");
+    std::fs::create_dir(&dest).unwrap();
+    (root, sub, dest)
+}
+
+#[test]
+fn copies_dot_and_dotdot_source_operands_into_trailing_slash_dest() {
+    // The trailing-slash "copy INTO dir" rule must work for `.`/`..` source operands, deriving the
+    // basename from the SAME canonicalization the copy operation uses, so `dest/<name>` matches the
+    // entry that gets created. cwd is `<root>/proj/sub`, so `.` == sub and `..` == proj.
+    let (_root, sub, dest) = setup_dot_operand_tree();
+    // (source operand run from cwd `sub`, expected file path created under `dest/`)
+    let cases: &[(&str, &str)] = &[
+        (".", "sub/file.txt"),
+        ("./", "sub/file.txt"),
+        ("..", "proj/sub/file.txt"),
+        ("../", "proj/sub/file.txt"),
+        ("../sub/..", "proj/sub/file.txt"), // embedded `..` canonicalizes to `proj`
+        ("../sub/.", "sub/file.txt"),       // trailing `/.` names the dir itself -> `sub`
+    ];
+    for (src, expected) in cases {
+        // fresh dest per case (rcp refuses to clobber an existing destination entry)
+        std::fs::remove_dir_all(&dest).unwrap();
+        std::fs::create_dir(&dest).unwrap();
+        let dst_arg = format!("{}/", dest.to_str().unwrap());
+        let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+        cmd.current_dir(&sub)
+            .args([*src, dst_arg.as_str()])
+            .assert()
+            .success();
+        let created = dest.join(expected);
+        assert!(
+            created.is_file(),
+            "operand {src:?} should copy the source into {created:?}"
+        );
+        assert_eq!(get_file_content(&created), "hello dot");
+    }
+}
+
+#[test]
+fn dot_source_without_trailing_slash_uses_dest_name_verbatim() {
+    // Deterministic contrast: WITHOUT a trailing slash the destination is the final name, so the
+    // result is knowable from the slash alone, independent of the source spelling. `rcp . X/named`
+    // copies the current directory AS `named`.
+    let (_root, sub, dest) = setup_dot_operand_tree();
+    let dst_arg = dest.join("named");
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.current_dir(&sub)
+        .args([".", dst_arg.to_str().unwrap()])
+        .assert()
+        .success();
+    let created = dest.join("named").join("file.txt");
+    assert!(created.is_file());
+    assert_eq!(get_file_content(&created), "hello dot");
+}
+
+#[test]
+fn copies_localhost_prefixed_dotdot_source_operand_into_trailing_slash_dest() {
+    // A `localhost:`-prefixed source parses as LOCAL (escape hatch), so its basename must be
+    // resolved the same way a plain local source is — by canonicalizing `..` — not lexically from
+    // the raw string (which still sees the `localhost:` host prefix and rejects the missing
+    // basename). `<root>/proj/sub/..` canonicalizes to `<root>/proj`, so the file lands at
+    // `dest/proj/sub/file.txt`.
+    let (root, sub, dest) = setup_dot_operand_tree();
+    let src_arg = format!("localhost:{}/proj/sub/..", root.path().to_str().unwrap());
+    let dst_arg = format!("{}/", dest.to_str().unwrap());
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.current_dir(&sub)
+        .args([src_arg.as_str(), dst_arg.as_str()])
+        .assert()
+        .success();
+    let created = dest.join("proj").join("sub").join("file.txt");
+    assert!(
+        created.is_file(),
+        "localhost-prefixed `..` source should copy into {created:?}"
+    );
+    assert_eq!(get_file_content(&created), "hello dot");
+}
+
+#[test]
+fn copies_tilde_dotdot_source_operand_into_trailing_slash_dest() {
+    // A `~`-prefixed source is tilde-expanded by the parser before canonicalization; the basename
+    // must be derived from the expanded path, not from the literal `~` (which has no real path to
+    // canonicalize). With HOME set to `<root>`, `~/proj/sub/..` expands to `<root>/proj/sub/..`,
+    // which canonicalizes to `<root>/proj`, so the file lands at `dest/proj/sub/file.txt`.
+    let (root, sub, dest) = setup_dot_operand_tree();
+    let dst_arg = format!("{}/", dest.to_str().unwrap());
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.current_dir(&sub)
+        .env("HOME", root.path())
+        .args(["~/proj/sub/..", dst_arg.as_str()])
+        .assert()
+        .success();
+    let created = dest.join("proj").join("sub").join("file.txt");
+    assert!(
+        created.is_file(),
+        "tilde-prefixed `..` source should copy into {created:?}"
+    );
+    assert_eq!(get_file_content(&created), "hello dot");
+}
