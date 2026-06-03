@@ -59,6 +59,18 @@ impl RemotePath {
             self.needs_remote_home = false;
         }
     }
+
+    /// Returns this path with `name` appended; the session and `needs_remote_home` flag are
+    /// preserved. Joining a name onto an absolute path stays absolute, and a
+    /// `needs_remote_home` path is allowed to be relative, so the [`RemotePath::new`]
+    /// invariant cannot be violated.
+    #[must_use]
+    pub fn joined(&self, name: &std::ffi::OsStr) -> RemotePath {
+        RemotePath {
+            path: self.path.join(name),
+            ..self.clone()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -152,20 +164,6 @@ fn split_remote_path(path_str: &str) -> (Option<String>, &str) {
 /// For local paths, returns the original path
 fn extract_filesystem_path(path_str: &str) -> &str {
     split_remote_path(path_str).1
-}
-
-/// Joins a filesystem path with a filename, handling both remote and local cases
-/// For example: ("user@host:22:", "/path/", "file.txt") -> "user@host:22:/path/file.txt"
-/// For local: (None, "/path/", "file.txt") -> "/path/file.txt"
-fn join_path_with_filename(host_prefix: Option<String>, dir_path: &str, filename: &str) -> String {
-    let fs_path = std::path::Path::new(dir_path);
-    let joined = fs_path.join(filename);
-    let joined_str = joined.to_string_lossy();
-    if let Some(prefix) = host_prefix {
-        format!("{prefix}{joined_str}")
-    } else {
-        joined_str.to_string()
-    }
 }
 
 pub fn expand_local_home(path: &str) -> anyhow::Result<std::path::PathBuf> {
@@ -306,40 +304,104 @@ pub fn validate_destination_path(dst_path_str: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolves destination path handling trailing slash semantics for both local and remote paths.
+/// Resolve the final destination for one source, applying the trailing-slash ("copy INTO
+/// directory") rule on the already-parsed destination.
 ///
-/// This function implements the logic: "foo/bar -> baz/" becomes "foo/bar -> baz/bar"
-/// i.e., when destination ends with '/', copy source INTO the directory.
-///
-/// # Arguments
-/// * `src_path_str` - Source path as string (before parsing)
-/// * `dst_path_str` - Destination path as string (before parsing)
-///
-/// # Returns
-/// * `Ok(resolved_dst_path)` - Destination path with trailing slash logic applied
-/// * `Err(...)` - If path resolution fails or invalid combination detected
-pub fn resolve_destination_path(src_path_str: &str, dst_path_str: &str) -> anyhow::Result<String> {
-    // validate destination path doesn't end with problematic patterns
-    validate_destination_path(dst_path_str)?;
-    if dst_path_str.ends_with('/') {
-        // extract source file name to append to destination directory
-        let actual_src_path = std::path::Path::new(extract_filesystem_path(src_path_str));
-        let src_file_name = actual_src_path.file_name().ok_or_else(|| {
-            anyhow::anyhow!("Source path {:?} does not have a basename", actual_src_path)
-        })?;
-        // construct destination: "baz/" + "bar" -> "baz/bar"
-        let (host_prefix, dir_path) = split_remote_path(dst_path_str);
-        let filename = src_file_name.to_string_lossy();
-        Ok(join_path_with_filename(host_prefix, dir_path, &filename))
-    } else {
+/// A `dst_str` ending in `/` means "copy INTO this directory": the source basename is appended
+/// to the parsed destination (`dst/<src_basename>`); otherwise the parsed destination is used
+/// verbatim. Classification (local vs remote) comes exclusively from the parsed values — the
+/// caller parses both with the active parse function, so `--force-remote` and the `localhost:`
+/// escape hatch are honored by construction. `dst_str` is consulted only for validation and
+/// the trailing-slash rule (parsing does not preserve a trailing slash). `dst` must be the
+/// result of parsing this same `dst_str` — the function trusts `dst_str` for the slash rule
+/// and `dst` for the value.
+pub fn resolve_destination(
+    src: &PathType,
+    dst: &PathType,
+    dst_str: &str,
+) -> anyhow::Result<PathType> {
+    // validate the destination string doesn't end with problematic patterns; rcp also
+    // validates once up front for early error ordering — these are cheap suffix checks, so
+    // the small redundancy keeps this function safe in isolation
+    validate_destination_path(dst_str)?;
+    if !dst_str.ends_with('/') {
         // no trailing slash - use destination as-is
-        Ok(dst_path_str.to_string())
+        return Ok(dst.clone());
     }
+    // derive the source basename to append, using the parser's classification
+    let src_file_name = match src {
+        PathType::Local(src_path) => {
+            // Local source: use the SAME decomposition the copy operation uses
+            // (`root_operand_basename` canonicalizes `.`/`..`/`dir/..`), so `dst/<name>` names
+            // exactly the entry that gets created — `rcp . out/` -> `out/<cwd-name>`. The path
+            // is already `~`-expanded and `localhost:`-stripped by the parser. A plain
+            // `file_name()` returns None for those operands and would reject them here, before
+            // `common::copy` could canonicalize the source.
+            common::walk::root_operand_basename(src_path)
+                .with_context(|| format!("resolving source operand {src_path:?}"))?
+        }
+        PathType::Remote(src_remote) => {
+            // Remote source: the basename must be resolved on the remote host, so only a
+            // lexical `file_name()` is available here. A remote operand with no basename — a
+            // path ending in `..`, or a bare `host:~` (stored as an empty path until the
+            // remote home is known) — would need remote resolution and is not supported.
+            let src_path = src_remote.path();
+            src_path
+                .file_name()
+                .map(std::ffi::OsStr::to_owned)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Remote source path {:?} does not have a basename that can be \
+                         resolved locally (e.g. a bare `host:~` or a path ending in `..`); \
+                         use a destination without a trailing slash to name the result \
+                         explicitly",
+                        src_path
+                    )
+                })?
+        }
+    };
+    // append the basename on the parsed destination: "baz/" + "bar" -> "baz/bar"
+    Ok(match dst {
+        PathType::Local(dir) => PathType::Local(dir.join(&src_file_name)),
+        PathType::Remote(dir) => PathType::Remote(dir.joined(&src_file_name)),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unwrap a local PathType or panic with a useful message.
+    fn expect_local(pt: PathType) -> std::path::PathBuf {
+        match pt {
+            PathType::Local(p) => p,
+            PathType::Remote(r) => panic!("expected local path, got remote {r:?}"),
+        }
+    }
+
+    /// Unwrap a remote PathType or panic with a useful message.
+    fn expect_remote(pt: PathType) -> RemotePath {
+        match pt {
+            PathType::Remote(r) => r,
+            PathType::Local(p) => panic!("expected remote path, got local {p:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_path_joined_appends_and_preserves_session_and_home_flag() {
+        // absolute remote path: joined name stays absolute, session fields preserved
+        let remote = expect_remote(parse_path("user@host:22:/backup/").unwrap());
+        let joined = remote.joined(std::ffi::OsStr::new("file.txt"));
+        assert_eq!(joined.path(), std::path::Path::new("/backup/file.txt"));
+        assert_eq!(joined.session(), remote.session());
+        assert!(!joined.needs_remote_home());
+        // bare remote tilde ("host:~/" parses to an empty path with needs_remote_home):
+        // the flag is preserved and the joined path stays relative until home expansion
+        let tilde = expect_remote(parse_path("host:~/").unwrap());
+        let joined = tilde.joined(std::ffi::OsStr::new("file.txt"));
+        assert!(joined.needs_remote_home());
+        assert_eq!(joined.path(), std::path::Path::new("file.txt"));
+    }
 
     #[test]
     fn test_parse_path_local() {
@@ -490,40 +552,126 @@ mod tests {
 
     #[test]
     fn test_resolve_destination_path_local_with_trailing_slash() {
-        let result = resolve_destination_path("/path/to/file.txt", "/dest/").unwrap();
-        assert_eq!(result, "/dest/file.txt");
+        let src = parse_path("/path/to/file.txt").unwrap();
+        let dst = parse_path("/dest/").unwrap();
+        let result = expect_local(resolve_destination(&src, &dst, "/dest/").unwrap());
+        assert_eq!(result, std::path::Path::new("/dest/file.txt"));
     }
 
     #[test]
     fn test_resolve_destination_path_local_without_trailing_slash() {
-        let result = resolve_destination_path("/path/to/file.txt", "/dest/newname.txt").unwrap();
-        assert_eq!(result, "/dest/newname.txt");
+        let src = parse_path("/path/to/file.txt").unwrap();
+        let dst = parse_path("/dest/newname.txt").unwrap();
+        let result = expect_local(resolve_destination(&src, &dst, "/dest/newname.txt").unwrap());
+        assert_eq!(result, std::path::Path::new("/dest/newname.txt"));
+    }
+
+    #[test]
+    fn test_resolve_destination_path_local_dotdot_source_uses_canonical_basename() {
+        // A local source with no lexical basename (`.`/`..`/`dir/..`) resolves through the same
+        // canonicalization the copy uses, so a trailing-slash dst appends the REAL entry name
+        // instead of failing. `<tmp>/sub/..` canonicalizes to `<tmp>`.
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let src = parse_path(&format!("{}/sub/..", tmp.path().to_str().unwrap())).unwrap();
+        let dst = parse_path("/dest/").unwrap();
+        let result = expect_local(resolve_destination(&src, &dst, "/dest/").unwrap());
+        let expected_name = tmp.path().file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            result,
+            std::path::PathBuf::from(format!("/dest/{expected_name}"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_destination_path_local_dotdot_source_into_remote_dest() {
+        // A LOCAL `.`/`..` source copied INTO a remote trailing-slash directory: the basename is
+        // resolved locally (canonicalize) and appended to the parsed remote destination.
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let src = parse_path(&format!("{}/sub/..", tmp.path().to_str().unwrap())).unwrap();
+        let dst = parse_path("host:/backup/").unwrap();
+        let result = expect_remote(resolve_destination(&src, &dst, "host:/backup/").unwrap());
+        let expected_name = tmp.path().file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            result.path(),
+            std::path::Path::new(&format!("/backup/{expected_name}"))
+        );
+        assert_eq!(result.session().host, "host");
+    }
+
+    #[test]
+    fn test_resolve_destination_path_localhost_dotdot_source_uses_canonical_basename() {
+        // A `localhost:`-prefixed source parses as LOCAL (escape hatch), so its basename resolves
+        // through the same canonicalization a plain local source uses, not lexically from the raw
+        // string. `<tmp>/sub/..` canonicalizes to `<tmp>`, so a trailing-slash dst appends the
+        // REAL entry name rather than failing on the missing lexical basename.
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let src = parse_path(&format!(
+            "localhost:{}/sub/..",
+            tmp.path().to_str().unwrap()
+        ))
+        .unwrap();
+        let dst = parse_path("/dest/").unwrap();
+        let result = expect_local(resolve_destination(&src, &dst, "/dest/").unwrap());
+        let expected_name = tmp.path().file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            result,
+            std::path::PathBuf::from(format!("/dest/{expected_name}"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_destination_path_remote_dotdot_source_is_unsupported() {
+        // A remote source's basename must be resolved on the remote host; a remote `.`/`..`
+        // operand (no lexical basename) is unsupported and errors rather than canonicalizing
+        // against the LOCAL filesystem.
+        let src = parse_path("host:/data/proj/..").unwrap();
+        let dst = parse_path("/dest/").unwrap();
+        let result = resolve_destination(&src, &dst, "/dest/");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("does not have a basename")
+        );
     }
 
     #[test]
     fn test_resolve_destination_path_remote_with_trailing_slash() {
-        let result = resolve_destination_path("host:/path/to/file.txt", "/dest/").unwrap();
-        assert_eq!(result, "/dest/file.txt");
+        let src = parse_path("host:/path/to/file.txt").unwrap();
+        let dst = parse_path("/dest/").unwrap();
+        let result = expect_local(resolve_destination(&src, &dst, "/dest/").unwrap());
+        assert_eq!(result, std::path::Path::new("/dest/file.txt"));
     }
 
     #[test]
     fn test_resolve_destination_path_remote_without_trailing_slash() {
-        let result =
-            resolve_destination_path("host:/path/to/file.txt", "/dest/newname.txt").unwrap();
-        assert_eq!(result, "/dest/newname.txt");
+        let src = parse_path("host:/path/to/file.txt").unwrap();
+        let dst = parse_path("/dest/newname.txt").unwrap();
+        let result = expect_local(resolve_destination(&src, &dst, "/dest/newname.txt").unwrap());
+        assert_eq!(result, std::path::Path::new("/dest/newname.txt"));
     }
 
     #[test]
     fn test_resolve_destination_path_remote_complex() {
-        let result =
-            resolve_destination_path("user@host:22:/home/user/docs/report.pdf", "host2:/backup/")
-                .unwrap();
-        assert_eq!(result, "host2:/backup/report.pdf");
+        let src = parse_path("user@host:22:/home/user/docs/report.pdf").unwrap();
+        let dst = parse_path("host2:/backup/").unwrap();
+        let result = expect_remote(resolve_destination(&src, &dst, "host2:/backup/").unwrap());
+        assert_eq!(result.path(), std::path::Path::new("/backup/report.pdf"));
+        assert_eq!(result.session().host, "host2");
+        assert_eq!(result.session().user, None);
+        assert_eq!(result.session().port, None);
     }
 
     #[test]
     fn test_validate_destination_path_dot_local() {
-        let result = resolve_destination_path("/path/to/file.txt", "/dest/.");
+        let result = validate_destination_path("/dest/.");
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(error.to_string().contains("cannot end with '/.'"));
@@ -532,7 +680,7 @@ mod tests {
 
     #[test]
     fn test_validate_destination_path_double_dot_local() {
-        let result = resolve_destination_path("/path/to/file.txt", "/dest/..");
+        let result = validate_destination_path("/dest/..");
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(error.to_string().contains("cannot end with '/..'"));
@@ -541,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_validate_destination_path_dot_remote() {
-        let result = resolve_destination_path("host:/path/to/file.txt", "host2:/dest/.");
+        let result = validate_destination_path("host2:/dest/.");
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(error.to_string().contains("cannot end with '/.'"));
@@ -549,7 +697,7 @@ mod tests {
 
     #[test]
     fn test_validate_destination_path_double_dot_remote() {
-        let result = resolve_destination_path("host:/path/to/file.txt", "host2:/dest/..");
+        let result = validate_destination_path("host2:/dest/..");
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(error.to_string().contains("cannot end with '/..'"));
@@ -557,7 +705,7 @@ mod tests {
 
     #[test]
     fn test_validate_destination_path_bare_dot() {
-        let result = resolve_destination_path("/path/to/file.txt", ".");
+        let result = validate_destination_path(".");
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(error.to_string().contains("cannot be '.'"));
@@ -565,7 +713,7 @@ mod tests {
 
     #[test]
     fn test_validate_destination_path_bare_double_dot() {
-        let result = resolve_destination_path("/path/to/file.txt", "..");
+        let result = validate_destination_path("..");
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(error.to_string().contains("cannot be '..'"));
@@ -573,7 +721,7 @@ mod tests {
 
     #[test]
     fn test_validate_destination_path_remote_bare_dot() {
-        let result = resolve_destination_path("host:/path/to/file.txt", "host2:.");
+        let result = validate_destination_path("host2:.");
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(error.to_string().contains("cannot be '.'"));
@@ -581,7 +729,7 @@ mod tests {
 
     #[test]
     fn test_validate_destination_path_remote_bare_double_dot() {
-        let result = resolve_destination_path("host:/path/to/file.txt", "host2:..");
+        let result = validate_destination_path("host2:..");
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(error.to_string().contains("cannot be '..'"));
@@ -590,34 +738,51 @@ mod tests {
     #[test]
     fn test_validate_destination_path_dot_with_slash_allowed() {
         // these should work fine because they end with '/' not '.'
-        let result = resolve_destination_path("/path/to/file.txt", "./").unwrap();
-        assert_eq!(result, "./file.txt");
-        let result = resolve_destination_path("/path/to/file.txt", "../").unwrap();
-        assert_eq!(result, "../file.txt");
+        let src = parse_path("/path/to/file.txt").unwrap();
+        let dst = parse_path("./").unwrap();
+        let result = expect_local(resolve_destination(&src, &dst, "./").unwrap());
+        assert_eq!(result, std::path::Path::new("./file.txt"));
+        let dst = parse_path("../").unwrap();
+        let result = expect_local(resolve_destination(&src, &dst, "../").unwrap());
+        assert_eq!(result, std::path::Path::new("../file.txt"));
     }
 
     #[test]
     fn test_validate_destination_path_normal_paths_allowed() {
         // normal paths should work fine
-        let result = resolve_destination_path("/path/to/file.txt", "/dest/normal").unwrap();
-        assert_eq!(result, "/dest/normal");
-        let result = resolve_destination_path("/path/to/file.txt", "/dest.txt").unwrap();
-        assert_eq!(result, "/dest.txt");
+        let src = parse_path("/path/to/file.txt").unwrap();
+        let dst = parse_path("/dest/normal").unwrap();
+        let result = expect_local(resolve_destination(&src, &dst, "/dest/normal").unwrap());
+        assert_eq!(result, std::path::Path::new("/dest/normal"));
+        let dst = parse_path("/dest.txt").unwrap();
+        let result = expect_local(resolve_destination(&src, &dst, "/dest.txt").unwrap());
+        assert_eq!(result, std::path::Path::new("/dest.txt"));
         // paths containing dots but not ending with them should work
-        let result = resolve_destination_path("/path/to/file.txt", "/dest.backup/").unwrap();
-        assert_eq!(result, "/dest.backup/file.txt");
+        let dst = parse_path("/dest.backup/").unwrap();
+        let result = expect_local(resolve_destination(&src, &dst, "/dest.backup/").unwrap());
+        assert_eq!(result, std::path::Path::new("/dest.backup/file.txt"));
     }
 
     #[test]
     fn test_resolve_destination_path_remote_with_complex_host() {
-        // test with complex remote paths including ports and IPv6
+        // complex remote destinations including ports and IPv6
+        let src = parse_path("host:/path/to/file.txt").unwrap();
+        let dst = parse_path("user@host2:22:/backup/").unwrap();
         let result =
-            resolve_destination_path("host:/path/to/file.txt", "user@host2:22:/backup/").unwrap();
-        assert_eq!(result, "user@host2:22:/backup/file.txt");
-
+            expect_remote(resolve_destination(&src, &dst, "user@host2:22:/backup/").unwrap());
+        assert_eq!(result.path(), std::path::Path::new("/backup/file.txt"));
+        assert_eq!(result.session().user, Some("user".to_string()));
+        assert_eq!(result.session().host, "host2");
+        assert_eq!(result.session().port, Some(22));
+        // note: bare [::1] parses as LOCAL (localhost escape hatch) — the source basename is
+        // identical either way; the IPv6 destination keeps host and port
+        let src = parse_path("[::1]:/path/file.txt").unwrap();
+        let dst = parse_path("[2001:db8::1]:8080:/dest/").unwrap();
         let result =
-            resolve_destination_path("[::1]:/path/file.txt", "[2001:db8::1]:8080:/dest/").unwrap();
-        assert_eq!(result, "[2001:db8::1]:8080:/dest/file.txt");
+            expect_remote(resolve_destination(&src, &dst, "[2001:db8::1]:8080:/dest/").unwrap());
+        assert_eq!(result.path(), std::path::Path::new("/dest/file.txt"));
+        assert_eq!(result.session().host, "[2001:db8::1]");
+        assert_eq!(result.session().port, Some(8080));
     }
 
     #[test]
@@ -672,29 +837,6 @@ mod tests {
     }
 
     #[test]
-    fn test_join_path_with_filename() {
-        // test remote path joining
-        assert_eq!(
-            join_path_with_filename(Some("user@host:22:".to_string()), "/backup/", "file.txt"),
-            "user@host:22:/backup/file.txt"
-        );
-        assert_eq!(
-            join_path_with_filename(Some("[::1]:8080:".to_string()), "/dest/", "file.txt"),
-            "[::1]:8080:/dest/file.txt"
-        );
-
-        // test local path joining
-        assert_eq!(
-            join_path_with_filename(None, "/backup/", "file.txt"),
-            "/backup/file.txt"
-        );
-        assert_eq!(
-            join_path_with_filename(None, "relative/", "file.txt"),
-            "relative/file.txt"
-        );
-    }
-
-    #[test]
     fn test_ipv6_edge_cases_consistency() {
         // Test that helper functions and parse_path handle IPv6 consistently
         // Note: [::1] without user/port is now treated as local (localhost),
@@ -725,14 +867,6 @@ mod tests {
                     );
                 }
                 PathType::Local(_) => panic!("parse_path should detect {case} as remote"),
-            }
-            // Test that join_path_with_filename can reconstruct correctly
-            if let (Some(host_prefix), dir_path) = split_remote_path(&case.replace("file", "")) {
-                let reconstructed = join_path_with_filename(Some(host_prefix), dir_path, "file");
-                assert_eq!(
-                    reconstructed, case,
-                    "Should be able to reconstruct {case} correctly"
-                );
             }
         }
         // [::1] without user/port is now local (localhost loopback)
@@ -836,5 +970,82 @@ mod tests {
         assert!(is_localhost("[::1]"));
         assert!(!is_localhost("example.com"));
         assert!(!is_localhost("192.168.1.1"));
+    }
+
+    #[test]
+    fn resolve_destination_no_trailing_slash_returns_dst_verbatim() {
+        // I1: without a trailing slash the parsed destination is the final name, used verbatim
+        let src = parse_path("/path/to/file.txt").unwrap();
+        let dst = parse_path("/dest/newname.txt").unwrap();
+        let result = expect_local(resolve_destination(&src, &dst, "/dest/newname.txt").unwrap());
+        assert_eq!(result, std::path::Path::new("/dest/newname.txt"));
+    }
+
+    #[test]
+    fn resolve_destination_joins_basename_on_local_dest() {
+        // I2: trailing-slash local destination gets the source basename appended; a
+        // `localhost:` destination parses as local (escape hatch) and behaves identically.
+        // (the `~/x/` local-destination leg needs a real HOME and is covered end-to-end by
+        // tilde_tests::test_local_copy_with_tilde_source_and_destination)
+        let src = parse_path("/path/to/file.txt").unwrap();
+        let dst = parse_path("/dest/").unwrap();
+        let result = expect_local(resolve_destination(&src, &dst, "/dest/").unwrap());
+        assert_eq!(result, std::path::Path::new("/dest/file.txt"));
+        let dst = parse_path("localhost:/dest/").unwrap();
+        let result = expect_local(resolve_destination(&src, &dst, "localhost:/dest/").unwrap());
+        assert_eq!(result, std::path::Path::new("/dest/file.txt"));
+    }
+
+    #[test]
+    fn resolve_destination_joins_basename_on_remote_dest_preserving_session() {
+        // I3: trailing-slash remote destination joins the name and keeps user/host/port
+        let src = parse_path("/path/to/file.txt").unwrap();
+        let dst = parse_path("user@host2:22:/backup/").unwrap();
+        let result =
+            expect_remote(resolve_destination(&src, &dst, "user@host2:22:/backup/").unwrap());
+        assert_eq!(result.path(), std::path::Path::new("/backup/file.txt"));
+        assert_eq!(result.session().user, Some("user".to_string()));
+        assert_eq!(result.session().host, "host2");
+        assert_eq!(result.session().port, Some(22));
+    }
+
+    #[test]
+    fn resolve_destination_remote_tilde_dest_preserves_needs_remote_home() {
+        // I4: "host:~/" parses to an empty remote path with needs_remote_home; joining the
+        // basename preserves that bookkeeping so apply_remote_home later yields home/<name>
+        let src = parse_path("/path/to/file.txt").unwrap();
+        let dst = parse_path("host:~/").unwrap();
+        let mut result = expect_remote(resolve_destination(&src, &dst, "host:~/").unwrap());
+        assert!(result.needs_remote_home());
+        assert_eq!(result.path(), std::path::Path::new("file.txt"));
+        result.apply_remote_home(std::path::Path::new("/home/user"));
+        assert_eq!(result.path(), std::path::Path::new("/home/user/file.txt"));
+    }
+
+    #[test]
+    fn resolve_destination_force_remote_localhost_dest_stays_remote() {
+        // I5: classification follows the caller's parse function — with --force-remote
+        // parsing, a localhost: destination resolves as remote (and a localhost: source
+        // uses the lexical remote basename)
+        let src = parse_path_force_remote("localhost:/src/file.txt").unwrap();
+        let dst = parse_path_force_remote("localhost:/dest/").unwrap();
+        let result = expect_remote(resolve_destination(&src, &dst, "localhost:/dest/").unwrap());
+        assert_eq!(result.path(), std::path::Path::new("/dest/file.txt"));
+        assert_eq!(result.session().host, "localhost");
+    }
+
+    #[test]
+    fn resolve_destination_rejects_invalid_destination_string() {
+        // the resolver is safe in isolation: it validates dst_str before touching the paths
+        let src = parse_path("/path/to/file.txt").unwrap();
+        let dst = parse_path("/dest/.").unwrap();
+        let result = resolve_destination(&src, &dst, "/dest/.");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot end with '/.'")
+        );
     }
 }

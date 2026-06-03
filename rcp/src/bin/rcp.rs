@@ -896,10 +896,9 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
     }
     // if any of the src/dst paths are remote, we'll be using the rcpd
     let remote_src_dst = if has_remote_paths {
-        // resolve destination path with trailing slash logic for remote case
-        let resolved_dst_string = path::resolve_destination_path(&src_strings[0], dst_string)?;
-        let resolved_dst_path_type = parse_fn(&resolved_dst_string)?;
-        match (first_src_path_type.clone(), resolved_dst_path_type) {
+        // resolve the destination with trailing-slash logic on the already-parsed paths
+        let resolved_dst = path::resolve_destination(&parsed_srcs[0], &dst_parsed, dst_string)?;
+        match (first_src_path_type.clone(), resolved_dst) {
             (path::PathType::Remote(src_remote), path::PathType::Remote(dst_remote)) => {
                 Some((src_remote, dst_remote))
             }
@@ -984,13 +983,12 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
             destination path with a trailing slash"
         ));
     }
-    let src_dst: Vec<(std::path::PathBuf, std::path::PathBuf)> = src_strings
+    let src_dst: Vec<(std::path::PathBuf, std::path::PathBuf)> = parsed_srcs
         .iter()
-        .zip(parsed_srcs.iter())
-        .map(|(src_str, parsed_src)| {
-            let resolved_dst = path::resolve_destination_path(src_str, dst_string)?;
-            // parse the resolved destination to handle localhost: prefix correctly
-            let dst_path = match parse_fn(&resolved_dst)? {
+        .map(|parsed_src| {
+            // the resolver preserves the destination's variant and this branch only runs when
+            // the destination parsed as local, so a remote result is an internal error
+            let dst_path = match path::resolve_destination(parsed_src, &dst_parsed, dst_string)? {
                 path::PathType::Local(p) => p,
                 path::PathType::Remote(_) => {
                     return Err(anyhow!(
