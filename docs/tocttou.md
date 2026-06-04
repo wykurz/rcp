@@ -134,6 +134,36 @@ A wildcard rule (`... --require-toctou-safe *`) enforces only the tool's half �
 walk, no `-L`. It does **not** make an arbitrary destination safe. Lock the paths down in the
 policy.
 
+### Name resolution under sudo (`rchm`)
+
+`rchm --owner <name>` / `--group <name>` resolve a user/group *name* to a numeric id. When the
+in-process lookup misses (the static musl release binaries have no NSS, so directory-service
+names from LDAP/SSSD/NIS are invisible), `rchm` spawns the host `getent` tool (directly, via an
+argument vector — never through a shell). Spawning a subprocess from a privileged process is a
+PATH-injection surface: `sudo` preserves the caller's
+`PATH` unless the policy sets `secure_path`, so a `getent` resolved through `PATH` could be an
+attacker-planted binary executed as root.
+
+`rchm` closes this without depending on the sudoers configuration:
+
+- **Privileged (effective-root):** `PATH` is **ignored**. `getent` is located only from a fixed
+  list of trusted, root-owned directories (`/usr/bin`, `/bin`, `/run/current-system/sw/bin`). If
+  it is not found there, the lookup errors rather than falling back to `PATH`.
+- **`--getent-path <ABSOLUTE>`:** pins the exact binary, bypassing both `PATH` and the probe.
+  Must be absolute (a relative path would re-introduce a `PATH`/cwd lookup) and may be given **at
+  most once** — a duplicate is rejected, because the wildcard sudo rules above (`... *`) would
+  otherwise let an attacker append a second `--getent-path` to override the value the rule pins.
+- **Numeric ids** (`--owner 1000`) never invoke `getent` at all — the safest option for a sudo
+  rule when the resolving environment is untrusted.
+
+```bash
+# Pin the resolver in the rule so name lookups never consult the caller's PATH:
+user ALL=(root) NOPASSWD: /usr/bin/rchm --require-toctou-safe --getent-path=/usr/bin/getent *
+```
+
+This is `rchm`-specific: `rcp`/`rlink` carry numeric ids from source metadata and never resolve
+names.
+
 ## What is TOCTTOU?
 
 TOCTTOU (Time-of-Check-Time-of-Use) is a class of race condition that occurs when:

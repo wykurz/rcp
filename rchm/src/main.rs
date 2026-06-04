@@ -97,6 +97,16 @@ struct Args {
     /// sudo rules: `NOPASSWD: /usr/bin/rchm --require-toctou-safe *`.
     #[arg(long, conflicts_with = "toctou_check", help_heading = "Security")]
     require_toctou_safe: bool,
+    /// Absolute path to the `getent` binary used to resolve user/group names
+    ///
+    /// When set, name lookups spawn exactly this binary instead of searching PATH. Bake it into a
+    /// sudo rule so a privileged rchm resolves names via a known-good getent regardless of the
+    /// caller's PATH (e.g. `--getent-path=/usr/bin/getent`). May be given at most once — a
+    /// duplicate is rejected so a trailing-wildcard sudo rule cannot be overridden with an
+    /// attacker-controlled path. When unset and running privileged, rchm searches a fixed list of
+    /// trusted system directories instead of PATH; numeric ids never need getent at all.
+    #[arg(long, value_name = "PATH", action = clap::ArgAction::Append, help_heading = "Security")]
+    getent_path: Vec<std::path::PathBuf>,
     /// Path(s) to modify
     #[arg()]
     paths: Vec<std::path::PathBuf>,
@@ -141,16 +151,31 @@ fn build_settings(args: &Args) -> Result<common::chmod::Settings> {
         .map(common::chmod::parse_mode_dsl)
         .transpose()?
         .unwrap_or_default();
+    // reduce repeated --getent-path to at most one. rejecting a duplicate (rather than taking the
+    // last) is a security property: the documented sudo rules end in a wildcard (`... *`), so an
+    // attacker could otherwise append a second --getent-path to override a value the rule baked in.
+    let getent_path = match args.getent_path.as_slice() {
+        [] => None,
+        [path] => Some(path.clone()),
+        _ => {
+            return Err(anyhow!(
+                "--getent-path may be given at most once (a duplicate could override the path \
+                 baked into a wildcard sudo rule)"
+            ));
+        }
+    };
+    let getent =
+        common::chmod::GetentResolver::from_cli(getent_path, common::chmod::is_privileged())?;
     let owner = args
         .owner
         .as_deref()
-        .map(|s| common::chmod::parse_owner_dsl(s, common::chmod::IdKind::User))
+        .map(|s| common::chmod::parse_owner_dsl(s, common::chmod::IdKind::User, &getent))
         .transpose()?
         .unwrap_or_default();
     let group = args
         .group
         .as_deref()
-        .map(|s| common::chmod::parse_owner_dsl(s, common::chmod::IdKind::Group))
+        .map(|s| common::chmod::parse_owner_dsl(s, common::chmod::IdKind::Group, &getent))
         .transpose()?
         .unwrap_or_default();
     if mode.is_empty() && owner.is_empty() && group.is_empty() {
