@@ -51,6 +51,34 @@ fn rejects_unknown_group() {
 }
 
 #[test]
+fn rejects_relative_getent_path() {
+    // a relative --getent-path would re-introduce a PATH/cwd lookup — rejected up front.
+    rchm()
+        .args(["--group", "data", "--getent-path", "getent", "/tmp"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("must be an absolute path"));
+}
+
+#[test]
+fn rejects_duplicate_getent_path() {
+    // a duplicate could override the path a wildcard sudo rule baked in — rejected, not last-wins.
+    rchm()
+        .args([
+            "--group",
+            "data",
+            "--getent-path",
+            "/usr/bin/getent",
+            "--getent-path",
+            "/tmp/evil/getent",
+            "/tmp",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("at most once"));
+}
+
+#[test]
 fn help_lists_operation_options() {
     rchm()
         .arg("--help")

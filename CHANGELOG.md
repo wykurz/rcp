@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   basename". The source basename for the trailing-slash form is now resolved
   through the same canonicalization the copy/link operation uses, so `dst/<name>`
   always matches the entry that gets created.
+- `rchm` `--owner`/`--group` name resolution now works for directory-service
+  (LDAP/SSSD/NIS) users and groups when using the static release binaries: when
+  the in-process lookup cannot see the name (static musl builds have no NSS and
+  read only `/etc/passwd`/`/etc/group`), `rchm` falls back to the host `getent`
+  tool, which carries full NSS. When running privileged (e.g. via `sudo`), the
+  `getent` binary is located from a fixed list of trusted system directories
+  rather than `PATH`, so a name lookup cannot exec an attacker-controlled binary
+  as root; `--getent-path <ABSOLUTE>` pins an exact binary (intended to be baked
+  into a sudo rule) and is rejected if given more than once. Numeric ids never
+  invoke `getent`.
 
 ## [0.33.0] - 2026-05-28
 

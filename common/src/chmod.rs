@@ -13,7 +13,7 @@ use crate::walk_driver::{
 use anyhow::{Context, anyhow};
 use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -190,32 +190,243 @@ pub enum IdKind {
     Group,
 }
 
-/// Resolve a DSL id token to a numeric id. All-numeric tokens are used directly;
-/// otherwise the token is looked up as a user/group name (matching `chown`/`chgrp`).
-fn resolve_id(token: &str, kind: IdKind) -> anyhow::Result<u32> {
-    if let Ok(n) = token.parse::<u32>() {
-        return Ok(n);
+impl IdKind {
+    /// The getent database to query for this kind.
+    fn getent_database(self) -> &'static str {
+        match self {
+            IdKind::User => "passwd",
+            IdKind::Group => "group",
+        }
     }
-    match kind {
-        IdKind::User => nix::unistd::User::from_name(token)
-            .with_context(|| format!("looking up user {token:?}"))?
-            .map(|u| u.uid.as_raw())
-            .ok_or_else(|| anyhow!("unknown user: {token}")),
-        IdKind::Group => nix::unistd::Group::from_name(token)
-            .with_context(|| format!("looking up group {token:?}"))?
-            .map(|g| g.gid.as_raw())
-            .ok_or_else(|| anyhow!("unknown group: {token}")),
+    /// Human label for error messages.
+    fn label(self) -> &'static str {
+        match self {
+            IdKind::User => "user",
+            IdKind::Group => "group",
+        }
     }
 }
 
+/// Resolve a DSL id token to a numeric id. All-numeric tokens are used directly;
+/// otherwise the token is looked up as a user/group name (matching `chown`/`chgrp`):
+/// first in-process (reads /etc/passwd & /etc/group; full NSS on dynamic-glibc
+/// builds), then via the host `getent` tool (located per `getent`), whose full NSS
+/// sees directory-service (LDAP/SSSD/NIS) names that static musl builds cannot.
+fn resolve_id(token: &str, kind: IdKind, getent: &GetentResolver) -> anyhow::Result<u32> {
+    if let Ok(n) = token.parse::<u32>() {
+        return Ok(n);
+    }
+    let in_process = match kind {
+        IdKind::User => {
+            nix::unistd::User::from_name(token).map(|user| user.map(|u| u.uid.as_raw()))
+        }
+        IdKind::Group => {
+            nix::unistd::Group::from_name(token).map(|group| group.map(|g| g.gid.as_raw()))
+        }
+    };
+    match in_process {
+        Ok(Some(id)) => Ok(id),
+        // a miss or an in-process lookup error both fall through to getent: the host
+        // tool is the authoritative lookup (full NSS), and on a real miss its
+        // "unknown user/group" verdict is the one worth reporting.
+        Ok(None) | Err(_) => resolve_via_getent(token, kind, getent),
+    }
+}
+
+/// `getent` exit status for "key not found" (glibc convention; other getent
+/// implementations may report a miss differently — those land in the generic
+/// failure arm, which still errors out but with the raw exit status).
+const GETENT_NOT_FOUND: i32 = 2;
+
+/// Resolve a name through the host `getent` tool. The host's getent is linked
+/// against the host libc with full NSS, so it sees directory-service entries
+/// (LDAP/SSSD/NIS) that are invisible to the in-process lookup in static builds
+/// (musl has no NSS and reads only /etc/passwd and /etc/group).
+///
+/// The binary to spawn comes from `getent` (see [`GetentResolver`]): an explicit
+/// `--getent-path`, a trusted-directory probe when privileged, or a normal PATH
+/// search when unprivileged. PATH is consulted only in that last, unprivileged case.
+fn resolve_via_getent(token: &str, kind: IdKind, getent: &GetentResolver) -> anyhow::Result<u32> {
+    match getent.program()? {
+        Some(path) => resolve_via_getent_cmd(path.as_os_str(), token, kind),
+        None => resolve_via_getent_cmd(OsStr::new("getent"), token, kind),
+    }
+}
+
+/// The [`resolve_via_getent`] body with the getent program injectable for tests.
+///
+/// `getent_program` is passed to [`std::process::Command::new`] as an `OsStr` — never
+/// lossily stringified first — so an exact `--getent-path` is spawned byte-for-byte even
+/// if it is not valid UTF-8. The lossy form is used only to render diagnostics.
+fn resolve_via_getent_cmd(
+    getent_program: &OsStr,
+    token: &str,
+    kind: IdKind,
+) -> anyhow::Result<u32> {
+    let database = kind.getent_database();
+    let label = kind.label();
+    // diagnostics only — the spawn above uses the OsStr verbatim.
+    let prog = getent_program.to_string_lossy();
+    // `--` terminates getent's option parsing, so a name that looks like an option (e.g.
+    // `--service=files`, reachable via `--group=--service=files`) is treated as the lookup
+    // key, not an option. Without it, GNU getent would honor the option, print the whole
+    // database, and this parser would take the first line's id — silently resolving a bogus
+    // name to uid/gid 0 instead of failing.
+    let output = std::process::Command::new(getent_program)
+        .args(["--", database, token])
+        .output()
+        .with_context(|| {
+            format!(
+                "cannot run `{prog} {database} {token}` to look up the {label} name; \
+                 use a numeric id instead"
+            )
+        })?;
+    if output.status.code() == Some(GETENT_NOT_FOUND) {
+        return Err(anyhow!("unknown {label}: {token}"));
+    }
+    if !output.status.success() {
+        let status = output.status;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        let detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        };
+        return Err(anyhow!(
+            "`{prog} {database} {token}` failed with {status}{detail}; \
+             use a numeric id instead"
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow!("`{prog} {database} {token}` produced no output"))?;
+    parse_getent_id(line).with_context(|| format!("unexpected getent output {line:?}"))
+}
+
+/// Directories searched for `getent` when running privileged, in order. PATH is
+/// **not** consulted in that case: a privileged `rchm` (e.g. via sudo) must never exec
+/// a binary that an unprivileged caller could have planted earlier on PATH. These dirs
+/// are root-owned on a sane system; `/run/current-system/sw/bin` covers NixOS, where
+/// system tools do not live in `/usr/bin`.
+const TRUSTED_GETENT_DIRS: &[&str] = &["/usr/bin", "/bin", "/run/current-system/sw/bin"];
+
+/// Whether this process runs with elevated privilege: effective-root, or a setuid
+/// mismatch (real ≠ effective uid). rchm is not installed setuid, but the mismatch
+/// check is cheap defense-in-depth. The check keys on uid, not Linux capabilities, so a
+/// `CAP_CHOWN` deployment without effective-root is treated as unprivileged (there the
+/// PATH is the operator's own, not a third party's).
+#[must_use]
+pub fn is_privileged() -> bool {
+    let euid = nix::unistd::geteuid();
+    euid.as_raw() == 0 || nix::unistd::getuid() != euid
+}
+
+/// Decides which `getent` binary name resolution spawns, hardened against PATH
+/// attacks when privileged. Built once from the CLI via [`GetentResolver::from_cli`].
+///
+/// The decision is deliberately *not* made at construction time: a numeric-only
+/// invocation (`--owner 0`) never needs `getent`, so the trusted-directory probe — and
+/// its "getent not found" error — must not fire then. The probe runs only when a name is
+/// actually looked up.
+#[derive(Clone, Debug)]
+pub struct GetentResolver {
+    /// An explicit `--getent-path`, validated absolute. Used verbatim, bypassing PATH.
+    explicit: Option<PathBuf>,
+    /// Whether to harden the unset case (privileged → trusted-dir probe, not PATH).
+    privileged: bool,
+}
+
+/// The unprivileged, no-override default: a normal PATH search. Used by tests and as a
+/// sensible base; production builds the resolver from the CLI via [`GetentResolver::from_cli`].
+impl Default for GetentResolver {
+    fn default() -> Self {
+        Self {
+            explicit: None,
+            privileged: false,
+        }
+    }
+}
+
+impl GetentResolver {
+    /// Build from the parsed CLI. `getent_path` is an explicit `--getent-path` (already
+    /// reduced to at most one by the caller); `privileged` is [`is_privileged`]. A
+    /// relative `--getent-path` is rejected here (fail-fast) — a relative program would
+    /// re-introduce a PATH/cwd lookup, defeating the point.
+    pub fn from_cli(getent_path: Option<PathBuf>, privileged: bool) -> anyhow::Result<Self> {
+        if let Some(path) = &getent_path
+            && !path.is_absolute()
+        {
+            return Err(anyhow!(
+                "--getent-path must be an absolute path, got {path:?}"
+            ));
+        }
+        Ok(Self {
+            explicit: getent_path,
+            privileged,
+        })
+    }
+
+    /// The `getent` binary to spawn, resolved on demand. `None` means "search PATH
+    /// normally" — returned only in the unprivileged, no-override case.
+    fn program(&self) -> anyhow::Result<Option<PathBuf>> {
+        self.program_in(TRUSTED_GETENT_DIRS)
+    }
+
+    /// [`Self::program`] with the trusted-directory list injected for tests.
+    fn program_in(&self, trusted_dirs: &[&str]) -> anyhow::Result<Option<PathBuf>> {
+        if let Some(path) = &self.explicit {
+            return Ok(Some(path.clone()));
+        }
+        if !self.privileged {
+            // unprivileged: a normal PATH search is fine — there is no privilege boundary
+            // to protect, and the caller's PATH (e.g. a nix profile) is what they expect.
+            return Ok(None);
+        }
+        // privileged: never consult PATH — find getent in a trusted, root-owned directory.
+        for dir in trusted_dirs {
+            let candidate = Path::new(dir).join("getent");
+            if candidate.is_file() {
+                return Ok(Some(candidate));
+            }
+        }
+        Err(anyhow!(
+            "running with elevated privilege and could not find `getent` in any trusted \
+             directory ({}); PATH is intentionally ignored when privileged so a name lookup \
+             cannot exec an attacker-controlled binary as root — pass an absolute \
+             --getent-path, or use numeric ids",
+            trusted_dirs.join(", ")
+        ))
+    }
+}
+
+/// Parse the numeric id out of a `getent passwd`/`getent group` line: the third
+/// colon-separated field is the uid (passwd) or gid (group).
+fn parse_getent_id(line: &str) -> anyhow::Result<u32> {
+    let field = line
+        .split(':')
+        .nth(2)
+        .ok_or_else(|| anyhow!("expected at least 3 ':'-separated fields"))?;
+    field
+        .parse::<u32>()
+        .with_context(|| format!("parsing id field {field:?}"))
+}
+
 /// Parse a `--group`/`--owner` DSL string. A bare token is the default for all
-/// types; `f:`/`d:`/`l:` sections override per type.
-pub fn parse_owner_dsl(s: &str, kind: IdKind) -> anyhow::Result<OwnerProgram> {
+/// types; `f:`/`d:`/`l:` sections override per type. `getent` locates the `getent`
+/// binary used to resolve any non-numeric, NSS-only names (see [`GetentResolver`]).
+pub fn parse_owner_dsl(
+    s: &str,
+    kind: IdKind,
+    getent: &GetentResolver,
+) -> anyhow::Result<OwnerProgram> {
     let mut prog = OwnerProgram::default();
     let mut bare: Option<u32> = None;
     for clause in s.split_whitespace() {
         if let Some((ty, rest)) = clause.split_once(':') {
-            let id = resolve_id(rest, kind)?;
+            let id = resolve_id(rest, kind, getent)?;
             match ty {
                 "f" | "file" => prog.file = Some(id),
                 "d" | "dir" | "directory" => prog.dir = Some(id),
@@ -227,7 +438,7 @@ pub fn parse_owner_dsl(s: &str, kind: IdKind) -> anyhow::Result<OwnerProgram> {
                 "multiple bare values in {s:?}; use f:/d:/l: prefixes to set different types"
             ));
         } else {
-            bare = Some(resolve_id(clause, kind)?);
+            bare = Some(resolve_id(clause, kind, getent)?);
         }
     }
     if let Some(b) = bare {
@@ -1136,39 +1347,225 @@ mod tests {
     }
     #[test]
     fn owner_dsl_bare_applies_to_all_types() {
-        let prog = parse_owner_dsl("0", IdKind::User).unwrap();
+        let prog = parse_owner_dsl("0", IdKind::User, &GetentResolver::default()).unwrap();
         assert_eq!(prog.file, Some(0));
         assert_eq!(prog.dir, Some(0));
         assert_eq!(prog.symlink, Some(0));
     }
     #[test]
     fn owner_dsl_per_type_overrides() {
-        let prog = parse_owner_dsl("f:1 d:2", IdKind::User).unwrap();
+        let prog = parse_owner_dsl("f:1 d:2", IdKind::User, &GetentResolver::default()).unwrap();
         assert_eq!(prog.file, Some(1));
         assert_eq!(prog.dir, Some(2));
         assert_eq!(prog.symlink, None);
     }
     #[test]
     fn owner_dsl_bare_plus_override() {
-        let prog = parse_owner_dsl("5 d:2", IdKind::Group).unwrap();
+        let prog = parse_owner_dsl("5 d:2", IdKind::Group, &GetentResolver::default()).unwrap();
         assert_eq!(prog.file, Some(5));
         assert_eq!(prog.dir, Some(2));
         assert_eq!(prog.symlink, Some(5));
     }
     #[test]
     fn owner_dsl_explicit_before_bare_is_order_independent() {
-        let prog = parse_owner_dsl("f:1 5", IdKind::User).unwrap();
+        let prog = parse_owner_dsl("f:1 5", IdKind::User, &GetentResolver::default()).unwrap();
         assert_eq!(prog.file, Some(1));
         assert_eq!(prog.dir, Some(5));
         assert_eq!(prog.symlink, Some(5));
     }
     #[test]
     fn owner_dsl_rejects_multiple_bare() {
-        assert!(parse_owner_dsl("1 2", IdKind::User).is_err());
+        assert!(parse_owner_dsl("1 2", IdKind::User, &GetentResolver::default()).is_err());
     }
     #[test]
     fn owner_dsl_rejects_unknown_id() {
-        assert!(parse_owner_dsl("definitely-no-such-group-xyz", IdKind::Group).is_err());
+        assert!(
+            parse_owner_dsl(
+                "definitely-no-such-group-xyz",
+                IdKind::Group,
+                &GetentResolver::default()
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn owner_dsl_resolves_root_name() {
+        // "root" is in /etc/passwd everywhere — covers the in-process from_name path
+        let prog = parse_owner_dsl("root", IdKind::User, &GetentResolver::default()).unwrap();
+        assert_eq!(prog.file, Some(0));
+        assert_eq!(prog.dir, Some(0));
+        assert_eq!(prog.symlink, Some(0));
+    }
+    #[test]
+    fn getent_id_parses_passwd_and_group_lines() {
+        // passwd: name:passwd:uid:gid:gecos:home:shell — field 3 is the uid
+        assert_eq!(
+            parse_getent_id("alice:x:1234:100:Alice:/home/alice:/bin/sh").unwrap(),
+            1234
+        );
+        // group: name:passwd:gid:members — field 3 is the gid
+        assert_eq!(parse_getent_id("data:*:5678:alice,bob").unwrap(), 5678);
+    }
+    #[test]
+    fn getent_id_rejects_malformed_lines() {
+        assert!(parse_getent_id("").is_err());
+        assert!(parse_getent_id("alice").is_err());
+        assert!(parse_getent_id("alice:x").is_err());
+        assert!(parse_getent_id("alice:x:notanumber:100").is_err());
+    }
+    /// Write an executable stub script into `dir` and return its path.
+    fn write_stub_getent(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+    #[test]
+    fn getent_stub_resolves_directory_service_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        // simulates an SSSD/LDAP-served entry: visible to getent, absent from /etc files. the
+        // guard asserts the args are `-- <database> <token>` — i.e. the `--` option terminator
+        // is present and the database lands in the right slot (a wrong database would exit 99).
+        let user_stub = write_stub_getent(
+            tmp.path(),
+            "getent-user",
+            "[ \"$1\" = -- ] && [ \"$2\" = passwd ] || exit 99\necho 'ldapuser:*:4242:4242:LDAP User:/home/ldapuser:/bin/sh'",
+        );
+        let group_stub = write_stub_getent(
+            tmp.path(),
+            "getent-group",
+            "[ \"$1\" = -- ] && [ \"$2\" = group ] || exit 99\necho 'ldapgroup:*:4343:ldapuser'",
+        );
+        assert_eq!(
+            resolve_via_getent_cmd(user_stub.as_os_str(), "ldapuser", IdKind::User).unwrap(),
+            4242
+        );
+        assert_eq!(
+            resolve_via_getent_cmd(group_stub.as_os_str(), "ldapgroup", IdKind::Group).unwrap(),
+            4343
+        );
+    }
+    #[test]
+    fn getent_stub_not_found_is_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = write_stub_getent(tmp.path(), "getent-miss", "exit 2");
+        let err = resolve_via_getent_cmd(stub.as_os_str(), "nosuch", IdKind::Group).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unknown group: nosuch"),
+            "got: {err:#}"
+        );
+    }
+    #[test]
+    fn getent_missing_program_suggests_numeric_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-such-getent");
+        let err = resolve_via_getent_cmd(missing.as_os_str(), "alice", IdKind::User).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("use a numeric id instead"),
+            "got: {err:#}"
+        );
+    }
+    #[test]
+    fn getent_stub_garbled_output_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = write_stub_getent(tmp.path(), "getent-garbled", "echo 'not a passwd line'");
+        let err = resolve_via_getent_cmd(stub.as_os_str(), "alice", IdKind::User).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unexpected getent output"),
+            "got: {err:#}"
+        );
+    }
+    #[test]
+    fn getent_stub_exit0_no_output_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = write_stub_getent(tmp.path(), "getent-empty", "exit 0");
+        let err = resolve_via_getent_cmd(stub.as_os_str(), "alice", IdKind::User).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("produced no output"),
+            "got: {err:#}"
+        );
+    }
+    #[test]
+    fn getent_real_resolves_root() {
+        // root exists in /etc/passwd and /etc/group on every supported host; this
+        // exercises the real `getent` end-to-end (spawn + parse).
+        assert_eq!(
+            resolve_via_getent("root", IdKind::User, &GetentResolver::default()).unwrap(),
+            0
+        );
+        assert_eq!(
+            resolve_via_getent("root", IdKind::Group, &GetentResolver::default()).unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn getent_real_option_like_name_fails_closed_no_injection() {
+        // a name starting with `-` must NOT be parsed as a getent option. Without the `--`
+        // terminator, `getent group --service=files` exits 0 and prints the whole database, so
+        // this parser would take the first line and silently resolve to gid 0. With `--` the
+        // name is a lookup key, found in no DB, so resolution fails closed. Reachable in the CLI
+        // via `rchm --group=--service=files` — a bogus name must never map to root.
+        let err = resolve_via_getent("--service=files", IdKind::Group, &GetentResolver::default())
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown group") || msg.contains("produced no output"),
+            "option-like name must fail closed (not resolve to an id), got: {msg}"
+        );
+    }
+    #[test]
+    fn getent_source_rejects_relative_explicit_path() {
+        // a relative --getent-path would re-introduce a PATH/cwd lookup — rejected up front.
+        let err = GetentResolver::from_cli(Some(PathBuf::from("getent")), false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("must be an absolute path"),
+            "got: {err:#}"
+        );
+    }
+    #[test]
+    fn getent_source_explicit_absolute_used_even_when_privileged() {
+        // an explicit absolute path is honored verbatim and bypasses the trusted-dir probe.
+        let resolver =
+            GetentResolver::from_cli(Some(PathBuf::from("/opt/nss/getent")), true).unwrap();
+        assert_eq!(
+            resolver.program_in(&["/usr/bin"]).unwrap(),
+            Some(PathBuf::from("/opt/nss/getent"))
+        );
+    }
+    #[test]
+    fn getent_source_unprivileged_searches_path() {
+        // unprivileged + no override → None means "search PATH normally".
+        let resolver = GetentResolver::from_cli(None, false).unwrap();
+        assert_eq!(resolver.program_in(&["/nonexistent"]).unwrap(), None);
+    }
+    #[test]
+    fn getent_source_privileged_probes_trusted_dirs_not_path() {
+        // privileged + no override → use getent found in a trusted dir; PATH is never consulted.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("getent");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        let resolver = GetentResolver::from_cli(None, true).unwrap();
+        let dirs = [tmp.path().to_str().unwrap()];
+        assert_eq!(resolver.program_in(&dirs).unwrap(), Some(bin));
+    }
+    #[test]
+    fn getent_source_privileged_missing_getent_errors_not_path_fallback() {
+        // privileged + no override + getent absent from every trusted dir → hard error,
+        // NOT a silent PATH fallback (the core anti-PATH-attack guarantee).
+        let tmp = tempfile::tempdir().unwrap(); // empty: no getent inside
+        let resolver = GetentResolver::from_cli(None, true).unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let err = resolver.program_in(&[dir]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("PATH is intentionally ignored"),
+            "should explain PATH is not consulted, got: {msg}"
+        );
+        assert!(
+            msg.contains(dir),
+            "should name the searched dir, got: {msg}"
+        );
     }
     fn sym(s: &str) -> ModeSpec {
         parse_mode_token(s).unwrap()
@@ -1267,10 +1664,10 @@ mod tests {
                 parse_mode_dsl(mode).unwrap()
             },
             owner: owner
-                .map(|s| parse_owner_dsl(s, IdKind::User).unwrap())
+                .map(|s| parse_owner_dsl(s, IdKind::User, &GetentResolver::default()).unwrap())
                 .unwrap_or_default(),
             group: group
-                .map(|s| parse_owner_dsl(s, IdKind::Group).unwrap())
+                .map(|s| parse_owner_dsl(s, IdKind::Group, &GetentResolver::default()).unwrap())
                 .unwrap_or_default(),
             fail_early: false,
             defer_dir_changes: false,
