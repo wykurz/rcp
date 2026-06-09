@@ -46,6 +46,15 @@ struct Args {
     )]
     overwrite_compare: String,
 
+    /// Max pre-existing destination entries per directory eligible for skip-without-transfer.
+    #[arg(
+        long,
+        default_value_t = remote::protocol::DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES,
+        value_name = "N",
+        help_heading = "Copy options"
+    )]
+    overwrite_manifest_max_entries: usize,
+
     /// Skip overwriting files that match a condition (used with --overwrite)
     #[arg(
         long,

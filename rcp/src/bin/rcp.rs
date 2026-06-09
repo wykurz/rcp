@@ -59,6 +59,16 @@ struct Args {
     )]
     overwrite_compare: String,
 
+    /// Max pre-existing destination entries per directory eligible for skip-without-transfer
+    /// (remote --overwrite/--ignore-existing). Above this, that directory transfers normally.
+    #[arg(
+        long,
+        default_value_t = remote::protocol::DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES,
+        value_name = "N",
+        help_heading = "Copy options"
+    )]
+    overwrite_manifest_max_entries: usize,
+
     /// Skip overwriting files that match a condition
     ///
     /// Available filters: "newer" (skip if destination mtime is strictly newer than source).
@@ -462,6 +472,7 @@ async fn run_rcpd_master(
         dereference: args.dereference,
         overwrite: args.overwrite,
         overwrite_compare: args.overwrite_compare.clone(),
+        overwrite_manifest_max_entries: args.overwrite_manifest_max_entries,
         overwrite_filter: args.overwrite_filter.map(|f| f.to_string()),
         ignore_existing: args.ignore_existing,
         skip_specials: args.skip_specials,
