@@ -5401,3 +5401,214 @@ fn test_remote_dest_symlink_at_file_path_not_followed_out_of_tree() {
         "planted file-path symlink should remain a symlink"
     );
 }
+
+/// re-syncing a directory whose files are byte-and-mtime identical must transfer NO file data:
+/// every file is files_unchanged, bytes_copied is 0, and the source-skip marker proves the data
+/// path was never opened (vs today's "send then drain").
+#[test]
+fn test_remote_overwrite_skips_identical_files_in_directory() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_sub = src_dir.path().join("tree");
+    let dst_sub = dst_dir.path().join("tree");
+    std::fs::create_dir(&src_sub).unwrap();
+    std::fs::create_dir(&dst_sub).unwrap();
+    for i in 0..3 {
+        let name = format!("f{i}.txt");
+        let content = format!("identical content {i}");
+        create_test_file(&src_sub.join(&name), &content, 0o644);
+        create_test_file(&dst_sub.join(&name), &content, 0o644);
+        // make mtimes identical so the default size,mtime quick-check matches
+        let t = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        filetime::set_file_mtime(src_sub.join(&name), t).unwrap();
+        filetime::set_file_mtime(dst_sub.join(&name), t).unwrap();
+    }
+    let src_remote = format!("localhost:{}", src_sub.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_sub.to_str().unwrap());
+    let output =
+        run_rcp_and_expect_success(&["--overwrite", "--summary", &src_remote, &dst_remote]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 0, "no file should be copied");
+    assert_eq!(summary.files_unchanged, 3, "all 3 files unchanged");
+    assert_eq!(summary.bytes_copied, 0, "no bytes written");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("skipping transfer (manifest)"),
+        "source-skip marker should appear (proving data was not sent), got:\n{combined}"
+    );
+}
+
+/// a mix of identical + changed + new files: only changed/new transfer; identical are skipped.
+#[test]
+fn test_remote_overwrite_partial_overlap_transfers_only_changed() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_sub = src_dir.path().join("tree");
+    let dst_sub = dst_dir.path().join("tree");
+    std::fs::create_dir(&src_sub).unwrap();
+    std::fs::create_dir(&dst_sub).unwrap();
+    let t = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+    // identical file
+    create_test_file(&src_sub.join("same.txt"), "same", 0o644);
+    create_test_file(&dst_sub.join("same.txt"), "same", 0o644);
+    filetime::set_file_mtime(src_sub.join("same.txt"), t).unwrap();
+    filetime::set_file_mtime(dst_sub.join("same.txt"), t).unwrap();
+    // changed file (different content => different size)
+    create_test_file(&src_sub.join("changed.txt"), "new longer content", 0o644);
+    create_test_file(&dst_sub.join("changed.txt"), "old", 0o644);
+    // brand-new file (not at destination)
+    create_test_file(&src_sub.join("new.txt"), "brand new", 0o644);
+    let src_remote = format!("localhost:{}", src_sub.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_sub.to_str().unwrap());
+    let output =
+        run_rcp_and_expect_success(&["--overwrite", "--summary", &src_remote, &dst_remote]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_unchanged, 1, "same.txt unchanged");
+    assert_eq!(summary.files_copied, 2, "changed.txt + new.txt copied");
+    // only the changed + new files' bytes cross the wire (18 + 9); same.txt contributes none
+    assert_eq!(summary.bytes_copied, 27, "only changed.txt + new.txt bytes");
+    assert_eq!(
+        get_file_content(&dst_sub.join("changed.txt")),
+        "new longer content"
+    );
+    assert_eq!(get_file_content(&dst_sub.join("new.txt")), "brand new");
+}
+
+/// a file whose SIZE matches but mtime differs must be re-sent (default compare is size,mtime).
+/// content is held same-length-but-different only so we can confirm the new bytes actually land —
+/// the size,mtime quick-check ignores content, so the resend is attributable to the mtime.
+#[test]
+fn test_remote_overwrite_resends_when_mtime_differs() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_sub = src_dir.path().join("tree");
+    let dst_sub = dst_dir.path().join("tree");
+    std::fs::create_dir(&src_sub).unwrap();
+    std::fs::create_dir(&dst_sub).unwrap();
+    // same length (10 bytes), different bytes, different mtime
+    create_test_file(&src_sub.join("f.txt"), "fresh data", 0o644);
+    create_test_file(&dst_sub.join("f.txt"), "stale data", 0o644);
+    filetime::set_file_mtime(
+        src_sub.join("f.txt"),
+        filetime::FileTime::from_unix_time(2_000_000_000, 0),
+    )
+    .unwrap();
+    filetime::set_file_mtime(
+        dst_sub.join("f.txt"),
+        filetime::FileTime::from_unix_time(1_000_000_000, 0),
+    )
+    .unwrap();
+    let src_remote = format!("localhost:{}", src_sub.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_sub.to_str().unwrap());
+    let output =
+        run_rcp_and_expect_success(&["--overwrite", "--summary", &src_remote, &dst_remote]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 1, "mtime differs => re-send");
+    assert_eq!(summary.files_unchanged, 0);
+    // confirm the resend actually wrote the source bytes (not merely counted it)
+    assert_eq!(get_file_content(&dst_sub.join("f.txt")), "fresh data");
+}
+
+/// --ignore-existing skips any colliding file by name without transfer (content untouched).
+#[test]
+fn test_remote_ignore_existing_skips_colliding_files_in_directory() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_sub = src_dir.path().join("tree");
+    let dst_sub = dst_dir.path().join("tree");
+    std::fs::create_dir(&src_sub).unwrap();
+    std::fs::create_dir(&dst_sub).unwrap();
+    create_test_file(&src_sub.join("keep.txt"), "source version", 0o644);
+    create_test_file(&dst_sub.join("keep.txt"), "destination version", 0o644);
+    create_test_file(&src_sub.join("fresh.txt"), "fresh", 0o644);
+    let src_remote = format!("localhost:{}", src_sub.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_sub.to_str().unwrap());
+    let output =
+        run_rcp_and_expect_success(&["--ignore-existing", "--summary", &src_remote, &dst_remote]);
+    assert_eq!(
+        get_file_content(&dst_sub.join("keep.txt")),
+        "destination version"
+    );
+    assert_eq!(get_file_content(&dst_sub.join("fresh.txt")), "fresh");
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_unchanged, 1);
+    assert_eq!(summary.files_copied, 1);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("skipping transfer (manifest)"),
+        "source-skip marker should appear for the colliding file, got:\n{combined}"
+    );
+}
+
+/// type mismatch under --overwrite: dest has a SYMLINK where source has a file => must send and
+/// replace (the manifest marks it is_file=false, so the source does not skip).
+#[test]
+fn test_remote_overwrite_sends_when_dest_entry_is_symlink() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_sub = src_dir.path().join("tree");
+    let dst_sub = dst_dir.path().join("tree");
+    std::fs::create_dir(&src_sub).unwrap();
+    std::fs::create_dir(&dst_sub).unwrap();
+    create_test_file(&src_sub.join("x"), "real file content", 0o644);
+    std::os::unix::fs::symlink("/nonexistent", dst_sub.join("x")).unwrap();
+    let src_remote = format!("localhost:{}", src_sub.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_sub.to_str().unwrap());
+    let output =
+        run_rcp_and_expect_success(&["--overwrite", "--summary", &src_remote, &dst_remote]);
+    assert!(
+        !dst_sub.join("x").is_symlink(),
+        "symlink should be replaced by a file"
+    );
+    assert_eq!(get_file_content(&dst_sub.join("x")), "real file content");
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_copied, 1);
+    assert_eq!(
+        summary.files_unchanged, 0,
+        "a type-mismatched dest entry must not be skipped"
+    );
+}
+
+/// large-directory safeguard: with the cap set to 1, a 2-entry reused dir falls back to
+/// transfer-and-drain — identical files are still unchanged, but the source-skip marker is absent.
+#[test]
+fn test_remote_overwrite_manifest_cap_falls_back_to_transfer() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_sub = src_dir.path().join("tree");
+    let dst_sub = dst_dir.path().join("tree");
+    std::fs::create_dir(&src_sub).unwrap();
+    std::fs::create_dir(&dst_sub).unwrap();
+    let t = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+    for i in 0..2 {
+        let name = format!("f{i}.txt");
+        create_test_file(&src_sub.join(&name), "same", 0o644);
+        create_test_file(&dst_sub.join(&name), "same", 0o644);
+        filetime::set_file_mtime(src_sub.join(&name), t).unwrap();
+        filetime::set_file_mtime(dst_sub.join(&name), t).unwrap();
+    }
+    let src_remote = format!("localhost:{}", src_sub.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_sub.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&[
+        "--overwrite",
+        "--overwrite-manifest-max-entries=1",
+        "--summary",
+        &src_remote,
+        &dst_remote,
+    ]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    // still correct: identical files are unchanged (destination drains them), no bytes written
+    assert_eq!(summary.files_unchanged, 2);
+    assert_eq!(summary.bytes_copied, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !combined.contains("skipping transfer (manifest)"),
+        "above the cap the manifest is omitted, so the source must NOT skip-by-manifest"
+    );
+}
