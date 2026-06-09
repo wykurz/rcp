@@ -43,6 +43,52 @@ impl std::fmt::Display for OverwriteFilter {
     }
 }
 
+/// A destination entry the source compares against, taken from the directory manifest.
+pub struct ExistingDst<'a, M: crate::preserve::Metadata> {
+    /// The destination entry's metadata (with `size()` populated).
+    pub meta: &'a M,
+    /// Whether the destination entry is a regular file (only files are eligible for the
+    /// metadata-equality compare; a non-file means the source must send so the destination
+    /// can remove-and-replace it).
+    pub is_file: bool,
+}
+
+/// Decide whether the source may SKIP sending a file because the destination already holds a
+/// matching entry. `dst` is `None` when the destination has no entry at that name. Returns
+/// `true` to skip (the caller sends a `FileUnchanged` notification instead of file data).
+///
+/// This mirrors the destination's `process_single_file` identical/`--ignore-existing`/newer
+/// checks, so the source pre-filters exactly the files the destination would otherwise receive
+/// and drain. Skipping performs no filesystem mutation.
+pub fn skip_unchanged_send<S, D>(
+    overwrite_compare: &filecmp::MetadataCmpSettings,
+    overwrite_filter: Option<OverwriteFilter>,
+    ignore_existing: bool,
+    src: &S,
+    dst: Option<ExistingDst<'_, D>>,
+) -> bool
+where
+    S: crate::preserve::Metadata + std::fmt::Debug,
+    D: crate::preserve::Metadata + std::fmt::Debug,
+{
+    let Some(dst) = dst else {
+        return false; // nothing at the destination — must send
+    };
+    if ignore_existing {
+        return true; // any pre-existing entry (file/dir/symlink) — skip
+    }
+    if !dst.is_file {
+        return false; // dest is a non-file under --overwrite — send so dest replaces it
+    }
+    if filecmp::metadata_equal(overwrite_compare, src, dst.meta) {
+        return true; // identical per --overwrite-compare
+    }
+    if overwrite_filter == Some(OverwriteFilter::Newer) && filecmp::dest_is_newer(src, dst.meta) {
+        return true; // --overwrite-filter=newer and destination is strictly newer
+    }
+    false
+}
+
 /// Settings controlling rsync-style `--delete` (mirror) behavior.
 ///
 /// Present (`Some`) only when `--delete` was requested. `None` means the
@@ -5903,5 +5949,209 @@ mod copy_tests {
             assert_eq!(content, format!("content {i}"));
         }
         Ok(())
+    }
+
+    // fake metadata carrying the fields --overwrite-compare can use (size, mtime, uid, gid, mode).
+    #[derive(Clone, Debug)]
+    struct CmpMeta {
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        size: u64,
+        mtime: i64,
+    }
+    impl crate::preserve::Metadata for CmpMeta {
+        fn uid(&self) -> u32 {
+            self.uid
+        }
+        fn gid(&self) -> u32 {
+            self.gid
+        }
+        fn atime(&self) -> i64 {
+            0
+        }
+        fn atime_nsec(&self) -> i64 {
+            0
+        }
+        fn mtime(&self) -> i64 {
+            self.mtime
+        }
+        fn mtime_nsec(&self) -> i64 {
+            0
+        }
+        fn permissions(&self) -> std::fs::Permissions {
+            std::os::unix::fs::PermissionsExt::from_mode(self.mode)
+        }
+        fn size(&self) -> u64 {
+            self.size
+        }
+    }
+
+    fn size_mtime() -> filecmp::MetadataCmpSettings {
+        filecmp::MetadataCmpSettings {
+            size: true,
+            mtime: true,
+            ..Default::default()
+        }
+    }
+    fn base() -> CmpMeta {
+        CmpMeta {
+            uid: 0,
+            gid: 0,
+            mode: 0o644,
+            size: 10,
+            mtime: 100,
+        }
+    }
+
+    #[test]
+    fn skip_send_no_existing_entry_sends() {
+        let src = base();
+        let r = skip_unchanged_send(
+            &size_mtime(),
+            None,
+            false,
+            &src,
+            None::<ExistingDst<CmpMeta>>,
+        );
+        assert!(!r);
+    }
+
+    #[test]
+    fn skip_send_ignore_existing_skips_any_type() {
+        let src = base();
+        let dst = base();
+        let r = skip_unchanged_send(
+            &size_mtime(),
+            None,
+            true,
+            &src,
+            Some(ExistingDst {
+                meta: &dst,
+                is_file: false,
+            }),
+        );
+        assert!(r);
+    }
+
+    #[test]
+    fn skip_send_overwrite_identical_skips() {
+        let src = base();
+        let dst = base();
+        let r = skip_unchanged_send(
+            &size_mtime(),
+            None,
+            false,
+            &src,
+            Some(ExistingDst {
+                meta: &dst,
+                is_file: true,
+            }),
+        );
+        assert!(r);
+    }
+
+    #[test]
+    fn skip_send_overwrite_different_size_sends() {
+        let src = base();
+        let dst = CmpMeta { size: 11, ..base() };
+        let r = skip_unchanged_send(
+            &size_mtime(),
+            None,
+            false,
+            &src,
+            Some(ExistingDst {
+                meta: &dst,
+                is_file: true,
+            }),
+        );
+        assert!(!r);
+    }
+
+    #[test]
+    fn skip_send_overwrite_different_mtime_sends() {
+        let src = base();
+        let dst = CmpMeta {
+            mtime: 200,
+            ..base()
+        };
+        let r = skip_unchanged_send(
+            &size_mtime(),
+            None,
+            false,
+            &src,
+            Some(ExistingDst {
+                meta: &dst,
+                is_file: true,
+            }),
+        );
+        assert!(!r);
+    }
+
+    #[test]
+    fn skip_send_overwrite_non_file_sends() {
+        let src = base();
+        let dst = base();
+        let r = skip_unchanged_send(
+            &size_mtime(),
+            None,
+            false,
+            &src,
+            Some(ExistingDst {
+                meta: &dst,
+                is_file: false,
+            }),
+        );
+        assert!(!r);
+    }
+
+    #[test]
+    fn skip_send_filter_newer_skips_when_dest_newer() {
+        let src = CmpMeta {
+            mtime: 100,
+            size: 5,
+            ..base()
+        };
+        let dst = CmpMeta {
+            mtime: 200,
+            size: 11,
+            ..base()
+        };
+        let r = skip_unchanged_send(
+            &size_mtime(),
+            Some(OverwriteFilter::Newer),
+            false,
+            &src,
+            Some(ExistingDst {
+                meta: &dst,
+                is_file: true,
+            }),
+        );
+        assert!(r);
+    }
+
+    #[test]
+    fn skip_send_filter_newer_sends_when_dest_older() {
+        let src = CmpMeta {
+            mtime: 200,
+            size: 5,
+            ..base()
+        };
+        let dst = CmpMeta {
+            mtime: 100,
+            size: 11,
+            ..base()
+        };
+        let r = skip_unchanged_send(
+            &size_mtime(),
+            Some(OverwriteFilter::Newer),
+            false,
+            &src,
+            Some(ExistingDst {
+                meta: &dst,
+                is_file: true,
+            }),
+        );
+        assert!(!r);
     }
 }
