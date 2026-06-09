@@ -1095,6 +1095,25 @@ async fn process_control_stream(
                     .await
                     .context("Failed to update tracker for skipped file")?;
             }
+            remote::protocol::SourceMessage::FileUnchanged { ref src, ref dst } => {
+                tracing::info!(
+                    "File unchanged, source skipped transfer: {:?} -> {:?}",
+                    src,
+                    dst
+                );
+                // destination is authoritative for files_unchanged (matches the drain path
+                // in process_single_file).
+                prog.files_unchanged.inc();
+                let parent_dir = dst
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("unchanged file {:?} has no parent", dst))?;
+                directory_tracker
+                    .lock()
+                    .await
+                    .process_file(parent_dir)
+                    .await
+                    .context("Failed to update tracker for unchanged file")?;
+            }
             remote::protocol::SourceMessage::SymlinkSkipped {
                 ref src_dst,
                 is_root,
