@@ -50,6 +50,12 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::prelude::PermissionsExt;
 
+/// Default cap on the number of pre-existing destination entries the destination will put in a
+/// directory's overwrite/ignore-existing manifest. Above this, the manifest is omitted and that
+/// directory falls back to transferring-and-draining files (see `docs/remote_protocol.md`). High
+/// by default — rcp typically runs on large hosts; the cap is a backstop, not a normal limit.
+pub const DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES: usize = 5_000_000;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Metadata {
     pub mode: u32,
@@ -299,6 +305,8 @@ pub struct RcpdConfig {
     pub dereference: bool,
     pub overwrite: bool,
     pub overwrite_compare: String,
+    /// Cap on pre-existing entries put into a directory's overwrite/ignore-existing manifest.
+    pub overwrite_manifest_max_entries: usize,
     pub overwrite_filter: Option<String>,
     pub ignore_existing: bool,
     pub skip_specials: bool,
@@ -341,6 +349,10 @@ impl RcpdConfig {
             format!("--iops-throttle={}", self.iops_throttle),
             format!("--chunk-size={}", self.chunk_size),
             format!("--overwrite-compare={}", self.overwrite_compare),
+            format!(
+                "--overwrite-manifest-max-entries={}",
+                self.overwrite_manifest_max_entries
+            ),
         ];
         if self.verbose > 0 {
             args.push(format!("-{}", "v".repeat(self.verbose as usize)));
@@ -596,7 +608,20 @@ mod tests {
             tokio_console_port: None,
             encryption: true,
             master_cert_fingerprint: None,
+            overwrite_manifest_max_entries: DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES,
         }
+    }
+
+    #[test]
+    fn to_args_includes_overwrite_manifest_max_entries() {
+        let mut config = minimal_rcpd_config();
+        config.overwrite_manifest_max_entries = 123_456;
+        let args = config.to_args();
+        assert!(
+            args.iter()
+                .any(|a| a == "--overwrite-manifest-max-entries=123456"),
+            "expected manifest cap flag in {args:?}"
+        );
     }
 
     #[test]
