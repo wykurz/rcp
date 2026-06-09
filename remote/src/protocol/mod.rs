@@ -19,11 +19,13 @@
 //!   |  ---- Symlink(...) ----------------> |  Create symlink
 //!   |  ---- DirStructureComplete --------> |  Structure complete
 //!   |                                      |
-//!   |  <--- DirectoryCreated(root) ------- |
-//!   |  <--- DirectoryCreated(child) ------ |
+//!   |  <--- DirectoryCreated(root,          |  existing=[...] for reused dirs
+//!   |         existing=[...]) ------------ |  under --overwrite/--ignore-existing
+//!   |  <--- DirectoryCreated(child,        |  (empty for freshly-created dirs or
+//!   |         existing=[...]) ------------ |  when cap exceeded)
 //!   |                                      |
-//!   |  ~~~~ File(f, total=N) ~~~~~~~~~~~~> |  Write file, track count
-//!   |  ~~~~ File(...) ~~~~~~~~~~~~~~~~~~-> |  ...
+//!   |  ~~~~ File(f) ~~~~~~~~~~~~~~~~~~~~~> |  Write file (not in manifest / differs)
+//!   |  ---- FileUnchanged(g) -----------> |  identical g not transferred
 //!   |                                      |  All files done → apply metadata
 //!   |                                      |
 //!   |  <--- DestinationDone -------------- |  Close send side
@@ -34,8 +36,11 @@
 //! # Error Communication
 //!
 //! The protocol uses asymmetric error communication:
-//! - **Source → Destination**: Must communicate failures (FileSkipped, SymlinkSkipped)
-//!   so destination can track file counts correctly
+//! - **Source → Destination**: Must communicate failures (`FileSkipped`, `SymlinkSkipped`)
+//!   so destination can track file counts correctly. `FileUnchanged` is also sent Source →
+//!   Destination but is an optimization notification (not a failure): it signals the source
+//!   skipped a file whose destination copy is already identical, and is counted as
+//!   `files_unchanged` on the destination.
 //! - **Destination → Source**: Does NOT communicate failures. Destination handles
 //!   errors locally and source continues sending the full structure.
 //!
