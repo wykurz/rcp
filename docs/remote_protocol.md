@@ -132,6 +132,15 @@ All TCP connections are encrypted and authenticated using TLS 1.3 with self-sign
 - **Fields**: `src`, `dst`
 - **Usage**: Sent when file open fails (before any data connection is used). Counts as a processed entry for the parent directory's completion tracking. Transport failures after connection is established are fatal.
 
+**`FileUnchanged`**
+- **Purpose**: Notify destination that the source skipped transferring a file because the
+  destination already holds a matching entry (per the directory manifest in `DirectoryCreated`).
+- **Fields**: `src`, `dst`
+- **Usage**: Sent on the control stream like `FileSkipped`, but signals a *successful* skip (the
+  destination copy is already identical) rather than a failure. Counts as a processed entry for
+  the parent directory and as `files_unchanged` (the destination is authoritative for that count).
+  No file data is sent for the skipped file.
+
 **`SymlinkSkipped`**
 - **Purpose**: Notify destination that a symlink failed to read
 - **Fields**: `src_dst: {src, dst}`, `is_root`
@@ -141,8 +150,16 @@ All TCP connections are encrypted and authenticated using TLS 1.3 with self-sign
 
 **`DirectoryCreated`**
 - **Purpose**: Confirm directory created, request file transfers
-- **Fields**: `src`, `dst`
+- **Fields**: `src`, `dst`, `existing: Vec<ExistingEntry>`
 - **Usage**: Sent after successfully creating directory. This is purely the Pass-2 trigger: it tells the source the destination created the directory and is ready to receive its files. The source already retains the authoritative child-file count it computed during the Pass-1 pre-read (hardened: in the fd-map entry; `-L`: in a path→count map), so no count is echoed back. Triggers source to send files. See §7.1.
+- **`existing` field**: A manifest of the reused destination directory's pre-existing entries.
+  Each `ExistingEntry` carries `name`, `is_file`, `metadata`, and `size`. The source uses this
+  to skip transferring files that are already identical at the destination (sending
+  `FileUnchanged` instead of file data). The manifest is **empty** when the directory was
+  freshly created (not reused), when neither `--overwrite` nor `--ignore-existing` is active,
+  or when the directory's entry count exceeds the manifest cap
+  (`--overwrite-manifest-max-entries`, default 5,000,000) — in which case that directory falls
+  back to transferring-and-draining (the baseline behavior). See §7.9.
 
 **`DirectorySkipped`**
 - **Purpose**: Acknowledge a `Directory` message the destination did NOT create (create failed, ancestor failed, or `--ignore-existing` skipped a non-directory), so no files will be requested for it.
@@ -170,6 +187,7 @@ The protocol uses asymmetric error communication between source and destination:
 **Source → Destination: MUST communicate failures**
 - Source must notify destination of skipped files (`FileSkipped`) so destination can track entry counts correctly
 - Source must notify destination of skipped symlinks (`SymlinkSkipped`) for logging purposes
+- Source must notify destination of skipped-identical files (`FileUnchanged`) so destination can track entry counts correctly — an optimization notification (the destination already matched), not a failure, but it serves the same count-tracking role as `FileSkipped`
 - Without these notifications, destination would hang waiting for entries that will never arrive
 - **Note**: `FileSkipped` is only sent for file open failures. Transport failures (send errors after connection established) are fatal and abort the entire transfer
 
@@ -242,13 +260,16 @@ Source                              Destination
   |                                      |  child2 notifies root: entries_processed++ (2/4)
   |  ---- DirStructureComplete --------> |  Structure complete
   |                                      |
-  |  <--- DirectoryCreated(root) ------- |  (trigger only; no count echoed)
-  |  <--- DirectoryCreated(child1) ----- |
+  |  <--- DirectoryCreated(root,          |  (trigger only; no count echoed;
+  |         existing=[...]) ------------ |   existing=[] for freshly-created dirs,
+  |  <--- DirectoryCreated(child1,       |   non-empty only for reused dirs under
+  |         existing=[...]) ------------ |   --overwrite/--ignore-existing within
+  |                                      |   the manifest-cap limit)
   |                                      |
-  |  (look up retained file_count=2; send 2 files from root) |
-  |  ~~~~ File(root/f1) ~~~~~~~~~~~~~~~~>|  Write file
+  |  (look up retained file_count=2; compare root/f1 and root/f2 against manifest) |
+  |  ~~~~ File(root/f1) ~~~~~~~~~~~~~~~~>|  Write file (f1 not in manifest or differs)
   |                                      |  root: entries_processed++ (3/4)
-  |  ~~~~ File(root/f2) ~~~~~~~~~~~~~~~~>|  Write file
+  |  ---- FileUnchanged(root/f2) ------> |  f2 matches manifest; no data sent
   |                                      |  root: entries_processed++ (4/4)
   |                                      |  root complete → apply metadata
   |                                      |
@@ -663,6 +684,52 @@ Two mechanisms work together:
 
 The multiplier ensures work is always queued when connections become available, avoiding
 idle time between file transfers.
+
+### 7.9 Skipping identical files (destination manifest + source decision)
+
+When `--overwrite` or `--ignore-existing` is active, the destination can supply the source
+with a manifest of the reused directory's pre-existing entries so the source can skip
+transferring files that are already up to date.
+
+**Mechanism:**
+
+1. **Pass 1 (directory creation):** When the destination reuses an existing directory and the
+   feature is active, it enumerates the directory's children fd-relatively (using the same
+   `read_entries()` + `child()` pattern as the source's TOCTOU-safe walk — the directory is
+   pinned via an `O_NOFOLLOW` handle and names are never re-resolved by path). The resulting
+   `existing: Vec<ExistingEntry>` list is piggybacked onto the `DirectoryCreated` message.
+
+2. **Pass 2 (file sending):** For each file the source would normally transfer, it looks up the
+   file's name in the manifest. If a matching `ExistingEntry` is found, the source applies the
+   same comparison logic as the local `--overwrite` path (`--overwrite-compare`, default
+   `size,mtime`; `--overwrite-filter=newer` is also honored). Under `--ignore-existing`, any
+   name collision causes a skip regardless of entry type. When the comparison determines the
+   destination copy is already identical (or should be left alone), the source sends
+   `SourceMessage::FileUnchanged { src, dst }` on the control stream instead of opening a data
+   connection and transferring the file.
+
+3. **Accounting:** `FileUnchanged` counts as a processed entry for the parent directory's
+   completion tracking (identical to `FileSkipped`) and increments `files_unchanged` on the
+   destination. The destination is authoritative for `files_unchanged` (consistent with §7.7).
+   No filesystem mutation occurs for a skipped file.
+
+**When the manifest is empty (fallback to baseline behavior):**
+- The directory was freshly created (not reused).
+- Neither `--overwrite` nor `--ignore-existing` is active.
+- The directory's pre-existing entry count exceeds `--overwrite-manifest-max-entries` (default
+  5,000,000). This cap bounds memory usage for pathological cases; it is a backstop, not a
+  normal limit. When exceeded, the manifest is omitted for that directory and the source
+  transfers-and-drains all its files as usual.
+
+**TOCTOU/safety:** The manifest is built fd-relatively on the pinned directory handle, so
+names are never re-resolved. A skip performs no filesystem mutation; the destination's existing
+`process_single_file` overwrite path still runs for files the source does send. The design's
+containment and permission-fidelity guarantees are therefore unchanged.
+
+**Limitation — single root-file copy:** When copying a single file (e.g. `rcp h1:/a/file
+h2:/b/file --overwrite`), there is no parent-directory `DirectoryCreated` message to carry a
+manifest. This case is not optimized: the source always transfers the file and the destination
+drains it.
 
 ## 8. Test Coverage
 
