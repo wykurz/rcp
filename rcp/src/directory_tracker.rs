@@ -196,6 +196,7 @@ impl DirectoryTracker {
     /// * `was_created` - true if we created this directory, false if it already existed
     /// * `entry_count` - total child entries (files + dirs + symlinks)
     /// * `keep_if_empty` - whether to keep this directory if empty
+    /// * `existing` - pre-existing destination entries to include in the `DirectoryCreated` manifest
     #[allow(clippy::too_many_arguments)]
     pub async fn add_directory(
         &mut self,
@@ -207,6 +208,7 @@ impl DirectoryTracker {
         was_created: bool,
         entry_count: usize,
         keep_if_empty: bool,
+        existing: Vec<remote::protocol::ExistingEntry>,
     ) -> anyhow::Result<()> {
         // store metadata for later application
         self.metadata.insert(dst.to_path_buf(), metadata);
@@ -234,6 +236,7 @@ impl DirectoryTracker {
         let message = remote::protocol::DestinationMessage::DirectoryCreated {
             src: src.to_path_buf(),
             dst: dst.to_path_buf(),
+            existing,
         };
         {
             let mut stream = self.control_send_stream.lock().await;
