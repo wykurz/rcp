@@ -395,6 +395,7 @@ where
                 &source_data_addr,
                 &server_name,
                 &settings,
+                args.overwrite_manifest_max_entries,
                 &preserve,
                 &tcp_config,
                 cert_key.as_ref(),
