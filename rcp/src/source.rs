@@ -1670,7 +1670,8 @@ async fn send_files_missing_directory(
     control_send_stream,
     stream_pool,
     pending_limit,
-    pass2_source
+    pass2_source,
+    existing
 ))]
 #[allow(clippy::too_many_arguments)]
 async fn send_files_in_directory_tcp(
@@ -1688,7 +1689,11 @@ async fn send_files_in_directory_tcp(
     pending_limit: std::sync::Arc<tokio::sync::Semaphore>,
     error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
     control_send_stream: remote::streams::BoxedSharedSendStream,
+    existing: std::sync::Arc<
+        std::collections::HashMap<std::path::PathBuf, remote::protocol::ExistingEntry>,
+    >,
 ) -> anyhow::Result<()> {
+    let _ = &existing; // used in a later task (skip identical files)
     // the Pass-1 count is authoritative for this directory's send logic (truncation
     // and synthetic `FileSkipped`). It comes entirely from the source side now (the
     // consumed map entry or the `-L` count map); the destination echoes nothing.
@@ -2111,11 +2116,21 @@ async fn dispatch_control_messages_tcp(
                     remote::protocol::DestinationMessage::DirectoryCreated {
                         ref src,
                         ref dst,
+                        ref existing,
                     } => {
                         tracing::info!(
-                            "Received directory creation confirmation for: {:?} -> {:?}",
+                            "Received directory creation confirmation for: {:?} -> {:?} ({} existing)",
                             src,
-                            dst
+                            dst,
+                            existing.len()
+                        );
+                        let existing_map: std::sync::Arc<
+                            std::collections::HashMap<std::path::PathBuf, remote::protocol::ExistingEntry>,
+                        > = std::sync::Arc::new(
+                            existing
+                                .iter()
+                                .map(|e| (e.name.clone(), e.clone()))
+                                .collect(),
                         );
                         // build the owned Pass-2 input. In hardened mode this CONSUMES the
                         // directory's held fd-map entry (one-shot ownership) and fails closed
@@ -2140,6 +2155,7 @@ async fn dispatch_control_messages_tcp(
                             pending_limit.clone(),
                             collector,
                             control_send_stream.clone(),
+                            existing_map,
                         ));
                     }
                     remote::protocol::DestinationMessage::DirectorySkipped {

@@ -959,6 +959,7 @@ async fn process_control_stream(
                                 was_created,
                                 entry_count,
                                 keep_if_empty,
+                                Vec::new(),
                             )
                             .await
                             .context("Failed to add directory to tracker")?;

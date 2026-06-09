@@ -148,6 +148,18 @@ impl From<&common::safedir::FileMeta> for Metadata {
     }
 }
 
+/// One pre-existing destination directory entry, sent in `DirectoryCreated`'s manifest so the
+/// source can skip transferring identical files. `name` is the child name (serialized as a
+/// `PathBuf`, matching the rest of the protocol's path handling). `metadata`/`size` are only
+/// meaningful when `is_file`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExistingEntry {
+    pub name: std::path::PathBuf,
+    pub is_file: bool,
+    pub metadata: Metadata,
+    pub size: u64,
+}
+
 /// File header sent on unidirectional streams, followed by raw file data.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct File {
@@ -259,6 +271,11 @@ pub enum DestinationMessage {
     DirectoryCreated {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
+        /// Pre-existing entries in the (reused) destination directory, used by the source to
+        /// skip transferring identical files. Empty for freshly-created dirs, when neither
+        /// `--overwrite` nor `--ignore-existing` is active, or when the directory exceeds the
+        /// manifest cap (see `RcpdConfig::overwrite_manifest_max_entries`).
+        existing: Vec<ExistingEntry>,
     },
     /// Acknowledge a `Directory` message the destination did NOT create (create
     /// failed, ancestor failed, or `--ignore-existing` skipped a non-directory).
