@@ -221,6 +221,14 @@ pub enum SourceMessage {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
     },
+    /// Notify destination that the source skipped sending a file because the destination
+    /// already holds a matching entry (per the directory manifest). Counts as a processed
+    /// entry for the parent directory and as `files_unchanged` (the destination is the
+    /// authority for that count). The control-stream sibling of `FileSkipped`.
+    FileUnchanged {
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+    },
     /// Notify destination that a symlink failed to read.
     /// If `is_root` is true, this signals that root processing is complete (even if failed).
     /// Non-root skipped symlinks count as a processed entry for the parent directory.
