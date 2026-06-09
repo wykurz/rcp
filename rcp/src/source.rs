@@ -1693,7 +1693,6 @@ async fn send_files_in_directory_tcp(
         std::collections::HashMap<std::path::PathBuf, remote::protocol::ExistingEntry>,
     >,
 ) -> anyhow::Result<()> {
-    let _ = &existing; // used in a later task (skip identical files)
     // the Pass-1 count is authoritative for this directory's send logic (truncation
     // and synthetic `FileSkipped`). It comes entirely from the source side now (the
     // consumed map entry or the `-L` count map); the destination echoes nothing.
@@ -1900,6 +1899,48 @@ async fn send_files_in_directory_tcp(
     let mut join_set = tokio::task::JoinSet::new();
     for file in file_entries {
         throttle::get_ops_token().await;
+        // skip transfer entirely when the destination already has a matching entry (per the
+        // manifest the destination sent in DirectoryCreated). this never opens a data connection.
+        let src_fm = remote::protocol::FileMetadata {
+            metadata: &file.metadata,
+            size: file.size,
+        };
+        let skip = match existing.get(std::path::Path::new(&file.name)) {
+            Some(e) => {
+                let dst_fm = remote::protocol::FileMetadata {
+                    metadata: &e.metadata,
+                    size: e.size,
+                };
+                common::copy::skip_unchanged_send(
+                    &settings.overwrite_compare,
+                    settings.overwrite_filter,
+                    settings.ignore_existing,
+                    &src_fm,
+                    Some(common::copy::ExistingDst {
+                        meta: &dst_fm,
+                        is_file: e.is_file,
+                    }),
+                )
+            }
+            None => false,
+        };
+        if skip {
+            tracing::info!(
+                "destination already has identical file, skipping transfer (manifest): {:?} -> {:?}",
+                file.src_path,
+                file.dst_path
+            );
+            let msg = remote::protocol::SourceMessage::FileUnchanged {
+                src: file.src_path.clone(),
+                dst: file.dst_path.clone(),
+            };
+            control_send_stream
+                .lock()
+                .await
+                .send_batch_message(&msg)
+                .await?;
+            continue;
+        }
         // wait for a pending slot - this is the main backpressure point
         let permit = pending_limit
             .clone()
