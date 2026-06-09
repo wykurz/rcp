@@ -675,6 +675,54 @@ enum DirectoryCreateResult {
     Failed,
 }
 
+/// Enumerate a reused destination directory (fd-relative on its pinned `O_NOFOLLOW` handle) into
+/// a manifest of pre-existing entries, so the source can skip transferring identical files.
+///
+/// Returns an empty manifest (no `child()` stats performed) when the entry count exceeds
+/// `max_entries` — the large-directory safeguard: that directory falls back to today's
+/// transfer-and-drain. Entries that cannot be enumerated/stat'd are omitted (conservative: the
+/// source will send them).
+async fn build_existing_manifest(
+    dir: &Arc<Dir>,
+    max_entries: usize,
+) -> Vec<remote::protocol::ExistingEntry> {
+    use common::preserve::Metadata as _;
+    let entries = match dir.read_entries().await {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::debug!("manifest: cannot enumerate destination directory: {:#}", e);
+            return Vec::new();
+        }
+    };
+    if entries.len() > max_entries {
+        tracing::debug!(
+            "manifest: {} entries exceeds cap {}, skipping manifest (files will transfer)",
+            entries.len(),
+            max_entries
+        );
+        return Vec::new();
+    }
+    let mut manifest = Vec::with_capacity(entries.len());
+    for (name, _hint) in entries {
+        match dir.child(&name).await {
+            Ok(handle) => {
+                let meta = handle.meta();
+                manifest.push(remote::protocol::ExistingEntry {
+                    name: std::path::PathBuf::from(name),
+                    is_file: handle.kind() == common::walk::EntryKind::File,
+                    metadata: remote::protocol::Metadata::from(meta),
+                    size: meta.size(),
+                });
+            }
+            Err(e) => {
+                let e: anyhow::Error = e.into();
+                tracing::debug!("manifest: cannot stat child {:?}: {:#}", name, e);
+            }
+        }
+    }
+    manifest
+}
+
 /// Create a directory fd-relative on the PARENT's held `Dir`, handling overwrite logic.
 ///
 /// All operations resolve relative to `dst_parent`'s pinned fd: classify an existing entry via
@@ -865,6 +913,7 @@ async fn create_symlink(
 #[instrument(skip(error_collector, control_recv_stream, directory_tracker))]
 async fn process_control_stream(
     settings: &common::copy::Settings,
+    overwrite_manifest_max_entries: usize,
     preserve: &common::preserve::Settings,
     mut control_recv_stream: remote::streams::BoxedRecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
@@ -945,6 +994,14 @@ async fn process_control_stream(
                 match create_result {
                     DirectoryCreateResult::Created(dir)
                     | DirectoryCreateResult::AlreadyExisted(dir) => {
+                        // build the manifest only for a REUSED dir under overwrite/ignore-existing;
+                        // a freshly-created dir is empty and feature-off needs no manifest.
+                        let existing =
+                            if !was_created && (settings.overwrite || settings.ignore_existing) {
+                                build_existing_manifest(&dir, overwrite_manifest_max_entries).await
+                            } else {
+                                Vec::new()
+                            };
                         // add to tracker (sends DirectoryCreated, stores the dir fd in the fd-map)
                         // tracker handles root directory tracking internally
                         directory_tracker
@@ -959,7 +1016,7 @@ async fn process_control_stream(
                                 was_created,
                                 entry_count,
                                 keep_if_empty,
-                                Vec::new(),
+                                existing,
                             )
                             .await
                             .context("Failed to add directory to tracker")?;
@@ -1160,6 +1217,7 @@ pub async fn run_destination(
     src_data_addr: &std::net::SocketAddr,
     _src_server_name: &str,
     settings: &common::copy::Settings,
+    overwrite_manifest_max_entries: usize,
     preserve: &common::preserve::Settings,
     tcp_config: &remote::TcpConfig,
     cert_key: Option<&remote::tls::CertifiedKey>,
@@ -1244,6 +1302,7 @@ pub async fn run_destination(
     );
     let control_future = process_control_stream(
         settings,
+        overwrite_manifest_max_entries,
         preserve,
         control_recv_stream,
         directory_tracker.clone(),
@@ -1312,5 +1371,59 @@ pub async fn run_destination(
         }
         .into()),
         None => Ok(("destination OK".to_string(), summary)),
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    async fn open_dir(path: &std::path::Path) -> Arc<Dir> {
+        Arc::new(
+            common::safedir::Dir::open_root_dir(path, false, common::Side::Destination)
+                .await
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn manifest_lists_files_dirs_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "hello").unwrap(); // 5 bytes
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::os::unix::fs::symlink("a.txt", tmp.path().join("link")).unwrap();
+        let dir = open_dir(tmp.path()).await;
+
+        let manifest = build_existing_manifest(&dir, usize::MAX).await;
+
+        assert_eq!(manifest.len(), 3);
+        let file = manifest
+            .iter()
+            .find(|e| e.name == std::path::Path::new("a.txt"))
+            .unwrap();
+        assert!(file.is_file);
+        assert_eq!(file.size, 5);
+        let sub = manifest
+            .iter()
+            .find(|e| e.name == std::path::Path::new("sub"))
+            .unwrap();
+        assert!(!sub.is_file);
+        let link = manifest
+            .iter()
+            .find(|e| e.name == std::path::Path::new("link"))
+            .unwrap();
+        assert!(!link.is_file);
+    }
+
+    #[tokio::test]
+    async fn manifest_capped_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "x").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "y").unwrap();
+        let dir = open_dir(tmp.path()).await;
+
+        // 2 entries, cap 1 => fall back to empty manifest (no stats, transfer-and-drain)
+        let manifest = build_existing_manifest(&dir, 1).await;
+        assert!(manifest.is_empty());
     }
 }
