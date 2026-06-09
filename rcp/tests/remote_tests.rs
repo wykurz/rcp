@@ -5612,3 +5612,117 @@ fn test_remote_overwrite_manifest_cap_falls_back_to_transfer() {
         "above the cap the manifest is omitted, so the source must NOT skip-by-manifest"
     );
 }
+
+/// nested tree: a reused parent containing a REUSED child subdir (identical file → skipped) and a
+/// FRESH child subdir (no destination counterpart → file copied). Proves the manifest is built
+/// per-directory: non-empty for the reused child, empty for the freshly-created child.
+#[test]
+fn test_remote_overwrite_nested_mixed_fresh_and_reused_dirs() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_sub = src_dir.path().join("tree");
+    let dst_sub = dst_dir.path().join("tree");
+    // reused child subdir exists on both sides with an identical file
+    std::fs::create_dir_all(src_sub.join("reused")).unwrap();
+    std::fs::create_dir_all(dst_sub.join("reused")).unwrap();
+    create_test_file(&src_sub.join("reused/f.txt"), "shared", 0o644);
+    create_test_file(&dst_sub.join("reused/f.txt"), "shared", 0o644);
+    let t = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+    filetime::set_file_mtime(src_sub.join("reused/f.txt"), t).unwrap();
+    filetime::set_file_mtime(dst_sub.join("reused/f.txt"), t).unwrap();
+    // fresh child subdir exists only on the source
+    std::fs::create_dir_all(src_sub.join("fresh")).unwrap();
+    create_test_file(&src_sub.join("fresh/g.txt"), "new file", 0o644);
+    let src_remote = format!("localhost:{}", src_sub.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_sub.to_str().unwrap());
+    let output =
+        run_rcp_and_expect_success(&["--overwrite", "--summary", &src_remote, &dst_remote]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    // reused/f.txt skipped (manifest), fresh/g.txt copied into the freshly-created subdir
+    assert_eq!(summary.files_unchanged, 1, "reused/f.txt unchanged");
+    assert_eq!(summary.files_copied, 1, "fresh/g.txt copied");
+    assert_eq!(get_file_content(&dst_sub.join("reused/f.txt")), "shared");
+    assert_eq!(get_file_content(&dst_sub.join("fresh/g.txt")), "new file");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("skipping transfer (manifest)"),
+        "the reused subdir's identical file should be skipped via the manifest, got:\n{combined}"
+    );
+}
+
+/// --overwrite-filter=newer through the manifest path (files within a reused directory): a file
+/// whose destination is strictly newer is skipped; one whose destination is older is re-sent.
+/// Both files differ in content/size so the newer-filter (not metadata-equality) drives the skip.
+#[test]
+fn test_remote_overwrite_filter_newer_in_directory() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_sub = src_dir.path().join("tree");
+    let dst_sub = dst_dir.path().join("tree");
+    std::fs::create_dir(&src_sub).unwrap();
+    std::fs::create_dir(&dst_sub).unwrap();
+    // dest is NEWER => skip (kept). content differs so this is the newer-filter, not equality.
+    create_test_file(&src_sub.join("keep_dest.txt"), "src side", 0o644);
+    create_test_file(
+        &dst_sub.join("keep_dest.txt"),
+        "destination is newer",
+        0o644,
+    );
+    filetime::set_file_mtime(
+        src_sub.join("keep_dest.txt"),
+        filetime::FileTime::from_unix_time(1_000_000_000, 0),
+    )
+    .unwrap();
+    filetime::set_file_mtime(
+        dst_sub.join("keep_dest.txt"),
+        filetime::FileTime::from_unix_time(2_000_000_000, 0),
+    )
+    .unwrap();
+    // dest is OLDER => re-send (overwritten).
+    create_test_file(
+        &src_sub.join("update_dest.txt"),
+        "fresh source bytes",
+        0o644,
+    );
+    create_test_file(&dst_sub.join("update_dest.txt"), "old", 0o644);
+    filetime::set_file_mtime(
+        src_sub.join("update_dest.txt"),
+        filetime::FileTime::from_unix_time(2_000_000_000, 0),
+    )
+    .unwrap();
+    filetime::set_file_mtime(
+        dst_sub.join("update_dest.txt"),
+        filetime::FileTime::from_unix_time(1_000_000_000, 0),
+    )
+    .unwrap();
+    let src_remote = format!("localhost:{}", src_sub.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_sub.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&[
+        "--overwrite",
+        "--overwrite-filter=newer",
+        "--summary",
+        &src_remote,
+        &dst_remote,
+    ]);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.files_unchanged, 1, "dest-newer file kept");
+    assert_eq!(summary.files_copied, 1, "dest-older file re-sent");
+    // newer destination preserved; older destination overwritten with source bytes
+    assert_eq!(
+        get_file_content(&dst_sub.join("keep_dest.txt")),
+        "destination is newer"
+    );
+    assert_eq!(
+        get_file_content(&dst_sub.join("update_dest.txt")),
+        "fresh source bytes"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("skipping transfer (manifest)"),
+        "the dest-newer file should be skipped via the manifest, got:\n{combined}"
+    );
+}
