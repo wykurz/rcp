@@ -42,20 +42,6 @@ impl EntryKind {
             Self::Special
         }
     }
-    /// Classify from an `Option<FileType>`. Unknown types (`None`) are treated
-    /// as `File` to match historical behavior across copy/link/rm: when
-    /// `entry.file_type()` fails, callers proceed as if the entry were a
-    /// regular file.
-    #[must_use]
-    pub fn from_file_type(file_type: Option<&std::fs::FileType>) -> Self {
-        match file_type {
-            Some(ft) if ft.is_dir() => Self::Dir,
-            Some(ft) if ft.is_symlink() => Self::Symlink,
-            Some(ft) if ft.is_file() => Self::File,
-            Some(_) => Self::Special,
-            None => Self::File,
-        }
-    }
     /// Short dry-run label used during directory iteration (`"dir"`, `"symlink"`, `"file"`).
     /// `Special` maps to `"file"` to match historical behavior — the old bool-triplet
     /// dispatch in copy/link/rm fell through `is_dir`/`is_symlink` to "file" for any
