@@ -23,7 +23,9 @@ path = "src/main.rs"
 
 [dev-dependencies]
 assert_cmd = "2"
+filetime = "0.2"
 predicates = "3"
+tempfile = "3"
 
 [dependencies]
 anyhow = "1.0"
