@@ -228,6 +228,44 @@ struct Args {
     protocol_version: bool,
 }
 
+impl Args {
+    /// Build the remote TCP config from CLI args. Shared by the listener setup in `async_main`
+    /// and the source/destination operations in `run_operation`.
+    fn to_tcp_config(&self) -> remote::TcpConfig {
+        remote::TcpConfig {
+            port_ranges: self.port_ranges.clone(),
+            conn_timeout_sec: self.remote_copy_conn_timeout_sec,
+            network_profile: self.network_profile,
+            buffer_size: self.buffer_size,
+            max_connections: self.max_connections,
+            pending_writes_multiplier: self.pending_writes_multiplier,
+        }
+    }
+    /// Build the copy settings shared by the source and destination arms. `filter`/`dry_run` come
+    /// from the `MasterHello`; the destination passes `None` for both (filtering happens at source).
+    fn to_copy_settings(
+        &self,
+        filter: Option<common::filter::FilterSettings>,
+        dry_run: Option<common::config::DryRunMode>,
+        tcp_config: &remote::TcpConfig,
+    ) -> anyhow::Result<common::copy::Settings> {
+        Ok(common::copy::Settings {
+            dereference: self.dereference,
+            fail_early: self.fail_early,
+            overwrite: self.overwrite,
+            overwrite_compare: common::parse_metadata_cmp_settings(&self.overwrite_compare)?,
+            overwrite_filter: self.overwrite_filter,
+            ignore_existing: self.ignore_existing,
+            chunk_size: self.chunk_size,
+            skip_specials: self.skip_specials,
+            remote_copy_buffer_size: tcp_config.effective_buffer_size(),
+            filter,
+            dry_run,
+            delete: None,
+        })
+    }
+}
+
 /// monitor stdin for EOF to detect master disconnection
 /// when SSH connection dies, stdin is closed and we should exit immediately
 async fn stdin_monitor() {
@@ -288,14 +326,7 @@ where
         .unwrap();
     tracing::info!("Received side: {:?}", master_hello);
     // build tcp_config first so we can use its effective_buffer_size()
-    let tcp_config = remote::TcpConfig {
-        port_ranges: args.port_ranges.clone(),
-        conn_timeout_sec: args.remote_copy_conn_timeout_sec,
-        network_profile: args.network_profile,
-        buffer_size: args.buffer_size,
-        max_connections: args.max_connections,
-        pending_writes_multiplier: args.pending_writes_multiplier,
-    };
+    let tcp_config = args.to_tcp_config();
     let rcpd_result = match master_hello {
         remote::protocol::MasterHello::Source {
             src,
@@ -305,20 +336,7 @@ where
             dry_run,
         } => {
             // build settings with filter from MasterHello
-            let settings = common::copy::Settings {
-                dereference: args.dereference,
-                fail_early: args.fail_early,
-                overwrite: args.overwrite,
-                overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
-                overwrite_filter: args.overwrite_filter,
-                ignore_existing: args.ignore_existing,
-                chunk_size: args.chunk_size,
-                skip_specials: args.skip_specials,
-                remote_copy_buffer_size: tcp_config.effective_buffer_size(),
-                filter,
-                dry_run,
-                delete: None,
-            };
+            let settings = args.to_copy_settings(filter, dry_run, &tcp_config)?;
             tracing::info!("Starting source");
             let shared_send = std::sync::Arc::new(tokio::sync::Mutex::new(master_send_stream));
             let result = match source::run_source(
@@ -375,20 +393,7 @@ where
             // destination doesn't use filter (filtering happens at source).
             // empty directory cleanup decisions are communicated per-directory
             // via keep_if_empty in the Directory message.
-            let settings = common::copy::Settings {
-                dereference: args.dereference,
-                fail_early: args.fail_early,
-                overwrite: args.overwrite,
-                overwrite_compare: common::parse_metadata_cmp_settings(&args.overwrite_compare)?,
-                overwrite_filter: args.overwrite_filter,
-                ignore_existing: args.ignore_existing,
-                chunk_size: args.chunk_size,
-                skip_specials: args.skip_specials,
-                remote_copy_buffer_size: tcp_config.effective_buffer_size(),
-                filter: None,
-                dry_run: None,
-                delete: None,
-            };
+            let settings = args.to_copy_settings(None, None, &tcp_config)?;
             tracing::info!("Starting destination");
             match destination::run_destination(
                 &source_control_addr,
@@ -456,14 +461,7 @@ async fn async_main(
             .ok(); // ignore if already installed
     }
     // build TCP config for listener creation
-    let tcp_config = remote::TcpConfig {
-        port_ranges: args.port_ranges.clone(),
-        conn_timeout_sec: args.remote_copy_conn_timeout_sec,
-        network_profile: args.network_profile,
-        buffer_size: args.buffer_size,
-        max_connections: args.max_connections,
-        pending_writes_multiplier: args.pending_writes_multiplier,
-    };
+    let tcp_config = args.to_tcp_config();
     // generate TLS certificate and create server config (if encryption enabled)
     let (cert_key, tls_acceptor) = if !args.no_encryption {
         let cert_key = remote::tls::generate_self_signed_cert()
