@@ -19,10 +19,11 @@
 //!   |  ---- Symlink(...) ----------------> |  Create symlink
 //!   |  ---- DirStructureComplete --------> |  Structure complete
 //!   |                                      |
-//!   |  <--- DirectoryCreated(root,          |  existing=[...] for reused dirs
-//!   |         existing=[...]) ------------ |  under --overwrite/--ignore-existing
-//!   |  <--- DirectoryCreated(child,        |  (empty for freshly-created dirs or
-//!   |         existing=[...]) ------------ |  when cap exceeded)
+//!   |  <--- DirectoryManifestChunk(root,..)|  0+ manifest chunks for reused dirs
+//!   |                                      |  under --overwrite/--ignore-existing,
+//!   |                                      |  sent BEFORE the trigger (FIFO)
+//!   |  <--- DirectoryCreated(root) -------- |  Pass-2 trigger
+//!   |  <--- DirectoryCreated(child) ------- |
 //!   |                                      |
 //!   |  ~~~~ File(f) ~~~~~~~~~~~~~~~~~~~~~> |  Write file (not in manifest / differs)
 //!   |  ---- FileUnchanged(g) -----------> |  identical g not transferred
@@ -153,7 +154,7 @@ impl From<&common::safedir::FileMeta> for Metadata {
     }
 }
 
-/// One pre-existing destination directory entry, sent in `DirectoryCreated`'s manifest so the
+/// One pre-existing destination directory entry, sent in a `DirectoryManifestChunk` so the
 /// source can skip transferring identical files. `name` is the child name (serialized as a
 /// `PathBuf`, matching the rest of the protocol's path handling). `metadata`/`size` are only
 /// meaningful when `is_file`.
@@ -163,6 +164,42 @@ pub struct ExistingEntry {
     pub is_file: bool,
     pub metadata: Metadata,
     pub size: u64,
+}
+
+/// Conservative byte budget for a single `DirectoryManifestChunk`. Well under the control
+/// stream's 8 MiB `LengthDelimitedCodec` frame limit, leaving ample margin for the message
+/// envelope and the worst-case final entry (a single ~`PATH_MAX` name).
+pub const MANIFEST_CHUNK_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+
+/// Conservative serialized-size estimate for one `ExistingEntry`: the variable-length name plus a
+/// fixed allowance covering `is_file` + `Metadata` + `size` + per-entry framing overhead. Used
+/// only to bound chunk sizes, so over-estimating (smaller, safer chunks) is fine.
+fn estimate_entry_size(entry: &ExistingEntry) -> usize {
+    entry.name.as_os_str().len() + 64
+}
+
+/// Split a directory manifest into chunks each estimated to stay within `byte_budget`, so every
+/// `DirectoryManifestChunk` frame fits under the control stream's frame limit. A single entry
+/// larger than the budget still gets its own chunk (it cannot be split further); with the 4 MiB
+/// budget versus a worst-case ~4 KiB path, a chunk never approaches the 8 MiB frame limit.
+/// `chunk_manifest(v, b).concat() == v` for any `v` (no entries lost or reordered).
+pub fn chunk_manifest(entries: Vec<ExistingEntry>, byte_budget: usize) -> Vec<Vec<ExistingEntry>> {
+    let mut chunks: Vec<Vec<ExistingEntry>> = Vec::new();
+    let mut current: Vec<ExistingEntry> = Vec::new();
+    let mut current_bytes = 0usize;
+    for entry in entries {
+        let size = estimate_entry_size(&entry);
+        if !current.is_empty() && current_bytes + size > byte_budget {
+            chunks.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += size;
+        current.push(entry);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 /// File header sent on unidirectional streams, followed by raw file data.
@@ -267,20 +304,26 @@ pub struct SrcDst {
 /// Messages sent from destination to source on the control stream.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum DestinationMessage {
+    /// Carry a chunk of the (reused) destination directory's pre-existing-entry manifest, used
+    /// by the source to skip transferring identical files. A directory's manifest is split into
+    /// one or more chunks (each well under the control stream's frame limit) and ALL of them are
+    /// sent BEFORE the directory's `DirectoryCreated`; the control stream is FIFO, so the source
+    /// has the complete manifest by the time it sees `DirectoryCreated`. No chunks are sent for a
+    /// freshly-created directory, when neither `--overwrite` nor `--ignore-existing` is active, or
+    /// when the directory exceeds the manifest cap (see `RcpdConfig::overwrite_manifest_max_entries`).
+    DirectoryManifestChunk {
+        dst: std::path::PathBuf,
+        entries: Vec<ExistingEntry>,
+    },
     /// Confirm directory created, request file transfers. This is purely the
     /// Pass-2 trigger: it tells the source the destination created the directory
     /// and is ready to receive its files. The source already retains the
     /// authoritative Pass-1 file count for the directory (in its fd-map entry under
     /// hardened reads, or in a path→count map under `-L`), so no count is echoed
-    /// back here.
+    /// back here. Any `DirectoryManifestChunk`s for this directory precede this message.
     DirectoryCreated {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
-        /// Pre-existing entries in the (reused) destination directory, used by the source to
-        /// skip transferring identical files. Empty for freshly-created dirs, when neither
-        /// `--overwrite` nor `--ignore-existing` is active, or when the directory exceeds the
-        /// manifest cap (see `RcpdConfig::overwrite_manifest_max_entries`).
-        existing: Vec<ExistingEntry>,
     },
     /// Acknowledge a `Directory` message the destination did NOT create (create
     /// failed, ancestor failed, or `--ignore-existing` skipped a non-directory).
@@ -593,6 +636,72 @@ pub enum RcpdResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mk_entry(name: &str) -> ExistingEntry {
+        ExistingEntry {
+            name: std::path::PathBuf::from(name),
+            is_file: true,
+            metadata: Metadata {
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                atime: 0,
+                mtime: 0,
+                atime_nsec: 0,
+                mtime_nsec: 0,
+            },
+            size: 0,
+        }
+    }
+
+    #[test]
+    fn chunk_manifest_empty_yields_no_chunks() {
+        assert!(chunk_manifest(vec![], MANIFEST_CHUNK_BYTE_BUDGET).is_empty());
+    }
+
+    #[test]
+    fn chunk_manifest_small_is_single_chunk() {
+        let entries: Vec<_> = (0..100).map(|i| mk_entry(&format!("f{i}.txt"))).collect();
+        let chunks = chunk_manifest(entries, MANIFEST_CHUNK_BYTE_BUDGET);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 100);
+    }
+
+    #[test]
+    fn chunk_manifest_splits_and_preserves_all_entries_in_order() {
+        let entries: Vec<_> = (0..1000)
+            .map(|i| mk_entry(&format!("file_{i:04}.dat")))
+            .collect();
+        // a tiny budget forces many chunks (each entry estimate is name.len() + 64 ≈ ~78 bytes)
+        let chunks = chunk_manifest(entries.clone(), 256);
+        assert!(
+            chunks.len() > 1,
+            "tiny budget should produce multiple chunks"
+        );
+        // frame-safety property: every multi-entry chunk stays within budget, so a chunk frame
+        // never approaches the control stream's frame limit
+        for chunk in &chunks {
+            if chunk.len() > 1 {
+                let total: usize = chunk.iter().map(estimate_entry_size).sum();
+                assert!(total <= 256, "multi-entry chunk exceeds budget: {total}");
+            }
+        }
+        // reassembly invariant: concat preserves every entry, in order, with nothing lost
+        let flat: Vec<_> = chunks.into_iter().flatten().collect();
+        assert_eq!(flat.len(), entries.len());
+        for (got, want) in flat.iter().zip(entries.iter()) {
+            assert_eq!(got.name, want.name);
+        }
+    }
+
+    #[test]
+    fn chunk_manifest_entry_larger_than_budget_gets_its_own_chunk() {
+        // budget smaller than a single entry: each still lands in its own chunk (never dropped).
+        let chunks = chunk_manifest(vec![mk_entry("a"), mk_entry("b")], 1);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 1);
+        assert_eq!(chunks[1].len(), 1);
+    }
 
     fn minimal_rcpd_config() -> RcpdConfig {
         RcpdConfig {

@@ -2122,6 +2122,13 @@ async fn dispatch_control_messages_tcp(
         }
         control_recv_stream.close().await;
     });
+    // accumulate per-directory manifest chunks (keyed by dst) until the directory's
+    // DirectoryCreated arrives; the FIFO control stream delivers all of a directory's chunks
+    // before its trigger, so the manifest is complete when we assemble it.
+    let mut manifest_chunks: std::collections::HashMap<
+        std::path::PathBuf,
+        Vec<remote::protocol::ExistingEntry>,
+    > = std::collections::HashMap::new();
     // main loop - select between task completions and messages (both are cancel-safe)
     let result = loop {
         tokio::select! {
@@ -2154,13 +2161,22 @@ async fn dispatch_control_messages_tcp(
                     Some(RecvResult::Error(e)) => break Err(e),
                 };
                 match message {
+                    remote::protocol::DestinationMessage::DirectoryManifestChunk {
+                        dst,
+                        entries,
+                    } => {
+                        // accumulate this directory's manifest; all chunks arrive (FIFO) before the
+                        // matching DirectoryCreated assembles and consumes them.
+                        manifest_chunks.entry(dst).or_default().extend(entries);
+                    }
                     remote::protocol::DestinationMessage::DirectoryCreated {
                         ref src,
                         ref dst,
-                        existing,
                     } => {
+                        // take the manifest accumulated from this directory's chunks (empty if none).
+                        let existing = manifest_chunks.remove(dst.as_path()).unwrap_or_default();
                         tracing::info!(
-                            "Received directory creation confirmation for: {:?} -> {:?} ({} existing)",
+                            "Received directory creation confirmation for: {:?} -> {:?} ({} manifest entries)",
                             src,
                             dst,
                             existing.len()
@@ -2168,8 +2184,7 @@ async fn dispatch_control_messages_tcp(
                         let existing_map: std::sync::Arc<
                             std::collections::HashMap<std::path::PathBuf, remote::protocol::ExistingEntry>,
                         > = std::sync::Arc::new(
-                            // move each entry into the map (only the small name key is cloned),
-                            // avoiding a full per-entry clone of the received manifest.
+                            // move each entry into the map (only the small name key is cloned).
                             existing
                                 .into_iter()
                                 .map(|e| (e.name.clone(), e))

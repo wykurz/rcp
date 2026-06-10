@@ -134,7 +134,7 @@ All TCP connections are encrypted and authenticated using TLS 1.3 with self-sign
 
 **`FileUnchanged`**
 - **Purpose**: Notify destination that the source skipped transferring a file because the
-  destination already holds a matching entry (per the directory manifest in `DirectoryCreated`).
+  destination already holds a matching entry (per the directory manifest in `DirectoryManifestChunk`s).
 - **Fields**: `src`, `dst`
 - **Usage**: Sent on the control stream like `FileSkipped`, but signals a *successful* skip (the
   destination copy is already identical) rather than a failure. Counts as a processed entry for
@@ -148,18 +148,30 @@ All TCP connections are encrypted and authenticated using TLS 1.3 with self-sign
 
 ### 2.3 Destination → Source Messages (Control Stream)
 
+**`DirectoryManifestChunk`**
+- **Purpose**: Carry a chunk of the reused destination directory's pre-existing-entry manifest,
+  used by the source to skip transferring identical files.
+- **Fields**: `dst`, `entries: Vec<ExistingEntry>` (each `ExistingEntry` carries `name`,
+  `is_file`, `metadata`, `size`)
+- **Usage**: A directory's manifest is split into one or more chunks, each well under the control
+  stream's frame limit (`LengthDelimitedCodec`, 8 MiB), and **all** of them are sent **before**
+  that directory's `DirectoryCreated`. The control stream is FIFO, so the source has the complete
+  manifest by the time it processes `DirectoryCreated`. No chunks are sent when the directory was
+  freshly created (not reused), when neither `--overwrite` nor `--ignore-existing` is active, or
+  when the directory's entry count exceeds the manifest cap (`--overwrite-manifest-max-entries`,
+  default 5,000,000) — in which case that directory falls back to transferring-and-draining (the
+  baseline behavior). Chunking the manifest (rather than inlining it in `DirectoryCreated`)
+  ensures the cap stays meaningful without any single control frame exceeding the frame limit.
+  See §7.9.
+
 **`DirectoryCreated`**
 - **Purpose**: Confirm directory created, request file transfers
-- **Fields**: `src`, `dst`, `existing: Vec<ExistingEntry>`
-- **Usage**: Sent after successfully creating directory. This is purely the Pass-2 trigger: it tells the source the destination created the directory and is ready to receive its files. The source already retains the authoritative child-file count it computed during the Pass-1 pre-read (hardened: in the fd-map entry; `-L`: in a path→count map), so no count is echoed back. Triggers source to send files. See §7.1.
-- **`existing` field**: A manifest of the reused destination directory's pre-existing entries.
-  Each `ExistingEntry` carries `name`, `is_file`, `metadata`, and `size`. The source uses this
-  to skip transferring files that are already identical at the destination (sending
-  `FileUnchanged` instead of file data). The manifest is **empty** when the directory was
-  freshly created (not reused), when neither `--overwrite` nor `--ignore-existing` is active,
-  or when the directory's entry count exceeds the manifest cap
-  (`--overwrite-manifest-max-entries`, default 5,000,000) — in which case that directory falls
-  back to transferring-and-draining (the baseline behavior). See §7.9.
+- **Fields**: `src`, `dst`
+- **Usage**: Sent after successfully creating directory, and after any `DirectoryManifestChunk`s
+  for it. This is purely the Pass-2 trigger: it tells the source the destination created the
+  directory and is ready to receive its files. The source already retains the authoritative
+  child-file count it computed during the Pass-1 pre-read (hardened: in the fd-map entry; `-L`: in
+  a path→count map), so no count is echoed back. Triggers source to send files. See §7.1.
 
 **`DirectorySkipped`**
 - **Purpose**: Acknowledge a `Directory` message the destination did NOT create (create failed, ancestor failed, or `--ignore-existing` skipped a non-directory), so no files will be requested for it.
@@ -260,11 +272,11 @@ Source                              Destination
   |                                      |  child2 notifies root: entries_processed++ (2/4)
   |  ---- DirStructureComplete --------> |  Structure complete
   |                                      |
-  |  <--- DirectoryCreated(root,          |  (trigger only; no count echoed;
-  |         existing=[...]) ------------ |   existing=[] for freshly-created dirs,
-  |  <--- DirectoryCreated(child1,       |   non-empty only for reused dirs under
-  |         existing=[...]) ------------ |   --overwrite/--ignore-existing within
-  |                                      |   the manifest-cap limit)
+  |  <--- DirectoryManifestChunk(root, [..]) | (0+ chunks for reused dirs under
+  |                                      |   --overwrite/--ignore-existing, sent
+  |                                      |   BEFORE the trigger; none otherwise)
+  |  <--- DirectoryCreated(root) -------- |  (trigger only; no count echoed)
+  |  <--- DirectoryCreated(child1) ------ |
   |                                      |
   |  (look up retained file_count=2; compare root/f1 and root/f2 against manifest) |
   |  ~~~~ File(root/f1) ~~~~~~~~~~~~~~~~>|  Write file (f1 not in manifest or differs)
@@ -697,7 +709,11 @@ transferring files that are already up to date.
    feature is active, it enumerates the directory's children fd-relatively (using the same
    `read_entries()` + `child()` pattern as the source's TOCTOU-safe walk — the directory is
    pinned via an `O_NOFOLLOW` handle and names are never re-resolved by path). The resulting
-   `existing: Vec<ExistingEntry>` list is piggybacked onto the `DirectoryCreated` message.
+   manifest (`Vec<ExistingEntry>`) is split into one or more `DirectoryManifestChunk` messages,
+   each kept well under the control stream's `LengthDelimitedCodec` frame limit (8 MiB), and sent
+   **before** that directory's `DirectoryCreated`. The control stream is FIFO, so the source has
+   the complete manifest in hand when it processes `DirectoryCreated`. Chunking keeps the entry
+   cap (default 5,000,000) meaningful without ever producing a single oversized control frame.
 
 2. **Pass 2 (file sending):** For each file the source would normally transfer, it looks up the
    file's name in the manifest. If a matching `ExistingEntry` is found, the source applies the
