@@ -175,10 +175,7 @@ impl FilterSettings {
         // (patterns with path separators like `bar/baz` match content inside, not the root)
         // note: trailing `/` is a dir-only marker, not a path separator
         for pattern in &self.excludes {
-            if !pattern.anchored
-                && !Self::is_path_pattern(&pattern.original)
-                && pattern.matches(name, is_dir)
-            {
+            if !pattern.anchored && !pattern.is_path_pattern() && pattern.matches(name, is_dir) {
                 return FilterResult::ExcludedByPattern(pattern.original.clone());
             }
         }
@@ -188,7 +185,7 @@ impl FilterSettings {
             if !is_dir {
                 for pattern in &self.includes {
                     if !pattern.anchored
-                        && !Self::is_path_pattern(&pattern.original)
+                        && !pattern.is_path_pattern()
                         && pattern.matches(name, false)
                     {
                         return FilterResult::Included;
@@ -204,11 +201,6 @@ impl FilterSettings {
         }
         // no includes and not excluded = included
         FilterResult::Included
-    }
-    /// Check if a pattern is a path pattern (contains `/` other than leading/trailing markers)
-    fn is_path_pattern(original: &str) -> bool {
-        let trimmed = original.trim_start_matches('/').trim_end_matches('/');
-        trimmed.contains('/')
     }
     /// Determine if a path should be included based on filter patterns
     ///

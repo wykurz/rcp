@@ -282,7 +282,7 @@ async fn process_single_file(
     // create the destination file fresh through the parent's pinned fd (O_CREAT|O_EXCL|
     // O_NOFOLLOW): never follows a symlink, never escapes dst_parent. the creation mode
     // matches the metadata applier's chmod target, mirroring copy.rs.
-    let create_mode = common::preserve::masked_file_mode(&preserve.file, &file_header.metadata);
+    let create_mode = common::preserve::masked_mode(preserve.file.mode_mask, &file_header.metadata);
     let std_file = dst_parent
         .create_file(dst_name, create_mode)
         .await

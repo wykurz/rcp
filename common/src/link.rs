@@ -845,9 +845,7 @@ async fn link_internal(
     link_dir_entry(
         prog_track,
         src_parent,
-        &src_handle,
         update_for_dir,
-        update_handle.as_ref().map(crate::safedir::Handle::meta),
         dst_parent,
         name,
         &dst_name,
@@ -919,9 +917,7 @@ async fn delegate_copy(
 async fn link_dir_entry(
     prog_track: &'static progress::Progress,
     src_parent: &Arc<Dir>,
-    src_handle: &crate::safedir::Handle,
     update: Option<(&Arc<Dir>, &std::ffi::OsStr)>,
-    update_meta: Option<&crate::safedir::FileMeta>,
     dst_parent: Option<&Arc<Dir>>,
     name: &std::ffi::OsStr,
     dst_name: &std::ffi::OsStr,
@@ -968,9 +964,7 @@ async fn link_dir_entry(
         return link_dir_contents(
             prog_track,
             &src_dir,
-            src_handle,
             update_dir.as_ref(),
-            update_meta,
             None, // dry-run: no destination dir
             None, // dry-run: no destination parent
             dst_name,
@@ -1023,9 +1017,7 @@ async fn link_dir_entry(
     link_dir_contents(
         prog_track,
         &src_dir,
-        src_handle,
         update_dir.as_ref(),
-        update_meta,
         Some(&dst_dir),
         Some(dst_parent),
         dst_name,
@@ -1057,11 +1049,7 @@ async fn link_dir_entry(
 async fn link_dir_contents(
     prog_track: &'static progress::Progress,
     src_dir: &Arc<Dir>,
-    // classify handles, retained for caller threading; directory metadata is now read from the
-    // opened `src_dir`/`update_dir` fds (read-side fidelity), so these are no longer read here.
-    _src_handle: &crate::safedir::Handle,
     update_dir: Option<&Arc<Dir>>,
-    _update_meta: Option<&crate::safedir::FileMeta>,
     dst_dir: Option<&Arc<Dir>>,
     dst_parent: Option<&Arc<Dir>>,
     dst_name: &std::ffi::OsStr,

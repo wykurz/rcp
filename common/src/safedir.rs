@@ -1166,7 +1166,7 @@ pub async fn set_file_metadata_fd<Meta: crate::preserve::Metadata>(
         let gid = if ut.gid { Some(meta.gid()) } else { None };
         fchown_fd(fd, side, uid, gid).await?;
     }
-    let mode = crate::preserve::masked_file_mode(&settings.file, meta);
+    let mode = crate::preserve::masked_mode(settings.file.mode_mask, meta);
     fchmod_fd(fd, side, mode).await?;
     if ut.time {
         futimens_fd(
@@ -1198,7 +1198,7 @@ pub async fn set_dir_metadata_fd<Meta: crate::preserve::Metadata>(
         let gid = if ut.gid { Some(meta.gid()) } else { None };
         fchown_fd(fd, side, uid, gid).await?;
     }
-    let mode = crate::preserve::masked_dir_mode(&settings.dir, meta);
+    let mode = crate::preserve::masked_mode(settings.dir.mode_mask, meta);
     fchmod_fd(fd, side, mode).await?;
     if ut.time {
         futimens_fd(

@@ -1304,10 +1304,7 @@ fn build_histogram_header(
     snapshot_interval: std::time::Duration,
 ) -> congestion::format::LogHeader {
     use congestion::format::{AutoMetaSnapshot, HdrSnapshot, LogHeader, UnitLabel};
-    let hostname = nix::unistd::gethostname()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "unknown".into());
+    let hostname = get_hostname();
     let mut unit_labels = Vec::with_capacity(congestion::N_META_RESOURCES);
     for &side in &congestion::Side::ALL {
         for &op in &congestion::MetadataOp::ALL {

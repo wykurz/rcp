@@ -123,7 +123,7 @@ pub struct Settings {
     pub symlink: SymlinkSettings,
 }
 
-/// Compute the file permission bits to apply, honoring the mode mask.
+/// Compute the permission bits to apply, honoring the mode mask.
 ///
 /// When `mode_mask == 0o7777` (the "preserve everything" case) the source mode
 /// is returned verbatim, including setuid/setgid/sticky bits. Otherwise the mode
@@ -132,29 +132,19 @@ pub struct Settings {
 /// permission bits (`0o7777`); file-type bits are never included.
 ///
 /// This is the single source of truth for the destination create-mode and the fd-based metadata
-/// appliers in `crate::safedir`.
+/// appliers in `crate::safedir`. Files and directories share this logic; pass the relevant
+/// `mode_mask` ([`FileSettings::mode_mask`] or [`DirSettings::mode_mask`]).
 #[must_use]
-pub fn masked_file_mode<Meta: Metadata>(settings: &FileSettings, metadata: &Meta) -> u32 {
-    let mode = metadata.permissions().mode();
-    if settings.mode_mask == 0o7777 {
-        // special case for default preserve: keep all permission bits verbatim
-        mode & 0o7777
+pub fn masked_mode<Meta: Metadata>(mode_mask: ModeMask, metadata: &Meta) -> u32 {
+    // confine to permission bits up front so a user-supplied mask that itself includes file-type
+    // (S_IF*) bits can never leak them into the create-mode / chmod target (`--preserve` parses the
+    // mask as an arbitrary octal, with no upper bound)
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode_mask == 0o7777 {
+        // default preserve keeps all permission bits verbatim
+        mode
     } else {
-        mode & settings.mode_mask
-    }
-}
-
-/// Compute the directory permission bits to apply, honoring the mode mask.
-///
-/// Mirrors [`masked_file_mode`] for directories. See that function for details.
-#[must_use]
-pub fn masked_dir_mode<Meta: Metadata>(settings: &DirSettings, metadata: &Meta) -> u32 {
-    let mode = metadata.permissions().mode();
-    if settings.mode_mask == 0o7777 {
-        // special case for default preserve: keep all permission bits verbatim
-        mode & 0o7777
-    } else {
-        mode & settings.mode_mask
+        mode & mode_mask
     }
 }
 
@@ -182,4 +172,76 @@ pub fn preserve_all() -> Settings {
 #[must_use]
 pub fn preserve_none() -> Settings {
     Settings::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    struct FakeMeta {
+        mode: u32,
+    }
+    impl Metadata for FakeMeta {
+        fn uid(&self) -> u32 {
+            0
+        }
+        fn gid(&self) -> u32 {
+            0
+        }
+        fn atime(&self) -> i64 {
+            0
+        }
+        fn atime_nsec(&self) -> i64 {
+            0
+        }
+        fn mtime(&self) -> i64 {
+            0
+        }
+        fn mtime_nsec(&self) -> i64 {
+            0
+        }
+        fn permissions(&self) -> std::fs::Permissions {
+            std::fs::Permissions::from_mode(self.mode)
+        }
+    }
+    #[test]
+    fn default_mask_strips_setuid_setgid_sticky() {
+        // default mode_mask is 0o0777, which must drop the special bits like `cp`
+        let meta = FakeMeta { mode: 0o7755 };
+        assert_eq!(masked_mode(0o0777, &meta), 0o0755);
+    }
+    #[test]
+    fn full_mask_preserves_special_bits_verbatim() {
+        // 0o7777 is the "preserve everything" sentinel: setuid/setgid/sticky survive
+        let meta = FakeMeta { mode: 0o4755 };
+        assert_eq!(masked_mode(0o7777, &meta), 0o4755);
+    }
+    #[test]
+    fn masking_strips_file_type_bits() {
+        // source mode carries S_IFREG (0o100000); only permission bits may be returned
+        let meta = FakeMeta { mode: 0o100644 };
+        assert_eq!(masked_mode(0o7777, &meta), 0o0644);
+        assert_eq!(masked_mode(0o0777, &meta), 0o0644);
+    }
+    #[test]
+    fn out_of_range_mask_cannot_leak_file_type_bits() {
+        // --preserve parses the mask as an arbitrary octal u32 (no upper bound), so a mask that
+        // itself includes S_IF* bits must still not leak them into the returned mode
+        let meta = FakeMeta { mode: 0o100644 };
+        assert_eq!(masked_mode(0o100777, &meta), 0o0644);
+    }
+    #[test]
+    fn custom_mask_applies() {
+        let meta = FakeMeta { mode: 0o0777 };
+        assert_eq!(masked_mode(0o0700, &meta), 0o0700);
+    }
+    #[test]
+    fn shipped_defaults_strip_special_bits_while_preserve_all_keeps_them() {
+        // pin the settings the tools ship with so a default change can't silently weaken fidelity
+        assert_eq!(FileSettings::default().mode_mask, 0o0777);
+        assert_eq!(DirSettings::default().mode_mask, 0o0777);
+        let all = preserve_all();
+        assert_eq!(all.file.mode_mask, 0o7777);
+        assert_eq!(all.dir.mode_mask, 0o7777);
+    }
 }

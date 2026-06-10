@@ -1339,7 +1339,7 @@ async fn copy_file_fd(
         .await
         .with_context(|| format!("failed opening src file {:?} for reading", src_path))
         .map_err(|err| Error::new(err, copy_summary))?;
-    let create_mode = preserve::masked_file_mode(&preserve.file, &open_meta);
+    let create_mode = preserve::masked_mode(preserve.file.mode_mask, &open_meta);
     let dst_file = dst_parent
         .create_file(dst_name, create_mode)
         .await
