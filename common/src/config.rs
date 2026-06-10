@@ -351,6 +351,25 @@ pub struct TracingConfig {
     pub tokio_console_port: Option<u16>,
 }
 
+impl TracingConfig {
+    /// Minimal tracing config for the simple local-only tools (`rrm`, `rchm`, `rcmp`, `rlink`,
+    /// `filegen`): no remote layer, no profiling, no tokio-console — only the trace identifier
+    /// varies between them.
+    #[must_use]
+    pub fn local(trace_identifier: &str) -> Self {
+        Self {
+            remote_layer: None,
+            debug_log_file: None,
+            chrome_trace_prefix: None,
+            flamegraph_prefix: None,
+            trace_identifier: trace_identifier.to_string(),
+            profile_level: None,
+            tokio_console: false,
+            tokio_console_port: None,
+        }
+    }
+}
+
 impl Default for TracingConfig {
     fn default() -> Self {
         Self {

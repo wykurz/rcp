@@ -310,16 +310,7 @@ fn main() -> Result<()> {
     let throttle = args
         .common
         .throttle_config(args.max_open_files, args.chunk_size);
-    let tracing = common::TracingConfig {
-        remote_layer: None,
-        debug_log_file: None,
-        chrome_trace_prefix: None,
-        flamegraph_prefix: None,
-        trace_identifier: "rlink".to_string(),
-        profile_level: None,
-        tokio_console: false,
-        tokio_console_port: None,
-    };
+    let tracing = common::TracingConfig::local("rlink");
     let progress = if is_dry_run {
         None
     } else {

@@ -200,7 +200,7 @@ fn test_progress_delay_duration() {
 
 // Helpers for duration-accept tests: run against an empty temp dir in dry-run
 // mode so parsing is actually exercised (unlike --help, which short-circuits
-// clap before the duration is forwarded to build_time_filter).
+// clap before the duration is forwarded to TimeFilter::from_cli_args).
 fn accept_duration(flag: &str, value: &str, dir_name: &str) {
     let tmp = std::env::temp_dir().join(dir_name);
     let _ = std::fs::remove_dir_all(&tmp);

@@ -133,38 +133,6 @@ struct Args {
     paths: Vec<std::path::PathBuf>,
 }
 
-fn parse_duration_arg(flag: &str, value: &str) -> Result<std::time::Duration> {
-    humantime::parse_duration(value).map_err(|err| {
-        anyhow!(
-            "{} value {:?} is not a valid duration: {}\n\
-             Hint: use suffixes like 1y, 6months, 30d, 12h, 30m, 45s. \
-             Note that 'M' means months and 'm' means minutes.",
-            flag,
-            value,
-            err
-        )
-    })
-}
-
-fn build_time_filter(
-    modified_before: Option<&str>,
-    created_before: Option<&str>,
-) -> Result<Option<common::filter::TimeFilter>> {
-    let modified_before = modified_before
-        .map(|v| parse_duration_arg("--modified-before", v))
-        .transpose()?;
-    let created_before = created_before
-        .map(|v| parse_duration_arg("--created-before", v))
-        .transpose()?;
-    if modified_before.is_none() && created_before.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(common::filter::TimeFilter {
-        modified_before,
-        created_before,
-    }))
-}
-
 #[instrument]
 async fn async_main(args: Args) -> Result<common::rm::Summary> {
     // build filter settings once before the loop
@@ -173,7 +141,7 @@ async fn async_main(args: Args) -> Result<common::rm::Summary> {
         &args.include,
         &args.exclude,
     )?;
-    let time_filter = build_time_filter(
+    let time_filter = common::filter::TimeFilter::from_cli_args(
         args.modified_before.as_deref(),
         args.created_before.as_deref(),
     )?;
@@ -217,16 +185,7 @@ async fn async_main(args: Args) -> Result<common::rm::Summary> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    #[cfg(target_env = "musl")]
-    if args.created_before.is_some() {
-        return Err(anyhow!(
-            "--created-before is not supported on musl builds: birth time (btime) is not \
-             readable via std::fs::Metadata::created() under musl, so every entry would \
-             fail evaluation and be skipped. Use --modified-before instead, or rebuild \
-             rrm against glibc."
-        ));
-    }
-
+    common::filter::reject_created_before_on_musl("rrm", args.created_before.as_deref())?;
     // TOCTOU linter: must run before the async runtime starts.
     // rrm has no --dereference flag; dereference is always false. The linter
     // does NOT inspect the operand paths — the trust of a path's prefix is the
@@ -261,16 +220,7 @@ fn main() -> Result<()> {
     let throttle = args
         .common
         .throttle_config(args.max_open_files, args.chunk_size);
-    let tracing = common::TracingConfig {
-        remote_layer: None,
-        debug_log_file: None,
-        chrome_trace_prefix: None,
-        flamegraph_prefix: None,
-        trace_identifier: "rrm".to_string(),
-        profile_level: None,
-        tokio_console: false,
-        tokio_console_port: None,
-    };
+    let tracing = common::TracingConfig::local("rrm");
     let progress = if is_dry_run {
         None
     } else {

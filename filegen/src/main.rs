@@ -169,16 +169,7 @@ fn main() -> Result<(), anyhow::Error> {
     let throttle = args
         .common
         .throttle_config(Some(max_open_files), args.chunk_size);
-    let tracing = common::TracingConfig {
-        remote_layer: None,
-        debug_log_file: None,
-        chrome_trace_prefix: None,
-        flamegraph_prefix: None,
-        trace_identifier: "filegen".to_string(),
-        profile_level: None,
-        tokio_console: false,
-        tokio_console_port: None,
-    };
+    let tracing = common::TracingConfig::local("filegen");
     // note: filegen historically does not treat --progress-delay alone as
     // implying --progress (unlike rrm/rlink). preserve that behavior here.
     let progress = if args.common.progress || args.common.progress_type.is_some() {

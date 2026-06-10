@@ -468,7 +468,62 @@ impl TimeFilterResult {
     }
 }
 
+fn parse_duration_arg(flag: &str, value: &str) -> anyhow::Result<std::time::Duration> {
+    humantime::parse_duration(value).map_err(|err| {
+        anyhow!(
+            "{} value {:?} is not a valid duration: {}\n\
+             Hint: use suffixes like 1y, 6months, 30d, 12h, 30m, 45s. \
+             Note that 'M' means months and 'm' means minutes.",
+            flag,
+            value,
+            err
+        )
+    })
+}
+
+/// Reject `--created-before` on musl builds, where birth time (btime) is unreadable via
+/// `std::fs::Metadata::created()` so every entry would fail evaluation and be skipped. No-op on
+/// glibc. `tool` names the binary for the error message.
+pub fn reject_created_before_on_musl(
+    tool: &str,
+    created_before: Option<&str>,
+) -> anyhow::Result<()> {
+    #[cfg(target_env = "musl")]
+    if created_before.is_some() {
+        return Err(anyhow!(
+            "--created-before is not supported on musl builds: birth time (btime) is not \
+             readable via std::fs::Metadata::created() under musl, so every entry would \
+             fail evaluation and be skipped. Use --modified-before instead, or rebuild \
+             {tool} against glibc."
+        ));
+    }
+    #[cfg(not(target_env = "musl"))]
+    let _ = (tool, created_before);
+    Ok(())
+}
+
 impl TimeFilter {
+    /// Build a `TimeFilter` from the raw CLI duration strings used by `rrm`/`rchm`
+    /// (`--modified-before` / `--created-before`). Returns `Ok(None)` when neither is set.
+    /// Durations use humantime syntax; note `M` means months and `m` means minutes.
+    pub fn from_cli_args(
+        modified_before: Option<&str>,
+        created_before: Option<&str>,
+    ) -> anyhow::Result<Option<TimeFilter>> {
+        let modified_before = modified_before
+            .map(|v| parse_duration_arg("--modified-before", v))
+            .transpose()?;
+        let created_before = created_before
+            .map(|v| parse_duration_arg("--created-before", v))
+            .transpose()?;
+        if modified_before.is_none() && created_before.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(TimeFilter {
+            modified_before,
+            created_before,
+        }))
+    }
     /// Returns true when no time thresholds are configured.
     pub fn is_empty(&self) -> bool {
         self.modified_before.is_none() && self.created_before.is_none()
