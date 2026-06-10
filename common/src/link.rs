@@ -1463,6 +1463,12 @@ async fn link_dir_contents(
                 dst_path
             );
             link_summary.copy_summary.directories_created = 0;
+            // a child error collected during the walk must still surface — otherwise a
+            // traversal-only directory whose only child FAILED becomes "empty", is skipped here, and
+            // the failed link is reported as success (mirrors copy::finalize_dir).
+            if errors.has_errors() {
+                return Err(Error::new(errors.into_error().unwrap(), link_summary));
+            }
             return Ok(link_summary);
         }
         EmptyDirAction::Remove => {
@@ -1488,6 +1494,12 @@ async fn link_dir_contents(
             match rmdir_result {
                 Ok(()) => {
                     link_summary.copy_summary.directories_created = 0;
+                    // surface a collected child error even though the empty directory was removed,
+                    // so a failed child link is never reported as success (mirrors
+                    // copy::finalize_dir).
+                    if errors.has_errors() {
+                        return Err(Error::new(errors.into_error().unwrap(), link_summary));
+                    }
                     return Ok(link_summary);
                 }
                 Err(err) => {
@@ -2546,6 +2558,84 @@ mod link_tests {
             assert!(
                 !test_path.join("dst/0.txt").exists(),
                 "0.txt should not be linked"
+            );
+            Ok(())
+        }
+        /// Regression: with a filter active and `fail_early = false`, a directory whose only
+        /// traversed child FAILS becomes "empty" and is pruned by the empty-dir cleanup — the child
+        /// failure must still surface, not be masked as success. copy.rs's `finalize_dir` guards
+        /// this in its DryRunSkip/Remove arms; `link_dir_contents` must do the same.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_filter_pruned_empty_dir_surfaces_child_error() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+            let test_path = tmp_dir.as_path();
+            // src/ is the root; src/sub/ is traversal-only under the filter (it does not directly
+            // match), and its sole child `unreadable/` (mode 0o000) fails to open during the walk.
+            // nothing links into sub/, so the empty-dir cleanup prunes it.
+            let src_dir = test_path.join("src");
+            let unreadable = src_dir.join("sub").join("unreadable");
+            tokio::fs::create_dir_all(&unreadable).await?;
+            tokio::fs::write(unreadable.join("x.txt"), "secret").await?;
+            tokio::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).await?;
+            // an include pattern that matches nothing present forces traversal of sub/ and
+            // unreadable/ without directly matching sub/, so sub/ is "traversal-only".
+            let mut filter = FilterSettings::new();
+            filter.add_include("*.match").unwrap();
+            let mut settings = common_settings(false, false);
+            settings.filter = Some(filter);
+            let result = link(
+                &PROGRESS,
+                test_path,
+                &src_dir,
+                &test_path.join("dst"),
+                &None,
+                &settings,
+                false,
+            )
+            .await;
+            // restore perms so the temp dir can be cleaned up
+            tokio::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).await?;
+            assert!(
+                result.is_err(),
+                "a child link failure inside a filter-pruned empty directory must surface as an \
+                 error, not be masked as success"
+            );
+            Ok(())
+        }
+        /// As above but in dry-run mode, which hits the `DryRunSkip` arm instead of `Remove`: a
+        /// collected child error must still surface rather than being reported as a clean dry run.
+        #[tokio::test]
+        #[traced_test]
+        async fn test_filter_pruned_empty_dir_surfaces_child_error_dry_run()
+        -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+            let test_path = tmp_dir.as_path();
+            let src_dir = test_path.join("src");
+            let unreadable = src_dir.join("sub").join("unreadable");
+            tokio::fs::create_dir_all(&unreadable).await?;
+            tokio::fs::write(unreadable.join("x.txt"), "secret").await?;
+            tokio::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).await?;
+            let mut filter = FilterSettings::new();
+            filter.add_include("*.match").unwrap();
+            let mut settings = common_settings(false, false);
+            settings.filter = Some(filter);
+            settings.dry_run = Some(crate::config::DryRunMode::Brief);
+            settings.copy_settings.dry_run = Some(crate::config::DryRunMode::Brief);
+            let result = link(
+                &PROGRESS,
+                test_path,
+                &src_dir,
+                &test_path.join("dst"),
+                &None,
+                &settings,
+                false,
+            )
+            .await;
+            tokio::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).await?;
+            assert!(
+                result.is_err(),
+                "dry-run must also surface the child error, not report a clean run"
             );
             Ok(())
         }
