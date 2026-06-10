@@ -231,22 +231,36 @@ impl DirectoryTracker {
                 keep_if_empty,
             },
         );
-        // send DirectoryCreated to trigger file sending (Pass-2 trigger only; the
-        // source retains the authoritative Pass-1 file count, so none is echoed).
-        let message = remote::protocol::DestinationMessage::DirectoryCreated {
-            src: src.to_path_buf(),
-            dst: dst.to_path_buf(),
+        // stream the pre-existing-entry manifest as chunks (each well under the control stream's
+        // frame limit) BEFORE DirectoryCreated, then send the trigger. The control stream is FIFO,
+        // so the source has the full manifest before it sees DirectoryCreated. The lock is held
+        // across the whole sequence so a directory's chunks stay contiguous with its trigger.
+        let manifest_entries = existing.len();
+        let chunks = remote::protocol::chunk_manifest(
             existing,
-        };
+            remote::protocol::MANIFEST_CHUNK_BYTE_BUDGET,
+        );
         {
             let mut stream = self.control_send_stream.lock().await;
+            for entries in chunks {
+                let chunk_msg = remote::protocol::DestinationMessage::DirectoryManifestChunk {
+                    dst: dst.to_path_buf(),
+                    entries,
+                };
+                stream.send_batch_message(&chunk_msg).await?;
+            }
+            let message = remote::protocol::DestinationMessage::DirectoryCreated {
+                src: src.to_path_buf(),
+                dst: dst.to_path_buf(),
+            };
             stream.send_control_message(&message).await?;
         }
         tracing::info!(
-            "Sent DirectoryCreated: {:?} -> {:?} (entries={})",
+            "Sent DirectoryCreated: {:?} -> {:?} (entries={}, manifest={})",
             src,
             dst,
-            entry_count
+            entry_count,
+            manifest_entries
         );
         // if entry_count is 0, directory is immediately complete
         if entry_count == 0 {
