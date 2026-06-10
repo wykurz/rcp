@@ -687,6 +687,11 @@ async fn build_existing_manifest(
     max_entries: usize,
 ) -> Vec<remote::protocol::ExistingEntry> {
     use common::preserve::Metadata as _;
+    // a cap of 0 disables the optimization for every non-empty directory; short-circuit before
+    // the readdir so the disable case pays nothing.
+    if max_entries == 0 {
+        return Vec::new();
+    }
     let entries = match dir.read_entries().await {
         Ok(entries) => entries,
         Err(e) => {
@@ -1424,6 +1429,17 @@ mod manifest_tests {
 
         // 2 entries, cap 1 => fall back to empty manifest (no stats, transfer-and-drain)
         let manifest = build_existing_manifest(&dir, 1).await;
+        assert!(manifest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manifest_zero_cap_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "x").unwrap();
+        let dir = open_dir(tmp.path()).await;
+
+        // cap 0 disables the optimization (short-circuits before the readdir)
+        let manifest = build_existing_manifest(&dir, 0).await;
         assert!(manifest.is_empty());
     }
 }
