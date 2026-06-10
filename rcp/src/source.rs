@@ -2157,7 +2157,7 @@ async fn dispatch_control_messages_tcp(
                     remote::protocol::DestinationMessage::DirectoryCreated {
                         ref src,
                         ref dst,
-                        ref existing,
+                        existing,
                     } => {
                         tracing::info!(
                             "Received directory creation confirmation for: {:?} -> {:?} ({} existing)",
@@ -2168,9 +2168,11 @@ async fn dispatch_control_messages_tcp(
                         let existing_map: std::sync::Arc<
                             std::collections::HashMap<std::path::PathBuf, remote::protocol::ExistingEntry>,
                         > = std::sync::Arc::new(
+                            // move each entry into the map (only the small name key is cloned),
+                            // avoiding a full per-entry clone of the received manifest.
                             existing
-                                .iter()
-                                .map(|e| (e.name.clone(), e.clone()))
+                                .into_iter()
+                                .map(|e| (e.name.clone(), e))
                                 .collect(),
                         );
                         // build the owned Pass-2 input. In hardened mode this CONSUMES the
