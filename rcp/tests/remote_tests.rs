@@ -1,23 +1,8 @@
 use std::os::unix::fs::PermissionsExt;
 
-fn setup_test_env() -> (tempfile::TempDir, tempfile::TempDir) {
-    let src_dir = tempfile::tempdir().unwrap();
-    let dst_dir = tempfile::tempdir().unwrap();
-    (src_dir, dst_dir)
-}
-
-fn create_test_file(path: &std::path::Path, content: &str, mode: u32) {
-    std::fs::write(path, content).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-}
-
-fn get_file_content(path: &std::path::Path) -> String {
-    std::fs::read_to_string(path).unwrap()
-}
-
-fn get_file_mode(path: &std::path::Path) -> u32 {
-    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
-}
+#[path = "support/fixtures.rs"]
+mod fixtures;
+use fixtures::{create_test_file, get_file_content, get_file_mode, setup_test_env};
 
 fn interpret_exit_code(code: i32) -> String {
     match code {

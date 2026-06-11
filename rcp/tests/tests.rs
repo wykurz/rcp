@@ -7,28 +7,9 @@ fn check_rcp_help() {
     cmd.arg("--help").assert().success();
 }
 
-fn setup_test_env() -> (tempfile::TempDir, tempfile::TempDir) {
-    let src_dir = tempfile::tempdir().unwrap();
-    let dst_dir = tempfile::tempdir().unwrap();
-    (src_dir, dst_dir)
-}
-
-fn create_test_file(path: &std::path::Path, content: &str, mode: u32) {
-    std::fs::write(path, content).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-}
-
-fn create_symlink(src: &std::path::Path, dst: &std::path::Path) {
-    std::os::unix::fs::symlink(src, dst).unwrap();
-}
-
-fn get_file_mode(path: &std::path::Path) -> u32 {
-    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
-}
-
-fn get_file_content(path: &std::path::Path) -> String {
-    std::fs::read_to_string(path).unwrap()
-}
+#[path = "support/fixtures.rs"]
+mod fixtures;
+use fixtures::{create_symlink, create_test_file, get_file_content, get_file_mode, setup_test_env};
 
 #[test]
 fn test_preserve_permissions_basic() {
