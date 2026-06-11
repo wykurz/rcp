@@ -703,6 +703,46 @@ mod tests {
         assert_eq!(chunks[1].len(), 1);
     }
 
+    #[test]
+    fn chunk_manifest_splits_a_large_manifest_at_the_production_budget() {
+        // a realistically large directory manifest (more than two budgets' worth) must split into
+        // multiple frames with the PRODUCTION budget — not just an artificially tiny one — so a
+        // change to the budget or to `estimate_entry_size` that breaks chunking at real scale is
+        // caught. built in memory (no files), so it stays a fast unit test.
+        let per_entry = estimate_entry_size(&mk_entry("file_0000000.dat"));
+        let n = (MANIFEST_CHUNK_BYTE_BUDGET / per_entry) * 2 + 1000;
+        let entries: Vec<_> = (0..n)
+            .map(|i| mk_entry(&format!("file_{i:07}.dat")))
+            .collect();
+        let chunks = chunk_manifest(entries.clone(), MANIFEST_CHUNK_BYTE_BUDGET);
+        assert!(
+            chunks.len() > 1,
+            "a manifest larger than the 4 MiB budget must span multiple chunks, got {}",
+            chunks.len()
+        );
+        // every multi-entry chunk stays within the real budget (frame-safety)
+        for chunk in &chunks {
+            if chunk.len() > 1 {
+                let total: usize = chunk.iter().map(estimate_entry_size).sum();
+                assert!(
+                    total <= MANIFEST_CHUNK_BYTE_BUDGET,
+                    "a chunk exceeds the production budget: {total}"
+                );
+            }
+        }
+        // reassembly invariant at production scale: concat preserves every entry, in order
+        let flat: Vec<_> = chunks.into_iter().flatten().collect();
+        assert_eq!(
+            flat.len(),
+            entries.len(),
+            "reassembly must preserve every entry"
+        );
+        assert!(
+            flat.iter().zip(&entries).all(|(a, b)| a.name == b.name),
+            "reassembly must preserve order"
+        );
+    }
+
     fn minimal_rcpd_config() -> RcpdConfig {
         RcpdConfig {
             verbose: 0,
