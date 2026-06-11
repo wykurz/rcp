@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Remote `rcp` skips re-transferring files the destination would leave untouched
+  anyway. The destination sends a manifest of its existing entries; the source
+  compares against it and sends a "file unchanged" notification instead of the file
+  body. Under `--overwrite` this covers destination entries identical to the source
+  (or strictly newer, with `--overwrite-filter=newer`); under `--ignore-existing` it
+  covers any name already present at the destination, regardless of its contents.
+  The per-directory manifest is capped by `--overwrite-manifest-max-entries`
+  (default 5,000,000); a directory exceeding the cap falls back to transferring
+  files normally.
+
 ### Changed
 - `rcp host:~ dst/` (a bare remote home as source with a trailing-slash
   destination) now errors instead of creating a directory literally named `~`
@@ -30,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as root; `--getent-path <ABSOLUTE>` pins an exact binary (intended to be baked
   into a sudo rule) and is rejected if given more than once. Numeric ids never
   invoke `getent`.
+- Fix `rlink` silently reporting success (exit 0) when a filter
+  (`--include`/`--exclude`/`--filter-file`) was active and a directory's only
+  traversed child failed to link: the directory became empty, was pruned by the
+  empty-directory cleanup, and the child's failure was dropped. The collected
+  error is now surfaced, so such a run exits non-zero.
 
 ## [0.33.0] - 2026-05-28
 
