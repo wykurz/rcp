@@ -551,3 +551,172 @@ pub fn make_shared(
         error_collector,
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // a sink writer discards every control message, so the completion state machine can be driven
+    // without a real connection.
+    fn mock_stream() -> remote::streams::BoxedSharedSendStream {
+        let writer: remote::streams::BoxedWrite = Box::new(tokio::io::sink());
+        std::sync::Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+            writer,
+        )))
+    }
+    fn new_tracker() -> DirectoryTracker {
+        DirectoryTracker::new(
+            mock_stream(),
+            common::preserve::preserve_none(),
+            false,
+            std::sync::Arc::new(common::error_collector::ErrorCollector::default()),
+        )
+    }
+    fn meta() -> remote::protocol::Metadata {
+        remote::protocol::Metadata {
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            atime: 0,
+            mtime: 0,
+            atime_nsec: 0,
+            mtime_nsec: 0,
+        }
+    }
+    async fn open_dir(path: &std::path::Path) -> Arc<Dir> {
+        Arc::new(
+            common::safedir::Dir::open_root_dir(path, false, common::Side::Destination)
+                .await
+                .unwrap(),
+        )
+    }
+    #[test]
+    fn has_failed_ancestor_walks_up_to_a_failed_directory() {
+        let mut t = new_tracker();
+        t.mark_directory_failed(std::path::Path::new("/dst/a/b"));
+        assert!(t.has_failed_ancestor(std::path::Path::new("/dst/a/b/c")));
+        assert!(t.has_failed_ancestor(std::path::Path::new("/dst/a/b/c/d")));
+        assert!(
+            !t.has_failed_ancestor(std::path::Path::new("/dst/a/b")),
+            "the failed directory is not its own ancestor"
+        );
+        assert!(
+            !t.has_failed_ancestor(std::path::Path::new("/dst/a/x")),
+            "a sibling subtree is unaffected"
+        );
+    }
+    #[tokio::test]
+    async fn is_done_requires_structure_root_complete_and_no_pending() {
+        let mut t = new_tracker();
+        assert!(!t.is_done(), "a fresh tracker is not done");
+        t.set_structure_complete(true); // has_root_item=true: does NOT auto-complete the root
+        assert!(
+            !t.is_done(),
+            "structure complete but the root item is still pending"
+        );
+        t.set_root_complete();
+        assert!(
+            t.is_done(),
+            "structure + root complete with no pending dirs is done"
+        );
+    }
+    #[tokio::test]
+    async fn structure_complete_with_no_root_item_is_immediately_done() {
+        // dry-run / filtered-root: no root messages will follow, so completion is immediate.
+        let mut t = new_tracker();
+        t.set_structure_complete(false);
+        assert!(t.is_done());
+    }
+    #[tokio::test]
+    async fn send_destination_done_guards_against_double_send() {
+        let mut t = new_tracker();
+        assert!(
+            t.send_destination_done().await.unwrap(),
+            "the first send returns true"
+        );
+        assert!(
+            !t.send_destination_done().await.unwrap(),
+            "a second send is a no-op and returns false"
+        );
+    }
+    #[tokio::test]
+    async fn process_on_untracked_directory_is_a_noop() {
+        // a File/FileSkipped/child entry received under a failed (untracked) ancestor must be
+        // tolerated rather than aborting the destination.
+        let mut t = new_tracker();
+        let untracked = std::path::Path::new("/not/tracked");
+        assert!(!t.process_file(untracked).await.unwrap());
+        t.process_child_entry(untracked).await.unwrap();
+    }
+    #[tokio::test]
+    async fn child_completion_propagates_to_parent_bottom_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_path = tmp.path().join("parent");
+        let child_path = parent_path.join("child");
+        std::fs::create_dir_all(&child_path).unwrap();
+        let parent_dir = open_dir(&parent_path).await;
+        let child_dir = open_dir(&child_path).await;
+        let mut t = new_tracker();
+        // the root parent expects exactly one child entry (the subdirectory).
+        t.add_directory(
+            &parent_path,
+            &parent_path,
+            parent_dir,
+            meta(),
+            true,
+            true,
+            1,
+            true,
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(!t.is_done(), "the parent still awaits its child");
+        // the child has no entries: it completes immediately, notifies the parent, and completes it.
+        t.add_directory(
+            &child_path,
+            &child_path,
+            child_dir,
+            meta(),
+            false,
+            true,
+            0,
+            true,
+            vec![],
+        )
+        .await
+        .unwrap();
+        t.set_structure_complete(true);
+        assert!(
+            t.is_done(),
+            "completing the child must propagate bottom-up and complete the root parent"
+        );
+    }
+    #[tokio::test]
+    async fn empty_created_directory_is_removed_when_not_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("root");
+        std::fs::create_dir(&root_path).unwrap();
+        let mut t = new_tracker();
+        // the root's parent fd (the trusted destination parent) backs the fd-relative rmdir.
+        t.set_root_parent_dir(open_dir(tmp.path()).await);
+        let root_dir = open_dir(&root_path).await;
+        // created, empty (entry_count=0), keep_if_empty=false → removed via the parent's pinned fd.
+        t.add_directory(
+            &root_path,
+            &root_path,
+            root_dir,
+            meta(),
+            true,
+            true,
+            0,
+            false,
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(
+            !root_path.exists(),
+            "an empty created directory with keep_if_empty=false must be removed"
+        );
+    }
+}
