@@ -6,21 +6,20 @@
 //! intentionally small and synchronous so algorithms can be implemented and
 //! tested without any I/O, async runtime, or wall-clock dependence.
 //!
-//! Three concentric layers are envisioned for integration with the rcp /
-//! rrm / rlink / filegen tools:
+//! Three concentric layers integrate with the rcp / rrm / rlink / filegen
+//! tools:
 //!
 //! 1. **Algorithm** — the `Controller` trait and its implementations; pure.
-//! 2. **Control loop** — plumbing that collects samples from the hot path,
-//!    drives the controller on a fixed tick, and publishes decisions. Lives
-//!    outside this crate (in `throttle` or a thin adapter) and is not part
-//!    of Phase 1.
+//! 2. **Control loop** — the [`ControlUnit`] plumbing (this crate's
+//!    `control_loop` module) that collects samples from the hot path, drives
+//!    the controller on a fixed tick, and publishes decisions.
 //! 3. **Enforcement** — the existing `throttle` token buckets and
 //!    semaphores, with their limits driven by the control loop.
 //!
 //! # Built-in controllers
 //!
-//! - [`NoopController`] — never limits. Default when congestion control is
-//!   disabled.
+//! - [`NoopController`] — never limits; the explicit unlimited baseline used
+//!   by the simulator and the controller conformance tests.
 //! - [`FixedController`] — honors a static concurrency/rate budget. Mirrors
 //!   the existing manual `--ops-throttle` / `--iops-throttle` knobs and is
 //!   the regression baseline for adaptive algorithms.
