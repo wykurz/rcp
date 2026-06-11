@@ -613,7 +613,7 @@ async fn link_internal(
             update_handle = None;
         }
     }
-    // ── rlink's acknowledged dual-tree special case (design spec §4): the single permit-drop site ──
+    // ── rlink's acknowledged dual-tree special case (docs/tocttou.md, "One shared traversal driver"): the single permit-drop site ──
     //
     // The spawn loop in `link_dir_contents` pre-acquired this leaf permit (open-files pool) for a
     // regular-file src `hint`, but the authoritative dual-tree decision below may instead COPY

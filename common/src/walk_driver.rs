@@ -33,10 +33,10 @@
 //! per-tool walks do. A dropped surrounding future (timeout, `fail_early` abort,
 //! Ctrl-C) therefore can never leave a spawned task holding a dangling borrow.
 //!
-//! ## How copy will map onto this trait (Phase D validation)
+//! ## How copy maps onto this trait
 //!
-//! `copy` is the reference single-tree visitor (implemented in `rcp::copy` as
-//! `CopyVisitor`); its mapping both validated the trait and shaped this module.
+//! `copy` is the reference single-tree visitor (`rcp::copy::CopyVisitor`); its
+//! mapping shaped this trait.
 //! `CopyVisitor` holds the run-constant state (`dst_root`, `filter_base`,
 //! `Settings`, `preserve::Settings`, the opened top-level destination parent — the
 //! *source* root needs no field, since each entry's source path is its
@@ -88,7 +88,7 @@
 //! branch copy already has. No part of copy needs a trait shape this module does
 //! not provide, which is why the trait stops here (no second-tree concept leaks
 //! into the driver — that asymmetry is what keeps rlink on the substrate, not the
-//! visitor, per the design spec §4).
+//! visitor; see docs/tocttou.md, "One shared traversal driver").
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
