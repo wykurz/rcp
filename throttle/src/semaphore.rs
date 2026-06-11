@@ -265,6 +265,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consume_many_drains_exactly_n_permits() {
+        let sem = Semaphore::new();
+        sem.set_max(10);
+        sem.consume_many(3).await;
+        assert_eq!(sem.sem.available_permits(), 7);
+        sem.consume_many(0).await;
+        assert_eq!(sem.sem.available_permits(), 7, "consuming zero is a no-op");
+    }
+
+    #[tokio::test]
+    async fn consume_many_is_a_noop_while_disabled() {
+        let sem = Semaphore::new();
+        sem.set_max(10);
+        sem.disable();
+        sem.consume_many(5).await;
+        assert_eq!(
+            sem.sem.available_permits(),
+            10,
+            "a disabled semaphore must not drain permits"
+        );
+    }
+
+    #[tokio::test]
     async fn set_max_to_zero_disables_acquires() {
         let sem = Semaphore::new();
         sem.set_max(4);
