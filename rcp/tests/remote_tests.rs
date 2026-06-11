@@ -5061,6 +5061,144 @@ fn test_remote_source_file_swap_never_transfers_sentinel() {
     swapper.join().unwrap();
 }
 
+/// Recursively check whether any regular file under `root` contains `needle`.
+fn tree_contains_content(root: &std::path::Path, needle: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() && tree_contains_content(&path, needle) {
+            return true;
+        } else if meta.is_file()
+            && let Ok(content) = std::fs::read_to_string(&path)
+            && content.contains(needle)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Best-effort race: while a remote copy runs, swap an intermediate SOURCE directory between a real
+/// (empty) directory and a symlink to an out-of-tree sentinel directory. The source's fd-relative
+/// `O_NOFOLLOW` descent must never follow the symlink to read the sentinel content into the
+/// destination. A leaked sentinel file is a true-positive failure; a clean run is the expected
+/// outcome. Mirrors `test_remote_source_file_swap_never_transfers_sentinel` for the
+/// intermediate-directory case.
+#[test]
+fn test_remote_source_intermediate_dir_swap_never_escapes() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let sentinel_dir = src_dir.path().join("sentinel_outside");
+    std::fs::create_dir(&sentinel_dir).unwrap();
+    create_test_file(
+        &sentinel_dir.join("secret.txt"),
+        "TOP-SECRET-SENTINEL",
+        0o600,
+    );
+    let tree = src_dir.path().join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    // a bed of real files so the copy has work to do (widens the race window).
+    for i in 0..200 {
+        create_test_file(&tree.join(format!("f{i}.txt")), "real data", 0o644);
+    }
+    // the intermediate dir we race between a real (empty) dir and a symlink to the sentinel dir.
+    let mid = tree.join("mid");
+    std::fs::create_dir(&mid).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let mid_thread = mid.clone();
+    let sentinel_thread = sentinel_dir.clone();
+    let swapper = std::thread::spawn(move || {
+        let mut as_link = false;
+        while !stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = std::fs::remove_dir_all(&mid_thread);
+            let _ = std::fs::remove_file(&mid_thread);
+            if as_link {
+                let _ = std::os::unix::fs::symlink(&sentinel_thread, &mid_thread);
+            } else {
+                let _ = std::fs::create_dir(&mid_thread);
+            }
+            as_link = !as_link;
+        }
+        // leave a clean real dir as the final state.
+        let _ = std::fs::remove_dir_all(&mid_thread);
+        let _ = std::fs::remove_file(&mid_thread);
+        let _ = std::fs::create_dir(&mid_thread);
+    });
+    let dst_tree = dst_dir.path().join("tree");
+    let src_remote = format!("localhost:{}", tree.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_tree.to_str().unwrap());
+    for _ in 0..3 {
+        let _ = std::fs::remove_dir_all(&dst_tree);
+        let _ = run_rcp_with_args(&[&src_remote, &dst_remote]);
+        assert!(
+            !tree_contains_content(&dst_tree, "TOP-SECRET-SENTINEL"),
+            "source followed a swapped intermediate symlink and copied the out-of-tree sentinel"
+        );
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    swapper.join().unwrap();
+}
+
+/// Best-effort race: while a remote copy WRITES into the destination, swap an intermediate
+/// DESTINATION directory between a real directory and a symlink pointing OUTSIDE the destination
+/// tree. The destination's fd-relative writes (pinned parent fd, `O_NOFOLLOW`, recheck-guarded)
+/// must never be redirected through the symlink to create/write outside the tree. Any file leaking
+/// into the out-of-tree "escape" directory is a true-positive failure; a clean run is expected.
+#[test]
+fn test_remote_dest_intermediate_dir_swap_never_escapes() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = src_dir.path().join("tree");
+    let src_mid = src_tree.join("mid");
+    std::fs::create_dir_all(&src_mid).unwrap();
+    for i in 0..200 {
+        create_test_file(&src_mid.join(format!("c{i}.txt")), "real data", 0o644);
+    }
+    // out-of-tree escape directory: must stay empty (nothing redirected here via a symlink swap).
+    let escape = dst_dir.path().join("escape_outside");
+    std::fs::create_dir(&escape).unwrap();
+    let dst_tree = dst_dir.path().join("tree");
+    let dst_mid = dst_tree.join("mid");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let dst_mid_thread = dst_mid.clone();
+    let escape_thread = escape.clone();
+    let swapper = std::thread::spawn(move || {
+        // repeatedly try to replace the destination's intermediate dir with a symlink to escape.
+        while !stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = std::fs::remove_dir_all(&dst_mid_thread);
+            let _ = std::fs::remove_file(&dst_mid_thread);
+            let _ = std::os::unix::fs::symlink(&escape_thread, &dst_mid_thread);
+            let _ = std::fs::remove_file(&dst_mid_thread);
+        }
+    });
+    let src_remote = format!("localhost:{}", src_tree.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_tree.to_str().unwrap());
+    for _ in 0..3 {
+        let _ = std::fs::remove_dir_all(&dst_tree);
+        // the copy may error as the swapper fights it for the path — that is fine; the invariant is
+        // that nothing is ever written OUTSIDE the destination tree.
+        let _ = run_rcp_with_args(&[&src_remote, &dst_remote]);
+        let escaped: Vec<std::path::PathBuf> = std::fs::read_dir(&escape)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert!(
+            escaped.is_empty(),
+            "destination followed a swapped intermediate symlink and wrote outside the tree: {escaped:?}"
+        );
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    swapper.join().unwrap();
+}
+
 /// The remote source must not dereference a ROOT symlink for data: a root operand that is a symlink
 /// to an out-of-tree sentinel is copied as a symlink (read fd-relative via its trusted parent),
 /// never followed to write the sentinel's bytes as a destination regular file. Deterministic
