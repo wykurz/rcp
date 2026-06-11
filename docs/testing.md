@@ -279,10 +279,29 @@ The `.github/workflows/validate.yml` workflow runs:
 ### Running CI Locally
 
 ```bash
-just ci  # Runs: lint + doc + test-all
+just ci  # lint + doc + test-all (debug + release + doctests) + Docker tests
 ```
 
-This replicates the CI checks locally before pushing.
+`just ci` is the primary local "is this ready to push?" gate — it runs the same lint,
+docs, and debug + release + doctest + Docker checks CI does, and is the one command to
+run before pushing. It's a close proxy for the CI matrix rather than a byte-for-byte
+match; a few CI steps live outside it:
+
+- **Sudo-gated tests** (`test(~sudo)`, which need passwordless sudo). CI runs these in a
+  separate step, in both debug and release. Run them yourself when a change touches
+  sudo-only behavior:
+
+  ```bash
+  cargo nextest run --run-ignored only -E 'test(~sudo)'   # add --release to also cover release
+  ```
+
+- **glibc release build.** CI also builds the workspace for `x86_64-unknown-linux-gnu`;
+  `just ci` builds and tests only the default `x86_64-unknown-linux-musl` target.
+
+- **Chaos tests.** `just ci`'s Docker step runs the full `docker` profile *including*
+  chaos (the compose containers are privileged, so they actually run), whereas CI
+  excludes chaos from its main Docker job and runs it in a separate `chaos-tests.yml`
+  workflow. So `just ci` does cover chaos locally — CI just schedules it separately.
 
 ## Chaos Testing
 

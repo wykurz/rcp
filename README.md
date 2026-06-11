@@ -368,6 +368,9 @@ Warning: This disables both encryption and authentication on the data path.
 - Keep encryption enabled (default) for sensitive data
 - Only use `--no-encryption` on isolated, trusted networks
 
+**TOCTOU-safe mutation (`rrm`, `rchm`, `rcp`, `rlink`):**
+The mutating tools harden their directory walk against symlink/path-swap races (fd-relative `openat`/`O_NOFOLLOW`; see `docs/tocttou.md`). `--toctou-check` prints whether a given invocation is hardened and exits (`0` = safe); `--require-toctou-safe` refuses to run unless it is — handy to pin in a `sudo` rule. Neither verifies the trust of the operand path's *prefix*; lock that down in the rule.
+
 For detailed security architecture and threat model, see `docs/security.md`.
 
 ## Terminal output
@@ -466,6 +469,18 @@ Preview what would happen without making changes:
 ```
 
 **Note:** Dry-run mode is primarily useful for previewing `--include`/`--exclude` filtering. It bypasses `--overwrite` checks and does not check whether files already exist at the destination. `--progress` and `--summary` are suppressed in dry-run mode (use `-v` to still see summary output).
+
+### Age-based filtering (`rrm`, `rchm`)
+
+`rrm` and `rchm` additionally support time-based entry filters: `--modified-before <DURATION>` acts only on entries whose mtime is at least that old, and `--created-before <DURATION>` does the same on birth time (btime). Durations use humantime syntax — note that **`M` means months and lowercase `m` means minutes**. The filter is per-entry: it applies to each file, directory, and symlink by that entry's *own* timestamp (directories are always traversed regardless of their own). For `rrm` specifically, a directory is then removed only when its own timestamp is old enough *and* it ends up empty after its children are processed — a directory left non-empty by a spared child is kept and logged, not an error. (`rchm` changes a matching directory's mode/owner based on its own timestamp regardless of its children.) `--created-before` is **not available on musl static builds** (btime is unreadable there) — use `--modified-before` or a glibc build.
+
+```fish
+# remove only files not modified in the last 30 days
+> rrm --modified-before 30d old-cache/
+
+# chmod only entries older than 6 months (M = months, not minutes)
+> rchm --mode g-w --modified-before 6M archive/
+```
 
 ## Overwrite
 
