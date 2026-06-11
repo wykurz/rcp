@@ -354,7 +354,9 @@ re-bracket `alpha` / `beta` around the observed idle ratio.
 
 A few worked examples make the shape concrete. Assume a 0.5 ms
 baseline percentile (p10), default thresholds, and `cwnd = 20`
-going into the tick:
+going into the tick. (20 is an illustrative midpoint, not a default:
+the controller starts at `initial_cwnd = 1` and grows one step per
+sample-bearing tick.)
 
 | Current percentile (p50) | Ratio | Decision | New `cwnd` |
 |--------------------------|-------|----------|------------|
@@ -381,6 +383,14 @@ defaults are cross (p10 baseline, p50 current). A ratio below 1.0 is
 unusual — it means the recent median is faster than the long-horizon
 p10, which only happens during a clear improvement (e.g. a competing
 client dropped off). The controller treats it as growth headroom.
+
+Third, a tick that consumed no *new* sample since the previous tick holds
+`cwnd` unchanged — it does not re-apply the law to a stale ratio. This
+matters because the tick cadence (default 50 ms) is faster than the sample
+arrival rate under light load; without the guard a single sample could
+otherwise drive many steps over a one-second window. (Likewise, when the
+latency windows age out to "no samples", the ratio resets to `None` and
+`cwnd` is held until fresh samples arrive.)
 
 The "responsiveness" of the controller is shaped by these knobs in
 combination:
