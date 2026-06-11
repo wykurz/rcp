@@ -1,14 +1,24 @@
-//! Shared primitives for directory-walking operations (copy, link, rm).
+//! Shared primitives for directory-walking operations (copy, link, rm, chmod, cmp).
 //!
-//! [`EntryKind`] classifies a directory entry by file type, and exposes the
-//! per-type bits (dry-run label, skipped-counter increment) so callers don't
-//! re-implement the dispatch.
-//!
-//! [`next_entry_probed`] wraps `tokio::fs::ReadDir::next_entry` (plus the
-//! follow-up `file_type()` lookup) with the static ops rate gate so
-//! copy/link/rm share a single source of truth for walk iteration. The
-//! walk path is deliberately not congestion-probed — see the function's
-//! own docs for why.
+//! This module collects several small, related helpers used by `walk_driver` and the per-tool
+//! visitors:
+//! - `EntryKind` — classifies a directory entry by file type and exposes the per-type bits
+//!   (dry-run label, skipped-counter increment) so callers don't re-implement the dispatch.
+//! - leaf-permit lifecycle (`PermitKind` / `LeafPermit` / `preacquire_leaf_permit`) — acquires a
+//!   leaf's open-files permit before spawning, co-located with the driver's drop-before-recurse
+//!   invariant.
+//! - congestion↔throttle bridges (`throttle_side` / `throttle_op` / `meta_resource`) — map the
+//!   walk's side/op enums onto the throttle and congestion resource enums.
+//! - metadata-probe wrappers (`next_entry_probed` / `run_metadata_probed`) — wrap the path-based
+//!   `ReadDir`/`metadata` calls with the static ops rate gate (deliberately not congestion-probed
+//!   — see the function docs). These are the iteration primitive for the PATH-based walks (rcmp and
+//!   the `-L`/dereference and remote-source paths); the TOCTOU-hardened copy/link/rm/chmod walks go
+//!   through the fd-based `walk_driver` instead.
+//! - filter helpers (`filter_is_dir` / `should_skip_entry`) — apply include/exclude filtering and
+//!   entry classification during enumeration.
+//! - root-operand parsing (`split_root_operand` / `root_operand_basename` /
+//!   `without_trailing_separators`) — resolve a user-specified source operand (trailing slashes,
+//!   `.`/`..`) into its components.
 
 use crate::filter::{FilterResult, FilterSettings};
 use crate::progress::Progress;
