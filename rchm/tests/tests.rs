@@ -301,3 +301,133 @@ fn defer_dir_changes_with_fail_early_does_not_change_ancestor_after_child_error(
     );
     std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+/// Supplementary groups the current user belongs to (for privilege-free chgrp tests).
+fn current_groups() -> Vec<u32> {
+    let out = std::process::Command::new("id").arg("-G").output().unwrap();
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .filter_map(|g| g.parse().ok())
+        .collect()
+}
+
+#[test]
+fn defer_dir_changes_keep_going_applies_change_despite_open_failure() {
+    // post-order (--defer-dir-changes) + keep-going: a pre-existing 0000 directory cannot be opened
+    // to process its contents, so the run reports an error — but the deferred change to the
+    // directory itself must still be applied via its O_PATH handle (which works on a 0000 dir).
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().join("locked");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("inner"), b"x").unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    rchm()
+        .args(["--mode", "d:u+rwx", "--defer-dir-changes"])
+        .arg(&dir)
+        .assert()
+        .failure();
+    assert_eq!(
+        mode_of(&dir),
+        0o700,
+        "the deferred change is applied even though the directory open failed"
+    );
+    // dir is now 0o700, so tempdir cleanup can recurse to remove the inner file
+}
+
+#[test]
+fn owner_change_to_current_uid_is_accepted_and_unchanged() {
+    // a file already owned by the current user: --owner <uid> resolves the DSL and the plan
+    // correctly accounts it as unchanged — exercises the owner-resolution path without privilege.
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("f.txt");
+    std::fs::write(&f, b"x").unwrap();
+    let uid = std::fs::metadata(&f).unwrap().uid();
+    let out = rchm()
+        .args(["--owner", &uid.to_string(), "--summary"])
+        .arg(&f)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::metadata(&f).unwrap().uid(),
+        uid,
+        "the uid is unchanged"
+    );
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("files unchanged: 1"),
+        "stdout was: {stdout}"
+    );
+    assert!(stdout.contains("files changed: 0"), "stdout was: {stdout}");
+}
+
+#[test]
+fn group_change_preserves_setgid_across_chgrp() {
+    // changing a setgid file's group to another group the user belongs to needs no privilege; the
+    // kernel clears setgid on chgrp, so rchm must restore it (chown-first, then re-chmod).
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("f.txt");
+    std::fs::write(&f, b"x").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o2644)).unwrap();
+    let cur_gid = std::fs::symlink_metadata(&f).unwrap().gid();
+    assert_eq!(
+        mode_of(&f),
+        0o2644,
+        "setup: the setgid bit must be set before the chgrp"
+    );
+    let Some(target) = current_groups().into_iter().find(|&g| g != cur_gid) else {
+        eprintln!("skipping: the user belongs to only one group, cannot chgrp without privilege");
+        return;
+    };
+    rchm()
+        .args(["--group", &target.to_string()])
+        .arg(&f)
+        .assert()
+        .success();
+    let after = std::fs::symlink_metadata(&f).unwrap();
+    assert_eq!(
+        after.gid(),
+        target,
+        "the group must change to the target group"
+    );
+    assert_eq!(
+        after.permissions().mode() & 0o7777,
+        0o2644,
+        "the setgid bit must be restored after the chgrp cleared it"
+    );
+}
+
+#[test]
+#[ignore = "requires passwordless sudo"]
+fn sudo_owner_and_group_change_to_root() {
+    // a real uid+gid change needs privilege; this runs only under the sudo-gated CI job. an
+    // unprivileged user can still unlink the resulting root-owned file from its own tempdir.
+    let sudo_ok = std::process::Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !sudo_ok {
+        eprintln!("Skipping test: passwordless sudo not available");
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("f.txt");
+    std::fs::write(&f, b"x").unwrap();
+    let status = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            env!("CARGO_BIN_EXE_rchm"),
+            "--owner",
+            "0",
+            "--group",
+            "0",
+        ])
+        .arg(&f)
+        .status()
+        .expect("failed to run sudo rchm");
+    assert!(status.success(), "sudo rchm should succeed");
+    let after = std::fs::symlink_metadata(&f).unwrap();
+    assert_eq!(after.uid(), 0, "owner must change to root");
+    assert_eq!(after.gid(), 0, "group must change to root");
+}
