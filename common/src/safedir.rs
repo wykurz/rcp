@@ -262,7 +262,7 @@ impl Dir {
     /// Open a TRUSTED command-line parent-prefix directory, resolving symlinks
     /// normally (the final component IS followed if it is a symlink).
     ///
-    /// The trusted-boundary model (design spec §2) trusts the directory named on
+    /// The trusted-boundary model (docs/tocttou.md, "Trusted boundary") trusts the directory named on
     /// the command line up to and including itself; only entries strictly BELOW
     /// it are hardened with `O_NOFOLLOW`. The parent prefix that CONTAINS the
     /// operand is therefore resolved like a normal path open — a symlinked parent
@@ -819,7 +819,7 @@ impl Dir {
 /// A directory opened by FOLLOWING symlinks normally — the command-line-named
 /// path's trusted parent prefix.
 ///
-/// The trusted-boundary model (design spec §2) trusts the path named on the
+/// The trusted-boundary model (docs/tocttou.md, "Trusted boundary") trusts the path named on the
 /// command line up to and including its container directory; only entries
 /// strictly BELOW the named root are hardened with `O_NOFOLLOW`. A `TrustedDir`
 /// is that trusted container, and it is the ONLY way in this crate to obtain a
