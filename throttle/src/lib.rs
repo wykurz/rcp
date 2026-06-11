@@ -357,21 +357,28 @@ async fn get_iops_tokens(tokens: u32) {
     IOPS_THROTTLE.consume_many(tokens).await;
 }
 
+/// Number of IOPS tokens a `file_size`-byte file costs at `chunk_size` granularity: one token per
+/// chunk, ceiling-divided (an empty file still costs one). Returns `None` when `chunk_size == 0` —
+/// IOPS throttling is off for this call, so nothing is charged. The count is a `u64`; callers must
+/// still bound it to `u32` before consuming (see [`get_file_iops_tokens`]).
+fn file_iops_token_count(chunk_size: u64, file_size: u64) -> Option<u64> {
+    (std::cmp::max(1, file_size) - 1)
+        .checked_div(chunk_size)
+        .map(|div| 1 + div)
+}
+
 pub async fn get_file_iops_tokens(chunk_size: u64, file_size: u64) {
-    if let Some(div) = (std::cmp::max(1, file_size) - 1).checked_div(chunk_size) {
-        let tokens = 1 + div;
-        if tokens > u64::from(u32::MAX) {
-            tracing::error!(
-                "chunk size: {} is too small to limit throughput for files this big, size: {}",
-                chunk_size,
-                file_size,
-            );
-        } else {
-            // tokens is guaranteed to be <= u32::MAX by check above
-            let tokens_u32 =
-                u32::try_from(tokens).expect("tokens should fit in u32 after bounds check");
-            get_iops_tokens(tokens_u32).await;
-        }
+    let Some(tokens) = file_iops_token_count(chunk_size, file_size) else {
+        // chunk_size == 0: iops throttling is off for this call
+        return;
+    };
+    match u32::try_from(tokens) {
+        Ok(tokens_u32) => get_iops_tokens(tokens_u32).await,
+        Err(_) => tracing::error!(
+            "chunk size: {} is too small to limit throughput for files this big, size: {}",
+            chunk_size,
+            file_size,
+        ),
     }
 }
 
@@ -441,4 +448,34 @@ pub fn enable_ops_throttle() -> bool {
 #[must_use]
 pub fn current_ops_in_flight_limit(resource: Resource) -> usize {
     ops_in_flight_limit(resource).current_limit()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn file_iops_token_count_is_ceiling_division() {
+        // one token per chunk, rounded up; an empty file still costs one token
+        assert_eq!(file_iops_token_count(10, 0), Some(1));
+        assert_eq!(file_iops_token_count(10, 1), Some(1));
+        assert_eq!(file_iops_token_count(10, 10), Some(1));
+        assert_eq!(file_iops_token_count(10, 11), Some(2));
+        assert_eq!(file_iops_token_count(10, 20), Some(2));
+        assert_eq!(file_iops_token_count(10, 21), Some(3));
+        assert_eq!(file_iops_token_count(10, 100), Some(10));
+    }
+    #[test]
+    fn file_iops_token_count_zero_chunk_charges_nothing() {
+        // chunk_size == 0 means iops throttling is off for this call — no tokens, no divide-by-zero
+        assert_eq!(file_iops_token_count(0, 0), None);
+        assert_eq!(file_iops_token_count(0, 1_000_000), None);
+    }
+    #[test]
+    fn file_iops_token_count_overflows_u32_for_a_tiny_chunk() {
+        // a 1-byte chunk over a >4 GiB file exceeds u32; get_file_iops_tokens logs and skips rather
+        // than consuming a truncated/wrong token count
+        let tokens = file_iops_token_count(1, u64::from(u32::MAX) + 10).unwrap();
+        assert!(tokens > u64::from(u32::MAX));
+        assert!(u32::try_from(tokens).is_err());
+    }
 }
