@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-06-12
+
 ### Added
 - Remote `rcp` skips re-transferring files the destination would leave untouched
   anyway. The destination sends a manifest of its existing entries; the source
@@ -46,6 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   traversed child failed to link: the directory became empty, was pruned by the
   empty-directory cleanup, and the child's failure was dropped. The collected
   error is now surfaced, so such a run exits non-zero.
+
+### Security
+- Harden `rcp`, `rlink`, `rchm`, `rrm`, and remote copy against time-of-check-to-
+  time-of-use (TOCTOU) races on Linux: traversal now uses an fd-based safe walk
+  (`O_NOFOLLOW` + fd-relative `*at()` syscalls) so a concurrent symlink or path-
+  component swap at or below a named root cannot redirect a read/write/chmod/chown/
+  delete outside that root's subtree, and mode/bytes are read from the same fd so a
+  swap can never widen permissions or attach the wrong owner. Add `--toctou-check`
+  and `--require-toctou-safe` to each tool to audit/enforce safe operands. See
+  `docs/tocttou.md`; `--dereference`/`-L`, non-Linux builds, and `rcmp` are out of
+  scope.
 
 ## [0.33.0] - 2026-05-28
 
@@ -243,7 +256,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See git history for changes in previous versions.
 
-[Unreleased]: https://github.com/wykurz/rcp/compare/v0.33.0...HEAD
+[Unreleased]: https://github.com/wykurz/rcp/compare/v0.34.0...HEAD
+[0.34.0]: https://github.com/wykurz/rcp/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/wykurz/rcp/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/wykurz/rcp/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/wykurz/rcp/compare/v0.30.0...v0.31.0
