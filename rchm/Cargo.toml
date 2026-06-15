@@ -5,6 +5,7 @@ description = "Fast recursive chmod/chgrp/chown for large filesets (a dchmod rep
 license.workspace = true
 edition.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 readme = "../README.md"
 documentation = "https://docs.rs/rcp-tools-rchm"
 keywords = ["cli", "file", "chmod", "chown", "performance"]

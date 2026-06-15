@@ -5,6 +5,7 @@ description = "Fast hard-linking tool - efficiently creates hard links for large
 license.workspace = true
 edition.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 readme = "../README.md"
 documentation = "https://docs.rs/rcp-tools-rlink"
 keywords = ["cli", "file", "hardlink", "link", "performance"]

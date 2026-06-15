@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Pinned `sysinfo` at `0.38` and froze the minimum supported Rust version (MSRV)
+  at 1.91.1, declared via `rust-version` in `Cargo.toml` and enforced by a
+  dedicated CI job that compiles the workspace on that toolchain. The dev/CI
+  toolchain (latest stable) is now tracked separately from the MSRV, so routine
+  dependency or toolchain updates can't silently raise the floor. `sysinfo` 0.39
+  required Rust 1.95; 0.38 keeps the same `set_open_files_limit` API at MSRV 1.88.
+
 ## [0.34.0] - 2026-06-12
 
 ### Added

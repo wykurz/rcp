@@ -5,6 +5,7 @@ description = "Fast file comparison tool - efficiently compares metadata across 
 license.workspace = true
 edition.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 readme = "../README.md"
 documentation = "https://docs.rs/rcp-tools-rcmp"
 keywords = ["cli", "file", "compare", "diff", "performance"]

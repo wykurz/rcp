@@ -50,7 +50,7 @@ for pkg in $PACKAGES; do
     fi
 
     # Check for workspace-inherited fields
-    for field in "version.workspace" "edition.workspace" "license.workspace" "repository.workspace"; do
+    for field in "version.workspace" "edition.workspace" "license.workspace" "repository.workspace" "rust-version.workspace"; do
         if ! grep -q "$field = true" "$cargo_toml"; then
             echo -e "${RED}ERROR: $cargo_toml missing '$field = true'${NC}"
             VIOLATIONS_FOUND=1
@@ -86,7 +86,7 @@ if [ $VIOLATIONS_FOUND -eq 1 ]; then
     echo ""
     echo "All packages should have:"
     echo "  1. [lints] workspace = true"
-    echo "  2. version.workspace = true, edition.workspace = true, etc."
+    echo "  2. version.workspace = true, edition.workspace = true, rust-version.workspace = true, etc."
     echo "  3. [package.metadata.docs.rs] with:"
     echo "     $EXPECTED_CARGO_ARGS"
     echo "     $EXPECTED_RUSTDOC_ARGS"

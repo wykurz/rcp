@@ -23,6 +23,17 @@
           targets = [ "x86_64-unknown-linux-musl" ];
         };
 
+        # MSRV toolchain — used only by the `msrv-check` wrapper (and CI's `msrv`
+        # job) to verify the workspace still compiles on the minimum supported
+        # Rust version. Kept separate from `rustToolchain` (latest stable) so
+        # everyday dev work uses the newest compiler.
+        msrvToolchain = pkgs.rust-bin.stable."1.91.1".minimal.override {
+          targets = [ "x86_64-unknown-linux-gnu" "x86_64-unknown-linux-musl" ];
+        };
+        msrvCheck = pkgs.writeShellScriptBin "msrv-check" ''
+          exec ${msrvToolchain}/bin/cargo check --workspace --locked --all-targets --target x86_64-unknown-linux-gnu --target x86_64-unknown-linux-musl "$@"
+        '';
+
         muslTools =
           if pkgs.stdenv.isLinux then {
             gcc = pkgs.pkgsCross.musl64.buildPackages.gcc;
@@ -129,6 +140,7 @@
             buildInputs =
               [
                 rustToolchain
+                msrvCheck
                 pkgs.rust-analyzer
 
                 # Development tools from the original default.nix

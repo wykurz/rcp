@@ -5,6 +5,12 @@ let
     extensions = [ "rust-analysis" "rust-src" ];
     targets = [ "x86_64-unknown-linux-musl" ];
   };
+  msrvToolchain = nixpkgs.rust-bin.stable."1.91.1".minimal.override {
+    targets = [ "x86_64-unknown-linux-gnu" "x86_64-unknown-linux-musl" ];
+  };
+  msrvCheck = nixpkgs.writeShellScriptBin "msrv-check" ''
+    exec ${msrvToolchain}/bin/cargo check --workspace --locked --all-targets --target x86_64-unknown-linux-gnu --target x86_64-unknown-linux-musl "$@"
+  '';
   muslTools =
     if nixpkgs.stdenv.isLinux then {
       gcc = nixpkgs.pkgsCross.musl64.buildPackages.gcc;
@@ -20,6 +26,7 @@ in
           [
             rust-analyzer
             myrust
+            msrvCheck
             binutils
             # cargo-audit
             cargo-bloat
