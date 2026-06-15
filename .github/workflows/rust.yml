@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# Least-privilege GITHUB_TOKEN; the called validate workflow only reads the repo.
+permissions:
+  contents: read
+
 jobs:
   validate:
     uses: ./.github/workflows/validate.yml

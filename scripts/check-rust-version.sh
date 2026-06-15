@@ -1,59 +1,85 @@
 #!/bin/bash
 # Rust Version Consistency Linter
-# Ensures all hardcoded Rust toolchain versions match across the repository
 #
-# This script checks that rust-toolchain.toml, flake.nix, and default.nix
-# all reference the same Rust version
+# The project deliberately tracks TWO separate Rust versions:
+#
+#   1. DEV toolchain — the (latest) stable used for day-to-day builds and CI.
+#      Source of truth: `channel` in rust-toolchain.toml.
+#      Must match the `.default` rust-overlay toolchains in flake.nix / default.nix.
+#
+#   2. MSRV (minimum supported Rust version) — the floor the project builds on.
+#      Source of truth: `rust-version` in [workspace.package] of Cargo.toml.
+#      Must match: the `toolchain:` pin of the `msrv` job in
+#      .github/workflows/validate.yml, and the `.minimal` rust-overlay toolchains
+#      in flake.nix / default.nix.
+#
+# The dedicated CI `msrv` job actually compiles the workspace on the MSRV
+# toolchain; this script ensures every file agrees on what that version is, so an
+# accidental bump can't slip through unnoticed.
 
 set -euo pipefail
 
-# colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 NC='\033[0m' # no color
+
+FAIL=0
+fail() { echo -e "${RED}✗ $1${NC}"; FAIL=1; }
+
+# Extract the first dotted version (2 or 3 components) from a line on stdin.
+extract_ver() { sed -n -E 's/.*"([0-9]+\.[0-9]+(\.[0-9]+)?)".*/\1/p'; }
+# Same, but anchored to the rust-overlay stable."..." token, so a trailing quoted
+# token on the same line (e.g. a comment) cannot be matched by mistake.
+extract_nix_ver() { sed -n -E 's/.*stable\."([0-9]+\.[0-9]+(\.[0-9]+)?)".*/\1/p'; }
 
 echo "🔍 checking rust version consistency..."
 
-# extract version from rust-toolchain.toml (source of truth)
-EXPECTED_VERSION=$(grep -E '^channel\s*=\s*"' rust-toolchain.toml | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/')
-
-if [ -z "$EXPECTED_VERSION" ]; then
-    echo -e "${RED}✗ failed to extract version from rust-toolchain.toml${NC}"
-    exit 1
+# --- 1. DEV toolchain ---------------------------------------------------------
+DEV=$(grep -E '^channel[[:space:]]*=' rust-toolchain.toml | head -n1 | extract_ver || true)
+if [ -z "$DEV" ]; then
+    fail "could not read dev toolchain 'channel' from rust-toolchain.toml"
 fi
 
-echo "expected version: $EXPECTED_VERSION"
+for file in flake.nix default.nix; do
+    v=$(grep -E 'rust-bin\.stable\."[0-9.]+"\.default' "$file" | head -n1 | extract_nix_ver || true)
+    if [ -z "$v" ]; then
+        fail "$file: could not find dev toolchain (rust-bin.stable.\"…\".default)"
+    elif [ "$v" != "$DEV" ]; then
+        fail "$file: dev toolchain is $v (expected $DEV from rust-toolchain.toml)"
+    fi
+done
 
-VIOLATIONS=0
-
-# check flake.nix
-FLAKE_VERSION=$(grep -E 'rust-bin\.stable\."[0-9]+\.[0-9]+\.[0-9]+"' flake.nix | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/' || true)
-if [ -z "$FLAKE_VERSION" ]; then
-    echo -e "${RED}✗ failed to extract version from flake.nix (pattern not found)${NC}"
-    VIOLATIONS=$((VIOLATIONS + 1))
-elif [ "$FLAKE_VERSION" != "$EXPECTED_VERSION" ]; then
-    echo -e "${RED}✗ flake.nix has version $FLAKE_VERSION (expected $EXPECTED_VERSION)${NC}"
-    VIOLATIONS=$((VIOLATIONS + 1))
+# --- 2. MSRV ------------------------------------------------------------------
+MSRV=$(grep -E '^rust-version[[:space:]]*=' Cargo.toml | head -n1 | extract_ver || true)
+if [ -z "$MSRV" ]; then
+    fail "could not read 'rust-version' (MSRV) from [workspace.package] in Cargo.toml"
 fi
 
-# check default.nix
-DEFAULT_VERSION=$(grep -E 'rust-bin\.stable\."[0-9]+\.[0-9]+\.[0-9]+"' default.nix | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/' || true)
-if [ -z "$DEFAULT_VERSION" ]; then
-    echo -e "${RED}✗ failed to extract version from default.nix (pattern not found)${NC}"
-    VIOLATIONS=$((VIOLATIONS + 1))
-elif [ "$DEFAULT_VERSION" != "$EXPECTED_VERSION" ]; then
-    echo -e "${RED}✗ default.nix has version $DEFAULT_VERSION (expected $EXPECTED_VERSION)${NC}"
-    VIOLATIONS=$((VIOLATIONS + 1))
+for file in flake.nix default.nix; do
+    v=$(grep -E 'rust-bin\.stable\."[0-9.]+"\.minimal' "$file" | head -n1 | extract_nix_ver || true)
+    if [ -z "$v" ]; then
+        fail "$file: could not find MSRV toolchain (rust-bin.stable.\"…\".minimal)"
+    elif [ "$v" != "$MSRV" ]; then
+        fail "$file: MSRV toolchain is $v (expected $MSRV from Cargo.toml rust-version)"
+    fi
+done
+
+CI_MSRV=$(grep -E '^[[:space:]]*toolchain:[[:space:]]*"?[0-9]+\.[0-9]+' .github/workflows/validate.yml \
+    | head -n1 | sed -E 's/.*toolchain:[[:space:]]*"?([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/' || true)
+if [ -z "$CI_MSRV" ]; then
+    fail ".github/workflows/validate.yml: could not find the msrv job 'toolchain:' pin"
+elif [ "$CI_MSRV" != "$MSRV" ]; then
+    fail ".github/workflows/validate.yml: msrv job pins $CI_MSRV (expected $MSRV)"
 fi
 
-if [ $VIOLATIONS -eq 0 ]; then
-    echo -e "${GREEN}✓ all rust versions are consistent: $EXPECTED_VERSION${NC}"
+# --- result -------------------------------------------------------------------
+if [ "$FAIL" -eq 0 ]; then
+    echo -e "${GREEN}✓ rust versions consistent — dev: $DEV, msrv: $MSRV${NC}"
     exit 0
 else
     echo ""
-    echo -e "${RED}found $VIOLATIONS version mismatch(es)${NC}"
-    echo ""
-    echo "to fix: update all files to use version $EXPECTED_VERSION from rust-toolchain.toml"
+    echo -e "${RED}rust version inconsistencies found (see above)${NC}"
+    echo "dev toolchain source of truth:  rust-toolchain.toml (channel)"
+    echo "msrv source of truth:           Cargo.toml ([workspace.package] rust-version)"
     exit 1
 fi

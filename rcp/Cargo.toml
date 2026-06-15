@@ -5,6 +5,7 @@ description = "Fast file operations tools - rcp (copy) and rcpd (remote copy dae
 license.workspace = true
 edition.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 readme = "../README.md"
 documentation = "https://docs.rs/rcp-tools-rcp"
 keywords = ["cli", "file", "copy", "remote", "performance"]

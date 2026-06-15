@@ -55,6 +55,12 @@ test-all: test doctest test-release doctest-release
 check:
     cargo check --workspace
 
+# Verify the workspace builds on the minimum supported Rust version (MSRV), for
+# both shipped targets (gnu + musl). Separate from `just ci`: needs the nix
+# devShell's `msrv-check` wrapper. GitHub CI enforces the same via the `msrv` job.
+msrv:
+    msrv-check
+
 # Build all packages
 build:
     cargo build --workspace
@@ -67,9 +73,11 @@ build-release:
 doc:
     RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" cargo doc --no-deps --workspace
 
-# Run all CI checks locally before pushing (matches GitHub Actions)
+# Run the standard CI checks locally before pushing (lint, docs, tests + Docker).
+# The MSRV check is intentionally separate — run `just msrv` (it needs the nix
+# devShell's pinned toolchain); GitHub CI runs it as the dedicated `msrv` job.
 ci: lint doc test-all-with-docker
-    @echo "✅ All CI checks passed! Safe to push."
+    @echo "✅ All CI checks passed! (run 'just msrv' for the separate MSRV check)"
 
 # Clean build artifacts
 clean:

@@ -5,6 +5,7 @@ description = "Test fileset generator - creates sample directory structures and 
 license.workspace = true
 edition.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 readme = "../README.md"
 documentation = "https://docs.rs/rcp-tools-filegen"
 keywords = ["cli", "file", "generator", "testing", "benchmark"]

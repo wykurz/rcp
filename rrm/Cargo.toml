@@ -5,6 +5,7 @@ description = "Fast file removal tool - efficiently removes large filesets (simi
 license.workspace = true
 edition.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 readme = "../README.md"
 documentation = "https://docs.rs/rcp-tools-rrm"
 keywords = ["cli", "file", "remove", "delete", "performance"]

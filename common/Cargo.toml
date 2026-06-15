@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Internal library for RCP file operation tools - shared utilities and core operations (not intended for direct use)"
 readme = "../README.md"
 documentation = "https://docs.rs/rcp-tools-common"
@@ -42,7 +43,7 @@ libc = "0.2"
 nix = { version = "0.31", features = ["dir", "fs", "hostname", "user", "zerocopy"] }
 procfs = "0.18"
 rand = "0.10"
-sysinfo = "0.39"
+sysinfo = "0.38"
 thiserror = "2.0"
 throttle = { workspace = true }
 tokio = { version = "1.52", features = ["full", "parking_lot", "tracing"] }
