@@ -289,6 +289,11 @@ jobs:
 
       - name: Publish to crates.io
         id: publish
+        # cargo-workspaces can swallow a per-crate publish failure and still exit 0, and
+        # may exit non-zero on already-published crates during a re-run. Don't gate the
+        # job on its exit code — the "Verify crates.io publication" step below is the
+        # source of truth.
+        continue-on-error: true
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
@@ -301,22 +306,19 @@ jobs:
             --yes \
             --no-verify
 
-      - name: Summary
-        if: always()
+      - name: Verify crates.io publication
         run: |
-          echo "## crates.io Publication Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.publish.outcome }}" = "success" ]; then
-            echo "✅ All workspace packages published to crates.io" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ crates.io publication failed" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Packages:" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          cargo workspaces list --all >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "## crates.io Publication Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          # errexit off so we can capture the script's status, append the closing code fence,
+          # and exit with the real result. 2>&1 folds the script's stderr (e.g. its final
+          # "ERROR: ... missing" line) into the summary; PIPESTATUS[0] = script, not tee.
+          set +e
+          scripts/check-crates-published.sh "${RELEASE_TAG#v}" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          status=${PIPESTATUS[0]}
+          set -e
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
   publish-release:
     runs-on: ubuntu-latest
