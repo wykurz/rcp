@@ -27,12 +27,18 @@ Builds, publishes binary packages, and publishes to crates.io when a tag is push
 All build and publish jobs check out the release tag, ensuring consistency even on manual workflow_dispatch reruns.
 
 **Usage:**
+
+Run `just release`, which guides you through the whole process. Because direct
+pushes to `main` are disabled, the CHANGELOG and version-bump commits land via
+pull requests (you merge them with **Rebase and merge** — click **Update branch**
+first if GitHub reports the branch is out of date); the helper opens those PRs
+for you. Tag pushes are *not* branch-protected, so the helper still pushes the
+release tag directly to trigger this workflow:
+
 ```bash
 git tag v0.24.0
 git push origin v0.24.0
 ```
-
-Or use `just release` which guides you through the process.
 
 ### publish.yml
 Manual-only workflow for re-publishing to crates.io (e.g., after a failed release). Requires an explicit release tag input (e.g., `v0.28.0`), validates and publishes from that exact tagged commit.
