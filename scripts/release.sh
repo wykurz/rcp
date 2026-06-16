@@ -79,6 +79,36 @@ get_last_tag() {
     git describe --tags --abbrev=0 2>/dev/null || echo ""
 }
 
+# Find open PRs from this script's release branches (release/changelog-* or
+# release/bump-*) that haven't been merged yet. Echoes one "url<TAB>title" line
+# per match (nothing if none). Deliberately narrow so an unrelated release/*
+# branch can't wedge the release flow.
+open_release_pr() {
+    # --limit well above any realistic open-PR count; we filter client-side, so a
+    # release PR must not fall off the default 30-result page. Emit every match so
+    # the caller can surface them all rather than an arbitrary first one.
+    gh pr list --repo "$GITHUB_REPO" --state open --limit 200 \
+        --json url,title,headRefName \
+        --jq '.[] | select((.headRefName | startswith("release/changelog-")) or (.headRefName | startswith("release/bump-"))) | "\(.url)\t\(.title)"'
+}
+
+# Abort if the target release branch already exists (a leftover from an
+# interrupted run); reusing it would fail or push a diverged history. We only
+# reach this when there is no open PR for it — the pending-PR guard handles that.
+ensure_branch_free() {
+    local branch="$1"
+    if git show-ref --verify --quiet "refs/heads/${branch}" \
+        || git ls-remote --exit-code --heads origin "${branch}" >/dev/null 2>&1; then
+        echo -e "${RED}Error: branch ${branch} already exists (local or remote).${NC}"
+        echo "It looks like a leftover from an interrupted release."
+        echo "  - If it still holds your release commit, open a PR for it instead:"
+        echo "      gh pr create --repo ${GITHUB_REPO} --base main --head ${branch}"
+        echo "  - Otherwise delete it and re-run 'just release':"
+        echo "      git branch -D ${branch} 2>/dev/null; git push origin --delete ${branch}"
+        exit 1
+    fi
+}
+
 # Build the Claude prompt from template
 build_changelog_prompt() {
     local version="$1"
@@ -113,11 +143,49 @@ if [[ "$CURRENT_BRANCH" != "main" ]]; then
     exit 1
 fi
 
+# Require a clean working tree up-front. Every state operates on main as a known
+# baseline (State 3's version bump even runs 'git add -A'), so stray uncommitted
+# changes must not be carried into a release branch — and we always want the
+# fast-forward below to run, not be skipped because the tree is dirty.
+if [[ -n "$(git status --porcelain)" ]]; then
+    echo -e "${RED}Error: working tree has uncommitted changes${NC}"
+    echo ""
+    git status --short
+    echo ""
+    echo "Commit, stash, or discard them before running the release helper."
+    exit 1
+fi
+
 # Fetch tags and main branch to ensure we have the latest release info
 # use --force to update local tags that may differ from remote
 echo -e "Fetching from origin..."
 git fetch --tags --force --quiet origin main
 echo ""
+
+# Sync local main with origin/main. After a release PR is merged (rebase),
+# origin/main advances; fast-forward catches local main up so the right commit
+# gets tagged. Fail loudly instead of inventing a merge commit (the linear-history
+# rule on main would reject it anyway).
+git merge --ff-only origin/main --quiet || {
+    echo -e "${RED}Error: local main has diverged from origin/main; cannot fast-forward.${NC}"
+    echo "Reconcile manually (e.g. 'git reset --hard origin/main' if you have no local-only commits)."
+    exit 1
+}
+
+# A fast-forward is a silent no-op when local main is *ahead* of origin/main (an
+# unpushed local commit), so it does not by itself guarantee the two match.
+# Require exact equality: releases are cut from origin/main (everything lands via
+# PR), and tagging an unpushed commit would publish from an unreviewed revision.
+if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+    echo -e "${RED}Error: local main is ahead of origin/main (unpushed commits)${NC}"
+    echo ""
+    echo "Local HEAD:  $(git rev-parse HEAD)"
+    echo "origin/main: $(git rev-parse origin/main)"
+    echo ""
+    echo "Releases must be cut from origin/main. After saving any work you need:"
+    echo "  git reset --hard origin/main"
+    exit 1
+fi
 
 CURRENT_VERSION=$(get_current_version)
 TAG="v${CURRENT_VERSION}"
@@ -126,6 +194,28 @@ LAST_TAG=$(get_last_tag)
 echo -e "Current version: ${GREEN}${CURRENT_VERSION}${NC}"
 echo -e "Last release:    ${GREEN}${LAST_TAG:-none}${NC}"
 echo ""
+
+# Direct pushes to main are disabled, so the CHANGELOG and version-bump commits
+# land via PR. If one is still open, the only valid next action is to merge it —
+# stop here so re-runs don't open duplicate PRs.
+if ! PENDING_PRS=$(open_release_pr); then
+    echo -e "${RED}Error: failed to query GitHub for open release PRs.${NC}"
+    echo "Check your GitHub CLI auth and access: gh auth status"
+    exit 1
+fi
+if [[ -n "$PENDING_PRS" ]]; then
+    echo -e "${YELLOW}${BOLD}State: release PR awaiting merge${NC}"
+    echo ""
+    echo "Open release PR(s) must be merged before continuing:"
+    while IFS=$'\t' read -r pr_url pr_title; do
+        echo -e "  ${BOLD}${pr_title}${NC}"
+        echo "  ${pr_url}"
+    done <<< "$PENDING_PRS"
+    echo ""
+    echo -e "Merge with ${BOLD}Rebase and merge${NC} once checks pass, then re-run 'just release'."
+    echo "(If GitHub says a branch is out of date with main, click 'Update branch' first.)"
+    exit 0
+fi
 
 # Determine state and act
 if ! changelog_has_version "$CURRENT_VERSION"; then
@@ -139,7 +229,7 @@ if ! changelog_has_version "$CURRENT_VERSION"; then
     echo ""
     echo -e "${BOLD}Proposed action:${NC}"
     echo "  1. Invoke Claude to update CHANGELOG.md with release notes"
-    echo "  2. Create a commit with the CHANGELOG update"
+    echo "  2. Open a PR with the CHANGELOG update for you to review and merge"
     echo ""
     echo "You can edit the changes afterward if needed."
     echo ""
@@ -189,27 +279,50 @@ if ! changelog_has_version "$CURRENT_VERSION"; then
     echo -e "${GREEN}CHANGELOG updated.${NC}"
     echo ""
 
-    # Show diff and ask to commit
+    # Show diff and ask to open a PR
     echo -e "${BOLD}Changes made:${NC}"
     git diff CHANGELOG.md || true
     echo ""
 
-    read -p "Create commit for CHANGELOG update? [Y/n] " -n 1 -r
+    read -p "Open a PR with this CHANGELOG update? [Y/n] " -n 1 -r
     echo
 
-    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-        git add CHANGELOG.md
-        git commit -m "Update CHANGELOG for v${CURRENT_VERSION}"
-        echo ""
-        echo -e "${GREEN}Committed CHANGELOG update.${NC}"
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
+        echo "Aborted. The CHANGELOG edit is left uncommitted in your working tree;"
+        echo "a re-run won't resume from here until you commit it or discard it"
+        echo "(git checkout -- CHANGELOG.md)."
+        exit 0
     fi
 
+    BRANCH="release/changelog-${TAG}"
+    ensure_branch_free "$BRANCH"
+    echo ""
+    echo -e "${GREEN}Creating branch ${BRANCH} and opening PR...${NC}"
+    git checkout -b "$BRANCH"
+    git add CHANGELOG.md
+    git commit -m "Update CHANGELOG for ${TAG}"
+    git push -u origin "$BRANCH"
+
+    if ! PR_URL=$(gh pr create --repo "$GITHUB_REPO" --base main --head "$BRANCH" \
+        --title "Update CHANGELOG for ${TAG}" \
+        --body "Finalize release notes for ${TAG}. Merge with **Rebase and merge** once checks pass (click **Update branch** first if GitHub says it's out of date), then run \`just release\` to create and push the tag."); then
+        git checkout main --quiet
+        echo ""
+        echo -e "${RED}Branch ${BRANCH} was pushed, but 'gh pr create' failed.${NC}"
+        echo "Your commit is safe on that branch — don't delete it. Open the PR manually:"
+        echo "  gh pr create --repo ${GITHUB_REPO} --base main --head ${BRANCH}"
+        exit 1
+    fi
+
+    # return to main so the working tree is clean for the next step
+    git checkout main --quiet
+
+    echo ""
+    echo -e "${GREEN}${BOLD}CHANGELOG PR opened:${NC} ${PR_URL}"
     echo ""
     echo -e "${BOLD}Next steps:${NC}"
-    echo "  1. Review the commit: git show"
-    echo "  2. Push to main: git push"
-    echo "  3. Push tag to trigger release: git tag ${TAG} && git push origin ${TAG}"
-    echo "  4. Run 'just release' again to bump version"
+    echo "  1. Wait for checks, then merge the PR with 'Rebase and merge'"
+    echo "  2. Run 'just release' again to create and push the ${TAG} tag"
 
 elif ! remote_tag_exists "$TAG"; then
     # ═══════════════════════════════════════════════════════════════════
@@ -228,18 +341,8 @@ elif ! remote_tag_exists "$TAG"; then
         exit 1
     fi
 
-    # verify current commit is on origin/main before tagging
-    LOCAL_HEAD=$(git rev-parse HEAD)
-    REMOTE_HEAD=$(git rev-parse origin/main 2>/dev/null || echo "")
-    if [[ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]]; then
-        echo -e "${RED}Error: local HEAD is not pushed to origin/main${NC}"
-        echo ""
-        echo "Local HEAD:  $LOCAL_HEAD"
-        echo "origin/main: ${REMOTE_HEAD:-<not fetched>}"
-        echo ""
-        echo "Push your changes first: git push"
-        exit 1
-    fi
+    # local main was fast-forwarded to origin/main at startup, so HEAD is exactly
+    # the commit that will be tagged — there is nothing to push to main here.
 
     # check if local tag already exists (from a previous failed push attempt)
     if git rev-parse "$TAG" >/dev/null 2>&1; then
@@ -253,6 +356,32 @@ elif ! remote_tag_exists "$TAG"; then
             exit 0
         fi
         git tag -d "$TAG"
+        echo ""
+    fi
+
+    # The release notes come from the CHANGELOG section for this version (see
+    # release.yml). The startup fast-forward may have advanced main past the commit
+    # that finalized those notes; anything landed since would ship in the tag
+    # without necessarily appearing in the published notes. Warn before tagging.
+    # Use the -S pickaxe to find the commit that introduced "## [VERSION]", not
+    # merely the last commit to touch CHANGELOG.md — a later unrelated edit to
+    # another section must not move the boundary forward and hide commits.
+    CHANGELOG_COMMIT=$(git log -1 --format=%H -S"## [${CURRENT_VERSION}]" -- CHANGELOG.md)
+    if [[ -n "$CHANGELOG_COMMIT" && "$CHANGELOG_COMMIT" != "$(git rev-parse HEAD)" ]]; then
+        echo -e "${YELLOW}${BOLD}Warning: main advanced past the CHANGELOG update for ${CURRENT_VERSION}.${NC}"
+        echo ""
+        echo "These commits landed after the release notes were finalized and would"
+        echo "ship in tag ${TAG} without necessarily appearing in the notes:"
+        git --no-pager log --oneline "${CHANGELOG_COMMIT}..HEAD"
+        echo ""
+        echo "Re-run the CHANGELOG step to cover them, or proceed if they are"
+        echo "release-irrelevant (e.g. CI/docs/tests)."
+        read -p "Tag ${TAG} at the current HEAD anyway? [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Aborted."
+            exit 0
+        fi
         echo ""
     fi
 
@@ -405,18 +534,43 @@ else
     git diff --stat
     echo ""
 
-    read -p "Create commit for version bump? [Y/n] " -n 1 -r
+    read -p "Open a PR with this version bump? [Y/n] " -n 1 -r
     echo
 
-    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-        git add -A
-        git commit -m "Bump version to ${NEXT_VERSION}"
-        echo ""
-        echo -e "${GREEN}Committed version bump.${NC}"
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
+        echo "Aborted. The version bump is left uncommitted in your working tree;"
+        echo "a re-run won't resume from here until you commit it or discard it"
+        echo "(git checkout -- Cargo.toml Cargo.lock flake.nix)."
+        exit 0
     fi
 
+    BRANCH="release/bump-v${NEXT_VERSION}"
+    ensure_branch_free "$BRANCH"
+    echo ""
+    echo -e "${GREEN}Creating branch ${BRANCH} and opening PR...${NC}"
+    git checkout -b "$BRANCH"
+    git add -A
+    git commit -m "Bump version to ${NEXT_VERSION}"
+    git push -u origin "$BRANCH"
+
+    if ! PR_URL=$(gh pr create --repo "$GITHUB_REPO" --base main --head "$BRANCH" \
+        --title "Bump version to ${NEXT_VERSION}" \
+        --body "Bump workspace version ${CURRENT_VERSION} → ${NEXT_VERSION} for the next development cycle. Merge with **Rebase and merge** (click **Update branch** first if GitHub says it's out of date)."); then
+        git checkout main --quiet
+        echo ""
+        echo -e "${RED}Branch ${BRANCH} was pushed, but 'gh pr create' failed.${NC}"
+        echo "Your commit is safe on that branch — don't delete it. Open the PR manually:"
+        echo "  gh pr create --repo ${GITHUB_REPO} --base main --head ${BRANCH}"
+        exit 1
+    fi
+
+    # return to main so the working tree is clean
+    git checkout main --quiet
+
+    echo ""
+    echo -e "${GREEN}${BOLD}Version bump PR opened:${NC} ${PR_URL}"
     echo ""
     echo -e "${BOLD}Next steps:${NC}"
-    echo "  1. Push changes: git push"
-    echo "  2. Start working on new features!"
+    echo "  1. Wait for checks, then merge the PR with 'Rebase and merge'"
+    echo "  2. That completes the ${TAG} release 🎉"
 fi
