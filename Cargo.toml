@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.35.0"
+version = "0.36.0"
 authors = ["Mateusz Wykurz <wykurz@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/wykurz/rcp"
@@ -24,10 +24,10 @@ rust-version = "1.91.1"
 
 [workspace.dependencies]
 # Internal library crates (use local names as keys)
-throttle = { package = "rcp-tools-throttle", version = "0.35.0", path = "throttle" }
-congestion = { package = "rcp-tools-congestion", version = "0.35.0", path = "congestion" }
-common = { package = "rcp-tools-common", version = "0.35.0", path = "common" }
-remote = { package = "rcp-tools-remote", version = "0.35.0", path = "remote" }
+throttle = { package = "rcp-tools-throttle", version = "0.36.0", path = "throttle" }
+congestion = { package = "rcp-tools-congestion", version = "0.36.0", path = "congestion" }
+common = { package = "rcp-tools-common", version = "0.36.0", path = "common" }
+remote = { package = "rcp-tools-remote", version = "0.36.0", path = "remote" }
 
 [workspace.lints.clippy]
 # Deny all warnings to enforce code quality
