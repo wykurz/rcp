@@ -18,6 +18,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Least-privilege default for every job; publish only needs read.
+permissions:
+  contents: read
+
 jobs:
   validate:
     uses: ./.github/workflows/validate.yml
@@ -35,9 +39,10 @@ jobs:
           ref: ${{ inputs.release_tag }}
 
       - name: Verify version matches release tag
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          TAG_VERSION="${{ inputs.release_tag }}"
-          TAG_VERSION="${TAG_VERSION#v}"
+          TAG_VERSION="${RELEASE_TAG#v}"
           CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           echo "Tag version: $TAG_VERSION"
           echo "Cargo version: $CARGO_VERSION"
@@ -53,8 +58,10 @@ jobs:
         run: cargo install cargo-workspaces --version 0.4.2 --locked
 
       - name: Set publish flags
+        env:
+          DRY_RUN_INPUT: ${{ github.event.inputs.dry-run }}
         run: |
-          if [ "${{ github.event.inputs.dry-run }}" = "true" ]; then
+          if [ "$DRY_RUN_INPUT" = "true" ]; then
             echo "DRY_RUN=--dry-run" >> $GITHUB_ENV
             echo "Running in DRY-RUN mode"
           else

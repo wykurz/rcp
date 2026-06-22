@@ -13,6 +13,10 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: --cfg tokio_unstable
 
+# Least-privilege: chaos tests only check out and run tests.
+permissions:
+  contents: read
+
 jobs:
   chaos-tests:
     name: "🌪️ Chaos Tests"
