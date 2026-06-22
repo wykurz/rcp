@@ -21,8 +21,15 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     groups:
       all-cargo:
         patterns:
           - "*"
+    # Dependabot has no MSRV awareness for cargo (dependabot-core#5423): it would
+    # otherwise propose bumps that exceed our rust-version and fail the CI `msrv` job.
+    # Pin offenders below the MSRV-raising version; the `msrv` job is the backstop.
+    ignore:
+      # sysinfo >= 0.39 needs rustc 1.95 > MSRV 1.91.1
+      - dependency-name: "sysinfo"
+        versions: [">= 0.39"]
