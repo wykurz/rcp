@@ -22,6 +22,11 @@ env:
   # Use workflow_dispatch input if provided, otherwise use the tag name
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
 
+# Least-privilege default for every job; jobs that need more (release asset
+# uploads) opt up with their own permissions: block.
+permissions:
+  contents: read
+
 jobs:
   validate:
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_validation }}
@@ -98,7 +103,7 @@ jobs:
           sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
 
       - name: Install cargo-deb
-        run: cargo install cargo-deb
+        run: cargo install cargo-deb --version 3.7.0 --locked
 
       - name: Build Debian packages
         env:
@@ -110,8 +115,8 @@ jobs:
           cargo deb --target=x86_64-unknown-linux-musl -p rcp-tools-rrm
           cargo deb --target=x86_64-unknown-linux-musl -p rcp-tools-rcmp
           cargo deb --target=x86_64-unknown-linux-musl -p rcp-tools-filegen
-          zip rcp-deb-amd64-${{ env.RELEASE_TAG }}.zip target/x86_64-unknown-linux-musl/debian/*.deb
-          ls -la rcp-deb-amd64-${{ env.RELEASE_TAG }}.zip
+          zip rcp-deb-amd64-${RELEASE_TAG}.zip target/x86_64-unknown-linux-musl/debian/*.deb
+          ls -la rcp-deb-amd64-${RELEASE_TAG}.zip
 
       - name: Upload to GitHub Release
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
@@ -144,7 +149,7 @@ jobs:
           sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
 
       - name: Install cargo-generate-rpm
-        run: cargo install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --version 0.21.0 --locked
 
       - name: Build RPM packages
         env:
@@ -157,8 +162,8 @@ jobs:
           cargo generate-rpm --target=x86_64-unknown-linux-musl -p rrm
           cargo generate-rpm --target=x86_64-unknown-linux-musl -p rcmp
           cargo generate-rpm --target=x86_64-unknown-linux-musl -p filegen
-          zip rcp-rpm-amd64-${{ env.RELEASE_TAG }}.zip target/x86_64-unknown-linux-musl/generate-rpm/*.rpm
-          ls -la rcp-rpm-amd64-${{ env.RELEASE_TAG }}.zip
+          zip rcp-rpm-amd64-${RELEASE_TAG}.zip target/x86_64-unknown-linux-musl/generate-rpm/*.rpm
+          ls -la rcp-rpm-amd64-${RELEASE_TAG}.zip
 
       - name: Upload to GitHub Release
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
@@ -189,7 +194,7 @@ jobs:
         run: cargo install cross --locked --version 0.2.5
 
       - name: Install cargo-deb
-        run: cargo install cargo-deb
+        run: cargo install cargo-deb --version 3.7.0 --locked
 
       - name: Build with cross
         env:
@@ -203,8 +208,8 @@ jobs:
           cargo deb --target=aarch64-unknown-linux-musl --no-build -p rcp-tools-rrm
           cargo deb --target=aarch64-unknown-linux-musl --no-build -p rcp-tools-rcmp
           cargo deb --target=aarch64-unknown-linux-musl --no-build -p rcp-tools-filegen
-          zip rcp-deb-arm64-${{ env.RELEASE_TAG }}.zip target/aarch64-unknown-linux-musl/debian/*.deb
-          ls -la rcp-deb-arm64-${{ env.RELEASE_TAG }}.zip
+          zip rcp-deb-arm64-${RELEASE_TAG}.zip target/aarch64-unknown-linux-musl/debian/*.deb
+          ls -la rcp-deb-arm64-${RELEASE_TAG}.zip
 
       - name: Upload to GitHub Release
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
@@ -235,7 +240,7 @@ jobs:
         run: cargo install cross --locked --version 0.2.5
 
       - name: Install cargo-generate-rpm
-        run: cargo install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --version 0.21.0 --locked
 
       - name: Build with cross
         env:
@@ -249,8 +254,8 @@ jobs:
           cargo generate-rpm --target=aarch64-unknown-linux-musl -p rrm
           cargo generate-rpm --target=aarch64-unknown-linux-musl -p rcmp
           cargo generate-rpm --target=aarch64-unknown-linux-musl -p filegen
-          zip rcp-rpm-arm64-${{ env.RELEASE_TAG }}.zip target/aarch64-unknown-linux-musl/generate-rpm/*.rpm
-          ls -la rcp-rpm-arm64-${{ env.RELEASE_TAG }}.zip
+          zip rcp-rpm-arm64-${RELEASE_TAG}.zip target/aarch64-unknown-linux-musl/generate-rpm/*.rpm
+          ls -la rcp-rpm-arm64-${RELEASE_TAG}.zip
 
       - name: Upload to GitHub Release
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}

@@ -2,6 +2,25 @@
 
 This directory contains GitHub Actions workflows for the RCP Tools project.
 
+## Security conventions
+
+These rules keep fork PRs unable to reach secrets or the release pipeline. Changing any
+of them is a security-sensitive change:
+
+- **Never use `pull_request_target` or `workflow_run`.** PR CI runs untrusted code; it must
+  stay in the unprivileged `pull_request` context (read-only token, no secrets).
+- **Never expose secrets to PR-triggered workflows** (no `secrets:` in `rust.yml` /
+  `validate.yml`, no `secrets: inherit`). crates.io / release secrets belong only to tag-
+  and `workflow_dispatch`-triggered jobs.
+- **SHA-pin every third-party action** with a `# vX` comment. (The `sha_pinning_required`
+  Actions policy enforces this once enabled — see repo settings.)
+- **Least-privilege `permissions:`** — default `contents: read`; opt up per-job only where
+  needed. Every workflow, including each reusable (`workflow_call`) workflow, must declare
+  its own `permissions:`; a caller's permissions are only an upper bound (a called workflow
+  can reduce them, never elevate).
+- **Release tags trigger publishing.** Only repository admins may create `v*` tags
+  (enforced by the tag ruleset — see repo settings).
+
 ## Workflows
 
 ### rust.yml
