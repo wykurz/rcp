@@ -53,6 +53,46 @@
             muslTools.binutils
           ];
 
+        # Tests that can't run in the Nix build sandbox -- they need setuid/chown
+        # permissions, `getent`/NSS, git-derived version info, or network access.
+        # Kept in sync with the nixpkgs package (pkgs/by-name/rc/rcp/package.nix);
+        # everything else still runs, so a flake.lock bump that breaks the build or
+        # the rest of the suite is still caught.
+        sandboxSkippedTests = [
+          # set setuid bits (3oXXX) on a test file, which the sandbox disallows
+          "--skip=copy::copy_tests::check_default_mode"
+          "--skip=test_weird_permissions"
+          "--skip=test_edge_case_special_permissions"
+          "--skip=test_default_strips_special_bits_on_directories"
+          "--skip=test_default_strips_special_bits_on_files"
+          "--skip=test_default_preserves_special_bits_on_directories"
+          "--skip=test_preserve_all_preserves_special_bits_on_directories"
+          "--skip=test_preserve_all_preserves_special_bits_on_files"
+          "--skip=test_preserve_settings_dir_gid_time_7777"
+          "--skip=test_preserve_settings_dir_7777_preserves_special_bits"
+          "--skip=test_preserve_settings_file_7777_preserves_special_bits"
+          "--skip=test_preserve_settings_none_strips_special_bits_on_directories"
+          # expects overwrite behavior that doesn't work in a sandbox
+          "--skip=test_overwrite_behavior"
+          # need network access to determine the local IP address
+          "--skip=test_remote"
+          # expect version/git info that build.rs can't derive without git
+          "--skip=version::tests::test_current_version"
+          "--skip=test_protocol_version_has_git_info"
+          "--skip=test_rcpd_protocol_version_has_git_info"
+          # shell out to `getent` to resolve real user/group names
+          "--skip=chmod::tests::getent_real_resolves_root"
+          "--skip=chmod::tests::getent_real_option_like_name_fails_closed_no_injection"
+          "--skip=rejects_unknown_group"
+          # change ownership / set setuid/setgid bits (fchown / chmod / chgrp), which
+          # the unprivileged sandbox build user isn't permitted to do (EPERM)
+          "--skip=safedir::tests::set_dir_metadata_fd_applies"
+          "--skip=safedir::tests::set_file_metadata_fd_ordering_preserves_setuid"
+          "--skip=applies_per_type_modes_recursively"
+          "--skip=group_change_preserves_setgid_across_chgrp"
+          "--skip=preserves_setgid_through_mode_change"
+        ];
+
         # Package builder for RCP tools with custom binary names
         mkRcpPackage = { packageName, binaryName, description }: pkgs.rustPlatform.buildRustPackage {
           pname = binaryName;
@@ -65,9 +105,12 @@
 
           inherit buildInputs nativeBuildInputs;
 
-          # Build only the specific package
+          # Build and test only the specific package
           cargoBuildFlags = [ "-p" packageName ];
           cargoTestFlags = [ "-p" packageName ];
+
+          # Run the package's tests, skipping the ones the sandbox can't support.
+          checkFlags = sandboxSkippedTests;
 
           meta = with pkgs.lib; {
             description = description;
@@ -125,6 +168,10 @@
             };
 
             inherit buildInputs nativeBuildInputs;
+
+            # Build and test the whole workspace, skipping the sandbox-incompatible
+            # tests (mirrors the nixpkgs package, which also builds the full workspace).
+            checkFlags = sandboxSkippedTests;
 
             meta = with pkgs.lib; {
               description = "Fast file operations tools suite";

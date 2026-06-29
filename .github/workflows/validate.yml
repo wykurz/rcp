@@ -318,3 +318,31 @@ jobs:
 
     - name: Build all binaries (glibc)
       run: cargo build --workspace --release --target x86_64-unknown-linux-gnu
+
+  # Validate the Nix flake. None of the jobs above touch Nix, so a flake.lock bump
+  # (Dependabot opens grouped `nix` PRs) could break `nix build` or the dev shell
+  # while the rest of CI stays green. Runs in parallel -- it's independent of the
+  # Rust lint/test jobs and gives fast feedback on the exact thing it guards.
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      with:
+        ref: ${{ inputs.ref || github.sha }}
+
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+    # Determinate Nix's `nix flake check` only *evaluates* outputs (it skips the
+    # builds), so it covers cross-platform eval -- including the darwin/aarch64
+    # outputs this linux runner can't build -- while the explicit build + dev-shell
+    # steps catch build-level breakage on this system. `--no-update-lock-file` makes
+    # each step validate the committed flake.lock as-is, so a flake.nix input change
+    # that forgets to commit the regenerated lock fails here instead of passing
+    # against a silently auto-updated lock.
+    - name: Flake check (evaluate all systems)
+      run: nix flake check --all-systems --no-update-lock-file -L
+    - name: Build the full suite
+      run: nix build --no-update-lock-file -L .#rcp-all
+    - name: Build the dev shell
+      run: nix develop --no-update-lock-file -L --command true
