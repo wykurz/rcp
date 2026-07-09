@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::instrument;
 
+const SETID_BITS: u32 = 0o6000;
+
 /// The full 12-bit (`0o7777`) mode of a metadata snapshot, including the
 /// setuid/setgid/sticky bits. [`FileMeta`] exposes its mode only through
 /// `permissions()`, so this is the canonical way `compute_plan`'s inputs are
@@ -117,6 +119,8 @@ pub struct Settings {
     pub mode: ModeProgram,
     pub owner: OwnerProgram,
     pub group: OwnerProgram,
+    /// Clear set-user-ID and set-group-ID from every selected non-symlink's final mode.
+    pub no_setid: bool,
     pub fail_early: bool,
     /// Apply directory mode/owner changes after their contents (post-order) instead of
     /// before (the default). Needed when recursively removing the owner's own traversal
@@ -638,18 +642,21 @@ pub fn parse_mode_dsl(s: &str) -> anyhow::Result<ModeProgram> {
     Ok(prog)
 }
 
-/// The concrete syscalls to perform for one entry. `chown` carries the
-/// `(uid, gid)` to pass to `fchownat` (each `None` means "leave unchanged");
-/// `chmod` is the target 12-bit mode. An all-`None` plan is a no-op.
+/// The concrete syscalls to perform for one entry. `chmod_before_chown` clears
+/// set-ID bits before an ownership change when required by policy. `chown`
+/// carries the `(uid, gid)` to pass to `fchownat` (each `None` means "leave
+/// unchanged"); `chmod` is the final target 12-bit mode. An all-`None` plan is
+/// a no-op.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EntryPlan {
+    pub chmod_before_chown: Option<u32>,
     pub chown: Option<(Option<u32>, Option<u32>)>,
     pub chmod: Option<u32>,
 }
 
 impl EntryPlan {
     pub(crate) fn is_noop(&self) -> bool {
-        self.chown.is_none() && self.chmod.is_none()
+        self.chmod_before_chown.is_none() && self.chown.is_none() && self.chmod.is_none()
     }
 }
 
@@ -663,30 +670,52 @@ pub(crate) fn compute_plan(
     settings: &Settings,
 ) -> EntryPlan {
     let cur_mode = cur_mode & 0o7777;
-    let uid_change = settings.owner.for_kind(kind).filter(|&u| u != cur_uid);
-    let gid_change = settings.group.for_kind(kind).filter(|&g| g != cur_gid);
+    let requested_uid = settings.owner.for_kind(kind);
+    let requested_gid = settings.group.for_kind(kind);
+    let mode_spec = settings.mode.for_kind(kind);
+    let selected = mode_spec.is_some() || requested_uid.is_some() || requested_gid.is_some();
+    let uid_change = requested_uid.filter(|&u| u != cur_uid);
+    let gid_change = requested_gid.filter(|&g| g != cur_gid);
     let need_chown = uid_change.is_some() || gid_change.is_some();
     let chown = need_chown.then_some((uid_change, gid_change));
+    let chmod_before_chown = (kind != EntryKind::Symlink
+        && settings.no_setid
+        && need_chown
+        && cur_mode & SETID_BITS != 0)
+        .then_some(cur_mode & !SETID_BITS);
     let chmod = if kind == EntryKind::Symlink {
         // symlink mode bits are not settable; never chmod a symlink
         None
-    } else if let Some(spec) = settings.mode.for_kind(kind) {
-        let desired = apply_mode(cur_mode, spec, kind == EntryKind::Dir);
-        // chmod if the value changes, or a chown would clear setuid/setgid we keep.
-        // 0o6000 = setuid|setgid; fchownat does not clear the sticky bit (0o1000)
-        if desired != cur_mode || (need_chown && desired & 0o6000 != 0) {
+    } else if let Some(spec) = mode_spec {
+        let requested = apply_mode(cur_mode, spec, kind == EntryKind::Dir);
+        let desired = if settings.no_setid {
+            requested & !SETID_BITS
+        } else {
+            requested
+        };
+        // chmod if the value changes, a chown would clear set-ID bits we keep, or the
+        // no-set-ID policy requires an authoritative masked chmod after chown.
+        if desired != cur_mode || (need_chown && (settings.no_setid || desired & SETID_BITS != 0)) {
             Some(desired)
         } else {
             None
         }
-    } else if need_chown && cur_mode & 0o6000 != 0 {
+    } else if settings.no_setid && selected && (need_chown || cur_mode & SETID_BITS != 0) {
+        // owner/group rules select an entry even when its id is already correct. after an
+        // actual chown, always issue the masked chmod so a concurrent set-ID change made
+        // after the metadata snapshot cannot survive the privileged ownership change.
+        Some(cur_mode & !SETID_BITS)
+    } else if need_chown && cur_mode & SETID_BITS != 0 {
         // no mode rule for this type, but chown clears setuid/setgid -> restore.
-        // 0o6000 = setuid|setgid; fchownat does not clear the sticky bit (0o1000)
         Some(cur_mode)
     } else {
         None
     };
-    EntryPlan { chown, chmod }
+    EntryPlan {
+        chmod_before_chown,
+        chown,
+        chmod,
+    }
 }
 
 fn inc_changed(prog: &Progress, kind: EntryKind) -> Summary {
@@ -763,7 +792,7 @@ fn describe_change(cur_mode: u32, cur_uid: u32, cur_gid: u32, plan: &EntryPlan) 
     let mut parts = Vec::new();
     if let Some(mode) = plan.chmod {
         if mode == cur_mode & 0o7777 {
-            // chmod re-applied only to restore setuid/setgid that chown clears
+            // chmod re-applied after chown to restore or enforce the selected mode policy
             parts.push(format!("mode {mode:04o} (re-applied after chown)"));
         } else {
             parts.push(format!("mode {:04o}->{:04o}", cur_mode & 0o7777, mode));
@@ -789,7 +818,11 @@ fn describe_change(cur_mode: u32, cur_uid: u32, cur_gid: u32, plan: &EntryPlan) 
 /// rename/symlink swap of the directory entry cannot redirect either operation to a
 /// different target.
 ///
-/// Syscall choice, following the documented chown → chmod ordering:
+/// Syscall choice, normally following the documented chown → chmod ordering:
+/// * **pre-chown chmod** — under the no-set-ID policy, existing set-ID bits are
+///   cleared before changing ownership rather than deliberately carried into a
+///   new user or group. The final masked chmod enforces the completed state after
+///   chown; the separate syscalls do not freeze concurrent mode changes.
 /// * **chown** — [`safedir::fchown_handle`] (inode-exact `fchownat` with
 ///   `AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW`). Applies to files, dirs, AND symlinks.
 /// * **chmod** — [`safedir::chmod_via_proc_fd`] (chmod of the inode via its
@@ -800,6 +833,13 @@ fn describe_change(cur_mode: u32, cur_uid: u32, cur_gid: u32, plan: &EntryPlan) 
 ///   it to recurse). Symlinks are never chmod'd — [`compute_plan`] guarantees
 ///   `plan.chmod` is `None` for a symlink.
 async fn apply_plan(handle: &Handle, plan: &EntryPlan) -> anyhow::Result<()> {
+    if let Some(mode) = plan.chmod_before_chown {
+        safedir::chmod_via_proc_fd(handle, congestion::Side::Destination, mode)
+            .await
+            .with_context(|| {
+                format!("failed to clear set-ID bits via fd before chown (mode {mode:04o})")
+            })?;
+    }
     if let Some((uid, gid)) = plan.chown {
         safedir::fchown_handle(handle, congestion::Side::Destination, uid, gid)
             .await
@@ -1669,12 +1709,18 @@ mod tests {
             group: group
                 .map(|s| parse_owner_dsl(s, IdKind::Group, &GetentResolver::default()).unwrap())
                 .unwrap_or_default(),
+            no_setid: false,
             fail_early: false,
             defer_dir_changes: false,
             filter: None,
             time_filter: None,
             dry_run: None,
         }
+    }
+    fn settings_with_no_setid(mode: &str, owner: Option<&str>, group: Option<&str>) -> Settings {
+        let mut settings = settings_with(mode, owner, group);
+        settings.no_setid = true;
+        settings
     }
     #[test]
     fn plan_noop_when_already_correct() {
@@ -1730,6 +1776,64 @@ mod tests {
         let plan = compute_plan(0o2770, 1000, 1000, EntryKind::Dir, &s);
         assert_eq!(plan.chown, Some((None, Some(2000))));
         assert_eq!(plan.chmod, Some(0o2770));
+    }
+    #[test]
+    fn no_setid_drops_symbolic_setuid_request() {
+        let s = settings_with_no_setid("u+s", None, None);
+        let plan = compute_plan(0o755, 1000, 1000, EntryKind::File, &s);
+        assert!(plan.is_noop());
+    }
+    #[test]
+    fn no_setid_masks_octal_setid_bits() {
+        let s = settings_with_no_setid("6755", None, None);
+        let plan = compute_plan(0o644, 1000, 1000, EntryKind::File, &s);
+        assert_eq!(plan.chmod, Some(0o755));
+    }
+    #[test]
+    fn no_setid_clears_inherited_bits_on_unrelated_mode_change() {
+        let s = settings_with_no_setid("g+w", None, None);
+        let plan = compute_plan(0o6755, 1000, 1000, EntryKind::File, &s);
+        assert_eq!(plan.chmod, Some(0o775));
+    }
+    #[test]
+    fn no_setid_clears_bits_before_and_after_ownership_change() {
+        let s = settings_with_no_setid("", Some("2000"), None);
+        let plan = compute_plan(0o4755, 1000, 1000, EntryKind::File, &s);
+        assert_eq!(plan.chmod_before_chown, Some(0o755));
+        assert_eq!(plan.chown, Some((Some(2000), None)));
+        assert_eq!(plan.chmod, Some(0o755));
+    }
+    #[test]
+    fn no_setid_reapplies_mask_after_chown_without_snapshot_bits() {
+        let s = settings_with_no_setid("", Some("2000"), None);
+        let plan = compute_plan(0o755, 1000, 1000, EntryKind::File, &s);
+        assert!(plan.chmod_before_chown.is_none());
+        assert_eq!(plan.chown, Some((Some(2000), None)));
+        assert_eq!(plan.chmod, Some(0o755));
+    }
+    #[test]
+    fn no_setid_clears_bits_when_selected_owner_is_unchanged() {
+        let s = settings_with_no_setid("", Some("1000"), None);
+        let plan = compute_plan(0o4755, 1000, 1000, EntryKind::File, &s);
+        assert!(plan.chmod_before_chown.is_none());
+        assert!(plan.chown.is_none());
+        assert_eq!(plan.chmod, Some(0o755));
+    }
+    #[test]
+    fn no_setid_retains_sticky_bit_on_setgid_directory() {
+        let s = settings_with_no_setid("", None, Some("2000"));
+        let plan = compute_plan(0o3775, 1000, 1000, EntryKind::Dir, &s);
+        assert_eq!(plan.chmod_before_chown, Some(0o1775));
+        assert_eq!(plan.chown, Some((None, Some(2000))));
+        assert_eq!(plan.chmod, Some(0o1775));
+    }
+    #[test]
+    fn no_setid_never_chmods_symlink() {
+        let s = settings_with_no_setid("", None, Some("2000"));
+        let plan = compute_plan(0o6777, 1000, 1000, EntryKind::Symlink, &s);
+        assert!(plan.chmod_before_chown.is_none());
+        assert_eq!(plan.chown, Some((None, Some(2000))));
+        assert!(plan.chmod.is_none());
     }
 
     static RACE_PROGRESS: std::sync::LazyLock<Progress> = std::sync::LazyLock::new(Progress::new);

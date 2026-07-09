@@ -121,17 +121,35 @@ entries (files, directories, and symlinks via `lchown`); `f:`/`d:`/`l:` prefixes
 one type. `--mode` uses the same DSL but covers only files and directories (a bare value
 sets both) — symlink mode bits aren't settable on Linux, so `l:` is rejected for `--mode`.
 
+For a privileged policy wrapper, add `--no-setid`. For every selected non-symlink whose
+type has an applicable `--mode`, `--owner`, or `--group` rule, it guarantees that the
+final mode has both set-user-ID (`04000`) and set-group-ID (`02000`) cleared. This also
+removes pre-existing set-ID bits, including set-group-ID on directories, even when the
+requested rule does not mention them; the sticky bit (`01000`) is unaffected. Filters and
+per-type rules still determine which entries are selected, and `--no-setid` by itself is
+not an operation. Without the flag, `rchm` retains its normal behavior, including
+preserving existing set-ID bits across ownership changes.
+
+This is a successful-final-state guarantee, not an atomic lock against a concurrent
+owner changing the mode between `rchm`'s metadata syscalls. Privileged wrappers must
+exclude adversarial concurrent mode mutation during ownership changes; see the detailed
+guidance below.
+
+`--no-setid` is necessary but not sufficient for delegating privileged `rchm`: a wrapper
+must also constrain target paths, allowed owners/groups and modes, pin
+`--require-toctou-safe`, and prevent caller-controlled file arguments. See the
+[privileged-use guidance](docs/tocttou.md#set-id-suppression-under-sudo-rchm).
+
 **Compatibility with `chmod`/`chown`/`chgrp`:** mode expressions are a subset of
 `chmod` (`[ugoa][+-=][rwxXst]`, octal, and conditional `X`), omitting who-copy
 references like `g=u`. Omitted-who clauses ignore umask (deliberate for a bulk
 tool). For ordinary operands `rchm` does not dereference symlinks (like `-h`): it
 applies group/owner to the symlink itself via `lchown` and never changes symlink mode
-bits. This is not a guarantee under concurrent path replacement when rchm runs with
-more privilege than an actor who can modify the tree being traversed (e.g. under
-`sudo` over attacker-writable directories) — the same path-based-operation limitation
-as the other rcp tools; see [docs/tocttou.md](docs/tocttou.md). `mtime` is preserved;
-`ctime` necessarily changes (the kernel stamps it on any metadata change) and cannot
-be preserved.
+bits. On Linux, the normal walk is hardened against concurrent symlink and path-component
+swaps at or below each named root; privileged policies should pin `--require-toctou-safe`.
+The caller remains responsible for trusting the path above each named root; see
+[docs/tocttou.md](docs/tocttou.md). `mtime` is preserved; `ctime` necessarily changes
+(the kernel stamps it on any metadata change) and cannot be preserved.
 
 Directories are changed **before** their contents by default (like `chmod -R`), so
 `--mode d:u+rwx` can repair an unreadable directory. Pass `--defer-dir-changes` to

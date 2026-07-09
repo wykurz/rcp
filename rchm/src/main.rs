@@ -93,20 +93,30 @@ struct Args {
     ///
     /// Refuses non-Linux builds (rchm has no --dereference). It does NOT verify the trust
     /// of the operand path's prefix — that is the caller's responsibility (lock paths down
-    /// in the sudo rule). See "Scope of TOCTOU safety" in docs/tocttou.md. Intended for
-    /// sudo rules: `NOPASSWD: /usr/bin/rchm --require-toctou-safe *`.
+    /// in the wrapper or sudo rule). See "Scope of TOCTOU safety" in docs/tocttou.md.
+    /// Intended to be pinned by a privileged wrapper or an exact sudo rule; it does not make
+    /// arbitrary trailing options or operands safe.
     #[arg(long, conflicts_with = "toctou_check", help_heading = "Security")]
     require_toctou_safe: bool,
     /// Absolute path to the `getent` binary used to resolve user/group names
     ///
-    /// When set, name lookups spawn exactly this binary instead of searching PATH. Bake it into a
-    /// sudo rule so a privileged rchm resolves names via a known-good getent regardless of the
-    /// caller's PATH (e.g. `--getent-path=/usr/bin/getent`). May be given at most once — a
-    /// duplicate is rejected so a trailing-wildcard sudo rule cannot be overridden with an
-    /// attacker-controlled path. When unset and running privileged, rchm searches a fixed list of
-    /// trusted system directories instead of PATH; numeric ids never need getent at all.
+    /// When set, name lookups spawn exactly this binary instead of searching PATH. Pin it in a
+    /// privileged wrapper or exact sudo rule so rchm resolves names via a known-good getent
+    /// regardless of the caller's PATH (e.g. `--getent-path=/usr/bin/getent`). May be given at
+    /// most once — duplicate rejection prevents an unsafe trailing-wildcard policy from being
+    /// overridden with an attacker-controlled path. When unset and running privileged, rchm
+    /// searches a fixed list of trusted system directories instead of PATH; numeric ids never
+    /// need getent at all.
     #[arg(long, value_name = "PATH", action = clap::ArgAction::Append, help_heading = "Security")]
     getent_path: Vec<std::path::PathBuf>,
+    /// Clear set-user-ID and set-group-ID bits on every selected non-symlink
+    ///
+    /// Applies to non-symlinks targeted by an applicable --mode, --owner or --group rule.
+    /// The requested mode is computed first, then both set-ID bits are removed; the sticky bit
+    /// is unaffected. Intended to be pinned by privileged wrappers that must not create or
+    /// preserve set-ID files or directories.
+    #[arg(long, help_heading = "Security")]
+    no_setid: bool,
     /// Path(s) to modify
     #[arg()]
     paths: Vec<std::path::PathBuf>,
@@ -120,8 +130,8 @@ fn build_settings(args: &Args) -> Result<common::chmod::Settings> {
         .transpose()?
         .unwrap_or_default();
     // reduce repeated --getent-path to at most one. rejecting a duplicate (rather than taking the
-    // last) is a security property: the documented sudo rules end in a wildcard (`... *`), so an
-    // attacker could otherwise append a second --getent-path to override a value the rule baked in.
+    // last) is a security property: an unsafe sudo rule ending in a wildcard (`... *`) could
+    // otherwise let an attacker append a second --getent-path to override its pinned value.
     let getent_path = match args.getent_path.as_slice() {
         [] => None,
         [path] => Some(path.clone()),
@@ -164,6 +174,7 @@ fn build_settings(args: &Args) -> Result<common::chmod::Settings> {
         mode,
         owner,
         group,
+        no_setid: args.no_setid,
         fail_early: args.fail_early,
         defer_dir_changes: args.defer_dir_changes,
         filter,

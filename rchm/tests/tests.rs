@@ -138,6 +138,110 @@ fn preserves_setgid_through_mode_change() {
 }
 
 #[test]
+fn no_setid_masks_explicit_symbolic_and_octal_modes() {
+    let d = tempfile::tempdir().unwrap();
+    let symbolic = d.path().join("symbolic");
+    let octal = d.path().join("octal");
+    std::fs::write(&symbolic, b"x").unwrap();
+    std::fs::write(&octal, b"x").unwrap();
+    std::fs::set_permissions(&symbolic, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&octal, std::fs::Permissions::from_mode(0o755)).unwrap();
+    rchm()
+        .args(["--no-setid", "--mode", "u+s,g+s"])
+        .arg(&symbolic)
+        .assert()
+        .success();
+    rchm()
+        .args(["--no-setid", "--mode", "6755"])
+        .arg(&octal)
+        .assert()
+        .success();
+    assert_eq!(mode_of(&symbolic), 0o755, "symbolic set-ID bits masked");
+    assert_eq!(mode_of(&octal), 0o755, "octal set-ID bits masked");
+}
+
+#[test]
+fn no_setid_clears_existing_bits_for_unrelated_mode() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("f");
+    std::fs::write(&f, b"x").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o6755)).unwrap();
+    rchm()
+        .args(["--no-setid", "--mode", "g+r"])
+        .arg(&f)
+        .assert()
+        .success();
+    assert_eq!(mode_of(&f), 0o755, "both existing set-ID bits cleared");
+}
+
+#[test]
+fn no_setid_retains_sticky_and_clears_setgid_on_directory() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().join("dir");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o3775)).unwrap();
+    assert_eq!(mode_of(&dir), 0o3775, "setup mode");
+    rchm()
+        .args(["--no-setid", "--mode", "d:g+r"])
+        .arg(&dir)
+        .assert()
+        .success();
+    assert_eq!(mode_of(&dir), 0o1775, "sticky retained and setgid cleared");
+}
+
+#[test]
+fn no_setid_dry_run_reports_but_does_not_clear_bits() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("f");
+    std::fs::write(&f, b"x").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o6755)).unwrap();
+    rchm()
+        .args(["--no-setid", "--mode", "g+r", "--dry-run", "brief"])
+        .arg(&f)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("mode 6755->0755"));
+    assert_eq!(mode_of(&f), 0o6755, "dry-run must retain set-ID bits");
+}
+
+#[test]
+fn no_setid_respects_filter_and_per_type_scope() {
+    let d = tempfile::tempdir().unwrap();
+    let selected = d.path().join("selected.txt");
+    let excluded = d.path().join("excluded.log");
+    let dir = d.path().join("subdir");
+    std::fs::write(&selected, b"x").unwrap();
+    std::fs::write(&excluded, b"x").unwrap();
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0o4755)).unwrap();
+    std::fs::set_permissions(&excluded, std::fs::Permissions::from_mode(0o4755)).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2775)).unwrap();
+    rchm()
+        .args(["--no-setid", "--mode", "f:g+r", "--include", "*.txt"])
+        .arg(d.path())
+        .assert()
+        .success();
+    assert_eq!(mode_of(&selected), 0o755, "matching file selected");
+    assert_eq!(mode_of(&excluded), 0o4755, "filtered file not selected");
+    assert_eq!(mode_of(&dir), 0o2775, "directory has no applicable rule");
+}
+
+#[test]
+fn no_setid_clears_bits_for_unchanged_owner_rule() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("f");
+    std::fs::write(&f, b"x").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o4755)).unwrap();
+    let uid = std::fs::symlink_metadata(&f).unwrap().uid();
+    rchm()
+        .args(["--no-setid", "--owner", &uid.to_string()])
+        .arg(&f)
+        .assert()
+        .success();
+    assert_eq!(mode_of(&f), 0o755, "applicable owner rule clears setuid");
+}
+
+#[test]
 fn preorder_dir_lockout_applies_change_then_reports() {
     // default pre-order: removing the dir's own traversal permission applies the change,
     // then can't descend -> reports an error (exit nonzero) but keeps going. Processing
@@ -430,4 +534,42 @@ fn sudo_owner_and_group_change_to_root() {
     let after = std::fs::symlink_metadata(&f).unwrap();
     assert_eq!(after.uid(), 0, "owner must change to root");
     assert_eq!(after.gid(), 0, "group must change to root");
+}
+
+#[test]
+#[ignore = "requires passwordless sudo"]
+fn sudo_no_setid_does_not_create_root_setid_executable() {
+    // this is the wrapper threat model: privileged chown must not restore attacker-set bits
+    let sudo_ok = std::process::Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !sudo_ok {
+        eprintln!("Skipping test: passwordless sudo not available");
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("payload");
+    std::fs::write(&f, b"attacker-controlled").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o6755)).unwrap();
+    let status = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            env!("CARGO_BIN_EXE_rchm"),
+            "--no-setid",
+            "--owner",
+            "0",
+        ])
+        .arg(&f)
+        .status()
+        .expect("failed to run sudo rchm");
+    assert!(status.success(), "sudo rchm should succeed");
+    let after = std::fs::symlink_metadata(&f).unwrap();
+    assert_eq!(after.uid(), 0, "owner must change to root");
+    assert_eq!(
+        after.permissions().mode() & 0o7777,
+        0o755,
+        "root-owned payload must not retain set-ID bits"
+    );
 }

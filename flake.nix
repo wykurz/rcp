@@ -91,6 +91,11 @@
           "--skip=applies_per_type_modes_recursively"
           "--skip=group_change_preserves_setgid_across_chgrp"
           "--skip=preserves_setgid_through_mode_change"
+          "--skip=no_setid_clears_bits_for_unchanged_owner_rule"
+          "--skip=no_setid_clears_existing_bits_for_unrelated_mode"
+          "--skip=no_setid_dry_run_reports_but_does_not_clear_bits"
+          "--skip=no_setid_respects_filter_and_per_type_scope"
+          "--skip=no_setid_retains_sticky_and_clears_setgid_on_directory"
         ];
 
         # Package builder for RCP tools with custom binary names
