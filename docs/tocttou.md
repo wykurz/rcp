@@ -9,6 +9,7 @@ applies to the other tools as well.
 
 - [Overview](#overview)
 - [Scope of TOCTOU safety](#scope-of-toctou-safety)
+- [Set-ID suppression under sudo (`rchm`)](#set-id-suppression-under-sudo-rchm)
 - [What is TOCTTOU?](#what-is-tocttou)
 - [Attack Scenarios](#attack-scenarios)
 - [Implemented Hardening](#implemented-hardening)
@@ -127,7 +128,7 @@ paths; that is the caller's responsibility per (1).
 ```bash
 # The sudo policy constrains operands to vetted, resolved, trusted paths;
 # --require-toctou-safe guarantees the hardened walk for what is at/below them.
-user ALL=(root) NOPASSWD: /usr/bin/rcp --require-toctou-safe /vetted/source/* /vetted/dest/
+user ALL=(root) NOPASSWD: /usr/bin/rcp --require-toctou-safe /vetted/source/snapshot /vetted/dest/
 ```
 
 A wildcard rule (`... --require-toctou-safe *`) enforces only the tool's half — hardened
@@ -151,18 +152,87 @@ attacker-planted binary executed as root.
   it is not found there, the lookup errors rather than falling back to `PATH`.
 - **`--getent-path <ABSOLUTE>`:** pins the exact binary, bypassing both `PATH` and the probe.
   Must be absolute (a relative path would re-introduce a `PATH`/cwd lookup) and may be given **at
-  most once** — a duplicate is rejected, because the wildcard sudo rules above (`... *`) would
-  otherwise let an attacker append a second `--getent-path` to override the value the rule pins.
+  most once** — a duplicate is rejected, because a permissive trailing-wildcard policy (`... *`)
+  would otherwise let an attacker append a second `--getent-path` to override a pinned value.
 - **Numeric ids** (`--owner 1000`) never invoke `getent` at all — the safest option for a sudo
   rule when the resolving environment is untrusted.
 
 ```bash
-# Pin the resolver in the rule so name lookups never consult the caller's PATH:
-user ALL=(root) NOPASSWD: /usr/bin/rchm --require-toctou-safe --getent-path=/usr/bin/getent *
+# Pin the resolver and the complete operation so name lookups never consult the caller's PATH:
+user ALL=(root) NOPASSWD: /usr/bin/rchm --require-toctou-safe --no-setid --group=data --getent-path=/usr/bin/getent /vetted/root
 ```
 
 This is `rchm`-specific: `rcp`/`rlink` carry numeric ids from source metadata and never resolve
 names.
+
+### Set-ID suppression under sudo (`rchm`)
+
+TOCTTOU hardening does not make an arbitrary privileged chmod/chown policy safe. In
+particular, an ownership change can turn an attacker-controlled executable with a set-ID bit
+into a privileged set-ID executable. The kernel normally clears set-user-ID and set-group-ID
+during `chown`, but `rchm` normally restores existing bits so an ownership-only operation
+preserves the requested metadata.
+
+`--no-setid` provides a stronger contract for a constrained privileged wrapper: for every
+selected non-symlink whose type has an applicable `--mode`, `--owner`, or `--group` rule, the
+entry's final mode has set-user-ID (`04000`) and set-group-ID (`02000`) cleared. The guarantee
+has these deliberate consequences:
+
+- Existing set-ID bits are removed even if the mode expression does not mention them.
+- Set-group-ID is removed from selected directories as well as files; sticky (`01000`) is
+  unaffected.
+- Filters and `f:`/`d:`/`l:` rules retain their normal scope. An entry that is filtered out,
+  or whose type has no applicable operation rule, is not changed merely because the flag is
+  present. Symlinks have no settable mode on Linux and are excluded from the guarantee.
+- `--no-setid` alone is not an operation; at least one of `--mode`, `--owner`, or `--group` is
+  still required.
+- Omitting the flag preserves the existing behavior, including preservation of set-ID bits
+  across ownership changes.
+
+The guarantee describes the mode after `rchm` successfully completes its operation on an
+entry. Clearing mode bits and changing ownership require separate syscalls; `rchm` does not
+freeze a concurrent owner from changing the mode between them. In particular, a set-group-ID
+directory can transiently carry that bit across a group change before the final masked chmod.
+A privileged wrapper must not rely on `--no-setid` for ownership changes while an adversary can
+concurrently chmod the selected inode or create entries in a selected directory; it must remove
+that concurrent control or otherwise quiesce the tree for the operation.
+
+This flag is **necessary but not sufficient** for a wrapper that delegates privileged
+`rchm`. Such a wrapper must validate a small, explicit interface rather than pass arbitrary
+arguments through to `rchm`:
+
+- Resolve and restrict every operand to policy-approved roots whose path prefixes are trusted.
+- Allowlist the exact numeric UIDs/GIDs and mode expressions the policy needs. Clearing set-ID
+  does not prevent damage from arbitrary chown/chgrp, world-writable modes, or access to a
+  sensitive target.
+- Always add both `--require-toctou-safe` and `--no-setid`; do not let the caller remove or
+  override them.
+- Prefer numeric IDs. If names are required, supply a fixed trusted
+  `--getent-path=/usr/bin/getent` (or another administrator-selected absolute path) rather than
+  accepting the resolver path from the caller.
+- Reject unrecognized options and additional operands. In particular, do not expose
+  caller-controlled file-valued options: `--filter-file` reads a file as the privileged process,
+  and `--auto-meta-histogram-log` creates or truncates its target. If the policy needs either,
+  the wrapper must supply a fixed, trusted path.
+
+For example, expose a vetted `safe-rchm` wrapper in sudoers, not a trailing-wildcard rule for
+the raw binary:
+
+```bash
+# safe-rchm validates its small argument set, then supplies fixed security flags,
+# allowlisted numeric ids/modes, a trusted root, and `--` before the operand.
+user ALL=(root) NOPASSWD: /usr/local/sbin/safe-rchm *
+```
+
+An administrator-selected invocation inside that wrapper might resemble:
+
+```bash
+/usr/bin/rchm --require-toctou-safe --no-setid \
+  --owner=1000 --group=2000 --mode='f:0644 d:0755' -- /vetted/root
+```
+
+The wrapper must construct this command from validated values; it must not interpolate or
+forward a caller-provided option string.
 
 ## What is TOCTTOU?
 
@@ -460,35 +530,31 @@ policy or a vetted wrapper must pass resolved operands whose prefix it trusts.
 inspects the operand paths, so it treats local and remote (`host:/path`) operands
 identically.
 
-### Recommended sudo rule pattern
+### Recommended sudo policy patterns
 
-To enforce that `rcp` only runs in a TOCTOU-safe configuration under a `sudo` rule:
+Pin `--require-toctou-safe` and exact, policy-approved operands for direct rules whenever the
+operation is fixed:
 
 ```bash
-# rcp: only allow TOCTOU-safe invocations
-user ALL=(root) NOPASSWD: /usr/bin/rcp --require-toctou-safe *
-
-# rchm: same pattern
-user ALL=(root) NOPASSWD: /usr/bin/rchm --require-toctou-safe *
-
-# rrm: same pattern
-user ALL=(root) NOPASSWD: /usr/bin/rrm --require-toctou-safe *
+# Exact paths keep the caller from choosing a different privileged target.
+user ALL=(root) NOPASSWD: /usr/bin/rcp --require-toctou-safe /specific/source /specific/dest/
+user ALL=(root) NOPASSWD: /usr/bin/rrm --require-toctou-safe /specific/staging/tree
 ```
 
-With this rule, any attempt to invoke with `--dereference`/`-L` or on a non-Linux build
-is rejected by the tool itself before any filesystem operation begins. The `*` wildcard
-means the user can supply any additional arguments, but because the sudo rule lists
-`--require-toctou-safe` as a literal token before the `*`, sudo only authorizes invocations
-where it appears first — so the user cannot omit it. (The tool itself accepts the flag in any
-position; it is the sudo prefix match, not the tool's argument parser, that pins it.) The flag
-enforces only the tool's half (the hardened walk); it does not verify that an arbitrary operand
-path is safe. Locking the paths down in the sudo rule IS the caller's prefix-trust decision (see
-[Scope of TOCTOU safety](#scope-of-toctou-safety)), so restrict source and destination paths
-wherever possible:
+`--require-toctou-safe` rejects `--dereference`/`-L` and non-Linux operation before filesystem
+work, but it enforces only the tool's half of the contract. It does not establish prefix trust
+or make arbitrary operands and operations safe. A rule ending in `*` can pin the literal flag
+position, but it also delegates every trailing option and operand accepted by that tool; do not
+treat that as a safe policy for a mutating binary.
+
+When callers need a limited choice of operations or operands, expose a vetted wrapper that
+allowlists those choices and constructs the final command. For `rchm`, the wrapper also needs
+`--no-setid` and the controls in
+[Set-ID suppression under sudo (`rchm`)](#set-id-suppression-under-sudo-rchm):
 
 ```bash
-# Better: also lock down the paths
-user ALL=(root) NOPASSWD: /usr/bin/rcp --require-toctou-safe /specific/source/* /specific/dest/
+# The wrapper validates arguments instead of forwarding them to rchm.
+user ALL=(root) NOPASSWD: /usr/local/sbin/safe-rchm *
 ```
 
 ## Summary

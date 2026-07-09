@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Add `rchm --no-setid` for constrained privileged wrappers. Every selected
+  non-symlink covered by an applicable mode, owner, or group rule finishes with
+  set-user-ID and set-group-ID cleared, including pre-existing bits; sticky is
+  unaffected. The flag respects filters and per-type rules, is not an operation
+  by itself, and leaves the default behavior unchanged when omitted.
+
 ## [0.35.0] - 2026-06-15
 
 ### Changed

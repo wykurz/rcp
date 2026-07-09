@@ -21,6 +21,16 @@ fn errors_when_no_operation_given() {
 }
 
 #[test]
+fn no_setid_alone_is_not_an_operation() {
+    // the safety policy only constrains an explicit mode or ownership operation
+    rchm()
+        .args(["--no-setid", "/tmp"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("nothing to do"));
+}
+
+#[test]
 fn errors_when_no_path_given() {
     // an operation but no path operand must fail loudly, not silently succeed
     rchm()
@@ -79,14 +89,15 @@ fn rejects_duplicate_getent_path() {
 }
 
 #[test]
-fn help_lists_operation_options() {
+fn help_lists_mode_ownership_and_no_setid_options() {
     rchm()
         .arg("--help")
         .assert()
         .success()
         .stdout(predicates::str::contains("--mode"))
         .stdout(predicates::str::contains("--group"))
-        .stdout(predicates::str::contains("--owner"));
+        .stdout(predicates::str::contains("--owner"))
+        .stdout(predicates::str::contains("--no-setid"));
 }
 
 // ============================================================================
