@@ -7,12 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-07-10
+
 ### Added
 - Add `rchm --no-setid` for constrained privileged wrappers. Every selected
   non-symlink covered by an applicable mode, owner, or group rule finishes with
   set-user-ID and set-group-ID cleared, including pre-existing bits; sticky is
   unaffected. The flag respects filters and per-type rules, is not an operation
   by itself, and leaves the default behavior unchanged when omitted.
+
+### Security
+- Fix a remote-copy TLS authentication bypass: the certificate verifiers
+  accepted any `CertificateVerify` signature, so fingerprint pinning only
+  proved a peer presented a known certificate, not that it held the private
+  key — a replayed certificate defeated the documented MITM protection.
+  Signature verification now delegates to rustls, restoring proof of
+  possession, and every remote connection pins TLS 1.3.
+- Update the remote transport's crypto stack (`aws-lc-rs` 1.15.1 → 1.17.0,
+  `aws-lc-sys` 0.34.0 → 0.41.0), resolving five high-severity `aws-lc-sys`
+  advisories, including X.509 name-constraints and PKCS7 signature-validation
+  bypasses.
 
 ## [0.35.0] - 2026-06-15
 
@@ -273,7 +287,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 See git history for changes in previous versions.
 
-[Unreleased]: https://github.com/wykurz/rcp/compare/v0.35.0...HEAD
+[Unreleased]: https://github.com/wykurz/rcp/compare/v0.36.0...HEAD
+[0.36.0]: https://github.com/wykurz/rcp/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/wykurz/rcp/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/wykurz/rcp/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/wykurz/rcp/compare/v0.32.0...v0.33.0
