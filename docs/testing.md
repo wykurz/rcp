@@ -341,6 +341,23 @@ Chaos tests run separately from regular Docker tests in CI (see `.github/workflo
 - Permission denied on source file
 - Verifies error chain preservation (root cause visible in stderr)
 
+**Filesystem chaos tests** (`docker_chaos_filesystem.rs`):
+- These are **best-effort liveness smoke tests**, not rigorous assertions. A detached
+  background process (`docker exec -d` — fire-and-forget, its launch and completion are not
+  checked) *attempts* to mutate the source tree (delete files, add files, remove a directory,
+  or mutate under an active `--include` filter) around the time a copy runs. Timing is
+  best-effort (a short `sleep` on small fixtures), so a given run may not actually overlap
+  traversal/transfer, and the mutation is not guaranteed to have happened — the tests do not
+  prove a specific race was exercised.
+- The assertion is a proxy for "rcp did not crash": it checks that the outer `docker exec`
+  exit status is `0` or `1`. That catches a gross crash — the build sets `panic = "abort"`, so
+  a panic raises SIGABRT, and both that and a segfault surface through `docker exec` as `128+n`
+  (`134` / `139`), outside the accepted range. Its limits: `docker exec` status `1` is not
+  distinguishable from a docker-level failure (the check observes docker's status, not rcp's
+  directly), and a true **hang** is not detected at all (`docker exec` has no per-command
+  timeout, so a hang stalls the CI job). Proving rcp actually ran and reading its true inner
+  status would require an in-container completion marker.
+
 **Protocol stress tests** (`docker_chaos_protocol.rs`):
 - Backpressure with slow destination/source (64 kbit/s bandwidth limit)
 - Many files (150 files to stress connection pool)

@@ -1,8 +1,9 @@
 //! TLS support for encrypted and authenticated connections.
 //!
 //! This module provides certificate generation and TLS configuration for:
-//! - Master↔rcpd connections (rcpd is server, master verifies fingerprint)
-//! - Source↔Destination connections (mutual TLS with client certificates)
+//! - Master↔rcpd connections (rcpd is server; mutual fingerprint verification — master
+//!   verifies rcpd's server cert, rcpd verifies master's client cert)
+//! - Source↔Destination connections (source is server; mutual TLS with client certificates)
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -14,6 +15,13 @@ use std::sync::Arc;
 
 /// A certificate fingerprint (SHA-256 of DER-encoded certificate).
 pub type Fingerprint = [u8; 32];
+
+/// rcp pins TLS 1.3 for every connection — TLS 1.2 is never negotiated. This is safe to do
+/// unconditionally: TLS 1.3 has been available at both ends since the TLS layer was introduced
+/// (rustls has always offered it), so pinning never excludes a legitimate rcp/rcpd peer. A peer
+/// that cannot negotiate 1.3 fails the handshake — the correct outcome — rather than silently
+/// downgrading. (This does not rely on the version check, which auto-deploy can bypass.)
+const TLS_VERSIONS: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
 /// A certified key pair (certificate + private key) with its fingerprint.
 #[derive(Clone)]
@@ -51,6 +59,13 @@ pub fn generate_self_signed_cert() -> anyhow::Result<CertifiedKey> {
     })
 }
 
+/// Returns the ring provider's signature-verification algorithms, used to check the peer's
+/// TLS `CertificateVerify` signature. Fingerprint pinning proves the peer presented the
+/// expected certificate; this proves the peer also holds the matching private key.
+fn signature_verification_algorithms() -> rustls::crypto::WebPkiSupportedAlgorithms {
+    rustls::crypto::ring::default_provider().signature_verification_algorithms
+}
+
 /// Computes SHA-256 fingerprint of a DER-encoded certificate.
 pub fn compute_fingerprint(cert_der: &[u8]) -> Fingerprint {
     let mut hasher = Sha256::new();
@@ -77,14 +92,16 @@ pub fn fingerprint_from_hex(s: &str) -> anyhow::Result<Fingerprint> {
     Ok(fp)
 }
 
-/// Creates a TLS server config for rcpd (no client authentication required).
+/// Creates a TLS server config without client authentication.
 ///
-/// Used for master→rcpd connections where master verifies rcpd's certificate.
-pub fn create_server_config(cert_key: &CertifiedKey) -> anyhow::Result<Arc<ServerConfig>> {
+/// Test-only — every production listener requires a verified client certificate
+/// (see [`create_server_config_with_client_auth`]).
+#[cfg(test)]
+fn create_server_config(cert_key: &CertifiedKey) -> anyhow::Result<Arc<ServerConfig>> {
     let cert = CertificateDer::from(cert_key.cert_der.clone());
     let key = PrivateKeyDer::try_from(cert_key.key_der.clone())
         .map_err(|e| anyhow::anyhow!("invalid private key: {e}"))?;
-    let config = ServerConfig::builder()
+    let config = ServerConfig::builder_with_protocol_versions(TLS_VERSIONS)
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)?;
     Ok(Arc::new(config))
@@ -92,7 +109,9 @@ pub fn create_server_config(cert_key: &CertifiedKey) -> anyhow::Result<Arc<Serve
 
 /// Creates a TLS server config with client certificate verification.
 ///
-/// Used for source→destination connections where source verifies destination's client cert.
+/// Used for all production TLS servers: rcpd's master-facing listener (verifies master's
+/// client cert against `--master-cert-fp`) and source's listeners for the destination
+/// (verifies destination's client cert).
 pub fn create_server_config_with_client_auth(
     cert_key: &CertifiedKey,
     expected_client_fingerprint: Fingerprint,
@@ -103,20 +122,23 @@ pub fn create_server_config_with_client_auth(
     let client_verifier = Arc::new(FingerprintClientCertVerifier::new(
         expected_client_fingerprint,
     ));
-    let config = ServerConfig::builder()
+    let config = ServerConfig::builder_with_protocol_versions(TLS_VERSIONS)
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(vec![cert], key)?;
     Ok(Arc::new(config))
 }
 
-/// Creates a TLS client config that verifies the server's certificate fingerprint.
+/// Creates a TLS client config that verifies the server's certificate fingerprint
+/// without presenting a client certificate.
 ///
-/// Used for master→rcpd connections where master has no client certificate.
-pub fn create_client_config(expected_server_fingerprint: Fingerprint) -> Arc<ClientConfig> {
+/// Test-only — production clients always present a client certificate
+/// (see [`create_client_config_with_cert`]).
+#[cfg(test)]
+fn create_client_config(expected_server_fingerprint: Fingerprint) -> Arc<ClientConfig> {
     let verifier = Arc::new(FingerprintServerCertVerifier::new(
         expected_server_fingerprint,
     ));
-    let config = ClientConfig::builder()
+    let config = ClientConfig::builder_with_protocol_versions(TLS_VERSIONS)
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
@@ -125,7 +147,9 @@ pub fn create_client_config(expected_server_fingerprint: Fingerprint) -> Arc<Cli
 
 /// Creates a TLS client config with a client certificate.
 ///
-/// Used for destination→source connections where destination presents its certificate.
+/// Used for all production TLS clients: master→rcpd connections (master presents its
+/// certificate for rcpd to verify) and destination→source connections (destination
+/// presents its certificate for source to verify).
 pub fn create_client_config_with_cert(
     client_cert_key: &CertifiedKey,
     expected_server_fingerprint: Fingerprint,
@@ -136,7 +160,7 @@ pub fn create_client_config_with_cert(
     let cert = CertificateDer::from(client_cert_key.cert_der.clone());
     let key = PrivateKeyDer::try_from(client_cert_key.key_der.clone())
         .map_err(|e| anyhow::anyhow!("invalid private key: {e}"))?;
-    let config = ClientConfig::builder()
+    let config = ClientConfig::builder_with_protocol_versions(TLS_VERSIONS)
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(vec![cert], key)?;
@@ -182,34 +206,34 @@ impl ServerCertVerifier for FingerprintServerCertVerifier {
     }
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        // we trust the certificate based on fingerprint, not signature chain
-        Ok(HandshakeSignatureValid::assertion())
+        // the fingerprint check above pins WHICH certificate we accept; this verifies the peer
+        // signed the handshake with that certificate's private key (proof of possession)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &signature_verification_algorithms(),
+        )
     }
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        // we trust the certificate based on fingerprint, not signature chain
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &signature_verification_algorithms(),
+        )
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ED25519,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-        ]
+        signature_verification_algorithms().supported_schemes()
     }
 }
 
@@ -253,32 +277,34 @@ impl ClientCertVerifier for FingerprintClientCertVerifier {
     }
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        // the fingerprint check above pins WHICH certificate we accept; this verifies the peer
+        // signed the handshake with that certificate's private key (proof of possession)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &signature_verification_algorithms(),
+        )
     }
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &signature_verification_algorithms(),
+        )
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ED25519,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-        ]
+        signature_verification_algorithms().supported_schemes()
     }
     fn client_auth_mandatory(&self) -> bool {
         true
@@ -571,6 +597,177 @@ mod integration_tests {
         let mut buf = [0u8; 6];
         tls_stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"mutual");
+        server_task.await.unwrap();
+    }
+
+    /// A peer that replays the pinned certificate's bytes but does NOT hold its private key must
+    /// fail the handshake. The certificate presented matches the pinned fingerprint, but the
+    /// `CertificateVerify` signature is produced with a different key, so proof-of-possession must
+    /// reject it. Guards against regressing the signature verifiers back to unconditional
+    /// acceptance (which would reduce authentication to "presented a known certificate").
+    #[tokio::test]
+    async fn test_tls_handshake_fails_when_cert_replayed_without_private_key() {
+        install_crypto_provider();
+        // the legitimate server certificate the client pins
+        let legit_cert = generate_self_signed_cert().unwrap();
+        // a separate certificate whose private key the attacker actually controls
+        let attacker_cert = generate_self_signed_cert().unwrap();
+        // present the legit certificate but sign with the attacker's key. building the
+        // `CertifiedKey` directly (rather than via `with_single_cert`) bypasses the cert/key
+        // consistency check, mimicking a hand-crafted malicious peer.
+        let attacker_signing_key = rustls::crypto::ring::sign::any_supported_type(
+            &PrivateKeyDer::try_from(attacker_cert.key_der.clone()).unwrap(),
+        )
+        .unwrap();
+        let replayed = std::sync::Arc::new(rustls::sign::CertifiedKey::new(
+            vec![CertificateDer::from(legit_cert.cert_der.clone())],
+            attacker_signing_key,
+        ));
+        #[derive(Debug)]
+        struct StaticResolver(std::sync::Arc<rustls::sign::CertifiedKey>);
+        impl rustls::server::ResolvesServerCert for StaticResolver {
+            fn resolve(
+                &self,
+                _client_hello: rustls::server::ClientHello<'_>,
+            ) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
+                Some(self.0.clone())
+            }
+        }
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(std::sync::Arc::new(StaticResolver(replayed)));
+        let acceptor = TlsAcceptor::from(std::sync::Arc::new(server_config));
+        // client pins the legit certificate's fingerprint, which the presented cert matches
+        let client_config = create_client_config(legit_cert.fingerprint);
+        let connector = TlsConnector::from(client_config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_acceptor = acceptor.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // handshake aborts once the client rejects the CertificateVerify signature
+            let _ = server_acceptor.accept(stream).await;
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let server_name = ServerName::try_from("rcp").unwrap();
+        let result = connector.connect(server_name, stream).await;
+        assert!(
+            result.is_err(),
+            "handshake must fail: cert fingerprint matched but the peer did not prove possession \
+             of the private key"
+        );
+        server_task.await.unwrap();
+    }
+
+    /// The mutual-TLS mirror of the previous test, for the client-certificate path: a client that
+    /// replays the pinned client certificate's bytes but signs with a different key must be
+    /// rejected by the server's client-cert verifier. Guards the source<->destination and
+    /// master<->rcpd client-auth direction.
+    #[tokio::test]
+    async fn test_mutual_tls_fails_when_client_cert_replayed_without_private_key() {
+        install_crypto_provider();
+        let server_cert = generate_self_signed_cert().unwrap();
+        // the legitimate client certificate the server pins
+        let legit_client_cert = generate_self_signed_cert().unwrap();
+        // a separate certificate whose private key the attacker actually controls
+        let attacker_cert = generate_self_signed_cert().unwrap();
+        // server requires a client certificate matching the legit client's fingerprint
+        let server_config =
+            create_server_config_with_client_auth(&server_cert, legit_client_cert.fingerprint)
+                .unwrap();
+        let acceptor = TlsAcceptor::from(server_config);
+        // client presents the legit client certificate but signs with the attacker's key
+        let attacker_signing_key = rustls::crypto::ring::sign::any_supported_type(
+            &PrivateKeyDer::try_from(attacker_cert.key_der.clone()).unwrap(),
+        )
+        .unwrap();
+        let replayed = std::sync::Arc::new(rustls::sign::CertifiedKey::new(
+            vec![CertificateDer::from(legit_client_cert.cert_der.clone())],
+            attacker_signing_key,
+        ));
+        #[derive(Debug)]
+        struct ReplayResolver(std::sync::Arc<rustls::sign::CertifiedKey>);
+        impl rustls::client::ResolvesClientCert for ReplayResolver {
+            fn resolve(
+                &self,
+                _root_hint_subjects: &[&[u8]],
+                _sigschemes: &[SignatureScheme],
+            ) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
+                Some(self.0.clone())
+            }
+            fn has_certs(&self) -> bool {
+                true
+            }
+        }
+        // client pins the real server certificate (so the server side is authenticated normally)
+        let server_verifier =
+            std::sync::Arc::new(FingerprintServerCertVerifier::new(server_cert.fingerprint));
+        let client_config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(server_verifier)
+            .with_client_cert_resolver(std::sync::Arc::new(ReplayResolver(replayed)));
+        let connector = TlsConnector::from(std::sync::Arc::new(client_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_acceptor = acceptor.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let result = server_acceptor.accept(stream).await;
+            assert!(
+                result.is_err(),
+                "server must reject a client that replayed the pinned certificate without its key"
+            );
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let server_name = ServerName::try_from("rcp").unwrap();
+        // in TLS 1.3 the server verifies the client cert after the client's flight, so the
+        // rejection surfaces as either a connect() error or a subsequent read error. if connect()
+        // fails outright that already proves rejection; otherwise the first read must fail/EOF
+        if let Ok(mut tls_stream) = connector.connect(server_name, stream).await {
+            let mut buf = [0u8; 1];
+            let read_result = tls_stream.read(&mut buf).await;
+            assert!(
+                read_result.is_err() || read_result.unwrap() == 0,
+                "expected read to fail or EOF after the server rejects the replayed client cert"
+            );
+        }
+        server_task.await.unwrap();
+    }
+
+    /// TLS 1.3 is pinned: a peer that offers only TLS 1.2 cannot complete a handshake. Guards the
+    /// version pin so a downgrade to 1.2 (whose separate signature callbacks would otherwise
+    /// apply) cannot be silently reintroduced.
+    #[tokio::test]
+    async fn test_tls_handshake_fails_when_peer_offers_only_tls12() {
+        install_crypto_provider();
+        let server_cert = generate_self_signed_cert().unwrap();
+        // production server config, pinned to TLS 1.3
+        let server_config = create_server_config(&server_cert).unwrap();
+        let acceptor = TlsAcceptor::from(server_config);
+        // client that offers ONLY TLS 1.2
+        let verifier =
+            std::sync::Arc::new(FingerprintServerCertVerifier::new(server_cert.fingerprint));
+        let client_config =
+            ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth();
+        let connector = TlsConnector::from(std::sync::Arc::new(client_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_acceptor = acceptor.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // handshake fails: no protocol version in common
+            let _ = server_acceptor.accept(stream).await;
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let server_name = ServerName::try_from("rcp").unwrap();
+        let result = connector.connect(server_name, stream).await;
+        assert!(
+            result.is_err(),
+            "a server pinned to TLS 1.3 must reject a client that offers only TLS 1.2"
+        );
         server_task.await.unwrap();
     }
 }

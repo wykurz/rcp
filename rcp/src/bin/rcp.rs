@@ -283,9 +283,10 @@ struct Args {
     /// Disable TLS encryption and authentication for remote copy operations
     ///
     /// By default, remote copy connections use mutual TLS for authentication and encryption.
-    /// This flag disables BOTH encryption AND authentication on the data path.
-    /// WARNING: Data is sent in plaintext and source accepts connections from anyone.
-    /// Only use on isolated, trusted networks.
+    /// This flag disables BOTH encryption AND authentication on ALL rcp TCP connections
+    /// (master<->rcpd control and tracing, plus source<->destination control and data).
+    /// WARNING: all traffic is sent in plaintext and every rcpd listener accepts connections
+    /// from anyone who can reach its port. Only use on isolated, trusted networks.
     #[arg(long, help_heading = "Remote copy options")]
     no_encryption: bool,
 

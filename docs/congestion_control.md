@@ -601,7 +601,7 @@ same protocol used for all other configuration:
   ───────────                                ─────────────
       │                                           │
       │  SSH                                      │
-      │  ────────── launch command ────────────▶ │
+      │  ────────── launch command ──────────────▶│
       │         (--auto-meta-* flags)             │
       │                                           │
       │                                           │  ┌─ local control loop

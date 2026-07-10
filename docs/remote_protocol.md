@@ -15,11 +15,12 @@ The remote copy system consists of three distinct components:
 **Spawning Sequence:**
 
 1. User invokes `rcp user@host1:/src user@host2:/dst`
-2. Master creates a TCP listener and waits for connections
-3. Master spawns source rcpd via SSH: `ssh user@host1 rcpd --master-addr=... --role=source ...`
-4. Master spawns destination rcpd via SSH: `ssh user@host2 rcpd --master-addr=... --role=destination ...`
-5. Both rcpd processes connect to master via TCP
-6. Master identifies them by their declared role (sent via `TracingHello`)
+2. Master spawns source rcpd via SSH: `ssh user@host1 rcpd --role=source --master-cert-fp=... ...`
+3. Master spawns destination rcpd via SSH: `ssh user@host2 rcpd --role=destination --master-cert-fp=... ...`
+4. Each rcpd creates a TCP listener and prints `RCP_TLS <addr> <fingerprint>` (or
+   `RCP_TCP <addr>` when encryption is disabled) to stderr; master reads that line via SSH
+5. Master connects to each rcpd's listener via TCP: first the control connection, then a
+   second connection used for tracing/progress forwarding
 
 **Special Case - Same Host Copies:**
 When source and destination are on the same host, the master:
@@ -44,29 +45,36 @@ Source (rcpd)-----(TCP)----Destination (rcpd)
 
 **Connection Details:**
 
-1. **Source → Master**: Bidirectional TCP, used for handshake and result reporting
-2. **Destination → Master**: Bidirectional TCP, used for handshake and result reporting
-3. **Source ↔ Destination**: Two TCP ports on source:
+1. **Master → Source**: Bidirectional TCP (master connects to source rcpd's listener),
+   used for handshake and result reporting
+2. **Master → Destination**: Bidirectional TCP (master connects to destination rcpd's
+   listener), used for handshake and result reporting
+3. **Source ↔ Destination**: Two TCP ports on source (destination connects to both):
    - **Control port**: Bidirectional TCP for directory metadata and coordination
-   - **Data port**: Multiple TCP connections for file transfers (one connection per file)
+   - **Data port**: A pool of TCP connections for file transfers (each connection is
+     reused for multiple files)
 
 **Connection Establishment Order:**
 
-1. Both rcpd processes connect to master (order undefined)
+1. Master connects to both rcpd processes (each rcpd listens; master learns the address
+   from the `RCP_TLS`/`RCP_TCP` line on the rcpd's stderr)
 2. Master sends `MasterHello::Source` to source rcpd with src/dst paths
 3. Source rcpd starts TCP listeners (control + data), sends `SourceMasterHello` back to master with both addresses
 4. Master sends `MasterHello::Destination` to destination rcpd with source addresses
 5. Destination rcpd connects to source's control port
-6. For each file, destination opens a new connection to source's data port
+6. Destination opens a pool of connections to source's data port; files are streamed over
+   these pooled connections (the `size` field in each header delimits file boundaries)
 
 ### 1.4 Security Model
 
-All TCP connections are encrypted and authenticated using TLS 1.3 with self-signed certificates and fingerprint pinning.
+All TCP connections are encrypted and authenticated using TLS 1.3 with self-signed
+certificates and fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never
+negotiated) — see the [Cipher Suites](security.md#cipher-suites) section of security.md.
 
 **Security Architecture:**
 - SSH is used for authentication and rcpd deployment
 - Each party generates an ephemeral self-signed certificate
-- rcpd outputs its certificate fingerprint to stdout (read by master via SSH)
+- rcpd outputs its certificate fingerprint to stderr (read by master via SSH)
 - Master distributes fingerprints to source/destination for mutual TLS authentication
 - All TCP connections use TLS with certificate fingerprint verification
 
@@ -84,11 +92,6 @@ All TCP connections are encrypted and authenticated using TLS 1.3 with self-sign
 
 ### 2.1 Handshake Messages
 
-**`TracingHello`** (rcpd → Master, first message on control connection)
-- **Purpose**: Identify the role of the connecting rcpd
-- **Fields**: `role: RcpdRole` (Source or Destination)
-- **Timing**: First message sent after connecting to master
-
 **`MasterHello`** (Master → rcpd, bidirectional stream)
 - **Purpose**: Provide configuration and connection details
 - **Variants**:
@@ -104,8 +107,8 @@ All TCP connections are encrypted and authenticated using TLS 1.3 with self-sign
 **`RcpdResult`** (rcpd → Master, bidirectional stream)
 - **Purpose**: Report final success/failure status and statistics
 - **Variants**:
-  - `Success { message, summary }`
-  - `Failure { error, summary }`
+  - `Success { message, summary, runtime_stats }`
+  - `Failure { error, summary, runtime_stats }`
 
 ### 2.2 Source → Destination Messages (Control Stream)
 
@@ -208,7 +211,7 @@ The protocol uses asymmetric error communication between source and destination:
 - Source continues sending the complete directory structure regardless of destination failures
 - This simplifies the protocol and reduces round-trips
 - Destination metadata errors (file, directory, symlink) are handled locally: logged with
-  `tracing::error!`, `error_occurred` flag set, and processing continues unless `--fail-early`
+  `tracing::error!`, the error recorded in the `ErrorCollector`, and processing continues unless `--fail-early`
   is set. This applies to both file metadata (via `DataConsumed` stream state) and directory
   metadata (in `DirectoryTracker::complete_directory_single`)
 - **Exception — directory acks:** the destination DOES tell the source the outcome of every
@@ -272,20 +275,21 @@ Source                              Destination
   |                                      |  child2 notifies root: entries_processed++ (2/4)
   |  ---- DirStructureComplete --------> |  Structure complete
   |                                      |
-  |  <--- DirectoryManifestChunk(root, [..]) | (0+ chunks for reused dirs under
+  |  <--- DirectoryManifestChunk(root)   |  (0+ chunks for reused dirs under
   |                                      |   --overwrite/--ignore-existing, sent
   |                                      |   BEFORE the trigger; none otherwise)
-  |  <--- DirectoryCreated(root) -------- |  (trigger only; no count echoed)
-  |  <--- DirectoryCreated(child1) ------ |
+  |  <--- DirectoryCreated(root) ------- |  (trigger only; no count echoed)
+  |  <--- DirectoryCreated(child1) ----- |
   |                                      |
-  |  (look up retained file_count=2; compare root/f1 and root/f2 against manifest) |
-  |  ~~~~ File(root/f1) ~~~~~~~~~~~~~~~~>|  Write file (f1 not in manifest or differs)
+  |  (look up retained file_count=2;     |
+  |   compare f1, f2 against manifest)   |
+  |  ~~~~ File(root/f1) ~~~~~~~~~~~~~~~> |  Write file (f1 not in manifest or differs)
   |                                      |  root: entries_processed++ (3/4)
   |  ---- FileUnchanged(root/f2) ------> |  f2 matches manifest; no data sent
   |                                      |  root: entries_processed++ (4/4)
   |                                      |  root complete → apply metadata
   |                                      |
-  |  (send 1 file from child1)          |
+  |  (send 1 file from child1)           |
   |  ~~~~ File(child1/f1) ~~~~~~~~~~~~~> |  Write file
   |                                      |  child1: entries_processed++ (1/1)
   |                                      |  child1 complete → apply metadata
@@ -363,6 +367,11 @@ directory's completion, ensuring metadata is only applied after all children fin
 
 ### 5.1 Data Structures
 
+The completion-tracking core, abridged — the full struct in `rcp/src/directory_tracker.rs`
+additionally holds the destination-side directory fd-map (`dirs`, plus the root's parent
+fd) through which child writes resolve, `created_directories` (for empty-directory
+cleanup), the control send stream, preserve/fail-early settings, and an error collector:
+
 ```rust
 struct DirectoryTracker {
     /// Directories waiting for entries (entries_expected known, entries_processed < entries_expected)
@@ -420,9 +429,9 @@ whether non-directory items can be replaced.
 
 **On directory completion (`complete_directory_single`):**
 - Apply stored metadata (permissions, owner, timestamps)
-- If metadata application fails (e.g., `fchownat` EPERM): log error, set `error_occurred`,
-  return error only if `fail_early`. Otherwise continue — the directory is still marked
-  complete and parent notification still happens.
+- If metadata application fails (e.g., `fchownat` EPERM): log error, push the error to the
+  `ErrorCollector`, return error only if `fail_early`. Otherwise continue — the directory is
+  still marked complete and parent notification still happens.
 
 **On `File` message:**
 - If `is_root`: write file, set `root_complete = true`
@@ -605,7 +614,8 @@ The protocol uses two sending primitives:
 Data connections are pooled for efficiency:
 - Pool size defaults to 100 connections (configurable via `--max-connections`)
 - Destination opens connections to source's data port up to pool size
-- Source accepts connections and assigns files to them round-robin
+- Source accepts connections into a shared pool of available send streams; each file-send
+  task borrows the next free connection and returns it for reuse (RAII)
 - Tasks borrow connections, send files, return them via RAII
 - `size` field in headers delimits file boundaries within a connection
 - Avoids connection creation overhead per file
@@ -638,7 +648,7 @@ This distinction matters for pool efficiency:
 - `Corrupted`: Connection unusable, must close (source will accept new connection if needed)
 
 Directory metadata errors are handled analogously in `DirectoryTracker::complete_directory_single`:
-the error is logged, `error_occurred` is set, and processing continues (unless `--fail-early`).
+the error is logged, pushed to the `ErrorCollector`, and processing continues (unless `--fail-early`).
 The directory is still marked complete and parent notifications still propagate.
 
 ### 7.7 Summary Statistics Authority

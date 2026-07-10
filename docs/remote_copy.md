@@ -35,8 +35,8 @@ By default, all TCP connections are encrypted using TLS 1.3 with self-signed cer
 
 | Connection | Authentication | Encryption |
 |------------|---------------|------------|
-| Master → rcpd | Certificate fingerprint (via SSH stdout) | TLS 1.3 |
-| Source ↔ Destination | Certificate fingerprint (via Master) | TLS 1.3 |
+| Master → rcpd | Mutual fingerprint pinning (exchanged via SSH) | TLS 1.3 |
+| Source ↔ Destination | Mutual fingerprint pinning (via Master) | TLS 1.3 |
 
 **Key features**:
 - **Forward secrecy**: Ephemeral keys per session
@@ -46,10 +46,11 @@ By default, all TCP connections are encrypted using TLS 1.3 with self-signed cer
 
 ### Connection Flow
 
-1. **Master spawns rcpd via SSH**: `ssh host "rcpd --role source"`
-2. **rcpd generates ephemeral certificate** and outputs fingerprint to stdout
+1. **Master spawns rcpd via SSH**: `ssh host "rcpd --role source --master-cert-fp <fp>"`
+2. **rcpd generates ephemeral certificate** and outputs fingerprint to stderr
 3. **Master reads fingerprint** before connecting (trusted via SSH channel)
-4. **Master connects with TLS**, verifying rcpd's certificate fingerprint
+4. **Master connects with TLS**, verifying rcpd's certificate fingerprint; rcpd in turn
+   verifies master's client certificate against `--master-cert-fp`
 5. **Master distributes fingerprints** to source and destination for mutual TLS
 
 ### Disabling Encryption
@@ -99,11 +100,12 @@ rcpd binary not found on remote host
 Searched in:
 - Same directory as local rcp binary
 - PATH (via 'which rcpd')
+- Deployed cache: ~/.cache/rcp/bin/rcpd-0.36.0
 
-Please install rcpd on the remote host and ensure it's in PATH:
-- cargo install rcp-tools-rcp --version 0.22.0
-Or specify the path explicitly:
-- rcp --rcpd-path=/path/to/rcpd ...
+Options:
+- Use automatic deployment: rcp --auto-deploy-rcpd ...
+- Install rcpd manually: cargo install rcp-tools-rcp --version 0.36.0
+- Specify explicit path: rcp --rcpd-path=/path/to/rcpd ...
 ```
 
 ### Graceful Degradation
@@ -166,11 +168,11 @@ To fix this, install the matching version on the remote host:
 ```bash
 # Human-readable version
 rcp --version
-# Output: rcp 0.22.0
+# Output: rcp 0.36.0
 
 # Machine-readable protocol version (JSON)
 rcp --protocol-version
-# Output: {"semantic":"0.22.0","git_describe":"v0.21.1-7-g644da27",...}
+# Output: {"semantic":"0.36.0","git_describe":"v0.35.0-7-g644da27",...}
 ```
 
 ## Automatic Deployment
@@ -240,12 +242,18 @@ mv -f ~/.cache/rcp/bin/.rcpd-{version}.tmp.$$ ~/.cache/rcp/bin/rcpd-{version}
 no local rcpd binary found for deployment
 
 Searched in:
-- Same directory: /path/to/rcp/../rcpd
-- PATH: (via 'which rcpd')
+- Same directory: /path/to/rcp/rcpd
 
 To use auto-deployment, ensure rcpd is available:
 - cargo install rcp-tools-rcp (installs to ~/.cargo/bin)
+- or add rcpd to PATH
+- or build with: cargo build --release --bin rcpd
 ```
+
+(A `PATH:` line is added to the "Searched in" list only in the unusual case where
+`which rcpd` resolves to a path that then doesn't exist or isn't a regular file; when
+`which` finds a usable binary it is deployed, and when it finds nothing no `PATH:` line is
+shown — hence the common not-found output lists only the same-directory candidate.)
 
 **Checksum mismatch**:
 ```
@@ -255,6 +263,7 @@ Expected: abc123...
 Got:      def456...
 
 The binary transfer may have been corrupted.
+Please try again or check network connectivity.
 ```
 
 ## Network Connectivity
@@ -265,9 +274,10 @@ The binary transfer may have been corrupted.
    - SSH to source host, start rcpd
    - SSH to destination host, start rcpd
 
-2. **rcpd connects back to Master**
-   - Source rcpd connects via TCP
-   - Destination rcpd connects via TCP
+2. **Master connects to each rcpd**
+   - Each rcpd creates a TCP listener and reports its address (and TLS fingerprint)
+     on stderr, which master reads over SSH
+   - Master connects via TCP (control + tracing connections)
 
 3. **Source waits for Destination**
    - Source starts TCP listeners (control + data ports)
@@ -291,23 +301,49 @@ The binary transfer may have been corrupted.
 
 **Scenario**: rcpd doesn't exist on remote host
 
-**Handling**: SSH command fails, master waits for connection (timeout: 15s default).
+**Handling**: Binary discovery and a version check run *before* rcpd is spawned — no
+connection timeout is involved. Two distinct outcomes:
 
-**Error**:
+- **No binary found** (and `--auto-deploy-rcpd` is not set): the master fails immediately
+  with the `rcpd binary not found on remote host` error shown in
+  [Error Handling](#error-handling).
+- **A binary is found but its version doesn't match** `rcp`, and `--auto-deploy-rcpd` is
+  **not** set: the master fails with the version-mismatch error shown in
+  [Version Mismatch Error](#version-mismatch-error), not the "not found" error. (With
+  `--auto-deploy-rcpd`, a mismatch instead triggers deployment: the master ships its
+  *local* rcpd binary — the one beside `rcp`, or failing that one found via `which rcpd` —
+  and stores it under the local `rcp`'s version. Note the local binary's own protocol
+  version is **not** re-verified before it is shipped and launched, so this assumes the
+  local rcpd is the build that matches `rcp`; see the note below.)
+
+> **Caveat:** auto-deployment trusts the local rcpd it finds; `find_local_rcpd_binary`
+> selects by existence, not version. The same-directory candidate is *expected* to be the
+> co-built sibling that matches `rcp` — but that is an expectation, not a verified guarantee —
+> and a `which rcpd` fallback could resolve to a stale binary. Either would be deployed under
+> the current version's filename and launched with a potentially incompatible protocol.
+> Prefer keeping `rcpd` next to `rcp`, or deploy manually, when versions may diverge.
+
+#### Master Cannot Connect to rcpd
+
+**Scenario**: TCP connection from Master to rcpd's listener fails (firewall, network)
+
+The master opens two connections — control then tracing — to *each* rcpd. In the master's
+error the `<purpose>` is therefore one of `source control`, `source tracing`,
+`dest control`, or `dest tracing`; in the rcpd's own error it is the bare `control` or
+`tracing`.
+
+**Master error**:
 ```
-Timed out waiting for source/destination rcpd to connect after 15s.
-Check if source/destination host is reachable and rcpd can be executed.
+failed to connect to rcpd at <addr> for <purpose>
+```
+or, on timeout:
+```
+timeout connecting to rcpd for <purpose>
 ```
 
-#### rcpd Cannot Connect to Master
-
-**Scenario**: TCP connection from rcpd to Master fails (firewall, network)
-
-**rcpd error**:
+**rcpd error** (while waiting for the master to connect):
 ```
-Failed to connect to master at <addr>.
-This usually means the master is unreachable from this host.
-Check network connectivity and firewall rules.
+timeout waiting for master <purpose> connection
 ```
 
 #### Destination Cannot Connect to Source (Most Common)
@@ -323,9 +359,11 @@ Check network connectivity and firewall rules.
 
 **Destination error**:
 ```
-Failed to connect to source at <addr>.
-This usually means the source is unreachable from the destination.
-Check network connectivity and firewall rules.
+connection to <addr> timed out after 15s
+```
+or:
+```
+failed to connect to <addr>
 ```
 
 ### Timeout Configuration
@@ -333,8 +371,8 @@ Check network connectivity and firewall rules.
 | Timeout | Default | Configuration |
 |---------|---------|---------------|
 | SSH connection | ~30s | SSH config |
-| rcpd → Master | 15s | `--remote-copy-conn-timeout-sec` |
-| Destination → Source | 15s | `--remote-copy-conn-timeout-sec` |
+| Master → rcpd | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Destination → Source | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
 
 Example:
 ```bash
@@ -346,7 +384,7 @@ rcp --remote-copy-conn-timeout-sec 30 source:/path dest:/path
 Use `--port-ranges` to restrict TCP ports:
 
 ```bash
-rcp --port-ranges 8000-8100 source:/path dest:/path
+rcp --port-ranges 8000-8999 source:/path dest:/path
 ```
 
 Useful when:
@@ -368,7 +406,8 @@ rcp builds static musl binaries by default for maximum portability.
 
 ### Configuration
 
-From `.cargo/config.toml`:
+From `.cargo/config.toml` (abridged; the file also sets `rustdocflags` per section and
+configures the `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-musl` targets):
 
 ```toml
 [build]
@@ -406,7 +445,7 @@ cargo build --target x86_64-unknown-linux-gnu
 |------|-------------|
 | `--rcpd-path=PATH` | Override rcpd binary path on remote hosts |
 | `--auto-deploy-rcpd` | Automatically deploy rcpd to remote hosts |
-| `--remote-copy-conn-timeout-sec=N` | Connection timeout (default: 15) |
+| `--remote-copy-conn-timeout-sec=N` | Connection timeout (default: 15; 60 with `--auto-deploy-rcpd`) |
 | `--port-ranges=RANGES` | Restrict TCP to specific ports (e.g., "8000-8999") |
 | `--max-connections=N` | Maximum concurrent data connections (default: 100) |
 | `--network-profile=PROFILE` | Buffer sizing: `datacenter` (default) or `internet` |
