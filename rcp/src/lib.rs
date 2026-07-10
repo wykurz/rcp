@@ -101,7 +101,7 @@
 //! ## Remote Copy Configuration
 //!
 //! - `--port-ranges`: Restrict TCP data ports to specific ranges (e.g., "8000-8999")
-//! - `--remote-copy-conn-timeout-sec`: Connection timeout in seconds (default: 15)
+//! - `--remote-copy-conn-timeout-sec`: Connection timeout in seconds (default: 15; 60 with `--auto-deploy-rcpd`)
 //!
 //! # Architecture
 //!
@@ -116,19 +116,20 @@
 //! ```text
 //! Master (rcp)
 //! ├── SSH → Source Host (rcpd in source mode)
-//! │   └── TCP → Master (control)
-//! │   └── TCP Server (data ports, waits for Destination)
+//! │   ├── TCP Server ← Master (control + tracing)
+//! │   └── TCP Server ← Destination (control + data ports)
 //! └── SSH → Destination Host (rcpd in destination mode)
-//!     └── TCP → Master (control)
-//!     └── TCP Client → Source (data)
+//!     ├── TCP Server ← Master (control + tracing)
+//!     └── TCP Client → Source (control + data)
 //! ```
 //!
 //! **Connection flow:**
 //! 1. Master starts `rcpd` processes on both hosts via SSH
-//! 2. Both `rcpd` processes connect back to Master via TCP (control channel)
+//! 2. Master connects to each `rcpd`'s TCP listener (control + tracing connections; the
+//!    listener address is read from the rcpd's stderr over SSH)
 //! 3. Source `rcpd` starts TCP listeners and sends its addresses to Master
 //! 4. Master forwards the addresses to Destination `rcpd`
-//! 5. Destination connects directly to Source's data port
+//! 5. Destination connects directly to Source's control and data ports
 //! 6. Data flows directly from Source to Destination (not through Master)
 //!
 //! This architecture ensures efficient data transfer while allowing the Master to coordinate the operation and monitor progress.

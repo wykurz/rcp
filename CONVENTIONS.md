@@ -17,11 +17,12 @@
 - Example pattern from existing tests:
   ```rust
   #[test]
-  fn test_feature() {
+  fn copies_single_file() {
       let (src_dir, dst_dir) = setup_test_env();
       let src_file = src_dir.path().join("file.txt");
+      let dst_file = dst_dir.path().join("file.txt");
       create_test_file(&src_file, "content", 0o644);
-      let output = run_rcp_and_expect_success(&[src_file.to_str().unwrap(), "localhost:/dest"]);
+      let output = run_rcp_and_expect_success(&[src_file.to_str().unwrap(), dst_file.to_str().unwrap()]);
       assert_eq!(get_file_content(&dst_file), "content");
       // verify specific behavior
       let summary = parse_summary_from_output(&output).expect("Failed to parse summary");

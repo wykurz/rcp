@@ -53,6 +53,7 @@ API documentation for the command-line tools is available on docs.rs:
 - [Remote Protocol](docs/remote_protocol.md) - Wire protocol specification
 - [Congestion Control](docs/congestion_control.md) - Adaptive metadata throttling design and tuning
 - [Testing](docs/testing.md) - Test infrastructure and Docker multi-host testing
+- [TOCTTOU Vulnerabilities](docs/tocttou.md) - TOCTTOU threat model and fd-based hardening
 
 Examples
 ========
@@ -250,7 +251,7 @@ To avoid this confusion, RCP tools:
 The following examples illustrate this (_those rules apply to both `rcp` and `rlink`_):
 
 - `rcp A/B C/D` - copy `A/B` into `C/` and name it `D`; if `C/D` exists fail immediately
-- `rcp A/B C/D/` - copy `B` into `D` WITHOUT renaming i.e., the resulting path will be `C/D/B`; if `C/B/D` exists fail immediately
+- `rcp A/B C/D/` - copy `B` into `D` WITHOUT renaming i.e., the resulting path will be `C/D/B`; if `C/D/B` exists fail immediately
 
 Using `rcp` it's also possible to copy multiple sources into a single destination, but the destination MUST have a trailing slash (`/`):
 - `rcp A B C D/` - copy `A`, `B` and `C` into `D` WITHOUT renaming i.e., the resulting paths will be `D/A`, `D/B` and `D/C`; if any of which exist fail immediately
@@ -349,7 +350,7 @@ Manual deployment is still supported and may be preferred for:
 
 **Configuration options:**
 - `--port-ranges` - restrict TCP data ports to specific ranges (e.g., "8000-8999")
-- `--remote-copy-conn-timeout-sec` - connection timeout in seconds (default: 15)
+- `--remote-copy-conn-timeout-sec` - connection timeout in seconds (default: 15; 60 with `--auto-deploy-rcpd`)
 
 **Architecture:**
 The remote copy uses a three-node architecture:
@@ -379,7 +380,10 @@ For trusted networks where encryption overhead is undesirable, use `--no-encrypt
 ```fish
 > rcp --no-encryption source:/path dest:/path
 ```
-Warning: This disables both encryption and authentication on the data path.
+Warning: This disables both encryption and authentication on **all** rcp TCP connections
+(master↔rcpd control and tracing, plus source↔destination control and data) — not just the
+file-data path. Every rcpd listener then accepts connections from anyone who can reach its
+port; only SSH still authenticates rcpd startup.
 
 **Best Practices:**
 - Use SSH key-based authentication

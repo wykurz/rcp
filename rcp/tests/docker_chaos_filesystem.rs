@@ -91,12 +91,27 @@ fn test_chaos_filesystem_files_deleted_during_copy_no_hang() -> Result<()> {
         &format!("host-a:{}", src_dir),
         &format!("host-b:{}", dst_dir),
     ])?;
-    // the critical check: rcp completed (didn't hang). if we reach this point,
-    // the copy finished within docker exec's implicit timeout.
+    // the critical check: rcp completed (didn't hang). `docker exec` has no timeout, so a
+    // genuine hang would stall here (and the CI job) rather than fail cleanly.
     eprintln!(
         "rcp exited with code: {:?} (success={}) - filesystem deletion race handled",
         output.status.code(),
         output.status.success()
+    );
+    // rcp exits 0 (success) or 1 (errors handled) for these scenarios. a crash surfaces
+    // differently: the build sets panic = "abort", so a panic raises SIGABRT, and both that
+    // and a segfault are reported by `docker exec` as 128+n (134 and 139 respectively) — note
+    // we observe the OUTER `docker exec` status, so a signal-killed rcp still yields Some(code),
+    // not None. reject anything outside 0/1.
+    // caveat: a docker-level failure (e.g. the container is gone) can also exit 1, which this
+    // cannot distinguish from rcp's own error exit; proving rcp actually ran would require an
+    // in-container completion marker reporting its inner status.
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "rcp exited with unexpected status {:?} (expected 0 or 1); a crash under concurrent \
+         filesystem mutation surfaces as SIGABRT (134) or SIGSEGV (139) via docker exec, \
+         outside that range",
+        output.status.code()
     );
     Ok(())
 }
@@ -156,6 +171,21 @@ fn test_chaos_filesystem_files_added_during_copy_no_hang() -> Result<()> {
         "rcp exited with code: {:?} (success={}) - filesystem addition race handled",
         output.status.code(),
         output.status.success()
+    );
+    // rcp exits 0 (success) or 1 (errors handled) for these scenarios. a crash surfaces
+    // differently: the build sets panic = "abort", so a panic raises SIGABRT, and both that
+    // and a segfault are reported by `docker exec` as 128+n (134 and 139 respectively) — note
+    // we observe the OUTER `docker exec` status, so a signal-killed rcp still yields Some(code),
+    // not None. reject anything outside 0/1.
+    // caveat: a docker-level failure (e.g. the container is gone) can also exit 1, which this
+    // cannot distinguish from rcp's own error exit; proving rcp actually ran would require an
+    // in-container completion marker reporting its inner status.
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "rcp exited with unexpected status {:?} (expected 0 or 1); a crash under concurrent \
+         filesystem mutation surfaces as SIGABRT (134) or SIGSEGV (139) via docker exec, \
+         outside that range",
+        output.status.code()
     );
     Ok(())
 }
@@ -220,6 +250,21 @@ fn test_chaos_filesystem_directory_removed_during_copy_no_hang() -> Result<()> {
         output.status.code(),
         output.status.success()
     );
+    // rcp exits 0 (success) or 1 (errors handled) for these scenarios. a crash surfaces
+    // differently: the build sets panic = "abort", so a panic raises SIGABRT, and both that
+    // and a segfault are reported by `docker exec` as 128+n (134 and 139 respectively) — note
+    // we observe the OUTER `docker exec` status, so a signal-killed rcp still yields Some(code),
+    // not None. reject anything outside 0/1.
+    // caveat: a docker-level failure (e.g. the container is gone) can also exit 1, which this
+    // cannot distinguish from rcp's own error exit; proving rcp actually ran would require an
+    // in-container completion marker reporting its inner status.
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "rcp exited with unexpected status {:?} (expected 0 or 1); a crash under concurrent \
+         filesystem mutation surfaces as SIGABRT (134) or SIGSEGV (139) via docker exec, \
+         outside that range",
+        output.status.code()
+    );
     Ok(())
 }
 
@@ -273,6 +318,21 @@ fn test_chaos_filesystem_deficit_with_filter_no_hang() -> Result<()> {
         "rcp exited with code: {:?} (success={}) - filtered deficit race handled",
         output.status.code(),
         output.status.success()
+    );
+    // rcp exits 0 (success) or 1 (errors handled) for these scenarios. a crash surfaces
+    // differently: the build sets panic = "abort", so a panic raises SIGABRT, and both that
+    // and a segfault are reported by `docker exec` as 128+n (134 and 139 respectively) — note
+    // we observe the OUTER `docker exec` status, so a signal-killed rcp still yields Some(code),
+    // not None. reject anything outside 0/1.
+    // caveat: a docker-level failure (e.g. the container is gone) can also exit 1, which this
+    // cannot distinguish from rcp's own error exit; proving rcp actually ran would require an
+    // in-container completion marker reporting its inner status.
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "rcp exited with unexpected status {:?} (expected 0 or 1); a crash under concurrent \
+         filesystem mutation surfaces as SIGABRT (134) or SIGSEGV (139) via docker exec, \
+         outside that range",
+        output.status.code()
     );
     Ok(())
 }

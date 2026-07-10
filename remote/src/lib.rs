@@ -10,17 +10,18 @@
 //! ```text
 //! Master (rcp)
 //! ├── SSH → Source Host (rcpd)
-//! │   └── TCP → Master (control)
-//! │   └── TCP Server (accepts data connections from Destination)
+//! │   ├── TCP Server ← Master (control + tracing)
+//! │   └── TCP Server ← Destination (control + data)
 //! └── SSH → Destination Host (rcpd)
-//!     └── TCP → Master (control)
-//!     └── TCP Client → Source (data transfer)
+//!     ├── TCP Server ← Master (control + tracing)
+//!     └── TCP Client → Source (control + data)
 //! ```
 //!
 //! ## Connection Flow
 //!
 //! 1. **Initialization**: Master starts `rcpd` processes on source and destination via SSH
-//! 2. **Control Connections**: Both `rcpd` processes connect back to Master via TCP
+//! 2. **Control Connections**: Master connects to each `rcpd`'s TCP listener (address read
+//!    from the rcpd's stderr over SSH)
 //! 3. **Address Exchange**: Source starts TCP listeners and sends addresses to Master
 //! 4. **Direct Connection**: Master forwards addresses to Destination, which connects to Source
 //! 5. **Data Transfer**: Files flow directly from Source to Destination (not through Master)
@@ -66,7 +67,6 @@
 //! - `MasterHello` - Master → rcpd configuration
 //! - `SourceMasterHello` - Source → Master address information
 //! - `RcpdResult` - rcpd → Master operation results
-//! - `TracingHello` - rcpd → Master tracing initialization
 //!
 //! ## Stream Communication
 //!
@@ -93,7 +93,7 @@
 //!
 //! **How it works**:
 //! 1. Each rcpd generates an ephemeral self-signed certificate
-//! 2. rcpd outputs its certificate fingerprint to SSH stdout (trusted channel)
+//! 2. rcpd outputs its certificate fingerprint to stderr (read by master over the trusted SSH channel)
 //! 3. Master connects to rcpd as TLS client, verifies fingerprint
 //! 4. Master distributes fingerprints to enable Source↔Destination mutual auth
 //!
@@ -104,7 +104,7 @@
 //! Common failure scenarios:
 //!
 //! - **SSH Connection Fails**: Host unreachable or authentication failure
-//! - **rcpd Cannot Connect to Master**: Firewall blocks TCP ports
+//! - **Master Cannot Connect to rcpd**: Firewall blocks TCP ports
 //! - **Destination Cannot Connect to Source**: Use `--port-ranges` to specify allowed ports
 //!
 //! # Module Organization
