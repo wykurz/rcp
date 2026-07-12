@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 620" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <!-- Section 4.4 Failed Directory Handling: dir1 fails to create; descendants are skipped -->
+  <defs>
+    <marker id="ar-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#334155"/>
+    </marker>
+    <marker id="ar-err" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#b91c1c"/>
+    </marker>
+  </defs>
+
+  <rect x="0.5" y="0.5" width="999" height="619" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+
+  <rect x="185" y="16" width="170" height="36" rx="7" fill="#eef2f7" stroke="#475569" stroke-width="1.5"/>
+  <text x="270" y="39" text-anchor="middle" font-size="14.5" font-weight="600" fill="#1e293b">Source (rcpd)</text>
+  <rect x="615" y="16" width="170" height="36" rx="7" fill="#eef2f7" stroke="#475569" stroke-width="1.5"/>
+  <text x="700" y="39" text-anchor="middle" font-size="14.5" font-weight="600" fill="#1e293b">Destination (rcpd)</text>
+
+  <line x1="270" y1="52" x2="270" y2="556" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <line x1="700" y1="52" x2="700" y2="556" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 4"/>
+
+  <line x1="270" y1="96" x2="694" y2="96" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+  <text x="485" y="90" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">Directory(dir1, entries=2, meta)</text>
+  <g font-size="12.5">
+    <text x="712" y="92" text-anchor="start" fill="#b91c1c" font-weight="600">mkdir dir1 → FAILS</text>
+    <text x="712" y="108" text-anchor="start" fill="#64748b">add to failed_directories</text>
+  </g>
+
+  <line x1="700" y1="146" x2="276" y2="146" stroke="#b91c1c" stroke-width="1.5" marker-end="url(#ar-err)"/>
+  <text x="485" y="140" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#b91c1c">DirectorySkipped(dir1)</text>
+  <text x="712" y="150" text-anchor="start" font-size="12.5" fill="#64748b">nack (not created)</text>
+  <g font-size="12.5" fill="#64748b">
+    <text x="258" y="166" text-anchor="end">release dir1 fd, no Pass 2</text>
+  </g>
+
+  <line x1="270" y1="210" x2="694" y2="210" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+  <text x="485" y="204" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">Directory(dir1/dir2, …)</text>
+  <text x="712" y="214" text-anchor="start" font-size="12.5" fill="#64748b">ancestor failed, skip (log warning)</text>
+
+  <line x1="700" y1="254" x2="276" y2="254" stroke="#b91c1c" stroke-width="1.5" marker-end="url(#ar-err)"/>
+  <text x="485" y="248" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#b91c1c">DirectorySkipped(dir1/dir2)</text>
+  <g font-size="12.5" fill="#64748b">
+    <text x="712" y="250" text-anchor="start">nack; parent(dir1)</text>
+    <text x="712" y="266" text-anchor="start">process_child_entry</text>
+    <text x="258" y="274" text-anchor="end">release dir1/dir2 fd, no Pass 2</text>
+  </g>
+
+  <line x1="270" y1="318" x2="694" y2="318" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+  <text x="485" y="312" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">Symlink(dir1/link, meta)</text>
+  <g font-size="12.5" fill="#64748b">
+    <text x="712" y="314" text-anchor="start">ancestor failed, skip (log warning);</text>
+    <text x="712" y="330" text-anchor="start">parent(dir1) process_child_entry (skipped)</text>
+  </g>
+
+  <line x1="270" y1="374" x2="694" y2="374" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+  <text x="485" y="368" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">DirStructureComplete</text>
+  <text x="712" y="378" text-anchor="start" font-size="12.5" fill="#64748b">structure complete</text>
+
+  <g font-size="12.5" fill="#64748b">
+    <text x="258" y="416" text-anchor="end">no DirectoryCreated for dir1,</text>
+    <text x="258" y="432" text-anchor="end">so source doesn't send its files</text>
+    <text x="712" y="424" text-anchor="start">all pending directories complete</text>
+  </g>
+
+  <line x1="700" y1="470" x2="276" y2="470" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+  <text x="485" y="464" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">DestinationDone</text>
+
+  <g font-size="12.5" fill="#64748b">
+    <text x="258" y="502" text-anchor="end">detect EOF, close send side</text>
+    <text x="258" y="518" text-anchor="end">detect EOF, close recv</text>
+    <text x="712" y="502" text-anchor="start">detect EOF, close recv</text>
+    <text x="712" y="518" text-anchor="start">close connection</text>
+  </g>
+
+  <g font-size="12">
+    <line x1="290" y1="586" x2="340" y2="586" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+    <text x="348" y="590" fill="#475569">control stream (FIFO)</text>
+    <line x1="530" y1="586" x2="580" y2="586" stroke="#b91c1c" stroke-width="1.5" marker-end="url(#ar-err)"/>
+    <text x="588" y="590" fill="#475569">skip notification (nack)</text>
+  </g>
+</svg>

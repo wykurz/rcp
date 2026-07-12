@@ -1,0 +1,145 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 950" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <!-- Section 4.1 Directory Copy Flow: example tree = root {f1, f2, link, child1 {f1}, child2 {}} -->
+  <defs>
+    <marker id="ar-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#334155"/>
+    </marker>
+    <marker id="ar-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+    <marker id="ar-opt" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect x="0.5" y="0.5" width="999" height="949" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+
+  <!-- participants -->
+  <rect x="185" y="16" width="170" height="36" rx="7" fill="#eef2f7" stroke="#475569" stroke-width="1.5"/>
+  <text x="270" y="39" text-anchor="middle" font-size="14.5" font-weight="600" fill="#1e293b">Source (rcpd)</text>
+  <rect x="615" y="16" width="170" height="36" rx="7" fill="#eef2f7" stroke="#475569" stroke-width="1.5"/>
+  <text x="700" y="39" text-anchor="middle" font-size="14.5" font-weight="600" fill="#1e293b">Destination (rcpd)</text>
+
+  <!-- lifelines -->
+  <line x1="270" y1="52" x2="270" y2="862" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <line x1="700" y1="52" x2="700" y2="862" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 4"/>
+
+  <!-- Pass 1: directory structure -->
+  <g font-size="12.5" fill="#64748b">
+    <text x="258" y="82" text-anchor="end">pre-read root: 2 files, 1 symlink,</text>
+    <text x="258" y="98" text-anchor="end">1 dir = 4 entries; retain root</text>
+    <text x="258" y="114" text-anchor="end">file_count=2 source-side</text>
+  </g>
+  <line x1="270" y1="134" x2="694" y2="134" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+  <text x="485" y="128" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">Directory(root, entries=4, meta)</text>
+  <g font-size="12.5" fill="#64748b">
+    <text x="712" y="130" text-anchor="start">create root, store metadata,</text>
+    <text x="712" y="146" text-anchor="start">entries_expected=4</text>
+  </g>
+
+  <g font-size="12.5" fill="#64748b">
+    <text x="258" y="172" text-anchor="end">pre-read child1: 1 file = 1 entry;</text>
+    <text x="258" y="188" text-anchor="end">retain child1 file_count=1</text>
+  </g>
+  <line x1="270" y1="208" x2="694" y2="208" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+  <text x="485" y="202" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">Directory(child1, entries=1, meta)</text>
+  <g font-size="12.5" fill="#64748b">
+    <text x="712" y="204" text-anchor="start">create child1, store metadata,</text>
+    <text x="712" y="220" text-anchor="start">entries_expected=1</text>
+    <text x="712" y="236" text-anchor="start" font-style="italic">(child1 does NOT count toward root yet)</text>
+  </g>
+
+  <line x1="270" y1="266" x2="694" y2="266" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+  <text x="485" y="260" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">Symlink(root/link, meta)</text>
+  <g font-size="12.5" fill="#64748b">
+    <text x="712" y="262" text-anchor="start">create symlink</text>
+    <text x="712" y="278" text-anchor="start">root: entries_processed++ (1/4)</text>
+  </g>
+
+  <g font-size="12.5" fill="#64748b">
+    <text x="258" y="306" text-anchor="end">pre-read child2: 0 entries;</text>
+    <text x="258" y="322" text-anchor="end">retain child2 file_count=0</text>
+  </g>
+  <line x1="270" y1="342" x2="694" y2="342" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+  <text x="485" y="336" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">Directory(child2, entries=0, meta)</text>
+  <g font-size="12.5" fill="#64748b">
+    <text x="712" y="338" text-anchor="start">create child2, entries_expected=0</text>
+    <text x="712" y="354" text-anchor="start">child2 complete → apply metadata;</text>
+    <text x="712" y="370" text-anchor="start">child2 notifies root:</text>
+    <text x="712" y="386" text-anchor="start">entries_processed++ (2/4)</text>
+  </g>
+
+  <line x1="270" y1="410" x2="694" y2="410" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+  <text x="485" y="404" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">DirStructureComplete</text>
+  <text x="712" y="414" text-anchor="start" font-size="12.5" fill="#64748b">structure complete</text>
+
+  <!-- manifest chunks (optional) + created triggers -->
+  <line x1="700" y1="452" x2="276" y2="452" stroke="#64748b" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#ar-opt)"/>
+  <text x="485" y="446" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#64748b">DirectoryManifestChunk(root)</text>
+  <g font-size="12.5" fill="#64748b">
+    <text x="712" y="448" text-anchor="start" font-style="italic">0+ chunks for reused dirs under</text>
+    <text x="712" y="464" text-anchor="start" font-style="italic">--overwrite/--ignore-existing, sent</text>
+    <text x="712" y="480" text-anchor="start" font-style="italic">BEFORE the trigger; none otherwise</text>
+  </g>
+
+  <line x1="700" y1="510" x2="276" y2="510" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+  <text x="485" y="504" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">DirectoryCreated(root)</text>
+  <text x="712" y="514" text-anchor="start" font-size="12.5" fill="#64748b" font-style="italic">trigger only; no count echoed</text>
+
+  <line x1="700" y1="546" x2="276" y2="546" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+  <text x="485" y="540" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">DirectoryCreated(child1)</text>
+
+  <!-- Pass 2: file contents -->
+  <g font-size="12.5" fill="#64748b">
+    <text x="258" y="576" text-anchor="end">look up retained file_count=2;</text>
+    <text x="258" y="592" text-anchor="end">compare f1, f2 against manifest</text>
+  </g>
+  <line x1="270" y1="612" x2="694" y2="612" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ar-data)"/>
+  <text x="485" y="606" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#2563eb">File(root/f1)</text>
+  <g font-size="12.5" fill="#64748b">
+    <text x="712" y="608" text-anchor="start">write file (f1 not in manifest, or differs)</text>
+    <text x="712" y="624" text-anchor="start">root: entries_processed++ (3/4)</text>
+  </g>
+
+  <line x1="270" y1="656" x2="694" y2="656" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+  <text x="485" y="650" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">FileUnchanged(root/f2)</text>
+  <g font-size="12.5" fill="#64748b">
+    <text x="712" y="652" text-anchor="start">f2 matches manifest; no data sent</text>
+    <text x="712" y="668" text-anchor="start">root: entries_processed++ (4/4)</text>
+    <text x="712" y="684" text-anchor="start">root complete → apply metadata</text>
+  </g>
+
+  <text x="258" y="712" text-anchor="end" font-size="12.5" fill="#64748b">send 1 file from child1</text>
+  <line x1="270" y1="732" x2="694" y2="732" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ar-data)"/>
+  <text x="485" y="726" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#2563eb">File(child1/f1)</text>
+  <g font-size="12.5" fill="#64748b">
+    <text x="712" y="728" text-anchor="start">write file</text>
+    <text x="712" y="744" text-anchor="start">child1: entries_processed++ (1/1)</text>
+    <text x="712" y="760" text-anchor="start">child1 complete → apply metadata;</text>
+    <text x="712" y="776" text-anchor="start">child1 notifies root (already complete, no-op)</text>
+  </g>
+
+  <!-- shutdown -->
+  <text x="712" y="806" text-anchor="start" font-size="12.5" fill="#64748b">all directories complete, structure complete</text>
+  <line x1="700" y1="826" x2="276" y2="826" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+  <text x="485" y="820" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">DestinationDone</text>
+  <text x="712" y="830" text-anchor="start" font-size="12.5" fill="#64748b">close send side</text>
+
+  <g font-size="12.5" fill="#64748b">
+    <text x="258" y="850" text-anchor="end">detect EOF, close send side</text>
+    <text x="258" y="866" text-anchor="end">detect EOF, close recv</text>
+    <text x="712" y="850" text-anchor="start">detect EOF, close recv</text>
+    <text x="712" y="866" text-anchor="start">close connection</text>
+  </g>
+
+  <!-- legend -->
+  <g font-size="12">
+    <line x1="240" y1="906" x2="290" y2="906" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+    <text x="298" y="910" fill="#475569">control stream (FIFO)</text>
+    <line x1="470" y1="906" x2="520" y2="906" stroke="#2563eb" stroke-width="2.5" marker-end="url(#ar-data)"/>
+    <text x="528" y="910" fill="#475569">pooled data connection</text>
+    <line x1="700" y1="906" x2="750" y2="906" stroke="#64748b" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#ar-opt)"/>
+    <text x="758" y="910" fill="#475569">optional</text>
+  </g>
+  <text x="500" y="936" text-anchor="middle" font-size="11.5" fill="#94a3b8">example tree: root { f1, f2, link, child1 { f1 }, child2 { } } — copied with --overwrite (manifest active)</text>
+</svg>

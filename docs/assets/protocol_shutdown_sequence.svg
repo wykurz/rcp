@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 790 360" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <!-- Section 6.1 Shutdown Sequence: coordinated through TCP stream closure -->
+  <defs>
+    <marker id="ar-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#334155"/>
+    </marker>
+    <marker id="ar-eof" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect x="0.5" y="0.5" width="789" height="359" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+
+  <rect x="115" y="16" width="150" height="34" rx="7" fill="#eef2f7" stroke="#475569" stroke-width="1.5"/>
+  <text x="190" y="38" text-anchor="middle" font-size="14" font-weight="600" fill="#1e293b">Source (rcpd)</text>
+  <rect x="475" y="16" width="160" height="34" rx="7" fill="#eef2f7" stroke="#475569" stroke-width="1.5"/>
+  <text x="555" y="38" text-anchor="middle" font-size="14" font-weight="600" fill="#1e293b">Destination (rcpd)</text>
+
+  <line x1="190" y1="50" x2="190" y2="302" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <line x1="555" y1="50" x2="555" y2="302" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 4"/>
+
+  <text x="567" y="80" text-anchor="start" font-size="12.5" fill="#64748b">all complete</text>
+  <line x1="555" y1="100" x2="196" y2="100" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+  <text x="372" y="94" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">DestinationDone</text>
+  <text x="567" y="116" text-anchor="start" font-size="12.5" fill="#64748b">then close control send stream</text>
+
+  <line x1="555" y1="148" x2="196" y2="148" stroke="#64748b" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#ar-eof)"/>
+  <text x="372" y="142" text-anchor="middle" font-size="12.5" font-style="italic" fill="#64748b">send-stream EOF</text>
+  <g font-size="12.5" fill="#64748b">
+    <text x="178" y="144" text-anchor="end">receive DestinationDone,</text>
+    <text x="178" y="160" text-anchor="end">detect EOF →</text>
+    <text x="178" y="176" text-anchor="end">close control send stream</text>
+  </g>
+
+  <line x1="190" y1="208" x2="549" y2="208" stroke="#64748b" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#ar-eof)"/>
+  <text x="372" y="202" text-anchor="middle" font-size="12.5" font-style="italic" fill="#64748b">send-stream EOF</text>
+  <g font-size="12.5" fill="#64748b">
+    <text x="567" y="204" text-anchor="start">detect EOF →</text>
+    <text x="567" y="220" text-anchor="start">close control recv stream,</text>
+    <text x="567" y="236" text-anchor="start">close TCP connection</text>
+  </g>
+
+  <line x1="555" y1="268" x2="196" y2="268" stroke="#64748b" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#ar-eof)"/>
+  <text x="372" y="262" text-anchor="middle" font-size="12.5" font-style="italic" fill="#64748b">connection close</text>
+  <g font-size="12.5" fill="#64748b">
+    <text x="178" y="264" text-anchor="end">detect close →</text>
+    <text x="178" y="280" text-anchor="end">close TCP listeners</text>
+  </g>
+
+  <g font-size="12">
+    <line x1="180" y1="330" x2="230" y2="330" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
+    <text x="238" y="334" fill="#475569">control message</text>
+    <line x1="400" y1="330" x2="450" y2="330" stroke="#64748b" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#ar-eof)"/>
+    <text x="458" y="334" fill="#475569">closure observed by peer (EOF)</text>
+  </g>
+</svg>
