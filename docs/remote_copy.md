@@ -10,17 +10,7 @@ For the detailed protocol specification (message types, flows, invariants), see
 
 The rcp remote copy system uses a three-node architecture:
 
-```
-         Master (rcp)
-           /    \
-          /      \
-       SSH      SSH
-        |        |
-       TLS      TLS
-        |        |
-Source (rcpd)--TLS--Destination (rcpd)
-              control + data
-```
+![Three-node remote copy architecture](assets/remote_architecture.svg)
 
 **Key components**:
 

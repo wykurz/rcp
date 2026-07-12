@@ -34,16 +34,7 @@ The remote copy system consists of three distinct components:
 
 The system uses a **triangle topology** with TCP connections:
 
-```
-         Master (rcp)
-           /    \
-          /      \
-     (TCP)      (TCP)
-        /          \
-       /            \
-Source (rcpd)-----(TCP)----Destination (rcpd)
-                control + data ports
-```
+![Triangle topology: master, source, destination](assets/remote_architecture.svg)
 
 **Connection Details:**
 
@@ -312,81 +303,15 @@ eventually return true and `DestinationDone` can be sent.
 
 ### 4.1 Directory Copy Flow
 
-```
-Source                              Destination
-  |                                      |
-  |  (pre-read root: 2 files, 1 symlink, 1 dir = 4 entries)
-  |  (retain root file_count=2 source-side)
-  |  ---- Directory(root, entries=4,  -> |  Create root, store metadata
-  |         meta) -------------------->  |  entries_expected=4
-  |  (pre-read child1: 1 file = 1 entry; retain child1 file_count=1)
-  |  ---- Directory(child1, entries=1,-> |  Create child1, store metadata
-  |         meta) -------------------->  |  entries_expected=1
-  |                                      |  (child1 does NOT count for root yet)
-  |  ---- Symlink(root/link, meta) ----> |  Create symlink
-  |                                      |  root: entries_processed++ (1/4)
-  |  (pre-read child2: 0 entries; retain child2 file_count=0)
-  |  ---- Directory(child2, entries=0,-> |  Create child2, entries_expected=0
-  |         meta) -------------------->  |  child2 complete → apply metadata
-  |                                      |  child2 notifies root: entries_processed++ (2/4)
-  |  ---- DirStructureComplete --------> |  Structure complete
-  |                                      |
-  |  <--- DirectoryManifestChunk(root)   |  (0+ chunks for reused dirs under
-  |                                      |   --overwrite/--ignore-existing, sent
-  |                                      |   BEFORE the trigger; none otherwise)
-  |  <--- DirectoryCreated(root) ------- |  (trigger only; no count echoed)
-  |  <--- DirectoryCreated(child1) ----- |
-  |                                      |
-  |  (look up retained file_count=2;     |
-  |   compare f1, f2 against manifest)   |
-  |  ~~~~ File(root/f1) ~~~~~~~~~~~~~~~> |  Write file (f1 not in manifest or differs)
-  |                                      |  root: entries_processed++ (3/4)
-  |  ---- FileUnchanged(root/f2) ------> |  f2 matches manifest; no data sent
-  |                                      |  root: entries_processed++ (4/4)
-  |                                      |  root complete → apply metadata
-  |                                      |
-  |  (send 1 file from child1)           |
-  |  ~~~~ File(child1/f1) ~~~~~~~~~~~~~> |  Write file
-  |                                      |  child1: entries_processed++ (1/1)
-  |                                      |  child1 complete → apply metadata
-  |                                      |  child1 notifies root (already complete, no-op)
-  |                                      |
-  |                                      |  All directories complete, structure complete
-  |  <--- DestinationDone -------------- |  Close send side
-  |                                      |
-  |  (detect EOF, close send side)       |  (detect EOF, close recv)
-  |  (detect EOF, close recv)            |  Close connection
-```
+![Directory copy flow sequence diagram](assets/protocol_flow_directory_copy.svg)
 
 ### 4.2 Single File Copy
 
-```
-Source                              Destination
-  |                                      |
-  |  ---- DirStructureComplete --------> |  (no directories)
-  |                                      |
-  |  ~~~~ File(f, is_root=true) ~~~~~~-> |  (dest opens data conn, receives file)
-  |                                      |  Root file complete
-  |                                      |
-  |  <--- DestinationDone -------------- |  Close send side
-  |                                      |
-  |  (close send side)                   |
-  |  (close connection)                  |
-```
+![Single file copy sequence diagram](assets/protocol_flow_single_file.svg)
 
 ### 4.3 Single Symlink Copy
 
-```
-Source                              Destination
-  |                                      |
-  |  ---- Symlink(s, is_root=true) ----> |  Create symlink
-  |  ---- DirStructureComplete --------> |  Structure complete, root symlink done
-  |                                      |
-  |  <--- DestinationDone -------------- |  Close send side
-  |                                      |
-  |  (close send side)                   |
-  |  (close connection)                  |
-```
+![Single symlink copy sequence diagram](assets/protocol_flow_single_symlink.svg)
 
 ### 4.4 Failed Directory Handling
 
@@ -394,26 +319,7 @@ When a directory fails to be created, destination tracks it locally and skips de
 parent directory's entry count still includes failed children, so `process_child_entry` is called
 even for skipped entries to ensure the parent can complete.
 
-```
-Source                              Destination
-  |                                      |
-  |  ---- Directory(dir1, entries=2,  -> |  mkdir dir1 → FAILS
-  |         meta) -------------------->  |  Add to failed_directories
-  |  <--- DirectorySkipped(dir1) ------- |  Nack (not created)
-  |  (release dir1 fd, no Pass 2)        |
-  |                                      |
-  |  ---- Directory(dir1/dir2, ...) ---> |  Ancestor failed, skip (log warning)
-  |  <--- DirectorySkipped(dir1/dir2) -- |  Nack; parent(dir1) process_child_entry
-  |  (release dir1/dir2 fd, no Pass 2)   |
-  |  ---- Symlink(dir1/link, meta) ----> |  Ancestor failed, skip (log warning)
-  |                                      |  parent(dir1) process_child_entry (skipped)
-  |  ---- DirStructureComplete --------> |  Structure complete
-  |                                      |
-  |  (no DirectoryCreated for dir1)      |
-  |  (source doesn't send files)         |
-  |                                      |  All pending directories complete
-  |  <--- DestinationDone -------------- |
-```
+![Failed directory handling sequence diagram](assets/protocol_flow_failed_directory.svg)
 
 ## 5. DirectoryTracker
 
@@ -538,23 +444,7 @@ non-directory items can be replaced.
 
 The shutdown is coordinated through TCP connection closure:
 
-```
-Destination                          Source
-  |                                      |
-  | All complete, send DestinationDone   |
-  | Close control send stream            |
-  |                                      |
-  |                   (receive DestinationDone)
-  |                   (detect send stream EOF)
-  |                   Close control send stream
-  |                                      |
-  | (detect send stream EOF)             |
-  | Close control recv stream            |
-  | Close TCP connection                 |
-  |                                      |
-  |                   (detect connection close)
-  |                   Close TCP listeners
-```
+![Shutdown sequence diagram](assets/protocol_shutdown_sequence.svg)
 
 **Key Points:**
 
@@ -867,59 +757,9 @@ h2:/b/file --overwrite`), there is no parent-directory `DirectoryCreated` messag
 carry a manifest. This case is not optimized: the source always transfers the file and the
 destination drains it.
 
-## 8. Test Coverage
+## 8. TCP Configuration
 
-### 8.1 Core Functionality Tests (`remote_tests.rs`)
-
-**Root item handling:**
-
-- ✅ Single file copy
-- ✅ Single symlink copy
-- ✅ Directory copy with files
-
-**Complex scenarios:**
-
-- ✅ Nested directories with mixed content
-- ✅ Symlink chains and dereferencing
-- ✅ Metadata preservation
-- ✅ Overwrite scenarios
-
-**Error handling:**
-
-- ✅ Unreadable source files with continue
-- ✅ Unreadable source files with fail-early
-- ✅ Nested unreadable files
-- ✅ Mixed success/failure
-- ✅ All operations fail
-- ✅ Unwritable destination
-- ✅ Root directory blocked by existing file (no hang)
-- ✅ Root symlink inaccessible/metadata failure (no hang)
-- ✅ Destination directory metadata errors continue without `--fail-early` (sudo test)
-
-**Lifecycle management:**
-
-- ✅ rcpd exit when master killed
-- ✅ No zombie processes
-- ✅ Custom connection timeouts
-
-### 8.2 Multi-Host Tests (`docker_multi_host*.rs`)
-
-- ✅ Basic multi-host copy between containers
-- ✅ Overwrite protection across hosts
-- ✅ Directory copy across hosts
-- ✅ Role assignment and logging
-
-### 8.3 Edge Cases
-
-- ✅ Empty directories
-- ✅ Deep nesting (100+ levels)
-- ✅ Empty files
-- ✅ Broken symlinks
-- ✅ Circular symlinks
-
-## 9. TCP Configuration
-
-### 9.1 Connection Settings
+### 8.1 Connection Settings
 
 Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
 
@@ -929,7 +769,7 @@ Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
 - `--pending-writes-multiplier=N` (default: 4) - Multiplier for pending file tasks (backpressure)
 - `--network-profile=PROFILE` (default: datacenter) - Buffer sizing profile
 
-### 9.2 Network Profiles
+### 8.2 Network Profiles
 
 **Datacenter Profile (default):**
 
@@ -941,7 +781,7 @@ Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
 - Smaller TCP buffer sizes (2 MiB)
 - More conservative settings for higher-latency networks
 
-### 9.3 Tuning Guidelines
+### 8.3 Tuning Guidelines
 
 - **Datacenter**: Use default settings for best performance
 - **Internet/WAN**: Use `--network-profile=internet` for better behavior on higher-latency links
