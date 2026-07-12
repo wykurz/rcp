@@ -8,14 +8,14 @@ tools as well.
 ## Table of Contents
 
 - [Overview](#overview)
-- [Scope of TOCTOU safety](#scope-of-toctou-safety)
-- [Set-ID suppression under sudo (`rchm`)](#set-id-suppression-under-sudo-rchm)
 - [What is TOCTTOU?](#what-is-tocttou)
 - [Attack Scenarios](#attack-scenarios)
+- [Scope of TOCTOU safety](#scope-of-toctou-safety)
 - [Implemented Hardening](#implemented-hardening)
 - [What Is Not Hardened](#what-is-not-hardened)
 - [Residual Preconditions](#residual-preconditions)
 - [The Linter: --toctou-check and --require-toctou-safe](#the-linter---toctou-check-and---require-toctou-safe)
+- [Safe privileged use (sudo)](#safe-privileged-use-sudo)
 - [Summary](#summary)
 
 ## Overview
@@ -36,196 +36,10 @@ than an actor who can modify the paths being traversed.* Root operating on trust
 is outside this threat; the risk arises specifically when a more-privileged run traverses a tree
 that a less-privileged actor can write to.
 
-On Linux, the local and remote default paths are now TOCTOU-hardened (see
-[Implemented Hardening](#implemented-hardening) below) — for everything *at or below the named
-root*. The trust of the path *above* the named root is the caller's responsibility. The next section
-defines the guarantee precisely; read it before relying on TOCTOU safety under elevated privilege.
-
-## Scope of TOCTOU safety
-
-TOCTOU safety in the RCP tools rests on **two guarantees** and **one delegated responsibility**. The
-scope is deliberately narrow, because a general-purpose copy/chmod/rm tool can neither freeze the
-filesystem while it works nor vouch for the paths it is handed. So it guarantees only what is both
-achievable and security-relevant, and leans on the caller for the rest.
-
-### In scope — the two guarantees
-
-On the default (non-`-L`) path, on Linux, given the operand paths as written:
-
-**1. Containment.** No symlink or path-component swap *at or below a named root* — anywhere in the
-tree the tool traverses — can redirect a read, write, chmod, chown, or delete to an object **outside
-that root's subtree.** This is the property that matters when a privileged process operates on a
-tree a less-privileged actor can write *into* (the classic "root copies, chmods, or removes over an
-attacker-controlled directory" hazard). It is delivered by the fd-based safe walk described below:
-the named root and every entry beneath it are opened `O_NOFOLLOW`, classified by `fstat` of the held
-fd, and operated on via fd-relative syscalls — and for chmod/chown/hard-link, via the entry's pinned
-`O_PATH` fd through `/proc/self/fd` — so a swapped-in symlink is never followed out of the subtree.
-
-**2. Permission and ownership fidelity.** The destination (`rcp`/`rlink`) or the modified entry
-(`rchm`) receives exactly the permissions and ownership of the source object that was actually read;
-a concurrent swap can never make the tool **widen** permissions or attach the wrong owner — e.g. it
-cannot write a `0600` root-owned file's contents out as world-readable. Mode and bytes are taken
-from the *same* fd, and metadata is applied through the destination's own held fd, never re-resolved
-by path.
-
-**"The named root"** is the final component of the operand path — the file or directory you name. It
-is opened `O_NOFOLLOW` and classified by the `fstat` of that held fd, so a swap of the root *entry
-itself* (within its parent) is caught at open, and everything reachable beneath it is the hardened
-tree. (Corollary: the root's immediate parent need not be non-writable for the guarantee to hold — a
-swap of the root entry there is caught at open.)
-
-### Out of scope — what we deliberately do not promise
-
-**Freezing the tree, or pinning *which* object is operated on.** The tree may change concurrently;
-the tool operates on whatever is validly reachable within the subtree at access time. Each child is
-reached with a single-component `openat(parent_fd, name, O_NOFOLLOW)`, which re-resolves `name` — it
-is **not** pinned to the exact inode first classified, so a same-name swap to *another regular file
-in the same hardened directory* is possible and accepted. This is deliberate, not a gap, because it
-is not a security boundary: an actor who can swap entries inside the subtree already controls that
-subtree's contents, so operating on the swapped-in file grants them nothing they did not already
-have. Both guarantees above still hold across such a swap — you cannot escape the subtree
-(Containment), and permissions are never widened because mode and bytes come from the *same* fd
-(Fidelity). We do not attempt to detect or prevent concurrent modification beyond that.
-
-**Whether the operand path *itself* is trustworthy.** The directories *above* the named root — the
-prefix the tool follows to reach it — are resolved normally (following symlinks). The tools do
-**not** verify that this prefix is free of less-privileged control, or free of symlinks that resolve
-somewhere unexpected. A general-purpose tool has no way to decide whether a given path is an
-acceptable privileged target: *"is `/home/alice` a legitimate place for root to write?"* depends
-entirely on policy the tool does not — and cannot — know. Any in-tool "is this prefix trusted"
-heuristic is either unsound (it cannot anticipate every symlink, `..`, ownership, and
-mount-namespace case) or so conservative it refuses almost every real privileged copy. So the tools
-do not attempt it. **The caller must pass operands it has resolved and whose prefix it trusts.**
-
-The guarantees are *additionally* bounded by separately-documented exceptions: `--dereference`/`-L`
-and non-Linux builds (see [What Is Not Hardened](#what-is-not-hardened)), `rcmp` (read-only; out of
-scope), and the kernel preconditions `fs.protected_hardlinks=1` and no attacker-controlled bind
-mounts (see [Residual Preconditions](#residual-preconditions)). A hardlink alias planted at or below
-the root, for instance, is a *non-swap* redirect covered by the `protected_hardlinks` precondition
-rather than by the Containment guarantee.
-
-### The contract for safe privileged (sudo) use
-
-Safe TOCTOU use under elevated privilege is a two-layer arrangement:
-
-1. **A layer above the RCP tools** — the `sudo` policy, or a thin vetted wrapper — decides which
-   operand paths are acceptable and ensures they are fully resolved and that the directories above
-   each named root are not under a less-privileged actor's control. The "is this path safe?"
-   judgment lives here, because this is where the policy context exists.
-2. **The RCP tool** guarantees the hardened walk for everything at and below those named roots (the
-   in-scope property above).
-
-`--require-toctou-safe` is the tool's half of this contract: it refuses to run unless the invocation
-uses the hardened walk — rejecting `--dereference`/`-L` (which follows symlinks by design) and
-non-Linux builds. It does **not**, and cannot, vouch for the trust of the operand paths; that is the
-caller's responsibility per (1).
-
-```bash
-# The sudo policy constrains operands to vetted, resolved, trusted paths;
-# --require-toctou-safe guarantees the hardened walk for what is at/below them.
-user ALL=(root) NOPASSWD: /usr/bin/rcp --require-toctou-safe /vetted/source/snapshot /vetted/dest/
-```
-
-A wildcard rule (`... --require-toctou-safe *`) enforces only the tool's half — hardened walk, no
-`-L`. It does **not** make an arbitrary destination safe. Lock the paths down in the policy.
-
-### Name resolution under sudo (`rchm`)
-
-`rchm --owner <name>` / `--group <name>` resolve a user/group *name* to a numeric id. When the
-in-process lookup misses (the static musl release binaries have no NSS, so directory-service names
-from LDAP/SSSD/NIS are invisible), `rchm` spawns the host `getent` tool (directly, via an argument
-vector — never through a shell). Spawning a subprocess from a privileged process is a PATH-injection
-surface: `sudo` preserves the caller's `PATH` unless the policy sets `secure_path`, so a `getent`
-resolved through `PATH` could be an attacker-planted binary executed as root.
-
-`rchm` closes this without depending on the sudoers configuration:
-
-- **Privileged (effective-root):** `PATH` is **ignored**. `getent` is located only from a fixed list
-  of trusted, root-owned directories (`/usr/bin`, `/bin`, `/run/current-system/sw/bin`). If it is
-  not found there, the lookup errors rather than falling back to `PATH`.
-- **`--getent-path <ABSOLUTE>`:** pins the exact binary, bypassing both `PATH` and the probe. Must
-  be absolute (a relative path would re-introduce a `PATH`/cwd lookup) and may be given **at most
-  once** — a duplicate is rejected, because a permissive trailing-wildcard policy (`... *`) would
-  otherwise let an attacker append a second `--getent-path` to override a pinned value.
-- **Numeric ids** (`--owner 1000`) never invoke `getent` at all — the safest option for a sudo rule
-  when the resolving environment is untrusted.
-
-```bash
-# Pin the resolver and the complete operation so name lookups never consult the caller's PATH:
-user ALL=(root) NOPASSWD: /usr/bin/rchm --require-toctou-safe --no-setid --group=data --getent-path=/usr/bin/getent /vetted/root
-```
-
-This is `rchm`-specific: `rcp`/`rlink` carry numeric ids from source metadata and never resolve
-names.
-
-### Set-ID suppression under sudo (`rchm`)
-
-TOCTTOU hardening does not make an arbitrary privileged chmod/chown policy safe. In particular, an
-ownership change can turn an attacker-controlled executable with a set-ID bit into a privileged
-set-ID executable. The kernel normally clears set-user-ID and set-group-ID during `chown`, but
-`rchm` normally restores existing bits so an ownership-only operation preserves the requested
-metadata.
-
-`--no-setid` provides a stronger contract for a constrained privileged wrapper: for every selected
-non-symlink whose type has an applicable `--mode`, `--owner`, or `--group` rule, the entry's final
-mode has set-user-ID (`04000`) and set-group-ID (`02000`) cleared. The guarantee has these
-deliberate consequences:
-
-- Existing set-ID bits are removed even if the mode expression does not mention them.
-- Set-group-ID is removed from selected directories as well as files; sticky (`01000`) is
-  unaffected.
-- Filters and `f:`/`d:`/`l:` rules retain their normal scope. An entry that is filtered out, or
-  whose type has no applicable operation rule, is not changed merely because the flag is present.
-  Symlinks have no settable mode on Linux and are excluded from the guarantee.
-- `--no-setid` alone is not an operation; at least one of `--mode`, `--owner`, or `--group` is still
-  required.
-- Omitting the flag preserves the existing behavior, including preservation of set-ID bits across
-  ownership changes.
-
-The guarantee describes the mode after `rchm` successfully completes its operation on an entry.
-Clearing mode bits and changing ownership require separate syscalls; `rchm` does not freeze a
-concurrent owner from changing the mode between them. In particular, a set-group-ID directory can
-transiently carry that bit across a group change before the final masked chmod. A privileged wrapper
-must not rely on `--no-setid` for ownership changes while an adversary can concurrently chmod the
-selected inode or create entries in a selected directory; it must remove that concurrent control or
-otherwise quiesce the tree for the operation.
-
-This flag is **necessary but not sufficient** for a wrapper that delegates privileged `rchm`. Such a
-wrapper must validate a small, explicit interface rather than pass arbitrary arguments through to
-`rchm`:
-
-- Resolve and restrict every operand to policy-approved roots whose path prefixes are trusted.
-- Allowlist the exact numeric UIDs/GIDs and mode expressions the policy needs. Clearing set-ID does
-  not prevent damage from arbitrary chown/chgrp, world-writable modes, or access to a sensitive
-  target.
-- Always add both `--require-toctou-safe` and `--no-setid`; do not let the caller remove or override
-  them.
-- Prefer numeric IDs. If names are required, supply a fixed trusted `--getent-path=/usr/bin/getent`
-  (or another administrator-selected absolute path) rather than accepting the resolver path from the
-  caller.
-- Reject unrecognized options and additional operands. In particular, do not expose
-  caller-controlled file-valued options: `--filter-file` reads a file as the privileged process, and
-  `--auto-meta-histogram-log` creates or truncates its target. If the policy needs either, the
-  wrapper must supply a fixed, trusted path.
-
-For example, expose a vetted `safe-rchm` wrapper in sudoers, not a trailing-wildcard rule for the
-raw binary:
-
-```bash
-# safe-rchm validates its small argument set, then supplies fixed security flags,
-# allowlisted numeric ids/modes, a trusted root, and `--` before the operand.
-user ALL=(root) NOPASSWD: /usr/local/sbin/safe-rchm *
-```
-
-An administrator-selected invocation inside that wrapper might resemble:
-
-```bash
-/usr/bin/rchm --require-toctou-safe --no-setid \
-  --owner=1000 --group=2000 --mode='f:0644 d:0755' -- /vetted/root
-```
-
-The wrapper must construct this command from validated values; it must not interpolate or forward a
-caller-provided option string.
+On Linux, the local and remote default paths are now TOCTOU-hardened — for everything *at or below
+the named root*. The trust of the path *above* the named root is the caller's responsibility.
+[Scope of TOCTOU safety](#scope-of-toctou-safety) defines the guarantee precisely; read it before
+relying on TOCTOU safety under elevated privilege.
 
 ## What is TOCTTOU?
 
@@ -334,6 +148,69 @@ sudo rcp --preserve=ownership /data/files /backup/
 `fchmod`, fd-relative `utimensat`) on the held destination fd rather than path-based calls. There is
 no path re-resolution after the file is created.
 
+## Scope of TOCTOU safety
+
+TOCTOU safety in the RCP tools rests on **two guarantees** and **one delegated responsibility**. The
+scope is deliberately narrow, because a general-purpose copy/chmod/rm tool can neither freeze the
+filesystem while it works nor vouch for the paths it is handed. So it guarantees only what is both
+achievable and security-relevant, and leans on the caller for the rest.
+
+### In scope — the two guarantees
+
+On the default (non-`-L`) path, on Linux, given the operand paths as written:
+
+**1. Containment.** No symlink or path-component swap *at or below a named root* — anywhere in the
+tree the tool traverses — can redirect a read, write, chmod, chown, or delete to an object **outside
+that root's subtree.** This is the property that matters when a privileged process operates on a
+tree a less-privileged actor can write *into* (the classic "root copies, chmods, or removes over an
+attacker-controlled directory" hazard). It is delivered by the fd-based safe walk described below:
+the named root and every entry beneath it are opened `O_NOFOLLOW`, classified by `fstat` of the held
+fd, and operated on via fd-relative syscalls — and for chmod/chown/hard-link, via the entry's pinned
+`O_PATH` fd through `/proc/self/fd` — so a swapped-in symlink is never followed out of the subtree.
+
+**2. Permission and ownership fidelity.** The destination (`rcp`/`rlink`) or the modified entry
+(`rchm`) receives exactly the permissions and ownership of the source object that was actually read;
+a concurrent swap can never make the tool **widen** permissions or attach the wrong owner — e.g. it
+cannot write a `0600` root-owned file's contents out as world-readable. Mode and bytes are taken
+from the *same* fd, and metadata is applied through the destination's own held fd, never re-resolved
+by path.
+
+**"The named root"** is the final component of the operand path — the file or directory you name. It
+is opened `O_NOFOLLOW` and classified by the `fstat` of that held fd, so a swap of the root *entry
+itself* (within its parent) is caught at open, and everything reachable beneath it is the hardened
+tree. (Corollary: the root's immediate parent need not be non-writable for the guarantee to hold — a
+swap of the root entry there is caught at open.)
+
+### Out of scope — what we deliberately do not promise
+
+**Freezing the tree, or pinning *which* object is operated on.** The tree may change concurrently;
+the tool operates on whatever is validly reachable within the subtree at access time. Each child is
+reached with a single-component `openat(parent_fd, name, O_NOFOLLOW)`, which re-resolves `name` — it
+is **not** pinned to the exact inode first classified, so a same-name swap to *another regular file
+in the same hardened directory* is possible and accepted. This is deliberate, not a gap, because it
+is not a security boundary: an actor who can swap entries inside the subtree already controls that
+subtree's contents, so operating on the swapped-in file grants them nothing they did not already
+have. Both guarantees above still hold across such a swap — you cannot escape the subtree
+(Containment), and permissions are never widened because mode and bytes come from the *same* fd
+(Fidelity). We do not attempt to detect or prevent concurrent modification beyond that.
+
+**Whether the operand path *itself* is trustworthy.** The directories *above* the named root — the
+prefix the tool follows to reach it — are resolved normally (following symlinks). The tools do
+**not** verify that this prefix is free of less-privileged control, or free of symlinks that resolve
+somewhere unexpected. A general-purpose tool has no way to decide whether a given path is an
+acceptable privileged target: *"is `/home/alice` a legitimate place for root to write?"* depends
+entirely on policy the tool does not — and cannot — know. Any in-tool "is this prefix trusted"
+heuristic is either unsound (it cannot anticipate every symlink, `..`, ownership, and
+mount-namespace case) or so conservative it refuses almost every real privileged copy. So the tools
+do not attempt it. **The caller must pass operands it has resolved and whose prefix it trusts.**
+
+The guarantees are *additionally* bounded by separately-documented exceptions: `--dereference`/`-L`
+and non-Linux builds (see [What Is Not Hardened](#what-is-not-hardened)), `rcmp` (read-only; out of
+scope), and the kernel preconditions `fs.protected_hardlinks=1` and no attacker-controlled bind
+mounts (see [Residual Preconditions](#residual-preconditions)). A hardlink alias planted at or below
+the root, for instance, is a *non-swap* redirect covered by the `protected_hardlinks` precondition
+rather than by the Containment guarantee.
+
 ## Implemented Hardening
 
 ### Mechanism: fd-based safe walk
@@ -412,23 +289,13 @@ Remote `--delete` is not yet supported and is rejected by rcp before any operati
 
 ### Trusted boundary
 
-The hardening protects everything **at or below the directory named on the command line**. It
-assumes the named root itself and the path components above it are not modifiable by a
-less-privileged actor. More precisely:
-
-- For `rcp /backup/foo /dst`, the identity of `/backup/foo` at open time is trusted. Every entry
-  strictly below it is hardened.
-- The components between a fixed sudo prefix and the named operand (e.g., the `foo` part of
-  `/backup/foo` where `/backup` is the fixed prefix and `foo` is actor-supplied) are resolved
-  normally when opening the root. If those intermediate components are actor-writable, that is the
-  operator's responsibility to prevent — typically by using a fixed source path in the sudo rule,
-  not a wildcard.
-
-The trust of these intermediate components — the prefix the tool follows to reach the named root —
-is the **caller's responsibility** and is not verified in-tool. See
-[Scope of TOCTOU safety](#scope-of-toctou-safety) for why this boundary is delegated to the caller,
-and [The Linter](#the-linter---toctou-check-and---require-toctou-safe) below for what
-`--require-toctou-safe` does enforce (the hardened walk, not the prefix).
+The hardening protects everything **at or below the directory named on the command line**; the
+identity of the named root at open time is trusted, and the prefix above it is the caller's
+responsibility (see [Scope of TOCTOU safety](#scope-of-toctou-safety) for why that judgment is
+delegated). Concretely, for `rcp /backup/foo /dst` under a sudo rule that fixes `/backup` but lets
+the caller supply `foo`: the components between the fixed prefix and the named operand are resolved
+normally when opening the root, so keeping them out of a less-privileged actor's control is the
+policy's job — typically by pinning the full path in the rule rather than using a wildcard.
 
 ## What Is Not Hardened
 
@@ -494,9 +361,7 @@ invocation alone.
 ### `--require-toctou-safe`
 
 Refuses to run unless the invocation uses the TOCTOU-hardened walk — that is, it refuses
-`--dereference`/`-L` (which follows symlinks by request) and non-Linux builds. It is the tool's half
-of the safe-privileged-use contract (see
-[The contract for safe privileged (sudo) use](#the-contract-for-safe-privileged-sudo-use)).
+`--dereference`/`-L` (which follows symlinks by request) and non-Linux builds.
 
 ```bash
 # Refused: -L is not safe
@@ -506,11 +371,25 @@ Refusing to run: invocation is not TOCTOU-safe.
 ```
 
 It does **not** verify the trust of the operand path's prefix — the directories above the named
-root. That judgment requires policy context the tool does not have, so it is the caller's
-responsibility (see [Scope of TOCTOU safety](#scope-of-toctou-safety)): the `sudo` policy or a
-vetted wrapper must pass resolved operands whose prefix it trusts. `--require-toctou-safe` operates
-purely on the verdict (`--dereference`/non-Linux) and never inspects the operand paths, so it treats
-local and remote (`host:/path`) operands identically.
+root; that judgment requires policy context the tool does not have, so it remains the caller's
+responsibility (see [Scope of TOCTOU safety](#scope-of-toctou-safety)). `--require-toctou-safe`
+operates purely on the verdict (`--dereference`/non-Linux) and never inspects the operand paths, so
+it treats local and remote (`host:/path`) operands identically.
+
+## Safe privileged use (sudo)
+
+Safe TOCTOU use under elevated privilege is a two-layer arrangement:
+
+1. **A layer above the RCP tools** — the `sudo` policy, or a thin vetted wrapper — decides which
+   operand paths are acceptable and ensures they are fully resolved and that the directories above
+   each named root are not under a less-privileged actor's control. The "is this path safe?"
+   judgment lives here, because this is where the policy context exists.
+2. **The RCP tool** guarantees the hardened walk for everything at and below those named roots (the
+   in-scope property of [Scope of TOCTOU safety](#scope-of-toctou-safety)).
+
+`--require-toctou-safe` is the tool's half of this contract: it refuses to run unless the invocation
+uses the hardened walk. It does **not**, and cannot, vouch for the trust of the operand paths; that
+is the caller's responsibility per (1).
 
 ### Recommended sudo policy patterns
 
@@ -518,26 +397,113 @@ Pin `--require-toctou-safe` and exact, policy-approved operands for direct rules
 operation is fixed:
 
 ```bash
-# Exact paths keep the caller from choosing a different privileged target.
-user ALL=(root) NOPASSWD: /usr/bin/rcp --require-toctou-safe /specific/source /specific/dest/
+# Exact paths keep the caller from choosing a different privileged target;
+# --require-toctou-safe guarantees the hardened walk for what is at/below them.
+user ALL=(root) NOPASSWD: /usr/bin/rcp --require-toctou-safe /vetted/source/snapshot /vetted/dest/
 user ALL=(root) NOPASSWD: /usr/bin/rrm --require-toctou-safe /specific/staging/tree
 ```
 
-`--require-toctou-safe` rejects `--dereference`/`-L` and non-Linux operation before filesystem work,
-but it enforces only the tool's half of the contract. It does not establish prefix trust or make
-arbitrary operands and operations safe. A rule ending in `*` can pin the literal flag position, but
-it also delegates every trailing option and operand accepted by that tool; do not treat that as a
-safe policy for a mutating binary.
-
-When callers need a limited choice of operations or operands, expose a vetted wrapper that
-allowlists those choices and constructs the final command. For `rchm`, the wrapper also needs
-`--no-setid` and the controls in
+A rule ending in `*` can pin the literal flag position, but it enforces only the tool's half of the
+contract — hardened walk, no `-L` — while delegating every trailing option and operand accepted by
+that tool. It does **not** make an arbitrary destination safe; do not treat it as a safe policy for
+a mutating binary. Lock the paths down in the policy, or — when callers need a limited choice of
+operations or operands — expose a vetted wrapper that allowlists those choices and constructs the
+final command. For `rchm`, the wrapper also needs `--no-setid` and the controls in
 [Set-ID suppression under sudo (`rchm`)](#set-id-suppression-under-sudo-rchm):
 
 ```bash
 # The wrapper validates arguments instead of forwarding them to rchm.
 user ALL=(root) NOPASSWD: /usr/local/sbin/safe-rchm *
 ```
+
+### Name resolution under sudo (`rchm`)
+
+`rchm --owner <name>` / `--group <name>` resolve a user/group *name* to a numeric id. When the
+in-process lookup misses (the static musl release binaries have no NSS, so directory-service names
+from LDAP/SSSD/NIS are invisible), `rchm` spawns the host `getent` tool (directly, via an argument
+vector — never through a shell). Spawning a subprocess from a privileged process is a PATH-injection
+surface: `sudo` preserves the caller's `PATH` unless the policy sets `secure_path`, so a `getent`
+resolved through `PATH` could be an attacker-planted binary executed as root.
+
+`rchm` closes this without depending on the sudoers configuration:
+
+- **Privileged (effective-root):** `PATH` is **ignored**. `getent` is located only from a fixed list
+  of trusted, root-owned directories (`/usr/bin`, `/bin`, `/run/current-system/sw/bin`). If it is
+  not found there, the lookup errors rather than falling back to `PATH`.
+- **`--getent-path <ABSOLUTE>`:** pins the exact binary, bypassing both `PATH` and the probe. Must
+  be absolute (a relative path would re-introduce a `PATH`/cwd lookup) and may be given **at most
+  once** — a duplicate is rejected, because a permissive trailing-wildcard policy (`... *`) would
+  otherwise let an attacker append a second `--getent-path` to override a pinned value.
+- **Numeric ids** (`--owner 1000`) never invoke `getent` at all — the safest option for a sudo rule
+  when the resolving environment is untrusted.
+
+```bash
+# Pin the resolver and the complete operation so name lookups never consult the caller's PATH:
+user ALL=(root) NOPASSWD: /usr/bin/rchm --require-toctou-safe --no-setid --group=data --getent-path=/usr/bin/getent /vetted/root
+```
+
+This is `rchm`-specific: `rcp`/`rlink` carry numeric ids from source metadata and never resolve
+names.
+
+### Set-ID suppression under sudo (`rchm`)
+
+TOCTTOU hardening does not make an arbitrary privileged chmod/chown policy safe. In particular, an
+ownership change can turn an attacker-controlled executable with a set-ID bit into a privileged
+set-ID executable. The kernel normally clears set-user-ID and set-group-ID during `chown`, but
+`rchm` normally restores existing bits so an ownership-only operation preserves the requested
+metadata.
+
+`--no-setid` provides a stronger contract for a constrained privileged wrapper: for every selected
+non-symlink whose type has an applicable `--mode`, `--owner`, or `--group` rule, the entry's final
+mode has set-user-ID (`04000`) and set-group-ID (`02000`) cleared. The guarantee has these
+deliberate consequences:
+
+- Existing set-ID bits are removed even if the mode expression does not mention them.
+- Set-group-ID is removed from selected directories as well as files; sticky (`01000`) is
+  unaffected.
+- Filters and `f:`/`d:`/`l:` rules retain their normal scope. An entry that is filtered out, or
+  whose type has no applicable operation rule, is not changed merely because the flag is present.
+  Symlinks have no settable mode on Linux and are excluded from the guarantee.
+- `--no-setid` alone is not an operation; at least one of `--mode`, `--owner`, or `--group` is still
+  required.
+- Omitting the flag preserves the existing behavior, including preservation of set-ID bits across
+  ownership changes.
+
+The guarantee describes the mode after `rchm` successfully completes its operation on an entry.
+Clearing mode bits and changing ownership require separate syscalls; `rchm` does not freeze a
+concurrent owner from changing the mode between them. In particular, a set-group-ID directory can
+transiently carry that bit across a group change before the final masked chmod. A privileged wrapper
+must not rely on `--no-setid` for ownership changes while an adversary can concurrently chmod the
+selected inode or create entries in a selected directory; it must remove that concurrent control or
+otherwise quiesce the tree for the operation.
+
+This flag is **necessary but not sufficient** for a wrapper that delegates privileged `rchm`. Such a
+wrapper must validate a small, explicit interface rather than pass arbitrary arguments through to
+`rchm`:
+
+- Resolve and restrict every operand to policy-approved roots whose path prefixes are trusted.
+- Allowlist the exact numeric UIDs/GIDs and mode expressions the policy needs. Clearing set-ID does
+  not prevent damage from arbitrary chown/chgrp, world-writable modes, or access to a sensitive
+  target.
+- Always add both `--require-toctou-safe` and `--no-setid`; do not let the caller remove or override
+  them.
+- Prefer numeric IDs. If names are required, supply a fixed trusted `--getent-path=/usr/bin/getent`
+  (or another administrator-selected absolute path) rather than accepting the resolver path from the
+  caller.
+- Reject unrecognized options and additional operands. In particular, do not expose
+  caller-controlled file-valued options: `--filter-file` reads a file as the privileged process, and
+  `--auto-meta-histogram-log` creates or truncates its target. If the policy needs either, the
+  wrapper must supply a fixed, trusted path.
+
+An administrator-selected invocation inside a vetted `safe-rchm` wrapper might resemble:
+
+```bash
+/usr/bin/rchm --require-toctou-safe --no-setid \
+  --owner=1000 --group=2000 --mode='f:0644 d:0755' -- /vetted/root
+```
+
+The wrapper must construct this command from validated values; it must not interpolate or forward a
+caller-provided option string.
 
 ## Summary
 
