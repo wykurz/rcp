@@ -1,8 +1,10 @@
 # Remote Copy Operations
 
-This document covers the operational aspects of rcp's remote copy functionality: binary discovery, version checking, automatic deployment, and network connectivity.
+This document covers the operational aspects of rcp's remote copy functionality: binary discovery,
+version checking, automatic deployment, and network connectivity.
 
-For the detailed protocol specification (message types, flows, invariants), see **[remote_protocol.md](remote_protocol.md)**.
+For the detailed protocol specification (message types, flows, invariants), see
+**[remote_protocol.md](remote_protocol.md)**.
 
 ## Overview
 
@@ -21,24 +23,28 @@ Source (rcpd)--TLS--Destination (rcpd)
 ```
 
 **Key components**:
+
 - **Master (rcp)**: Coordinates the operation, runs on user's machine
 - **Source (rcpd)**: Reads and sends files
 - **Destination (rcpd)**: Receives and writes files
 
-The master connects to remote hosts via SSH, spawns rcpd processes, and coordinates the transfer. All TCP connections (Master↔rcpd and Source↔Destination) are encrypted with TLS by default.
+The master connects to remote hosts via SSH, spawns rcpd processes, and coordinates the transfer.
+All TCP connections (Master↔rcpd and Source↔Destination) are encrypted with TLS by default.
 
 ## TLS Encryption
 
-By default, all TCP connections are encrypted using TLS 1.3 with self-signed certificates and fingerprint pinning.
+By default, all TCP connections are encrypted using TLS 1.3 with self-signed certificates and
+fingerprint pinning.
 
 ### Security Properties
 
-| Connection | Authentication | Encryption |
-|------------|---------------|------------|
-| Master → rcpd | Mutual fingerprint pinning (exchanged via SSH) | TLS 1.3 |
-| Source ↔ Destination | Mutual fingerprint pinning (via Master) | TLS 1.3 |
+| Connection           | Authentication                                 | Encryption |
+| -------------------- | ---------------------------------------------- | ---------- |
+| Master → rcpd        | Mutual fingerprint pinning (exchanged via SSH) | TLS 1.3    |
+| Source ↔ Destination | Mutual fingerprint pinning (via Master)        | TLS 1.3    |
 
 **Key features**:
+
 - **Forward secrecy**: Ephemeral keys per session
 - **Mutual authentication**: Both parties verify each other's certificates
 - **No trust anchor**: Self-signed certificates with fingerprint pinning (no CA)
@@ -49,8 +55,8 @@ By default, all TCP connections are encrypted using TLS 1.3 with self-signed cer
 1. **Master spawns rcpd via SSH**: `ssh host "rcpd --role source --master-cert-fp <fp>"`
 2. **rcpd generates ephemeral certificate** and outputs fingerprint to stderr
 3. **Master reads fingerprint** before connecting (trusted via SSH channel)
-4. **Master connects with TLS**, verifying rcpd's certificate fingerprint; rcpd in turn
-   verifies master's client certificate against `--master-cert-fp`
+4. **Master connects with TLS**, verifying rcpd's certificate fingerprint; rcpd in turn verifies
+   master's client certificate against `--master-cert-fp`
 5. **Master distributes fingerprints** to source and destination for mutual TLS
 
 ### Disabling Encryption
@@ -61,7 +67,8 @@ For performance on fully trusted networks, encryption can be disabled:
 rcp --no-encryption source:/path dest:/path
 ```
 
-**WARNING**: This exposes all data in plain text over the network. Only use on trusted, isolated networks.
+**WARNING**: This exposes all data in plain text over the network. Only use on trusted, isolated
+networks.
 
 For more details on the security model, see [security.md](security.md).
 
@@ -111,6 +118,7 @@ Options:
 ### Graceful Degradation
 
 If `HOME` is not set on the remote host:
+
 - Cache directory check is skipped
 - Discovery continues with same-directory and PATH checks
 - Error message indicates cache was skipped
@@ -214,6 +222,7 @@ mv -f ~/.cache/rcp/bin/.rcpd-{version}.tmp.$$ ~/.cache/rcp/bin/rcpd-{version}
 ```
 
 **Why base64**:
+
 - Universal availability (POSIX standard)
 - No external dependencies (no scp/rsync needed)
 - Works with restricted shells
@@ -222,9 +231,11 @@ mv -f ~/.cache/rcp/bin/.rcpd-{version}.tmp.$$ ~/.cache/rcp/bin/rcpd-{version}
 
 **Unique temporary files**: Each deployment uses `.rcpd-{version}.tmp.$$` where `$$` is shell PID.
 
-**Atomic rename**: `mv -f` is atomic on POSIX filesystems. Binary is either fully present or not present.
+**Atomic rename**: `mv -f` is atomic on POSIX filesystems. Binary is either fully present or not
+present.
 
 **Race condition handling**:
+
 - Multiple concurrent deployments: Each uses unique temp file, final `mv` is atomic
 - Interrupted deployment: Temp file left behind (harmless), final file unaffected
 - Reading during deployment: Reader sees old or new inode, never corruption
@@ -238,6 +249,7 @@ mv -f ~/.cache/rcp/bin/.rcpd-{version}.tmp.$$ ~/.cache/rcp/bin/rcpd-{version}
 ### Error Messages
 
 **Local binary not found**:
+
 ```
 no local rcpd binary found for deployment
 
@@ -250,12 +262,13 @@ To use auto-deployment, ensure rcpd is available:
 - or build with: cargo build --release --bin rcpd
 ```
 
-(A `PATH:` line is added to the "Searched in" list only in the unusual case where
-`which rcpd` resolves to a path that then doesn't exist or isn't a regular file; when
-`which` finds a usable binary it is deployed, and when it finds nothing no `PATH:` line is
-shown — hence the common not-found output lists only the same-directory candidate.)
+(A `PATH:` line is added to the "Searched in" list only in the unusual case where `which rcpd`
+resolves to a path that then doesn't exist or isn't a regular file; when `which` finds a usable
+binary it is deployed, and when it finds nothing no `PATH:` line is shown — hence the common
+not-found output lists only the same-directory candidate.)
 
 **Checksum mismatch**:
+
 ```
 checksum mismatch after transfer
 
@@ -275,8 +288,8 @@ Please try again or check network connectivity.
    - SSH to destination host, start rcpd
 
 2. **Master connects to each rcpd**
-   - Each rcpd creates a TCP listener and reports its address (and TLS fingerprint)
-     on stderr, which master reads over SSH
+   - Each rcpd creates a TCP listener and reports its address (and TLS fingerprint) on stderr, which
+     master reads over SSH
    - Master connects via TCP (control + tracing connections)
 
 3. **Source waits for Destination**
@@ -301,47 +314,49 @@ Please try again or check network connectivity.
 
 **Scenario**: rcpd doesn't exist on remote host
 
-**Handling**: Binary discovery and a version check run *before* rcpd is spawned — no
-connection timeout is involved. Two distinct outcomes:
+**Handling**: Binary discovery and a version check run *before* rcpd is spawned — no connection
+timeout is involved. Two distinct outcomes:
 
-- **No binary found** (and `--auto-deploy-rcpd` is not set): the master fails immediately
-  with the `rcpd binary not found on remote host` error shown in
-  [Error Handling](#error-handling).
-- **A binary is found but its version doesn't match** `rcp`, and `--auto-deploy-rcpd` is
-  **not** set: the master fails with the version-mismatch error shown in
+- **No binary found** (and `--auto-deploy-rcpd` is not set): the master fails immediately with the
+  `rcpd binary not found on remote host` error shown in [Error Handling](#error-handling).
+- **A binary is found but its version doesn't match** `rcp`, and `--auto-deploy-rcpd` is **not**
+  set: the master fails with the version-mismatch error shown in
   [Version Mismatch Error](#version-mismatch-error), not the "not found" error. (With
-  `--auto-deploy-rcpd`, a mismatch instead triggers deployment: the master ships its
-  *local* rcpd binary — the one beside `rcp`, or failing that one found via `which rcpd` —
-  and stores it under the local `rcp`'s version. Note the local binary's own protocol
-  version is **not** re-verified before it is shipped and launched, so this assumes the
-  local rcpd is the build that matches `rcp`; see the note below.)
+  `--auto-deploy-rcpd`, a mismatch instead triggers deployment: the master ships its *local* rcpd
+  binary — the one beside `rcp`, or failing that one found via `which rcpd` — and stores it under
+  the local `rcp`'s version. Note the local binary's own protocol version is **not** re-verified
+  before it is shipped and launched, so this assumes the local rcpd is the build that matches `rcp`;
+  see the note below.)
 
-> **Caveat:** auto-deployment trusts the local rcpd it finds; `find_local_rcpd_binary`
-> selects by existence, not version. The same-directory candidate is *expected* to be the
-> co-built sibling that matches `rcp` — but that is an expectation, not a verified guarantee —
-> and a `which rcpd` fallback could resolve to a stale binary. Either would be deployed under
-> the current version's filename and launched with a potentially incompatible protocol.
-> Prefer keeping `rcpd` next to `rcp`, or deploy manually, when versions may diverge.
+> **Caveat:** auto-deployment trusts the local rcpd it finds; `find_local_rcpd_binary` selects by
+> existence, not version. The same-directory candidate is *expected* to be the co-built sibling that
+> matches `rcp` — but that is an expectation, not a verified guarantee — and a `which rcpd` fallback
+> could resolve to a stale binary. Either would be deployed under the current version's filename and
+> launched with a potentially incompatible protocol. Prefer keeping `rcpd` next to `rcp`, or deploy
+> manually, when versions may diverge.
 
 #### Master Cannot Connect to rcpd
 
 **Scenario**: TCP connection from Master to rcpd's listener fails (firewall, network)
 
-The master opens two connections — control then tracing — to *each* rcpd. In the master's
-error the `<purpose>` is therefore one of `source control`, `source tracing`,
-`dest control`, or `dest tracing`; in the rcpd's own error it is the bare `control` or
-`tracing`.
+The master opens two connections — control then tracing — to *each* rcpd. In the master's error the
+`<purpose>` is therefore one of `source control`, `source tracing`, `dest control`, or
+`dest tracing`; in the rcpd's own error it is the bare `control` or `tracing`.
 
 **Master error**:
+
 ```
 failed to connect to rcpd at <addr> for <purpose>
 ```
+
 or, on timeout:
+
 ```
 timeout connecting to rcpd for <purpose>
 ```
 
 **rcpd error** (while waiting for the master to connect):
+
 ```
 timeout waiting for master <purpose> connection
 ```
@@ -351,6 +366,7 @@ timeout waiting for master <purpose> connection
 **Scenario**: Destination cannot reach Source's TCP server
 
 **Source error**:
+
 ```
 Timed out waiting for destination to connect after 15s.
 This usually means the destination cannot reach the source.
@@ -358,23 +374,27 @@ Check network connectivity and firewall rules.
 ```
 
 **Destination error**:
+
 ```
 connection to <addr> timed out after 15s
 ```
+
 or:
+
 ```
 failed to connect to <addr>
 ```
 
 ### Timeout Configuration
 
-| Timeout | Default | Configuration |
-|---------|---------|---------------|
-| SSH connection | ~30s | SSH config |
-| Master → rcpd | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Timeout              | Default                             | Configuration                    |
+| -------------------- | ----------------------------------- | -------------------------------- |
+| SSH connection       | ~30s                                | SSH config                       |
+| Master → rcpd        | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
 | Destination → Source | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
 
 Example:
+
 ```bash
 rcp --remote-copy-conn-timeout-sec 30 source:/path dest:/path
 ```
@@ -388,6 +408,7 @@ rcp --port-ranges 8000-8999 source:/path dest:/path
 ```
 
 Useful when:
+
 - Firewalls only allow specific port ranges
 - Avoiding conflicts with other services
 - Security policies require specific ports
@@ -406,8 +427,8 @@ rcp builds static musl binaries by default for maximum portability.
 
 ### Configuration
 
-From `.cargo/config.toml` (abridged; the file also sets `rustdocflags` per section and
-configures the `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-musl` targets):
+From `.cargo/config.toml` (abridged; the file also sets `rustdocflags` per section and configures
+the `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-musl` targets):
 
 ```toml
 [build]
@@ -441,22 +462,24 @@ cargo build --target x86_64-unknown-linux-gnu
 
 ### rcp Flags for Remote Operations
 
-| Flag | Description |
-|------|-------------|
-| `--rcpd-path=PATH` | Override rcpd binary path on remote hosts |
-| `--auto-deploy-rcpd` | Automatically deploy rcpd to remote hosts |
+| Flag                               | Description                                                    |
+| ---------------------------------- | -------------------------------------------------------------- |
+| `--rcpd-path=PATH`                 | Override rcpd binary path on remote hosts                      |
+| `--auto-deploy-rcpd`               | Automatically deploy rcpd to remote hosts                      |
 | `--remote-copy-conn-timeout-sec=N` | Connection timeout (default: 15; 60 with `--auto-deploy-rcpd`) |
-| `--port-ranges=RANGES` | Restrict TCP to specific ports (e.g., "8000-8999") |
-| `--max-connections=N` | Maximum concurrent data connections (default: 100) |
-| `--network-profile=PROFILE` | Buffer sizing: `datacenter` (default) or `internet` |
+| `--port-ranges=RANGES`             | Restrict TCP to specific ports (e.g., "8000-8999")             |
+| `--max-connections=N`              | Maximum concurrent data connections (default: 100)             |
+| `--network-profile=PROFILE`        | Buffer sizing: `datacenter` (default) or `internet`            |
 
 ### Network Profiles
 
 **Datacenter (default)**:
+
 - Larger TCP buffers (16 MiB)
 - Optimized for low-latency, high-bandwidth networks
 
 **Internet**:
+
 - Smaller TCP buffers (2 MiB)
 - Better for higher-latency networks
 
@@ -484,6 +507,7 @@ For comprehensive security analysis, see **[security.md](security.md)**.
 **Decision**: Require exact semantic version match
 
 **Rationale**:
+
 - Strictest policy during active development
 - Protocol changes are frequent
 - Prevents subtle bugs from version skew
@@ -494,6 +518,7 @@ For comprehensive security analysis, see **[security.md](security.md)**.
 **Decision**: Explicit path → same dir → PATH → cache
 
 **Rationale**:
+
 - Respects explicit user configuration (highest priority)
 - Same directory likely has matching version
 - PATH follows Unix conventions
@@ -504,6 +529,7 @@ For comprehensive security analysis, see **[security.md](security.md)**.
 **Decision**: Build static musl binaries by default
 
 **Rationale**:
+
 - Eliminates "works on my machine" issues
 - Single binary works everywhere
 - Critical for deployment simplicity

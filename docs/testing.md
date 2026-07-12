@@ -73,7 +73,8 @@ Tests using localhost SSH (`rcp/tests/remote_tests.rs`):
 - Error scenarios (unreadable files, permission errors)
 - rcpd lifecycle management
 
-**Requirements**: localhost SSH must be available and usable (running sshd, accessible via `ssh localhost`).
+**Requirements**: localhost SSH must be available and usable (running sshd, accessible via
+`ssh localhost`).
 
 ### Sudo-Required Tests
 
@@ -84,6 +85,7 @@ Some tests require passwordless sudo (e.g., creating root-owned files):
 - **CI runs separately**: `cargo nextest run --run-ignored only -E 'test(~sudo)'`
 
 To run locally:
+
 ```bash
 cargo nextest run --run-ignored only -E 'test(~sudo)'
 ```
@@ -117,6 +119,7 @@ Three Alpine Linux containers simulate separate hosts:
 ```
 
 **Container configuration**:
+
 - Based on Alpine Linux 3.19
 - OpenSSH server configured with pre-installed SSH keys
 - rcp/rcpd binaries mounted from `target/x86_64-unknown-linux-musl/debug/`
@@ -162,12 +165,14 @@ cd tests/docker
 ### Test Coverage
 
 **Basic multi-host operations** (`docker_multi_host.rs`):
+
 - File copying between separate hosts
 - Directory copying with cleanup
 - Overwrite protection behavior
 - Error handling for missing files
 
 **Connection ordering scenarios** (`docker_multi_host_role_ordering.rs`):
+
 - Role assignment verification regardless of connection timing
 - Delayed rcpd connection tests (forces specific connection order)
 - Rapid successive operations
@@ -233,22 +238,27 @@ just docker-down
 ### Troubleshooting
 
 **Docker daemon not running**:
+
 ```bash
 docker info  # Check connection
 ```
+
 → Start Docker Desktop application
 
 **Permission errors on SSH keys**:
+
 ```bash
 chmod 600 tests/docker/ssh_keys/id_ed25519
 ```
 
 **Binaries not found**:
+
 ```bash
 cargo build  # Builds to musl target by default
 ```
 
 **Containers fail to start**:
+
 ```bash
 cd tests/docker
 docker-compose logs     # Check for errors
@@ -270,6 +280,7 @@ The `.github/workflows/validate.yml` workflow runs:
 4. **Sudo tests**: `cargo nextest run --run-ignored only -E 'test(~sudo)'`
 
 **Docker job details**:
+
 - Sets up musl toolchain and builds binaries
 - Starts Docker containers with `docker-compose`
 - Runs tests using nextest Docker profile
@@ -282,31 +293,30 @@ The `.github/workflows/validate.yml` workflow runs:
 just ci  # lint + doc + test-all (debug + release + doctests) + Docker tests
 ```
 
-`just ci` is the primary local "is this ready to push?" gate — it runs the same lint,
-docs, and debug + release + doctest + Docker checks CI does, and is the one command to
-run before pushing. It's a close proxy for the CI matrix rather than a byte-for-byte
-match; a few CI steps live outside it:
+`just ci` is the primary local "is this ready to push?" gate — it runs the same lint, docs, and
+debug + release + doctest + Docker checks CI does, and is the one command to run before pushing.
+It's a close proxy for the CI matrix rather than a byte-for-byte match; a few CI steps live outside
+it:
 
-- **Sudo-gated tests** (`test(~sudo)`, which need passwordless sudo). CI runs these in a
-  separate step, in both debug and release. Run them yourself when a change touches
-  sudo-only behavior:
+- **Sudo-gated tests** (`test(~sudo)`, which need passwordless sudo). CI runs these in a separate
+  step, in both debug and release. Run them yourself when a change touches sudo-only behavior:
 
   ```bash
   cargo nextest run --run-ignored only -E 'test(~sudo)'   # add --release to also cover release
   ```
 
-- **glibc release build.** CI also builds the workspace for `x86_64-unknown-linux-gnu`;
-  `just ci` builds and tests only the default `x86_64-unknown-linux-musl` target.
+- **glibc release build.** CI also builds the workspace for `x86_64-unknown-linux-gnu`; `just ci`
+  builds and tests only the default `x86_64-unknown-linux-musl` target.
 
-- **Chaos tests.** `just ci`'s Docker step runs the full `docker` profile *including*
-  chaos (the compose containers are privileged, so they actually run), whereas CI
-  excludes chaos from its main Docker job and runs it in a separate `chaos-tests.yml`
-  workflow. So `just ci` does cover chaos locally — CI just schedules it separately.
+- **Chaos tests.** `just ci`'s Docker step runs the full `docker` profile *including* chaos (the
+  compose containers are privileged, so they actually run), whereas CI excludes chaos from its main
+  Docker job and runs it in a separate `chaos-tests.yml` workflow. So `just ci` does cover chaos
+  locally — CI just schedules it separately.
 
 ## Chaos Testing
 
-Chaos tests verify rcp's behavior under adverse conditions. They run in Docker containers
-with special capabilities and are designed to be reproducible in CI.
+Chaos tests verify rcp's behavior under adverse conditions. They run in Docker containers with
+special capabilities and are designed to be reproducible in CI.
 
 ### Running Chaos Tests
 
@@ -320,53 +330,58 @@ cargo nextest run --profile docker --run-ignored only -E 'test(~chaos)'
 just docker-down
 ```
 
-Chaos tests run separately from regular Docker tests in CI (see `.github/workflows/chaos-tests.yml`).
+Chaos tests run separately from regular Docker tests in CI (see
+`.github/workflows/chaos-tests.yml`).
 
 ### Test Categories
 
 **Network condition tests** (`docker_chaos_network.rs`):
+
 - High latency (200ms) - verifies timeouts and protocol resilience
 - Bandwidth limits (1 Mbit/s) - verifies throttled transfer completion
 - Directory copy under latency - verifies multi-RTT protocol handling
 
 **Process chaos tests** (`docker_chaos_process.rs`):
+
 - Kill rcpd early (before connections established)
 - Kill rcpd mid-transfer (tests TCP failure detection)
 - Pause rcpd (SIGSTOP) to simulate hangs - verifies timeout behavior
 - Master killed - verifies rcpd cleanup via stdin watchdog
 
 **I/O chaos tests** (`docker_chaos_io.rs`):
+
 - Disk full (ENOSPC) via small tmpfs mount
 - Permission denied on destination directory
 - Permission denied on source file
 - Verifies error chain preservation (root cause visible in stderr)
 
 **Filesystem chaos tests** (`docker_chaos_filesystem.rs`):
-- These are **best-effort liveness smoke tests**, not rigorous assertions. A detached
-  background process (`docker exec -d` — fire-and-forget, its launch and completion are not
-  checked) *attempts* to mutate the source tree (delete files, add files, remove a directory,
-  or mutate under an active `--include` filter) around the time a copy runs. Timing is
-  best-effort (a short `sleep` on small fixtures), so a given run may not actually overlap
-  traversal/transfer, and the mutation is not guaranteed to have happened — the tests do not
-  prove a specific race was exercised.
-- The assertion is a proxy for "rcp did not crash": it checks that the outer `docker exec`
-  exit status is `0` or `1`. That catches a gross crash — the build sets `panic = "abort"`, so
-  a panic raises SIGABRT, and both that and a segfault surface through `docker exec` as `128+n`
-  (`134` / `139`), outside the accepted range. Its limits: `docker exec` status `1` is not
-  distinguishable from a docker-level failure (the check observes docker's status, not rcp's
-  directly), and a true **hang** is not detected at all (`docker exec` has no per-command
-  timeout, so a hang stalls the CI job). Proving rcp actually ran and reading its true inner
-  status would require an in-container completion marker.
+
+- These are **best-effort liveness smoke tests**, not rigorous assertions. A detached background
+  process (`docker exec -d` — fire-and-forget, its launch and completion are not checked) *attempts*
+  to mutate the source tree (delete files, add files, remove a directory, or mutate under an active
+  `--include` filter) around the time a copy runs. Timing is best-effort (a short `sleep` on small
+  fixtures), so a given run may not actually overlap traversal/transfer, and the mutation is not
+  guaranteed to have happened — the tests do not prove a specific race was exercised.
+- The assertion is a proxy for "rcp did not crash": it checks that the outer `docker exec` exit
+  status is `0` or `1`. That catches a gross crash — the build sets `panic = "abort"`, so a panic
+  raises SIGABRT, and both that and a segfault surface through `docker exec` as `128+n` (`134` /
+  `139`), outside the accepted range. Its limits: `docker exec` status `1` is not distinguishable
+  from a docker-level failure (the check observes docker's status, not rcp's directly), and a true
+  **hang** is not detected at all (`docker exec` has no per-command timeout, so a hang stalls the CI
+  job). Proving rcp actually ran and reading its true inner status would require an in-container
+  completion marker.
 
 **Protocol stress tests** (`docker_chaos_protocol.rs`):
+
 - Backpressure with slow destination/source (64 kbit/s bandwidth limit)
 - Many files (150 files to stress connection pool)
 - Limited connections (`--max-connections=10`)
 - Large file transfer (10MB to test chunking)
 - Combined stress (files + bandwidth + limited connections)
 
-**Note**: Packet loss tests are disabled because `tc netem loss` affects all traffic
-including SSH, causing hangs before the copy starts.
+**Note**: Packet loss tests are disabled because `tc netem loss` affects all traffic including SSH,
+causing hangs before the copy starts.
 
 ### Implementation Details
 
@@ -380,21 +395,25 @@ including SSH, causing hangs before the copy starts.
 ## Design Decisions
 
 **Why Docker over alternatives?**
+
 - **vs. Network namespaces**: More portable, works on macOS/Windows
 - **vs. VMs**: Faster startup, easier to manage, better CI integration
 - **vs. Mock transport**: More realistic, tests actual SSH/TCP stack
 
 **Why Alpine Linux?**
+
 - Small image size (~50MB vs ~150MB for Debian/Ubuntu)
 - Fast container startup
 - OpenSSH available in package manager
 
 **Why mount binaries instead of COPY?**
+
 - No container rebuild needed for code changes
 - Faster iteration during development
 - Ensures tests use exact same binary as local builds
 
 **Why musl target?**
+
 - Static linking ensures binaries work in Alpine containers
 - Avoids glibc version incompatibilities
 - Project default target anyway
