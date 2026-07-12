@@ -40,7 +40,7 @@ A remote copy operation involves three participants:
         │   ┌───────┘       └───────┐   │
     SSH │   │ TLS               TLS │   │ SSH
 (spawn) │   │ (control)   (control) │   │ (spawn)
-        ▼   ▼                       ▼   ▼
+        v   v                       v   v
    ┌─────────────┐             ┌─────────────┐
    │   Source    │             │ Destination │
    │   (rcpd)    │─── TLS ────>│   (rcpd)    │

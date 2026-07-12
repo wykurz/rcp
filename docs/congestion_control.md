@@ -55,7 +55,7 @@ percentiles to differ to encode the inter-quantile spread directly.
 - Make the control algorithm swappable; do not bake controller- specific assumptions into the rest
   of the stack.
 
-**Non-goals (for this release):**
+**Non-goals:**
 
 - Data-path throughput control (MB/s caps on reads/writes). The current controller reasons about
   metadata operations only.
@@ -73,23 +73,23 @@ Three concentric layers. Each is independently testable and replaceable.
 │         Algorithm         │
 │ (controller trait + impl) │
 │   sample in → decision    │
-└─────────▲─────────┬───────┘
+└─────────^─────────┬───────┘
           │         │
   samples │         │ decisions
-          │         ▼
+          │         v
 ┌─────────┴─────────────────┐
 │       Control Loop        │
 │  sample routing + tick +  │
 │      decision broadcast   │
-└─────────▲─────────┬───────┘
+└─────────^─────────┬───────┘
           │         │
   probes  │         │ limits
-          │         ▼
+          │         v
 ┌─────────┴─────────────────┐
 │        Enforcement        │
 │  concurrency semaphores + │
 │     rate token buckets    │
-└─────────▲─────────────────┘
+└─────────^─────────────────┘
           │
           │ acquire / release
           │
@@ -363,19 +363,18 @@ What "wide coverage" means concretely:
 - **Write-side metadata:** `create_dir`, `hard_link`, `symlink`, `remove_file`, `remove_dir`,
   `set_permissions`, the `chown` and `utimens` syscalls inside `preserve::set_*_metadata`, and the
   `File::open` / `OpenOptions::open(create:true, …)` for new files. Each is one probe per syscall.
-- **Not probed by design — directory iteration.** Walks (`next_entry`
-  - cached `file_type`) are *not* probed and *not* concurrency-capped. `tokio::fs::ReadDir`
-    amortizes a single `getdents` syscall over many `next_entry` calls, so most "walk probes" don't
-    enter the kernel at all and complete in tens of nanoseconds. The resulting bimodal cache-hit /
-    real-syscall distribution collapses any baseline a controller could derive from it and pins
-    `cwnd` at the floor. The per-file metadata syscalls that *follow* the walk still carry a clean
-    signal, so we let those drive the controllers and skip the walk path entirely. One side-effect
-    worth flagging: a workload that walks a wide tree but filters most entries away (large
-    `--include`/`--exclude` exclusions) will still spawn concurrent directory scans without any
-    auto-meta backpressure, since the filter short-circuit happens before any metadata syscall
-    fires. Walks self-pace through the OS getdents cache and the global `--ops-throttle` rate gate
-    still applies; if you need a hard cap on walk-side load on a fragile NAS, reach for
-    `--ops-throttle`.
+- **Not probed by design — directory iteration.** Walks (`next_entry` plus cached `file_type`) are
+  *not* probed and *not* concurrency-capped. `tokio::fs::ReadDir` amortizes a single `getdents`
+  syscall over many `next_entry` calls, so most "walk probes" don't enter the kernel at all and
+  complete in tens of nanoseconds. The resulting bimodal cache-hit / real-syscall distribution
+  collapses any baseline a controller could derive from it and pins `cwnd` at the floor. The
+  per-file metadata syscalls that *follow* the walk still carry a clean signal, so we let those
+  drive the controllers and skip the walk path entirely. One side-effect worth flagging: a workload
+  that walks a wide tree but filters most entries away (large `--include`/`--exclude` exclusions)
+  will still spawn concurrent directory scans without any auto-meta backpressure, since the filter
+  short-circuit happens before any metadata syscall fires. Walks self-pace through the OS getdents
+  cache and the global `--ops-throttle` rate gate still applies; if you need a hard cap on walk-side
+  load on a fragile NAS, reach for `--ops-throttle`.
 - **Not probed by design — data path.** The read-loop and write-loop inside the copy pipeline, and
   `tokio::fs::copy` itself. Bandwidth- bound, not service-time-bound; a latency-ratio controller
   doesn't fit. See [Pluggability](#pluggability) for the BBR direction.
@@ -476,8 +475,8 @@ The adaptive and static knobs compose:
           rate gate     concurrency gate
             (token        (semaphore)
             bucket)
-caller ───▶ [  ] ────────▶ [    ] ────▶ syscall
-              ▲                ▲
+caller ───> [  ] ────────> [    ] ────> syscall
+              ^                ^
               │                │
        --ops-throttle   --auto-meta-throttle
         (static rate)   (dynamic concurrency)
@@ -503,7 +502,7 @@ rcp master                                 rcpd (remote)
 ───────────                                ─────────────
     │                                           │
     │  SSH                                      │
-    │  ────────── launch command ──────────────▶│
+    │  ────────── launch command ──────────────>│
     │         (--auto-meta-* flags)             │
     │                                           │
     │                                           │  ┌─ local control loop
@@ -512,7 +511,7 @@ rcp master                                 rcpd (remote)
     │                                           │  │   independent state)
     │                                           │  └─
     │  TLS control channel                      │
-    │  ◀═══════════════════════════════════════▶│
+    │  <═══════════════════════════════════════>│
     │         (file transfers)                  │
 ```
 
