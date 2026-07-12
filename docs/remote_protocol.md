@@ -36,12 +36,43 @@ The system uses a **triangle topology** with TCP connections:
 
 ![Triangle topology: master, source, destination](assets/remote_architecture.svg)
 
+<details>
+<summary>Text transcript</summary>
+
+The diagram distinguishes the SSH bootstrap from the rcp TCP connections and shows every
+application-data direction:
+
+1. Master uses SSH to start both rcpd processes. Each rcpd reports its listener address and, when
+   TLS is enabled, its certificate fingerprint back to master on SSH stderr.
+2. Master opens a bidirectional control TCP connection to source rcpd. Master sends
+   `MasterHello::Source`; source returns `SourceMasterHello` and later `RcpdResult`.
+3. Master separately opens source rcpd's tracing/progress TCP connection, drops its send half, and
+   receives tracing/progress data from source rcpd.
+4. Master opens a bidirectional control TCP connection to destination rcpd. Master sends
+   `MasterHello::Destination`; destination later returns `RcpdResult`.
+5. Master separately opens destination rcpd's tracing/progress TCP connection, drops its send half,
+   and receives tracing/progress data from destination rcpd.
+6. Destination opens the source/destination bidirectional control connection. Directory and symlink
+   messages flow source → destination; manifests, directory acknowledgements, and `DestinationDone`
+   flow destination → source.
+7. Destination also opens the pooled data connections to source. File headers and bytes flow only
+   source → destination and never through master.
+
+By default every rcp TCP connection uses TLS 1.3 and certificate-fingerprint authentication. The
+`--no-encryption` option disables TLS and certificate authentication on every rcp TCP connection;
+SSH remains protected and still launches rcpd and carries its listener announcement.
+
+</details>
+
 **Connection Details:**
 
-1. **Master → Source**: Bidirectional TCP (master connects to source rcpd's listener), used for
-   handshake and result reporting
-2. **Master → Destination**: Bidirectional TCP (master connects to destination rcpd's listener),
-   used for handshake and result reporting
+1. **Master ↔ Source**: Two TCP connections (master connects to source rcpd's listener twice):
+   - **Control**: Bidirectional, used for handshake and result reporting
+   - **Tracing/progress**: One-way rcpd → master; master drops this connection's send half
+2. **Master ↔ Destination**: Two TCP connections (master connects to destination rcpd's listener
+   twice):
+   - **Control**: Bidirectional, used for handshake and result reporting
+   - **Tracing/progress**: One-way rcpd → master; master drops this connection's send half
 3. **Source ↔ Destination**: Two TCP ports on source (destination connects to both):
    - **Control port**: Bidirectional TCP for directory metadata and coordination
    - **Data port**: A pool of TCP connections for file transfers (each connection is reused for
@@ -49,8 +80,9 @@ The system uses a **triangle topology** with TCP connections:
 
 **Connection Establishment Order:**
 
-1. Master connects to both rcpd processes (each rcpd listens; master learns the address from the
-   `RCP_TLS`/`RCP_TCP` line on the rcpd's stderr)
+1. Master opens the control connection and then the separate tracing/progress connection to each
+   rcpd process (each rcpd listens; master learns the address from the `RCP_TLS`/`RCP_TCP` line on
+   the rcpd's stderr)
 2. Master sends `MasterHello::Source` to source rcpd with src/dst paths
 3. Source rcpd starts TCP listeners (control + data), sends `SourceMasterHello` back to master with
    both addresses
@@ -82,7 +114,8 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
 
 **Opt-out:**
 
-- Use `--no-encryption` flag for trusted networks where performance is critical
+- Use `--no-encryption` for trusted networks where performance is critical. It disables TLS and
+  certificate authentication on every rcp TCP connection; SSH remains protected.
 - See [security.md](security.md) for detailed threat model and best practices
 
 ## 2. Protocol Messages
@@ -305,13 +338,75 @@ eventually return true and `DestinationDone` can be sent.
 
 ![Directory copy flow sequence diagram](assets/protocol_flow_directory_copy.svg)
 
+<details>
+<summary>Text transcript</summary>
+
+The destination has already opened its reusable pool of data connections before this trace begins.
+The source root has five entries: two files, one symlink, and two directories; `child1` contains one
+file and `child2` is empty. The reused destination root initially contains only `f2`, and in that
+root only `f2` already matches. In this manifest-active example, `--overwrite` is enabled and the
+reused root's pre-existing entry count is within the `--overwrite-manifest-max-entries` cap.
+Control-stream and pooled-data work can overlap, so this is one valid interleaving:
+
+1. Source pre-reads the root, retains its two-file count, and sends
+   `Directory(root, entries=5, meta)`. Destination reuses the root and sends one or more
+   `DirectoryManifestChunk(root)` messages including `f2`, then sends `DirectoryCreated(root)`.
+2. Source sends `Symlink(root/link, meta)` before recursing into child directories; destination
+   creates it and advances the root to 1/5.
+3. Source pre-reads `child1`, sends `Directory(child1, entries=1, meta)`, and immediately receives
+   `DirectoryCreated(child1)`.
+4. Source pre-reads the empty `child2`, sends `Directory(child2, entries=0, meta)`, and immediately
+   receives `DirectoryCreated(child2)`. The destination completes `child2` and propagates that
+   completion upward, advancing the root to 2/5.
+5. Source sends `DirStructureComplete`. On existing pooled data connections it then sends
+   `File(root/f1)`, advancing the root to 3/5, and reports matching `root/f2` as `FileUnchanged`,
+   advancing the root to 4/5.
+6. Source sends `File(child1/f1)` on an existing pooled data connection. `child1` reaches 1/1,
+   applies its metadata, and propagates completion upward. Only then does the root reach 5/5 and
+   apply its metadata.
+7. Once the structure and root are complete and no directories remain pending, destination sends
+   `DestinationDone` from the data worker that processed the last file. This is the data-completed
+   path: `DestinationDone` triggers source shutdown, the destination control receiver remains active
+   and later observes source control EOF. Destination data-stream handlers end on EOF; their outer
+   workers exit after reconnect attempts fail. Data-stream EOF and source control EOF have no
+   guaranteed ordering. See [section 6.1](#61-shutdown-sequence).
+
+</details>
+
 ### 4.2 Single File Copy
 
 ![Single file copy sequence diagram](assets/protocol_flow_single_file.svg)
 
+<details>
+<summary>Text transcript</summary>
+
+Destination pre-opens the pooled data connections. Source sends
+`DirStructureComplete { has_root_item: true }`, then sends the root `File` header and bytes over an
+existing pooled data connection. Destination writes the file and marks the root item complete. It
+then sends `DestinationDone` from that data worker. This is the data-completed path:
+`DestinationDone` triggers source shutdown, the destination control receiver later observes source
+control EOF, destination data-stream handlers end on EOF, and their outer workers exit after
+reconnect attempts fail. Data-stream EOF and source control EOF have no guaranteed ordering. See
+[section 6.1](#61-shutdown-sequence).
+
+</details>
+
 ### 4.3 Single Symlink Copy
 
 ![Single symlink copy sequence diagram](assets/protocol_flow_single_symlink.svg)
+
+<details>
+<summary>Text transcript</summary>
+
+Destination pre-opens the pooled data connections, although a single-symlink copy does not use them.
+Source sends `Symlink(s, is_root=true, meta)` on the control stream; destination creates it and
+marks the root item complete. Source then sends `DirStructureComplete`, and destination sends
+`DestinationDone` from its control receiver. This is the control-completed path: that receiver exits
+without observing source control EOF. `DestinationDone` triggers source shutdown; the idle
+destination data-stream handlers end on EOF, and their outer workers exit after reconnect attempts
+fail. See [section 6.1](#61-shutdown-sequence).
+
+</details>
 
 ### 4.4 Failed Directory Handling
 
@@ -320,6 +415,25 @@ parent directory's entry count still includes failed children, so `process_child
 even for skipped entries to ensure the parent can complete.
 
 ![Failed directory handling sequence diagram](assets/protocol_flow_failed_directory.svg)
+
+<details>
+<summary>Text transcript</summary>
+
+Destination has already opened the pooled data connections, but no data connection is used for the
+failed subtree. Source sends `Directory(dir1, entries=2, meta)`. Creation fails, so destination
+records `dir1` in `failed_directories` and immediately sends `DirectorySkipped(dir1)`; this nack
+releases the source's held directory fd and prevents Pass 2 file sends for `dir1`. Only after the
+nack does destination update parent accounting: it counts the failed directory in its successfully
+tracked parent. Source still sends the complete structure, sending `Symlink(dir1/link, …)` before
+recursing to `Directory(dir1/dir2, …)`. Destination skips the symlink locally. For the descendant
+directory it immediately sends `DirectorySkipped(dir1/dir2)` before attempting parent accounting, so
+that fd is also released. After `DirStructureComplete`, the destination control receiver can send
+`DestinationDone` once the remaining completion conditions are met. This is the control-completed
+path: the receiver then exits without observing source control EOF. `DestinationDone` triggers
+source shutdown; destination data-stream handlers end on EOF, and their outer workers exit after
+reconnect attempts fail. See [section 6.1](#61-shutdown-sequence).
+
+</details>
 
 ## 5. DirectoryTracker
 
@@ -442,16 +556,47 @@ non-directory items can be replaced.
 
 ### 6.1 Shutdown Sequence
 
-The shutdown is coordinated through TCP connection closure:
+Shutdown is initiated by the protocol message and completed through stream closure:
 
 ![Shutdown sequence diagram](assets/protocol_shutdown_sequence.svg)
 
+<details>
+<summary>Text transcript</summary>
+
+After directory structure, root-item, and pending-directory completion, destination sends
+`DestinationDone` and closes its control send stream. `DestinationDone` triggers source shutdown;
+the source does not wait for control EOF before starting that shutdown. It cancels the pooled-data
+shutdown token, which closes the pooled data send streams, drains its file-send tasks, then closes
+its control send stream and joins its control-receive task.
+
+EOF ends each current data-stream handler. The enclosing destination worker then loops back to
+`DataConnectionPool::connect`.
+
+After source pool/listener shutdown, the next connection attempt fails. The worker then exits.
+Data-stream EOF and source control EOF have no guaranteed ordering at the destination.
+
+Two destination-side paths are valid. In the **data-completed path**, the data worker that processes
+the final file sends `DestinationDone`; the destination control receiver remains active and later
+observes source control EOF. In the **control-completed path** (for example, a single symlink or a
+failed-directory-only flow), the destination control receiver sends `DestinationDone` and exits
+without observing source control EOF. Thus source control EOF is not a universal destination-side
+application event, and there is no application-level `SourceDone` message or universal bidirectional
+EOF handshake.
+
+</details>
+
 **Key Points:**
 
-- Destination initiates shutdown by sending `DestinationDone` and closing its send side
-- Source detects this (EOF on recv), closes its send side
-- Destination detects source's send side closed, closes connection
-- Both sides close cleanly without needing explicit `SourceDone` message
+- Destination sends `DestinationDone` and closes its control send side when completion conditions
+  are met
+- `DestinationDone`, not EOF, triggers the source to cancel/close the data pool before draining file
+  tasks, closing its control send side, and joining its control-receive task
+- EOF ends each current data-stream handler; after pool/listener shutdown, the outer worker's next
+  connection attempt fails and the worker exits
+- Data-stream EOF and source control EOF have no guaranteed ordering at the destination
+- Only the data-completed path keeps the destination control receiver active to observe source
+  control EOF; the control-completed path exits that receiver earlier
+- No explicit `SourceDone` or universal bidirectional EOF handshake is required
 
 ### 6.2 Connection Types and Ownership
 
@@ -494,12 +639,10 @@ The shutdown is coordinated through TCP connection closure:
 The protocol uses a two-layer counting scheme for directory completion:
 
 **Entry count (traversal-time, source → destination):** The `entry_count` in the `Directory` message
-counts all child entries (files + directories
-
-- symlinks) visible during source's pre-read of the directory. This count is set at traversal time
-  and used by DirectoryTracker to determine when all children have been processed. Since
-  directories, symlinks, and files all count, a parent directory only completes after all its
-  children are done — preventing premature metadata application.
+counts all child entries (files, directories, and symlinks) visible during source's pre-read of the
+directory. This count is set at traversal time and used by DirectoryTracker to determine when all
+children have been processed. Since directories, symlinks, and files all count, a parent directory
+only completes after all its children are done — preventing premature metadata application.
 
 **File count (source-retained, no round-trip):** The number of child files in a directory is
 computed by the source during the Pass-1 pre-read and **retained on the source side** — it is not

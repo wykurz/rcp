@@ -376,6 +376,8 @@ responsibility (see [Scope of TOCTOU safety](#scope-of-toctou-safety)). `--requi
 operates purely on the verdict (`--dereference`/non-Linux) and never inspects the operand paths, so
 it treats local and remote (`host:/path`) operands identically.
 
+<a id="the-contract-for-safe-privileged-sudo-use"></a>
+
 ## Safe privileged use (sudo)
 
 Safe TOCTOU use under elevated privilege is a two-layer arrangement:
