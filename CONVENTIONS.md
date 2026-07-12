@@ -31,3 +31,8 @@
       assert_eq!(summary.files_copied, 1);
   }
   ```
+
+## Documentation Conventions
+
+- Markdown files are formatted with dprint (see `dprint.json`): prose hard-wrapped at 100 columns.
+  Run `just fmt` to format; `just lint` (and CI) verify.

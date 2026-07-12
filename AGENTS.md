@@ -104,6 +104,9 @@ Enforced by `scripts/check-package-metadata.sh`.
 
 - Doc comments (`///`, `//!`): start with a capitalized sentence, read naturally.
 - Regular comments (`//`): start lowercase (see CONVENTIONS.md).
+- Markdown docs: formatted with dprint, prose hard-wrapped at 100 columns — `just fmt` fixes.
+
+Markdown formatting is enforced by `scripts/check-doc-format.sh`.
 
 ### Structural Simplification
 

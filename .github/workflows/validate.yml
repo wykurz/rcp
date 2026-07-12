@@ -41,6 +41,19 @@ jobs:
     - name: Format
       run: cargo fmt --check
 
+    # The CLI version is pinned here for reproducibility, but formatting output
+    # is determined by the plugin version + checksum pinned in dprint.json.
+    - name: Install dprint
+      run: |
+        curl -fsSL -o /tmp/dprint.zip https://github.com/dprint/dprint/releases/download/0.54.0/dprint-x86_64-unknown-linux-gnu.zip
+        echo "8cb5925a0d6d0d8aa74c82a00f76734577592dfa1eda9517c261a84fe06accd7  /tmp/dprint.zip" | sha256sum -c -
+        mkdir -p "$HOME/.local/bin"
+        unzip -o -q /tmp/dprint.zip -d "$HOME/.local/bin"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Check markdown formatting
+      run: ./scripts/check-doc-format.sh
+
     - name: Check error logging format
       run: ./scripts/check-error-logging.sh
 

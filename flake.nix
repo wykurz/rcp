@@ -207,6 +207,7 @@
                 pkgs.cargo-nextest
                 pkgs.cargo-outdated
                 pkgs.cargo-udeps
+                pkgs.dprint
                 pkgs.gdb
                 pkgs.just
                 pkgs.llvmPackages.bintools
