@@ -5,10 +5,12 @@
 default:
     @just --list
 
-# Run all lints (fmt, clippy, error logging, anyhow error msg, rust version, remote test naming, package metadata, walk-driver usage, source-read fidelity)
+# Run all lints (fmt, markdown formatting, clippy, error logging, anyhow error msg, rust version, remote test naming, package metadata, walk-driver usage, source-read fidelity)
 lint:
     @echo "🔍 Checking formatting..."
     cargo fmt --check
+    @echo "🔍 Checking markdown formatting..."
+    ./scripts/check-doc-format.sh
     @echo "🔍 Running clippy..."
     cargo clippy --workspace --all-targets -- -D warnings
     @echo "🔍 Checking error logging format..."
@@ -27,9 +29,10 @@ lint:
     ./scripts/check-source-read-fidelity.sh
     @echo "✅ All lints passed!"
 
-# Format code
+# Format code and markdown docs
 fmt:
     cargo fmt
+    dprint fmt
 
 # Run tests (debug mode, using nextest by default)
 test:
