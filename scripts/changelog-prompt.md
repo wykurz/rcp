@@ -16,6 +16,7 @@ Update CHANGELOG.md for release ${VERSION}:
 5. Keep an empty [Unreleased] section at the top
 
 Style guidelines:
+
 - Be concise - one line per change
 - Focus on user-facing changes, skip internal refactors unless significant
 - Start entries with a verb (Add, Fix, Change, Remove, Improve)

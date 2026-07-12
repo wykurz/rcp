@@ -4,7 +4,8 @@
 
 ## What are these keys for?
 
-These SSH keys are used **exclusively** for the Docker-based multi-host integration tests in this directory. They enable passwordless SSH authentication between test containers.
+These SSH keys are used **exclusively** for the Docker-based multi-host integration tests in this
+directory. They enable passwordless SSH authentication between test containers.
 
 ## Security Notice
 
@@ -48,8 +49,11 @@ cd ..
 
 ## Alternative: Generate keys at runtime
 
-If you prefer not to check in keys, you could modify the setup to generate them on first run. However, this adds complexity and makes tests less reproducible. For test infrastructure, checking in test keys is the pragmatic choice.
+If you prefer not to check in keys, you could modify the setup to generate them on first run.
+However, this adds complexity and makes tests less reproducible. For test infrastructure, checking
+in test keys is the pragmatic choice.
 
 ---
 
-**Remember: These keys are worthless for security. They're checked into a public repository and should never touch real infrastructure.**
+**Remember: These keys are worthless for security. They're checked into a public repository and
+should never touch real infrastructure.**

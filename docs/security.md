@@ -21,8 +21,8 @@ The rcp remote copy system provides:
 2. **TLS with certificate pinning** for encrypted and authenticated data transfer
 
 All TCP connections are encrypted and mutually authenticated by default using TLS 1.3 with
-self-signed certificates and fingerprint pinning. Each party generates an ephemeral certificate,
-and fingerprints are distributed via SSH (for master↔rcpd) or protocol messages (for source↔dest).
+self-signed certificates and fingerprint pinning. Each party generates an ephemeral certificate, and
+fingerprints are distributed via SSH (for master↔rcpd) or protocol messages (for source↔dest).
 
 ## Architecture
 
@@ -48,29 +48,29 @@ A remote copy operation involves three participants:
                  (control + data)
 ```
 
-Each master↔rcpd TLS arrow above stands for two connections — control plus a
-tracing/progress channel — listed separately in the table below.
+Each master↔rcpd TLS arrow above stands for two connections — control plus a tracing/progress
+channel — listed separately in the table below.
 
 ### Communication Channels
 
-| Channel | Protocol | Authentication | Encryption |
-|---------|----------|----------------|------------|
-| Master → Source (spawn) | SSH | SSH keys/password | SSH |
-| Master → Destination (spawn) | SSH | SSH keys/password | SSH |
-| Master ↔ Source (control + tracing) | TLS | Mutual fingerprint pinning | TLS 1.3 |
-| Master ↔ Destination (control + tracing) | TLS | Mutual fingerprint pinning | TLS 1.3 |
-| Source ↔ Destination (control) | TLS | Mutual fingerprint pinning | TLS 1.3 |
-| Source → Destination (data) | TLS | Mutual fingerprint pinning | TLS 1.3 |
+| Channel                                  | Protocol | Authentication             | Encryption |
+| ---------------------------------------- | -------- | -------------------------- | ---------- |
+| Master → Source (spawn)                  | SSH      | SSH keys/password          | SSH        |
+| Master → Destination (spawn)             | SSH      | SSH keys/password          | SSH        |
+| Master ↔ Source (control + tracing)      | TLS      | Mutual fingerprint pinning | TLS 1.3    |
+| Master ↔ Destination (control + tracing) | TLS      | Mutual fingerprint pinning | TLS 1.3    |
+| Source ↔ Destination (control)           | TLS      | Mutual fingerprint pinning | TLS 1.3    |
+| Source → Destination (data)              | TLS      | Mutual fingerprint pinning | TLS 1.3    |
 
 ## TLS Certificate Authentication
 
 ### How It Works
 
-Each party generates an ephemeral self-signed certificate. The key design principle is that
-**for master connections, rcpd is always the TLS server** (master connects to it as a TLS
-client) - this allows master to read the certificate fingerprint from rcpd's stderr, carried
-over the trusted SSH channel, before connecting. (For source↔destination connections, the
-source is the TLS server and the destination connects as a client.)
+Each party generates an ephemeral self-signed certificate. The key design principle is that **for
+master connections, rcpd is always the TLS server** (master connects to it as a TLS client) - this
+allows master to read the certificate fingerprint from rcpd's stderr, carried over the trusted SSH
+channel, before connecting. (For source↔destination connections, the source is the TLS server and
+the destination connects as a client.)
 
 **Authentication Flow:**
 
@@ -110,12 +110,12 @@ Source creates TLS server, destination connects with client cert:
 
 ### Security Properties
 
-| Property | Guarantee |
-|----------|-----------|
+| Property            | Guarantee                                                |
+| ------------------- | -------------------------------------------------------- |
 | **Confidentiality** | All data encrypted with AES-256-GCM or ChaCha20-Poly1305 |
-| **Integrity** | AEAD (Authenticated Encryption with Associated Data) |
-| **Authentication** | Certificate fingerprint verification |
-| **Forward Secrecy** | TLS 1.3 ephemeral key exchange |
+| **Integrity**       | AEAD (Authenticated Encryption with Associated Data)     |
+| **Authentication**  | Certificate fingerprint verification                     |
+| **Forward Secrecy** | TLS 1.3 ephemeral key exchange                           |
 
 ### Why Certificate Pinning?
 
@@ -137,8 +137,8 @@ Certificate fingerprints are distributed via trusted channels:
 - **Per-session**: New certificates and fingerprints for each rcp invocation
 - **Memory-only**: Private keys are never written to disk
 
-The key insight is that rcpd acts as the TLS server, allowing master to receive the
-fingerprint through the trusted SSH channel BEFORE making any network connection.
+The key insight is that rcpd acts as the TLS server, allowing master to receive the fingerprint
+through the trusted SSH channel BEFORE making any network connection.
 
 ## Trust Model
 
@@ -179,66 +179,64 @@ User
 - **Compromised local machine**: Master machine is fully trusted
 - **Compromised remote hosts**: If host is compromised, attacker controls rcpd
 - **Side-channel attacks**: No specific mitigations for timing attacks, etc.
-- **TOCTTOU attacks with `--dereference`/`-L`**: Following symlinks is requested behavior
-  and cannot be hardened. See [TOCTTOU Vulnerabilities](tocttou.md) for details.
-- **TOCTTOU on non-Linux**: The hardened path is Linux-only; non-Linux builds use
-  path-based operations. See [TOCTTOU Vulnerabilities](tocttou.md).
-- **Trust of the operand path's prefix**: The hardening protects everything at or below the
-  named root, but the tools do not verify that the directories *above* it are free of
-  less-privileged control. `--require-toctou-safe` enforces the hardened walk (refusing
-  `-L`/non-Linux); the prefix trust is the caller's responsibility — see the
+- **TOCTTOU attacks with `--dereference`/`-L`**: Following symlinks is requested behavior and cannot
+  be hardened. See [TOCTTOU Vulnerabilities](tocttou.md) for details.
+- **TOCTTOU on non-Linux**: The hardened path is Linux-only; non-Linux builds use path-based
+  operations. See [TOCTTOU Vulnerabilities](tocttou.md).
+- **Trust of the operand path's prefix**: The hardening protects everything at or below the named
+  root, but the tools do not verify that the directories *above* it are free of less-privileged
+  control. `--require-toctou-safe` enforces the hardened walk (refusing `-L`/non-Linux); the prefix
+  trust is the caller's responsibility — see the
   [Scope of TOCTOU safety](tocttou.md#scope-of-toctou-safety) section.
 
-On Linux, the default (non-`-L`) local hardening is implemented through a single shared
-safe-walk driver (`common/src/walk_driver.rs`): `rcp` (copy), `rchm`, and `rrm` are
-`WalkVisitor` implementations, so the recursive walk — and in particular the leaf-permit
-"drop before recursion" deadlock invariant — lives in one place rather than being
-hand-maintained per tool. The trusted/hardened boundary is type-enforced via `TrustedDir`,
-and `DT_UNKNOWN` filter classification goes through the single `filter_is_dir` path. `rlink`
-remains dual-tree (source plus `--update`) but shares the same substrate. See
-[TOCTTOU Vulnerabilities](tocttou.md) for the full mechanism.
+On Linux, the default (non-`-L`) local hardening is implemented through a single shared safe-walk
+driver (`common/src/walk_driver.rs`): `rcp` (copy), `rchm`, and `rrm` are `WalkVisitor`
+implementations, so the recursive walk — and in particular the leaf-permit "drop before recursion"
+deadlock invariant — lives in one place rather than being hand-maintained per tool. The
+trusted/hardened boundary is type-enforced via `TrustedDir`, and `DT_UNKNOWN` filter classification
+goes through the single `filter_is_dir` path. `rlink` remains dual-tree (source plus `--update`) but
+shares the same substrate. See [TOCTTOU Vulnerabilities](tocttou.md) for the full mechanism.
 
 ## Threat Model
 
 ### Threats Mitigated
 
-| Threat | Mitigation |
-|--------|------------|
-| **Passive eavesdropping** | TLS encryption prevents reading data |
-| **Active MITM** | Fingerprint verification fails for wrong certificate |
-| **Rogue rcpd connection** | TLS handshake fails - wrong/missing fingerprint |
-| **Connection racing** | Attacker cannot present correct certificate |
-| **Data tampering** | AEAD detects any modification |
-| **Session hijacking** | TLS session keys are connection-specific |
+| Threat                    | Mitigation                                           |
+| ------------------------- | ---------------------------------------------------- |
+| **Passive eavesdropping** | TLS encryption prevents reading data                 |
+| **Active MITM**           | Fingerprint verification fails for wrong certificate |
+| **Rogue rcpd connection** | TLS handshake fails - wrong/missing fingerprint      |
+| **Connection racing**     | Attacker cannot present correct certificate          |
+| **Data tampering**        | AEAD detects any modification                        |
+| **Session hijacking**     | TLS session keys are connection-specific             |
 
 ### Race Condition Prevention
 
-A potential attack vector is an attacker racing to connect to a freshly started rcpd
-listener before the legitimate master does. Certificate fingerprint verification prevents
-an attacker from *authenticating* — it cannot establish a trusted session or impersonate
-the master:
+A potential attack vector is an attacker racing to connect to a freshly started rcpd listener before
+the legitimate master does. Certificate fingerprint verification prevents an attacker from
+*authenticating* — it cannot establish a trusted session or impersonate the master:
 
 1. Attacker observes SSH spawning rcpd and probes rcpd's TCP port
 2. Attacker attempts a TLS handshake before master connects
-3. rcpd requires a client certificate and verifies its fingerprint against
-   `--master-cert-fp` (received via SSH)
-4. **Attacker's certificate has wrong fingerprint** - handshake rejected, no authenticated
-   session is established (confidentiality and integrity are preserved)
+3. rcpd requires a client certificate and verifies its fingerprint against `--master-cert-fp`
+   (received via SSH)
+4. **Attacker's certificate has wrong fingerprint** - handshake rejected, no authenticated session
+   is established (confidentiality and integrity are preserved)
 
-**Availability caveat**: this protects authenticity, not availability. None of the
-listeners bound the TLS handshake duration, and each awaits handshakes serially, so an
-attacker who can reach a listening port before the legitimate peer can deny service:
+**Availability caveat**: this protects authenticity, not availability. None of the listeners bound
+the TLS handshake duration, and each awaits handshakes serially, so an attacker who can reach a
+listening port before the legitimate peer can deny service:
 
-- **Master-facing listeners (rcpd):** accept the two master connections one at a time and
-  treat a failed handshake as fatal — a wrong-certificate attempt aborts rcpd, and a client
-  that stalls mid-handshake blocks it.
-- **Source↔destination listeners (source rcpd):** the control listener likewise propagates
-  a failed handshake as fatal; the data listener logs and continues on failure, but a peer
-  that stalls mid-handshake still blocks the accept loop.
+- **Master-facing listeners (rcpd):** accept the two master connections one at a time and treat a
+  failed handshake as fatal — a wrong-certificate attempt aborts rcpd, and a client that stalls
+  mid-handshake blocks it.
+- **Source↔destination listeners (source rcpd):** the control listener likewise propagates a failed
+  handshake as fatal; the data listener logs and continues on failure, but a peer that stalls
+  mid-handshake still blocks the accept loop.
 
-Reaching these ports requires network access to the (typically trusted) source/destination
-hosts; restrict it with `--port-ranges` plus firewall rules. Bounding each handshake with a
-timeout and tolerating failed attempts is a planned hardening.
+Reaching these ports requires network access to the (typically trusted) source/destination hosts;
+restrict it with `--port-ranges` plus firewall rules. Bounding each handshake with a timeout and
+tolerating failed attempts is a planned hardening.
 
 ### Cipher Suites
 
@@ -248,14 +246,14 @@ With TLS 1.3, the following cipher suites are used:
 - `TLS_AES_128_GCM_SHA256` (fallback)
 - `TLS_CHACHA20_POLY1305_SHA256` (software-only systems)
 
-These are the TLS 1.3 suites of the rustls `ring` provider; rcp does not override
-cipher-suite selection or ordering. TLS 1.3 is **pinned** — every connection is configured
-for TLS 1.3 only (`builder_with_protocol_versions`), so TLS 1.2 is never negotiated. This is
-safe to do unconditionally: TLS 1.3 has been available at both ends since the TLS layer was
-introduced (rustls has always offered it), so pinning never excludes a legitimate rcp/rcpd
-peer. A peer that cannot negotiate 1.3 simply fails the handshake — the correct outcome —
-rather than silently downgrading. (This does not depend on the version check, which
-`--auto-deploy-rcpd` can bypass; see [Remote Copy](remote_copy.md).)
+These are the TLS 1.3 suites of the rustls `ring` provider; rcp does not override cipher-suite
+selection or ordering. TLS 1.3 is **pinned** — every connection is configured for TLS 1.3 only
+(`builder_with_protocol_versions`), so TLS 1.2 is never negotiated. This is safe to do
+unconditionally: TLS 1.3 has been available at both ends since the TLS layer was introduced (rustls
+has always offered it), so pinning never excludes a legitimate rcp/rcpd peer. A peer that cannot
+negotiate 1.3 simply fails the handshake — the correct outcome — rather than silently downgrading.
+(This does not depend on the version check, which `--auto-deploy-rcpd` can bypass; see
+[Remote Copy](remote_copy.md).)
 
 ## Disabling Encryption
 
@@ -265,24 +263,26 @@ For trusted networks where encryption overhead is undesirable, use `--no-encrypt
 rcp --no-encryption source:/path dest:/path
 ```
 
-**Important**: `--no-encryption` disables **both encryption AND authentication** on **all**
-rcp TCP connections — master↔rcpd (control and tracing) as well as Source↔Destination
-(control and data). With this flag:
+**Important**: `--no-encryption` disables **both encryption AND authentication** on **all** rcp TCP
+connections — master↔rcpd (control and tracing) as well as Source↔Destination (control and data).
+With this flag:
 
 - All traffic (control messages and file data) is transmitted in plaintext
 - Every listener accepts connections from anyone who can reach its port (rcpd advertises
   `RCP_TCP <addr>` with no fingerprint)
-- SSH authenticates only the *spawning* of rcpd — the subsequent TCP connections are made
-  directly to rcpd's port and are not protected by SSH
+- SSH authenticates only the *spawning* of rcpd — the subsequent TCP connections are made directly
+  to rcpd's port and are not protected by SSH
 
 The security model with `--no-encryption` relies entirely on network isolation.
 
 **When to use `--no-encryption`:**
+
 - Isolated datacenter networks with no untrusted traffic
 - Performance-critical transfers on physically secured networks
 - Testing and debugging
 
 **When NOT to use `--no-encryption`:**
+
 - Any network with potential eavesdroppers or MITM attackers
 - Cross-datacenter transfers over public internet
 - Transfers containing sensitive data
@@ -363,13 +363,12 @@ The rcp security model provides:
 
 **Limitations**:
 
-- ⚠️ **TOCTTOU with `--dereference`/`-L`**: Following symlinks is requested behavior and
-  is not hardened. On Linux, all other default paths (local copy/link/chmod/rm/delete,
-  remote copy source+destination) are fully TOCTOU-hardened. Non-Linux builds are not
-  hardened. Use `--require-toctou-safe` in sudo rules to enforce the hardened walk (it
-  refuses `-L`/non-Linux). The trust of the destination path's prefix is the caller's
-  responsibility, not verified in-tool — see the
-  [Scope of TOCTOU safety](tocttou.md#scope-of-toctou-safety) section of
+- ⚠️ **TOCTTOU with `--dereference`/`-L`**: Following symlinks is requested behavior and is not
+  hardened. On Linux, all other default paths (local copy/link/chmod/rm/delete, remote copy
+  source+destination) are fully TOCTOU-hardened. Non-Linux builds are not hardened. Use
+  `--require-toctou-safe` in sudo rules to enforce the hardened walk (it refuses `-L`/non-Linux).
+  The trust of the destination path's prefix is the caller's responsibility, not verified in-tool —
+  see the [Scope of TOCTOU safety](tocttou.md#scope-of-toctou-safety) section of
   [TOCTTOU Vulnerabilities](tocttou.md) for details.
 
 Use `--no-encryption` only on trusted networks where performance is critical.

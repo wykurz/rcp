@@ -2,22 +2,25 @@
 
 This file provides guidance to AI coding agents when working with code in this repository.
 
-For project overview and tool descriptions, see [README.md](README.md).
-For coding conventions, see [CONVENTIONS.md](CONVENTIONS.md).
-For design and reference documentation, see the [docs/](docs/) directory.
+For project overview and tool descriptions, see [README.md](README.md). For coding conventions, see
+[CONVENTIONS.md](CONVENTIONS.md). For design and reference documentation, see the [docs/](docs/)
+directory.
 
 ## Build & Test Commands
 
-This project uses [`just`](https://github.com/casey/just). Always prefer `just` commands over direct `cargo` commands.
+This project uses [`just`](https://github.com/casey/just). Always prefer `just` commands over direct
+`cargo` commands.
 
 ### Setup
 
 **Using nix (recommended):**
+
 ```bash
 nix develop  # automatically includes just and all dev tools
 ```
 
 **Without nix:**
+
 ```bash
 cargo install just
 cargo install cargo-nextest  # required for `just test`, `just test-release`, `just test-all`, and `just ci`
@@ -37,11 +40,14 @@ cargo install cargo-nextest  # required for `just test`, `just test-release`, `j
 - `just doc` — check docs build
 - `just ci` — full CI checks (lint + doc + test-all + Docker tests)
 
-**IMPORTANT**: Always run `just ci` before committing changes. CI workflows run debug and release tests in parallel to catch optimization-related bugs.
+**IMPORTANT**: Always run `just ci` before committing changes. CI workflows run debug and release
+tests in parallel to catch optimization-related bugs.
 
 ## Critical Conventions
 
-General coding conventions are in [CONVENTIONS.md](CONVENTIONS.md). Several rules below are enforced by CI scripts (each such subsection explicitly names the check); other guidance is still expected to be followed even if not CI-checked.
+General coding conventions are in [CONVENTIONS.md](CONVENTIONS.md). Several rules below are enforced
+by CI scripts (each such subsection explicitly names the check); other guidance is still expected to
+be followed even if not CI-checked.
 
 ### Error Logging
 
@@ -81,7 +87,8 @@ Enforced by `scripts/check-anyhow-error-msg.sh`.
 
 All workspace packages must have consistent `Cargo.toml`:
 
-1. Workspace inheritance: `version.workspace = true`, `edition.workspace = true`, `license.workspace = true`, `repository.workspace = true`
+1. Workspace inheritance: `version.workspace = true`, `edition.workspace = true`,
+   `license.workspace = true`, `repository.workspace = true`
 2. Lints: `[lints] workspace = true`
 3. Identical `[package.metadata.docs.rs]`:
 
@@ -101,44 +108,58 @@ Enforced by `scripts/check-package-metadata.sh`.
 ### Structural Simplification
 
 Always look for structural simplifications in the area you touch. The goal is simplicity —
-de-duplication is a means to it, not an absolute rule. The most common smell: re-deriving a
-value from raw input that an earlier stage already computed (e.g. re-parsing a string the CLI
-already parsed into a typed value); re-derivation drifts from the source of truth and breeds
-inconsistency bugs. Thread the already-computed value through when that is the simpler shape;
-keep a small redundancy when *it* is. Apply low-risk simplifications as part of the change;
-describe larger restructurings in the PR rather than bundling them.
+de-duplication is a means to it, not an absolute rule. The most common smell: re-deriving a value
+from raw input that an earlier stage already computed (e.g. re-parsing a string the CLI already
+parsed into a typed value); re-derivation drifts from the source of truth and breeds inconsistency
+bugs. Thread the already-computed value through when that is the simpler shape; keep a small
+redundancy when *it* is. Apply low-risk simplifications as part of the change; describe larger
+restructurings in the PR rather than bundling them.
 
 ## Testing
 
-Name tests after observed behavior (e.g., `copies_directory_tree`, `fails_on_permission_denied`). Use the `filegen` crate for repeatable fixtures.
+Name tests after observed behavior (e.g., `copies_directory_tree`, `fails_on_permission_denied`).
+Use the `filegen` crate for repeatable fixtures.
 
 When modifying function signatures or parameters, verify:
-1. Tests still pass: `just test`
-2. Doc examples still compile and run: `just doctest` (and optionally `just doc` to verify generated docs with warnings denied)
 
-For test categories, Docker multi-host tests, chaos tests, and sudo-required tests, see [docs/testing.md](docs/testing.md).
+1. Tests still pass: `just test`
+2. Doc examples still compile and run: `just doctest` (and optionally `just doc` to verify generated
+   docs with warnings denied)
+
+For test categories, Docker multi-host tests, chaos tests, and sudo-required tests, see
+[docs/testing.md](docs/testing.md).
 
 ## Remote Operations
 
-Before making any changes to remote copy operations, **always read [docs/remote_protocol.md](docs/remote_protocol.md) first**. It is the source of truth for protocol behavior and must be kept in sync with the implementation. For operational aspects (binary discovery, deployment, connectivity), see [docs/remote_copy.md](docs/remote_copy.md).
+Before making any changes to remote copy operations, **always read
+[docs/remote_protocol.md](docs/remote_protocol.md) first**. It is the source of truth for protocol
+behavior and must be kept in sync with the implementation. For operational aspects (binary
+discovery, deployment, connectivity), see [docs/remote_copy.md](docs/remote_copy.md).
 
-**Remote tests** require localhost SSH available and usable (`ssh localhost` must succeed). Tests fail fast if unavailable — they are never skipped based on environment.
+**Remote tests** require localhost SSH available and usable (`ssh localhost` must succeed). Tests
+fail fast if unavailable — they are never skipped based on environment.
 
 **Security**: Never commit SSH config or keys to the repository.
 
 ## Pull Requests
 
-After creating a PR, check all review comments (including automated ones from Copilot). Evaluate each on its merit — address valid suggestions and respond to ones that aren't applicable.
+After creating a PR, check all review comments (including automated ones from Copilot). Evaluate
+each on its merit — address valid suggestions and respond to ones that aren't applicable.
 
 ## Commit Guidelines
 
-Keep commit subjects concise and imperative, matching the existing history style (e.g., "Fix how we manage dependencies"). Provide context and issue links in the body when applicable.
+Keep commit subjects concise and imperative, matching the existing history style (e.g., "Fix how we
+manage dependencies"). Provide context and issue links in the body when applicable.
 
-Squash work-in-progress commits before opening a PR — land clean, reviewable commits. Never commit working specs or implementation plans (e.g. `docs/superpowers/`, which is gitignored); they are session artifacts.
+Squash work-in-progress commits before opening a PR — land clean, reviewable commits. Never commit
+working specs or implementation plans (e.g. `docs/superpowers/`, which is gitignored); they are
+session artifacts.
 
 ## Shell Compatibility
 
-The user's shell is `fish`, not `bash`. For bash-specific syntax (`for` loops, `$(...)` substitutions):
+The user's shell is `fish`, not `bash`. For bash-specific syntax (`for` loops, `$(...)`
+substitutions):
+
 - Wrap in `bash -c '...'`, or
 - Write to `/tmp/*.sh` and execute
 

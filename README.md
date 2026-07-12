@@ -1,9 +1,9 @@
 <img src="https://raw.githubusercontent.com/wykurz/rcp/main/assets/logo.svg" height="64" alt="RCP Tools Logo">
 
-RCP TOOLS
-=========
+# RCP TOOLS
 
-This repo contains tools to efficiently copy, remove and link large filesets, both locally and across remote hosts.
+This repo contains tools to efficiently copy, remove and link large filesets, both locally and
+across remote hosts.
 
 [![Build status](https://github.com/wykurz/rcp/actions/workflows/rust.yml/badge.svg)](https://github.com/wykurz/rcp/actions)
 [![Chaos Tests](https://github.com/wykurz/rcp/actions/workflows/chaos-tests.yml/badge.svg)](https://github.com/wykurz/rcp/actions/workflows/chaos-tests.yml)
@@ -14,24 +14,26 @@ This repo contains tools to efficiently copy, remove and link large filesets, bo
 
 ![Demo](assets/demo.gif)
 
-- `rcp` is for copying files; similar to `cp` but generally MUCH faster when dealing with large filesets.
+- `rcp` is for copying files; similar to `cp` but generally MUCH faster when dealing with large
+  filesets.
 
-    Supports both local and remote copying using `host:/path` syntax (similar to `scp`).
+  Supports both local and remote copying using `host:/path` syntax (similar to `scp`).
 
-    Inspired by tools like `dsync`(1) and `pcp`(2).
+  Inspired by tools like `dsync`(1) and `pcp`(2).
 
 - `rrm` is for removing large filesets.
 
-- `rchm` is for recursively changing permissions and ownership of large filesets; a fast replacement for `dchmod`(3).
+- `rchm` is for recursively changing permissions and ownership of large filesets; a fast replacement
+  for `dchmod`(3).
 
-- `rlink` allows hard-linking filesets with optional update path; typically used for hard-linking datasets with a delta.
+- `rlink` allows hard-linking filesets with optional update path; typically used for hard-linking
+  datasets with a delta.
 
 - `rcmp` tool is for comparing filesets.
 
 - `filegen` tool generates sample filesets, useful for testing.
 
-Documentation
-=============
+# Documentation
 
 API documentation for the command-line tools is available on docs.rs:
 
@@ -43,11 +45,13 @@ API documentation for the command-line tools is available on docs.rs:
 - [rcp-tools-filegen](https://docs.rs/rcp-tools-filegen) - Test file generation utility
 
 **For contributors**: Internal library crates used by the tools above:
+
 - [rcp-tools-common](https://docs.rs/rcp-tools-common) - Shared utilities and types
 - [rcp-tools-remote](https://docs.rs/rcp-tools-remote) - Remote operation protocol
 - [rcp-tools-throttle](https://docs.rs/rcp-tools-throttle) - Resource throttling
 
 **Design and reference documents** (in the `docs/` directory):
+
 - [Security](docs/security.md) - Threat model and security architecture
 - [Remote Copy](docs/remote_copy.md) - rcpd deployment, version checking, troubleshooting
 - [Remote Protocol](docs/remote_protocol.md) - Wire protocol specification
@@ -55,53 +59,68 @@ API documentation for the command-line tools is available on docs.rs:
 - [Testing](docs/testing.md) - Test infrastructure and Docker multi-host testing
 - [TOCTTOU Vulnerabilities](docs/tocttou.md) - TOCTTOU threat model and fd-based hardening
 
-Examples
-========
+# Examples
 
 Basic local copy with progress-bar and summary at the end:
+
 ```fish
 > rcp <foo> <bar> --progress --summary
 ```
 
 Copy while preserving metadata, overwrite/update destination if it already exists:
+
 ```fish
 > rcp <foo> <bar> --preserve-settings=all --progress --summary --overwrite
 ```
 
 Remote copy from one host to another:
+
 ```fish
 > rcp user@host1:/path/to/source user@host2:/path/to/dest --progress --summary
 ```
-Copies files from `host1` to `host2`. The `rcpd` process is automatically started on both hosts via SSH.
+
+Copies files from `host1` to `host2`. The `rcpd` process is automatically started on both hosts via
+SSH.
 
 Copy from remote host to local machine:
+
 ```fish
 > rcp host:/remote/path /local/path --progress --summary
 ```
 
 Copy from local machine to remote host and preserve metadata:
+
 ```fish
 > rcp /local/path host:/remote/path --progress --summary --preserve-settings=all
 ```
 
 Remote copy with automatic rcpd deployment:
+
 ```fish
 > rcp /local/data remote-host:/backup --auto-deploy-rcpd --progress
 ```
-Automatically deploys rcpd to the remote host if not already installed. Useful for dynamic infrastructure, development environments, or when rcpd is not pre-installed on remote hosts.
+
+Automatically deploys rcpd to the remote host if not already installed. Useful for dynamic
+infrastructure, development environments, or when rcpd is not pre-installed on remote hosts.
 
 Log tool output to a file while using progress bar:
+
 ```fish
 > rcp <foo> <bar> --progress --summary > copy.log
 ```
-Progress bar is sent to `stderr` while log messages go to `stdout`. This allows us to pipe `stdout` to a file to preserve the tool output while still viewing the interactive progress bar. This works for all RCP tools.
+
+Progress bar is sent to `stderr` while log messages go to `stdout`. This allows us to pipe `stdout`
+to a file to preserve the tool output while still viewing the interactive progress bar. This works
+for all RCP tools.
 
 Remove a path recursively:
+
 ```fish
 > rrm <bar> --progress --summary
 ```
 
 Recursively change group and permissions:
+
 ```fish
 # join group 'data'; add group rwx + setgid to dirs, group rw to files
 > rchm --group data --mode "f:g+rw d:g+rwxs" <path> --progress --summary
@@ -109,22 +128,31 @@ Recursively change group and permissions:
 # dchmod-style: one mode for everything (bare value, no type prefix)
 > rchm --mode g+rwX <path> --progress
 ```
-`--mode`, `--group` and `--owner` take a per-type DSL: a bare value applies to all applicable types, `f:`/`d:`/`l:` prefixes target one. See [Permissions and ownership (`rchm`)](#permissions-and-ownership-rchm) for the full rules and [Security](#security) for privileged use (`sudo`, `--no-setid`).
+
+`--mode`, `--group` and `--owner` take a per-type DSL: a bare value applies to all applicable types,
+`f:`/`d:`/`l:` prefixes target one. See
+[Permissions and ownership (`rchm`)](#permissions-and-ownership-rchm) for the full rules and
+[Security](#security) for privileged use (`sudo`, `--no-setid`).
 
 Hard-link contents of one path to another:
+
 ```fish
 > rlink <foo> <bar> --progress --summary
 ```
+
 Roughly equivalent to: `cp -p --link <foo> <bar>`.
 
 Hard-link contents of `<foo>` to `<baz>` if they are identical to `<bar>`:
+
 ```fish
 > rlink <foo> --update <bar> <baz> --update-exclusive --progress --summary
 ```
-Using `--update-exclusive` means that if a file is present in `<foo>` but not in `<bar>` it will be ignored.
-Roughly equivalent to: `rsync -a --link-dest=<foo> <bar> <baz>`.
+
+Using `--update-exclusive` means that if a file is present in `<foo>` but not in `<bar>` it will be
+ignored. Roughly equivalent to: `rsync -a --link-dest=<foo> <bar> <baz>`.
 
 Control which metadata is preserved with `--preserve-settings`:
+
 ```fish
 # preserve nothing (directories get default mode, no uid/gid/time)
 > rlink <foo> <bar> --preserve-settings=none
@@ -132,11 +160,17 @@ Control which metadata is preserved with `--preserve-settings`:
 # custom: preserve uid, gid, and time on files and dirs
 > rlink <foo> <bar> --preserve-settings="f:uid,gid,time,0777 d:uid,gid,time,0777 l:uid,gid,time"
 ```
-Hard-linked files always share metadata with their source via the inode -- preserve settings affect directories and symlinks in all modes, and additionally files that are copied (not linked) during `--update` operations. By default `rlink` uses `--preserve-settings=all`.
 
-When using `--update` with `--preserve-settings` that does not cover all compared attributes (e.g. `--preserve-settings=none` while `--update-compare=size,mtime`), `rlink` will error to prevent silent data integrity issues. Use `--allow-lossy-update` to override.
+Hard-linked files always share metadata with their source via the inode -- preserve settings affect
+directories and symlinks in all modes, and additionally files that are copied (not linked) during
+`--update` operations. By default `rlink` uses `--preserve-settings=all`.
+
+When using `--update` with `--preserve-settings` that does not cover all compared attributes (e.g.
+`--preserve-settings=none` while `--update-compare=size,mtime`), `rlink` will error to prevent
+silent data integrity issues. Use `--allow-lossy-update` to override.
 
 Compare `<foo>` vs. `<bar>`:
+
 ```fish
 # differences are printed to stdout by default
 > rcmp <foo> <bar> --progress --summary
@@ -151,15 +185,15 @@ Compare `<foo>` vs. `<bar>`:
 > rcmp <foo> <bar> --quiet --log compare.log
 ```
 
-Installation
-============
+# Installation
 
 <img src="https://raw.githubusercontent.com/NixOS/nixos-artwork/master/logo/nix-snowflake-colours.svg" height="64" alt="Nix">
 
-nixpkgs
--------
+## nixpkgs
 
-All tools are available via nixpkgs under [rcp](https://github.com/NixOS/nixpkgs/blob/nixos-unstable/pkgs/by-name/rc/rcp/package.nix) package name.
+All tools are available via nixpkgs under
+[rcp](https://github.com/NixOS/nixpkgs/blob/nixos-unstable/pkgs/by-name/rc/rcp/package.nix) package
+name.
 
 The following command will install all the tools on your system:
 
@@ -167,60 +201,70 @@ The following command will install all the tools on your system:
 > nix-env -iA nixpkgs.rcp
 ```
 
-crates.io
----------
+## crates.io
 
-All tools are available on [crates.io](https://crates.io/search?q=rcp-tools). Individual tools can be installed using `cargo install`:
+All tools are available on [crates.io](https://crates.io/search?q=rcp-tools). Individual tools can
+be installed using `cargo install`:
 
 ```fish
 > cargo install rcp-tools-rcp
 ```
 
-debian / rhel
--------------
+## debian / rhel
 
 Starting with release `v0.10.1`, .deb and .rpm packages are available as part of each release.
 
-Static musl builds
-------------------
+## Static musl builds
 
-The repository is configured to build static musl binaries by default via `.cargo/config.toml`. Simply run `cargo build` or `cargo build --release` to produce fully static binaries. To build glibc binaries instead, use `cargo build --target x86_64-unknown-linux-gnu`.
+The repository is configured to build static musl binaries by default via `.cargo/config.toml`.
+Simply run `cargo build` or `cargo build --release` to produce fully static binaries. To build glibc
+binaries instead, use `cargo build --target x86_64-unknown-linux-gnu`.
 
-For development, enter the nix environment (`nix develop`) to get all required tools including the musl toolchain. Outside nix shell, install the musl target with `rustup target add x86_64-unknown-linux-musl` and ensure you have musl-tools installed (e.g., `apt-get install musl-tools` on Ubuntu/Debian).
+For development, enter the nix environment (`nix develop`) to get all required tools including the
+musl toolchain. Outside nix shell, install the musl target with
+`rustup target add x86_64-unknown-linux-musl` and ensure you have musl-tools installed (e.g.,
+`apt-get install musl-tools` on Ubuntu/Debian).
 
-General controls
-================
+# General controls
 
 ## Copy semantics
 
-The copy semantics for RCP tools differ slightly from how e.g. the `cp` tool works. This is because of the ambiguity in the result of a `cp` operation that we wanted to avoid.
+The copy semantics for RCP tools differ slightly from how e.g. the `cp` tool works. This is because
+of the ambiguity in the result of a `cp` operation that we wanted to avoid.
 
-Specifically, the result of `cp foo/x bar/x` depends on `bar/x` being a directory. If so, the resulting path will be `bar/x/x` (which is usually undesired), otherwise it will be `bar/x`.
+Specifically, the result of `cp foo/x bar/x` depends on `bar/x` being a directory. If so, the
+resulting path will be `bar/x/x` (which is usually undesired), otherwise it will be `bar/x`.
 
 To avoid this confusion, RCP tools:
+
 - will NOT overwrite data by default (use `--overwrite` to change)
 - do assume that a path WITHOUT a trailing slash is the final name of the destination and
 - path ending in slash is a directory into which we want to copy the sources (without renaming)
 
-The following examples illustrate this (_those rules apply to both `rcp` and `rlink`_):
+The following examples illustrate this (*those rules apply to both `rcp` and `rlink`*):
 
 - `rcp A/B C/D` - copy `A/B` into `C/` and name it `D`; if `C/D` exists fail immediately
-- `rcp A/B C/D/` - copy `B` into `D` WITHOUT renaming i.e., the resulting path will be `C/D/B`; if `C/D/B` exists fail immediately
+- `rcp A/B C/D/` - copy `B` into `D` WITHOUT renaming i.e., the resulting path will be `C/D/B`; if
+  `C/D/B` exists fail immediately
 
-Using `rcp` it's also possible to copy multiple sources into a single destination, but the destination MUST have a trailing slash (`/`):
-- `rcp A B C D/` - copy `A`, `B` and `C` into `D` WITHOUT renaming i.e., the resulting paths will be `D/A`, `D/B` and `D/C`; if any of which exist fail immediately
+Using `rcp` it's also possible to copy multiple sources into a single destination, but the
+destination MUST have a trailing slash (`/`):
+
+- `rcp A B C D/` - copy `A`, `B` and `C` into `D` WITHOUT renaming i.e., the resulting paths will be
+  `D/A`, `D/B` and `D/C`; if any of which exist fail immediately
 
 ## Path handling (tilde `~` support)
 
 - Local paths: leading `~` or `~/...` expands to your local `$HOME`.
-- Remote paths: leading `~/...` expands to the remote user’s `$HOME` (resolved over SSH). Other `~user` forms are not supported.
-- Remote paths may be absolute, start with `~/`, or be relative. Relative remote paths are resolved against the local current working directory before being used remotely.
+- Remote paths: leading `~/...` expands to the remote user’s `$HOME` (resolved over SSH). Other
+  `~user` forms are not supported.
+- Remote paths may be absolute, start with `~/`, or be relative. Relative remote paths are resolved
+  against the local current working directory before being used remotely.
 
 ## Throttling
 
-Two complementary mechanisms: **static caps** that you set once based on
-budget or policy, and **adaptive metadata throttling** that watches
-filesystem latency and adjusts concurrency on the fly.
+Two complementary mechanisms: **static caps** that you set once based on budget or policy, and
+**adaptive metadata throttling** that watches filesystem latency and adjusts concurrency on the fly.
 
 ### Static caps
 
@@ -231,17 +275,16 @@ filesystem latency and adjusts concurrency on the fly.
   - MUST be used with `--chunk-size`, which is used to calculate I/O operations per file
 
 - set `--max-open-files` to limit the maximum number of open files
-  - RCP tools will automatically adjust the maximum based on the system limits however, this setting can be used if there are additional constraints
+  - RCP tools will automatically adjust the maximum based on the system limits however, this setting
+    can be used if there are additional constraints
 
 ### Adaptive metadata throttling (`--auto-meta-throttle`)
 
-Pass `--auto-meta-throttle` to enable a latency-ratio controller
-that watches per-op latency and grows or shrinks the in-flight
-concurrency cap (`cwnd`) on the fly. The controller stays just below
-the saturation point of whatever metadata path the tool is hitting —
-useful on shared distributed filesystems (Weka, Lustre, NFS, etc.)
-where a fixed `--ops-throttle` is hard to pick: too low and the job
-takes all day, too high and the filesystem suffers.
+Pass `--auto-meta-throttle` to enable a latency-ratio controller that watches per-op latency and
+grows or shrinks the in-flight concurrency cap (`cwnd`) on the fly. The controller stays just below
+the saturation point of whatever metadata path the tool is hitting — useful on shared distributed
+filesystems (Weka, Lustre, NFS, etc.) where a fixed `--ops-throttle` is hard to pick: too low and
+the job takes all day, too high and the filesystem suffers.
 
 ```fish
 # Adaptive throttling alone — recommended default for distributed FS.
@@ -255,24 +298,19 @@ takes all day, too high and the filesystem suffers.
 > rcp --auto-meta-throttle --ops-throttle=5000 src/ dst/
 ```
 
-**Remote copies** propagate `--auto-meta-*` flags to both `rcpd`
-processes (source and destination) automatically, so each side runs
-its own controller against the local part of the filesystem it
+**Remote copies** propagate `--auto-meta-*` flags to both `rcpd` processes (source and destination)
+automatically, so each side runs its own controller against the local part of the filesystem it
 actually observes.
 
-**Tuning knobs** (all listed under `--help-all` on each binary): the
-initial / minimum / maximum `cwnd`, the grow/shrink ratio thresholds
-(`alpha`, `beta`), the baseline / current percentiles used to
-summarize the long and short windows, the long / short window
-durations, per-tick step sizes, and the control-loop tick cadence.
-The defaults ship a cross-percentile signal (baseline `p10`, current
-`p50`) with `alpha = 1.3` and `beta = 1.8` bracketing the typical
-inter-quantile spread of metadata syscalls, and are a good starting
-point.
+**Tuning knobs** (all listed under `--help-all` on each binary): the initial / minimum / maximum
+`cwnd`, the grow/shrink ratio thresholds (`alpha`, `beta`), the baseline / current percentiles used
+to summarize the long and short windows, the long / short window durations, per-tick step sizes, and
+the control-loop tick cadence. The defaults ship a cross-percentile signal (baseline `p10`, current
+`p50`) with `alpha = 1.3` and `beta = 1.8` bracketing the typical inter-quantile spread of metadata
+syscalls, and are a good starting point.
 
-For the design rationale (why concurrency is the lever, what
-`cwnd` is, the exact control law including worked ratio→action
-examples, and how the controller stays robust to load it generates
+For the design rationale (why concurrency is the lever, what `cwnd` is, the exact control law
+including worked ratio→action examples, and how the controller stays robust to load it generates
 itself), see [docs/congestion_control.md](docs/congestion_control.md).
 
 ## Error handling
@@ -282,14 +320,17 @@ itself), see [docs/congestion_control.md](docs/congestion_control.md).
 
 ## Remote copy configuration
 
-When using remote paths (`host:/path` syntax), `rcp` automatically starts `rcpd` daemons on remote hosts via SSH.
+When using remote paths (`host:/path` syntax), `rcp` automatically starts `rcpd` daemons on remote
+hosts via SSH.
 
 **Requirements:**
+
 - SSH access to remote hosts (uses your SSH config and keys)
 - `rcpd` binary available on remote hosts (see **Auto-deployment** below for automatic setup)
 
-**Auto-deployment:**
-Starting with v0.22.0, `rcp` can automatically deploy `rcpd` to remote hosts using the `--auto-deploy-rcpd` flag. This eliminates the need to manually install `rcpd` on each remote host.
+**Auto-deployment:** Starting with v0.22.0, `rcp` can automatically deploy `rcpd` to remote hosts
+using the `--auto-deploy-rcpd` flag. This eliminates the need to manually install `rcpd` on each
+remote host.
 
 ```fish
 # automatic deployment - no manual setup required
@@ -297,6 +338,7 @@ Starting with v0.22.0, `rcp` can automatically deploy `rcpd` to remote hosts usi
 ```
 
 When auto-deployment is enabled:
+
 - `rcp` finds the local `rcpd` binary (same directory or PATH)
 - Deploys it to `~/.cache/rcp/bin/rcpd-{version}` on remote hosts via SSH
 - Verifies integrity using SHA-256 checksums
@@ -304,16 +346,19 @@ When auto-deployment is enabled:
 - Reuses deployed binaries for subsequent operations (cached until version changes)
 
 Manual deployment is still supported and may be preferred for:
+
 - Air-gapped environments where auto-deployment is not feasible
 - Production systems with strict change control
 - Situations where you want to verify the binary before deployment
 
 **Configuration options:**
-- `--port-ranges` - restrict TCP data ports to specific ranges (e.g., "8000-8999")
-- `--remote-copy-conn-timeout-sec` - connection timeout in seconds (default: 15; 60 with `--auto-deploy-rcpd`)
 
-**Architecture:**
-The remote copy uses a three-node architecture:
+- `--port-ranges` - restrict TCP data ports to specific ranges (e.g., "8000-8999")
+- `--remote-copy-conn-timeout-sec` - connection timeout in seconds (default: 15; 60 with
+  `--auto-deploy-rcpd`)
+
+**Architecture:** The remote copy uses a three-node architecture:
+
 - Master (`rcp`) orchestrates the copy operation
 - Source `rcpd` reads files from source host
 - Destination `rcpd` writes files to destination host
@@ -326,49 +371,55 @@ For detailed network connectivity and troubleshooting information, see `docs/rem
 **Remote copy uses SSH for authentication and TLS 1.3 for encrypted data transfer.**
 
 **Security Model:**
+
 - **SSH Authentication**: All remote operations require SSH authentication first
 - **TLS Encryption**: Data transfers are encrypted by default using TLS 1.3 with certificate pinning
 - **Mutual Authentication**: Both source and destination verify each other's certificates
 
 **What's Protected:**
+
 - ✅ Unauthorized access (SSH authentication required)
 - ✅ Data encryption (TLS 1.3 with AES-256-GCM)
 - ✅ Man-in-the-middle attacks (certificate fingerprint verification)
 
-**Performance Option:**
-For trusted networks where encryption overhead is undesirable, use `--no-encryption`:
+**Performance Option:** For trusted networks where encryption overhead is undesirable, use
+`--no-encryption`:
+
 ```fish
 > rcp --no-encryption source:/path dest:/path
 ```
+
 Warning: This disables both encryption and authentication on **all** rcp TCP connections
-(master↔rcpd control and tracing, plus source↔destination control and data) — not just the
-file-data path. Every rcpd listener then accepts connections from anyone who can reach its
-port; only SSH still authenticates rcpd startup.
+(master↔rcpd control and tracing, plus source↔destination control and data) — not just the file-data
+path. Every rcpd listener then accepts connections from anyone who can reach its port; only SSH
+still authenticates rcpd startup.
 
 **Best Practices:**
+
 - Use SSH key-based authentication
 - Keep encryption enabled (default) for sensitive data
 - Only use `--no-encryption` on isolated, trusted networks
 
-**TOCTOU-safe mutation (`rrm`, `rchm`, `rcp`, `rlink`):**
-The mutating tools harden their directory walk against symlink/path-swap races (fd-relative `openat`/`O_NOFOLLOW`; see `docs/tocttou.md`). `--toctou-check` prints whether a given invocation is hardened and exits (`0` = safe); `--require-toctou-safe` refuses to run unless it is — handy to pin in a `sudo` rule. Neither verifies the trust of the operand path's *prefix*; lock that down in the rule.
+**TOCTOU-safe mutation (`rrm`, `rchm`, `rcp`, `rlink`):** The mutating tools harden their directory
+walk against symlink/path-swap races (fd-relative `openat`/`O_NOFOLLOW`; see `docs/tocttou.md`).
+`--toctou-check` prints whether a given invocation is hardened and exits (`0` = safe);
+`--require-toctou-safe` refuses to run unless it is — handy to pin in a `sudo` rule. Neither
+verifies the trust of the operand path's *prefix*; lock that down in the rule.
 
-**Set-ID suppression for privileged `rchm` (`--no-setid`):**
-For a privileged policy wrapper (e.g. a `sudo` rule), add `--no-setid`. For every selected
-non-symlink whose type has an applicable `--mode`, `--owner`, or `--group` rule, it guarantees
-that the final mode has both set-user-ID (`04000`) and set-group-ID (`02000`) cleared. This
-also removes pre-existing set-ID bits, including set-group-ID on directories, even when the
-requested rule does not mention them; the sticky bit (`01000`) is unaffected. Filters and
-per-type rules still determine which entries are selected, and `--no-setid` by itself is
-not an operation. Without the flag, `rchm` retains its normal behavior, including
-preserving existing set-ID bits across ownership changes.
+**Set-ID suppression for privileged `rchm` (`--no-setid`):** For a privileged policy wrapper (e.g. a
+`sudo` rule), add `--no-setid`. For every selected non-symlink whose type has an applicable
+`--mode`, `--owner`, or `--group` rule, it guarantees that the final mode has both set-user-ID
+(`04000`) and set-group-ID (`02000`) cleared. This also removes pre-existing set-ID bits, including
+set-group-ID on directories, even when the requested rule does not mention them; the sticky bit
+(`01000`) is unaffected. Filters and per-type rules still determine which entries are selected, and
+`--no-setid` by itself is not an operation. Without the flag, `rchm` retains its normal behavior,
+including preserving existing set-ID bits across ownership changes.
 
-This is a successful-final-state guarantee, not an atomic lock against a concurrent owner
-changing the mode between `rchm`'s metadata syscalls — privileged wrappers must exclude
-adversarial concurrent mode mutation during ownership changes. `--no-setid` is also
-necessary but not sufficient for delegating privileged `rchm`: a wrapper must constrain
-target paths, allowed owners/groups and modes, pin `--require-toctou-safe`, and prevent
-caller-controlled file arguments. See the
+This is a successful-final-state guarantee, not an atomic lock against a concurrent owner changing
+the mode between `rchm`'s metadata syscalls — privileged wrappers must exclude adversarial
+concurrent mode mutation during ownership changes. `--no-setid` is also necessary but not sufficient
+for delegating privileged `rchm`: a wrapper must constrain target paths, allowed owners/groups and
+modes, pin `--require-toctou-safe`, and prevent caller-controlled file arguments. See the
 [privileged-use guidance](docs/tocttou.md#set-id-suppression-under-sudo-rchm).
 
 For detailed security architecture and threat model, see `docs/security.md`.
@@ -376,16 +427,19 @@ For detailed security architecture and threat model, see `docs/security.md`.
 ## Terminal output
 
 **Log messages**
+
 - sent to `stdout`
 - by default only errors are logged
 - verbosity controlled using `-v`/`-vv`/`-vvv` for INFO/DEBUG/TRACE and `-q`/`--quiet` to disable
 
 **Progress**
+
 - sent to `stderr` (both `ProgressBar` and `TextUpdates`)
 - by default disabled
 - enabled using `-p`/`--progress` with optional `--progress-type=...` override
 
 **Summary**
+
 - sent to `stdout`
 - by default disabled
 - enabled using `--summary`
@@ -426,6 +480,7 @@ All tools support pattern-based filtering with `--include` and `--exclude` flags
 ```
 
 Filter file format (`filters.txt`):
+
 ```
 # Comments start with #
 --include *.rs
@@ -436,9 +491,12 @@ Filter file format (`filters.txt`):
 
 ### Pattern Semantics
 
-**Simple patterns** (like `*.txt`, `*_dir/`) apply to all files at any level, including the source root itself.
+**Simple patterns** (like `*.txt`, `*_dir/`) apply to all files at any level, including the source
+root itself.
 
-**Anchored patterns** (starting with `/`, like `/src/**` or `/bar/*.txt`) match paths *inside* the source, not the source root itself. This allows you to copy a directory while filtering its contents:
+**Anchored patterns** (starting with `/`, like `/src/**` or `/bar/*.txt`) match paths *inside* the
+source, not the source root itself. This allows you to copy a directory while filtering its
+contents:
 
 ```fish
 # Copy project/ but only include the src subdirectory and its contents
@@ -449,9 +507,11 @@ Filter file format (`filters.txt`):
 > rcp --exclude '/build/' project/ backup/
 ```
 
-Note: `/src` matches only the `src` directory entry itself, while `/src/**` matches the directory and all files inside it.
+Note: `/src` matches only the `src` directory entry itself, while `/src/**` matches the directory
+and all files inside it.
 
-**Path patterns** (containing `/` but not starting with `/`, like `bar/*.txt`) match relative paths inside the source directory.
+**Path patterns** (containing `/` but not starting with `/`, like `bar/*.txt`) match relative paths
+inside the source directory.
 
 ### Dry-Run Mode
 
@@ -468,11 +528,22 @@ Preview what would happen without making changes:
 > rcp --dry-run=explain --exclude '*.log' src/ dst/
 ```
 
-**Note:** Dry-run mode is primarily useful for previewing `--include`/`--exclude` filtering. It bypasses `--overwrite` checks and does not check whether files already exist at the destination. `--progress` and `--summary` are suppressed in dry-run mode (use `-v` to still see summary output).
+**Note:** Dry-run mode is primarily useful for previewing `--include`/`--exclude` filtering. It
+bypasses `--overwrite` checks and does not check whether files already exist at the destination.
+`--progress` and `--summary` are suppressed in dry-run mode (use `-v` to still see summary output).
 
 ### Age-based filtering (`rrm`, `rchm`)
 
-`rrm` and `rchm` additionally support time-based entry filters: `--modified-before <DURATION>` acts only on entries whose mtime is at least that old, and `--created-before <DURATION>` does the same on birth time (btime). Durations use humantime syntax — note that **`M` means months and lowercase `m` means minutes**. The filter is per-entry: it applies to each file, directory, and symlink by that entry's *own* timestamp (directories are always traversed regardless of their own). For `rrm` specifically, a directory is then removed only when its own timestamp is old enough *and* it ends up empty after its children are processed — a directory left non-empty by a spared child is kept and logged, not an error. (`rchm` changes a matching directory's mode/owner based on its own timestamp regardless of its children.) `--created-before` is **not available on musl static builds** (btime is unreadable there) — use `--modified-before` or a glibc build.
+`rrm` and `rchm` additionally support time-based entry filters: `--modified-before <DURATION>` acts
+only on entries whose mtime is at least that old, and `--created-before <DURATION>` does the same on
+birth time (btime). Durations use humantime syntax — note that **`M` means months and lowercase `m`
+means minutes**. The filter is per-entry: it applies to each file, directory, and symlink by that
+entry's *own* timestamp (directories are always traversed regardless of their own). For `rrm`
+specifically, a directory is then removed only when its own timestamp is old enough *and* it ends up
+empty after its children are processed — a directory left non-empty by a spared child is kept and
+logged, not an error. (`rchm` changes a matching directory's mode/owner based on its own timestamp
+regardless of its children.) `--created-before` is **not available on musl static builds** (btime is
+unreadable there) — use `--modified-before` or a glibc build.
 
 ```fish
 # remove only files not modified in the last 30 days
@@ -488,65 +559,63 @@ Preview what would happen without making changes:
 
 ## Delete (mirror)
 
-`rcp --delete` makes the destination a mirror of the source: any entry under the
-destination with no counterpart in the source is removed. `--delete` implies
-`--overwrite`, requires a single source, and cannot be combined with
-`--dereference` (`-L`). `rlink --delete` works the same way for hard-linked trees.
+`rcp --delete` makes the destination a mirror of the source: any entry under the destination with no
+counterpart in the source is removed. `--delete` implies `--overwrite`, requires a single source,
+and cannot be combined with `--dereference` (`-L`). `rlink --delete` works the same way for
+hard-linked trees.
 
 ```fish
 # make dst an exact mirror of src (removing anything in dst not present in src)
 > rcp --delete src dst --progress --summary
 ```
 
-Excluded files are protected from deletion by default; pass `--delete-excluded`
-to remove them too. `--dry-run` previews deletions without performing them. `--delete` is
-supported for local operations (remote support is planned).
+Excluded files are protected from deletion by default; pass `--delete-excluded` to remove them too.
+`--dry-run` previews deletions without performing them. `--delete` is supported for local operations
+(remote support is planned).
 
-Exclude-protection applies to pruning *extraneous* entries — those
-with no source counterpart. When `--overwrite` (implied by `--delete`) replaces a destination
-entry whose source counterpart changed type — e.g. a directory that is now a file in the source
-— removing the old destination entry is part of that overwrite, not an exclude-filtered
-deletion.
+Exclude-protection applies to pruning *extraneous* entries — those with no source counterpart. When
+`--overwrite` (implied by `--delete`) replaces a destination entry whose source counterpart changed
+type — e.g. a directory that is now a file in the source — removing the old destination entry is
+part of that overwrite, not an exclude-filtered deletion.
 
-Pruning happens incrementally as the parallel copy proceeds, and a directory's extraneous
-entries are removed only once that directory's subtree has been processed without error — so
-deletions never act on an incomplete source listing. Unlike rsync, rcp/rlink do not cancel
-*all* deletions when a single error occurs elsewhere: subtrees that were processed cleanly are
-still mirrored.
+Pruning happens incrementally as the parallel copy proceeds, and a directory's extraneous entries
+are removed only once that directory's subtree has been processed without error — so deletions never
+act on an incomplete source listing. Unlike rsync, rcp/rlink do not cancel *all* deletions when a
+single error occurs elsewhere: subtrees that were processed cleanly are still mirrored.
 
 ## Permissions and ownership (`rchm`)
 
-The `--group` and `--owner` options take a per-type DSL: a bare value applies to all
-entries (files, directories, and symlinks via `lchown`); `f:`/`d:`/`l:` prefixes target
-one type. `--mode` uses the same DSL but covers only files and directories (a bare value
-sets both) — symlink mode bits aren't settable on Linux, so `l:` is rejected for `--mode`.
+The `--group` and `--owner` options take a per-type DSL: a bare value applies to all entries (files,
+directories, and symlinks via `lchown`); `f:`/`d:`/`l:` prefixes target one type. `--mode` uses the
+same DSL but covers only files and directories (a bare value sets both) — symlink mode bits aren't
+settable on Linux, so `l:` is rejected for `--mode`.
 
-**Compatibility with `chmod`/`chown`/`chgrp`:** mode expressions are a subset of
-`chmod` (`[ugoa][+-=][rwxXst]`, octal, and conditional `X`), omitting who-copy
-references like `g=u`. Omitted-who clauses ignore umask (deliberate for a bulk
-tool). For ordinary operands `rchm` does not dereference symlinks (like `-h`): it
-applies group/owner to the symlink itself via `lchown` and never changes symlink mode
-bits. `mtime` is preserved; `ctime` necessarily changes (the kernel stamps it on any
-metadata change) and cannot be preserved.
+**Compatibility with `chmod`/`chown`/`chgrp`:** mode expressions are a subset of `chmod`
+(`[ugoa][+-=][rwxXst]`, octal, and conditional `X`), omitting who-copy references like `g=u`.
+Omitted-who clauses ignore umask (deliberate for a bulk tool). For ordinary operands `rchm` does not
+dereference symlinks (like `-h`): it applies group/owner to the symlink itself via `lchown` and
+never changes symlink mode bits. `mtime` is preserved; `ctime` necessarily changes (the kernel
+stamps it on any metadata change) and cannot be preserved.
 
-Directories are changed **before** their contents by default (like `chmod -R`), so
-`--mode d:u+rwx` can repair an unreadable directory. Pass `--defer-dir-changes` to
-change directories **after** their contents — needed when recursively removing your
-own read/execute permission from directories, where the default would lock itself out.
+Directories are changed **before** their contents by default (like `chmod -R`), so `--mode d:u+rwx`
+can repair an unreadable directory. Pass `--defer-dir-changes` to change directories **after** their
+contents — needed when recursively removing your own read/execute permission from directories, where
+the default would lock itself out.
 
 For the hardened walk, `sudo` policies, and set-ID suppression (`--no-setid`), see
 [Security](#security).
 
-Performance Tuning
-==================
+# Performance Tuning
 
-For maximum throughput, especially with remote copies over high-speed networks, consider these optimizations.
+For maximum throughput, especially with remote copies over high-speed networks, consider these
+optimizations.
 
 ## System-Level Tuning (Linux)
 
 ### TCP Socket Buffers
 
-`rcp` automatically requests larger TCP socket buffers for high-throughput transfers, but the kernel caps these to system limits. Increase the limits to allow full utilization of high-bandwidth links:
+`rcp` automatically requests larger TCP socket buffers for high-throughput transfers, but the kernel
+caps these to system limits. Increase the limits to allow full utilization of high-bandwidth links:
 
 ```bash
 # Check current limits
@@ -579,7 +648,8 @@ ulimit -n 65536
 * hard nofile 65536
 ```
 
-`rcp` automatically queries the system limit and uses `--max-open-files` to self-throttle, but higher limits allow more parallelism.
+`rcp` automatically queries the system limit and uses `--max-open-files` to self-throttle, but
+higher limits allow more parallelism.
 
 ### Network Backlog (10+ Gbps)
 
@@ -606,7 +676,8 @@ rcp --max-workers=4 /source /dest
 
 ### Remote Copy Buffer Size
 
-For remote copies, the `--remote-copy-buffer-size` flag controls the size of data chunks sent over TCP:
+For remote copies, the `--remote-copy-buffer-size` flag controls the size of data chunks sent over
+TCP:
 
 ```bash
 # Larger buffers for high-bandwidth links (default: 16 MiB for datacenter)
@@ -644,7 +715,8 @@ rcp --max-connections=16 host1:/data host2:/dest
 
 ### Check TCP Buffer Sizes
 
-When `rcp` starts, it logs the actual buffer sizes achieved (visible with `-v`). If the actual sizes are much smaller than requested, increase your system's `rmem_max`/`wmem_max`.
+When `rcp` starts, it logs the actual buffer sizes achieved (visible with `-v`). If the actual sizes
+are much smaller than requested, increase your system's `rmem_max`/`wmem_max`.
 
 ### Check for Network Issues
 
@@ -668,9 +740,12 @@ For optimal performance on high-speed networks:
 
 ## filegen Performance
 
-The `filegen` tool generates random test data, which is CPU-intensive. Unlike other rcp tools that are typically I/O-bound, filegen's bottleneck is often the CPU generating random bytes.
+The `filegen` tool generates random test data, which is CPU-intensive. Unlike other rcp tools that
+are typically I/O-bound, filegen's bottleneck is often the CPU generating random bytes.
 
-**Default behavior**: `filegen` defaults `--max-open-files` to the number of physical CPU cores, rather than 80% of the system's open file limit used by other tools. This matches concurrency to compute capacity, avoiding excessive parallelism that would cause CPU contention.
+**Default behavior**: `filegen` defaults `--max-open-files` to the number of physical CPU cores,
+rather than 80% of the system's open file limit used by other tools. This matches concurrency to
+compute capacity, avoiding excessive parallelism that would cause CPU contention.
 
 **Tuning for your workload**:
 
@@ -685,8 +760,7 @@ filegen /tmp 3,2 10 1M --max-open-files=64 --progress
 filegen /tmp 3,2 10 1M --max-open-files=0 --progress
 ```
 
-Profiling
-=========
+# Profiling
 
 `rcp` supports several profiling and debugging options.
 
@@ -705,6 +779,7 @@ rcp --chrome-trace=/tmp/trace host1:/path host2:/path
 Output files are named: `{prefix}-{identifier}-{hostname}-{pid}-{timestamp}.json`
 
 Example output:
+
 - `/tmp/trace-rcp-master-myhost-12345-2025-01-15T10:30:45.json`
 - `/tmp/trace-rcpd-source-host1-23456-2025-01-15T10:30:46.json`
 - `/tmp/trace-rcpd-destination-host2-34567-2025-01-15T10:30:46.json`
@@ -713,7 +788,8 @@ View traces by opening https://ui.perfetto.dev and dragging the JSON file into t
 
 ## Flamegraph
 
-Produces folded stack files convertible to SVG flamegraphs using [inferno](https://github.com/jonhoo/inferno).
+Produces folded stack files convertible to SVG flamegraphs using
+[inferno](https://github.com/jonhoo/inferno).
 
 ```bash
 # Profile and generate flamegraph data
@@ -754,7 +830,8 @@ rcp --tokio-console --tokio-console-port=6670 /source /dest
 tokio-console http://127.0.0.1:6669
 ```
 
-Trace events are retained for 60s by default. This can be modified with `RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS=120`.
+Trace events are retained for 60s by default. This can be modified with
+`RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS=120`.
 
 ## Combined profiling
 
@@ -764,8 +841,8 @@ All profiling options can be used together:
 rcp --chrome-trace=/tmp/trace --flamegraph=/tmp/flame --tokio-console /source /dest
 ```
 
-References
-==========
-1) https://mpifileutils.readthedocs.io/en/v0.11.1/dsync.1.html
-2) https://github.com/wtsi-ssg/pcp
-3) https://mpifileutils.readthedocs.io/en/v0.11/dchmod.1.html
+# References
+
+1. https://mpifileutils.readthedocs.io/en/v0.11.1/dsync.1.html
+2. https://github.com/wtsi-ssg/pcp
+3. https://mpifileutils.readthedocs.io/en/v0.11/dchmod.1.html

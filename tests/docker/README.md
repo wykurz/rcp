@@ -5,11 +5,13 @@ This directory contains a Docker-based setup for testing RCP operations across m
 ## Overview
 
 The setup creates 3 Alpine Linux containers with SSH servers:
+
 - **master**: Where you run `rcp` commands from
 - **host-a**: First remote host (source or destination)
 - **host-b**: Second remote host (source or destination)
 
-All containers have the RCP binaries (`rcp`, `rcpd`, `rrm`, `rlink`, `rcmp`) available and can SSH to each other using pre-configured keys.
+All containers have the RCP binaries (`rcp`, `rcpd`, `rrm`, `rlink`, `rcmp`) available and can SSH
+to each other using pre-configured keys.
 
 ## Quick Start: Running Tests
 
@@ -27,7 +29,8 @@ just docker-test-only    # Run tests again without setup (containers must be run
 just docker-down         # Stop containers when done
 ```
 
-**Note**: `just docker-test` automatically builds the required binaries (musl target) before starting containers. No manual build step needed!
+**Note**: `just docker-test` automatically builds the required binaries (musl target) before
+starting containers. No manual build step needed!
 
 ### Option 2: Using `cargo nextest` Directly
 
@@ -81,7 +84,8 @@ just docker-clean
 just docker-down
 ```
 
-**Tip**: If you only change test code (in `rcp/tests/`), you don't need to rebuild binaries. If you change RCP source code, run `cargo build` before running tests again.
+**Tip**: If you only change test code (in `rcp/tests/`), you don't need to rebuild binaries. If you
+change RCP source code, run `cargo build` before running tests again.
 
 ## Available `just` Commands
 
@@ -145,7 +149,9 @@ cd tests/docker
    sudo apt install docker-compose
    ```
 
-**Note**: Binaries are automatically built when you run `just docker-test` or `just docker-up`. This project uses the musl target by default, and binaries are mounted from `target/x86_64-unknown-linux-musl/debug/` into the containers.
+**Note**: Binaries are automatically built when you run `just docker-test` or `just docker-up`. This
+project uses the musl target by default, and binaries are mounted from
+`target/x86_64-unknown-linux-musl/debug/` into the containers.
 
 ## Manual Testing Scenarios
 
@@ -195,6 +201,7 @@ rcp -vv host-a:/tmp/src.txt host-b:/tmp/dst.txt
 ```
 
 Look for log lines showing:
+
 - SSH connections to each host
 - rcpd deployment (if needed)
 - TCP connection establishment
@@ -319,6 +326,7 @@ tests/docker/
 ## Security Note
 
 **WARNING**: The SSH keys in this directory are FOR TESTING ONLY. They are:
+
 - Checked into version control
 - Publicly visible
 - Should NEVER be used for production systems
@@ -329,6 +337,7 @@ tests/docker/
 The Docker environment supports automated integration tests in:
 
 ### `tests/docker_multi_host.rs`
+
 - Basic multi-host file copy
 - Overwrite protection behavior
 - Directory copying (with cleanup before/after to prevent hangs)
@@ -337,6 +346,7 @@ The Docker environment supports automated integration tests in:
 **Note**: The verbose logging test is disabled because docker exec doesn't capture stderr.
 
 ### `tests/docker_multi_host_role_ordering.rs`
+
 - **Baseline tests**: Verify basic multi-host functionality
 - **Rapid operations**: Stress-test role assignment with quick successive copies
 - **Bidirectional copies**: Test A→B then B→A scenarios
