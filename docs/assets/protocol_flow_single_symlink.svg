@@ -1,4 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="single-symlink-title single-symlink-desc">
+  <title id="single-symlink-title">Single-symlink remote copy flow</title>
+  <desc id="single-symlink-desc">Source sends a root symlink and then announces that directory structure is complete. The destination control receiver sends DestinationDone and exits without observing source control EOF. Destination data-stream handlers end on EOF; workers exit after reconnect fails.</desc>
   <!-- Section 4.3 Single Symlink Copy -->
   <defs>
     <marker id="ar-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -13,8 +15,8 @@
   <rect x="475" y="16" width="160" height="34" rx="7" fill="#eef2f7" stroke="#475569" stroke-width="1.5"/>
   <text x="555" y="38" text-anchor="middle" font-size="14" font-weight="600" fill="#1e293b">Destination (rcpd)</text>
 
-  <line x1="190" y1="50" x2="190" y2="272" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 4"/>
-  <line x1="555" y1="50" x2="555" y2="272" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <line x1="190" y1="50" x2="190" y2="224" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <line x1="555" y1="50" x2="555" y2="224" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 4"/>
 
   <line x1="190" y1="94" x2="549" y2="94" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
   <text x="372" y="88" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">Symlink(s, is_root=true, meta)</text>
@@ -29,10 +31,13 @@
 
   <line x1="555" y1="198" x2="196" y2="198" stroke="#334155" stroke-width="1.5" marker-end="url(#ar-ctl)"/>
   <text x="372" y="192" text-anchor="middle" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#334155">DestinationDone</text>
-  <text x="565" y="202" text-anchor="start" font-size="12.5" fill="#64748b">close send side</text>
-
   <g font-size="12.5" fill="#64748b">
-    <text x="178" y="228" text-anchor="end">close send side,</text>
-    <text x="178" y="244" text-anchor="end">close connection</text>
+    <text x="565" y="202" text-anchor="start">control receiver sends,</text>
+    <text x="565" y="218" text-anchor="start">closes send side, and exits</text>
+  </g>
+  <g text-anchor="middle" font-size="12" fill="#64748b">
+    <text x="380" y="238">control-completed path: DestinationDone triggers source shutdown</text>
+    <text x="380" y="254">receiver exits without observing source control EOF</text>
+    <text x="380" y="270">handlers end on EOF; workers exit after reconnect fails</text>
   </g>
 </svg>

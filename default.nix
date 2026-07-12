@@ -41,6 +41,7 @@ in
             just
             cargo-outdated
             cargo-udeps
+            dprint
             gdb
             llvmPackages.bintools
             tokio-console

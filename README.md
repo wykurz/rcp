@@ -400,11 +400,13 @@ still authenticates rcpd startup.
 - Keep encryption enabled (default) for sensitive data
 - Only use `--no-encryption` on isolated, trusted networks
 
-**TOCTOU-safe mutation (`rrm`, `rchm`, `rcp`, `rlink`):** The mutating tools harden their directory
-walk against symlink/path-swap races (fd-relative `openat`/`O_NOFOLLOW`; see `docs/tocttou.md`).
-`--toctou-check` prints whether a given invocation is hardened and exits (`0` = safe);
-`--require-toctou-safe` refuses to run unless it is — handy to pin in a `sudo` rule. Neither
-verifies the trust of the operand path's *prefix*; lock that down in the rule.
+**TOCTOU-safe mutation (`rrm`, `rchm`, `rcp`, `rlink`):**
+
+On Linux, for default non-`-L` invocations, the mutating tools harden their directory walk against
+symlink/path-swap races (fd-relative `openat`/`O_NOFOLLOW`; see the
+[TOCTOU documentation](docs/tocttou.md)). `--toctou-check` prints whether a given invocation is
+hardened and exits (`0` = safe), while `--require-toctou-safe` rejects non-hardened invocations.
+Neither verifies the trust of the operand path's *prefix*; lock that down in the `sudo` rule.
 
 **Set-ID suppression for privileged `rchm` (`--no-setid`):** For a privileged policy wrapper (e.g. a
 `sudo` rule), add `--no-setid`. For every selected non-symlink whose type has an applicable

@@ -24,6 +24,7 @@ nix develop  # automatically includes just and all dev tools
 ```bash
 cargo install just
 cargo install cargo-nextest  # required for `just test`, `just test-release`, `just test-all`, and `just ci`
+cargo install dprint  # required for `just fmt`, `just lint`, and `just ci`
 ```
 
 ### Common Commands
