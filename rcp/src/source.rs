@@ -1,5 +1,7 @@
 use anyhow::Context;
 use async_recursion::async_recursion;
+// trait-only import: brings FileMeta::size()/uid()/... into scope without shadowing std::fs::Metadata
+use common::preserve::Metadata as _;
 use common::safedir::Dir;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -2597,8 +2599,9 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Traverse filesystem and report dry-run entries via tracing.
-/// This function outputs what would be copied without actually copying.
+/// Traverse filesystem and report dry-run entries via tracing — `-L`/`--dereference` ONLY.
+/// This path-based reporter follows symlinks by request (documented not hardened); the
+/// default path uses the fd-relative [`dry_run_traverse_fd`].
 #[async_recursion]
 #[allow(clippy::too_many_arguments)]
 async fn dry_run_traverse(
@@ -2888,6 +2891,376 @@ async fn dry_run_traverse(
     Ok(())
 }
 
+/// Where [`dry_run_traverse_fd`] classifies and opens the CURRENT entry from.
+///
+/// Nested entries and the strict-mode root are always `Opened` (fd-relative, the hardened
+/// shape). The default-path root is `Lazy`: classified by path stat, its parent opened only
+/// when traversal actually proceeds past the root filter — so an excluded root under an
+/// execute-only (0111, searchable-not-readable) parent skips cleanly (the O_RDONLY parent
+/// open would fail EACCES there), matching the local copy's root-filter behavior and the
+/// historical path-based dry run. An INCLUDED root still requires the parent open, exactly
+/// like the real remote copy this dry run previews.
+enum DryRunDirSource {
+    Opened(Arc<Dir>),
+    /// The operand's parent path, opened on demand (default-path root only).
+    Lazy(std::path::PathBuf),
+}
+
+/// Traverse and report dry-run entries via tracing, fd-relative — the default (non-`-L`) path.
+///
+/// The hardened twin of [`dry_run_traverse`]: the entry is classified via its parent's held fd
+/// (`child(name)`, `O_NOFOLLOW`), a symlink's target is read inode-exact off the classified
+/// handle, and directories are enumerated through their own opened fd — the walk never
+/// re-resolves a multi-component path, so a concurrent swap cannot make the dry run report
+/// names, sizes, or targets from outside the source tree (the same shape as the real copy's
+/// hardened walk; this one only *reports*). The sole exception is the default-path root
+/// (see [`DryRunDirSource::Lazy`]). `src` is the display path for reporting/filters.
+#[async_recursion]
+#[allow(clippy::too_many_arguments)]
+async fn dry_run_traverse_fd(
+    settings: &common::copy::Settings,
+    parent: &DryRunDirSource,
+    name: &std::ffi::OsStr,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    source_root: &std::path::Path,
+    is_root: bool,
+    dry_run_mode: common::config::DryRunMode,
+    summary: &mut common::copy::Summary,
+) -> anyhow::Result<()> {
+    // classify the entry: fd-relative via the held parent fd, or — for the default-path
+    // root only (`Lazy`) — by path stat, so a root the filter excludes never requires
+    // read permission on its parent
+    let (kind, size, handle) = match parent {
+        DryRunDirSource::Opened(dir) => match dir.child(name).await {
+            Ok(handle) => (handle.kind(), handle.meta().size(), Some(handle)),
+            Err(e) => {
+                tracing::error!("Failed reading metadata from src {src:?}: {e:#}");
+                if settings.fail_early || is_root {
+                    return Err(e.into());
+                }
+                return Ok(());
+            }
+        },
+        DryRunDirSource::Lazy(_) => {
+            match common::walk::run_metadata_probed(
+                common::Side::Source,
+                common::MetadataOp::Stat,
+                tokio::fs::symlink_metadata(src),
+            )
+            .await
+            {
+                Ok(md) => (common::walk::EntryKind::from_metadata(&md), md.len(), None),
+                Err(e) => {
+                    tracing::error!("Failed reading metadata from src {src:?}: {e:#}");
+                    if settings.fail_early || is_root {
+                        return Err(e.into());
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    };
+    let is_dir = kind == common::walk::EntryKind::Dir;
+    // apply filter - use should_include_root_item for root items
+    // (anchored patterns match paths inside the source, not the source itself)
+    let filter_result = if let Some(ref filter) = settings.filter {
+        if is_root {
+            let file_name = src.file_name().map(std::path::Path::new).unwrap_or(src);
+            filter.should_include_root_item(file_name, is_dir)
+        } else {
+            let relative_path = src.strip_prefix(source_root).unwrap_or(src);
+            filter.should_include(relative_path, is_dir)
+        }
+    } else {
+        common::filter::FilterResult::Included
+    };
+    let should_process = matches!(filter_result, common::filter::FilterResult::Included);
+    let skip_reason = common::dry_run::format_skip_reason(&filter_result);
+    // determine if we should report this entry based on dry-run mode
+    let should_report = match dry_run_mode {
+        common::config::DryRunMode::Brief => should_process,
+        common::config::DryRunMode::All | common::config::DryRunMode::Explain => true,
+    };
+    // helper to format status for output
+    let format_status = |process: bool, reason: &Option<String>| -> String {
+        if process {
+            "would copy".to_string()
+        } else if matches!(dry_run_mode, common::config::DryRunMode::Explain) {
+            format!("skip ({})", reason.as_deref().unwrap_or("filtered"))
+        } else {
+            "skip".to_string()
+        }
+    };
+    // A default-path Lazy ROOT that will be COPIED (INCLUDED) opens its parent HERE — for every
+    // kind (file/symlink/special/dir) — matching the real remote copy, which opens the source
+    // parent to read the root. So an execute-only (0111) parent, or a nonexistent one, fails the
+    // dry run identically (exit 1) instead of succeeding where the real copy would not. An EXCLUDED
+    // root was never materialized, preserving the skip-without-parent-read behavior; nested entries
+    // and the strict-mode root are already Opened. Held for the Dir arm's enumeration below.
+    let opened_parent: Option<Arc<Dir>> = match parent {
+        DryRunDirSource::Opened(dir) => Some(dir.clone()),
+        DryRunDirSource::Lazy(parent_path) if should_process => Some(Arc::new(
+            Dir::open_parent_dir(parent_path, common::Side::Source)
+                .await
+                .with_context(|| {
+                    format!("cannot open parent directory of dry-run root {parent_path:?}")
+                })?
+                .into_tree(),
+        )),
+        DryRunDirSource::Lazy(_) => None,
+    };
+    match kind {
+        common::walk::EntryKind::File => {
+            if should_report {
+                tracing::info!(
+                    target: "dry_run",
+                    "{}: {:?} -> {:?} [file ({})]",
+                    format_status(should_process, &skip_reason),
+                    src,
+                    dst,
+                    bytesize::ByteSize(size)
+                );
+            }
+            if should_process {
+                summary.files_copied += 1;
+                summary.bytes_copied += size;
+            } else {
+                summary.files_skipped += 1;
+                progress().files_skipped.inc();
+            }
+            Ok(())
+        }
+        common::walk::EntryKind::Symlink => {
+            // target read inode-exact off the classified handle (read-side fidelity); the
+            // default-path ROOT (`Lazy`, no handle) reads by path like the historical dry
+            // run — the operand itself sits at the trusted boundary, and every nested
+            // entry is read via the fd walk
+            let target = match &handle {
+                Some(handle) => handle
+                    .read_symlink(common::Side::Source)
+                    .await
+                    .map(|(target, _meta)| target),
+                None => {
+                    common::walk::run_metadata_probed(
+                        common::Side::Source,
+                        common::MetadataOp::ReadLink,
+                        tokio::fs::read_link(src), // rcp-toctou-allow: default-path dry-run ROOT only (Lazy operand at the trusted boundary); nested entries read inode-exact via the fd walk
+                    )
+                    .await
+                }
+            };
+            let target = match target {
+                Ok(target) => target,
+                Err(e) => {
+                    tracing::error!("Failed reading symlink {src:?}: {e:#}");
+                    if settings.fail_early {
+                        return Err(e.into());
+                    }
+                    return Ok(());
+                }
+            };
+            if should_report {
+                tracing::info!(
+                    target: "dry_run",
+                    "{}: {:?} -> {:?} [symlink -> {:?}]",
+                    format_status(should_process, &skip_reason),
+                    src,
+                    dst,
+                    target
+                );
+            }
+            if should_process {
+                summary.symlinks_created += 1;
+            } else {
+                summary.symlinks_skipped += 1;
+                progress().symlinks_skipped.inc();
+            }
+            Ok(())
+        }
+        common::walk::EntryKind::Special => {
+            if !should_process {
+                // filtered out by include/exclude - count as files_skipped (matching local copy)
+                summary.files_skipped += 1;
+                progress().files_skipped.inc();
+            } else if settings.skip_specials {
+                if should_report {
+                    tracing::info!(
+                        target: "dry_run",
+                        "skip (special file): {:?} -> {:?}",
+                        src,
+                        dst
+                    );
+                }
+                summary.specials_skipped += 1;
+                progress().specials_skipped.inc();
+            } else {
+                // without --skip-specials, real copy would error on this file type — so the dry
+                // run must too. A root special is always fatal (matches the real copy's exit 1);
+                // a nested one respects --fail-early.
+                let err = anyhow::anyhow!(
+                    "dry-run: {:?} -> {:?} unsupported (special) file type",
+                    src,
+                    dst
+                );
+                tracing::error!("{:#}", &err);
+                if settings.fail_early || is_root {
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }
+        common::walk::EntryKind::Dir => {
+            if should_report {
+                tracing::info!(
+                    target: "dry_run",
+                    "{}: {:?} -> {:?} [dir]",
+                    format_status(should_process, &skip_reason),
+                    src,
+                    dst
+                );
+            }
+            // if filtered out, check whether to stop or still traverse
+            if !should_process {
+                match &filter_result {
+                    // explicitly excluded by pattern - never traverse (excludes are absolute)
+                    common::filter::FilterResult::ExcludedByPattern(_) => {
+                        summary.directories_skipped += 1;
+                        progress().directories_skipped.inc();
+                        return Ok(());
+                    }
+                    // no include pattern matched - traverse only if could contain matches
+                    common::filter::FilterResult::ExcludedByDefault => {
+                        if let Some(ref filter) = settings.filter {
+                            let relative_path = if is_root {
+                                src.file_name().map(std::path::Path::new).unwrap_or(src)
+                            } else {
+                                src.strip_prefix(source_root).unwrap_or(src)
+                            };
+                            let mut should_traverse = false;
+                            for pattern in &filter.includes {
+                                if filter.could_contain_matches(relative_path, pattern) {
+                                    should_traverse = true;
+                                    break;
+                                }
+                            }
+                            if !should_traverse {
+                                summary.directories_skipped += 1;
+                                progress().directories_skipped.inc();
+                                return Ok(());
+                            }
+                            // will traverse looking for matches - defer created/skipped decision
+                        } else {
+                            summary.directories_skipped += 1;
+                            progress().directories_skipped.inc();
+                            return Ok(());
+                        }
+                    }
+                    // included - will be processed, continue to recurse
+                    common::filter::FilterResult::Included => {}
+                }
+            }
+            // save current counts before recursing to detect if anything was added
+            let before_files = summary.files_copied;
+            let before_symlinks = summary.symlinks_created;
+            let before_dirs = summary.directories_created;
+            if should_process {
+                summary.directories_created += 1;
+            }
+            // open the directory through the held parent fd (O_NOFOLLOW) and enumerate it
+            // via its own fd — a swapped-in symlink fails closed here, never redirects. An
+            // INCLUDED root and every Opened source already hold the parent fd
+            // (`opened_parent`); a traversed-but-excluded Lazy dir opens its parent here (it is
+            // being traversed to look for matches, so parent read is needed, matching the real
+            // copy).
+            let dir = match &opened_parent {
+                Some(parent_dir) => parent_dir.open_dir(name).await,
+                None => match parent {
+                    DryRunDirSource::Lazy(parent_path) => {
+                        match Dir::open_parent_dir(parent_path, common::Side::Source).await {
+                            Ok(trusted) => trusted.into_tree().open_dir(name).await,
+                            Err(e) => Err(e),
+                        }
+                    }
+                    // Opened always populates opened_parent above; unreachable
+                    DryRunDirSource::Opened(_) => unreachable!("Opened sets opened_parent"),
+                },
+            };
+            let dir = dir.map(Arc::new);
+            let entries = match &dir {
+                Ok(dir) => dir.read_entries().await,
+                Err(_) => Ok(Vec::new()),
+            };
+            match (dir, entries) {
+                (Ok(dir), Ok(entries)) => {
+                    let dir_source = DryRunDirSource::Opened(dir);
+                    for (entry_name, _kind_hint) in entries {
+                        let entry_src = src.join(&entry_name);
+                        let entry_dst = dst.join(&entry_name);
+                        if let Err(e) = dry_run_traverse_fd(
+                            settings,
+                            &dir_source,
+                            &entry_name,
+                            &entry_src,
+                            &entry_dst,
+                            source_root,
+                            false,
+                            dry_run_mode,
+                            summary,
+                        )
+                        .await
+                        {
+                            tracing::error!("Failed to traverse {entry_src:?}: {e:#}");
+                            if settings.fail_early {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::error!("Cannot open directory {src:?} for reading: {e:#}");
+                    // a root open/enumeration failure is fatal (matches the real copy's exit 1);
+                    // a nested one respects --fail-early and is otherwise skipped.
+                    if settings.fail_early || is_root {
+                        return Err(e.into());
+                    }
+                    return Ok(());
+                }
+            }
+            // after recursing, check if anything was added inside this directory.
+            // if nothing was added AND this directory doesn't directly match an include pattern,
+            // we should not count it (it was only traversed to look for potential matches).
+            // the root directory is never uncounted — it's the user-specified source.
+            if !is_root {
+                let child_content_added = summary.files_copied > before_files
+                    || summary.symlinks_created > before_symlinks
+                    || summary.directories_created
+                        > before_dirs + if should_process { 1 } else { 0 };
+                if should_process {
+                    // directly matched directory: un-count if nothing was added and not
+                    // directly matched by an include pattern
+                    if !child_content_added && let Some(filter) = &settings.filter {
+                        let relative_path = src.strip_prefix(source_root).unwrap_or(src);
+                        if !filter.directly_matches_include(relative_path, true) {
+                            summary.directories_created -= 1;
+                        }
+                    }
+                } else {
+                    // traversed-only directory: promote to created if descendants matched,
+                    // otherwise count as skipped
+                    if child_content_added {
+                        summary.directories_created += 1;
+                    } else {
+                        summary.directories_skipped += 1;
+                        progress().directories_skipped.inc();
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Handle a dry-run connection: traverse, log entries, and complete without transferring data.
 /// Destination sees an empty copy and completes immediately.
 async fn handle_dry_run_connection(
@@ -2919,9 +3292,44 @@ async fn handle_dry_run_connection(
     };
     let control_send_stream: remote::streams::BoxedSharedSendStream =
         std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
-    // traverse and log dry-run entries (output goes via tracing)
+    // traverse and log dry-run entries (output goes via tracing). The default path uses the
+    // fd-relative walker — the same hardened shape as the real copy, so a concurrent swap
+    // cannot make the dry run report content from outside the source tree, and under strict
+    // operand resolution a symlinked operand prefix fails closed at the parent open. `-L`
+    // keeps the path-based reporter (follows symlinks by request; documented not hardened).
     let mut summary = common::copy::Summary::default();
-    dry_run_traverse(settings, src, dst, src, true, dry_run_mode, &mut summary).await?;
+    if settings.dereference {
+        dry_run_traverse(settings, src, dst, src, true, dry_run_mode, &mut summary).await?;
+    } else {
+        let operand = common::walk::split_root_operand(src).await?;
+        let display = operand.display.clone();
+        // strict operand resolution: open the parent EAGERLY (openat2 RESOLVE_NO_SYMLINKS)
+        // so a symlinked operand prefix fails closed before anything is reported. On the
+        // default path the parent is opened lazily — only if the walk proceeds past the
+        // root filter — so an excluded root under an execute-only (0111) parent skips
+        // cleanly, matching the local copy's root-filter behavior (see DryRunDirSource).
+        let parent = if common::safedir::strict_operand_resolution() {
+            let parent = Dir::open_parent_dir(&operand.parent, common::Side::Source)
+                .await
+                .with_context(|| format!("cannot open parent directory of dry-run source {src:?}"))?
+                .into_tree();
+            DryRunDirSource::Opened(Arc::new(parent))
+        } else {
+            DryRunDirSource::Lazy(operand.parent.clone())
+        };
+        dry_run_traverse_fd(
+            settings,
+            &parent,
+            &operand.name,
+            &display,
+            dst,
+            &display,
+            true,
+            dry_run_mode,
+            &mut summary,
+        )
+        .await?;
+    }
     // tell destination we're done with directory structure (nothing was sent in dry-run)
     {
         let mut stream = control_send_stream.lock().await;

@@ -5849,3 +5849,131 @@ fn test_remote_overwrite_filter_newer_in_directory() {
         "the dest-newer file should be skipped via the manifest, got:\n{combined}"
     );
 }
+
+/// --require-toctou-safe propagates to both rcpd sides and the copy succeeds for
+/// fully-resolved absolute remote operands
+#[test]
+fn test_remote_require_toctou_safe_copies() {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2), --require-toctou-safe refuses");
+        return;
+    }
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // canonicalize: TMPDIR itself may contain symlinked components (e.g. under
+    // nix-shell), which strict resolution would — correctly — refuse
+    let src_base = src_dir.path().canonicalize().unwrap();
+    let dst_base = dst_dir.path().canonicalize().unwrap();
+    let src_file = src_base.join("strict.txt");
+    create_test_file(&src_file, "strict content", 0o644);
+    let dst_file = dst_base.join("strict_out.txt");
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    run_rcp_and_expect_success(&["--require-toctou-safe", &src_remote, &dst_remote]);
+    assert_eq!(get_file_content(&dst_file), "strict content");
+}
+
+/// --require-toctou-safe fails closed when a remote source operand path crosses a
+/// symlink: the source rcpd resolves it RESOLVE_NO_SYMLINKS and gets ELOOP
+#[test]
+fn test_remote_require_toctou_safe_refuses_symlinked_src_prefix() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_base = src_dir.path().canonicalize().unwrap();
+    let dst_base = dst_dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(src_base.join("real")).unwrap();
+    create_test_file(&src_base.join("real/a.txt"), "x", 0o644);
+    std::os::unix::fs::symlink(src_base.join("real"), src_base.join("link")).unwrap();
+    let src_remote = format!(
+        "localhost:{}",
+        src_base.join("link/a.txt").to_str().unwrap()
+    );
+    let dst_remote = format!("localhost:{}", dst_base.join("out.txt").to_str().unwrap());
+    run_rcp_and_expect_failure(&["--require-toctou-safe", &src_remote, &dst_remote]);
+    assert!(
+        !dst_base.join("out.txt").exists(),
+        "nothing must be copied through a symlinked prefix"
+    );
+}
+
+/// --require-toctou-safe fails closed when the remote DESTINATION operand path
+/// crosses a symlink: the destination rcpd resolves it RESOLVE_NO_SYMLINKS
+#[test]
+fn test_remote_require_toctou_safe_refuses_symlinked_dst_prefix() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_base = src_dir.path().canonicalize().unwrap();
+    let dst_base = dst_dir.path().canonicalize().unwrap();
+    let src_file = src_base.join("a.txt");
+    create_test_file(&src_file, "x", 0o644);
+    std::fs::create_dir_all(dst_base.join("real")).unwrap();
+    std::os::unix::fs::symlink(dst_base.join("real"), dst_base.join("link")).unwrap();
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!(
+        "localhost:{}",
+        dst_base.join("link/out.txt").to_str().unwrap()
+    );
+    run_rcp_and_expect_failure(&["--require-toctou-safe", &src_remote, &dst_remote]);
+    assert!(
+        !dst_base.join("real/out.txt").exists(),
+        "nothing must be written through a symlinked prefix"
+    );
+}
+
+/// --require-toctou-safe holds for remote --dry-run too: a symlinked source
+/// prefix fails closed instead of being silently traversed by the path-based
+/// dry-run reporter
+#[test]
+fn test_remote_require_toctou_safe_dry_run_refuses_symlinked_src_prefix() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_base = src_dir.path().canonicalize().unwrap();
+    let dst_base = dst_dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(src_base.join("real/tree")).unwrap();
+    create_test_file(&src_base.join("real/tree/a.txt"), "x", 0o644);
+    std::os::unix::fs::symlink(src_base.join("real"), src_base.join("link")).unwrap();
+    let src_remote = format!("localhost:{}", src_base.join("link/tree").to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_base.join("out").to_str().unwrap());
+    run_rcp_and_expect_failure(&[
+        "--require-toctou-safe",
+        "--dry-run=brief",
+        &src_remote,
+        &dst_remote,
+    ]);
+}
+
+/// A remote dry-run whose root the filter excludes skips cleanly even when the
+/// source parent is execute-only (0111): the default-path root filter classifies
+/// by path stat and the parent is opened only when traversal proceeds
+#[test]
+fn test_remote_dry_run_excluded_root_skips_under_execute_only_parent() {
+    use std::os::unix::fs::PermissionsExt;
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_base = src_dir.path().canonicalize().unwrap();
+    let dst_base = dst_dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(src_base.join("parent/src")).unwrap();
+    create_test_file(&src_base.join("parent/src/a.txt"), "x", 0o644);
+    std::fs::set_permissions(
+        src_base.join("parent"),
+        std::fs::Permissions::from_mode(0o111),
+    )
+    .unwrap();
+    let src_remote = format!(
+        "localhost:{}",
+        src_base.join("parent/src").to_str().unwrap()
+    );
+    let dst_remote = format!("localhost:{}", dst_base.join("out").to_str().unwrap());
+    let output = run_rcp_with_args(&["--dry-run=brief", "--exclude=src", &src_remote, &dst_remote]);
+    // restore permissions before asserting so the tempdir cleanup works either way
+    std::fs::set_permissions(
+        src_base.join("parent"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    print_command_output(&output);
+    assert!(
+        output.status.success(),
+        "excluded dry-run root under an execute-only parent must skip cleanly"
+    );
+}

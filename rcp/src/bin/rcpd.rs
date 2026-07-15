@@ -700,8 +700,24 @@ fn main() -> Result<(), anyhow::Error> {
     // --require-toctou-safe, and fail-closes on this host if the invocation
     // cannot be hardened (e.g. -L, or a pre-openat2 kernel). Operands arrive
     // via the master — which already linted their strict form — so none are
-    // passed here.
-    common::toctou_check::enforce_or_exit(args.dereference, false, args.require_toctou_safe, &[]);
+    // passed here. Unlike the tools' `enforce_or_exit` (stdout), a refusal is
+    // printed to STDERR as a single line: the master reads rcpd's first stderr
+    // line for the startup handshake, so this is what surfaces in its error —
+    // on stdout the reason would drown in the log drain and the user would only
+    // see a generic handshake failure.
+    match common::toctou_check::run_linter(args.dereference, false, args.require_toctou_safe, &[]) {
+        common::toctou_check::LinterAction::Exit { output, code } => {
+            let one_line = output
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("rcpd: {one_line}");
+            std::process::exit(code);
+        }
+        common::toctou_check::LinterAction::Proceed => {}
+    }
     let (tracing_layer, tracing_sender, tracing_receiver) =
         common::remote_tracing::RemoteTracingLayer::new();
     let func = {

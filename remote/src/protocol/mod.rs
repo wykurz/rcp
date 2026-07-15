@@ -368,6 +368,9 @@ pub struct RcpdConfig {
     pub auto_meta_histogram_interval: std::time::Duration,
     // common::copy::Settings
     pub dereference: bool,
+    /// Mirror of master's --require-toctou-safe flag: arms strict operand
+    /// resolution (openat2 RESOLVE_NO_SYMLINKS root opens) on the rcpd side.
+    pub require_toctou_safe: bool,
     pub overwrite: bool,
     pub overwrite_compare: String,
     /// Cap on pre-existing entries put into a directory's overwrite/ignore-existing manifest.
@@ -430,6 +433,9 @@ impl RcpdConfig {
         }
         if self.dereference {
             args.push("--dereference".to_string());
+        }
+        if self.require_toctou_safe {
+            args.push("--require-toctou-safe".to_string());
         }
         if self.overwrite {
             args.push("--overwrite".to_string());
@@ -758,6 +764,7 @@ mod tests {
             auto_meta_histogram_log: None,
             auto_meta_histogram_interval: std::time::Duration::from_secs(1),
             dereference: false,
+            require_toctou_safe: false,
             overwrite: false,
             overwrite_compare: "size,mtime".to_string(),
             overwrite_filter: None,
@@ -792,6 +799,25 @@ mod tests {
             args.iter()
                 .any(|a| a == "--overwrite-manifest-max-entries=123456"),
             "expected manifest cap flag in {args:?}"
+        );
+    }
+
+    #[test]
+    fn to_args_mirrors_require_toctou_safe() {
+        let mut config = minimal_rcpd_config();
+        config.require_toctou_safe = true;
+        let args = config.to_args();
+        assert!(
+            args.iter().any(|a| a == "--require-toctou-safe"),
+            "expected --require-toctou-safe in {args:?}"
+        );
+        let config = minimal_rcpd_config();
+        assert!(
+            !config
+                .to_args()
+                .iter()
+                .any(|a| a == "--require-toctou-safe"),
+            "flag must be omitted when off"
         );
     }
 

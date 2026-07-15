@@ -471,6 +471,7 @@ async fn run_rcpd_master(
             .map(|p| p.to_string_lossy().to_string()),
         auto_meta_histogram_interval: args.common.auto_meta_histogram_interval.into(),
         dereference: args.dereference,
+        require_toctou_safe: args.require_toctou_safe,
         overwrite: args.overwrite,
         overwrite_compare: args.overwrite_compare.clone(),
         overwrite_manifest_max_entries: args.overwrite_manifest_max_entries,
