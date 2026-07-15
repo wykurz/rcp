@@ -827,14 +827,36 @@ fn require_toctou_safe_rejects_dotdot_operand() {
         .stdout(predicates::str::contains("`..` component"));
 }
 
-/// --require-toctou-safe refuses a home-relative remote operand (the remote path
-/// part must be absolute as written)
+/// --require-toctou-safe refuses home-relative and relative remote operands: the
+/// raw path part (tilde NOT expanded, host stripped) must be absolute as written.
+/// Covers a real remote host with `~`, a force-remote localhost `~`, and a
+/// relative path via the localhost escape hatch.
 #[cfg(target_os = "linux")]
 #[test]
 fn require_toctou_safe_rejects_home_relative_remote_operand() {
+    // a real remote host with a tilde source: `host:~/src` → raw part `~/src` → not absolute
     Command::cargo_bin("rcp")
         .unwrap()
-        .args(["--require-toctou-safe", "localhost:rel/src", "/tmp/dst"])
+        .args(["--require-toctou-safe", "examplehost:~/src", "/abs/dst"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("absolute"));
+    // --force-remote makes `localhost:~/src` a genuine remote tilde operand → rejected
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args([
+            "--require-toctou-safe",
+            "--force-remote",
+            "localhost:~/src",
+            "examplehost:/abs/dst",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("absolute"));
+    // a relative path via the localhost escape hatch → raw part `rel/src` → not absolute
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--require-toctou-safe", "localhost:rel/src", "/abs/dst"])
         .assert()
         .failure()
         .stdout(predicates::str::contains("absolute"));
@@ -853,4 +875,390 @@ fn toctou_check_notes_strict_form_violation_without_failing() {
         .stdout(predicates::str::contains(
             "--require-toctou-safe would refuse",
         ));
+}
+
+/// --require-toctou-safe with fully-resolved absolute operands performs the copy
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_copies_with_resolved_absolute_operands() {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2), --require-toctou-safe refuses");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // canonicalize: TMPDIR itself may contain symlinked components (e.g. under
+    // nix-shell), which strict resolution would — correctly — refuse
+    let tmp = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir(tmp.join("src")).unwrap();
+    std::fs::write(tmp.join("src/a.txt"), b"hello").unwrap();
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .arg("--require-toctou-safe")
+        .arg(tmp.join("src"))
+        .arg(tmp.join("dst"))
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(tmp.join("dst/a.txt")).unwrap(), b"hello");
+}
+
+/// --require-toctou-safe fails closed when an operand path crosses a symlink:
+/// the strict open resolves RESOLVE_NO_SYMLINKS and gets ELOOP
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_refuses_symlinked_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(tmp.join("real/src")).unwrap();
+    std::fs::write(tmp.join("real/src/a.txt"), b"x").unwrap();
+    std::os::unix::fs::symlink(tmp.join("real"), tmp.join("link")).unwrap();
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .arg("--require-toctou-safe")
+        .arg(tmp.join("link/src"))
+        .arg(tmp.join("dst"))
+        .assert()
+        .failure();
+    assert!(
+        !tmp.join("dst").exists(),
+        "nothing must be copied through a symlinked prefix"
+    );
+}
+
+/// Without --require-toctou-safe a symlinked prefix is followed normally (the
+/// documented trusted-boundary default is unchanged)
+#[test]
+fn symlinked_prefix_followed_without_require_toctou_safe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(tmp.join("real/src")).unwrap();
+    std::fs::write(tmp.join("real/src/a.txt"), b"x").unwrap();
+    std::os::unix::fs::symlink(tmp.join("real"), tmp.join("link")).unwrap();
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .arg(tmp.join("link/src"))
+        .arg(tmp.join("dst"))
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(tmp.join("dst/a.txt")).unwrap(), b"x");
+}
+
+/// --require-toctou-safe fails closed on a symlinked prefix even when a filter
+/// would skip the root: the strict operand open runs before the root filter
+/// short-circuit (regression test for the filter early-return bypass)
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_refuses_symlinked_prefix_even_when_filter_excludes_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(tmp.join("real/src")).unwrap();
+    std::fs::write(tmp.join("real/src/a.txt"), b"x").unwrap();
+    std::os::unix::fs::symlink(tmp.join("real"), tmp.join("link")).unwrap();
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--require-toctou-safe", "--exclude=src"])
+        .arg(tmp.join("link/src"))
+        .arg(tmp.join("dst"))
+        .assert()
+        .failure();
+    assert!(!tmp.join("dst").exists());
+}
+
+/// A symlink OPERAND under --require-toctou-safe keeps the tools' non--L
+/// semantics: it is copied as the link object itself, never followed
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_copies_symlink_operand_as_link() {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2), --require-toctou-safe refuses");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tmp.path().canonicalize().unwrap();
+    std::fs::write(tmp.join("target.txt"), b"payload").unwrap();
+    std::os::unix::fs::symlink("target.txt", tmp.join("link")).unwrap();
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .arg("--require-toctou-safe")
+        .arg(tmp.join("link"))
+        .arg(tmp.join("out"))
+        .assert()
+        .success();
+    let out_meta = std::fs::symlink_metadata(tmp.join("out")).unwrap();
+    assert!(
+        out_meta.file_type().is_symlink(),
+        "the destination must be the copied LINK, not the followed target"
+    );
+    assert_eq!(
+        std::fs::read_link(tmp.join("out")).unwrap(),
+        std::path::PathBuf::from("target.txt")
+    );
+}
+
+/// An excluded source under an execute-only (searchable, not readable) parent skips
+/// cleanly on the default path: the root filter classifies via a path stat and must
+/// not require opening the parent directory for read (regression test — the strict
+/// mode's pre-filter parent open must stay strict-only)
+#[test]
+fn filtered_out_root_skips_under_execute_only_parent() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(tmp.join("parent/src")).unwrap();
+    std::fs::write(tmp.join("parent/src/a.txt"), b"x").unwrap();
+    std::fs::set_permissions(tmp.join("parent"), std::fs::Permissions::from_mode(0o111)).unwrap();
+    let assert = Command::cargo_bin("rcp")
+        .unwrap()
+        .arg("--exclude=src")
+        .arg(tmp.join("parent/src"))
+        .arg(tmp.join("dst"))
+        .assert();
+    // restore permissions before asserting so the tempdir cleanup works either way
+    std::fs::set_permissions(tmp.join("parent"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert.success();
+    assert!(!tmp.join("dst").exists());
+}
+
+/// --require-toctou-safe validates the raw filesystem path part of each operand
+/// (`host:` prefix stripped, tilde NOT expanded); the `localhost:/abs` colon escape
+/// hatch yields an absolute `/abs`, so it is accepted.
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_accepts_localhost_colon_escape_hatch() {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2), --require-toctou-safe refuses");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir(tmp.join("src")).unwrap();
+    std::fs::write(tmp.join("src/a.txt"), b"hello").unwrap();
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .arg("--require-toctou-safe")
+        .arg(format!("localhost:{}", tmp.join("src").display()))
+        .arg(format!("localhost:{}", tmp.join("dst").display()))
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(tmp.join("dst/a.txt")).unwrap(), b"hello");
+}
+
+// ── Strict destination-prefix validation (round-5 regression matrix) ──────────
+// Each of these exits 0 on the pre-fix code (the destination prefix was validated
+// only conditionally / after the source filter), and must now fail closed.
+
+/// Helper: a canonicalized tempdir with `real/` (a dir) and `link -> real` (a symlinked prefix).
+#[cfg(target_os = "linux")]
+fn symlinked_dst_prefix_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base.join("src")).unwrap();
+    std::fs::write(base.join("src/a.txt"), b"x").unwrap();
+    std::fs::create_dir_all(base.join("real")).unwrap();
+    std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+    tmp
+}
+
+/// A symlinked DESTINATION prefix fails closed even when the SOURCE root is filtered out
+/// (the up-front dst validation runs before the source-filter early-return).
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_refuses_symlinked_dst_prefix_when_source_filtered() {
+    if !common::safedir::openat2_available() {
+        return;
+    }
+    let tmp = symlinked_dst_prefix_fixture();
+    let base = tmp.path().canonicalize().unwrap();
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--require-toctou-safe", "--exclude=src"])
+        .arg(base.join("src"))
+        .arg(base.join("link/out"))
+        .assert()
+        .failure();
+    assert!(!base.join("real/out").exists());
+}
+
+/// A symlinked DESTINATION prefix fails closed with a trailing-slash destination
+/// (the conditional CLI "already exists" check is skipped there; the engine still validates).
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_refuses_symlinked_dst_prefix_with_trailing_slash() {
+    if !common::safedir::openat2_available() {
+        return;
+    }
+    let tmp = symlinked_dst_prefix_fixture();
+    let base = tmp.path().canonicalize().unwrap();
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .arg("--require-toctou-safe")
+        .arg(base.join("src"))
+        .arg(format!("{}/", base.join("link").display()))
+        .assert()
+        .failure();
+    assert!(!base.join("real/src").exists());
+}
+
+/// A symlinked DESTINATION prefix fails closed with --overwrite (the CLI check is skipped there).
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_refuses_symlinked_dst_prefix_with_overwrite() {
+    if !common::safedir::openat2_available() {
+        return;
+    }
+    let tmp = symlinked_dst_prefix_fixture();
+    let base = tmp.path().canonicalize().unwrap();
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--require-toctou-safe", "--overwrite"])
+        .arg(base.join("src"))
+        .arg(base.join("link/out"))
+        .assert()
+        .failure();
+    assert!(!base.join("real/out").exists());
+}
+
+/// A symlinked DESTINATION prefix fails closed in --dry-run (which otherwise touches no dst).
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_dry_run_refuses_symlinked_dst_prefix() {
+    if !common::safedir::openat2_available() {
+        return;
+    }
+    let tmp = symlinked_dst_prefix_fixture();
+    let base = tmp.path().canonicalize().unwrap();
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--require-toctou-safe", "--dry-run=brief"])
+        .arg(base.join("src"))
+        .arg(base.join("link/out"))
+        .assert()
+        .failure();
+}
+
+/// `--dry-run --delete` onto a destination that is itself a final symlink must SUCCEED (the final
+/// symlink is a replaceable operand, not an intermediate-prefix violation): the dry-run
+/// --ignore-existing probes are gated off, so no child spuriously fails with ELOOP.
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_dry_run_delete_onto_final_symlink_succeeds() {
+    if !common::safedir::openat2_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base.join("src")).unwrap();
+    std::fs::write(base.join("src/a.txt"), b"x").unwrap();
+    std::fs::write(base.join("src/b.txt"), b"y").unwrap();
+    // the destination operand's FINAL component is a symlink (to a real dir); its prefix is clean
+    std::fs::create_dir_all(base.join("realdst")).unwrap();
+    std::os::unix::fs::symlink(base.join("realdst"), base.join("dstlink")).unwrap();
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--require-toctou-safe", "--dry-run=brief", "--delete"])
+        .arg(base.join("src"))
+        .arg(base.join("dstlink"))
+        .assert()
+        .success();
+}
+
+/// A symlinked SOURCE prefix fails closed even when the source root is filtered out
+/// (the source parent is opened+validated up front, before the filter early-return).
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_refuses_symlinked_src_prefix_when_filtered() {
+    if !common::safedir::openat2_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base.join("real/src")).unwrap();
+    std::fs::write(base.join("real/src/a.txt"), b"x").unwrap();
+    std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--require-toctou-safe", "--exclude=src"])
+        .arg(base.join("link/src"))
+        .arg(base.join("dst"))
+        .assert()
+        .failure();
+    assert!(!base.join("dst").exists());
+}
+
+/// --require-toctou-safe rejects a home-relative `~/…` operand: its expansion is
+/// environment-dependent, so the raw path part (`~/src`) is not absolute as written
+/// and must be refused (the linter validates the pre-tilde-expansion string).
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_rejects_tilde_operand() {
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--require-toctou-safe", "~/src", "/abs/dst"])
+        .env("HOME", "/tmp/attacker")
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("absolute"));
+}
+
+/// The `localhost:/abs` colon escape hatch keeps its absolute path and is accepted
+/// under --require-toctou-safe (regression guard alongside the tilde rejection).
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_accepts_localhost_escape_after_tilde_fix() {
+    if !common::safedir::openat2_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir(base.join("src")).unwrap();
+    std::fs::write(base.join("src/a.txt"), b"x").unwrap();
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .arg("--require-toctou-safe")
+        .arg(format!("localhost:{}", base.join("src").display()))
+        .arg(base.join("dst"))
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(base.join("dst/a.txt")).unwrap(), b"x");
+}
+
+/// Strict `--dry-run --delete` must exit 0 (like the real run) when a destination
+/// intermediate is a symlink the real run would replace with a directory — the
+/// below-root prune reopen skips such entries instead of failing with ELOOP.
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_dry_run_delete_over_replaced_intermediate_symlink() {
+    if !common::safedir::openat2_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base.join("src/child/grand")).unwrap();
+    std::fs::write(base.join("src/child/grand/f.txt"), b"x").unwrap();
+    std::fs::create_dir_all(base.join("other/grand/extra")).unwrap();
+    std::fs::create_dir(base.join("dst")).unwrap();
+    // dst/child is a symlink the real --overwrite run would replace with a directory
+    std::os::unix::fs::symlink(base.join("other"), base.join("dst/child")).unwrap();
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args([
+            "--require-toctou-safe",
+            "--dry-run=brief",
+            "--overwrite",
+            "--delete",
+        ])
+        .arg(base.join("src"))
+        .arg(base.join("dst"))
+        .assert()
+        .success();
+    // the real run indeed succeeds and leaves the symlink target untouched
+    std::fs::remove_dir_all(base.join("dst")).unwrap();
+    std::fs::create_dir(base.join("dst")).unwrap();
+    std::os::unix::fs::symlink(base.join("other"), base.join("dst/child")).unwrap();
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--require-toctou-safe", "--overwrite", "--delete"])
+        .arg(base.join("src"))
+        .arg(base.join("dst"))
+        .assert()
+        .success();
 }

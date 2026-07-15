@@ -363,3 +363,148 @@ fn require_toctou_safe_rejects_dotdot_update_operand() {
         .failure()
         .stdout(predicates::str::contains("`..` component"));
 }
+
+/// --require-toctou-safe with fully-resolved absolute operands performs the link
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_links_with_resolved_absolute_operands() {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2), --require-toctou-safe refuses");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // canonicalize: TMPDIR itself may contain symlinked components (e.g. under
+    // nix-shell), which strict resolution would — correctly — refuse
+    let tmp = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir(tmp.join("src")).unwrap();
+    std::fs::write(tmp.join("src/a.txt"), b"hello").unwrap();
+    Command::cargo_bin("rlink")
+        .unwrap()
+        .arg("--require-toctou-safe")
+        .arg(tmp.join("src"))
+        .arg(tmp.join("dst"))
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(tmp.join("dst/a.txt")).unwrap(), b"hello");
+}
+
+/// --require-toctou-safe fails closed when an operand path crosses a symlink
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_refuses_symlinked_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(tmp.join("real/src")).unwrap();
+    std::fs::write(tmp.join("real/src/a.txt"), b"x").unwrap();
+    std::os::unix::fs::symlink(tmp.join("real"), tmp.join("link")).unwrap();
+    Command::cargo_bin("rlink")
+        .unwrap()
+        .arg("--require-toctou-safe")
+        .arg(tmp.join("link/src"))
+        .arg(tmp.join("dst"))
+        .assert()
+        .failure();
+    assert!(
+        !tmp.join("dst").exists(),
+        "nothing must be linked through a symlinked prefix"
+    );
+}
+
+/// An excluded source under an execute-only (searchable, not readable) parent skips
+/// cleanly on the default path: the root filter classifies via a path stat and must
+/// not require opening the parent directory for read (regression test — the strict
+/// mode's pre-filter parent open must stay strict-only)
+#[test]
+fn filtered_out_root_skips_under_execute_only_parent() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(tmp.join("parent/src")).unwrap();
+    std::fs::write(tmp.join("parent/src/a.txt"), b"x").unwrap();
+    std::fs::set_permissions(tmp.join("parent"), std::fs::Permissions::from_mode(0o111)).unwrap();
+    let assert = Command::cargo_bin("rlink")
+        .unwrap()
+        .arg("--exclude=src")
+        .arg(tmp.join("parent/src"))
+        .arg(tmp.join("dst"))
+        .assert();
+    // restore permissions before asserting so the tempdir cleanup works either way
+    std::fs::set_permissions(tmp.join("parent"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert.success();
+    assert!(!tmp.join("dst").exists());
+}
+
+// ── Strict destination/update-prefix validation (round-5 regression matrix) ───
+
+/// A symlinked DESTINATION prefix fails closed even when the SOURCE root is filtered out.
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_refuses_symlinked_dst_prefix_when_source_filtered() {
+    if !common::safedir::openat2_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base.join("src")).unwrap();
+    std::fs::write(base.join("src/a.txt"), b"x").unwrap();
+    std::fs::create_dir_all(base.join("real")).unwrap();
+    std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+    Command::cargo_bin("rlink")
+        .unwrap()
+        .args(["--require-toctou-safe", "--exclude=src"])
+        .arg(base.join("src"))
+        .arg(base.join("link/out"))
+        .assert()
+        .failure();
+    assert!(!base.join("real/out").exists());
+}
+
+/// A symlinked `--update` prefix fails closed under PLAIN `--update` (no --delete/--update-exclusive)
+/// even when the source root is filtered out — the update prefix is validated up front, before the
+/// source-filter early-return that plain --update would otherwise take.
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_refuses_symlinked_update_prefix_plain_update_filtered_src() {
+    if !common::safedir::openat2_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base.join("src")).unwrap();
+    std::fs::write(base.join("src/a.txt"), b"x").unwrap();
+    std::fs::create_dir_all(base.join("realupd/tree")).unwrap();
+    std::os::unix::fs::symlink(base.join("realupd"), base.join("updlink")).unwrap();
+    Command::cargo_bin("rlink")
+        .unwrap()
+        .args(["--require-toctou-safe", "--exclude=src", "--update"])
+        .arg(base.join("updlink/tree"))
+        .arg(base.join("src"))
+        .arg(base.join("dst"))
+        .assert()
+        .failure();
+    assert!(!base.join("dst").exists());
+}
+
+/// A symlinked `--update` prefix fails closed under destructive `--delete` (the up-front strict
+/// update-prefix validation replaces the old path-based existence guard).
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_refuses_symlinked_update_prefix_destructive() {
+    if !common::safedir::openat2_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base.join("src")).unwrap();
+    std::fs::write(base.join("src/a.txt"), b"x").unwrap();
+    std::fs::create_dir_all(base.join("realupd/tree")).unwrap();
+    std::os::unix::fs::symlink(base.join("realupd"), base.join("updlink")).unwrap();
+    Command::cargo_bin("rlink")
+        .unwrap()
+        .args(["--require-toctou-safe", "--delete", "--update"])
+        .arg(base.join("updlink/tree"))
+        .arg(base.join("src"))
+        .arg(base.join("dst"))
+        .assert()
+        .failure();
+}

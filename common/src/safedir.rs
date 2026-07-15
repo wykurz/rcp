@@ -304,7 +304,10 @@ impl Dir {
     /// `ELOOP`. If `dereference` is `true` and the final component is a symlink,
     /// the call is retried without `O_NOFOLLOW` so the symlink is followed.
     ///
-    /// The parent prefix is resolved normally (it is trusted).
+    /// The parent prefix is resolved normally (it is trusted) — unless strict
+    /// operand resolution is armed (`--require-toctou-safe`), in which case the
+    /// whole path is resolved `RESOLVE_NO_SYMLINKS` and a symlink in ANY
+    /// component fails closed with `ELOOP`.
     pub async fn open_root_dir(
         path: &Path,
         dereference: bool,
@@ -316,6 +319,26 @@ impl Dir {
         run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
             let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
             let mode = Mode::empty();
+            #[cfg(target_os = "linux")]
+            {
+                if strict_operand_resolution() {
+                    // --require-toctou-safe: `-L` is refused by the linter before strict
+                    // mode can arm, so a dereference request here is an internal
+                    // inconsistency; fail closed rather than follow a symlink.
+                    if dereference {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "--dereference cannot be combined with strict operand resolution",
+                        ));
+                    }
+                    return openat2_no_symlinks(&path, flags)
+                        .map(|fd| Dir {
+                            fd: Arc::new(fd),
+                            side,
+                        })
+                        .map_err(nix_to_io);
+                }
+            }
             match openat(AT_FDCWD, &path, flags, mode) {
                 Ok(fd) => Ok(Dir {
                     fd: Arc::new(fd),
@@ -359,15 +382,33 @@ impl Dir {
     /// symlink-following open can be obtained nowhere else. Crossing into the
     /// hardened tree below the named root is the explicit [`TrustedDir::into_tree`]
     /// step.
+    ///
+    /// Under strict operand resolution (`--require-toctou-safe`) the prefix must
+    /// already be symlink-free: it is resolved `RESOLVE_NO_SYMLINKS`, and a
+    /// symlink in any component fails closed with `ELOOP` instead of being
+    /// followed. Pass fully-resolved operands (`realpath` output) in that mode.
     pub async fn open_parent_dir(
         path: &Path,
         side: congestion::Side,
     ) -> std::io::Result<TrustedDir> {
         let path = path.to_owned();
         run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
+            let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+            #[cfg(target_os = "linux")]
+            {
+                if strict_operand_resolution() {
+                    return openat2_no_symlinks(&path, flags)
+                        .map(|fd| {
+                            TrustedDir(Dir {
+                                fd: Arc::new(fd),
+                                side,
+                            })
+                        })
+                        .map_err(nix_to_io);
+                }
+            }
             // a normal directory open: the kernel resolves the whole path following
             // symlinks, including the final (trusted parent) component. No O_NOFOLLOW.
-            let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
             openat(AT_FDCWD, &path, flags, Mode::empty())
                 .map(|fd| {
                     TrustedDir(Dir {
@@ -911,6 +952,11 @@ impl Dir {
 /// filled by the follow-open, and a hardened `Dir` cannot be used where a trusted
 /// parent is required. Crossing from the trusted prefix into the hardened tree is
 /// the single explicit [`Self::into_tree`] step.
+///
+/// Under strict operand resolution (`--require-toctou-safe`) the "trusted"
+/// prefix is additionally required to be symlink-free: the open resolves it
+/// `RESOLVE_NO_SYMLINKS`, so a symlink component fails closed with `ELOOP`
+/// rather than being followed (see [`enable_strict_operand_resolution`]).
 #[derive(Debug)]
 pub struct TrustedDir(Dir);
 
@@ -922,6 +968,69 @@ impl TrustedDir {
     #[must_use]
     pub fn into_tree(self) -> Dir {
         self.0
+    }
+}
+
+// ── Strict operand probes ────────────────────────────────────────────────────
+//
+// Existence/kind and directory-open probes on an operand path that stay faithful
+// to strict operand resolution (`--require-toctou-safe`): they resolve the
+// operand's parent prefix with `open_parent_dir` (which is
+// `openat2(RESOLVE_NO_SYMLINKS)` while armed) and touch the final component only
+// fd-relative, so a symlink in a directory component of the operand path fails
+// closed with `ELOOP` instead of being followed by a path-based probe
+// (`Path::exists`, `symlink_metadata`, `open_root_dir` on the full path). These
+// decompose the path into parent + final component so an INTERMEDIATE-prefix
+// symlink (a strict violation → `Err(ELOOP)`) is never conflated with a final
+// component that is merely a symlink / non-directory (→ `Ok(None)`). Callers use
+// these under `strict_operand_resolution()`; the default path keeps its
+// path-based probes unchanged.
+
+/// Split a lexically-normal absolute operand into `(parent, final_component)` for
+/// an fd-relative probe. Strict operands are already absolute + normal (the linter
+/// enforced it), so a plain `parent()`/`file_name()` split is correct. Returns
+/// `None` when the path has no distinct parent+name (e.g. `/`), where there is
+/// nothing to probe fd-relative.
+fn split_parent_and_name(path: &Path) -> Option<(&Path, &OsStr)> {
+    let name = path.file_name()?;
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        // a single-component relative path means the current directory
+        _ => Path::new("."),
+    };
+    Some((parent, name))
+}
+
+/// Probe an operand's existence and kind fd-relative under strict operand
+/// resolution: open its parent with `open_parent_dir` (`RESOLVE_NO_SYMLINKS`
+/// while armed) and classify the final component via `child` (`O_NOFOLLOW`).
+///
+/// - `Ok(Some(kind))` — the entry exists (a final-component symlink counts as
+///   existing, classified `Symlink`, and is never followed, matching
+///   `symlink_metadata`).
+/// - `Ok(None)` — the entry, or its parent, does not exist (`ENOENT`/`ENOTDIR`).
+/// - `Err(ELOOP)` — a directory component of the operand path is a symlink; the
+///   caller must fail closed.
+pub async fn strict_probe_dst_kind(
+    path: &Path,
+    side: congestion::Side,
+) -> std::io::Result<Option<EntryKind>> {
+    let Some((parent, name)) = split_parent_and_name(path) else {
+        return Ok(None);
+    };
+    match Dir::open_parent_dir(parent, side).await {
+        Ok(parent) => match parent.into_tree().child(name).await {
+            Ok(handle) => Ok(Some(handle.kind())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
+        },
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                || err.raw_os_error() == Some(libc::ENOTDIR) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -2596,5 +2705,24 @@ mod tests {
             "expected the LINK's own mtime; a target-following stat would return 1_700_000_000"
         );
         Ok(())
+    }
+
+    // NOTE: the test that ARMS strict operand resolution and exercises the strict
+    // (openat2) open path lives in tests/strict_resolution.rs — its own integration
+    // binary and therefore its own process. The switch is one-way, and under the
+    // plain `cargo test` harness (used by the nix checkPhase) a lib's unit tests
+    // share one process, so arming here would leak into the symlink-following
+    // default-behavior tests above.
+
+    #[test]
+    fn openat2_probe_is_stable() {
+        // the probe is memoized; both calls must agree. On kernels without openat2 a
+        // `false` result is the correct answer (the linter then refuses strict mode),
+        // so no hard assertion on availability itself.
+        let first = openat2_available();
+        assert_eq!(first, openat2_available(), "probe must be stable");
+        if !first {
+            eprintln!("this kernel lacks openat2(2); strict-mode tests skip themselves");
+        }
     }
 }

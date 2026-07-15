@@ -370,3 +370,77 @@ fn require_toctou_safe_rejects_dotdot_operand() {
         .failure()
         .stdout(predicates::str::contains("`..` component"));
 }
+
+/// --require-toctou-safe with a fully-resolved absolute operand performs the removal
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_removes_with_resolved_absolute_operand() {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2), --require-toctou-safe refuses");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // canonicalize: TMPDIR itself may contain symlinked components (e.g. under
+    // nix-shell), which strict resolution would — correctly — refuse
+    let tmp = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir(tmp.join("victim")).unwrap();
+    std::fs::write(tmp.join("victim/a.txt"), b"x").unwrap();
+    Command::cargo_bin("rrm")
+        .unwrap()
+        .arg("--require-toctou-safe")
+        .arg(tmp.join("victim"))
+        .assert()
+        .success();
+    assert!(!tmp.join("victim").exists());
+}
+
+/// --require-toctou-safe fails closed when the operand path crosses a symlink —
+/// and removes nothing through it
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_refuses_symlinked_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(tmp.join("real/victim")).unwrap();
+    std::fs::write(tmp.join("real/victim/a.txt"), b"x").unwrap();
+    std::os::unix::fs::symlink(tmp.join("real"), tmp.join("link")).unwrap();
+    Command::cargo_bin("rrm")
+        .unwrap()
+        .arg("--require-toctou-safe")
+        .arg(tmp.join("link/victim"))
+        .assert()
+        .failure();
+    assert!(
+        tmp.join("real/victim/a.txt").exists(),
+        "nothing must be removed through a symlinked prefix"
+    );
+}
+
+/// A symlink OPERAND under --require-toctou-safe keeps the tools' non--L
+/// semantics: the link itself is removed, its target is never touched
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_removes_symlink_operand_as_link() {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2), --require-toctou-safe refuses");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tmp.path().canonicalize().unwrap();
+    std::fs::write(tmp.join("target.txt"), b"payload").unwrap();
+    std::os::unix::fs::symlink(tmp.join("target.txt"), tmp.join("link")).unwrap();
+    Command::cargo_bin("rrm")
+        .unwrap()
+        .arg("--require-toctou-safe")
+        .arg(tmp.join("link"))
+        .assert()
+        .success();
+    assert!(
+        std::fs::symlink_metadata(tmp.join("link")).is_err(),
+        "the link itself must be removed"
+    );
+    assert!(
+        tmp.join("target.txt").exists(),
+        "the link target must never be touched"
+    );
+}

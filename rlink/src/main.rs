@@ -207,12 +207,26 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
     // directory just like `rrm .`/`rchm .` already work. (`/` is rejected there.) Use a shell glob
     // (`dir/*`) if you want to expand a directory's contents instead.
     let dst = resolve_dst_root(&args.src, &args.dst)?;
-    if !args.dst.ends_with('/') && dst.exists() && !(args.overwrite || args.delete) {
-        return Err(anyhow!(
-            "Destination path {dst:?} already exists! \n\
-            If you want to copy INTO it then follow the destination path with a trailing slash (/) or use \
-            --overwrite if you want to overwrite it"
-        ));
+    if !(args.dst.ends_with('/') || args.overwrite || args.delete) {
+        // Under strict operand resolution, probe the destination fd-relative (parent opened
+        // openat2 RESOLVE_NO_SYMLINKS) so a symlinked destination prefix fails closed instead of
+        // being followed by a path-based `exists()`. The engine also validates the prefix up front;
+        // this keeps the friendly pre-flight message from doing a symlink-following probe.
+        let dst_exists = if common::safedir::strict_operand_resolution() {
+            common::safedir::strict_probe_dst_kind(&dst, common::Side::Destination)
+                .await
+                .with_context(|| format!("cannot probe destination {dst:?}"))?
+                .is_some()
+        } else {
+            dst.exists()
+        };
+        if dst_exists {
+            return Err(anyhow!(
+                "Destination path {dst:?} already exists! \n\
+                If you want to copy INTO it then follow the destination path with a trailing slash (/) or use \
+                --overwrite if you want to overwrite it"
+            ));
+        }
     }
     // parse preserve settings
     let preserve = if let Some(ref settings_str) = args.preserve_settings {

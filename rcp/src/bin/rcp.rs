@@ -995,38 +995,53 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
             destination path with a trailing slash"
         ));
     }
-    let src_dst: Vec<(std::path::PathBuf, std::path::PathBuf)> = parsed_srcs
-        .iter()
-        .map(|parsed_src| {
-            // the resolver preserves the destination's variant and this branch only runs when
-            // the destination parsed as local, so a remote result is an internal error
-            let dst_path = match path::resolve_destination(parsed_src, &dst_parsed, dst_string)? {
-                path::PathType::Local(p) => p,
-                path::PathType::Remote(_) => {
-                    return Err(anyhow!(
-                        "Internal error: unexpected remote path in local copy branch"
-                    ))
-                }
+    let mut src_dst: Vec<(std::path::PathBuf, std::path::PathBuf)> =
+        Vec::with_capacity(parsed_srcs.len());
+    for parsed_src in &parsed_srcs {
+        // the resolver preserves the destination's variant and this branch only runs when
+        // the destination parsed as local, so a remote result is an internal error
+        let dst_path = match path::resolve_destination(parsed_src, &dst_parsed, dst_string)? {
+            path::PathType::Local(p) => p,
+            path::PathType::Remote(_) => {
+                return Err(anyhow!(
+                    "Internal error: unexpected remote path in local copy branch"
+                ));
+            }
+        };
+        let src_path = match parsed_src {
+            path::PathType::Local(p) => p.clone(),
+            path::PathType::Remote(_) => {
+                return Err(anyhow!(
+                    "Internal error: unexpected remote path in local copy branch"
+                ));
+            }
+        };
+        // check for existing destination only when not using trailing slash (single source case)
+        if src_strings.len() == 1 && !dst_string.ends_with('/') && !(args.overwrite || args.delete)
+        {
+            // Under strict operand resolution, probe the destination fd-relative (parent opened
+            // openat2 RESOLVE_NO_SYMLINKS) so a symlinked destination prefix fails closed instead
+            // of being followed by a path-based `exists()`. The engine also validates the prefix
+            // up front, so this is only the friendly pre-flight message; keeping it fd-relative
+            // avoids a pre-engine symlink-following existence probe.
+            let dst_exists = if common::safedir::strict_operand_resolution() {
+                common::safedir::strict_probe_dst_kind(&dst_path, common::Side::Destination)
+                    .await
+                    .with_context(|| format!("cannot probe destination {dst_path:?}"))?
+                    .is_some()
+            } else {
+                dst_path.exists()
             };
-            let src_path = match parsed_src {
-                path::PathType::Local(p) => p.clone(),
-                path::PathType::Remote(_) => {
-                    return Err(anyhow!(
-                        "Internal error: unexpected remote path in local copy branch"
-                    ))
-                }
-            };
-            // check for existing destination only when not using trailing slash (single source case)
-            if src_strings.len() == 1 && !dst_string.ends_with('/') && dst_path.exists() && !(args.overwrite || args.delete) {
+            if dst_exists {
                 return Err(anyhow!(
                     "Destination path {dst_path:?} already exists! \n\
                     If you want to copy INTO it, then follow the destination path with a trailing slash (/). Use \
                     --overwrite if you want to overwrite it"
                 ));
             }
-            Ok((src_path, dst_path))
-        })
-        .collect::<anyhow::Result<Vec<(std::path::PathBuf, std::path::PathBuf)>>>()?;
+        }
+        src_dst.push((src_path, dst_path));
+    }
     // build filter settings from CLI arguments
     let filter = common::filter::FilterSettings::from_args(
         args.filter_file.as_deref(),
@@ -1141,33 +1156,22 @@ fn main() -> Result<(), anyhow::Error> {
 
     // TOCTOU linter: must run before the async runtime starts. The verdict
     // (dereference/Linux) applies to every operation, local or remote. Operands
-    // are passed as the paths the tool will actually operate on — the parsed
-    // local payload (so the `localhost:` colon escape hatch and quoted-`~` forms
-    // validate their resolved local path, not the raw argument string) and the
-    // remote path part as written (a home-relative `host:~/x` form stays
-    // relative here and is rejected by the absolute-path requirement) — so
-    // --require-toctou-safe can enforce the strict operand contract (absolute +
-    // lexically normal, resolved RESOLVE_NO_SYMLINKS); keeping the directories
-    // along them out of a less-privileged actor's write control remains the
-    // caller's responsibility (see the "Scope of TOCTOU safety" section of
-    // docs/tocttou.md).
-    let operand_paths: Vec<std::path::PathBuf> = {
-        let parse_fn = if args.force_remote {
-            path::parse_path_force_remote
-        } else {
-            path::parse_path
-        };
-        args.paths
-            .iter()
-            .map(|path| match parse_fn(path) {
-                Ok(path::PathType::Remote(remote)) => remote.path().to_path_buf(),
-                Ok(path::PathType::Local(local)) => local,
-                // a parse error surfaces later, in async_main, exactly as it
-                // does today
-                Err(_) => std::path::PathBuf::from(path),
-            })
-            .collect()
-    };
+    // are passed as the filesystem path portion of each argument STRING — the
+    // `host:` prefix stripped but tilde NOT expanded (`path::operand_fs_path`),
+    // i.e. exactly what a string-level operand policy sees. This makes
+    // --require-toctou-safe reject a home-relative `~/x` (or `host:~/x`), whose
+    // expansion is environment-dependent and not absolute as written, while the
+    // `localhost:/abs` colon escape hatch keeps its absolute `/abs`. So the
+    // string a sudo rule / wrapper validated is exactly what the strict contract
+    // (absolute + lexically normal, resolved RESOLVE_NO_SYMLINKS) validates;
+    // keeping the directories along the path out of a less-privileged actor's
+    // write control remains the caller's responsibility (see the "Scope of
+    // TOCTOU safety" section of docs/tocttou.md).
+    let operand_paths: Vec<std::path::PathBuf> = args
+        .paths
+        .iter()
+        .map(|path| std::path::PathBuf::from(path::operand_fs_path(path)))
+        .collect();
     common::toctou_check::enforce_or_exit(
         args.dereference,
         args.toctou_check,
