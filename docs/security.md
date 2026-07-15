@@ -184,9 +184,12 @@ User
 - **TOCTTOU on non-Linux**: The hardened path is Linux-only; non-Linux builds use path-based
   operations. See [TOCTTOU Vulnerabilities](tocttou.md).
 - **Trust of the operand path's prefix**: The hardening protects everything at or below the named
-  root, but the tools do not verify that the directories *above* it are free of less-privileged
-  control. `--require-toctou-safe` enforces the hardened walk (refusing `-L`/non-Linux); the prefix
-  trust is the caller's responsibility — see the
+  root, but by default the tools do not verify that the directories *above* it are free of
+  less-privileged control. `--require-toctou-safe` enforces the hardened walk (refusing
+  `-L`/non-Linux) and the strict operand contract: operands must be absolute and lexically normal,
+  and every operand open resolves `RESOLVE_NO_SYMLINKS`, so a symlink spliced anywhere along the
+  path fails closed. Path *policy* — and keeping prefix directories non-writable by lesser-
+  privileged actors — remains the caller's responsibility; see the
   [Scope of TOCTOU safety](tocttou.md#scope-of-toctou-safety) section.
 
 On Linux, the default (non-`-L`) local hardening is implemented through a single shared safe-walk
@@ -366,9 +369,10 @@ The rcp security model provides:
 - ⚠️ **TOCTTOU with `--dereference`/`-L`**: Following symlinks is requested behavior and is not
   hardened. On Linux, all other default paths (local copy/link/chmod/rm/delete, remote copy
   source+destination) are fully TOCTOU-hardened. Non-Linux builds are not hardened. Use
-  `--require-toctou-safe` in sudo rules to enforce the hardened walk (it refuses `-L`/non-Linux).
-  The trust of the destination path's prefix is the caller's responsibility, not verified in-tool —
-  see the [Scope of TOCTOU safety](tocttou.md#scope-of-toctou-safety) section of
+  `--require-toctou-safe` in sudo rules to enforce the hardened walk (it refuses `-L`/non-Linux)
+  plus the strict operand contract (absolute, lexically normal operands, resolved
+  `RESOLVE_NO_SYMLINKS`; needs Linux 5.6+). Path policy is still the caller's responsibility — see
+  the [Scope of TOCTOU safety](tocttou.md#scope-of-toctou-safety) section of
   [TOCTTOU Vulnerabilities](tocttou.md) for details.
 
 Use `--no-encryption` only on trusted networks where performance is critical.
