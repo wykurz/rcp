@@ -24,6 +24,22 @@ The remote copy system consists of three distinct components:
 5. Master connects to each rcpd's listener via TCP: first the control connection, then a second
    connection used for tracing/progress forwarding
 
+**Propagated security flags:** When the master runs with `--require-toctou-safe`, it mirrors the
+flag into each rcpd's spawn arguments (via `RcpdConfig::to_args()`). Each rcpd then arms strict
+operand resolution before any filesystem work: its operand root/parent opens resolve with
+`openat2(RESOLVE_NO_SYMLINKS)`, and it refuses to run on kernels without `openat2` (Linux 5.6+) —
+the refusal is printed as a single line on stderr, where the master's handshake reader surfaces it.
+The operands still travel as before — the master lints their strict form (absolute as written,
+lexically normal; `~`-relative forms are rejected) before spawning. Note the asymmetry: the source's
+`MasterHello::Source` carries both `src` and `dst`, so the source `rcpd` opens+validates its source
+parent up front, but `MasterHello::Destination` carries **no path** — the destination `rcpd` learns
+the destination only from the source's per-entry messages, so it validates its prefix only when it
+actually opens the destination to write (a `--dry-run` or fully-filtered source writes nothing and
+therefore does not separately validate it; see the strict-operand residual in
+[tocttou.md](tocttou.md)). This is a spawn-argument change, not a wire-format change;
+version-matched rcpd binaries (see binary discovery in [remote_copy.md](remote_copy.md)) understand
+the flag.
+
 **Special Case - Same Host Copies:** When source and destination are on the same host, the master:
 
 - Deploys rcpd only once (if needed)

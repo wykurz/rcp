@@ -405,8 +405,12 @@ still authenticates rcpd startup.
 On Linux, for default non-`-L` invocations, the mutating tools harden their directory walk against
 symlink/path-swap races (fd-relative `openat`/`O_NOFOLLOW`; see the
 [TOCTOU documentation](docs/tocttou.md)). `--toctou-check` prints whether a given invocation is
-hardened and exits (`0` = safe), while `--require-toctou-safe` rejects non-hardened invocations.
-Neither verifies the trust of the operand path's *prefix*; lock that down in the `sudo` rule.
+hardened and exits (`0` = safe), while `--require-toctou-safe` rejects non-hardened invocations and
+additionally enforces a strict operand contract: operands must be absolute and lexically normal
+(`realpath` output), and every operand open resolves `RESOLVE_NO_SYMLINKS` (Linux 5.6+), so a
+symlink spliced into any directory component of an operand path fails closed (a symlink operand
+itself is never followed). Which paths are *acceptable* remains policy — lock that down in the
+`sudo` rule or wrapper.
 
 **Set-ID suppression for privileged `rchm` (`--no-setid`):** For a privileged policy wrapper (e.g. a
 `sudo` rule), add `--no-setid`. For every selected non-symlink whose type has an applicable

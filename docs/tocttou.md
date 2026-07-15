@@ -37,7 +37,10 @@ is outside this threat; the risk arises specifically when a more-privileged run 
 that a less-privileged actor can write to.
 
 On Linux, the local and remote default paths are now TOCTOU-hardened — for everything *at or below
-the named root*. The trust of the path *above* the named root is the caller's responsibility.
+the named root*. The trust of the path *above* the named root is the caller's responsibility;
+`--require-toctou-safe` additionally machine-checks the operand form and enforces symlink-free
+resolution of the whole operand path (see
+[The Linter](#the-linter---toctou-check-and---require-toctou-safe)).
 [Scope of TOCTOU safety](#scope-of-toctou-safety) defines the guarantee precisely; read it before
 relying on TOCTOU safety under elevated privilege.
 
@@ -204,6 +207,21 @@ heuristic is either unsound (it cannot anticipate every symlink, `..`, ownership
 mount-namespace case) or so conservative it refuses almost every real privileged copy. So the tools
 do not attempt it. **The caller must pass operands it has resolved and whose prefix it trusts.**
 
+**Narrowed under `--require-toctou-safe`.** The strict mode cannot decide *policy* either — it still
+cannot know whether `/home/alice` is a legitimate privileged target — but it machine-checks the
+mechanical half of this responsibility. Every operand must be absolute and lexically normal (no
+`.`/`..` components, no `//` segments; `realpath` output always qualifies), and every operand
+root/parent open resolves with `openat2(RESOLVE_NO_SYMLINKS)`, so a symlink in any *directory*
+component of an operand path fails closed with `ELOOP` at the open itself. The named entry itself is
+never followed either: a symlink *operand* is handled as the link object (copied/removed/chowned as
+a link, `ELOOP` where a directory is required), per the tools' existing non-`-L` semantics. A
+wrapper that resolves and string-validates an operand therefore validates the object the tool
+operates on: between its check and the tool's use, no symlink can be spliced anywhere along the
+path. What such a caller still owes is *write*-control of the directories along the path — an actor
+with write access to a prefix directory can rename real directories into place, substituting only
+content they could already write — plus the bind-mount and `protected_hardlinks` preconditions
+below.
+
 The guarantees are *additionally* bounded by separately-documented exceptions: `--dereference`/`-L`
 and non-Linux builds (see [What Is Not Hardened](#what-is-not-hardened)), `rcmp` (read-only; out of
 scope), and the kernel preconditions `fs.protected_hardlinks=1` and no attacker-controlled bind
@@ -245,6 +263,67 @@ Specific invariants enforced:
   created fd, so there are no two source fds to mismatch. `scripts/check-source-read-fidelity.sh`
   (run in CI) backstops this by forbidding by-name source-payload reads (`read_link_at`,
   `File::open`) in the hardened modules, outside the `-L`/`--dereference` path.
+
+### Strict operand resolution (`--require-toctou-safe`)
+
+The operand paths themselves — the one place the fd-based walk still consults multi-component paths
+(`Dir::open_root_dir` for a named root, `Dir::open_parent_dir` for its container; both in
+`common/src/safedir.rs`) — get a stricter contract when `--require-toctou-safe` is in force:
+
+- **Lexical form.** Every operand must be absolute and lexically normal: no `.` or `..` components,
+  no empty (`//`) segments; a single trailing slash is allowed (it carries copy-into meaning for
+  destinations). `realpath` output always qualifies. This makes string-level operand policies
+  (sudoers patterns, wrapper prefix checks) sound — `/vetted/../etc` can no longer pass a
+  `/vetted/*` check.
+- **No-symlink resolution.** Both operand opens switch from plain `openat` to
+  `openat2(RESOLVE_NO_SYMLINKS)` (which implies `RESOLVE_NO_MAGICLINKS`), enforced by the kernel at
+  the open itself: a symlink in any directory component of the path fails closed with `ELOOP`. This
+  closes the race between a wrapper's `realpath`+policy check and the tool's open. Requires Linux
+  5.6+; on older kernels `--require-toctou-safe` refuses to run rather than degrade. The named entry
+  itself keeps the tools' existing non-`-L` semantics: classified `O_NOFOLLOW`, a symlink operand is
+  operated on as the link object and never followed (`ELOOP` where the open requires a directory,
+  e.g. the `--delete` prune reopen).
+- **Resolved once, up front, then threaded.** Each operand's parent is opened exactly once, at the
+  entry of the operation, **before any filter / dry-run / overwrite / `--update` branching** — the
+  same discipline the recursive walk already uses below the named root, now extended up to the
+  operands themselves. That single open IS the validation: a symlinked prefix fails closed there, so
+  no downstream branch (a filtered-out source root, a trailing-slash or `--overwrite` destination, a
+  plain `--update`, a `--dry-run` that never touches the destination) can let a symlinked prefix
+  slip past by skipping a later check. The held fd is reused by every consumer (root-filter
+  classification, the "already exists" check, the walk, the dry-run reporter, the `--update` probe).
+  Where a dry run holds no persistent destination fd, the existence probes re-resolve with a
+  decomposed `openat2` (parent open + `O_NOFOLLOW` child), which is atomic and distinguishes an
+  intermediate-prefix symlink (fail closed) from a final component that is merely a symlink or
+  non-directory (a replaceable operand, accepted). The `--delete` prune scan is the one consumer
+  that, in a dry run, reopens the destination directory by its full path (`openat2`
+  `RESOLVE_NO_SYMLINKS`): this path is *below* the named root, which the real run walks fd-relative
+  and would replace or skip as it goes, so a symlink anywhere in it (an intermediate the real run
+  would replace, or a final symlink) yields `ELOOP` and the prune preview is simply skipped —
+  nothing to prune, since the real run creates a fresh directory there and exits successfully. The
+  operand prefix *above* the named root is still validated up front (fatal), so this below-root skip
+  does not weaken the contract; it only keeps the preview consistent with the real run.
+- **Remote operands.** The master lints the remote path parts (which must be absolute as written;
+  `host:~/x` forms are rejected) and mirrors the flag onto each spawned `rcpd`, which arms the same
+  strict resolution for its root opens on the remote host. The source `rcpd` opens the source parent
+  up front (fail closed) before its root filter; the destination `rcpd` learns the destination path
+  only from the source's directory/symlink messages (its own `MasterHello::Destination` carries no
+  path), and opens the destination parent when it processes the root — so a symlinked prefix fails
+  closed whenever an operand is actually accessed. **Residual:** whenever the destination `rcpd`
+  receives no create message — a remote **`--dry-run`** (which writes nothing by design), a copy
+  whose **source root is entirely filtered out**, or a **skipped root special** — it never opens
+  (hence never validates) its destination parent. Nothing is written through the prefix, so it is
+  benign, but unlike a local operation it does not separately fail closed on a symlinked destination
+  prefix. Closing this fully needs a remote-protocol change (handing the destination operand to the
+  destination `rcpd` up front, since neither the master nor the source can open a path on the
+  destination host) and is deferred.
+
+The switch is process-global, armed once by the linter before any filesystem work; the default (no
+flag) behavior is unchanged. Because the operand parents are opened for read up front, an excluded
+root under an execute-only (`0111`) parent — which the default path skips via a path stat — instead
+fails with `EACCES` under strict mode; this is consistent with the real copy (which already required
+parent read) and with `rrm`/`rchm`. One consequence worth knowing: systems whose legitimate paths
+cross symlinks (`/home → /var/home`, automounts) must pass the resolved form — that is the point,
+and it is why this is opt-in rather than the default.
 
 ### One shared traversal driver
 
@@ -296,6 +375,12 @@ delegated). Concretely, for `rcp /backup/foo /dst` under a sudo rule that fixes 
 the caller supply `foo`: the components between the fixed prefix and the named operand are resolved
 normally when opening the root, so keeping them out of a less-privileged actor's control is the
 policy's job — typically by pinning the full path in the rule rather than using a wildcard.
+
+Under `--require-toctou-safe` the boundary tightens: operands must be absolute and lexically normal,
+and the full operand path — prefix included — is opened `RESOLVE_NO_SYMLINKS`, so the "resolved
+normally" clause above no longer applies; a symlink between the fixed prefix and the named operand
+fails closed instead of being followed. See
+[Strict operand resolution](#strict-operand-resolution---require-toctou-safe).
 
 ## What Is Not Hardened
 
@@ -358,23 +443,45 @@ The "safe" verdict always includes a caveat reminding that the trusted-boundary 
 components above the named root are not actor-writable) cannot be statically verified from the
 invocation alone.
 
+`--toctou-check` also emits a `Note:` for every operand that `--require-toctou-safe` would refuse
+(non-absolute or non-normal form, or a kernel without `openat2`), without changing the exit code —
+useful when preparing a wrapper or sudo rule for the strict mode.
+
 ### `--require-toctou-safe`
 
-Refuses to run unless the invocation uses the TOCTOU-hardened walk — that is, it refuses
-`--dereference`/`-L` (which follows symlinks by request) and non-Linux builds.
+Refuses to run unless the invocation uses the TOCTOU-hardened walk **and** satisfies the strict
+operand contract:
+
+- refuses `--dereference`/`-L` (follows symlinks by request) and non-Linux builds;
+- refuses any operand that is not absolute and lexically normal (no `.`/`..` components, no `//`
+  segments; a single trailing slash is allowed — `realpath` output always qualifies);
+- refuses kernels without `openat2(2)` (Linux 5.6+);
+- and, having passed those checks, resolves every operand root/parent open with
+  `openat2(RESOLVE_NO_SYMLINKS)`, so a symlink in any directory component of an operand path fails
+  closed with `ELOOP` at use time (a symlink *operand* is never followed either — it is operated on
+  as the link object, per the tools' non-`-L` semantics).
 
 ```bash
 # Refused: -L is not safe
 $ sudo rcp --require-toctou-safe -L /backup/data /restore/
 Refusing to run: invocation is not TOCTOU-safe.
   Reason: --dereference/-L follows symlinks by request ...
+
+# Refused: operand is not in strict form
+$ sudo rcp --require-toctou-safe ./data /restore/out
+Refusing to run: invocation is not TOCTOU-safe.
+  Reason: operand "./data" is not absolute; --require-toctou-safe requires absolute, ...
+
+# Fails closed (ELOOP) at the open if any directory component is — or becomes — a symlink
+$ sudo rcp --require-toctou-safe /backup/linkdir/data /restore/out
 ```
 
-It does **not** verify the trust of the operand path's prefix — the directories above the named
-root; that judgment requires policy context the tool does not have, so it remains the caller's
-responsibility (see [Scope of TOCTOU safety](#scope-of-toctou-safety)). `--require-toctou-safe`
-operates purely on the verdict (`--dereference`/non-Linux) and never inspects the operand paths, so
-it treats local and remote (`host:/path`) operands identically.
+What it still does **not** decide is *policy*: whether a given absolute path is an acceptable
+privileged target remains the caller's judgment, and the directories along the operand paths must
+still be kept out of a less-privileged actor's *write* control (a prefix-writer can rename real
+directories, substituting content they could already place — though never redirect through a
+symlink). See [Scope of TOCTOU safety](#scope-of-toctou-safety). Local and remote (`host:/path`)
+operands are held to the same contract; the flag is mirrored to each `rcpd`.
 
 <a id="the-contract-for-safe-privileged-sudo-use"></a>
 
@@ -383,15 +490,20 @@ it treats local and remote (`host:/path`) operands identically.
 Safe TOCTOU use under elevated privilege is a two-layer arrangement:
 
 1. **A layer above the RCP tools** — the `sudo` policy, or a thin vetted wrapper — decides which
-   operand paths are acceptable and ensures they are fully resolved and that the directories above
-   each named root are not under a less-privileged actor's control. The "is this path safe?"
-   judgment lives here, because this is where the policy context exists.
+   operand paths are acceptable (typically: `realpath` the operand, then match the result against
+   the policy's allowlist) and ensures the directories along each path are not under a
+   less-privileged actor's *write* control. The "is this path safe?" judgment lives here, because
+   this is where the policy context exists.
 2. **The RCP tool** guarantees the hardened walk for everything at and below those named roots (the
    in-scope property of [Scope of TOCTOU safety](#scope-of-toctou-safety)).
 
-`--require-toctou-safe` is the tool's half of this contract: it refuses to run unless the invocation
-uses the hardened walk. It does **not**, and cannot, vouch for the trust of the operand paths; that
-is the caller's responsibility per (1).
+`--require-toctou-safe` is the tool's half of this contract, and it also verifies the mechanical
+half of (1): it refuses non-hardened invocations, refuses operands that are not absolute and
+lexically normal (so the string the policy validated is the only object the path can denote), and
+resolves every operand `RESOLVE_NO_SYMLINKS` so the object it opens is the one at that literal path
+at open time. What it cannot do is make the *policy* judgment — which paths are acceptable — or
+defend against an actor who can already write a prefix directory renaming real directories; that
+remains the caller's responsibility per (1).
 
 ### Recommended sudo policy patterns
 
@@ -509,23 +621,23 @@ caller-provided option string.
 
 ## Summary
 
-| Aspect                                       | Status                                                                                                                                                                                                                  |
-| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Symlink following (leaf)                     | Hardened (Linux): `O_NOFOLLOW` on every entry open                                                                                                                                                                      |
-| Intermediate directory swaps                 | Hardened (Linux): every dir opened fd-relative from parent                                                                                                                                                              |
-| FIFO swap (DoS/side-effect)                  | Hardened (Linux): `O_NONBLOCK` + `fstat`+`S_ISREG`                                                                                                                                                                      |
-| Metadata ops (chown/chmod/utimes)            | Hardened (Linux): fd-based, no path re-resolution                                                                                                                                                                       |
-| File data copy                               | Hardened (Linux): `copy_file_range` between held fds                                                                                                                                                                    |
-| `--delete` pruning                           | Hardened (Linux): fd-relative enumeration and removal                                                                                                                                                                   |
-| Remote copy (source side)                    | Hardened (Linux): two-pass dir-fd map                                                                                                                                                                                   |
-| Remote copy (destination side)               | Hardened (Linux): directory tracker fd-map                                                                                                                                                                              |
-| Remote `--delete`                            | Not supported (rejected before operation)                                                                                                                                                                               |
-| `--dereference` / `-L`                       | **Not hardened** (follows symlinks by design)                                                                                                                                                                           |
-| Non-Linux builds                             | **Not hardened** (path-based code, documented)                                                                                                                                                                          |
-| `rcmp`                                       | Out of scope (read-only; no mis-permissioning possible)                                                                                                                                                                 |
-| *Which* in-subtree file a swap makes us read | Out of scope — reads are not inode-pinned; a same-directory regular-file swap can change which file is read, but cannot escape the subtree or widen permissions (see [Scope of TOCTOU safety](#scope-of-toctou-safety)) |
-| Prefix trust (path above the named root)     | Caller's responsibility — out of scope, not verified in-tool (see [Scope of TOCTOU safety](#scope-of-toctou-safety))                                                                                                    |
-| `fs.protected_hardlinks=0`                   | **Not defended** (userspace cannot close this gap)                                                                                                                                                                      |
+| Aspect                                       | Status                                                                                                                                                                                                                                                                                        |
+| -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Symlink following (leaf)                     | Hardened (Linux): `O_NOFOLLOW` on every entry open                                                                                                                                                                                                                                            |
+| Intermediate directory swaps                 | Hardened (Linux): every dir opened fd-relative from parent                                                                                                                                                                                                                                    |
+| FIFO swap (DoS/side-effect)                  | Hardened (Linux): `O_NONBLOCK` + `fstat`+`S_ISREG`                                                                                                                                                                                                                                            |
+| Metadata ops (chown/chmod/utimes)            | Hardened (Linux): fd-based, no path re-resolution                                                                                                                                                                                                                                             |
+| File data copy                               | Hardened (Linux): `copy_file_range` between held fds                                                                                                                                                                                                                                          |
+| `--delete` pruning                           | Hardened (Linux): fd-relative enumeration and removal                                                                                                                                                                                                                                         |
+| Remote copy (source side)                    | Hardened (Linux): two-pass dir-fd map                                                                                                                                                                                                                                                         |
+| Remote copy (destination side)               | Hardened (Linux): directory tracker fd-map                                                                                                                                                                                                                                                    |
+| Remote `--delete`                            | Not supported (rejected before operation)                                                                                                                                                                                                                                                     |
+| `--dereference` / `-L`                       | **Not hardened** (follows symlinks by design)                                                                                                                                                                                                                                                 |
+| Non-Linux builds                             | **Not hardened** (path-based code, documented)                                                                                                                                                                                                                                                |
+| `rcmp`                                       | Out of scope (read-only; no mis-permissioning possible)                                                                                                                                                                                                                                       |
+| *Which* in-subtree file a swap makes us read | Out of scope — reads are not inode-pinned; a same-directory regular-file swap can change which file is read, but cannot escape the subtree or widen permissions (see [Scope of TOCTOU safety](#scope-of-toctou-safety))                                                                       |
+| Prefix trust (path above the named root)     | Caller's responsibility by default; under `--require-toctou-safe`, operands must be absolute + lexically normal and resolve `RESOLVE_NO_SYMLINKS` — a spliced symlink fails closed; prefix-writer renames stay in scope of the caller (see [Scope of TOCTOU safety](#scope-of-toctou-safety)) |
+| `fs.protected_hardlinks=0`                   | **Not defended** (userspace cannot close this gap)                                                                                                                                                                                                                                            |
 
 TOCTTOU vulnerabilities in rcp are **real but require local access** and specific privilege
 configurations to exploit. On Linux, the default (non-`-L`) paths of all write-capable tools are now

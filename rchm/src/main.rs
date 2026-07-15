@@ -91,11 +91,14 @@ struct Args {
     toctou_check: bool,
     /// Refuse to run unless the invocation uses the TOCTOU-hardened walk
     ///
-    /// Refuses non-Linux builds (rchm has no --dereference). It does NOT verify the trust
-    /// of the operand path's prefix — that is the caller's responsibility (lock paths down
-    /// in the wrapper or sudo rule). See "Scope of TOCTOU safety" in docs/tocttou.md.
-    /// Intended to be pinned by a privileged wrapper or an exact sudo rule; it does not make
-    /// arbitrary trailing options or operands safe.
+    /// Refuses non-Linux builds (rchm has no --dereference), kernels without openat2
+    /// (Linux 5.6+), and any operand that is not absolute and lexically normal (no
+    /// `.`/`..`/`//`; realpath output qualifies). Operand root opens then resolve with
+    /// openat2(RESOLVE_NO_SYMLINKS), so a symlink in any directory component fails closed (a
+    /// symlink operand itself is never followed — it is handled as the link object). Path
+    /// POLICY stays the caller's — lock paths down in the wrapper or sudo rule. See "Scope
+    /// of TOCTOU safety" in docs/tocttou.md. Intended to be pinned by a privileged wrapper
+    /// or an exact sudo rule; it does not make arbitrary trailing options or operands safe.
     #[arg(long, conflicts_with = "toctou_check", help_heading = "Security")]
     require_toctou_safe: bool,
     /// Absolute path to the `getent` binary used to resolve user/group names

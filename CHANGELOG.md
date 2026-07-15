@@ -7,6 +7,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- `--require-toctou-safe` now enforces a strict operand contract in addition to requiring the
+  hardened walk. Every operand path (including `rlink --update` and the path part of remote
+  `host:/path` operands) must be absolute and lexically normal — no `.` or `..` components, no empty
+  `//` segments; `realpath` output always qualifies — and every operand root/parent open resolves
+  with `openat2(RESOLVE_NO_SYMLINKS)`, so a symlink in any directory component of an operand path
+  fails closed with `ELOOP` at the open itself (a symlink operand is never followed either — it is
+  operated on as the link object, per the tools' non-`-L` semantics). This closes the race between a
+  wrapper's `realpath`+policy validation and the tool's open, and makes string-level operand
+  policies in sudo rules and vetted wrappers sound. The flag now requires Linux 5.6+ (`openat2`) and
+  refuses older kernels; remote copies mirror the flag to each `rcpd`. Invocations that previously
+  passed relative or unnormalized operands with `--require-toctou-safe` are now refused — pass
+  `realpath`-resolved operands. `--toctou-check` output gains informational notes for operands the
+  strict mode would refuse; its exit code is unchanged, as is all behavior without the flag. For
+  LOCAL operations, destination and `--update` operands are validated the same way, up front, on
+  every path (real copy, `--dry-run`, filtered source, `--overwrite`, trailing-slash), so a
+  symlinked destination prefix fails closed regardless of flags. The remote `--dry-run` source
+  traversal on the default (non-`-L`) path is now fd-relative like the real copy, so a concurrent
+  swap cannot make a privileged dry run report names, sizes, or symlink targets from outside the
+  source tree. One remote limitation: the destination `rcpd` validates its operand prefix only when
+  it actually writes, so a fully source-filtered remote copy or a remote `--dry-run` (which write
+  nothing) do not separately fail closed on a symlinked destination prefix — nothing is followed
+  through it; closing this gap fully requires sending the destination operand to the destination
+  `rcpd` up front (a protocol change, deferred). See `docs/tocttou.md`.
+
 ## [0.36.0] - 2026-07-10
 
 ### Added
