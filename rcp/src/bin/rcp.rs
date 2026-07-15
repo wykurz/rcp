@@ -1140,14 +1140,39 @@ fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
 
     // TOCTOU linter: must run before the async runtime starts. The verdict
-    // (dereference/Linux) applies to every operation, local or remote. The linter
-    // does NOT inspect the operand paths — the trust of a path's prefix is the
+    // (dereference/Linux) applies to every operation, local or remote. Operands
+    // are passed as the paths the tool will actually operate on — the parsed
+    // local payload (so the `localhost:` colon escape hatch and quoted-`~` forms
+    // validate their resolved local path, not the raw argument string) and the
+    // remote path part as written (a home-relative `host:~/x` form stays
+    // relative here and is rejected by the absolute-path requirement) — so
+    // --require-toctou-safe can enforce the strict operand contract (absolute +
+    // lexically normal, resolved RESOLVE_NO_SYMLINKS); keeping the directories
+    // along them out of a less-privileged actor's write control remains the
     // caller's responsibility (see the "Scope of TOCTOU safety" section of
     // docs/tocttou.md).
+    let operand_paths: Vec<std::path::PathBuf> = {
+        let parse_fn = if args.force_remote {
+            path::parse_path_force_remote
+        } else {
+            path::parse_path
+        };
+        args.paths
+            .iter()
+            .map(|path| match parse_fn(path) {
+                Ok(path::PathType::Remote(remote)) => remote.path().to_path_buf(),
+                Ok(path::PathType::Local(local)) => local,
+                // a parse error surfaces later, in async_main, exactly as it
+                // does today
+                Err(_) => std::path::PathBuf::from(path),
+            })
+            .collect()
+    };
     common::toctou_check::enforce_or_exit(
         args.dereference,
         args.toctou_check,
         args.require_toctou_safe,
+        &operand_paths,
     );
 
     let is_remote_operation = has_remote_paths(&args);

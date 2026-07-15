@@ -599,16 +599,25 @@ fn missing_update_path_with_absent_parent_without_delete_or_exclusive_falls_back
 
 #[test]
 fn require_toctou_safe_with_missing_update_path_proceeds() {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2), --require-toctou-safe refuses");
+        return;
+    }
     // `--require-toctou-safe` must not reject a plain `--update` run whose update path (and its
-    // parent) is absent. The rationale shifted with the scope reframe (docs/tocttou.md "Scope of
-    // TOCTOU safety"): the linter now operates purely on the verdict (`!dereference && linux`) and
-    // no longer inspects operand paths at all, so a missing update path can never cause a refusal —
-    // this passes trivially. (It originally guarded against the removed trusted-prefix check, which
-    // would fail on the missing ancestor before the operation could apply its no-update fallback.)
+    // parent) is absent. The linter's strict operand contract is purely LEXICAL (absolute +
+    // normal form) — it never checks existence — so the absent operand passes validation; the
+    // strict `openat2(RESOLVE_NO_SYMLINKS)` open of the missing update parent then yields ENOENT,
+    // which takes the documented no-update fallback (see the update-parent match in
+    // common/src/link.rs) instead of failing the run. That fallback surviving strict mode is
+    // exactly what this test pins. (It originally guarded against a removed trusted-prefix check,
+    // which would fail on the missing ancestor before the fallback could apply.)
     let tmp = tempfile::tempdir().unwrap();
-    let src = tmp.path().join("src");
-    let dst = tmp.path().join("dst");
-    let missing_upd_deep = tmp.path().join("nonexistent_parent").join("also_missing");
+    // canonicalize: TMPDIR itself may contain symlinked components (e.g. under nix-shell), which
+    // strict resolution would — correctly — refuse
+    let tmp = tmp.path().canonicalize().unwrap();
+    let src = tmp.join("src");
+    let dst = tmp.join("dst");
+    let missing_upd_deep = tmp.join("nonexistent_parent").join("also_missing");
     std::fs::create_dir(&src).unwrap();
     std::fs::write(src.join("a.txt"), b"x").unwrap();
 

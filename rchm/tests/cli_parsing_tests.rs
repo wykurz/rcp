@@ -161,3 +161,26 @@ fn toctou_check_and_require_toctou_safe_conflict() {
         .failure()
         .stderr(predicates::str::contains("--require-toctou-safe"));
 }
+
+/// --require-toctou-safe refuses a relative operand: the strict operand contract
+/// requires absolute, lexically normal paths
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_rejects_relative_operand() {
+    rchm()
+        .args(["--require-toctou-safe", "--mode", "g+r", "rel/path"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("absolute"));
+}
+
+/// --require-toctou-safe refuses an operand containing a `..` component
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_rejects_dotdot_operand() {
+    rchm()
+        .args(["--require-toctou-safe", "--mode", "g+r", "/tmp/../victim"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("`..` component"));
+}

@@ -281,11 +281,27 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // TOCTOU linter: must run before the async runtime starts.
-    // rlink has no --dereference flag; dereference is always false. The linter
-    // does NOT inspect the operand paths — the trust of a path's prefix is the
-    // caller's responsibility (see the "Scope of TOCTOU safety" section of
+    // rlink has no --dereference flag; dereference is always false. Operands
+    // (src, dst, and --update when given) are passed so --require-toctou-safe
+    // can enforce the strict operand contract (absolute + lexically normal,
+    // resolved RESOLVE_NO_SYMLINKS); keeping the directories along them out of
+    // a less-privileged actor's write control remains the caller's
+    // responsibility (see the "Scope of TOCTOU safety" section of
     // docs/tocttou.md).
-    common::toctou_check::enforce_or_exit(false, args.toctou_check, args.require_toctou_safe);
+    let operand_paths: Vec<std::path::PathBuf> = [
+        Some(args.src.clone()),
+        Some(std::path::PathBuf::from(&args.dst)),
+        args.update.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    common::toctou_check::enforce_or_exit(
+        false,
+        args.toctou_check,
+        args.require_toctou_safe,
+        &operand_paths,
+    );
 
     let dry_run_warnings = args.dry_run.map(|_| {
         common::DryRunWarnings::new(
