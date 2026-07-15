@@ -184,3 +184,56 @@ fn require_toctou_safe_rejects_dotdot_operand() {
         .failure()
         .stdout(predicates::str::contains("`..` component"));
 }
+
+/// --require-toctou-safe with a fully-resolved absolute operand performs the chmod
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_chmods_with_resolved_absolute_operand() {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2), --require-toctou-safe refuses");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    // canonicalize: TMPDIR itself may contain symlinked components (e.g. under
+    // nix-shell), which strict resolution would — correctly — refuse
+    let tmp = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir(tmp.join("dir")).unwrap();
+    rchm()
+        .args(["--require-toctou-safe", "--mode", "0700"])
+        .arg(tmp.join("dir"))
+        .assert()
+        .success();
+    let mode = std::fs::metadata(tmp.join("dir"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o7777, 0o700);
+}
+
+/// --require-toctou-safe fails closed when the operand path crosses a symlink —
+/// and changes nothing through it
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_refuses_symlinked_prefix() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(tmp.join("real/dir")).unwrap();
+    std::fs::set_permissions(tmp.join("real/dir"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(tmp.join("real"), tmp.join("link")).unwrap();
+    rchm()
+        .args(["--require-toctou-safe", "--mode", "0700"])
+        .arg(tmp.join("link/dir"))
+        .assert()
+        .failure();
+    let mode = std::fs::metadata(tmp.join("real/dir"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o7777,
+        0o755,
+        "mode must be unchanged through a symlinked prefix"
+    );
+}

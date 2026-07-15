@@ -209,18 +209,26 @@ pub async fn link(
     // mode (long-standing behavior), and recursive child-level "update missing" cases stay
     // handled inside link_internal — they correctly no-op so the parent's prune removes their
     // dst counterpart per the documented semantics.
-    if let Some(update_path) = update.as_ref()
-        && (settings.update_exclusive || settings.copy_settings.delete.is_some())
-    {
-        match crate::walk::run_metadata_probed(
-            congestion::Side::Source,
-            congestion::MetadataOp::Stat,
-            tokio::fs::symlink_metadata(update_path),
-        )
-        .await
-        {
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+    if let Some(update_path) = update.as_ref() {
+        let destructive = settings.update_exclusive || settings.copy_settings.delete.is_some();
+        if crate::safedir::strict_operand_resolution() {
+            // Under strict operand resolution, validate the update operand prefix UP FRONT
+            // (fd-relative, `openat2(RESOLVE_NO_SYMLINKS)`), unconditionally for ALL --update — so a
+            // plain --update with an excluded source (which returns before the update parent would
+            // otherwise be opened) cannot slip a symlinked update prefix through. A symlink in a
+            // directory component fails closed (ELOOP); this also serves the destructive-mode
+            // existence check below.
+            let kind = crate::safedir::strict_probe_dst_kind(update_path, congestion::Side::Source)
+                .await
+                .map_err(|err| {
+                    Error::new(
+                        anyhow::Error::new(err).context(format!(
+                            "failed reading metadata from update {update_path:?}"
+                        )),
+                        Default::default(),
+                    )
+                })?;
+            if destructive && kind.is_none() {
                 return Err(Error::new(
                     anyhow!(
                         "--update path {:?} does not exist (rejected under --delete or --update-exclusive to avoid silently pruning destination entries the update tree would otherwise have preserved)",
@@ -229,14 +237,33 @@ pub async fn link(
                     Default::default(),
                 ));
             }
-            Err(err) => {
-                return Err(Error::new(
-                    anyhow::Error::new(err).context(format!(
-                        "failed reading metadata from update {:?}",
-                        update_path
-                    )),
-                    Default::default(),
-                ));
+        } else if destructive {
+            match crate::walk::run_metadata_probed(
+                congestion::Side::Source,
+                congestion::MetadataOp::Stat,
+                tokio::fs::symlink_metadata(update_path),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Error::new(
+                        anyhow!(
+                            "--update path {:?} does not exist (rejected under --delete or --update-exclusive to avoid silently pruning destination entries the update tree would otherwise have preserved)",
+                            update_path
+                        ),
+                        Default::default(),
+                    ));
+                }
+                Err(err) => {
+                    return Err(Error::new(
+                        anyhow::Error::new(err).context(format!(
+                            "failed reading metadata from update {:?}",
+                            update_path
+                        )),
+                        Default::default(),
+                    ));
+                }
             }
         }
     }
@@ -248,22 +275,98 @@ pub async fn link(
         .map_err(|err| Error::new(err, Default::default()))?;
     let src = src_operand.display.as_path();
     let src_name = src_operand.name.as_os_str();
+    // under strict operand resolution (--require-toctou-safe) the parent prefix is opened BEFORE
+    // the root filter check, so a symlinked source prefix fails closed even when the root would be
+    // skipped by a filter, and the root is classified fd-relative. On the default path the filter
+    // check keeps the historical path-based `symlink_metadata` classification and runs FIRST: an
+    // excluded root under an execute-only (0111, searchable-not-readable) parent must skip cleanly,
+    // and the O_RDONLY parent open would fail EACCES there.
+    let strict_src_parent: Option<Arc<Dir>> = if crate::safedir::strict_operand_resolution() {
+        let parent = Dir::open_parent_dir(&src_operand.parent, congestion::Side::Source)
+            .await
+            .with_context(|| {
+                format!(
+                    "cannot open source parent directory {:?}",
+                    src_operand.parent
+                )
+            })
+            .map_err(|err| Error::new(err, Default::default()))?;
+        // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
+        Some(Arc::new(parent.into_tree()))
+    } else {
+        None
+    };
+    // The destination's parent path, split leniently for the up-front strict validation below (a
+    // `.`/`..`/`/` destination has no distinct parent+name; the authoritative split — which rejects
+    // such a destination — runs AFTER the filter, preserving default-mode ordering so a filtered-out
+    // source still skips cleanly). empty parent (a single-component relative path) means ".".
+    let dst_parent_path_opt: Option<&std::path::Path> = match (dst.parent(), dst.file_name()) {
+        (Some(parent), Some(_)) if parent.as_os_str().is_empty() => Some(std::path::Path::new(".")),
+        (Some(parent), Some(_)) => Some(parent),
+        _ => None,
+    };
+    // Under strict operand resolution, resolve the destination parent UP FRONT — before the source
+    // root-filter early-return, unconditionally — so a symlinked destination prefix fails closed in
+    // every mode regardless of filters/flags (see copy::copy for the same pattern). An absent parent
+    // (dry-run previewing into a not-yet-created tree, or a filtered-out root) is not a symlink
+    // violation; only a symlinked prefix component (ELOOP) fails closed here.
+    let strict_dst_parent: Option<Arc<Dir>> = match (
+        crate::safedir::strict_operand_resolution(),
+        dst_parent_path_opt,
+    ) {
+        (true, Some(dst_parent_path)) => {
+            match Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination).await {
+                Ok(parent) => Some(Arc::new(parent.into_tree())),
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::NotFound
+                        || err.raw_os_error() == Some(libc::ENOTDIR) =>
+                {
+                    None
+                }
+                Err(err) => {
+                    return Err(Error::new(
+                        anyhow::Error::new(err).context(format!(
+                            "cannot open destination parent directory {dst_parent_path:?}"
+                        )),
+                        Default::default(),
+                    ));
+                }
+            }
+        }
+        // default mode, or a degenerate destination (rejected by the authoritative split below)
+        _ => None,
+    };
     // check filter for top-level source (files, directories, and symlinks)
     if let Some(ref filter) = settings.filter {
-        let src_metadata = crate::walk::run_metadata_probed(
-            congestion::Side::Source,
-            congestion::MetadataOp::Stat,
-            tokio::fs::symlink_metadata(src),
-        )
-        .await
-        .with_context(|| format!("failed reading metadata from {:?}", &src))
-        .map_err(|err| Error::new(err, Default::default()))?;
-        let is_dir = src_metadata.is_dir();
+        let (kind, is_dir) = match &strict_src_parent {
+            // strict: classify via the held parent fd (O_NOFOLLOW), never by path
+            Some(parent) => {
+                let root_handle = parent
+                    .child(src_name)
+                    .await
+                    .with_context(|| format!("failed reading metadata from {:?}", &src))
+                    .map_err(|err| Error::new(err, Default::default()))?;
+                (root_handle.kind(), root_handle.kind() == EntryKind::Dir)
+            }
+            None => {
+                let src_metadata = crate::walk::run_metadata_probed(
+                    congestion::Side::Source,
+                    congestion::MetadataOp::Stat,
+                    tokio::fs::symlink_metadata(src),
+                )
+                .await
+                .with_context(|| format!("failed reading metadata from {:?}", &src))
+                .map_err(|err| Error::new(err, Default::default()))?;
+                (
+                    EntryKind::from_metadata(&src_metadata),
+                    src_metadata.is_dir(),
+                )
+            }
+        };
         let result = filter.should_include_root_item(std::path::Path::new(src_name), is_dir);
         match result {
             crate::filter::FilterResult::Included => {}
             result => {
-                let kind = EntryKind::from_metadata(&src_metadata);
                 if let Some(mode) = settings.dry_run {
                     crate::dry_run::report_skip(src, &result, mode, kind.label_long());
                 }
@@ -272,12 +375,9 @@ pub async fn link(
             }
         }
     }
-    // Open the parent directories of the source, destination, and (optional) update roots so each
-    // root entry is opened and classified relative to a directory fd — the same fd-relative path
-    // every nested entry takes. The roots are then handed to `link_internal` by their basenames,
-    // exactly like child entries. The source was decomposed above (via `split_root_operand`, which
-    // canonicalizes `.`/`..` and rejects `/`); the destination keeps the direct split — a `.`/`..`
-    // destination is not a meaningful link target, and rejecting it avoids clobbering the cwd.
+    // Authoritative destination split (runs AFTER the filter, preserving default-mode ordering): a
+    // `.`/`..`/`/` destination is not a meaningful link target, and rejecting it avoids clobbering
+    // the cwd. empty parent (a single-component relative path) means the current directory.
     let (Some(dst_parent_path), Some(_dst_name)) = (dst.parent(), dst.file_name()) else {
         return Err(Error::new(
             anyhow!(
@@ -287,45 +387,56 @@ pub async fn link(
             Default::default(),
         ));
     };
-    // empty parent (relative path with a single component) means the current directory.
-    let resolve_parent = |p: &std::path::Path| -> std::path::PathBuf {
-        if p.as_os_str().is_empty() {
-            std::path::PathBuf::from(".")
-        } else {
-            p.to_path_buf()
+    let dst_parent_path = if dst_parent_path.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        dst_parent_path
+    };
+    // Open the parent directories of the source, destination, and (optional) update roots for the
+    // walk so each root entry is opened and classified relative to a directory fd — the same
+    // fd-relative path every nested entry takes. The roots are then handed to `link_internal` by
+    // their basenames, exactly like child entries. Under strict operand resolution both parents were
+    // already opened+validated above, so reuse the held fds here.
+    let src_parent = match strict_src_parent {
+        Some(parent) => parent,
+        None => {
+            let parent = Dir::open_parent_dir(&src_operand.parent, congestion::Side::Source)
+                .await
+                .with_context(|| {
+                    format!(
+                        "cannot open source parent directory {:?}",
+                        src_operand.parent
+                    )
+                })
+                .map_err(|err| Error::new(err, Default::default()))?;
+            // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
+            Arc::new(parent.into_tree())
         }
     };
-    // the helper already normalized the source's empty parent to ".".
-    let src_parent_path = src_operand.parent.clone();
-    let dst_parent_path = resolve_parent(dst_parent_path);
-    // open the operand's TRUSTED parent prefix following symlinks normally (the prefix is trusted
-    // up to and including the operand's container — only entries strictly below the named root are
-    // O_NOFOLLOW-hardened). a symlinked parent (e.g. `rlink symlinkdir/src dst`) is followed.
-    let src_parent = Dir::open_parent_dir(&src_parent_path, congestion::Side::Source)
-        .await
-        .with_context(|| format!("cannot open source parent directory {:?}", src_parent_path))
-        .map_err(|err| Error::new(err, Default::default()))?;
-    // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
-    let src_parent = Arc::new(src_parent.into_tree());
     // In dry-run we never touch the destination, so we don't open its parent at all (it may not
     // even exist). `dst_parent == None` is the signal throughout the walk that destination
-    // operations must be skipped.
+    // operations must be skipped. In a real link, reuse the strict-validated parent, or open it
+    // following symlinks (default mode; a symlinked destination container is followed into the real
+    // dir).
     let dst_parent = if settings.dry_run.is_some() {
         None
     } else {
-        // the destination's TRUSTED parent prefix is resolved following symlinks (see the source
-        // parent above): a symlinked destination container must be followed into the real dir.
-        let dir = Dir::open_parent_dir(&dst_parent_path, congestion::Side::Destination)
-            .await
-            .with_context(|| {
-                format!(
-                    "cannot open destination parent directory {:?}",
-                    dst_parent_path
-                )
-            })
-            .map_err(|err| Error::new(err, Default::default()))?;
-        // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
-        Some(Arc::new(dir.into_tree()))
+        match strict_dst_parent {
+            Some(parent) => Some(parent),
+            None => {
+                let dir = Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "cannot open destination parent directory {:?}",
+                            dst_parent_path
+                        )
+                    })
+                    .map_err(|err| Error::new(err, Default::default()))?;
+                // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below).
+                Some(Arc::new(dir.into_tree()))
+            }
+        }
     };
     // The update tree (if present) is rooted at `update`; open its parent and remember the root
     // basename so `link_internal` can classify it via the held fd. A missing update root is handled
@@ -1374,6 +1485,13 @@ async fn link_dir_contents(
             // so open it `O_NOFOLLOW|O_DIRECTORY` (dereference=false) — a symlink or non-directory
             // fails closed and prune is skipped, never following the symlink to delete a tree
             // OUTSIDE the destination. A missing dir likewise skips.
+            // This reopen runs only in --dry-run (a real link holds `dst_dir`). It re-resolves the
+            // destination directory BELOW the named root; under strict operand resolution the open
+            // is openat2(RESOLVE_NO_SYMLINKS), so a symlink anywhere in `dst_path` — an intermediate
+            // component the real run would replace, or a final symlink — fails with ELOOP and is
+            // SKIPPED here (nothing to prune; the real run creates a fresh directory). The operand
+            // prefix ABOVE the named root is validated up front, so this below-root skip does not
+            // weaken the strict contract and keeps the preview consistent with the real run.
             let prune_dir: Option<Arc<Dir>> = match dst_dir {
                 Some(dir) => Some(Arc::clone(dir)),
                 None => {

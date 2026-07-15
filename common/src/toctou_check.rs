@@ -212,7 +212,10 @@ pub fn run_linter(
                 ));
             }
         }
-        if !crate::safedir::openat2_available() {
+        // the openat2 note only makes sense on Linux (where a pre-5.6 kernel is the reason strict
+        // mode is unavailable); on non-Linux the verdict already carries the "Linux-only" reason,
+        // and the Linux-specific "kernel lacks openat2" wording would just confuse.
+        if cfg!(target_os = "linux") && !crate::safedir::openat2_available() {
             output.push_str(
                 "  Note: --require-toctou-safe would refuse this invocation: the kernel \
                 lacks openat2(2) (Linux 5.6+), so strict operand resolution is unavailable\n",
@@ -447,36 +450,12 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn require_mode_arms_strict_resolution_on_proceed() {
-        // one process per test under nextest, so observing the process-global is safe
-        assert!(
-            !crate::safedir::strict_operand_resolution(),
-            "strict mode must be off before the linter proceeds"
-        );
-        let operands = vec![
-            std::path::PathBuf::from("/ok/src"),
-            std::path::PathBuf::from("/ok/dst"),
-        ];
-        match run_linter(false, false, true, &operands) {
-            LinterAction::Proceed => {
-                assert!(
-                    crate::safedir::strict_operand_resolution(),
-                    "linter Proceed in require mode must arm strict operand resolution"
-                );
-            }
-            LinterAction::Exit { output, code } => {
-                // on kernels without openat2 the refusal is the correct outcome
-                assert!(
-                    !crate::safedir::openat2_available(),
-                    "good operands must proceed on openat2-capable kernels, got: {output}"
-                );
-                assert_eq!(code, 1);
-                assert!(output.contains("openat2"), "got: {output}");
-            }
-        }
-    }
+    // NOTE: the tests where require mode PROCEEDS (and thereby arms the one-way
+    // process-global strict-resolution switch) live in tests/strict_resolution.rs —
+    // their own integration binary and therefore their own process, so the arming
+    // cannot leak into other lib tests under the plain `cargo test` harness (used
+    // by the nix checkPhase). Every test below stays on a refusal/check path and
+    // never arms the switch.
 
     #[test]
     fn require_mode_flag_refusal_suppresses_operand_reasons() {
@@ -497,24 +476,6 @@ mod tests {
                 );
             }
             LinterAction::Proceed => panic!("-L must not proceed under require mode"),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn require_mode_with_no_operands_proceeds() {
-        // rcpd passes no operands (they arrive via the master, already validated)
-        match run_linter(false, false, true, &[]) {
-            LinterAction::Proceed => {}
-            LinterAction::Exit { output, code } => {
-                // on kernels without openat2 the refusal is the correct outcome
-                assert!(
-                    !crate::safedir::openat2_available(),
-                    "empty operand list must proceed on openat2-capable kernels, got: {output}"
-                );
-                assert_eq!(code, 1);
-                assert!(output.contains("openat2"), "got: {output}");
-            }
         }
     }
 

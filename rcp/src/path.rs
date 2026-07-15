@@ -159,9 +159,19 @@ fn split_remote_path(path_str: &str) -> (Option<String>, &str) {
     }
 }
 
-/// Extracts just the filesystem path part from a remote or local path string
-/// For example: "user@host:22:/path/to/file" -> "/path/to/file"
-/// For local paths, returns the original path
+/// The filesystem-path portion of an operand string, with any `host:` prefix
+/// stripped but NO tilde (`~`) expansion — i.e. exactly what a string-level
+/// operand policy (a sudo rule / vetted wrapper) sees. `--require-toctou-safe`
+/// validates THIS, so a home-relative `~/x` (whose expansion is environment-
+/// dependent) is rejected as non-absolute, while the `localhost:/abs` colon
+/// escape hatch keeps its absolute `/abs`.
+pub fn operand_fs_path(path_str: &str) -> &str {
+    extract_filesystem_path(path_str)
+}
+
+/// Extracts just the filesystem path part from a remote or local path string.
+/// For example: "user@host:22:/path/to/file" -> "/path/to/file".
+/// For local paths, returns the original path.
 fn extract_filesystem_path(path_str: &str) -> &str {
     split_remote_path(path_str).1
 }
