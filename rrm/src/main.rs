@@ -187,11 +187,18 @@ fn main() -> Result<()> {
     let args = Args::parse();
     common::filter::reject_created_before_on_musl("rrm", args.created_before.as_deref())?;
     // TOCTOU linter: must run before the async runtime starts.
-    // rrm has no --dereference flag; dereference is always false. The linter
-    // does NOT inspect the operand paths — the trust of a path's prefix is the
-    // caller's responsibility (see the "Scope of TOCTOU safety" section of
-    // docs/tocttou.md).
-    common::toctou_check::enforce_or_exit(false, args.toctou_check, args.require_toctou_safe);
+    // rrm has no --dereference flag; dereference is always false. Operands are
+    // passed so --require-toctou-safe can enforce the strict operand contract
+    // (absolute + lexically normal, resolved RESOLVE_NO_SYMLINKS); keeping the
+    // directories along them out of a less-privileged actor's write control
+    // remains the caller's responsibility (see the "Scope of TOCTOU safety"
+    // section of docs/tocttou.md).
+    common::toctou_check::enforce_or_exit(
+        false,
+        args.toctou_check,
+        args.require_toctou_safe,
+        &args.paths,
+    );
 
     let dry_run_warnings = args.dry_run.map(|_| {
         common::DryRunWarnings::new(

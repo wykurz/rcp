@@ -801,3 +801,56 @@ fn test_pending_writes_multiplier_zero_rejected() {
         .failure()
         .stderr(predicates::str::contains("at least 1"));
 }
+
+/// --require-toctou-safe refuses a relative operand: the strict operand contract
+/// requires absolute, lexically normal paths
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_rejects_relative_operand() {
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--require-toctou-safe", "rel/src", "/tmp/dst"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("absolute"));
+}
+
+/// --require-toctou-safe refuses an operand containing a `..` component
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_rejects_dotdot_operand() {
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--require-toctou-safe", "/tmp/../src", "/tmp/dst"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("`..` component"));
+}
+
+/// --require-toctou-safe refuses a home-relative remote operand (the remote path
+/// part must be absolute as written)
+#[cfg(target_os = "linux")]
+#[test]
+fn require_toctou_safe_rejects_home_relative_remote_operand() {
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--require-toctou-safe", "localhost:rel/src", "/tmp/dst"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("absolute"));
+}
+
+/// --toctou-check keeps its verdict-based exit code for operands that
+/// --require-toctou-safe would refuse, but notes the strict-form violation
+#[cfg(target_os = "linux")]
+#[test]
+fn toctou_check_notes_strict_form_violation_without_failing() {
+    Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--toctou-check", "rel/src", "/tmp/dst"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "--require-toctou-safe would refuse",
+        ));
+}

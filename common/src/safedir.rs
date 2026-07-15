@@ -21,6 +21,84 @@ use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, fchownat, linkat, symlinkat, 
 
 use crate::walk::EntryKind;
 
+// ── Strict operand resolution (--require-toctou-safe) ────────────────────────
+//
+// A process-global, one-way switch armed by the TOCTOU linter (see
+// `crate::toctou_check::run_linter`) when `--require-toctou-safe` proceeds. When
+// armed, the two multi-component path resolutions in this module —
+// `Dir::open_root_dir` and `Dir::open_parent_dir`, the only places an operand
+// path is resolved — use `openat2(2)` with `RESOLVE_NO_SYMLINKS` instead of a
+// plain `openat`, so a symlink in ANY component of an operand path fails closed
+// with `ELOOP` at the open itself (not in a racy pre-check). This is a global
+// rather than a threaded setting because it is per-process security policy that
+// must cover every operand open in every engine (copy/link/rm/chmod, local and
+// rcpd) without widening each Settings struct and the rcpd spawn contract; it is
+// armed once before the async runtime starts and never unset.
+
+static STRICT_OPERAND_RESOLUTION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arm strict operand resolution for the rest of this process (one-way).
+///
+/// Called by the TOCTOU linter when `--require-toctou-safe` proceeds; not
+/// intended to be called from anywhere else.
+pub fn enable_strict_operand_resolution() {
+    STRICT_OPERAND_RESOLUTION.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether strict operand resolution is armed for this process.
+#[must_use]
+pub fn strict_operand_resolution() -> bool {
+    STRICT_OPERAND_RESOLUTION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Open `path` with `openat2(2)`, refusing to resolve ANY symlink component
+/// (`RESOLVE_NO_SYMLINKS`, which also implies `RESOLVE_NO_MAGICLINKS`). A
+/// symlink anywhere in the path fails with `ELOOP`.
+#[cfg(target_os = "linux")]
+fn openat2_no_symlinks(path: &Path, flags: OFlag) -> nix::Result<OwnedFd> {
+    use nix::fcntl::{OpenHow, ResolveFlag, openat2};
+    let how = OpenHow::new()
+        .flags(flags)
+        .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS);
+    // bounded retry: with resolve restrictions openat2 can return EAGAIN when the
+    // kernel detects a rename race during resolution (see openat2(2)); retrying a
+    // handful of times resolves transient races without risking an unbounded loop.
+    let mut attempts = 0;
+    loop {
+        match openat2(AT_FDCWD, path, how) {
+            Err(nix::errno::Errno::EAGAIN) if attempts < 4 => attempts += 1,
+            other => return other,
+        }
+    }
+}
+
+/// Whether this kernel supports `openat2(2)` (Linux 5.6+), probed once.
+///
+/// Strict operand resolution is impossible without it, so
+/// `--require-toctou-safe` refuses to run when this returns `false`.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn openat2_available() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| {
+        // "/" always exists and is a directory; ENOSYS is the only expected failure
+        !matches!(
+            openat2_no_symlinks(Path::new("/"), OFlag::O_PATH | OFlag::O_CLOEXEC),
+            Err(nix::errno::Errno::ENOSYS)
+        )
+    })
+}
+
+/// Non-Linux builds have no `openat2`; `--require-toctou-safe` already refuses
+/// to run there (the hardened walk is Linux-only), so this is only consulted to
+/// render an accurate `--toctou-check` note.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn openat2_available() -> bool {
+    false
+}
+
 // ── FileMeta ──────────────────────────────────────────────────────────────────
 
 /// A snapshot of filesystem metadata obtained via `fstat`/`fstatat`.

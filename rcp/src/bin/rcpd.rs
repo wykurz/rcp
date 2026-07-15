@@ -80,6 +80,15 @@ struct Args {
     #[arg(short = 'L', long, help_heading = "Copy options")]
     dereference: bool,
 
+    /// Mirror of master's --require-toctou-safe flag
+    ///
+    /// Arms strict operand resolution on this rcpd instance: the operand
+    /// root/parent opens resolve with openat2(RESOLVE_NO_SYMLINKS). The operand
+    /// paths themselves arrive via the master (which validated their strict
+    /// form), so no operands are linted here.
+    #[arg(long, help_heading = "Copy options")]
+    require_toctou_safe: bool,
+
     /// Quiet mode, don't report errors
     #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
     quiet: bool,
@@ -687,6 +696,12 @@ fn main() -> Result<(), anyhow::Error> {
     }
 
     let args = Args::parse();
+    // TOCTOU linter: arms strict operand resolution when the master passed
+    // --require-toctou-safe, and fail-closes on this host if the invocation
+    // cannot be hardened (e.g. -L, or a pre-openat2 kernel). Operands arrive
+    // via the master — which already linted their strict form — so none are
+    // passed here.
+    common::toctou_check::enforce_or_exit(args.dereference, false, args.require_toctou_safe, &[]);
     let (tracing_layer, tracing_sender, tracing_receiver) =
         common::remote_tracing::RemoteTracingLayer::new();
     let func = {
