@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-07-15
+
 ### Security
 
 - `--require-toctou-safe` now enforces a strict operand contract in addition to requiring the
@@ -360,7 +362,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 See git history for changes in previous versions.
 
-[Unreleased]: https://github.com/wykurz/rcp/compare/v0.36.0...HEAD
+[Unreleased]: https://github.com/wykurz/rcp/compare/v0.37.0...HEAD
+[0.37.0]: https://github.com/wykurz/rcp/compare/v0.36.0...v0.37.0
 [0.36.0]: https://github.com/wykurz/rcp/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/wykurz/rcp/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/wykurz/rcp/compare/v0.33.0...v0.34.0
