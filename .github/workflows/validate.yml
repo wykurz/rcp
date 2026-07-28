@@ -72,6 +72,9 @@ jobs:
     - name: Check source-read fidelity
       run: ./scripts/check-source-read-fidelity.sh
 
+    - name: Check TLS handshake timeouts
+      run: ./scripts/check-tls-handshake-timeout.sh
+
     - name: Check package metadata
       run: ./scripts/check-package-metadata.sh
 
@@ -147,6 +150,15 @@ jobs:
         cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
         chmod 600 ~/.ssh/authorized_keys
         ssh-keyscan -H localhost >> ~/.ssh/known_hosts
+        # Root SSH-to-localhost, for the sudo-gated remote tests that run the WHOLE
+        # rcp+rcpd chain as root (rcp spawns rcpd over ssh, so root must reach localhost
+        # passwordlessly). sshd's default PermitRootLogin=prohibit-password allows key auth.
+        sudo mkdir -p /root/.ssh
+        sudo ssh-keygen -t rsa -f /root/.ssh/id_rsa -N ""
+        sudo cp /root/.ssh/id_rsa.pub /root/.ssh/authorized_keys
+        sudo chmod 600 /root/.ssh/authorized_keys
+        sudo ssh-keyscan -H localhost | sudo tee /root/.ssh/known_hosts > /dev/null
+        sudo ssh -o BatchMode=yes localhost true
 
     - name: Install cargo-nextest
       run: cargo install cargo-nextest --version 0.9.85 --locked
@@ -162,7 +174,10 @@ jobs:
     - name: Test sudo-required tests (musl debug)
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
+        # root SSH is provisioned above, so a missing precondition is a CI bug, not a skip
+        RCP_REQUIRE_ROOT_SSH: "1"
       run: |
+        set -o pipefail
         # Run tests that require passwordless sudo (available in CI)
         cargo nextest run --no-capture --run-ignored only -E 'test(~sudo)' 2>&1 | tee -a test_output_musl_debug.log
 
@@ -205,6 +220,15 @@ jobs:
         cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
         chmod 600 ~/.ssh/authorized_keys
         ssh-keyscan -H localhost >> ~/.ssh/known_hosts
+        # Root SSH-to-localhost, for the sudo-gated remote tests that run the WHOLE
+        # rcp+rcpd chain as root (rcp spawns rcpd over ssh, so root must reach localhost
+        # passwordlessly). sshd's default PermitRootLogin=prohibit-password allows key auth.
+        sudo mkdir -p /root/.ssh
+        sudo ssh-keygen -t rsa -f /root/.ssh/id_rsa -N ""
+        sudo cp /root/.ssh/id_rsa.pub /root/.ssh/authorized_keys
+        sudo chmod 600 /root/.ssh/authorized_keys
+        sudo ssh-keyscan -H localhost | sudo tee /root/.ssh/known_hosts > /dev/null
+        sudo ssh -o BatchMode=yes localhost true
 
     - name: Install cargo-nextest
       run: cargo install cargo-nextest --version 0.9.85 --locked
@@ -220,7 +244,10 @@ jobs:
     - name: Test sudo-required tests (musl release)
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
+        # root SSH is provisioned above, so a missing precondition is a CI bug, not a skip
+        RCP_REQUIRE_ROOT_SSH: "1"
       run: |
+        set -o pipefail
         # Run tests that require passwordless sudo (available in CI)
         cargo nextest run --release --no-capture --run-ignored only -E 'test(~sudo)' 2>&1 | tee -a test_output_musl_release.log
 

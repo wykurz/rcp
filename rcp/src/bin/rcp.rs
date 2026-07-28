@@ -600,22 +600,14 @@ async fn run_rcpd_master(
                     remote::tls::create_client_config_with_cert(cert, rcpd_fingerprint)
                         .context("failed to create TLS client config with certificate")?;
                 let connector = tokio_rustls::TlsConnector::from(tls_config);
-                let server_name = rustls::pki_types::ServerName::try_from("rcpd")
-                    .map_err(|e| anyhow!("invalid server name: {}", e))?;
-                // wrap TLS handshake in timeout to prevent hanging on stalled peers
-                let tls_stream =
-                    tokio::time::timeout(timeout, connector.connect(server_name, stream))
-                        .await
-                        .with_context(|| format!("TLS handshake timeout for {}", purpose))?
-                        .context("TLS handshake with rcpd failed")?;
-                let (read_half, write_half) = tokio::io::split(tls_stream);
-                let recv_stream = remote::streams::RecvStream::new(
-                    Box::new(read_half) as remote::streams::BoxedRead
-                );
-                let send_stream = remote::streams::SendStream::new(
-                    Box::new(write_half) as remote::streams::BoxedWrite
-                );
-                Ok((send_stream, recv_stream))
+                remote::tls::connect_bounded(
+                    Some(&connector),
+                    remote::tls::SERVER_NAME_RCPD,
+                    stream,
+                    timeout,
+                    purpose,
+                )
+                .await
             }
             (Some(_), None) | (None, Some(_)) => {
                 anyhow::bail!(
@@ -624,14 +616,14 @@ async fn run_rcpd_master(
             }
             (None, None) => {
                 // plain TCP (no encryption)
-                let (read_half, write_half) = stream.into_split();
-                let recv_stream = remote::streams::RecvStream::new(
-                    Box::new(read_half) as remote::streams::BoxedRead
-                );
-                let send_stream = remote::streams::SendStream::new(
-                    Box::new(write_half) as remote::streams::BoxedWrite
-                );
-                Ok((send_stream, recv_stream))
+                remote::tls::connect_bounded(
+                    None,
+                    remote::tls::SERVER_NAME_RCPD,
+                    stream,
+                    timeout,
+                    purpose,
+                )
+                .await
             }
         }
     }
@@ -1047,6 +1039,27 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         }
         src_dst.push((src_path, dst_path));
     }
+    // Under --require-toctou-safe, refuse byte-equal duplicate resolved destinations up front — a
+    // clear error for the obvious `rcp /a/foo /b/foo /dst/` mistake. This is only the fast, EXACT
+    // check: two sources can ALSO alias to the same destination directory via the filesystem (a
+    // case-insensitive/casefold or Unicode-normalizing destination, or a bind mount), which a lexical
+    // comparison cannot see. The dispatch below therefore ALSO serializes strict multi-source copies,
+    // removing the concurrent reused-directory-lockdown race for every such alias without having to
+    // detect it. (Outside strict mode, concurrent merge-into-the-same-subtree is a pre-existing race
+    // and is left as-is.)
+    if common::safedir::strict_operand_resolution() {
+        let mut seen = std::collections::HashSet::new();
+        for (_, dst) in &src_dst {
+            if !seen.insert(dst.as_path()) {
+                return Err(anyhow!(
+                    "multiple sources resolve to the same destination {:?} under \
+                     --require-toctou-safe; run them as separate copies (concurrent copies sharing a \
+                     destination directory would race the reused-directory lockdown)",
+                    dst
+                ));
+            }
+        }
+    }
     // build filter settings from CLI arguments
     let filter = common::filter::FilterSettings::from_args(
         args.filter_file.as_deref(),
@@ -1079,39 +1092,55 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
     };
     tracing::debug!("copy settings: {:?}", &settings);
     let fail_early = settings.fail_early;
-    let mut join_set = tokio::task::JoinSet::new();
-    for (src_path, dst_path) in src_dst {
-        let settings = settings.clone();
-        let do_copy =
-            || async move { common::copy(&src_path, &dst_path, &settings, &preserve).await };
-        join_set.spawn(do_copy());
-    }
     let error_collector = common::error_collector::ErrorCollector::default();
     let mut copy_summary = common::copy::Summary::default();
-    while let Some(res) = join_set.join_next().await {
-        match res {
-            Ok(result) => match result {
-                Ok(summary) => copy_summary = copy_summary + summary,
+    // Under --require-toctou-safe, run multi-source copies SEQUENTIALLY instead of concurrently, so
+    // two sources that alias to the same destination directory (see the duplicate check above)
+    // cannot run overlapping reused-directory lockdown/restore lifecycles against it. Strict
+    // multi-source is the paranoid, uncommon path, so the sequential cost is acceptable.
+    if common::safedir::strict_operand_resolution() && src_dst.len() > 1 {
+        for (src_path, dst_path) in src_dst {
+            let result = common::copy(&src_path, &dst_path, &settings, &preserve).await;
+            if let Some(err) = fold_copy_result(
+                result,
+                &mut copy_summary,
+                &error_collector,
+                fail_early,
+                args.summary,
+            ) {
+                return Err(err);
+            }
+        }
+    } else {
+        let mut join_set = tokio::task::JoinSet::new();
+        for (src_path, dst_path) in src_dst {
+            let settings = settings.clone();
+            let do_copy =
+                || async move { common::copy(&src_path, &dst_path, &settings, &preserve).await };
+            join_set.spawn(do_copy());
+        }
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok(result) => {
+                    if let Some(err) = fold_copy_result(
+                        result,
+                        &mut copy_summary,
+                        &error_collector,
+                        fail_early,
+                        args.summary,
+                    ) {
+                        return Err(err);
+                    }
+                }
                 Err(error) => {
-                    tracing::error!("{:#}", &error);
-                    copy_summary = copy_summary + error.summary;
-                    if args.fail_early {
+                    if fail_early {
                         if args.summary {
                             return Err(anyhow!("{}\n\n{}", error, &copy_summary));
                         }
                         return Err(anyhow!("{}", error));
                     }
-                    error_collector.push(error.source);
+                    error_collector.push(error.into());
                 }
-            },
-            Err(error) => {
-                if fail_early {
-                    if args.summary {
-                        return Err(anyhow!("{}\n\n{}", error, &copy_summary));
-                    }
-                    return Err(anyhow!("{}", error));
-                }
-                error_collector.push(error.into());
             }
         }
     }
@@ -1122,6 +1151,39 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
         return Err(err);
     }
     Ok(copy_summary)
+}
+
+/// Fold one source→destination copy result into the running summary, applying the shared error
+/// policy: on success add the summary; on a copy error log it, add its partial summary, and either
+/// signal an immediate `--fail-early` return (`Some(err)`) or push it to `error_collector` and
+/// continue (`None`). Used by both the concurrent (default) and serialized (`--require-toctou-safe`
+/// multi-source) dispatch paths so both apply identical accounting and fail-early behavior.
+fn fold_copy_result(
+    result: Result<common::copy::Summary, common::copy::Error>,
+    copy_summary: &mut common::copy::Summary,
+    error_collector: &common::error_collector::ErrorCollector,
+    fail_early: bool,
+    want_summary: bool,
+) -> Option<anyhow::Error> {
+    match result {
+        Ok(summary) => {
+            *copy_summary = *copy_summary + summary;
+            None
+        }
+        Err(error) => {
+            tracing::error!("{:#}", &error);
+            *copy_summary = *copy_summary + error.summary;
+            if fail_early {
+                return Some(if want_summary {
+                    anyhow!("{}\n\n{}", error, copy_summary)
+                } else {
+                    anyhow!("{}", error)
+                });
+            }
+            error_collector.push(error.source);
+            None
+        }
+    }
 }
 
 fn has_remote_paths(args: &Args) -> bool {

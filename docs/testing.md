@@ -90,6 +90,18 @@ To run locally:
 cargo nextest run --run-ignored only -E 'test(~sudo)'
 ```
 
+Most of these use sudo only to plant root-owned inputs and still run `rcpd` as the normal user.
+`test_remote_sudo_strict_reuse_restores_foreign_owned_dir` is the exception: it runs the whole
+`rcp`+`rcpd` chain as root, so root itself must reach localhost over SSH passwordlessly. It skips
+when that is unavailable, which keeps it runnable on a workstation — but CI provisions root SSH and
+sets `RCP_REQUIRE_ROOT_SSH=1`, which turns the skip into a hard failure so the assertion cannot
+silently stop running:
+
+```bash
+# run it with the preconditions enforced rather than skipped
+RCP_REQUIRE_ROOT_SSH=1 cargo nextest run --run-ignored only -E 'test(~sudo)'
+```
+
 ## Docker Multi-Host Testing
 
 Docker-based tests provide true multi-host scenarios that localhost tests cannot cover.

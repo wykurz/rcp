@@ -612,6 +612,9 @@ struct CopyDirState {
     dst_name: OsString,
     /// Whether we created the destination directory (vs. reused an existing one).
     we_created: bool,
+    /// The original `(uid, gid)` restored at finalize before source metadata is re-applied,
+    /// `Some` iff this reused directory was locked down (strict mode). See [`DirSlot::restore_owner`].
+    restore_owner: Option<(u32, u32)>,
     /// The source directory's metadata, applied to the destination post-order.
     src_meta: FileMeta,
     /// Whether this is the user-specified root directory (never empty-dir-cleaned up).
@@ -785,6 +788,7 @@ impl CopyVisitor {
             dst_name,
             src_meta,
             we_created,
+            restore_owner,
             is_root,
         } = fin;
         let src_path = &cx.real_path;
@@ -874,7 +878,19 @@ impl CopyVisitor {
         // log the metadata error, return the child error).
         tracing::debug!("set 'dst' directory metadata");
         let metadata_result = match &dst_dir {
-            Some(dst_dir) => safedir::set_dir_metadata_fd(&self.preserve, &src_meta, dst_dir).await,
+            // For a reused directory locked down under strict mode, `set_reused_dir_metadata_fd`
+            // restores the original owner component-wise — so no transient window hands the directory
+            // back to a hostile prior owner — then applies the source metadata (mode last, so
+            // setgid/special bits survive). `restore_owner` is None for fresh dirs / non-strict reuse.
+            Some(dst_dir) => {
+                safedir::set_reused_dir_metadata_fd(
+                    &self.preserve,
+                    &src_meta,
+                    restore_owner,
+                    dst_dir,
+                )
+                .await
+            }
             None => Ok(()),
         };
         if let Some(child_error) = child_error {
@@ -907,6 +923,7 @@ struct FinalizeDir {
     dst_name: OsString,
     src_meta: FileMeta,
     we_created: bool,
+    restore_owner: Option<(u32, u32)>,
     is_root: bool,
 }
 
@@ -1208,6 +1225,8 @@ impl WalkVisitor for CopyVisitor {
                     dst_name,
                     // treat as "created" so empty-dir cleanup can suppress the dry-run count.
                     we_created: true,
+                    // dry-run never opens/locks a destination directory, so nothing to restore.
+                    restore_owner: None,
                     src_meta,
                     is_root,
                     base,
@@ -1224,6 +1243,7 @@ impl WalkVisitor for CopyVisitor {
             summary: base,
             is_fresh: child_is_fresh,
             we_created,
+            restore_owner,
         } = match resolve_dst_dir(
             self.prog_track,
             dst_parent,
@@ -1248,6 +1268,7 @@ impl WalkVisitor for CopyVisitor {
                 dst_parent: Some(Arc::clone(dst_parent)),
                 dst_name,
                 we_created,
+                restore_owner,
                 src_meta,
                 is_root,
                 base,
@@ -1267,6 +1288,7 @@ impl WalkVisitor for CopyVisitor {
             dst_parent,
             dst_name,
             we_created,
+            restore_owner,
             src_meta,
             is_root,
             base,
@@ -1303,6 +1325,7 @@ impl WalkVisitor for CopyVisitor {
                 dst_name,
                 src_meta,
                 we_created,
+                restore_owner,
                 is_root,
             },
             cx,
@@ -1693,6 +1716,10 @@ pub(crate) struct DirSlot {
     pub(crate) summary: Summary,
     pub(crate) is_fresh: bool,
     pub(crate) we_created: bool,
+    /// The original `(uid, gid)` to restore at finalize, `Some` iff this directory was LOCKED
+    /// (strict operand resolution + a reused existing directory). `None` for a freshly created
+    /// directory, which must never be restore-chowned. Its presence is the "locked" marker.
+    pub(crate) restore_owner: Option<(u32, u32)>,
 }
 
 /// Outcome of resolving a destination directory.
@@ -1729,6 +1756,8 @@ pub(crate) async fn resolve_dst_dir(
                 },
                 is_fresh: true,
                 we_created: true,
+                // fresh dirs are already created copier-owned at 0o700; nothing to restore.
+                restore_owner: None,
             }))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1742,15 +1771,28 @@ pub(crate) async fn resolve_dst_dir(
                 .with_context(|| format!("failed reading metadata from dst: {:?}", dst_path))
                 .map_err(|err| Error::new(err, Default::default()))?;
             if dst_handle.kind() == EntryKind::Dir {
-                // an existing directory: leave it as is and reuse it.
+                // an existing directory: reuse it.
                 //
-                // N.B. its permissions may stop us writing into it, but the alternative (opening
-                // it up while we copy) isn't safe.
-                tracing::debug!("'dst' is a directory, leaving it as is");
+                // In the default (non-strict) path we leave it exactly as-is and copy into it: its
+                // permissions may stop us writing, but the alternative (opening it up while we copy)
+                // isn't safe. Under strict operand resolution we instead LOCK IT DOWN — take it over
+                // and restrict it to 0o700 for the copy's duration, restoring the original owner and
+                // source mode at finalize (see `finalize_dir`) so the final state is unchanged.
+                tracing::debug!("'dst' is a directory, reusing it");
                 let dir = dst_parent
                     .open_dir(name)
                     .await
                     .with_context(|| format!("cannot open existing directory {:?}", dst_path))
+                    .map_err(|err| Error::new(err, Default::default()))?;
+                // strict-only lockdown: take over the reused directory and restrict it to 0o700 for
+                // the copy's duration (no-op / None in the default path). A recheck or EPERM failure
+                // surfaces as this directory's error, honoring --fail-early; `dir_pre` returning Err
+                // skips descent, so no child is ever written into an unsecured directory.
+                let restore_owner = safedir::lockdown_reused_dir(&dir, &dst_handle)
+                    .await
+                    .with_context(|| {
+                        format!("cannot secure reused destination directory {:?}", dst_path)
+                    })
                     .map_err(|err| Error::new(err, Default::default()))?;
                 prog_track.directories_unchanged.inc();
                 Ok(DirResolution::Proceed(DirSlot {
@@ -1761,6 +1803,7 @@ pub(crate) async fn resolve_dst_dir(
                     },
                     is_fresh,
                     we_created: false,
+                    restore_owner,
                 }))
             } else if settings.ignore_existing {
                 // a non-directory exists and --ignore-existing was set: skip the whole subtree.
@@ -1807,6 +1850,8 @@ pub(crate) async fn resolve_dst_dir(
                     },
                     is_fresh: true,
                     we_created: true,
+                    // freshly created after removing a non-dir: copier-owned at 0o700, nothing to restore.
+                    restore_owner: None,
                 }))
             } else {
                 Err(Error::new(
@@ -3665,6 +3710,57 @@ mod copy_tests {
             assert!(
                 err_msg.to_lowercase().contains("permission denied") || err_msg.contains("EACCES"),
                 "Error message must include permission denied text. Got: {}",
+                err_msg
+            );
+            Ok(())
+        }
+
+        // Regression guard for the reused-directory lockdown: WITHOUT --require-toctou-safe the
+        // reuse branch leaves a pre-existing destination directory exactly as-is, so copying into a
+        // read-only reused directory still fails EACCES. The lockdown that makes such a directory
+        // writable for the copy is strict-mode only (exercised in common/tests/strict_resolution.rs);
+        // this pins that the default path is unchanged.
+        #[tokio::test]
+        #[traced_test]
+        async fn default_reused_readonly_dir_still_fails_eacces() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::setup_test_dir().await?;
+            let test_path = tmp_dir.as_path();
+            // reused destination directory: exists, owned by us, read-only
+            let dst = test_path.join("dst");
+            tokio::fs::create_dir(&dst).await?;
+            tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o500)).await?;
+            let result = copy(
+                &PROGRESS,
+                &test_path.join("foo"),
+                &dst,
+                &Settings {
+                    dereference: false,
+                    fail_early: true,
+                    overwrite: true,
+                    overwrite_compare: Default::default(),
+                    overwrite_filter: None,
+                    ignore_existing: false,
+                    chunk_size: 0,
+                    skip_specials: false,
+                    remote_copy_buffer_size: 0,
+                    filter: None,
+                    dry_run: None,
+                    delete: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await;
+            // restore permissions so the tempdir cleanup can remove the directory
+            tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o700)).await?;
+            assert!(
+                result.is_err(),
+                "copy into a read-only reused directory must fail without strict mode"
+            );
+            let err_msg = get_full_error_message(&result.unwrap_err());
+            assert!(
+                err_msg.to_lowercase().contains("permission denied") || err_msg.contains("EACCES"),
+                "error must be a permission error. Got: {}",
                 err_msg
             );
             Ok(())

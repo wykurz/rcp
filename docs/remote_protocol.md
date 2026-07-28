@@ -264,6 +264,94 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
   would never be released, so a no-ack subtree larger than the budget would block the source's
   Pass-1 walk and hang the copy. Does not affect completion accounting: skipped directories were
   never added to `pending_directories`.
+- **Exception — hard abort.** Most failure paths still send `DirectorySkipped` — an ancestor failed,
+  the create was converted to `Failed`, or `--ignore-existing` skipped a non-directory — even under
+  `--fail-early`, and the accounting rule ("exactly one per directory") holds for them. The
+  exception is any **fatal abort** that tears the connection down before the ack/nack is sent: a
+  directory-create error that propagates as `Err` under `--fail-early` (e.g. a
+  `--require-toctou-safe` lockdown that cannot secure a reused directory, or an I/O failure), a
+  transport failure on either stream, or the destination closing its control stream. So the source
+  MUST NOT depend on receiving an ack/nack for every directory: it releases the **entire** dir-fd
+  budget (`close_fd_budget`) whenever its control-message dispatch loop exits for ANY reason
+  (control-stream close, a transport-task error, or a panic), once after the loop and before
+  draining tasks, so a Pass-1 walk parked on the budget always unblocks and the source tears down
+  cleanly instead of hanging. On such an abort the top-level cause depends on which side detected
+  it. A **source-side** cause (e.g. a source file's `Permission denied` on read) is published to a
+  shared slot before the budget is released, and the teardown surfaces it in place of the synthetic
+  budget-closed wakeup (a typed `FdBudgetClosed` marker, detected by type) that unblocks the parked
+  walk. A **destination-side** cause (e.g. the destination cannot create a file) is not visible to
+  the source — its slot stays empty, so the source reports only a benign teardown symptom (a
+  meaningful "destination closed the control connection before the source finished sending" message,
+  or a broken-pipe Pass-2 send error — never the internal `FdBudgetClosed` marker, which is
+  substituted), while the **destination** reports the real cause, preferring its own recorded
+  operation error over the connection-teardown symptom, and the master prefixes it `Destination:`.
+  So a destination-side abort still fails the copy with the real cause named — on the destination's
+  half of the aggregated error — while the source adds only the benign teardown symptom alongside
+  it. (Fully suppressing that source-side symptom is deferred: once the peer has aborted, the
+  source's own Pass-2 sends genuinely fail, and a benign peer-abort is not reliably distinguishable
+  there from a real transport fault.)
+  - **A data-path abort is signaled by closing the control stream.** A fatal error on a *data*
+    connection — a `--fail-early` file/metadata failure, or a corrupted data stream — propagates out
+    of the data worker; the destination records it and closes its control send stream (the
+    `destination closing its control stream` trigger above) so the source observes the close,
+    releases its dir-fd budget, and tears down. This close is required because the source may have
+    no failing operation of its own to notice: an all-empty-file transfer carries no data body (its
+    sends never break with a broken pipe), and a source that has finished its walk or is parked on
+    the dir-fd budget is otherwise idle — it would wait forever for a `DestinationDone` an aborting
+    destination can never send. The close is issued PROMPTLY — the moment the abort is observed, not
+    after the worker pool finishes draining: the pool only drains once the source has closed the
+    data connections, which happens only after the source has torn down, so deferring the close
+    would deadlock. (The destination funnels this through one `signal_source_teardown` step —
+    invoked eagerly on the first worker abort, and again in `run_destination` after its two futures
+    finish racing, run CONCURRENTLY with awaiting the loser via `tokio::join!` so the loser can
+    release the tracker lock it may hold mid-send — rather than at each worker exit, so no exit path
+    can forget it and no inline signal can deadlock against a suspended peer.)
+  - **A file-header-boundary close is fatal UNLESS the transfer already completed.** An end-of-
+    stream at a file-header boundary reaches the destination in TWO shapes, and they are decided
+    identically. A socket that died without a clean shutdown surfaces as a transport-level
+    *peer-closure* error (under TLS, rustls's missing `close_notify`; empirically `UnexpectedEof` or
+    `ConnectionReset`, any connection-ended kind by timing); a peer that shut the stream down
+    cleanly surfaces as a graceful `Ok(None)`. Neither is self-evidently benign — the source closes
+    a data stream gracefully while it keeps running (it discards a stream whose send failed, and the
+    pool drain closes returning streams), and on plain TCP a graceful FIN is the ordinary shape — so
+    the shape carries no information about whether the transfer finished. COMPLETION STATE decides,
+    through ONE gate consulted by both: an end-of-stream is benign ONLY when the transfer already
+    completed (`is_done()`) or teardown has begun; otherwise it is a mid-transfer TRUNCATION or
+    dropped link and is FATAL — recorded (a fixed message so duplicate truncations dedup and cannot
+    mask a real cause), it signals the source and fails the copy. Tolerating a pre-completion
+    closure made the worker reconnect and block on an idle socket while the source waited for a
+    `DestinationDone` that could never come — an indefinite hang. This also closes the
+    MITM-tail-truncation residual: a truncation the source does not notice is fatal at the header
+    boundary. Teardown is read from the data pool (lock-free) as well as the tracker's
+    `is_closing()`, because the latter is set behind the tracker mutex, which a suspended future can
+    hold for an unbounded window — reading it alone would let a worker record a spurious truncation
+    that masks the real cause. A framing/decode fault — an oversized length prefix (`InvalidData`),
+    a TLS protocol fault, or a frame that does not deserialize to a `File` — is always fatal.
+  - **The destination fails closed if the transfer is incomplete.** After both its futures finish
+    racing, `run_destination` reads the tracker's `is_done()` once; if it is NOT done and no
+    per-operation error was recorded, the copy is reported as an incomplete-transfer FAILURE, never
+    a success — naming the actual cause when one is available: the FIRST genuine data-`connect()`
+    failure to the source port (e.g. "connection refused" / "TLS handshake timed out"), which the
+    worker stashes for exactly this; else a stream teardown symptom; else a synthetic message. This
+    is the backstop for a premature `connect()` failure that leaves queued files unsent; without it
+    such a state would exit 0 with files missing, because the source reads the control-stream close
+    as graceful regardless of whether `DestinationDone` preceded it. A benign LATE reconnect that
+    fails after `DestinationDone` also stashes a cause, but the transfer completed (`is_done()`), so
+    the gate never fires and it is dropped. (A destination-side gate failure is sufficient: the
+    master fails the copy if EITHER rcpd fails. Making the source ALSO distinguish a close with vs.
+    without a prior `DestinationDone` is a deferred defense-in-depth backstop.)
+  - **Every TLS handshake is bounded.** All of them go through `remote::tls::accept_bounded` /
+    `connect_bounded`, which apply the timeout and are the only place a handshake is performed; a
+    bare `TlsAcceptor::accept`/`TlsConnector::connect` elsewhere is rejected by
+    `scripts/check-tls-handshake-timeout.sh`. Each data `connect()` additionally races the TCP
+    connect + TLS handshake against a teardown cancellation token (fired by `data_pool.close()`), so
+    a worker stuck mid-handshake cannot keep the file-handler future waiting forever. The CONTROL
+    connection's handshake (destination connect, source accept), each source-side DATA-accept
+    handshake, the source's DRY-RUN control accept, and both master↔rcpd accepts (control and
+    tracing) are bounded by `conn_timeout_sec` — a peer that establishes TCP then stalls the
+    handshake can no longer hang any of them. (Two of these bounds matter most: the data-accept and
+    the rcpd accepts run inline in a sequential accept loop, so a single stall would otherwise block
+    every further connection — for rcpd, including the legitimate master's.)
 
 **`DestinationDone`**
 
@@ -312,7 +400,8 @@ The protocol uses asymmetric error communication between source and destination:
   `DirectorySkipped` (not created). This is not failure reporting for its own sake — the source
   needs it to release the directory's held fd from its source-side fd-map (TOCTOU-safe reads). It
   does not change what the source sends next (a skipped directory's children still arrive and are
-  skipped via `failed_directories`).
+  skipped via `failed_directories`). (Sole exception: a **hard abort** may close the control stream
+  in place of a final ack/nack — see `DirectorySkipped` §2.2, "Exception — hard abort".)
 
 ### 3.2 Rationale
 
@@ -486,8 +575,25 @@ struct DirectoryState {
     entries_expected: usize,    // set from Directory message's entry_count
     entries_processed: usize,   // incremented for each child (file, dir, symlink)
     keep_if_empty: bool,        // whether to keep directory if it has no content
+    restore_owner: Option<(u32, u32)>, // original (uid, gid) to restore at completion for a reused
+                                        // directory locked down under --require-toctou-safe; None
+                                        // otherwise. Destination-local — never sent on the wire.
 }
 ```
+
+**Reused-directory lockdown (`--require-toctou-safe`).** When the destination REUSES an existing
+directory under strict operand resolution (the `AlreadyExisted` outcome of directory creation), it
+takes the directory over before any child is written: it inode-rechecks the opened fd against the
+just-classified entry, `fchown`s its uid to the copier (pinning the group to the captured value for
+a setgid directory), `fchmod`s it to `0o700` (preserving setgid), and re-stats to verify the
+takeover landed. The directory's original `(uid, gid)` is captured into `restore_owner`. At
+completion (§5.2), before the source metadata is applied, that original owner is restored
+component-wise (only the components the copy is not preserving to the source), so a successful copy
+leaves the directory byte-identical to a run without this hardening. This is entirely
+destination-side: no protocol message carries `restore_owner`, and the wire format is unchanged. A
+lockdown failure (recheck mismatch, an `fchown`/`fchmod` `EPERM`, or a failed post-takeover
+verification) is a directory-create failure, handled exactly like any other (§7): `DirectorySkipped`
+in collect mode, or an abort under `--fail-early`.
 
 ### 5.2 Completion Conditions
 
@@ -727,7 +833,8 @@ Failed directories are tracked in a simple set:
 - Skipped descendants still call `process_child_entry(parent)` so the parent's entry count is
   correctly maintained — even when a child directory fails, it counts as a processed entry
 - Failed directories are not added to `pending_directories`; a `DirectorySkipped` nack is sent in
-  place of `DirectoryCreated` (exactly one of the two is sent per `Directory`)
+  place of `DirectoryCreated` (exactly one of the two is sent per `Directory`, except on a hard
+  abort that closes the control stream in place of the ack/nack — see `DirectorySkipped` §2.2)
 
 ### 7.4 Message Batching
 

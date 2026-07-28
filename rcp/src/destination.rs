@@ -87,6 +87,36 @@ async fn resolve_parent_dir(
 /// `File` header (the `size` field delimits its bytes), and a worker keeps
 /// reading files from the connection until the source closes the stream (EOF).
 /// See `handle_file_stream` and the source-side reuse note in `rcp::source`.
+/// Outcome of [`DataConnectionPool::connect`]. Distinguishing a teardown-induced close (`PoolClosed`)
+/// from a genuine connection failure (`Failed`) AT THE ERROR SOURCE (not by later timing) is what lets
+/// the worker record only genuine failures — a benign late reconnect during teardown is `PoolClosed`
+/// and is never mistaken for a cause.
+enum ConnectOutcome {
+    Connected(
+        remote::streams::BoxedRecvStream,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
+    /// The pool was closed / cancelled by teardown — a benign end, not a failure to report.
+    PoolClosed,
+    /// A genuine connect failure (refused, timed out, TLS fault) whose cause is worth surfacing if the
+    /// transfer turns out incomplete.
+    Failed(anyhow::Error),
+}
+
+/// The stashed connect cause and the teardown latch, under ONE mutex.
+///
+/// They must be one state, not two: a worker that checked a separate "are we tearing down" flag and
+/// only then locked the slot could be cancelled in between, and would stash a teardown artifact that
+/// `choose_final_result` then prefers over the real control failure. Sharing the mutex makes the
+/// transition atomic — [`DataConnectionPool::close`] latches `tearing_down` under the lock BEFORE
+/// cancelling, so every recorder either wins the lock first (its failure genuinely predates
+/// teardown) or sees the latch and drops its error.
+#[derive(Default)]
+struct ConnectErrors {
+    tearing_down: bool,
+    first: Option<anyhow::Error>,
+}
+
 struct DataConnectionPool {
     data_addr: std::net::SocketAddr,
     network_profile: remote::NetworkProfile,
@@ -94,6 +124,17 @@ struct DataConnectionPool {
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     /// Optional TLS connector for encrypted connections
     tls_connector: Option<std::sync::Arc<tokio_rustls::TlsConnector>>,
+    /// Upper bound on a single TCP-connect + TLS-handshake, so a worker already past the semaphore
+    /// but stuck mid-handshake cannot block the pool drain forever (it would otherwise leave the
+    /// file-handler future — and thus `run_destination`'s teardown — waiting indefinitely).
+    conn_timeout: std::time::Duration,
+    /// Cancelled by [`Self::close`] so an IN-FLIGHT `connect()` is released immediately on teardown,
+    /// not only bounded by `conn_timeout`.
+    cancel: tokio_util::sync::CancellationToken,
+    /// The FIRST genuine (non-teardown) connect failure, first-writer-wins. Surfaced as the cause when
+    /// the completion gate fires, so a premature connect failure names e.g. "connection refused"
+    /// rather than only a synthetic "incomplete transfer".
+    connect_errors: std::sync::Mutex<ConnectErrors>,
 }
 
 impl DataConnectionPool {
@@ -102,51 +143,105 @@ impl DataConnectionPool {
         max_connections: usize,
         network_profile: remote::NetworkProfile,
         tls_connector: Option<std::sync::Arc<tokio_rustls::TlsConnector>>,
+        conn_timeout_sec: u64,
     ) -> Self {
         Self {
             data_addr,
             network_profile,
             semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections)),
             tls_connector,
+            conn_timeout: std::time::Duration::from_secs(conn_timeout_sec),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            connect_errors: std::sync::Mutex::new(ConnectErrors::default()),
         }
     }
     /// Open a new connection to the source's data port.
-    /// Returns a RecvStream for reading file data.
-    async fn connect(
-        &self,
-    ) -> anyhow::Result<(
-        remote::streams::BoxedRecvStream,
-        tokio::sync::OwnedSemaphorePermit,
-    )> {
-        // acquire semaphore permit (limits concurrent connections)
-        let permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow::anyhow!("data pool closed"))?;
-        // connect to source
+    async fn connect(&self) -> ConnectOutcome {
+        // acquire a permit; a closed semaphore means teardown (not a failure to report).
+        let permit = match self.semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return ConnectOutcome::PoolClosed,
+        };
+        // Race the TCP connect + TLS handshake against teardown cancellation and a hard timeout. A
+        // worker already PAST the semaphore, stuck mid-handshake on an unresponsive peer, would
+        // otherwise never finish — leaving the file-handler future (and thus `run_destination`'s
+        // teardown) waiting for it forever. A cancel is a benign teardown (`PoolClosed`).
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => ConnectOutcome::PoolClosed,
+            result = tokio::time::timeout(self.conn_timeout, self.connect_and_handshake()) => {
+                match result {
+                    Ok(Ok(recv_stream)) => ConnectOutcome::Connected(recv_stream, permit),
+                    Ok(Err(e)) => ConnectOutcome::Failed(e),
+                    Err(_elapsed) => ConnectOutcome::Failed(anyhow::anyhow!(
+                        "data connection to source timed out after {}s",
+                        self.conn_timeout.as_secs()
+                    )),
+                }
+            }
+        }
+    }
+    /// Record the FIRST genuine (non-teardown) connect failure (first-writer-wins).
+    ///
+    /// Drops the error once teardown has begun. `connect()` classifies at the error source, but a
+    /// connect that had ALREADY resolved to `Failed` when `close()` fired still reaches here — and
+    /// that failure is a teardown artifact (the source is closing its data listener), not a cause.
+    /// Recording it would let `choose_final_result` prefer it over the real error. The latch is read
+    /// under the SAME lock that guards the slot, so the check cannot be overtaken by a concurrent
+    /// `close()` between testing it and writing.
+    fn record_first_connect_error(&self, e: anyhow::Error) {
+        let mut errs = self.connect_errors.lock().unwrap();
+        if errs.tearing_down {
+            tracing::debug!("ignoring connect failure observed after teardown began: {e:#}");
+            return;
+        }
+        if errs.first.is_none() {
+            errs.first = Some(e);
+        }
+    }
+    /// Whether teardown has begun, observable WITHOUT the tracker mutex.
+    ///
+    /// Set by [`Self::close`], which `signal_source_teardown` invokes first precisely so this is
+    /// true from the instant teardown starts. The data workers' end-of-stream gate relies on that:
+    /// the tracker's own `is_closing()` is only set behind OUTER and can still read false while a
+    /// suspended future holds it. This reads the cancellation token rather than
+    /// [`ConnectErrors::tearing_down`] so the gate stays lock-free — `close()` latches the flag
+    /// before cancelling, so a cancelled token always implies the flag is already set.
+    fn is_tearing_down(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+    fn take_first_connect_error(&self) -> Option<anyhow::Error> {
+        self.connect_errors.lock().unwrap().first.take()
+    }
+    /// The blocking-on-I/O part of [`Self::connect`], factored out so it can be bounded/cancelled.
+    ///
+    /// The handshake bound here is `conn_timeout`, the same deadline [`Self::connect`] applies to
+    /// the whole TCP-connect + handshake; only the read half is kept (this side never sends on a
+    /// data connection).
+    async fn connect_and_handshake(&self) -> anyhow::Result<remote::streams::BoxedRecvStream> {
         let stream = tokio::net::TcpStream::connect(self.data_addr).await?;
         stream.set_nodelay(true)?;
         remote::configure_tcp_buffers(&stream, self.network_profile);
-        // wrap with TLS if configured
-        let recv_stream = if let Some(ref connector) = self.tls_connector {
-            let server_name =
-                rustls::pki_types::ServerName::try_from("rcp").expect("'rcp' is a valid DNS name");
-            let tls_stream = connector
-                .connect(server_name, stream)
-                .await
-                .context("TLS handshake failed for data connection")?;
-            let (read_half, _write_half) = tokio::io::split(tls_stream);
-            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead)
-        } else {
-            let (read_half, _write_half) = stream.into_split();
-            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead)
-        };
-        Ok((recv_stream, permit))
+        let (_send_stream, recv_stream) = remote::tls::connect_bounded(
+            self.tls_connector.as_deref(),
+            remote::tls::SERVER_NAME_SOURCE,
+            stream,
+            self.conn_timeout,
+            "data",
+        )
+        .await?;
+        Ok(recv_stream)
     }
     fn close(&self) {
+        // Latch teardown BEFORE cancelling, under the slot's own lock: a recorder either commits its
+        // cause before this point (so it genuinely predates teardown) or observes the latch and
+        // drops it. Ordering it before `cancel()` also keeps `is_tearing_down()` — which reads the
+        // token lock-free — from ever being true while the latch is still false.
+        self.connect_errors.lock().unwrap().tearing_down = true;
         self.semaphore.close();
+        // release any worker currently blocked in `connect_and_handshake` (semaphore close only
+        // stops NEW permit acquisitions; it does not touch a connect already in flight).
+        self.cancel.cancel();
     }
 }
 
@@ -324,6 +419,14 @@ async fn process_single_file(
         file_header.dst.display(),
         file_header.size
     );
+    // Count the file BEFORE applying metadata: its bytes are already on disk, so a metadata
+    // failure below must not erase it from the summary. This mirrors the local path
+    // (`common::copy`, which increments its progress counters before `set_file_metadata_fd`) —
+    // the remote summary is built from these counters, so incrementing after would report
+    // "files copied: 0" for a tree whose data transferred completely and only failed to be
+    // chowned. The metadata error is still recorded and still fails the copy.
+    prog.files_copied.inc();
+    prog.bytes_copied.add(file_header.size);
     // metadata errors happen after all bytes consumed - stream is at clean boundary.
     // apply through the file's OWN fd (fd-relative): no path re-resolution of dst.
     common::safedir::set_file_metadata_fd(
@@ -336,8 +439,6 @@ async fn process_single_file(
     .with_context(|| format!("failed setting metadata on {:?}", file_header.dst))
     .map_err(err_data_consumed)?;
     drop(file);
-    prog.files_copied.inc();
-    prog.bytes_copied.add(file_header.size);
     Ok(())
 }
 
@@ -432,16 +533,56 @@ async fn remove_existing_dst(
     }
 }
 
+/// Whether a peer closure at a file-header boundary is benign.
+///
+/// THE single completion gate for end-of-stream on a data connection, consulted by EVERY shape the
+/// stream can end in — a clean framed EOF (`Ok(None)`) and a transport-level peer closure alike.
+/// Keeping one gate is the point: the two shapes are indistinguishable in meaning (the peer stopped
+/// between two headers) and differ only in whether a `close_notify`/FIN arrived before the socket
+/// died, which is timing, not semantics. Gating only one of them is what let the hang below survive.
+///
+/// A closure is benign ONLY if the transfer already completed (`is_done()`: the source closes data
+/// connections only after consuming our `DestinationDone`) or teardown has begun. Otherwise it is a
+/// mid-transfer truncation: tolerating it would make the worker reconnect and block on an idle
+/// socket while the source waits for a `DestinationDone` that can never come — an indefinite hang,
+/// with the completion gate unreachable because neither future completes.
+///
+/// Teardown is read from the POOL (lock-free) as well as the tracker: the tracker's `is_closing()`
+/// is set behind OUTER, which a suspended future can hold for an unbounded window, so relying on it
+/// alone lets a worker record a spurious truncation that then masks the real cause.
+async fn peer_close_is_benign(
+    directory_tracker: &directory_tracker::SharedDirectoryTracker,
+    data_pool: &DataConnectionPool,
+) -> bool {
+    if data_pool.is_tearing_down() {
+        return true;
+    }
+    let t = directory_tracker.lock().await;
+    t.is_done() || t.is_closing()
+}
+
+/// The error for a data stream that ended before the transfer completed.
+///
+/// A FIXED message (never the transport error) so `ErrorCollector` dedups several concurrent
+/// truncations to one cause and cannot mask a real error; the transport kind is logged at the call
+/// site.
+fn truncated_stream_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "data stream closed before the transfer completed (truncated header or dropped link)"
+    )
+}
+
 /// Handle a stream that may contain multiple files.
 ///
 /// Loops until the stream is closed (EOF on header read).
-#[instrument(skip(error_collector, file_recv_stream, directory_tracker))]
+#[instrument(skip(error_collector, file_recv_stream, directory_tracker, data_pool))]
 async fn handle_file_stream(
     settings: common::copy::Settings,
     preserve: common::preserve::Settings,
     mut file_recv_stream: remote::streams::BoxedRecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
     error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
+    data_pool: std::sync::Arc<DataConnectionPool>,
 ) -> anyhow::Result<()> {
     let prog = progress();
     tracing::info!("Processing file stream (may contain multiple files)");
@@ -450,13 +591,64 @@ async fn handle_file_stream(
         // try to receive next file header
         let file_header = match file_recv_stream
             .recv_object::<remote::protocol::File>()
-            .await?
+            .await
         {
-            Some(h) => h,
-            None => {
-                // stream closed by source, no more files
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                // A CLEAN framed EOF at a header boundary. This is NOT self-evidently benign: the
+                // source closes a data stream gracefully while it keeps running (a send failure
+                // discards the stream with `close()`, and the pool drain closes returning streams),
+                // and on plain TCP a graceful FIN is the ordinary shape anyway. So it goes through
+                // the SAME completion gate as a transport-level closure — see `peer_close_is_benign`.
+                if !peer_close_is_benign(&directory_tracker, &data_pool).await {
+                    tracing::error!("Data stream closed cleanly before the transfer completed");
+                    return Err(truncated_stream_error());
+                }
                 tracing::debug!("Stream closed, no more files");
                 break;
+            }
+            Err(e) => {
+                // Distinguish a benign end-of-transfer close from a mid-transfer TRUNCATION, and both
+                // from a framing/decode fault.
+                //
+                // A peer closure reaches us as a TRANSPORT error whenever the socket died without a
+                // clean `close_notify`/FIN — `UnexpectedEof` (TLS: rustls's missing `close_notify`)
+                // or `ConnectionReset`, or any other "the peer closed" kind depending on timing. The
+                // clean-EOF shape arrives as `Ok(None)` above; both mean the same thing and share one
+                // gate.
+                let peer_closed = e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                    use std::io::ErrorKind::{
+                        BrokenPipe, ConnectionAborted, ConnectionReset, NotConnected, UnexpectedEof,
+                    };
+                    matches!(
+                        io.kind(),
+                        UnexpectedEof
+                            | ConnectionReset
+                            | ConnectionAborted
+                            | BrokenPipe
+                            | NotConnected
+                    )
+                });
+                if peer_closed {
+                    // The kind alone is ambiguous — a truncated header ending in a reset looks
+                    // identical to a benign close — so COMPLETION STATE decides, via the same gate
+                    // the clean-EOF arm uses. A PRE-completion closure is FATAL: it propagates, the
+                    // worker aborts, the join loop signals teardown, and the copy fails with this
+                    // cause.
+                    if peer_close_is_benign(&directory_tracker, &data_pool).await {
+                        tracing::debug!(
+                            "Data stream ended at header boundary (peer closed): {e:#}"
+                        );
+                        break;
+                    }
+                    tracing::error!(
+                        "Data stream closed before the transfer completed (truncation): {e:#}"
+                    );
+                    return Err(truncated_stream_error());
+                }
+                // A framing/decode fault — an oversized length prefix (`InvalidData`), a TLS protocol
+                // fault, or a frame that does not decode to a `File` — is always fatal.
+                return Err(e).context("transport or decode fault reading file header");
             }
         };
         tracing::info!(
@@ -551,7 +743,12 @@ async fn handle_file_stream(
                     .await
                     .context("Failed to update directory tracker after receiving file")?;
             }
-            // check if we're done after each file - this may send DestinationDone
+            // check if we're done after each file - this may send DestinationDone. We send it even
+            // when THIS file failed: the failure is recorded (in the collector) so the destination
+            // still reports Failure, but DestinationDone is what lets the source shut down cleanly on
+            // the COMPLETION path. (On a non-completion abort the source is instead signaled by
+            // `signal_source_teardown` closing the control stream — see `run_destination` and
+            // docs/remote_protocol.md.)
             if tracker.is_done() {
                 tracing::info!(
                     "All operations complete after file processing, sending DestinationDone"
@@ -578,6 +775,36 @@ async fn handle_file_stream(
     Ok(())
 }
 
+/// Signal the source to tear down, and stop the local data pool.
+///
+/// This is the ONE abort funnel for the destination. Closing the control send stream makes the
+/// source observe the close, release its dir-fd budget, and tear down — so a source that is idle (an
+/// all-empty-file transfer, whose header-only sends never trip a broken pipe) or parked on a
+/// saturated dir-fd budget stops, instead of leaving the destination waiting on `control_future`
+/// forever (an infinite hang). Closing the data pool fails the workers' reconnects so they exit.
+///
+/// Both operations are idempotent, which is what lets every caller invoke it unconditionally: on the
+/// happy path `send_destination_done` already closed the stream (a no-op close here) and the copy is
+/// done with the pool. There is no armed/disarmed state to get wrong — the invariant "the source is
+/// always signaled before the destination waits on it" holds because this is called on every path.
+///
+/// ORDER MATTERS: the pool is closed FIRST. `close()` is synchronous and lock-free, so it lands on
+/// this future's very first poll, whereas `close_stream()` must first acquire the tracker mutex
+/// (OUTER) — which the loser future can hold while SUSPENDED mid-send (see `run_destination`). Doing
+/// the awaited close first would leave, for that whole unbounded window, a teardown that no worker
+/// can observe: workers would keep reconnecting into an idle socket, and a connect that failed in
+/// the window would stash a teardown ARTIFACT that `choose_final_result` then prefers over the real
+/// cause. Closing the pool first makes "teardown has begun" observable immediately and lock-free —
+/// it cancels in-flight connects (`ConnectOutcome::PoolClosed`) and is the signal
+/// [`DataConnectionPool::is_tearing_down`] exposes to the data workers' end-of-stream gate.
+async fn signal_source_teardown(
+    directory_tracker: &directory_tracker::SharedDirectoryTracker,
+    data_pool: &DataConnectionPool,
+) {
+    data_pool.close();
+    directory_tracker.lock().await.close_stream().await;
+}
+
 /// Process incoming files over TCP data connections.
 ///
 /// Opens connections to source's data port and reads file data.
@@ -596,7 +823,6 @@ async fn process_incoming_file_streams_tcp(
     // each handling one file at a time. this is intentional: the semaphore limits concurrent
     // *connections* (and thus concurrent file transfers), not workers. each worker loops:
     // acquire permit -> connect -> receive files until EOF -> release permit.
-    let fail_early = settings.fail_early;
     let settings = std::sync::Arc::new(settings);
     let preserve = std::sync::Arc::new(preserve);
     for _ in 0..data_pool.semaphore.available_permits() {
@@ -607,51 +833,68 @@ async fn process_incoming_file_streams_tcp(
         let preserve = preserve.clone();
         join_set.spawn(async move {
             loop {
-                // try to connect to source's data port
+                // Connect to the source's data port. A `PoolClosed` outcome is teardown (benign) — stop
+                // silently. A `Failed` outcome is a GENUINE connect failure (refused / timed out / TLS
+                // fault): stash the first such cause so the completion gate can name it if the transfer
+                // turns out incomplete, then stop. Whether it actually mattered is decided centrally by
+                // whether the transfer completed — a benign late reconnect that fails during teardown is
+                // dropped because the gate never fires. The worker carries no signaling responsibility.
                 let (recv_stream, _permit) = match pool.connect().await {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        // pool closed or connection failed
-                        tracing::debug!("Data connection ended: {e}");
+                    ConnectOutcome::Connected(recv_stream, permit) => (recv_stream, permit),
+                    ConnectOutcome::PoolClosed => break,
+                    ConnectOutcome::Failed(e) => {
+                        tracing::debug!("Data connection failed: {e:#}");
+                        pool.record_first_connect_error(e);
                         break;
                     }
                 };
-                // receive files from this connection until the source closes it (EOF)
-                if let Err(e) = handle_file_stream(
+                // Receive files until the source closes this connection (EOF). A returned error is a
+                // genuine abort — a --fail-early file/metadata failure, or a corrupted stream whose
+                // lost files can never let the tracker reach is_done() — so propagate it OUT of the
+                // task (the join loop records it and signals the source ONCE). Individual
+                // non-fail-early errors never return here: handle_file_stream records them into the
+                // collector and keeps draining.
+                handle_file_stream(
                     (*settings).clone(),
                     *preserve,
                     recv_stream,
                     tracker.clone(),
                     collector.clone(),
+                    pool.clone(),
                 )
-                .await
-                {
-                    tracing::debug!("File stream handling ended: {e}");
-                    break;
-                }
+                .await?;
                 // permit is released when _permit is dropped
             }
             Ok::<(), anyhow::Error>(())
         });
     }
-    // wait for all workers to complete
+    // Drain the workers. A worker returns Err (or panics) ONLY on a genuine abort — a --fail-early
+    // file/metadata failure, a corrupted stream, or a panic — never on a limpable individual error
+    // (handle_file_stream records those and keeps draining). Record every abort so
+    // `run_destination`'s `take_error` reports the real cause, and on the FIRST abort signal the
+    // source ONCE, EAGERLY: the abort must reach the source now, not after the pool finishes
+    // draining, because the other workers stay parked reading their data streams until the source is
+    // told to stop (and the source only closes the data connections once it has torn down). Deferring
+    // the signal to after the loop would therefore deadlock. `signal_source_teardown` is idempotent,
+    // and `run_destination` calls it again unconditionally.
+    let mut signaled = false;
     while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
+        let aborted = match result {
+            Ok(Ok(())) => false,
             Ok(Err(e)) => {
-                tracing::error!("File stream handling task failed: {e}");
-                if fail_early {
-                    return Err(e);
-                }
+                tracing::error!("File stream worker aborted: {e:#}");
                 error_collector.push(e);
+                true
             }
             Err(e) => {
-                tracing::error!("File stream handling task panicked: {e}");
-                if fail_early {
-                    return Err(e.into());
-                }
+                tracing::error!("File stream worker panicked: {e:#}");
                 error_collector.push(e.into());
+                true
             }
+        };
+        if aborted && !signaled {
+            signaled = true;
+            signal_source_teardown(&directory_tracker, &data_pool).await;
         }
     }
     join_set.shutdown().await;
@@ -667,8 +910,10 @@ async fn process_incoming_file_streams_tcp(
 enum DirectoryCreateResult {
     /// directory was created by us (new), with its open fd
     Created(Arc<Dir>),
-    /// directory already existed (reused), with its open fd
-    AlreadyExisted(Arc<Dir>),
+    /// directory already existed (reused), with its open fd and, under strict operand resolution,
+    /// the original `(uid, gid)` to restore at completion (`None` in the default path — see
+    /// [`common::safedir::lockdown_reused_dir`])
+    AlreadyExisted(Arc<Dir>, Option<(u32, u32)>),
     /// skipped due to --ignore-existing (destination is not a directory)
     Skipped,
     /// failed to create directory
@@ -769,8 +1014,21 @@ async fn create_directory(
                     .open_dir(dst_name)
                     .await
                     .with_context(|| format!("cannot open existing directory {dst:?}"))?;
+                // strict-only lockdown: take over the reused directory and restrict it to 0o700 for
+                // the copy's duration, restoring the original owner at completion (no-op / None in
+                // the default path). A recheck or EPERM failure propagates as this directory's
+                // create error — the caller marks it Failed (or aborts under --fail-early), so no
+                // child is written into an unsecured directory.
+                let restore_owner = common::safedir::lockdown_reused_dir(&dir, &dst_handle)
+                    .await
+                    .with_context(|| {
+                        format!("cannot secure reused destination directory {dst:?}")
+                    })?;
                 prog.directories_unchanged.inc();
-                Ok(DirectoryCreateResult::AlreadyExisted(Arc::new(dir)))
+                Ok(DirectoryCreateResult::AlreadyExisted(
+                    Arc::new(dir),
+                    restore_owner,
+                ))
             } else if settings.ignore_existing {
                 // not a directory but ignore_existing is set - skip the subtree
                 tracing::debug!(
@@ -996,9 +1254,15 @@ async fn process_control_stream(
                 // failure (vs an --ignore-existing skip).
                 let was_created = matches!(create_result, DirectoryCreateResult::Created(_));
                 let create_failed = matches!(create_result, DirectoryCreateResult::Failed);
+                // the original owner to restore at completion — Some only for a strict-mode locked
+                // reused directory (see create_directory / lockdown_reused_dir); None otherwise.
+                let restore_owner = match &create_result {
+                    DirectoryCreateResult::AlreadyExisted(_, restore_owner) => *restore_owner,
+                    _ => None,
+                };
                 match create_result {
                     DirectoryCreateResult::Created(dir)
-                    | DirectoryCreateResult::AlreadyExisted(dir) => {
+                    | DirectoryCreateResult::AlreadyExisted(dir, _) => {
                         // build the manifest only for a REUSED dir under overwrite/ignore-existing;
                         // a freshly-created dir is empty and feature-off needs no manifest.
                         let existing =
@@ -1022,6 +1286,7 @@ async fn process_control_stream(
                                 entry_count,
                                 keep_if_empty,
                                 existing,
+                                restore_owner,
                             )
                             .await
                             .context("Failed to add directory to tracker")?;
@@ -1259,28 +1524,17 @@ pub async fn run_destination(
     tracing::info!("Connected to source control port");
     remote::configure_tcp_buffers(&control_stream, tcp_config.network_profile);
     // wrap control connection with TLS if configured
-    let (control_send_stream, control_recv_stream) = if let Some(ref connector) = tls_connector {
-        // use a dummy server name - we verify via fingerprint, not hostname
-        let server_name =
-            rustls::pki_types::ServerName::try_from("rcp").expect("'rcp' is a valid DNS name");
-        let tls_stream = connector
-            .connect(server_name, control_stream)
-            .await
-            .context("TLS handshake failed for control connection")?;
-        let (read_half, write_half) = tokio::io::split(tls_stream);
-        let recv_stream =
-            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead);
-        let send_stream =
-            remote::streams::SendStream::new(Box::new(write_half) as remote::streams::BoxedWrite);
-        (send_stream, recv_stream)
-    } else {
-        let (read_half, write_half) = control_stream.into_split();
-        let recv_stream =
-            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead);
-        let send_stream =
-            remote::streams::SendStream::new(Box::new(write_half) as remote::streams::BoxedWrite);
-        (send_stream, recv_stream)
-    };
+    // the handshake is bounded because a peer that establishes TCP then stalls it would otherwise
+    // hang here indefinitely, BEFORE any teardown state exists (only the TCP connect above was
+    // timed out)
+    let (control_send_stream, control_recv_stream) = remote::tls::connect_bounded(
+        tls_connector.as_deref(),
+        remote::tls::SERVER_NAME_SOURCE,
+        control_stream,
+        std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
+        "control",
+    )
+    .await?;
     // wrap in Arc<Mutex<>> for shared access
     let control_send_stream = std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
     tracing::info!("Created control streams");
@@ -1297,6 +1551,7 @@ pub async fn run_destination(
         tcp_config.max_connections,
         tcp_config.network_profile,
         tls_connector,
+        tcp_config.conn_timeout_sec,
     ));
     let file_handler_future = process_incoming_file_streams_tcp(
         settings.clone(),
@@ -1315,35 +1570,45 @@ pub async fn run_destination(
     );
     tokio::pin!(file_handler_future);
     tokio::pin!(control_future);
-    // race both futures - if either completes first, handle it and then wait for the other.
-    // CANCEL SAFETY: the "cancelled" future is NOT dropped - it's awaited after select!
-    // completes. Both futures are pinned and the winning branch awaits the other, ensuring
-    // both run to completion. No work is lost due to cancellation.
-    let select_result: anyhow::Result<()> = async {
-        tokio::select! {
-            file_result = &mut file_handler_future => {
-                file_result.context("Failed to process incoming file streams")?;
-                control_future.await.context("Failed to process control stream")?;
-            }
-            control_result = &mut control_future => {
-                control_result.context("Failed to process control stream")?;
-                file_handler_future.await.context("Failed to process incoming file streams")?;
-            }
+    // Race both futures to first completion, then ALWAYS drive BOTH to completion before choosing an
+    // error — the loser is never cancelled (a `?` on the winner would drop a data worker mid-record,
+    // degrading the reported cause to a teardown symptom).
+    //
+    // The source is signaled to tear down (`signal_source_teardown` → `close_stream`) CONCURRENTLY
+    // with the loser via `tokio::join!`, NOT inline before awaiting it. This avoids a held-but-unpolled
+    // deadlock: `close_stream` takes the tracker mutex (OUTER), and the loser (`process_control_stream`
+    // mid-`add_directory`) can be SUSPENDED holding OUTER across a control-stream send. Awaiting the
+    // signal inline would park it on OUTER while the loser — the very next statement — is never polled
+    // to release it. `join!` polls both, so the loser drains its send, releases OUTER, and the signal
+    // then acquires it. This is deadlock-free because the lock order is strictly OUTER ≺ INNER (the
+    // `control_send_stream` mutex; INNER is only ever taken through a `&mut DirectoryTracker` method,
+    // which holds OUTER first), so no cycle is possible, and the source drains the control stream
+    // continuously so the loser's send always completes. DO NOT reintroduce an inline `signal.await`
+    // here, and DO NOT acquire OUTER while holding INNER anywhere, or this deadlock returns.
+    let (file_result, control_result) = tokio::select! {
+        file_result = &mut file_handler_future => {
+            let ((), control_result) = tokio::join!(
+                signal_source_teardown(&directory_tracker, &data_pool),
+                &mut control_future,
+            );
+            (file_result, control_result)
         }
-        Ok(())
-    }
-    .await;
-    // if there was an error, close the control stream properly before returning.
-    // this is important for TLS streams which need explicit shutdown to send close_notify.
-    if let Err(e) = select_result {
-        tracing::info!("Error during operation, closing streams for cleanup");
-        directory_tracker.lock().await.close_stream().await;
-        data_pool.close();
-        return Err(e);
-    }
-    tracing::info!("Destination is done");
-    data_pool.close();
-    // build summary from progress counters
+        control_result = &mut control_future => {
+            let ((), file_result) = tokio::join!(
+                signal_source_teardown(&directory_tracker, &data_pool),
+                &mut file_handler_future,
+            );
+            (file_result, control_result)
+        }
+    };
+    // `file_handler_future` returns Ok even when workers aborted (they record into the collector),
+    // so a stream-level error here is almost always the control future's; either way `take_error`
+    // below prefers the recorded operation cause.
+    let select_result: anyhow::Result<()> = file_result
+        .context("Failed to process incoming file streams")
+        .and(control_result.context("Failed to process control stream"));
+    // build summary from progress counters (used by every exit path below; the counters are
+    // final now that the select! above has driven both futures to completion).
     let prog = progress();
     let summary = common::copy::Summary {
         bytes_copied: prog.bytes_copied.get(),
@@ -1369,13 +1634,387 @@ pub async fn run_destination(
             directories_skipped: 0,
         },
     };
-    match error_collector.take_error() {
-        Some(err) => Err(common::copy::Error {
+    // Choose the final result. Both futures have completed and the control stream + data pool were
+    // already closed by `signal_source_teardown`. Read completion ONCE — the tracker is quiescent
+    // (both futures done), so `is_done()` is stable, and it is monotonic once true.
+    let completed = directory_tracker.lock().await.is_done();
+    let recorded = error_collector.take_error();
+    let connect_cause = data_pool.take_first_connect_error();
+    choose_final_result(recorded, select_result, completed, connect_cause, summary)
+}
+
+/// Decide the destination's final result from the three teardown signals. Extracted from
+/// [`run_destination`] so the decision matrix — which is easy to get subtly wrong — can be unit
+/// tested directly (see `teardown_tests`).
+///
+/// Priority: (1) a recorded per-operation error is the real user-facing cause; (2) an INCOMPLETE
+/// tracker must never report success even with nothing recorded (a data worker's `pool.connect()`
+/// failing before completion leaves queued files unsent, and the source reads our control-stream
+/// close as graceful) — name the actual cause, preferring the stashed `connect_cause` (e.g.
+/// "connection refused" / "TLS handshake timed out") over a `select_result` teardown symptom, over a
+/// synthetic message; (3) once complete, a late `select_result` error (and any stashed
+/// `connect_cause` from a benign late reconnect) is only a teardown symptom and is swallowed.
+fn choose_final_result(
+    recorded: Option<anyhow::Error>,
+    select_result: anyhow::Result<()>,
+    completed: bool,
+    connect_cause: Option<anyhow::Error>,
+    summary: common::copy::Summary,
+) -> anyhow::Result<(String, common::copy::Summary)> {
+    if let Some(err) = recorded {
+        return Err(common::copy::Error {
             source: err,
             summary,
         }
-        .into()),
-        None => Ok(("destination OK".to_string(), summary)),
+        .into());
+    }
+    if !completed {
+        let cause = connect_cause
+            .or_else(|| select_result.err())
+            .unwrap_or_else(|| {
+                anyhow::anyhow!(
+                    "destination did not receive all expected entries (transfer incomplete)"
+                )
+            });
+        return Err(common::copy::Error {
+            source: cause.context("incomplete transfer"),
+            summary,
+        }
+        .into());
+    }
+    if let Err(e) = select_result {
+        tracing::debug!("ignoring teardown symptom after successful completion: {e:#}");
+    }
+    tracing::info!("Destination is done");
+    Ok(("destination OK".to_string(), summary))
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+
+    fn summary() -> common::copy::Summary {
+        common::copy::Summary::default()
+    }
+
+    // ── choose_final_result: the completion-gate decision matrix ──
+
+    #[test]
+    fn recorded_error_is_reported_even_when_completed() {
+        let r = choose_final_result(
+            Some(anyhow::anyhow!("permission denied writing file")),
+            Ok(()),
+            true,
+            None,
+            summary(),
+        );
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.contains("permission denied writing file"), "{e}");
+    }
+
+    #[test]
+    fn incomplete_without_a_recorded_error_fails_synthetically() {
+        // a premature closure records nothing and the streams close cleanly, but the tracker never
+        // reached is_done() — must NOT report success.
+        let r = choose_final_result(None, Ok(()), false, None, summary());
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.to_lowercase().contains("incomplete"), "{e}");
+    }
+
+    #[test]
+    fn incomplete_prefers_the_specific_stream_cause() {
+        let r = choose_final_result(
+            None,
+            Err(anyhow::anyhow!("Permission denied creating /dst/foo")),
+            false,
+            None,
+            summary(),
+        );
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.contains("Permission denied creating /dst/foo"), "{e}");
+        assert!(e.contains("incomplete transfer"), "{e}");
+    }
+
+    #[test]
+    fn incomplete_prefers_the_connect_cause_over_stream_symptom() {
+        // Finding #5: a premature connect failure stashes its cause; the gate names it (over a
+        // generic message or a select_result teardown symptom).
+        let r = choose_final_result(
+            None,
+            Err(anyhow::anyhow!("peer closed connection")), // teardown symptom
+            false,
+            Some(anyhow::anyhow!("connection refused")), // the real connect cause
+            summary(),
+        );
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.contains("connection refused"), "{e}");
+        assert!(e.contains("incomplete transfer"), "{e}");
+    }
+
+    #[test]
+    fn completed_ignores_a_stashed_connect_cause_from_a_benign_reconnect() {
+        // Finding #5: a worker that looped to connect() as the source stopped accepting after
+        // DestinationDone stashes "connection refused", but the transfer COMPLETED — must be success.
+        let r = choose_final_result(
+            None,
+            Ok(()),
+            true,
+            Some(anyhow::anyhow!("connection refused")),
+            summary(),
+        );
+        assert!(
+            r.is_ok(),
+            "a completed transfer must not fail on a benign late-reconnect connect error"
+        );
+    }
+
+    #[test]
+    fn completed_with_no_error_is_success() {
+        assert!(choose_final_result(None, Ok(()), true, None, summary()).is_ok());
+    }
+
+    #[test]
+    fn completed_swallows_a_late_teardown_symptom() {
+        // once complete, a late control error is only a teardown symptom (e.g. a control send that
+        // lost the race with the stream close) — success must not flip to failure.
+        let r = choose_final_result(
+            None,
+            Err(anyhow::anyhow!("peer closed connection")),
+            true,
+            None,
+            summary(),
+        );
+        assert!(
+            r.is_ok(),
+            "a completed transfer must not fail on a teardown symptom"
+        );
+    }
+
+    // ── the deadlock-freedom property of the teardown combinator ──
+
+    /// Reproduces the shape that deadlocked before the fix: a "signal" that needs a mutex (the
+    /// tracker OUTER lock) and a "loser" future that is SUSPENDED holding that mutex across an await.
+    /// The old inline form (`signal.await; loser.await`) parks the signal on the mutex while the
+    /// never-polled loser holds it → deadlock. `tokio::join!(signal, loser)` polls both, so the loser
+    /// makes progress, releases the lock, and the signal completes. This pins the async-ordering
+    /// property the real `run_destination` combinator relies on.
+    #[tokio::test(start_paused = true)]
+    async fn join_of_signal_and_loser_does_not_deadlock_when_loser_holds_the_lock() {
+        let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        // the loser acquires the lock and then suspends WHILE STILL HOLDING it (mirrors
+        // process_control_stream suspended mid-`add_directory` holding the tracker lock).
+        let loser = {
+            let lock = lock.clone();
+            let release = release.clone();
+            async move {
+                let _guard = lock.lock().await;
+                release.notified().await;
+            }
+        };
+        // the signal parks on the same lock (mirrors signal_source_teardown → close_stream).
+        let signal = {
+            let lock = lock.clone();
+            async move {
+                let _g = lock.lock().await;
+            }
+        };
+        // release the loser shortly after both are being polled — reachable ONLY because `join!`
+        // polls the loser concurrently with the parked signal.
+        let trigger = {
+            let release = release.clone();
+            async move {
+                tokio::task::yield_now().await;
+                release.notify_one();
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(signal, loser, trigger);
+        })
+        .await
+        .expect("join! must not deadlock when the loser holds the lock across an await");
+    }
+
+    // ── #1: a header-boundary peer-closure is fatal ONLY before completion ──
+
+    /// A reader that immediately fails at the first `poll_read` with a given "peer closed" kind —
+    /// reproducing a header-boundary transport drop (a truncated header looks identical to a benign
+    /// close). This covers the TRANSPORT-error shape of an end-of-stream; the clean shape is covered
+    /// separately with `tokio::io::empty()`, which yields `Ok(0)` on an empty decode buffer and so
+    /// arrives as `Ok(None)`. (Only a PARTIAL frame produces `ErrorKind::Other` — "bytes remaining
+    /// on stream" — which is the always-fatal decode arm.)
+    struct FailingReader(std::io::ErrorKind);
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(self.0, "simulated peer closure")))
+        }
+    }
+
+    // handle_file_stream fails at the first recv here, so the settings values are immaterial.
+    fn test_copy_settings() -> common::copy::Settings {
+        common::copy::Settings {
+            dereference: false,
+            fail_early: false,
+            overwrite: false,
+            overwrite_compare: Default::default(),
+            overwrite_filter: None,
+            ignore_existing: false,
+            chunk_size: 0,
+            skip_specials: false,
+            remote_copy_buffer_size: 0,
+            filter: None,
+            dry_run: None,
+            delete: None,
+        }
+    }
+
+    fn tracker_over_sink() -> directory_tracker::SharedDirectoryTracker {
+        let send = remote::streams::SendStream::new(
+            Box::new(tokio::io::sink()) as remote::streams::BoxedWrite
+        );
+        directory_tracker::make_shared(
+            std::sync::Arc::new(tokio::sync::Mutex::new(send)),
+            common::preserve::Settings::default(),
+            false,
+            std::sync::Arc::new(common::error_collector::ErrorCollector::default()),
+        )
+    }
+
+    /// An OPEN pool (teardown not begun), so the gate is decided by the tracker alone.
+    fn test_pool() -> std::sync::Arc<DataConnectionPool> {
+        std::sync::Arc::new(DataConnectionPool::new(
+            "127.0.0.1:1".parse().unwrap(),
+            1,
+            remote::NetworkProfile::default(),
+            None,
+            1,
+        ))
+    }
+
+    async fn run_over_reader(
+        tracker: directory_tracker::SharedDirectoryTracker,
+        pool: std::sync::Arc<DataConnectionPool>,
+        reader: remote::streams::BoxedRead,
+    ) -> anyhow::Result<()> {
+        let recv = remote::streams::RecvStream::new(reader);
+        handle_file_stream(
+            test_copy_settings(),
+            common::preserve::Settings::default(),
+            recv,
+            tracker,
+            std::sync::Arc::new(common::error_collector::ErrorCollector::default()),
+            pool,
+        )
+        .await
+    }
+
+    async fn run_handle_file_stream(
+        tracker: directory_tracker::SharedDirectoryTracker,
+        kind: std::io::ErrorKind,
+    ) -> anyhow::Result<()> {
+        run_over_reader(
+            tracker,
+            test_pool(),
+            Box::new(FailingReader(kind)) as remote::streams::BoxedRead,
+        )
+        .await
+    }
+
+    /// A CLEAN framed EOF (an empty reader) before completion must be fatal, exactly like a
+    /// transport-level peer closure. This is the arm that previously broke out un-gated and left the
+    /// worker reconnecting into an idle socket while the source waited for `DestinationDone`.
+    #[tokio::test]
+    async fn pre_completion_clean_eof_is_fatal() {
+        let r = run_over_reader(
+            tracker_over_sink(),
+            test_pool(),
+            Box::new(tokio::io::empty()) as remote::streams::BoxedRead,
+        )
+        .await;
+        let e = format!(
+            "{:#}",
+            r.expect_err("a pre-completion clean EOF must be fatal")
+        );
+        assert!(e.contains("before the transfer completed"), "{e}");
+    }
+
+    /// A connect failure recorded BEFORE teardown is a genuine cause and is kept; one recorded
+    /// after `close()` is a teardown artifact and must be dropped, or `choose_final_result` would
+    /// prefer it over the real control failure.
+    #[tokio::test]
+    async fn connect_errors_recorded_after_teardown_are_dropped() {
+        let pool = test_pool();
+        pool.record_first_connect_error(anyhow::anyhow!("genuine: connection refused"));
+        pool.close();
+        pool.record_first_connect_error(anyhow::anyhow!("artifact: listener gone"));
+        let cause = format!("{:#}", pool.take_first_connect_error().expect("a cause"));
+        assert!(cause.contains("genuine"), "{cause}");
+
+        let torn_down = test_pool();
+        torn_down.close();
+        torn_down.record_first_connect_error(anyhow::anyhow!("artifact: listener gone"));
+        assert!(
+            torn_down.take_first_connect_error().is_none(),
+            "an error observed only after teardown must not become the reported cause"
+        );
+    }
+
+    /// The same clean EOF is BENIGN once teardown has begun — and the pool alone must establish
+    /// that, without the tracker mutex, since a suspended future can hold it for an unbounded window.
+    #[tokio::test]
+    async fn clean_eof_during_teardown_is_benign() {
+        let pool = test_pool();
+        pool.close();
+        run_over_reader(
+            tracker_over_sink(),
+            pool,
+            Box::new(tokio::io::empty()) as remote::streams::BoxedRead,
+        )
+        .await
+        .expect("a clean EOF during teardown is benign");
+    }
+
+    #[tokio::test]
+    async fn pre_completion_peer_closure_is_fatal() {
+        // incomplete tracker (is_done()==false, is_closing()==false) + a whitelisted peer-closure →
+        // FATAL. Before the fix this returned Ok (treated as clean EOF) → the hang.
+        let r =
+            run_handle_file_stream(tracker_over_sink(), std::io::ErrorKind::ConnectionReset).await;
+        let e = format!(
+            "{:#}",
+            r.expect_err("a pre-completion peer closure must be fatal")
+        );
+        assert!(e.contains("before the transfer completed"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn peer_closure_after_completion_is_benign() {
+        let t = tracker_over_sink();
+        // has_root_item=false sets structure_complete AND root_complete → is_done() == true.
+        t.lock().await.set_structure_complete(false);
+        assert!(t.lock().await.is_done());
+        let r = run_handle_file_stream(t, std::io::ErrorKind::UnexpectedEof).await;
+        assert!(
+            r.is_ok(),
+            "a peer closure after completion is a normal end-of-transfer"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_closure_during_our_teardown_is_benign() {
+        let t = tracker_over_sink();
+        t.lock().await.close_stream().await; // sets is_closing()
+        assert!(t.lock().await.is_closing());
+        let r = run_handle_file_stream(t, std::io::ErrorKind::ConnectionReset).await;
+        assert!(
+            r.is_ok(),
+            "a peer closure during an abort we initiated is benign"
+        );
     }
 }
 

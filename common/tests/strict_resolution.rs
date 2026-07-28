@@ -163,3 +163,202 @@ fn require_mode_with_no_operands_proceeds() {
         }
     }
 }
+
+// ── Reused-destination-directory lockdown (--require-toctou-safe) ─────────────
+//
+// Under strict operand resolution a REUSED destination directory is taken over by
+// the copier and restricted to 0o700 for the copy's duration, then restored to its
+// original owner and the source mode at finalize (see
+// `common::safedir::lockdown_reused_dir`). These arm the strict switch and drive a
+// real copy/link into a directory this (non-root) user owns — the cases exercisable
+// without multiple uids; the foreign-owner restore is covered by the `sudo_`-gated
+// tests in the rcp/rlink integration suites.
+
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+fn overwrite_copy_settings() -> common::copy::Settings {
+    common::copy::Settings {
+        dereference: false,
+        fail_early: true,
+        overwrite: true,
+        overwrite_compare: Default::default(),
+        overwrite_filter: None,
+        ignore_existing: false,
+        chunk_size: 0,
+        skip_specials: false,
+        remote_copy_buffer_size: 0,
+        filter: None,
+        dry_run: None,
+        delete: None,
+    }
+}
+
+/// The current process's effective uid/gid (the copier's identity), read via libc
+/// as the rest of this binary already does for raw errnos.
+fn effective_owner() -> (u32, u32) {
+    // SAFETY: geteuid/getegid are always-successful, argument-free syscalls.
+    unsafe { (libc::geteuid(), libc::getegid()) }
+}
+
+/// Strict reuse of an owned `0o500` directory makes it writable for the copy and
+/// leaves it at the SOURCE mode with the owner unchanged — the write-into-readonly
+/// regression guard, and proof the interim `0o700` state is not left behind.
+#[tokio::test]
+async fn strict_reuse_owned_readonly_dir_becomes_writable_final_mode_source() -> anyhow::Result<()>
+{
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2)");
+        return Ok(());
+    }
+    let tmp = tempfile::tempdir()?;
+    let tmp = tokio::fs::canonicalize(tmp.path()).await?;
+    // source directory (distinctive mode 0o755) with one child to write into the reused dir
+    let src = tmp.join("src");
+    tokio::fs::create_dir(&src).await?;
+    tokio::fs::write(src.join("a.txt"), b"payload").await?;
+    tokio::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).await?;
+    // reused destination directory: exists, owned by us, read-only (un-writable as-is)
+    let dst = tmp.join("dst");
+    tokio::fs::create_dir(&dst).await?;
+    tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o500)).await?;
+    common::safedir::enable_strict_operand_resolution();
+    let result = common::copy::copy(
+        common::get_progress(),
+        &src,
+        &dst,
+        &overwrite_copy_settings(),
+        &common::preserve::preserve_none(),
+        false,
+    )
+    .await;
+    if let Err(e) = result {
+        panic!("strict reuse copy must succeed, got: {:#}", e.source);
+    }
+    // the child was written despite the 0o500 start → the lockdown made the dir writable
+    assert!(
+        dst.join("a.txt").exists(),
+        "child must be copied into the locked-then-restored directory"
+    );
+    let md = std::fs::symlink_metadata(&dst)?;
+    // final mode is the source's masked mode (0o755), not the interim 0o700 or original 0o500
+    assert_eq!(
+        md.permissions().mode() & 0o777,
+        0o755,
+        "final mode must equal the source directory mode"
+    );
+    // owner restored to the original (== us): unchanged from before the copy
+    let (euid, egid) = effective_owner();
+    assert_eq!(md.uid(), euid, "owner uid must be unchanged");
+    assert_eq!(md.gid(), egid, "owner gid must be unchanged");
+    Ok(())
+}
+
+/// `preserve_none` reuse of an owned `0o777` directory ends with the owner
+/// UNCHANGED — the v1-blocker guard (a naive "chown gated on preserve" would leave
+/// the copier as the permanent owner under the default `preserve_none`).
+#[tokio::test]
+async fn strict_reuse_preserve_none_owner_unchanged() -> anyhow::Result<()> {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2)");
+        return Ok(());
+    }
+    let tmp = tempfile::tempdir()?;
+    let tmp = tokio::fs::canonicalize(tmp.path()).await?;
+    let src = tmp.join("src");
+    tokio::fs::create_dir(&src).await?;
+    tokio::fs::write(src.join("a.txt"), b"payload").await?;
+    tokio::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).await?;
+    // reused destination directory: exists, owned by us, world-open (0o777)
+    let dst = tmp.join("dst");
+    tokio::fs::create_dir(&dst).await?;
+    tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o777)).await?;
+    let (euid_before, egid_before) = effective_owner();
+    common::safedir::enable_strict_operand_resolution();
+    let result = common::copy::copy(
+        common::get_progress(),
+        &src,
+        &dst,
+        &overwrite_copy_settings(),
+        &common::preserve::preserve_none(),
+        false,
+    )
+    .await;
+    if let Err(e) = result {
+        panic!("strict reuse copy must succeed, got: {:#}", e.source);
+    }
+    let md = std::fs::symlink_metadata(&dst)?;
+    assert_eq!(
+        md.uid(),
+        euid_before,
+        "preserve_none must leave the reused directory's owner uid unchanged"
+    );
+    assert_eq!(
+        md.gid(),
+        egid_before,
+        "preserve_none must leave the reused directory's owner gid unchanged"
+    );
+    Ok(())
+}
+
+/// rlink mirror: strict reuse of an owned `0o500` directory is made writable for the
+/// hard-link pass and restored to the source mode with the owner unchanged. rlink has
+/// its OWN finalize (`link_dir_contents`), a distinct restore site from copy's.
+#[tokio::test]
+async fn strict_reuse_rlink_owned_readonly_dir_becomes_writable() -> anyhow::Result<()> {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2)");
+        return Ok(());
+    }
+    let tmp = tempfile::tempdir()?;
+    let tmp = tokio::fs::canonicalize(tmp.path()).await?;
+    let src = tmp.join("src");
+    tokio::fs::create_dir(&src).await?;
+    tokio::fs::write(src.join("a.txt"), b"payload").await?;
+    tokio::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).await?;
+    let dst = tmp.join("dst");
+    tokio::fs::create_dir(&dst).await?;
+    tokio::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o500)).await?;
+    let link_settings = common::link::Settings {
+        copy_settings: overwrite_copy_settings(),
+        update_compare: Default::default(),
+        update_exclusive: false,
+        filter: None,
+        dry_run: None,
+        preserve: common::preserve::preserve_none(),
+    };
+    common::safedir::enable_strict_operand_resolution();
+    let result = common::link::link(
+        common::get_progress(),
+        &tmp,
+        &src,
+        &dst,
+        &None,
+        &link_settings,
+        false,
+    )
+    .await;
+    if let Err(e) = result {
+        panic!("strict reuse rlink must succeed, got: {:#}", e.source);
+    }
+    let linked = dst.join("a.txt");
+    assert!(
+        linked.exists(),
+        "child must be hard-linked into the locked-then-restored directory"
+    );
+    // the hard link shares the source inode (rlink, not copy)
+    assert_eq!(
+        std::fs::symlink_metadata(&linked)?.ino(),
+        std::fs::symlink_metadata(src.join("a.txt"))?.ino(),
+        "rlink must hard-link the source file"
+    );
+    let md = std::fs::symlink_metadata(&dst)?;
+    assert_eq!(
+        md.permissions().mode() & 0o777,
+        0o755,
+        "final mode must equal the source directory mode"
+    );
+    let (euid, egid) = effective_owner();
+    assert_eq!(md.uid(), euid, "owner uid must be unchanged");
+    assert_eq!(md.gid(), egid, "owner gid must be unchanged");
+    Ok(())
+}

@@ -1087,6 +1087,7 @@ async fn link_dir_entry(
             dst_path,
             true, // treat as "created" so empty-dir cleanup can suppress the dry-run count
             is_fresh,
+            None, // dry-run: no destination dir is opened or locked, so nothing to restore
             settings,
             base,
         )
@@ -1099,6 +1100,7 @@ async fn link_dir_entry(
         summary: base,
         is_fresh: child_is_fresh,
         we_created,
+        restore_owner,
     } = match copy::resolve_dst_dir(
         prog_track,
         dst_parent,
@@ -1140,6 +1142,7 @@ async fn link_dir_entry(
         dst_path,
         we_created,
         child_is_fresh,
+        restore_owner,
         settings,
         Summary {
             copy_summary: base,
@@ -1172,6 +1175,7 @@ async fn link_dir_contents(
     dst_path: &std::path::Path,
     we_created_this_dir: bool,
     is_fresh: bool,
+    restore_owner: Option<(u32, u32)>,
     settings: &Settings,
     base: Summary,
 ) -> Result<Summary, Error> {
@@ -1642,13 +1646,20 @@ async fn link_dir_contents(
     let metadata_result = match dst_dir {
         Some(dst_dir) => {
             let meta_dir = update_dir.unwrap_or(src_dir);
-            match meta_dir.meta().await {
-                Ok(preserve_meta) => {
-                    crate::safedir::set_dir_metadata_fd(&settings.preserve, &preserve_meta, dst_dir)
-                        .await
-                }
-                Err(e) => Err(e),
+            // for a reused directory locked down under strict mode, restore the original owner
+            // component-wise then apply source metadata (see set_reused_dir_metadata_fd — no
+            // transient window hands the directory to a hostile prior owner); None for fresh dirs.
+            async {
+                let preserve_meta = meta_dir.meta().await?;
+                crate::safedir::set_reused_dir_metadata_fd(
+                    &settings.preserve,
+                    &preserve_meta,
+                    restore_owner,
+                    dst_dir,
+                )
+                .await
             }
+            .await
         }
         None => Ok(()),
     };

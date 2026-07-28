@@ -158,6 +158,17 @@ enum MapEntry {
     Tombstone,
 }
 
+/// Marker error raised when the dir-fd budget semaphore is closed (by `close_fd_budget`). It is a
+/// SYNTHETIC wakeup used to unblock a Pass-1 walk parked on the budget during teardown, NOT a root
+/// cause — the caller detects it BY TYPE (`e.chain().any(|c| c.is::<FdBudgetClosed>())`) to prefer
+/// the dispatch task's real error (the transport/task failure that triggered the close) when
+/// reporting. A typed marker (rather than a matched-on string) keeps that detection robust against
+/// message rewording and context-wrapping. Its Display text is kept stable because it can still
+/// surface on abnormal teardown paths.
+#[derive(Debug, thiserror::Error)]
+#[error("source dir-fd budget semaphore closed")]
+struct FdBudgetClosed;
+
 impl SourceDirMap {
     /// Create a map bounded to at most `fd_budget` directory fds held in flight
     /// across the round-trip between Pass 1 and Pass 2.
@@ -182,7 +193,7 @@ impl SourceDirMap {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| anyhow::anyhow!("source dir-fd budget semaphore closed"))?;
+            .map_err(|_| anyhow::Error::new(FdBudgetClosed))?;
         self.entries.lock().unwrap().insert(
             src,
             MapEntry::Readable {
@@ -228,6 +239,27 @@ impl SourceDirMap {
     /// Pass-1 walk parked on the budget (see the struct-level docs).
     fn close_fd_budget(&self) {
         self.fd_budget.close();
+    }
+}
+
+/// RAII backstop that closes the dir-fd budget on drop.
+///
+/// The dispatch loop closes the budget explicitly (once, before draining its Pass-2 tasks) on every
+/// NORMAL exit. This guard covers the one path an explicit close cannot: a panic unwinding out of
+/// the dispatch loop would skip that call, leaving a Pass-1 walk parked on the budget forever — and
+/// because the caller awaits that walk INLINE (before it ever awaits the dispatch task), it would
+/// never reach the point where it observes the panicked task, deadlocking the whole source. Holding
+/// this guard from the top of the dispatch function means the unwind runs it and releases the walk,
+/// which then returns the synthetic `FdBudgetClosed` and lets the source tear down instead of
+/// hanging. `close_fd_budget` is idempotent, so on the normal path (explicit close already done)
+/// this drop is a no-op.
+struct FdBudgetCloser(Option<Arc<SourceDirMap>>);
+
+impl Drop for FdBudgetCloser {
+    fn drop(&mut self) {
+        if let Some(map) = &self.0 {
+            map.close_fd_budget();
+        }
     }
 }
 
@@ -1589,9 +1621,10 @@ impl Pass2Source {
 ///   `file_count: 0`) — both are legitimately committed entries, so both are
 ///   consumed normally. On a MISS — the entry is gone (never inserted, or already
 ///   consumed by a prior `DirectoryCreated` for the same `src`) — FAIL CLOSED: this
-///   is a TOCTOU-safety / protocol-invariant violation, so close the fd-budget (so
-///   a Pass-1 walk parked on it unblocks and the whole copy tears down cleanly) and
-///   return an error. NEVER fall back to a path-based read.
+///   is a TOCTOU-safety / protocol-invariant violation, so return an error (the
+///   dispatch loop then breaks and releases the fd-budget ONCE post-loop, unblocking
+///   any parked Pass-1 walk and tearing the copy down cleanly). NEVER fall back to a
+///   path-based read.
 /// - `SourceRead::DereferencePath`: the `-L` walk holds no fd. Recover the Pass-1
 ///   count from the `path → file_count` map. A missing entry is treated as count 0
 ///   with a debug log — `-L` is intentionally NOT hardened, so a miss is not a
@@ -1612,7 +1645,6 @@ fn resolve_pass2_source(
                      (TOCTOU-safety violation: refusing to re-resolve by path)"
                 );
                 tracing::error!("{:#}", &err);
-                map.close_fd_budget();
                 Err(err)
             }
         },
@@ -2082,11 +2114,18 @@ async fn dispatch_control_messages_tcp(
     max_pending_files: usize,
     error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
     pool_shutdown: PoolShutdownToken,
+    // shared slot into which this task publishes its fatal loop error (if any) BEFORE releasing the
+    // fd-budget, so the caller can report the real cause even when the budget wakeup would mask it.
+    fatal_error: std::sync::Arc<std::sync::Mutex<Option<anyhow::Error>>>,
     // explicit source read mode. In hardened mode each directory's `DirectoryCreated`
     // consumes the held fd-map entry (the owned `Dir` + permit) for Pass 2 and a miss
     // fails closed; under `-L` there is no fd-map and Pass 2 re-enumerates by path.
     source_read: SourceRead,
 ) -> anyhow::Result<()> {
+    // panic-safety backstop: if the dispatch loop below unwinds, close the fd-budget on drop so a
+    // Pass-1 walk parked on it is released (every NORMAL exit still closes it explicitly, before the
+    // task drain). Held from here so it covers the whole body.
+    let _fd_budget_closer = FdBudgetCloser(source_read.dir_map().cloned());
     // create semaphore to limit pending file tasks for backpressure
     let pending_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_pending_files));
     tracing::info!(
@@ -2159,6 +2198,8 @@ async fn dispatch_control_messages_tcp(
             recv_result = msg_rx.recv() => {
                 let message = match recv_result {
                     Some(RecvResult::Message(m)) => m,
+                    // control stream closed (destination done) or errored/aborted; break the loop.
+                    // The fd-budget is released ONCE after the loop, covering every exit arm.
                     Some(RecvResult::StreamClosed) | None => break Ok(()), // stream closed
                     Some(RecvResult::Error(e)) => break Err(e),
                 };
@@ -2199,8 +2240,8 @@ async fn dispatch_control_messages_tcp(
                         // source-side (map entry or `-L` count map) — no wire echo.
                         let pass2_source = match resolve_pass2_source(&source_read, src) {
                             Ok(source) => source,
-                            // fail closed: the fd-budget was already closed inside the helper
-                            // to unblock any parked Pass-1 walk; abort the dispatch loop.
+                            // fail closed: break the loop; the post-loop teardown publishes this
+                            // error and releases the fd-budget, unblocking any parked Pass-1 walk.
                             Err(e) => break Err(e),
                         };
                         let collector = error_collector.clone();
@@ -2265,9 +2306,29 @@ async fn dispatch_control_messages_tcp(
             }
         }
     };
+    // Publish a fatal loop error to the shared slot BEFORE releasing the fd-budget below. Closing
+    // the budget wakes the Pass-1 walk (awaited inline in the caller, parked on
+    // `SourceDirMap::insert`'s `acquire_owned()`), which then returns the synthetic
+    // `FdBudgetClosed`; the caller reads THIS slot to report the real cause instead — and
+    // reads it WITHOUT awaiting this task, which still has to drain its Pass-2 tasks below (a slow
+    // drain must not re-mask the cause). Publishing before the close guarantees the slot is
+    // populated by the time the walk wakes.
+    let had_fatal_error = result.is_err();
+    if let Err(e) = result {
+        *fatal_error.lock().unwrap() = Some(e);
+    }
+    // Release the hardened dir-fd budget on EVERY dispatch-loop exit — a control-stream close, a
+    // transport-task error, or a panic in the biased task arm above — BEFORE draining tasks. The
+    // Pass-1 walk may be parked on `acquire_owned()`, and only a permit release or this close
+    // unblocks it; closing here, once post-loop rather than per-arm, is what stops a Pass-2 task
+    // error under `--fail-early` from deadlocking the walk. Idempotent, and a no-op on a clean close
+    // (the walk has already finished by then).
+    if let SourceRead::Hardened(map) = &source_read {
+        map.close_fd_budget();
+    }
     // if we're exiting with an error, abort the recv task immediately
     // (otherwise it would block waiting for more messages from destination)
-    if result.is_err() {
+    if had_fatal_error {
         recv_task.abort();
     }
     // CRITICAL: Signal pool shutdown BEFORE draining tasks to prevent deadlock.
@@ -2288,7 +2349,7 @@ async fn dispatch_control_messages_tcp(
     // - shutdown_initiated=true (DestinationDone received): all errors expected, log debug
     // - shutdown_initiated=false, result=Ok (unexpected close): pool errors expected, log debug
     // - result=Err: we already have an error, just log additional errors
-    let pool_shutdown_errors_expected = result.is_ok(); // pool was just cancelled
+    let pool_shutdown_errors_expected = !had_fatal_error; // pool was just cancelled
     while let Some(task_result) = join_set.join_next().await {
         match task_result {
             Ok(Ok(())) => {}
@@ -2321,10 +2382,18 @@ async fn dispatch_control_messages_tcp(
             tracing::debug!("Failed to close control stream: {e:#}");
         }
     }
-    // wait for recv task to finish (it will close the stream)
-    let _ = recv_task.await;
+    // wait for recv task to finish (it will close the stream). A normal end is expected; propagate a
+    // genuine panic (rather than silently swallowing the JoinError) so a bug in the receive path
+    // surfaces as a task failure instead of masquerading as a clean stream close.
+    if let Err(join_err) = recv_task.await
+        && join_err.is_panic()
+    {
+        std::panic::resume_unwind(join_err.into_panic());
+    }
     tracing::info!("Finished dispatching control messages");
-    result
+    // any fatal loop error is in the shared slot the caller reads; this task returns clean success
+    // (a panic surfaces as a JoinError on the caller's await).
+    Ok(())
 }
 
 /// Cancellation token alias for pool shutdown signaling.
@@ -2356,6 +2425,7 @@ impl AcceptingSendStreamPool {
         data_listener: tokio::net::TcpListener,
         pool_size: usize,
         profile: remote::NetworkProfile,
+        conn_timeout_sec: u64,
         tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
     ) -> (Self, PoolShutdownToken, tokio::task::JoinHandle<()>) {
         let (send_tx, recv) = async_channel::bounded(pool_size);
@@ -2363,6 +2433,10 @@ impl AcceptingSendStreamPool {
             async_channel::bounded::<remote::streams::BoxedSendStream>(pool_size);
         let shutdown_token = PoolShutdownToken::new();
         let shutdown_token_clone = shutdown_token.clone();
+        // bound each data-connection TLS accept: this handshake runs INLINE in the accept loop below,
+        // so a destination that connects TCP then stalls the handshake would otherwise block ALL
+        // further data connections (a hang, not just a lost connection).
+        let accept_tls_timeout = std::time::Duration::from_secs(conn_timeout_sec);
         // spawn task to accept data connections and manage pool
         let accept_task = tokio::spawn(async move {
             // wrap the main loop so we can handle shutdown
@@ -2377,25 +2451,22 @@ impl AcceptingSendStreamPool {
                                         tracing::debug!("Accepted data connection from {}", addr);
                                         stream.set_nodelay(true).ok();
                                         remote::configure_tcp_buffers(&stream, profile);
-                                        // wrap with TLS if configured
-                                        let send_stream = if let Some(ref acceptor) = tls_acceptor {
-                                            match acceptor.accept(stream).await {
-                                                Ok(tls_stream) => {
-                                                    let (_read_half, write_half) = tokio::io::split(tls_stream);
-                                                    remote::streams::SendStream::new(
-                                                        Box::new(write_half) as remote::streams::BoxedWrite
-                                                    )
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!("TLS handshake failed for data connection: {}", e);
-                                                    continue;
-                                                }
+                                        // Wrap with TLS if configured. This handshake runs INLINE in
+                                        // the accept loop, so its bound is what stops one stalled
+                                        // peer from blocking every further data connection. Only the
+                                        // write half is kept (the destination never sends here), and
+                                        // a failure drops just this connection.
+                                        let send_stream = match remote::tls::accept_bounded(
+                                            tls_acceptor.as_deref(),
+                                            stream,
+                                            accept_tls_timeout,
+                                            "data",
+                                        ).await {
+                                            Ok((send_stream, _recv_stream)) => send_stream,
+                                            Err(e) => {
+                                                tracing::warn!("Dropping data connection: {:#}", &e);
+                                                continue;
                                             }
-                                        } else {
-                                            let (_read_half, write_half) = stream.into_split();
-                                            remote::streams::SendStream::new(
-                                                Box::new(write_half) as remote::streams::BoxedWrite
-                                            )
                                         };
                                         if send_tx.send(send_stream).await.is_err() {
                                             tracing::debug!("Pool closed, stopping accept loop");
@@ -2494,38 +2565,34 @@ async fn handle_connection(
     pool_size: usize,
     max_pending_files: usize,
     network_profile: remote::NetworkProfile,
+    conn_timeout_sec: u64,
     error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
     tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Destination control connection established");
     // configure TCP buffers for high throughput
     remote::configure_tcp_buffers(&control_stream, network_profile);
-    // wrap control connection with TLS if configured
-    let (control_send_stream, control_recv_stream) = if let Some(ref acceptor) = tls_acceptor {
-        let tls_stream = acceptor
-            .accept(control_stream)
-            .await
-            .context("TLS handshake failed for control connection")?;
-        let (read_half, write_half) = tokio::io::split(tls_stream);
-        let recv_stream =
-            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead);
-        let send_stream =
-            remote::streams::SendStream::new(Box::new(write_half) as remote::streams::BoxedWrite);
-        (send_stream, recv_stream)
-    } else {
-        let (read_half, write_half) = control_stream.into_split();
-        let recv_stream =
-            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead);
-        let send_stream =
-            remote::streams::SendStream::new(Box::new(write_half) as remote::streams::BoxedWrite);
-        (send_stream, recv_stream)
-    };
+    // wrap control connection with TLS if configured; the handshake is bounded because a peer that
+    // establishes TCP then stalls it would otherwise hang the source here indefinitely, before any
+    // teardown state exists
+    let (control_send_stream, control_recv_stream) = remote::tls::accept_bounded(
+        tls_acceptor.as_deref(),
+        control_stream,
+        std::time::Duration::from_secs(conn_timeout_sec),
+        "control",
+    )
+    .await?;
     // wrap in Arc<Mutex<>> for shared access
     let control_send_stream = std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
     tracing::info!("Created control streams for directory transfer");
     // create a pool that accepts data connections from destination and provides SendStreams
-    let (stream_pool, pool_shutdown, accept_task) =
-        AcceptingSendStreamPool::new(data_listener, pool_size, network_profile, tls_acceptor);
+    let (stream_pool, pool_shutdown, accept_task) = AcceptingSendStreamPool::new(
+        data_listener,
+        pool_size,
+        network_profile,
+        conn_timeout_sec,
+        tls_acceptor,
+    );
     let stream_pool = std::sync::Arc::new(stream_pool);
     tracing::info!(
         "Created accepting send stream pool with {} slots",
@@ -2549,6 +2616,12 @@ async fn handle_connection(
     // pass a clone of the shutdown token to dispatch - it will signal shutdown before
     // draining its tasks to prevent deadlock when destination closes unexpectedly.
     // see dispatch_control_messages_tcp doc comment for detailed shutdown flow.
+    // Shared slot for the dispatch task's fatal loop error. It publishes here BEFORE it releases the
+    // fd-budget that wakes the (parked) Pass-1 walk, so on a `--fail-early` budget-saturation failure
+    // we report the REAL cause instead of the synthetic budget wakeup — without awaiting the dispatch
+    // task's (possibly slow) Pass-2 drain.
+    let dispatch_fatal_error: std::sync::Arc<std::sync::Mutex<Option<anyhow::Error>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     let dispatch_task = tokio::spawn(dispatch_control_messages_tcp(
         settings.clone(),
         src.to_path_buf(),
@@ -2558,6 +2631,7 @@ async fn handle_connection(
         max_pending_files,
         error_collector.clone(),
         pool_shutdown.clone(),
+        dispatch_fatal_error.clone(),
         source_read.clone(),
     ));
     // send files to destination. returns Err only for fatal errors (e.g., root file failure).
@@ -2581,11 +2655,42 @@ async fn handle_connection(
         // signal pool to shutdown (closes all streams so destination sees EOF)
         // note: cancel() is idempotent, safe to call even if dispatch already called it
         pool_shutdown.cancel();
-        // abort dispatch task since we're not going to get a clean shutdown
+        // If the walk failed ONLY because `close_fd_budget()` woke it with the synthetic
+        // `FdBudgetClosed`, the dispatch loop published the REAL root cause (the transport/task
+        // failure that triggered the close) to `dispatch_fatal_error` BEFORE closing the budget — so
+        // it is already present here. Report it instead of the meaningless wakeup, reading the slot
+        // WITHOUT awaiting the dispatch task (its Pass-2 drain can be slow, and a timed-out await
+        // would re-mask the cause). Then abort the now-doomed dispatch task — dropping its join set
+        // aborts the in-flight Pass-2 tasks. For any OTHER walk failure, that IS the real cause, so
+        // abort and report it as before.
+        let is_budget_wakeup = send_result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.chain().any(|c| c.is::<FdBudgetClosed>()));
+        // take the real cause out of the slot up front (dropping the guard before any await); None
+        // for a non-budget-wakeup failure or if nothing was published.
+        let published_cause = if is_budget_wakeup {
+            dispatch_fatal_error.lock().unwrap().take()
+        } else {
+            None
+        };
+        // abort the now-doomed dispatch task (dropping its join set aborts in-flight Pass-2 tasks)
+        // and let the accept task finish closing streams.
         dispatch_task.abort();
-        // wait for accept task to finish closing all streams
         let _ = accept_task.await;
-        return send_result;
+        return match published_cause {
+            // the budget wakeup masked the real cause; report the published cause.
+            Some(dispatch_err) => Err(dispatch_err),
+            // budget wakeup but NOTHING was published: the dispatch loop exited abnormally (a
+            // destination-side control-stream close before the copy finished, or a panic whose cause
+            // was discarded). Report a meaningful teardown cause rather than leaking the internal
+            // `FdBudgetClosed` marker to the user.
+            None if is_budget_wakeup => Err(anyhow::anyhow!(
+                "destination closed the control connection before the source finished sending"
+            )),
+            // a genuine walk failure that was NOT a budget wakeup: `send_result` is the real cause.
+            None => send_result,
+        };
     }
     // send succeeded - wait for dispatch task to complete (handles destination responses).
     // note: dispatch_control_messages_tcp always calls pool_shutdown.cancel() before
@@ -2593,8 +2698,13 @@ async fn handle_connection(
     let dispatch_result = dispatch_task.await;
     // wait for accept task to finish (pool shutdown was signaled by dispatch)
     let _ = accept_task.await;
-    // propagate dispatch errors after cleanup
+    // propagate a dispatch-task panic (JoinError); its inner result is always clean success now —
+    // any fatal loop error was published to the shared slot, which we surface next.
     dispatch_result??;
+    let published_cause = dispatch_fatal_error.lock().unwrap().take();
+    if let Some(dispatch_err) = published_cause {
+        return Err(dispatch_err);
+    }
     tracing::info!("Data sent successfully");
     Ok(())
 }
@@ -3270,26 +3380,18 @@ async fn handle_dry_run_connection(
     dst: &std::path::Path,
     dry_run_mode: common::config::DryRunMode,
     tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
+    conn_timeout_sec: u64,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
     tracing::info!("Handling dry-run connection");
-    // set up TLS if needed
-    let (control_send_stream, mut control_recv_stream): (
-        remote::streams::BoxedSendStream,
-        remote::streams::BoxedRecvStream,
-    ) = if let Some(acceptor) = tls_acceptor {
-        let tls_stream = acceptor.accept(stream).await.context("TLS accept failed")?;
-        let (read_half, write_half) = tokio::io::split(tls_stream);
-        (
-            remote::streams::SendStream::new(Box::new(write_half) as remote::streams::BoxedWrite),
-            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead),
-        )
-    } else {
-        let (read_half, write_half) = stream.into_split();
-        (
-            remote::streams::SendStream::new(Box::new(write_half) as remote::streams::BoxedWrite),
-            remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead),
-        )
-    };
+    // set up TLS if needed; the handshake is bounded like every other (a peer that establishes TCP
+    // then stalls would otherwise hang this connection indefinitely)
+    let (control_send_stream, mut control_recv_stream) = remote::tls::accept_bounded(
+        tls_acceptor.as_deref(),
+        stream,
+        std::time::Duration::from_secs(conn_timeout_sec),
+        "dry-run control",
+    )
+    .await?;
     let control_send_stream: remote::streams::BoxedSharedSendStream =
         std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
     // traverse and log dry-run entries (output goes via tracing). The default path uses the
@@ -3446,6 +3548,7 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
                     dst,
                     dry_run_mode,
                     tls_acceptor,
+                    tcp_config.conn_timeout_sec,
                 )
                 .await;
             }
@@ -3459,6 +3562,7 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
                 pool_size,
                 max_pending_files,
                 tcp_config.network_profile,
+                tcp_config.conn_timeout_sec,
                 error_collector.clone(),
                 tls_acceptor,
             )

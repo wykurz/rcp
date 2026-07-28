@@ -222,6 +222,107 @@ with write access to a prefix directory can rename real directories into place, 
 content they could already write — plus the bind-mount and `protected_hardlinks` preconditions
 below.
 
+**Reused destination directories are locked down under `--require-toctou-safe`.** A privileged copy
+into an existing tree *reuses* a destination directory that is already present rather than
+recreating it. Fresh directories are created copier-owned at `0o700` and only widened to the source
+mode at the very end, but a reused directory would otherwise be copied into as-is — a pre-existing
+`0o777` directory would expose the directory and every freshly written child for the whole subtree
+copy, and stay exposed if the copy is interrupted. Under strict mode each reused directory is
+therefore taken over by the copier before any child is written: the opened directory fd is
+inode-rechecked against the entry classified a moment earlier (a `rename` that swapped in a
+*different* directory fails closed), then it is `fchown`ed to the copier and `fchmod`ed to `0o700` —
+chown first, so the prior owner cannot `chmod` it back open mid-copy. The takeover is then verified
+by re-stat and fails closed if it did not actually land (a filesystem that reports a successful
+`chown`/`chmod` without honoring it, e.g. CIFS without unix extensions). A reused directory that had
+the setgid bit keeps it through the lockdown — children created during the copy inherit the
+directory's group, and finalize cannot repair the group of a child already created — so the group is
+also pinned to the value captured at classification: taking uid ownership freezes the group (only
+the copier or root can change it now), and if a prior owner raced a `chgrp` into the takeover window
+the copier resets it, so a setgid directory cannot funnel freshly written children into an
+attacker-chosen group. At finalize — after all children and any `--delete` prune — the directory's
+original owner is restored and the source metadata re-applied (the final owner is the source owner
+for each `--preserve`d component and the original owner otherwise, and the mode is the same masked
+metadata the unhardened copy would apply — the source directory's, or the update tree's for
+`rlink --update`), so a successful copy leaves the directory byte-identical to a copy without this
+hardening — with one strict-mode refinement: under `--require-toctou-safe`, finalize additionally
+re-stats each reused directory and fails closed if the restored owner or mode did not take effect
+(catching a backend that does not honor `chown`/`chmod`); a setgid bit that the kernel drops because
+the copier is not in the directory's group and is not privileged is reported as a WARNING (narrower
+than the source, and not a failure — matching the best-effort behavior of a non-strict copy). Two
+side effects are accepted, not hidden. First, a reused directory whose processing is *aborted after
+lockdown* — by a `--fail-early` abort, or by any per-directory error that returns before finalize
+(e.g. an enumeration failure) even *without* `--fail-early` — is left no wider than a successful
+copy's result: the local path leaves it *secured* (copier-owned at `0o700`), while the remote path
+may instead have already restored it to its transparent final state (source mode with the
+original/source owner). The lockdown restricts the mode to `0o700` immediately after taking
+ownership, and the takeover is VERIFIED (uid + exactly `0o700`) before any further step, so on a
+filesystem that honors these syscalls any later failure leaves the directory secured. Three
+exceptions still fail closed (no child written) but leave the directory no narrower than requested —
+possibly its ORIGINAL, pre-lockdown mode, which may be wider than the `0o700` a mid-copy directory
+holds (though never wider than the directory already was before rcp ran): (1) the restricting
+`chmod` fails but the ownership rollback SUCCEEDS — the directory is returned to its original owner
+and mode (the failed `chmod` changed nothing); (2) BOTH the `chmod` and the rollback fail (a
+read-only or failing backend), reported with both errnos, leaving it copier-owned at its original
+mode; and (3) a backend reports `chmod`/`chown` success without taking effect (e.g. CIFS without
+unix extensions), so the verification fails. rcp cannot force a non-honoring backend narrower and
+does not retain the directory's original mode to re-restrict — and it does not chown a secured
+directory back to the prior owner (that would re-widen) — so it reports the true observed owner/mode
+and leaves repair to the operator. Restoration is likewise deliberately *not* forced onto the normal
+abort paths: doing so would re-widen the directory (chown it back to the prior owner and re-apply
+the source mode) while its children may be incomplete — the opposite of failing closed. On a
+honoring backend the secured `0o700` is the outcome and no abort yields a wider directory than the
+mid-copy state; the exceptions above only ever return the directory toward the state it already had.
+Second, an actor holding a directory fd opened *before* the lockdown can still read the *names* of
+children written afterward (each child's contents stay protected by its own source-derived mode).
+This is destination-only and strict-mode-only; the default path leaves reused directories exactly
+as-is (their permissions may then block writing, which is the pre-existing behavior).
+
+**Limitation — case-folding/normalizing destinations.** The lockdown coordinates each reused
+directory's lifecycle per resolved destination path, and strict *multi-source* copies are
+serialized, but sibling directories *within* one tree are still copied concurrently. If the
+destination filesystem folds or normalizes distinct source names onto one inode (e.g. `Foo/` and
+`foo/` on a case-insensitive mount), two concurrent tasks can lock down and restore the *same*
+destination inode, so one task's restore — widening the mode, or chowning back to the original owner
+— can fire while the other is still writing children, transiently reverting that shared directory to
+its un-hardened exposure for the overlap. This is narrow (it needs a folding destination *and*
+source siblings that alias on it), and the underlying concurrent merge of two source directories
+into one destination inode is pre-existing and independent of this hardening. Closing it fully
+requires coordinating every directory lifecycle — fresh *and* reused — by `(dev, ino)` across the
+local, `rlink`, and remote engines (fail closed on an in-flight alias); it is tracked as a
+follow-up.
+
+**Limitation — concurrent privileged invocations require a single writer.** The lockdown coordinates
+each reused directory's lifecycle only WITHIN a single process (strict multi-source copies in one
+invocation are serialized). It does NOT coordinate across SEPARATE processes: two concurrent
+`rcp`/`rlink` invocations that reuse the SAME destination directory each independently lock it down
+(chown to the copier, `chmod 0o700`) and later restore it, with no cross-process lock. One
+invocation's restore — chowning back to the original owner and re-applying the source mode at
+finalize — can therefore fire while the other is still writing children, transiently reverting the
+shared directory to its un-hardened exposure. Note what an overlap does *not* cost: both guarantees
+still hold for each invocation — children are created `O_CREAT|O_EXCL|O_NOFOLLOW` through the
+invocation's own held fd and mode and bytes come from the same source fd, so neither Containment nor
+Fidelity is affected. What is exposed is the shared directory's *interim* mode for the overlap
+(which, being the copy's final source mode, can be wider than the `0o700` a mid-copy directory would
+otherwise hold).
+
+rcp does not take a cross-process inode lock, and the reason is not deadlock avoidance. A *blocking*
+`flock` held from lockdown through finalize could deadlock if two walks took directories in
+different orders, but a *non-blocking* one (fail closed on contention) cannot. The decisive problem
+is that `flock` is **advisory and carries no holder identity**: in exactly the situation the
+lockdown exists for — a reused destination directory an unprivileged actor can open — that actor can
+take `LOCK_EX` and hold it indefinitely, turning every `--require-toctou-safe` copy into a hard
+failure, and rcp cannot tell that holder from a peer copy. That trades a narrow, precondition-gated
+exposure for a cheap, persistent, attacker-triggerable denial of service. Secondarily, `flock` is
+unreliable on the shared destinations where this would matter (NFS emulates it via POSIX locks; some
+FUSE backends make it node-local), and it coordinates only rcp against rcp — never against the
+adversary — so the precondition would still have to be documented.
+
+The precondition is therefore **single-writer** — do not run concurrent privileged copies into the
+same destination subtree (the general expectation that a destination tree has one writer at a time).
+Running a single invocation with multiple sources is safe (it is serialized in-process). Overlaps
+are often, but not reliably, caught: finalize re-stats each reused directory and fails closed if the
+restored owner or mode did not take effect, which surfaces many interleavings as a loud error.
+
 The guarantees are *additionally* bounded by separately-documented exceptions: `--dereference`/`-L`
 and non-Linux builds (see [What Is Not Hardened](#what-is-not-hardened)), `rcmp` (read-only; out of
 scope), and the kernel preconditions `fs.protected_hardlinks=1` and no attacker-controlled bind
@@ -384,7 +485,10 @@ fails closed instead of being followed. See
 
 ## What Is Not Hardened
 
-The following are **not TOCTOU-hardened** and are reported as "not safe" by `--toctou-check`:
+The following are **not TOCTOU-hardened**. The flag- and platform-level items (`-L`, non-Linux) are
+reported as "not safe" by `--toctou-check`; the runtime filesystem-property items (POSIX ACLs) are
+NOT — `--toctou-check` inspects operand form and flags, not the runtime state of the destination
+filesystem, so it cannot detect them:
 
 - **`--dereference` / `-L`**: Following symlinks is the requested behavior. A swapped link is
   followed by design. Do not use `-L` in privileged sudo rules over attacker-writable trees.
@@ -394,10 +498,27 @@ The following are **not TOCTOU-hardened** and are reported as "not safe" by `--t
 - **`rcmp`** (read-only compare): `rcmp` cannot mis-permission or destroy files. A concurrent swap
   could cause a wrong comparison result (treating an unintended file as equal or unequal), but no
   data is written. This is accepted and `rcmp` is out of scope.
+- **POSIX ACLs**: rcp does not process POSIX ACLs anywhere. The reused-destination-directory
+  lockdown restricts the directory **mode** only — it does not snapshot, strip, or restore a
+  directory's access ACL or default ACL, under `--require-toctou-safe` or otherwise. The interim
+  `fchmod(0o700)` does nonetheless contain a directory's *access* ACL: on Linux `chmod` rewrites the
+  `ACL_MASK` entry from the new group bits, so `0o700` sets the mask to `---` and every named
+  `user:`/`group:` entry — and the owning group — is rendered ineffective for the duration of the
+  copy. The entries survive; they grant nothing. A permissive **default ACL** is NOT contained:
+  `chmod` does not touch it, so children created during the copy inherit it and are granted access
+  beyond their `mode`. The finalize `chmod` likewise re-derives the mask from the restored mode's
+  group bits rather than from the directory's original mask — the same rewrite an unhardened copy's
+  directory-metadata step performs, so the end state is unchanged by this hardening. Where a reused
+  destination tree may carry security-relevant default ACLs, do not rely on the lockdown. Because an
+  ACL is a property of the destination filesystem at runtime (not of the operand path or flags),
+  `--toctou-check` does not — and cannot — detect or report this. Handling ACLs (including across
+  the remote transport) is deferred.
 
 ## Residual Preconditions
 
-The fd-based mechanism is sound under two Linux kernel conditions that are enabled by default:
+The mechanism is sound given the following, none of which the tools can enforce themselves. The
+first two are Linux kernel conditions that hold by default; the third is a privilege assumption; the
+fourth is an operational one the caller owes:
 
 - **`fs.protected_hardlinks=1`** (Linux default): With this setting disabled, an actor who can
   hardlink a sensitive file into the traversed tree defeats any userspace hardening — the privileged
@@ -409,6 +530,12 @@ The fd-based mechanism is sound under two Linux kernel conditions that are enabl
   Linux distributions.
 - **Actor cannot create bind mounts or manipulate mount namespaces**: Requires privilege; an
   unprivileged actor cannot exploit this.
+- **A destination subtree has a single writer**: The reused-directory lockdown under
+  `--require-toctou-safe` coordinates each directory's lifecycle only *within* one process. Do not
+  run concurrent privileged copies into the same destination subtree — see
+  [Limitation — concurrent privileged invocations](#out-of-scope--what-we-deliberately-do-not-promise)
+  for what overlaps, and why rcp does not take a cross-process lock. A single invocation with
+  multiple sources is safe (strict multi-source copies are serialized in-process).
 
 ## The Linter: --toctou-check and --require-toctou-safe
 
@@ -516,6 +643,11 @@ operation is fixed:
 user ALL=(root) NOPASSWD: /usr/bin/rcp --require-toctou-safe /vetted/source/snapshot /vetted/dest/
 user ALL=(root) NOPASSWD: /usr/bin/rrm --require-toctou-safe /specific/staging/tree
 ```
+
+Note what a rule like this does *not* constrain: how many times the caller runs it, or when. Nothing
+above stops two of these invocations overlapping, and the reused-directory lockdown assumes a
+[single writer per destination subtree](#residual-preconditions). Where a policy grants a mutating
+rule over a shared destination, the wrapper — not rcp — must serialize it.
 
 A rule ending in `*` can pin the literal flag position, but it enforces only the tool's half of the
 contract — hardened walk, no `-L` — while delegating every trailing option and operand accepted by
@@ -640,8 +772,12 @@ caller-provided option string.
 | `fs.protected_hardlinks=0`                   | **Not defended** (userspace cannot close this gap)                                                                                                                                                                                                                                            |
 
 TOCTTOU vulnerabilities in rcp are **real but require local access** and specific privilege
-configurations to exploit. On Linux, the default (non-`-L`) paths of all write-capable tools are now
-fully hardened. Use `--require-toctou-safe` in sudo rules to enforce safe invocations automatically.
+configurations to exploit. On Linux, the default (non-`-L`) paths of all write-capable tools are
+hardened for the two guarantees stated in [Scope of TOCTOU safety](#scope-of-toctou-safety) —
+containment and permission/ownership fidelity — subject to the
+[Residual Preconditions](#residual-preconditions) and the limitations above; they are not a claim of
+TOCTOU safety in every sense. Use `--require-toctou-safe` in sudo rules to enforce safe invocations
+automatically.
 
 ## Further Reading
 

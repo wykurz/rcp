@@ -88,6 +88,7 @@
           # the unprivileged sandbox build user isn't permitted to do (EPERM)
           "--skip=safedir::tests::set_dir_metadata_fd_applies"
           "--skip=safedir::tests::set_file_metadata_fd_ordering_preserves_setuid"
+          "--skip=safedir::tests::secure_as_copier_takes_ownership_restricts_mode_and_preserves_gid"
           "--skip=applies_per_type_modes_recursively"
           "--skip=group_change_preserves_setgid_across_chgrp"
           "--skip=preserves_setgid_through_mode_change"

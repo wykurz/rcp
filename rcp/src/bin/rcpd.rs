@@ -516,6 +516,11 @@ async fn async_main(
     tracing::info!("Listening for master connections on {}", listen_addr);
     let conn_timeout = std::time::Duration::from_secs(args.remote_copy_conn_timeout_sec);
     // helper to accept a connection and optionally wrap with TLS
+    //
+    // BOTH the TCP accept and the TLS handshake are bounded. These accepts are sequential and the
+    // handshake runs inline, so a peer that completes TCP and then sends no TLS bytes would
+    // otherwise block the legitimate master from ever connecting, leaving an orphaned rcpd holding
+    // the port. The handshake bound lives in `remote::tls::accept_bounded`.
     async fn accept_connection(
         listener: &tokio::net::TcpListener,
         tls_acceptor: Option<&tokio_rustls::TlsAcceptor>,
@@ -531,32 +536,12 @@ async fn async_main(
             .with_context(|| format!("failed to accept {} connection", purpose))?;
         tracing::info!("Accepted {} connection from {}", purpose, addr);
         stream.set_nodelay(true)?;
-        if let Some(acceptor) = tls_acceptor {
-            let tls_stream = acceptor
-                .accept(stream)
-                .await
-                .with_context(|| format!("TLS handshake failed for {} connection", purpose))?;
-            let (read_half, write_half) = tokio::io::split(tls_stream);
-            let recv_stream =
-                remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead);
-            let send_stream = remote::streams::SendStream::new(
-                Box::new(write_half) as remote::streams::BoxedWrite
-            );
-            Ok((send_stream, recv_stream))
-        } else {
-            let (read_half, write_half) = stream.into_split();
-            let recv_stream =
-                remote::streams::RecvStream::new(Box::new(read_half) as remote::streams::BoxedRead);
-            let send_stream = remote::streams::SendStream::new(
-                Box::new(write_half) as remote::streams::BoxedWrite
-            );
-            Ok((send_stream, recv_stream))
-        }
+        remote::tls::accept_bounded(tls_acceptor, stream, timeout, purpose).await
     }
-    // accept control connection (TCP + TLS handshake immediately)
+    // accept control connection (TCP + TLS handshake, both bounded)
     let (master_send_stream, master_recv_stream) =
         accept_connection(&listener, tls_acceptor.as_ref(), conn_timeout, "control").await?;
-    // accept tracing connection (TCP + TLS handshake immediately)
+    // accept tracing connection (TCP + TLS handshake, both bounded)
     let (tracing_send_stream, _tracing_recv_stream) =
         accept_connection(&listener, tls_acceptor.as_ref(), conn_timeout, "tracing").await?;
     tracing::info!(
