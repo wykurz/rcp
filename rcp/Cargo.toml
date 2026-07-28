@@ -32,6 +32,10 @@ filetime = "0.2"
 predicates = "3"
 serde_json = "1"
 tempfile = "3"
+# `test-util` (for `#[tokio::test(start_paused = true)]`) is NOT implied by `full`. Without it this
+# package's tests only build when a workspace-wide run unifies the feature in from another crate's
+# dev-dependency — `cargo test -p rcp-tools-rcp` and `nix build .#rcp` would fail on their own.
+tokio = { version = "1.52", features = ["full", "parking_lot", "tracing", "test-util"] }
 
 [dependencies]
 anyhow = "1.0"

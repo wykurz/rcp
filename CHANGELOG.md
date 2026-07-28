@@ -7,6 +7,114 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- Under `--require-toctou-safe`, a privileged copy/link now locks down each *reused* destination
+  directory for the duration of the copy. Previously a fresh destination directory was created
+  copier-owned at `0o700` and only widened to the source mode at the end, but an existing directory
+  that the copy reused was left exactly as-is — a pre-existing `0o777` directory exposed the
+  directory and every freshly written child for the whole subtree copy, and stayed exposed if the
+  copy was interrupted. Strict mode now takes over each reused directory before any child is
+  written: it inode-rechecks the opened directory fd against the just-classified entry (a `rename`
+  that swapped in a different directory fails closed), then `fchown`s it to the copier and `fchmod`s
+  it to `0o700` (chown first, so the prior owner cannot re-widen it mid-copy). The takeover is
+  verified by re-stat and fails closed if it did not land (a filesystem that does not honor
+  `chown`/`chmod`, e.g. CIFS without unix extensions). A reused directory that had the setgid bit
+  keeps it (children created during the copy inherit its group), and the group is pinned to the
+  value captured at classification — if a prior owner raced a `chgrp` into the takeover window, the
+  copier resets it so children cannot be redirected into an attacker-chosen group. At finalize the
+  original owner is restored and the source metadata re-applied, so a successful copy leaves the
+  directory byte-identical to before this change (final owner is the source owner for each
+  `--preserve`d component and the original owner otherwise, and the mode is the same masked metadata
+  the unhardened copy would apply — the source directory's mode, or under `rlink --update` the
+  update tree's), and finalize re-stats each reused directory and fails closed if the restored owner
+  or mode did not take effect (a dropped setgid bit the kernel strips for a non-root copier outside
+  the group is a warning, not a failure). Applies to local `rcp`/`rlink` and remote (`rcpd`) copies.
+  Two documented side effects. First, a reused directory whose processing is aborted after lockdown
+  — by a `--fail-early` abort, or by any per-directory error that returns before finalize (e.g. an
+  enumeration failure) even *without* `--fail-early` — is left no wider than a successful copy would
+  leave it (the local path leaves it secured — copier-owned at `0o700`; the remote path may instead
+  have already restored it to its transparent final state), except when the restricting `chmod`
+  itself fails: the directory is then returned toward the state it already had before rcp ran (its
+  original owner and mode if the ownership rollback succeeds, its original mode copier-owned if that
+  also fails) — never wider than it already was. Second, an actor holding a directory fd opened
+  before the lockdown can still observe the names of children written afterward (child contents stay
+  protected by their own source-derived mode). A non-owning, non-privileged copier that cannot chown
+  the reused directory fails closed for that directory. Limitations: the lockdown restricts the
+  directory MODE only — POSIX access/default ACLs are not snapshotted, stripped, or restored, so a
+  permissive **default** ACL is still inherited by freshly written children (the interim `0o700`
+  does neutralize a directory's own access ACL, because `chmod` rewrites the ACL mask from the group
+  bits; ACL handling is deferred); and on a backend that does not honor `chown`/`chmod` (e.g. CIFS
+  without unix extensions) the takeover or finalize fails closed but may leave the reused directory
+  copier-owned at its original, possibly permissive, mode. The default (non-strict) path is
+  unchanged: reused directories are left as-is.
+
+### Fixed
+
+- Fix a long-standing indefinite hang in remote (`rcpd`) copies under `--fail-early`. When a
+  directory failed to be created — out of space, or a `--require-toctou-safe` lockdown that could
+  not secure a reused directory — or a transfer task failed, the source's directory walk could stay
+  parked on its file-descriptor budget forever, because the budget was not released on the
+  destination's abort. The source now releases that budget whenever its control-message dispatch
+  loop exits for any reason (a control-stream close, a transport-task error, or a panic), so the
+  copy tears down cleanly instead of hanging. The failure is now also reported with its real cause
+  (for example a file's `Permission denied`) rather than the internal budget-release wakeup that
+  unblocks the parked walk.
+- Fix a silent data-loss bug in remote (`rcpd`) copies under `--fail-early`: a regular file that
+  could not be written at the destination (for example into a pre-existing directory with no write
+  permission) was logged and then dropped, and the destination reported success — the copy exited
+  `0` with the file missing. The destination now records the failure and reports it, so the copy
+  exits non-zero naming the real cause (e.g. `Permission denied`). When an operation error and a
+  connection-teardown error coincide, the destination now reports the operation error (the real
+  cause) rather than the teardown symptom. To surface any such abort the destination signals the
+  source by closing its control stream — on every data-path abort path (a fatal stream error, a
+  worker panic, or an early connection loss), so a source with no data left in flight (an
+  all-empty-file transfer, whose header-only sends never trip a broken pipe) or one parked on its
+  file-descriptor budget tears down promptly instead of the copy hanging indefinitely. The
+  destination also drives both of its internal futures to completion before choosing the error, so a
+  worker's real cause is never lost to a cancellation when the control side reports a teardown
+  symptom first.
+- Remote (`rcpd`) copies now treat a corrupt or malformed file-header frame — a decode failure (a
+  frame received intact that does not decode), an oversized length prefix, or another framing/TLS
+  protocol fault — as a fatal error instead of silently ending the data stream. An end-of-stream at
+  a header boundary is tolerated as normal ONLY when the transfer has already completed or teardown
+  has begun; otherwise it is a truncation and is fatal (see the incomplete-transfer entry below).
+  This applies to BOTH shapes an end-of-stream takes — a transport-level peer closure
+  (`UnexpectedEof` under TLS, a connection reset otherwise) and a CLEAN shutdown surfacing as a
+  graceful end-of-frames. The clean shape was previously accepted unconditionally, which left the
+  original hang reachable whenever the peer closed gracefully — the source does exactly that for a
+  stream whose send failed, and a graceful FIN is the ordinary shape on unencrypted transports.
+- Remote (`rcpd`) copies now fail closed on an incomplete transfer instead of exiting `0` with files
+  missing. If the destination's completion accounting is not satisfied at teardown and no error was
+  recorded — for example a data connection to the source failed transiently before all files were
+  received — the copy is now reported as an "incomplete transfer" failure, naming the actual cause
+  when one is available (e.g. "connection refused" / "TLS handshake timed out") rather than a
+  generic message. A data-stream that closes MID-transfer (a truncated header or a dropped link
+  before the transfer completed) is now treated as fatal and fails the copy promptly, instead of the
+  destination reconnecting and hanging while the source waited for a completion signal that could
+  never come.
+- Bound every remote-copy TLS handshake by the connection timeout. Previously only the TCP connect
+  was timed out; a peer that established TCP and then stalled the TLS handshake could hang a copy
+  indefinitely. Every handshake now runs through one bounded helper — the data connection (both
+  directions), the control connection (destination connect and source accept), each source-side
+  data-accept, the source's dry-run control accept, and both master↔`rcpd` accepts — each bounded by
+  `--remote-copy-conn-timeout-sec` and released on teardown. The `rcpd` accepts matter most: they
+  are sequential with the handshake inline, so a peer that connected and sent no TLS bytes would
+  block the legitimate master indefinitely and strand an `rcpd` holding its port. A CI check
+  (`scripts/check-tls-handshake-timeout.sh`) now rejects a handshake performed outside that helper,
+  since the timeout had previously been added at three call sites and missed at two.
+- Remote (`rcpd`) copies now count a file whose DATA transferred but whose metadata could not be
+  applied. The destination incremented its file/byte counters only after `chown`/`chmod` succeeded,
+  so copying a root-owned tree as an unprivileged user reported `files copied: 0` even though every
+  file's contents had landed on disk. The counters are now incremented once the data is written —
+  matching the local path — while the metadata error is still recorded and still fails the copy.
+- Remote (`rcpd`) copies now report the real cause when a data connector fails during teardown. The
+  destination's abort funnel closed the control stream (an awaited, lock-taking operation) before
+  stopping the data pool, so a connector failing in that window stashed a teardown artifact — e.g.
+  "connection refused" — that was then preferred over the actual error. The pool is now stopped
+  first (it is synchronous and lock-free, so it takes effect immediately), and a connect failure
+  observed after teardown began is discarded rather than recorded.
+
 ## [0.37.0] - 2026-07-15
 
 ### Security

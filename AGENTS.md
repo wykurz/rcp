@@ -119,6 +119,24 @@ bugs. Thread the already-computed value through when that is the simpler shape; 
 redundancy when *it* is. Apply low-risk simplifications as part of the change; describe larger
 restructurings in the PR rather than bundling them.
 
+### Prefer Structural Fixes Over Repeated Patching
+
+When code — especially delicate concurrency / teardown / error-handling code — accumulates repeated
+bug reports or review findings, stop patching symptom by symptom. Step back and ask whether a
+**structural** change would make the whole thing simpler to reason about and its invariants
+verifiable *by construction*. Reach for:
+
+- **RAII guards** so an invariant holds on **every** exit path — early return, `break`, `?`, panic —
+  instead of the same cleanup/signal being repeated (and eventually forgotten) at each call site. A
+  missed exit path is the single most common source of the recurring findings here.
+- **The type system** — type-state, newtypes, and enums that make illegal states unrepresentable —
+  so the compiler enforces the invariant rather than a comment asking a reader to.
+- **Consolidation** — move a scattered check or cleanup into one place a reader can verify once.
+
+For any change of non-trivial size or risk, consider **launching subagents to review different areas
+or aspects in parallel** (one per module or concern) before settling on an approach — an independent
+read catches missed exit paths, aliasing, and invariant gaps that a single pass misses.
+
 ## Testing
 
 Name tests after observed behavior (e.g., `copies_directory_tree`, `fails_on_permission_denied`).

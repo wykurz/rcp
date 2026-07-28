@@ -27,6 +27,8 @@ lint:
     ./scripts/check-walk-driver-usage.sh
     @echo "🔍 Checking source-read fidelity..."
     ./scripts/check-source-read-fidelity.sh
+    @echo "🔍 Checking TLS handshake timeouts..."
+    ./scripts/check-tls-handshake-timeout.sh
     @echo "✅ All lints passed!"
 
 # Format code and markdown docs

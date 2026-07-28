@@ -4,6 +4,7 @@
 //! - Master↔rcpd connections (rcpd is server; mutual fingerprint verification — master
 //!   verifies rcpd's server cert, rcpd verifies master's client cert)
 //! - Source↔Destination connections (source is server; mutual TLS with client certificates)
+use anyhow::Context;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -309,6 +310,108 @@ impl ClientCertVerifier for FingerprintClientCertVerifier {
     fn client_auth_mandatory(&self) -> bool {
         true
     }
+}
+
+// ============================================================================
+// Bounded handshakes
+// ============================================================================
+//
+// EVERY production TLS handshake goes through `accept_bounded` / `connect_bounded`. A bare
+// `TlsAcceptor::accept` / `TlsConnector::connect` outside this module is a bug and is rejected by
+// `scripts/check-tls-handshake-timeout.sh`.
+//
+// Why a shared helper rather than a timeout at each call site: the handshake runs AFTER the TCP
+// accept/connect has already been bounded, so a peer that completes TCP and then sends no TLS bytes
+// stalls the future forever — and on the rcpd listener, whose accepts are sequential and inline,
+// one such peer blocks the legitimate master from ever connecting. That timeout was added at three
+// call sites and forgotten at two, which is exactly the failure mode a single funnel removes. The
+// helpers also own the identical `split` → `Box` → `SendStream`/`RecvStream` wrapping (and the
+// non-TLS fallback) that every site otherwise repeats.
+
+/// Wrap an accepted TCP stream in TLS (when `acceptor` is set) and split it into framed streams,
+/// bounding the handshake by `timeout`.
+///
+/// `purpose` names the connection in error messages (e.g. "control", "data").
+pub async fn accept_bounded(
+    acceptor: Option<&tokio_rustls::TlsAcceptor>,
+    stream: tokio::net::TcpStream,
+    timeout: std::time::Duration,
+    purpose: &str,
+) -> anyhow::Result<(
+    crate::streams::BoxedSendStream,
+    crate::streams::BoxedRecvStream,
+)> {
+    let Some(acceptor) = acceptor else {
+        let (read_half, write_half) = stream.into_split();
+        return Ok(split_into_streams(
+            Box::new(write_half) as crate::streams::BoxedWrite,
+            Box::new(read_half) as crate::streams::BoxedRead,
+        ));
+    };
+    let tls_stream = tokio::time::timeout(timeout, acceptor.accept(stream))
+        .await
+        .with_context(|| format!("TLS handshake timed out for {purpose} connection"))?
+        .with_context(|| format!("TLS handshake failed for {purpose} connection"))?;
+    let (read_half, write_half) = tokio::io::split(tls_stream);
+    Ok(split_into_streams(
+        Box::new(write_half) as crate::streams::BoxedWrite,
+        Box::new(read_half) as crate::streams::BoxedRead,
+    ))
+}
+
+/// Wrap a connected TCP stream in TLS (when `connector` is set) and split it into framed streams,
+/// bounding the handshake by `timeout`.
+///
+/// `server_name` is only an SNI placeholder — peers are verified by certificate fingerprint, not
+/// hostname (see [`create_client_config_with_cert`]). It is a parameter rather than a constant
+/// because the two connection kinds send different values on the wire.
+pub async fn connect_bounded(
+    connector: Option<&tokio_rustls::TlsConnector>,
+    server_name: &'static str,
+    stream: tokio::net::TcpStream,
+    timeout: std::time::Duration,
+    purpose: &str,
+) -> anyhow::Result<(
+    crate::streams::BoxedSendStream,
+    crate::streams::BoxedRecvStream,
+)> {
+    let Some(connector) = connector else {
+        let (read_half, write_half) = stream.into_split();
+        return Ok(split_into_streams(
+            Box::new(write_half) as crate::streams::BoxedWrite,
+            Box::new(read_half) as crate::streams::BoxedRead,
+        ));
+    };
+    let server_name = ServerName::try_from(server_name)
+        .with_context(|| format!("invalid server name for {purpose} connection"))?;
+    let tls_stream = tokio::time::timeout(timeout, connector.connect(server_name, stream))
+        .await
+        .with_context(|| format!("TLS handshake timed out for {purpose} connection"))?
+        .with_context(|| format!("TLS handshake failed for {purpose} connection"))?;
+    let (read_half, write_half) = tokio::io::split(tls_stream);
+    Ok(split_into_streams(
+        Box::new(write_half) as crate::streams::BoxedWrite,
+        Box::new(read_half) as crate::streams::BoxedRead,
+    ))
+}
+
+/// SNI placeholder for destination→source connections. Authentication is by certificate
+/// fingerprint, so the name itself is never checked.
+pub const SERVER_NAME_SOURCE: &str = "rcp";
+/// SNI placeholder for master→rcpd connections.
+pub const SERVER_NAME_RCPD: &str = "rcpd";
+
+fn split_into_streams(
+    write_half: crate::streams::BoxedWrite,
+    read_half: crate::streams::BoxedRead,
+) -> (
+    crate::streams::BoxedSendStream,
+    crate::streams::BoxedRecvStream,
+) {
+    (
+        crate::streams::SendStream::new(write_half),
+        crate::streams::RecvStream::new(read_half),
+    )
 }
 
 #[cfg(test)]

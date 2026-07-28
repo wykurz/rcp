@@ -690,3 +690,74 @@ fn dot_source_without_trailing_slash_uses_dest_name_verbatim() {
         &dest.join("named").join("file.txt")
     ));
 }
+
+// ── Reused-destination-directory lockdown under --require-toctou-safe (sudo) ──
+//
+// rlink mirror of the copy primary-blocker guard. rlink has its OWN finalize
+// (`link_dir_contents`), a distinct restore site from copy's, so it is exercised
+// separately. Gated to the sudo CI job (name contains `sudo`, `#[ignore]`).
+
+fn passwordless_sudo_available() -> bool {
+    let ok = std::process::Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("Skipping test: passwordless sudo not available");
+    }
+    ok
+}
+
+/// Primary blocker guard (rlink): a privileged copier secures a foreign-owned reused
+/// directory then RESTORES the original owner at finalize. rlink defaults to
+/// `preserve_all`, so we force `--preserve-settings none` to make the restore the
+/// only owner change — the reused directory must end owned by the original
+/// unprivileged user, not the root copier.
+#[test]
+#[ignore = "requires passwordless sudo"]
+fn test_sudo_strict_reuse_restores_foreign_owned_dir_rlink() {
+    if !passwordless_sudo_available() {
+        return;
+    }
+    if !common::safedir::openat2_available() {
+        eprintln!("Skipping test: kernel lacks openat2(2)");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = std::fs::canonicalize(tmp.path()).unwrap();
+    let src = tmp.join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"payload").unwrap();
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let dst = tmp.join("dst");
+    std::fs::create_dir(&dst).unwrap();
+    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let orig_uid = std::fs::metadata(&dst).unwrap().uid();
+    let status = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            env!("CARGO_BIN_EXE_rlink"),
+            "--require-toctou-safe",
+            "--preserve-settings",
+            "none",
+            "--overwrite",
+        ])
+        .arg(&src)
+        .arg(&dst)
+        .status()
+        .expect("failed to run sudo rlink");
+    assert!(
+        status.success(),
+        "sudo rlink --require-toctou-safe must succeed"
+    );
+    assert!(
+        dst.join("a.txt").exists(),
+        "child must be hard-linked into the reused directory"
+    );
+    assert_eq!(
+        std::fs::metadata(&dst).unwrap().uid(),
+        orig_uid,
+        "reused dir owner uid must be restored to the original, not left as the root copier"
+    );
+}

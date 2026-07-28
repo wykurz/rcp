@@ -117,6 +117,8 @@ pub struct FileMeta {
     ctime_nsec: i64,
     mode: u32,
     size: u64,
+    dev: u64,
+    ino: u64,
 }
 
 impl FileMeta {
@@ -132,7 +134,21 @@ impl FileMeta {
             ctime_nsec: st.st_ctime_nsec,
             mode: st.st_mode,
             size: st.st_size as u64,
+            dev: st.st_dev,
+            ino: st.st_ino,
         }
+    }
+
+    /// The device number of the filesystem this entry lives on.
+    #[must_use]
+    pub fn dev(&self) -> u64 {
+        self.dev
+    }
+
+    /// The entry's inode number.
+    #[must_use]
+    pub fn ino(&self) -> u64 {
+        self.ino
     }
 }
 
@@ -578,6 +594,182 @@ impl Dir {
         } else {
             Err(std::io::Error::from_raw_os_error(libc::ESTALE))
         }
+    }
+
+    /// Confirm this directory's own held fd still refers to the same inode as
+    /// `handle` (same `dev` + `ino`), returning `ESTALE` on mismatch.
+    ///
+    /// Unlike [`Self::recheck`], which re-opens a child BY NAME and compares, this
+    /// stats THIS `Dir`'s already-pinned fd (via [`Self::meta`]) against a classify
+    /// [`Handle`] taken earlier for the same entry. It closes the
+    /// classify→`open_dir` window in the reused-destination-directory lockdown:
+    /// `open_dir` re-resolves the name, so a concurrent `rename` could swap in a
+    /// DIFFERENT directory between classification and the open; comparing the opened
+    /// fd's identity to the pinned classify handle catches that swap and fails
+    /// closed. `handle`'s `O_PATH` fd pins the classified inode's number alive for
+    /// the call, so a matching `(dev, ino)` genuinely proves identity (there is no
+    /// ino-reuse window — same argument as [`Self::recheck`]).
+    pub async fn verify_same_inode(&self, handle: &Handle) -> std::io::Result<()> {
+        let meta = self.meta().await?;
+        if meta.dev() == handle.dev() && meta.ino() == handle.ino() {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(libc::ESTALE))
+        }
+    }
+
+    /// Take uid ownership of this directory as the copier and restrict it to `mode`,
+    /// atomically and verified. Used by the reused-destination-directory lockdown under
+    /// [`strict_operand_resolution`]: taking ownership first means the directory's PRIOR
+    /// owner can no longer `chmod` it back open while children are written.
+    ///
+    /// The sequence — inside ONE `spawn_blocking` closure (NOT cancelled once started, so it
+    /// runs to completion) — is ordered so that **every failure exit leaves the directory no
+    /// wider than a successful copy would**:
+    ///
+    /// 1. `fchown` the owner to the effective uid (lock the prior owner out). Failing here
+    ///    leaves the directory untouched — transparent, fail-safe.
+    /// 2. `fchmod` to a plain `0o700` IMMEDIATELY. From here on any failure leaves the
+    ///    directory owner-only, i.e. no wider than success. If this `fchmod` fails, roll the
+    ///    ownership back to `orig_uid` and CHECK the rollback: a clean rollback fully restores
+    ///    the pre-lockdown state (the failed `chmod` changed nothing); a rollback that ALSO
+    ///    fails is a genuinely stuck state (a read-only/failing backend) reported with both
+    ///    errnos — the caller fails closed, so no child is ever written there.
+    /// 3. Reset the gid to `orig_gid` **only if it differs** (a prior owner raced a `chgrp`
+    ///    between classification and step 1). This matters for a **setgid** directory:
+    ///    children inherit the directory's gid, and finalization cannot repair children
+    ///    already created. Writing only-when-different keeps the common case a no-op — never
+    ///    an EPERM for a non-root copier that owns the directory but is not in its group — and
+    ///    a difference implies a foreign-owned directory, so the copier took ownership in step
+    ///    1 as root and can set any gid.
+    /// 4. Re-add the setgid bit (`fchmod` to `mode`) when wanted, now that the gid is
+    ///    `orig_gid`. Doing this AFTER the gid reset stops a non-privileged copier's `chmod`
+    ///    from silently dropping `S_ISGID`.
+    /// 5. Final `fstat` verifies the directory is owned by the effective uid, carries gid
+    ///    `orig_gid`, and carries exactly `mode`. A filesystem that reports a successful
+    ///    `chown`/`chmod` without honoring it (e.g. CIFS without unix extensions), or a
+    ///    dropped `S_ISGID`, is caught here rather than descending into a still-exposed
+    ///    directory. A verify failure still leaves the directory at the restrictive interim
+    ///    mode from step 2/4.
+    ///
+    /// `orig_uid`/`orig_gid` are the owner/group captured at classification. Fails (typically
+    /// `EPERM`) when the copier neither owns the directory nor is privileged — caller fails closed.
+    pub async fn secure_as_copier(
+        &self,
+        mode: u32,
+        orig_uid: u32,
+        orig_gid: u32,
+    ) -> std::io::Result<()> {
+        let fd = self.fd.clone();
+        let euid = nix::unistd::geteuid().as_raw();
+        run_metadata_probed_blocking(self.side, congestion::MetadataOp::Chmod, move || {
+            let raw = fd.as_fd();
+            // Take uid ownership — this locks the prior owner out of any further chown/chmod. If it
+            // fails the directory is left untouched (transparent), which is fail-safe.
+            fchown(raw, Some(Uid::from_raw(euid)), None).map_err(nix_to_io)?;
+            // Restrict to owner-only IMMEDIATELY, so EVERY later failure leaves the directory no wider
+            // than a successful copy would. Drop to a plain 0o700 first — there is no special bit to
+            // lose yet; the setgid bit (if wanted) is re-added below, once the gid is correct. If the
+            // chmod fails, roll the ownership back AND CHECK the rollback, so we never silently leave
+            // the directory copier-owned at its original (possibly permissive) mode.
+            if let Err(chmod_err) = fchmod(raw, Mode::from_bits_truncate(0o700)).map_err(nix_to_io)
+            {
+                // roll the ownership back AND VERIFY it landed with an fstat: a non-honoring backend
+                // can report a false chown success, so we must never claim a restore that did not
+                // happen.
+                match fchown(raw, Some(Uid::from_raw(orig_uid)), None)
+                    .map_err(nix_to_io)
+                    .and_then(|()| fstat(raw).map_err(nix_to_io))
+                {
+                    // rollback landed: back to the prior owner at its original mode (the failed chmod
+                    // changed nothing). Report the chmod cause.
+                    Ok(st) if st.st_uid == orig_uid => return Err(chmod_err),
+                    // rollback reported success but did not take effect (non-honoring backend).
+                    Ok(st) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "reused-directory lockdown could not restrict the directory (chmod: \
+                                 {chmod_err}); the ownership rollback did not take effect (directory \
+                                 shows uid={}, expected {orig_uid}) — it is left copier-owned at its \
+                                 original mode, refusing to descend (the filesystem may not honor \
+                                 chown/chmod)",
+                                st.st_uid,
+                            ),
+                        ));
+                    }
+                    Err(rb) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "reused-directory lockdown could not restrict the directory (chmod: \
+                                 {chmod_err}) and could not roll ownership back (chown/stat: {rb}); \
+                                 it is left owned by the copier at its original mode — refusing to \
+                                 descend (the destination filesystem may be read-only or failing)"
+                            ),
+                        ));
+                    }
+                }
+            }
+            // VERIFY the takeover landed NOW — uid == copier and mode == exactly 0o700 — BEFORE the
+            // fallible gid/setgid steps below run on a possibly-unverified directory. A backend that
+            // reports a false chown/chmod success (e.g. CIFS without unix extensions) is thus caught
+            // here rather than after more operations, and the directory is never descended into while
+            // it might still be permissive.
+            let st = fstat(raw).map_err(nix_to_io)?;
+            if st.st_uid != euid || (st.st_mode & 0o7777) != 0o700 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "reused-directory lockdown could not be verified: after chown+chmod the \
+                         directory shows uid={} mode={:#o} (expected uid={} mode={:#o}); the \
+                         filesystem may not honor chown/chmod (e.g. CIFS without unix extensions) — \
+                         refusing to descend",
+                        st.st_uid,
+                        st.st_mode & 0o7777,
+                        euid,
+                        0o700,
+                    ),
+                ));
+            }
+            // The directory is now VERIFIED copier-owned at 0o700 (restrictive); every exit below
+            // leaves it at least that restrictive. Reset the gid if a prior owner raced a `chgrp`
+            // before the take — only when it differs, so the unchanged common case issues no gid write
+            // (never an EPERM for a non-root copier that owns the directory but is not in its group).
+            // A setgid directory's children must inherit the captured gid, not the raced one.
+            if st.st_gid != orig_gid {
+                fchown(raw, None, Some(Gid::from_raw(orig_gid))).map_err(nix_to_io)?;
+            }
+            // Re-add the setgid bit now that the gid is orig_gid (skipped when the interim mode is a
+            // plain 0o700). Doing this AFTER the gid reset means a non-privileged copier's chmod
+            // cannot silently drop S_ISGID — the kernel keeps it because the directory's gid is now
+            // one the copier is in (or the copier is root, with CAP_FSETID).
+            if mode != 0o700 {
+                fchmod(raw, Mode::from_bits_truncate(mode)).map_err(nix_to_io)?;
+            }
+            // verify the whole takeover actually landed (uid, gid, mode); fail closed otherwise.
+            let st = fstat(raw).map_err(nix_to_io)?;
+            if st.st_uid != euid || st.st_gid != orig_gid || (st.st_mode & 0o7777) != mode {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "reused-directory lockdown could not be verified: after takeover the \
+                         directory shows uid={} gid={} mode={:#o} (expected uid={} gid={} \
+                         mode={:#o}); the filesystem may not honor chown/chmod (e.g. CIFS without \
+                         unix extensions), or the copier is not in the directory's group and lacks \
+                         CAP_FSETID to keep setgid — refusing to descend",
+                        st.st_uid,
+                        st.st_gid,
+                        st.st_mode & 0o7777,
+                        euid,
+                        orig_gid,
+                        mode,
+                    ),
+                ));
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Create a child directory and return an open `Dir` handle to it (same side as self).
@@ -1034,6 +1226,57 @@ pub async fn strict_probe_dst_kind(
     }
 }
 
+/// Lock down a REUSED destination directory under strict operand resolution, returning the original
+/// `(uid, gid)` to restore at finalize — `Some` when locked, `None` (a pure no-op) when strict mode
+/// is off.
+///
+/// `dir` is the freshly `open_dir`'d handle to the reused directory; `handle` is the `O_PATH`
+/// classify [`Handle`] taken for the same entry BEFORE the open (still held, pinning the classified
+/// inode). While strict operand resolution is armed the lockdown:
+///
+/// 1. captures `handle`'s original `(uid, gid)` as the restore owner;
+/// 2. [`Dir::verify_same_inode`] — confirms `dir` is still that exact inode, failing closed
+///    (`ESTALE`) on a classify→open swap;
+/// 3. [`Dir::secure_as_copier`] — takes ownership as the copier then restricts to `0o700`, so no
+///    child is written while the directory is world-readable/writable and the prior owner cannot
+///    re-widen it mid-copy.
+///
+/// The returned owner is restored (via [`set_reused_dir_metadata_fd`], component-wise so no
+/// transient window hands the directory back to a hostile prior owner) and the source mode
+/// re-applied at finalize, so a successful copy leaves the directory byte-identical to a copy without
+/// this
+/// hardening. A recheck mismatch or an `fchown`/`fchmod` `EPERM` (non-owner, non-privileged copier)
+/// propagates as `Err`; callers fail closed and skip descent, so no child is written into an
+/// unsecured directory. This is the single lockdown used by BOTH the local (`copy`/`link`) and
+/// remote (`rcpd`) reuse sites.
+pub async fn lockdown_reused_dir(
+    dir: &Dir,
+    handle: &Handle,
+) -> std::io::Result<Option<(u32, u32)>> {
+    if !strict_operand_resolution() {
+        return Ok(None);
+    }
+    use crate::preserve::Metadata as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let orig_meta = handle.meta();
+    let restore_owner = (orig_meta.uid(), orig_meta.gid());
+    dir.verify_same_inode(handle).await?;
+    // Restrict to 0o700 (owner-only) for the copy's duration, PRESERVING the setgid bit if the reused
+    // directory had it (0o700 already denies all group/other access, so keeping setgid costs nothing
+    // security-wise). Unlike the source mode applied at finalize, this INTERIM setgid bit governs the
+    // group that every child created during the copy inherits — and finalization cannot repair those
+    // children's GIDs under `preserve_none`. So a setgid directory must be locked down with BOTH its
+    // gid value and its S_ISGID bit intact: `secure_as_copier` (given the classified gid) resets the
+    // gid if a prior owner raced a `chgrp`, and re-stats to fail closed if `chmod` cleared S_ISGID (a
+    // non-privileged copier not in the directory's group, lacking `CAP_FSETID`) or if the filesystem
+    // did not honor the takeover at all. Root has `CAP_FSETID`, keeps the bit, and never trips this.
+    let want_setgid = orig_meta.permissions().mode() & 0o2000 != 0;
+    let interim_mode = if want_setgid { 0o2700 } else { 0o700 };
+    dir.secure_as_copier(interim_mode, orig_meta.uid(), orig_meta.gid())
+        .await?;
+    Ok(Some(restore_owner))
+}
+
 // ── fd-based metadata application ───────────────────────────────────────────────
 //
 // These primitives apply ownership / mode / timestamps to an entry through a
@@ -1401,6 +1644,93 @@ pub async fn set_dir_metadata_fd<Meta: crate::preserve::Metadata>(
     Ok(())
 }
 
+/// Apply directory metadata to a REUSED destination directory that may have been locked down under
+/// [`strict_operand_resolution`], restoring the original owner correctly and WITHOUT a transient
+/// window in which a hostile prior owner regains control.
+///
+/// `restore_owner` is the directory's original `(uid, gid)` (from [`lockdown_reused_dir`]), or `None`
+/// for a freshly created directory (nothing to restore). When present, this restores ONLY the
+/// components that are NOT being preserved to the source — leaving each preserved component as the
+/// copier for [`set_dir_metadata_fd`] to set to the source owner. So the directory's transient owner
+/// is always the copier (for a preserved uid) or the final owner (a non-preserved uid equals the
+/// original) — NEVER a prior owner who will not own the final directory. This closes the brief
+/// re-grant window that a plain "chown to the original, then chown the preserved components to
+/// source" sequence would open for a preserving copy, and removes the "left owned by the original if
+/// the second chown fails" case. The non-preserved gid write, when issued, targets the directory's
+/// unchanged gid — a kernel-permitted set-to-current no-op, safe even for a non-root copier not in
+/// that group.
+pub async fn set_reused_dir_metadata_fd<Meta: crate::preserve::Metadata>(
+    settings: &crate::preserve::Settings,
+    meta: &Meta,
+    restore_owner: Option<(u32, u32)>,
+    dir: &Dir,
+) -> std::io::Result<()> {
+    // A fresh / non-strict directory (restore_owner == None) uses the shared best-effort applier
+    // UNVERIFIED — verifying it would regress legitimate non-root `--preserve` copies (which the
+    // kernel silently strips setgid from, best-effort). Only a strict-mode LOCKED reused directory
+    // (restore_owner == Some) gets the restore + final verify below.
+    let Some((orig_uid, orig_gid)) = restore_owner else {
+        return set_dir_metadata_fd(settings, meta, dir).await;
+    };
+    let ut = &settings.dir.user_and_time;
+    {
+        let uid = (!ut.uid).then_some(orig_uid);
+        let gid = (!ut.gid).then_some(orig_gid);
+        if uid.is_some() || gid.is_some() {
+            fchown_fd(dir.fd.as_fd(), dir.side, uid, gid).await?;
+        }
+    }
+    set_dir_metadata_fd(settings, meta, dir).await?;
+    // Re-stat and verify the finalize actually landed. A backend that reports chown/chmod success
+    // without honoring it (e.g. CIFS without unix extensions) would otherwise leave a strict reused
+    // directory silently owned by the copier or at the wrong mode. A lone dropped S_ISGID bit is a
+    // WARNING, not a failure: it is narrower than the source, child safety was already ensured by the
+    // INTERIM setgid held during the copy, and failing here would regress a legitimate non-root
+    // `--preserve` of a setgid directory (the kernel strips setgid when the copier is not in the
+    // group and lacks CAP_FSETID) — matching the best-effort behavior of a non-strict copy.
+    use crate::preserve::Metadata as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let want_uid = if ut.uid { meta.uid() } else { orig_uid };
+    let want_gid = if ut.gid { meta.gid() } else { orig_gid };
+    let want_mode = crate::preserve::masked_mode(settings.dir.mode_mask, meta);
+    let got = dir.meta().await?;
+    let got_mode = got.permissions().mode() & 0o7777;
+    if got.uid() != want_uid || got.gid() != want_gid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "reused-directory finalize could not be verified: the directory shows uid={} gid={} \
+                 (expected uid={} gid={}); the filesystem may not honor chown/chmod",
+                got.uid(),
+                got.gid(),
+                want_uid,
+                want_gid,
+            ),
+        ));
+    }
+    if got_mode != want_mode {
+        if want_mode & 0o2000 != 0 && want_mode & !0o2000 == got_mode {
+            // the ONLY difference is a dropped setgid bit — warn, do not fail.
+            tracing::warn!(
+                "setgid not applied to reused directory (final mode {:#o} vs source {:#o}): the \
+                 copier is not in the directory's group and lacks CAP_FSETID",
+                got_mode,
+                want_mode,
+            );
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "reused-directory finalize could not be verified: the directory shows \
+                     mode={:#o} (expected {:#o}); the filesystem may not honor chmod",
+                    got_mode, want_mode,
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Apply symlink metadata (owner and timestamps only — never mode) to a symlink
 /// [`Handle`], operating on the link itself via `AT_EMPTY_PATH`.
 ///
@@ -1514,6 +1844,63 @@ mod tests {
         assert_eq!(
             bar.child(OsStr::new("1.txt")).await?.kind(),
             EntryKind::File
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn secure_as_copier_takes_ownership_restricts_mode_and_preserves_gid()
+    -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = testutils::setup_test_dir().await?;
+        let root =
+            Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
+
+        // a plain reused subdir locked down to 0o700: ownership becomes the copier, the mode is
+        // exactly 0o700, and the gid is unchanged (no race means no gid write at all).
+        let plain = root.make_dir(OsStr::new("reused_plain"), 0o755).await?;
+        let before = plain.meta().await?;
+        plain
+            .secure_as_copier(0o700, before.uid(), before.gid())
+            .await?;
+        let after = plain.meta().await?;
+        assert_eq!(
+            after.permissions().mode() & 0o7777,
+            0o700,
+            "mode restricted"
+        );
+        assert_eq!(
+            after.uid(),
+            nix::unistd::geteuid().as_raw(),
+            "owned by copier"
+        );
+        assert_eq!(after.gid(), before.gid(), "gid unchanged when it matches");
+
+        // a setgid reused subdir: BOTH the S_ISGID bit and the gid value must survive the
+        // lockdown, since children created during the copy inherit the directory's group.
+        let sg = root.make_dir(OsStr::new("reused_setgid"), 0o755).await?;
+        std::fs::set_permissions(
+            tmp.join("foo/reused_setgid"),
+            std::fs::Permissions::from_mode(0o2755),
+        )?;
+        let sg_before = sg.meta().await?;
+        assert_eq!(
+            sg_before.permissions().mode() & 0o2000,
+            0o2000,
+            "test setup: S_ISGID is set before lockdown"
+        );
+        sg.secure_as_copier(0o2700, sg_before.uid(), sg_before.gid())
+            .await?;
+        let sg_after = sg.meta().await?;
+        assert_eq!(
+            sg_after.permissions().mode() & 0o7777,
+            0o2700,
+            "S_ISGID + 0o700 both preserved"
+        );
+        assert_eq!(
+            sg_after.gid(),
+            sg_before.gid(),
+            "gid preserved under setgid"
         );
         Ok(())
     }

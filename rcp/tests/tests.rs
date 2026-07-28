@@ -1328,3 +1328,328 @@ fn copies_tilde_dotdot_source_operand_into_trailing_slash_dest() {
     );
     assert_eq!(get_file_content(&created), "hello dot");
 }
+
+// ── Reused-destination-directory lockdown under --require-toctou-safe (sudo) ──
+//
+// These need a real uid/gid difference — a directory owned by a user other than the
+// privileged copier — so they only run under the sudo-gated CI job (name contains
+// `sudo`, `#[ignore]`). They drive the real `rcp` binary and verify filesystem state
+// as the unprivileged user afterward, mirroring the rchm sudo tests.
+
+/// True when passwordless sudo is usable; prints a skip note and returns false
+/// otherwise (matching the repo's other sudo-gated tests).
+fn passwordless_sudo_available() -> bool {
+    let ok = std::process::Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("Skipping test: passwordless sudo not available");
+    }
+    ok
+}
+
+/// Primary blocker guard (copy): under `--require-toctou-safe` a privileged copier
+/// secures a foreign-owned reused directory (chown to itself + 0o700) then RESTORES
+/// the original owner at finalize. With the default `preserve_none` the restore is
+/// the only owner change, so the reused directory must end owned by the original
+/// unprivileged user — NOT the root copier (the v1 "no restore" bug).
+/// Under `--require-toctou-safe`, multiple sources are copied SEQUENTIALLY (not concurrently) so two
+/// sources that alias to the same destination directory cannot run overlapping reused-directory
+/// lockdown/restore lifecycles against it. This exercises that serialized dispatch path and confirms
+/// it still copies every source correctly. (Non-sudo — no uid difference needed.)
+#[test]
+fn strict_multi_source_copies_all_sources() {
+    if !common::safedir::openat2_available() {
+        eprintln!("Skipping test: kernel lacks openat2(2)");
+        return;
+    }
+    // absolute, symlink-free operands are required under --require-toctou-safe
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = std::fs::canonicalize(tmp.path()).unwrap();
+    let src_a = tmp.join("src_a");
+    let src_b = tmp.join("src_b");
+    std::fs::create_dir(&src_a).unwrap();
+    std::fs::create_dir(&src_b).unwrap();
+    std::fs::write(src_a.join("a.txt"), b"alpha").unwrap();
+    std::fs::write(src_b.join("b.txt"), b"bravo").unwrap();
+    let dst = tmp.join("dst");
+    std::fs::create_dir(&dst).unwrap();
+    // trailing slash: copy the sources INTO the directory (multi-source requires it)
+    let dst_arg = format!("{}/", dst.to_str().unwrap());
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args([
+        "--require-toctou-safe",
+        "--overwrite",
+        src_a.to_str().unwrap(),
+        src_b.to_str().unwrap(),
+        dst_arg.as_str(),
+    ])
+    .assert()
+    .success();
+    // both sources were copied via the serialized strict-mode dispatch
+    assert_eq!(
+        std::fs::read_to_string(dst.join("src_a").join("a.txt")).unwrap(),
+        "alpha"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dst.join("src_b").join("b.txt")).unwrap(),
+        "bravo"
+    );
+}
+
+/// Under `--require-toctou-safe`, if a REUSED directory is setgid but the copier cannot preserve
+/// `S_ISGID` (a non-privileged copier not in the directory's group — `chmod(2)` clears the bit
+/// silently), the lockdown re-stats and FAILS CLOSED rather than let children inherit the wrong
+/// group. Setup needs sudo to give the directory a foreign group; the copy itself runs as us
+/// (non-root, no `CAP_FSETID`). UNVERIFIED here (no passwordless sudo / second group).
+#[test]
+#[ignore = "requires passwordless sudo + a foreign-group setup"]
+fn test_sudo_strict_reused_setgid_foreign_group_fails_closed() {
+    use std::os::unix::fs::MetadataExt;
+    if !passwordless_sudo_available() {
+        return;
+    }
+    if !common::safedir::openat2_available() {
+        eprintln!("Skipping test: kernel lacks openat2(2)");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = std::fs::canonicalize(tmp.path()).unwrap();
+    let src = tmp.join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"payload").unwrap();
+    let our_uid = std::fs::metadata(&src).unwrap().uid();
+    let dst = tmp.join("dst");
+    std::fs::create_dir(&dst).unwrap();
+    // pre-existing (reused) directory dst/src that we own but with a FOREIGN group (root/0, which we
+    // are not a member of) and setgid — established via sudo.
+    let reused = dst.join("src");
+    std::fs::create_dir(&reused).unwrap();
+    let chown_ok = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            "chown",
+            &format!("{our_uid}:0"),
+            reused.to_str().unwrap(),
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !chown_ok {
+        eprintln!("Skipping test: cannot chown to a foreign group");
+        return;
+    }
+    let setgid_ok = std::process::Command::new("sudo")
+        .args(["-n", "chmod", "2700", reused.to_str().unwrap()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(setgid_ok, "sudo chmod 2700 must succeed");
+    // run the copy as ourselves (non-root, no CAP_FSETID, not in group 0): reusing the setgid
+    // dst/src, the interim chmod silently drops setgid → the lockdown re-stat fails closed.
+    let dst_arg = format!("{}/", dst.to_str().unwrap());
+    let mut cmd = assert_cmd::Command::cargo_bin("rcp").unwrap();
+    cmd.args([
+        "--require-toctou-safe",
+        "--overwrite",
+        src.to_str().unwrap(),
+        dst_arg.as_str(),
+    ]);
+    cmd.assert().failure();
+    // cleanup: restore a removable mode on the root-owned-group dir
+    let _ = std::process::Command::new("sudo")
+        .args(["-n", "chmod", "0700", reused.to_str().unwrap()])
+        .status();
+}
+
+#[test]
+#[ignore = "requires passwordless sudo"]
+fn test_sudo_strict_reuse_restores_foreign_owned_dir() {
+    use std::os::unix::fs::MetadataExt;
+    if !passwordless_sudo_available() {
+        return;
+    }
+    if !common::safedir::openat2_available() {
+        eprintln!("Skipping test: kernel lacks openat2(2)");
+        return;
+    }
+    // absolute, symlink-free operands are required under --require-toctou-safe
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = std::fs::canonicalize(tmp.path()).unwrap();
+    let src = tmp.join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"payload").unwrap();
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // reused destination directory, owned by us (the unprivileged user), world-open
+    let dst = tmp.join("dst");
+    std::fs::create_dir(&dst).unwrap();
+    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let orig_uid = std::fs::metadata(&dst).unwrap().uid();
+    let status = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            env!("CARGO_BIN_EXE_rcp"),
+            "--require-toctou-safe",
+            "--preserve-settings",
+            "none",
+            "--overwrite",
+        ])
+        .arg(&src)
+        .arg(&dst)
+        .status()
+        .expect("failed to run sudo rcp");
+    assert!(
+        status.success(),
+        "sudo rcp --require-toctou-safe must succeed"
+    );
+    // the child was copied (as root) into the locked-then-restored directory
+    assert!(
+        dst.join("a.txt").exists(),
+        "child must be copied into the reused directory"
+    );
+    // KEY: the reused directory's owner is restored to the original unprivileged user
+    assert_eq!(
+        std::fs::metadata(&dst).unwrap().uid(),
+        orig_uid,
+        "reused dir owner uid must be restored to the original, not left as the root copier"
+    );
+}
+
+/// Per-component restore guard (copy, the v2 blocker): with `--preserve-settings
+/// "d:gid"` the reused directory's gid is preserved (from the root-owned source) but
+/// its uid is NOT — so the final owner must be (original uid restored, source gid).
+/// A binary "any preserve → chown both / skip restore" gate would mis-own a
+/// component.
+#[test]
+#[ignore = "requires passwordless sudo"]
+fn test_sudo_strict_reuse_mixed_preserve_dir_gid() {
+    use std::os::unix::fs::MetadataExt;
+    if !passwordless_sudo_available() {
+        return;
+    }
+    if !common::safedir::openat2_available() {
+        eprintln!("Skipping test: kernel lacks openat2(2)");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = std::fs::canonicalize(tmp.path()).unwrap();
+    let src = tmp.join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"payload").unwrap();
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // give the SOURCE a distinct owner (root:root) so its gid (0) differs from ours
+    assert!(
+        std::process::Command::new("sudo")
+            .args(["-n", "chown", "-R", "0:0"])
+            .arg(&src)
+            .status()
+            .expect("failed to chown src")
+            .success()
+    );
+    let dst = tmp.join("dst");
+    std::fs::create_dir(&dst).unwrap();
+    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let orig_uid = std::fs::metadata(&dst).unwrap().uid();
+    let status = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            env!("CARGO_BIN_EXE_rcp"),
+            "--require-toctou-safe",
+            "--preserve-settings",
+            "d:gid",
+            "--overwrite",
+        ])
+        .arg(&src)
+        .arg(&dst)
+        .status()
+        .expect("failed to run sudo rcp");
+    assert!(status.success(), "sudo rcp must succeed");
+    let after = std::fs::metadata(&dst).unwrap();
+    // uid NOT preserved → restored to the original unprivileged user
+    assert_eq!(
+        after.uid(),
+        orig_uid,
+        "uid is not preserved, so it must be restored to the original (not the root copier)"
+    );
+    // gid preserved from the (root) source
+    assert_eq!(
+        after.gid(),
+        0,
+        "gid must be the preserved source gid (root)"
+    );
+    // the source tree is root-owned; remove it with sudo so the tempdir drop can finish
+    let _ = std::process::Command::new("sudo")
+        .args(["-n", "rm", "-rf"])
+        .arg(&src)
+        .status();
+}
+
+/// Fail-closed guard (copy): a NON-root copier that does not own the reused directory
+/// cannot chown it, so the lockdown fails closed (EPERM) and NO child is written. We
+/// run `rcp` as ourselves into a root-owned, world-writable directory: without the
+/// lockdown the 0o777 dir would accept children; with it, the copy fails and writes
+/// nothing.
+#[test]
+#[ignore = "requires passwordless sudo"]
+fn test_sudo_strict_reuse_non_owner_fails_closed() {
+    use std::os::unix::fs::MetadataExt;
+    if !passwordless_sudo_available() {
+        return;
+    }
+    if !common::safedir::openat2_available() {
+        eprintln!("Skipping test: kernel lacks openat2(2)");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = std::fs::canonicalize(tmp.path()).unwrap();
+    // a file we create reveals our uid; if we are root this test is not meaningful
+    let probe = tmp.join(".probe");
+    std::fs::write(&probe, b"").unwrap();
+    let my_uid = std::fs::metadata(&probe).unwrap().uid();
+    std::fs::remove_file(&probe).ok();
+    if my_uid == 0 {
+        eprintln!("Skipping test: running as root, cannot exercise non-owner fail-closed");
+        return;
+    }
+    let src = tmp.join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"payload").unwrap();
+    let dst = tmp.join("dst");
+    std::fs::create_dir(&dst).unwrap();
+    // make the reused dir owned by root but world-writable, so ONLY ownership blocks the lockdown
+    assert!(
+        std::process::Command::new("sudo")
+            .args(["-n", "chown", "0:0"])
+            .arg(&dst)
+            .status()
+            .expect("failed to chown dst")
+            .success()
+    );
+    assert!(
+        std::process::Command::new("sudo")
+            .args(["-n", "chmod", "0777"])
+            .arg(&dst)
+            .status()
+            .expect("failed to chmod dst")
+            .success()
+    );
+    // run rcp AS OURSELVES: we cannot chown the root-owned dir, so the lockdown fails closed
+    assert_cmd::Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--require-toctou-safe", "--overwrite", "--fail-early"])
+        .arg(&src)
+        .arg(&dst)
+        .assert()
+        .failure();
+    assert!(
+        !dst.join("a.txt").exists(),
+        "no child may be written when the lockdown fails closed"
+    );
+    // dst is root-owned; remove it with sudo so the tempdir drop can finish
+    let _ = std::process::Command::new("sudo")
+        .args(["-n", "rm", "-rf"])
+        .arg(&dst)
+        .status();
+}

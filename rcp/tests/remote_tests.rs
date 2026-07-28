@@ -3048,6 +3048,132 @@ fn test_remote_child_symlink_fail_early_no_hang_no_encryption() {
     );
 }
 
+/// A regular FILE that cannot be written into a reused, non-writable destination
+/// directory under `--fail-early` must make the whole copy FAIL — not silently exit 0.
+///
+/// Regression: the symlink cases above travel the CONTROL stream (which propagated the
+/// error), but a regular file travels a data connection handled by `handle_file_stream`.
+/// That worker logged the file-stream error and `break`-ed with `Ok(())`, so the
+/// fail-early write error never reached its `JoinSet`; the destination also still sent
+/// `DestinationDone` after the failed file. Both together reported success and dropped
+/// the file with a zero exit code — silent data loss.
+#[test]
+fn test_remote_file_fail_early_reports_failure() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+
+    // source: a directory holding a regular file
+    let src_subdir = src_dir.path().join("data");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("file.txt"), "content", 0o644);
+
+    // destination: a pre-existing (reused) directory made non-writable, so the file's
+    // create fails with EACCES on the data connection (the directory itself opens fine).
+    let dst_subdir = dst_dir.path().join("data");
+    std::fs::create_dir_all(&dst_subdir).unwrap();
+    std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+
+    let output =
+        run_rcp_and_expect_failure(&["--fail-early", "--overwrite", &src_remote, &dst_remote]);
+
+    // restore permissions for cleanup
+    let _ = std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o755));
+
+    // not a timeout/hang
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert!(exit_code != 124, "Command timed out - indicates a hang bug");
+
+    // the real cause (destination Permission denied) must be reported, not swallowed into
+    // a bare success. The remote harness routes the final error to stdout, so scan both.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.to_lowercase().contains("permission denied"),
+        "expected the real 'Permission denied' cause in the output, got:\n{combined}"
+    );
+}
+
+/// Regression: a `--fail-early` file failure with MORE files still pending must fail fast,
+/// not hang. (`test_remote_file_fail_early_reports_failure` copies a single file, so the
+/// failing file is also the last item — the tracker reaches is_done() and sends
+/// DestinationDone, masking this bug. This test keeps files pending after the failure.)
+///
+/// Bug scenario: with a single data connection the failing file's worker recorded the error
+/// and `break`ed WITHOUT telling the source to stop. The files here are EMPTY, so the source
+/// sends only headers (no data body) and its sends never fail with a broken pipe — nothing
+/// tears the source down. It never closed its control stream, so the destination's
+/// control_future waited forever: an infinite hang. The worker now closes its control send
+/// stream on abort, which makes the source release its fd-budget and tear down. The empty
+/// files are essential: with data bodies, the source's broken-pipe teardown hides the bug.
+///
+/// This also covers Finding 2's shape (a `--fail-early` error surfacing through the data
+/// worker before completion accounting): the fix is the same worker-side abort signal
+/// whether the error is a file create or a directory-metadata failure.
+#[test]
+fn test_remote_multiple_empty_files_fail_early_no_hang() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+
+    // source: a directory of two EMPTY files (header-only transfers). Exactly two is the
+    // reliable trigger: the source finishes sending both tiny headers and goes idle before the
+    // destination fails the first one, so there is no in-flight data send to break. With more
+    // files the source is often still sending when the destination aborts and a broken pipe
+    // tears it down instead — hiding the bug.
+    let src_subdir = src_dir.path().join("data");
+    std::fs::create_dir(&src_subdir).unwrap();
+    for i in 0..2 {
+        create_test_file(&src_subdir.join(format!("f{i}.txt")), "", 0o644);
+    }
+
+    // destination: a pre-existing (reused) directory made non-writable so every file create
+    // fails with EACCES while others are still pending.
+    let dst_subdir = dst_dir.path().join("data");
+    std::fs::create_dir_all(&dst_subdir).unwrap();
+    std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+
+    // budget 1 (single data worker) + --preserve to exercise the metadata-completion path.
+    let output = run_rcp_and_expect_failure(&[
+        "--fail-early",
+        "--overwrite",
+        "--preserve",
+        "--max-connections",
+        "1",
+        "--pending-writes-multiplier",
+        "1",
+        &src_remote,
+        &dst_remote,
+    ]);
+
+    // restore permissions for cleanup
+    let _ = std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o755));
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    assert!(
+        exit_code != 124,
+        "Command timed out - the --fail-early multi-file destination hang has regressed"
+    );
+
+    // the real cause (destination Permission denied) must be reported, not a teardown symptom.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.to_lowercase().contains("permission denied"),
+        "expected the real 'Permission denied' cause in the output, got:\n{combined}"
+    );
+}
+
 /// Test that root symlink creation failure with --fail-early doesn't cause a hang.
 ///
 /// Bug scenario: When copying a single symlink as root and it fails to create on
@@ -3087,43 +3213,83 @@ fn test_remote_root_symlink_fail_early_no_hang() {
     );
 }
 
-/// Test that directory metadata failure doesn't cause a hang.
+/// Deterministic regression for a metadata failure at FINALIZATION under `--fail-early`: the copy
+/// must abort promptly (no hang) AND report the real cause.
 ///
-/// Bug scenario: When set_dir_metadata() fails (e.g., due to permission issues),
-/// the destination should still call decrement_entry() for child directories or
-/// send_root_done() for root directories before returning the error.
-///
-/// This is harder to trigger reliably since metadata setting typically succeeds,
-/// but we can test with a directory that has restrictive permissions.
+/// This needs `sudo`: directory (and file) metadata application on entries the copier owns
+/// essentially always succeeds, so a metadata failure can only be forced with a foreign-owned
+/// source, which is why the former non-sudo version of this test could not induce one — it accepted
+/// either outcome and only rejected a timeout (vacuous). A root-owned source tree makes the
+/// destination's `--preserve` chown fail with EPERM when it finalizes the created directory/file (we
+/// run rcpd as a normal user), which is distinct from a file-CREATION failure. The shared abort
+/// mechanism this exercises — `handle_file_stream` returns Err, the worker pool's join loop signals
+/// the source once, and `run_destination` reports the recorded cause — is also covered WITHOUT root
+/// by `test_remote_multiple_empty_files_fail_early_no_hang`; this pins the finalization ORIGIN.
 #[test]
-fn test_remote_directory_metadata_failure_no_hang() {
+#[ignore = "requires passwordless sudo"]
+fn test_remote_sudo_metadata_failure_fail_early_no_hang() {
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
 
-    // create source directory with a file
-    let src_subdir = src_dir.path().join("meta_test");
-    std::fs::create_dir(&src_subdir).unwrap();
-    create_test_file(&src_subdir.join("file.txt"), "content", 0o644);
-
-    // create destination parent, but make it read-only after creating the subdir
-    // this may cause metadata operations to fail
-    let dst_subdir = dst_dir.path().join("meta_test");
-    std::fs::create_dir_all(&dst_subdir).unwrap();
+    // ISOLATE the directory-finalization failure: make ONLY the directory root-owned, and give the
+    // file back to the invoking user. Under --preserve the destination's chown of the FILE is then a
+    // no-op (source file owner == copier), so it succeeds, and the only EPERM is the chown of the
+    // DIRECTORY to root at finalization — pinning the directory-finalization path (not a file error).
+    // (`$SUDO_UID`/`$SUDO_GID` are the invoking user's ids, set by sudo.) The dir stays 0o755 so the
+    // normal-user source rcpd can still enumerate it.
+    let src_subdir = src_dir.path().join("meta_dir");
+    let status = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            "bash",
+            "-c",
+            &format!(
+                "mkdir -p '{dir}' && echo data > '{dir}/f.txt' && \
+                 chown root:root '{dir}' && chown \"$SUDO_UID:$SUDO_GID\" '{dir}/f.txt'",
+                dir = src_subdir.display()
+            ),
+        ])
+        .status()
+        .expect("Failed to run sudo");
+    if !status.success() {
+        eprintln!("Skipping test: passwordless sudo not available");
+        return;
+    }
 
     let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_subdir = dst_dir.path().join("meta_dir");
     let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
 
-    // copy with --preserve to ensure metadata operations are attempted
-    // the test mainly verifies we don't hang - the operation may succeed or fail
-    // depending on permissions, but it should never timeout
-    let output = run_rcp_with_args(&["--preserve", "--overwrite", &src_remote, &dst_remote]);
-    print_command_output(&output);
+    // --preserve triggers the finalization chown; --fail-early makes that failure ABORT.
+    let output =
+        run_rcp_and_expect_failure(&["--preserve", "--fail-early", &src_remote, &dst_remote]);
 
-    // verify we didn't timeout (exit code 124 = timeout)
+    // cleanup root-owned source
+    let _ = std::process::Command::new("sudo")
+        .args(["-n", "rm", "-rf", &src_subdir.to_string_lossy()])
+        .status();
+
     let exit_code = output.status.code().unwrap_or(-1);
     assert!(
         exit_code != 124,
-        "Command timed out - this indicates a potential hang bug in metadata error handling"
+        "Command timed out - a metadata failure under --fail-early hung"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = combined.to_lowercase();
+    assert!(
+        combined.contains("operation not permitted") || combined.contains("permission denied"),
+        "expected the real metadata-failure cause (chown EPERM), got:\n{combined}"
+    );
+    // the directory is isolated (the file chown is a no-op), so the EPERM can ONLY be the
+    // directory's finalization chown — confirm the reported cause is the metadata path, not a file
+    // create error (which would read "failed creating", never "metadata").
+    assert!(
+        combined.contains("metadata"),
+        "expected the DIRECTORY metadata-finalization cause (not a file error), got:\n{combined}"
     );
 }
 
@@ -5873,6 +6039,189 @@ fn test_remote_require_toctou_safe_copies() {
     assert_eq!(get_file_content(&dst_file), "strict content");
 }
 
+/// The remote reused-destination-directory lockdown+restore path, end-to-end over
+/// the real protocol: a `--require-toctou-safe --overwrite` remote copy INTO a
+/// PRE-EXISTING (reused) destination directory locks it down for the copy
+/// (`create_directory`: verify_same_inode → secure_as_copier → 0o700) and restores
+/// it at completion (`complete_directory_single`: chown_to + the tracker threading
+/// through `DirectoryState.restore_owner`). The reused dir starts NON-WRITABLE at
+/// 0o500 (like the local test): without the lockdown (which fchmods it to 0o700) the
+/// copier could not write the child into it, so a successful copy PROVES the lockdown
+/// fired — not a vacuous pass. The source dir is at 0o755; a successful copy must
+/// leave the reused dir at the SOURCE mode (0o755, not the interim 0o700) with its
+/// owner unchanged. Runs without extra privilege — the owner value is a no-op
+/// without a uid difference (the `sudo` test below covers the foreign-owner
+/// restore), but this still exercises the whole remote lockdown machinery and
+/// catches gross breakage in the rcpd plumbing.
+#[test]
+fn test_remote_require_toctou_safe_reused_dir_locked_and_restored() {
+    use std::os::unix::fs::MetadataExt;
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2), --require-toctou-safe refuses");
+        return;
+    }
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // canonicalize: TMPDIR itself may contain symlinked components, which strict resolution refuses
+    let src_base = src_dir.path().canonicalize().unwrap();
+    let dst_base = dst_dir.path().canonicalize().unwrap();
+    // source directory (distinctive mode 0o755) with a child to write into the reused dir
+    let src_subdir = src_base.join("tree");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("a.txt"), "payload", 0o644);
+    std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // pre-existing (reused) destination directory, owned by us, NON-WRITABLE at 0o500 — without the
+    // lockdown (which fchmods it to 0o700) the copier could not write the child, so the copy's
+    // success is proof the lockdown fired (not a vacuous pass, matching the local test).
+    let dst_subdir = dst_base.join("tree");
+    std::fs::create_dir(&dst_subdir).unwrap();
+    std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let orig_uid = std::fs::metadata(&dst_subdir).unwrap().uid();
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&[
+        "--require-toctou-safe",
+        "--overwrite",
+        "--summary",
+        &src_remote,
+        &dst_remote,
+    ]);
+    // the child landed → the reused dir was made writable for the copy, then restored
+    assert_eq!(get_file_content(&dst_subdir.join("a.txt")), "payload");
+    // the directory was REUSED (not recreated): directories_created must be 0
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(
+        summary.directories_created, 0,
+        "the destination directory was reused, not created"
+    );
+    // final mode is the SOURCE mode (0o755), not the interim lockdown 0o700
+    assert_eq!(
+        get_file_mode(&dst_subdir),
+        0o755,
+        "reused dir final mode must equal the source directory mode"
+    );
+    // owner unchanged (a no-op without a uid difference, but must not be left mangled)
+    assert_eq!(
+        std::fs::metadata(&dst_subdir).unwrap().uid(),
+        orig_uid,
+        "reused dir owner uid must be unchanged"
+    );
+}
+
+/// Remote mirror of the local `test_sudo_strict_reuse_restores_foreign_owned_dir`
+/// (rcp/tests/tests.rs): a privileged (root) rcpd copier secures a FOREIGN-owned
+/// reused remote destination directory and restores its ORIGINAL owner at
+/// completion, so under `preserve_none` the reused dir ends owned by the original
+/// unprivileged user — not the root copier (the v1 "no restore" bug).
+///
+/// Beyond passwordless sudo, this needs the WHOLE rcp+rcpd chain to run as root — i.e.
+/// passwordless root→localhost SSH, a higher bar than the other remote `sudo` tests
+/// (which run rcpd as the normal user and use sudo only to plant root-owned inputs).
+/// The differing uid it needs comes for free: the reused destination directory is
+/// created by the invoking user while the copy itself runs as root.
+///
+/// It SKIPS (does not fail) when sudo or root→localhost SSH is unavailable, so it stays
+/// runnable on a workstation, and is `#[ignore]` so a normal `just test` never runs it.
+/// CI provisions root SSH and sets `RCP_REQUIRE_ROOT_SSH=1`, which turns every skip below
+/// into a hard failure — otherwise a silent regression in that provisioning would quietly
+/// stop exercising the assertion.
+#[test]
+#[ignore = "requires passwordless sudo + root SSH-to-localhost"]
+fn test_remote_sudo_strict_reuse_restores_foreign_owned_dir() {
+    use std::os::unix::fs::MetadataExt;
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2), --require-toctou-safe refuses");
+        return;
+    }
+    require_local_ssh();
+    // `RCP_REQUIRE_ROOT_SSH=1` (set by CI) makes a missing precondition FAIL instead of skip, so a
+    // broken provisioning step cannot silently stop exercising the assertion below.
+    let must_run = std::env::var_os("RCP_REQUIRE_ROOT_SSH").is_some_and(|v| v == "1");
+    let skip_unless = |ok: bool, what: &str| -> bool {
+        if ok {
+            return false;
+        }
+        assert!(
+            !must_run,
+            "RCP_REQUIRE_ROOT_SSH=1 but {what} is unavailable"
+        );
+        eprintln!("Skipping test: {what} not available");
+        true
+    };
+    let sudo_ok = std::process::Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if skip_unless(sudo_ok, "passwordless sudo") {
+        return;
+    }
+    // rcp runs as root and spawns rcpd via ssh, so ROOT must reach localhost passwordlessly
+    let root_ssh_ok = std::process::Command::new("sudo")
+        .args(["-n", "ssh", "-o", "BatchMode=yes", "localhost", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if skip_unless(root_ssh_ok, "passwordless root SSH-to-localhost") {
+        return;
+    }
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_base = src_dir.path().canonicalize().unwrap();
+    let dst_base = dst_dir.path().canonicalize().unwrap();
+    // source directory + child, owned by us
+    let src_subdir = src_base.join("tree");
+    std::fs::create_dir(&src_subdir).unwrap();
+    create_test_file(&src_subdir.join("a.txt"), "payload", 0o644);
+    std::fs::set_permissions(&src_subdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // reused destination directory, owned by us (the unprivileged user), world-open
+    let dst_subdir = dst_base.join("tree");
+    std::fs::create_dir(&dst_subdir).unwrap();
+    std::fs::set_permissions(&dst_subdir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let orig_uid = std::fs::metadata(&dst_subdir).unwrap().uid();
+    let src_remote = format!("localhost:{}", src_subdir.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_subdir.to_str().unwrap());
+    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
+    // run the WHOLE chain as root so the destination rcpd is privileged; `timeout` guards a hang.
+    let status = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            "timeout",
+            "90",
+            rcp_path.to_str().unwrap(),
+            "--force-remote",
+            "--require-toctou-safe",
+            "--preserve-settings",
+            "none",
+            "--overwrite",
+        ])
+        .arg(&src_remote)
+        .arg(&dst_remote)
+        .status()
+        .expect("failed to run sudo rcp");
+    // snapshot observations BEFORE cleanup so the assertions use pre-cleanup state
+    let final_uid = std::fs::metadata(&dst_subdir).unwrap().uid();
+    let child_exists = dst_subdir.join("a.txt").exists();
+    // root copied the child, so the reused subtree may hold root-owned entries; remove with sudo so
+    // the tempdir drop can finish regardless of the outcome
+    let _ = std::process::Command::new("sudo")
+        .args(["-n", "rm", "-rf"])
+        .arg(&dst_subdir)
+        .status();
+    assert!(
+        status.success(),
+        "sudo remote rcp --require-toctou-safe must succeed"
+    );
+    assert!(
+        child_exists,
+        "child must be copied into the reused directory"
+    );
+    // KEY: the reused remote directory's owner is restored to the original unprivileged user
+    assert_eq!(
+        final_uid, orig_uid,
+        "reused remote dir owner uid must be restored to the original, not left as the root copier"
+    );
+}
+
 /// --require-toctou-safe fails closed when a remote source operand path crosses a
 /// symlink: the source rcpd resolves it RESOLVE_NO_SYMLINKS and gets ELOOP
 #[test]
@@ -5976,4 +6325,65 @@ fn test_remote_dry_run_excluded_root_skips_under_execute_only_parent() {
         output.status.success(),
         "excluded dry-run root under an execute-only parent must skip cleanly"
     );
+}
+
+/// A saturated dir-fd budget plus a Pass-2 file failure under `--fail-early` must (a) NOT deadlock
+/// the source (the `run_rcp_and_expect_failure` helper asserts non-timeout) and (b) report the REAL
+/// cause, not the synthetic "budget semaphore closed" wakeup that `close_fd_budget()` raises to
+/// unblock the parked Pass-1 walk. Forcing the budget to 1 (`--max-connections 1
+/// --pending-writes-multiplier 1`) lets a handful of directories park the walk. Regression guard for
+/// the deadlock fix AND the error-prioritization fix.
+#[test]
+fn test_remote_fail_early_saturated_budget_reports_real_cause() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src = src_dir.path().canonicalize().unwrap();
+    let dst = dst_dir.path().canonicalize().unwrap();
+    // several subdirs (> budget 1) so the Pass-1 walk parks on the fd-budget; EVERY subdir holds a
+    // file the source cannot read, so whichever directory Pass 2 reaches first (readdir order is
+    // unspecified) triggers a Pass-2 permission error under --fail-early while the walk is still
+    // parked — making the repro deterministic regardless of enumeration order (a single bad dir
+    // could land last, after the walk already drained, and let the old masking bug pass too).
+    for i in 0..10 {
+        let d = src.join(format!("d{i}"));
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("ok.txt"), b"ok").unwrap();
+        let bad = d.join("bad.txt");
+        std::fs::write(&bad, b"secret").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let src_remote = format!("localhost:{}", src.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst.to_str().unwrap());
+    let output = run_rcp_and_expect_failure(&[
+        "--max-connections",
+        "1",
+        "--pending-writes-multiplier",
+        "1",
+        "--fail-early",
+        &src_remote,
+        &dst_remote,
+    ]);
+    // the -vv tracing and the final error print both go to stdout in this harness, so assert against
+    // the combined streams rather than a single one.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // the reported top-level Source error must be the real cause, not the synthetic budget wakeup.
+    assert!(
+        combined.contains("Source: Permission denied"),
+        "top-level Source error must name the real cause (Permission denied); got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Source: source dir-fd budget semaphore closed"),
+        "top-level Source error must not be the synthetic budget wakeup; got:\n{combined}"
+    );
+    // restore perms so the tempdir cleans up
+    for i in 0..10 {
+        let _ = std::fs::set_permissions(
+            src.join(format!("d{i}")).join("bad.txt"),
+            std::fs::Permissions::from_mode(0o600),
+        );
+    }
 }
