@@ -349,7 +349,7 @@ pub(crate) fn install_tracing_subscriber(
                 Some(layer.with_filter(make_profile_filter()))
             }
             Err(e) => {
-                eprintln!("Failed to create flamegraph layer: {e}");
+                eprintln!("Failed to create flamegraph layer: {e:?}");
                 None
             }
         }

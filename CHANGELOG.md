@@ -9,6 +9,61 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- Destination files are now created owner-only (`0o600`) and only widened to the source mode once
+  their contents are written and every other metadata step has succeeded. Previously the destination
+  was created at its *final* source mode before a single byte had been written, so a half-written
+  file carried the audience its finished form was meant to have. At default settings that is an
+  exposure of partial contents: the mode mask is `0o0777` (`setuid`/`setgid`/sticky are stripped,
+  matching `cp`), so a world-readable source produces a world-readable destination from the moment
+  it is created, and anyone who can reach the directory can read whatever has landed so far. No
+  symlink race is needed — a world-searchable destination directory is enough, which is the default
+  for any repeat or incremental `rcp --overwrite`.
+
+  The sharper case needs the special bits preserved (`--preserve`, or a `--preserve-settings` mask
+  of `7777`) **and** a copier that is interrupted. Root holds `CAP_FSETID` ("don't clear set-user-ID
+  and set-group-ID mode bits when a file is modified"), so writing does not strip `S_ISUID` from a
+  root copier's destination, and a `SIGKILL`, OOM kill, or crash after the last byte left behind a
+  complete, functional, setuid-root executable whose contents the *source's* owner authored. Note
+  that the **successful** copy was never an exec window on Linux: the destination stays open for
+  writing through metadata application, and `execve` refuses a file any process holds open for
+  writing with `ETXTBSY`. It is the interrupted copy — where the copier's death closes that
+  descriptor and removes the protection — that the old creation mode exposed. (A non-root copier's
+  first write clears the special bits, so there the leftover was a zero-length setuid file.)
+
+  The fix is the file counterpart of the split-chmod destination directories already get, it costs
+  no extra syscalls — only the mode argument of the creating `openat` changes — and it is
+  unconditional rather than gated behind `--require-toctou-safe`, because a file the copy creates is
+  its own new object with no prior user-visible state to preserve. It applies to local `rcp`/`rlink`
+  (including every `rlink` fall-back-to-copy path) and to remote (`rcpd`) copies. One intended
+  behavior change: a copy that is interrupted, or that fails anywhere before *or during* metadata
+  application, now leaves a file readable only by its owner (`0o600`) rather than at the source
+  mode. Its owner, not necessarily the copier: the chown runs before the chmod, so a copy that
+  preserves ownership and got past that step has already handed the file to the source's uid. That
+  holds for every step because the widening `fchmod` is applied last, after the timestamps: metadata
+  application is chown → utimens → chmod, chown first so it cannot clear the `setuid` bit the chmod
+  restores, and chmod last so no failure after it can publish the final mode on a file the copy is
+  about to report as failed. The most likely instance is a copy that preserves ownership whose
+  `fchown` is refused — a non-root copier copying a file owned by someone else gets `EPERM` at the
+  first step. The copy exits non-zero naming that error either way, and a later run *normally*
+  re-copies such a file: the default `--overwrite-compare` is `size,mtime`, and a partial file
+  differs in size.
+
+  "Normally" needs two exceptions stated, because before this change a skipped retry was harmless —
+  a failed metadata application still left the file at its correct final mode, whereas now it leaves
+  the destination owner-only until something re-copies it. First, a *data-complete* file that failed
+  at the closing `fchmod` has already had its timestamps applied, so it matches its source on both
+  size and mtime and is skipped. (Something has to run last; under the previous chown → chmod →
+  utimens order this was the `futimens` failure instead. What changed is that the step which can
+  strand a file is now also the step that no longer publishes a mode the copy did not finish
+  earning.) Second, the mtime comparison skips nanoseconds whenever *either* side's `mtime_nsec` is
+  zero — a concession to filesystems that do not store sub-second timestamps — so even a file that
+  never reached `futimens`, and therefore carries its own write time, compares *equal* to its source
+  when that write and the source mtime fall in the same whole second **and** either side's
+  nanosecond field is zero. Copying a file written in that same second reaches it, as does a source
+  carrying a whole-second mtime (`touch -d @<seconds>`, a tar extraction, a reproducible-build
+  epoch) or a destination filesystem without sub-second timestamps. Comparing the mode too
+  (`--overwrite-compare=size,mtime,mode`) closes both, since a stranded destination is `0o600` and
+  its source is not; so does removing the file first.
 - Under `--require-toctou-safe`, a privileged copy/link now locks down each *reused* destination
   directory for the duration of the copy. Previously a fresh destination directory was created
   copier-owned at `0o700` and only widened to the source mode at the end, but an existing directory
@@ -114,6 +169,107 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "connection refused" — that was then preferred over the actual error. The pool is now stopped
   first (it is synchronous and lock-free, so it takes effect immediately), and a connect failure
   observed after teardown began is discarded rather than recorded.
+- Fix `rcp`/`rlink` aborting the process (`SIGABRT`, exit 134) instead of completing a copy when two
+  source operands alias the same destination directory, e.g. `rcp A/x B/x dst/` (both map to
+  `dst/x`) — the default dispatch runs operands concurrently, so the second to reach `dst/x` found a
+  directory the first had already created and tripped an internal assertion that treated "we just
+  created this directory" as proof no other writer could have populated it. Two concurrent `rcp`
+  processes into the same destination hit the same assertion. A destination directory that already
+  exists is now handled like any other pre-existing entry in this case (matching how a pre-existing
+  destination symlink was already handled), instead of aborting.
+- Fix `rcp`/`rlink` failing a file with `File exists (os error 17)` — silently bypassing
+  `--overwrite` and `--ignore-existing` — when another writer created that file first. The copy
+  skips the per-file existence check inside a destination directory it just created, on the
+  assumption that a directory it created moments ago is still empty; when that assumption is stale
+  (a second source operand whose destination aliases this one, a concurrent `rcp`, or any other
+  writer), the create failed on `O_EXCL` instead of consulting the overwrite settings, so
+  `rcp --overwrite A/x B/x dst/` failed on whichever file lost the race and `--ignore-existing`
+  failed on a file it had been asked to skip. Such a file is now resolved like any other
+  pre-existing destination: overwritten, skipped, or — with neither flag — reported with the
+  actionable "did you intend to specify `--overwrite`?" error rather than a raw `EEXIST`. The same
+  recovery now also applies to a destination the copy did *not* just create — in local copies, which
+  previously failed the same way if a file appeared in the moment between the copy checking the
+  destination and creating it, and on the remote (`rcpd`) destination, which had no recovery at all
+  and failed the file on `EEXIST` regardless of `--overwrite` or `--ignore-existing` whenever a
+  writer filled the slot after the destination classified it. That window is not instantaneous on
+  the remote side: it spans the whole `--iops-throttle` reservation, which can be seconds. None of
+  these cases costs a copy without a conflict any extra syscall.
+- Fix the remote master and `rcpd` aborting the process (`SIGABRT`, exit 134, core dump) instead of
+  reporting a clean error when a peer's control connection closed without sending an expected
+  message — the master reading a dead source or destination `rcpd`'s hello or result, and an `rcpd`
+  reading a master that vanished before sending the hello that assigns its role. Because the
+  workspace builds with `panic = "abort"`, hitting any of these four sites skipped normal unwinding:
+  the tracing guards kept alive specifically so chrome traces, flamegraphs, and histogram logs flush
+  never ran, silently discarding them, and the runtime summary was never printed. All four sites now
+  report a descriptive error naming the affected host (e.g. "destination rcpd on '\<host\>' did not
+  report a result (the process likely died - check the remote host for crashes or OOM kills)")
+  through the normal error-reporting path, exiting `1` instead of aborting. A transport error on
+  those same reads is now reported just as descriptively, keeping the underlying cause in the chain:
+  a dying `rcpd` reaches the master as a clean EOF only when the socket's receive queue happens to
+  be empty at the moment of death, and as a connection reset otherwise, and which of the two arrives
+  is not something either side controls — so previously the same crash produced a clear diagnostic
+  or a bare "connection reset by peer" depending on timing. The two are worded to say which happened
+  ("closed its control connection cleanly but did not report a result" versus "did not report a
+  result" with the transport error beneath it), because they point in different directions: a
+  connection that closed cleanly but silently means the peer exited without sending its message,
+  while one that failed can also mean the network went away.
+- Fix `--overwrite` removing a destination file before the copy was able to replace it, which could
+  leave neither the old file nor a new one. The old destination was unlinked while deciding *what to
+  do* about it, and only afterwards did the copy reserve its I/O-throttle budget and open the source
+  — so a source that turned out to be unreadable or had been swapped away had already destroyed data
+  the copy then could not replace, for a file it never held a single byte of. Deciding and doing are
+  now separate steps: the destination is classified without being touched, the source open and
+  throttle wait happen next, and only then is the old entry removed — with an inode-recheck, so an
+  entry swapped in since the decision fails closed instead of being deleted. One visible
+  consequence: a copy that fails to read a source file no longer removes that file's destination, so
+  `rm_summary.files_removed` (and `--summary`) can be lower than before for a run with read errors.
+  The remote destination (`rcpd`) had the same shape — it unlinked and only then waited on the
+  throttle — and got the same treatment; it has no source open to reorder, so there the reordering
+  shortens the gap to the create syscall rather than removing a failure from it.
+
+  This is not atomic replacement and does not try to be. `rcp` copies are point-in-time and
+  non-atomic: an interrupted or failed `--overwrite` can still leave the files it was overwriting
+  truncated or missing, and the data copy following the create is a far larger window than anything
+  before it. Making replacement atomic means staging every file under a temporary name and renaming
+  it into place, which costs performance `rcp` deliberately does not spend.
+- Fix `rcp`/`rlink` treating a destination lookup that *failed* as a destination that does not
+  exist, locally and on the remote (`rcpd`) destination alike. Only `ENOENT` means an empty slot;
+  `EACCES` on the destination directory, `EMFILE`, `EIO`, or an `ESTALE` from a network filesystem
+  all mean the copy could not look. Those were resolved to "nothing there, go ahead and create", so
+  the real errno was replaced by whatever the subsequent create reported — and `--ignore-existing`
+  failed on a file it should have skipped. Such a failure is now reported with its own cause intact.
+  The same rule now also governs both `--dry-run --ignore-existing` probes, for files and for
+  directories — the one place a destination is examined by path rather than through a pinned parent
+  directory, since a dry run holds no destination descriptor. They previously reported "would copy"
+  and exited `0` through a destination parent they could not even traverse, predicting a copy the
+  real run then fails and swallowing the error that explains why. The directory probe additionally
+  consulted `Path::is_dir()`, which FOLLOWS symlinks: a destination symlink — even one pointing at a
+  directory — read as "a directory is already there, recurse into it", while the real
+  `--ignore-existing` run classifies that same entry through the parent's descriptor (`O_NOFOLLOW`)
+  as a non-directory and skips the whole subtree. So the dry run predicted copying a subtree the
+  real run skips. That decision now comes from the metadata already probed, which also drops a
+  second, un-throttled path-resolving syscall per directory.
+- Fix local `rcp`/`rlink` reporting zero removed bytes in the summary when `--overwrite` replaced an
+  existing destination file. The live progress display counted them, so the two disagreed, and the
+  final summary and any error payload under-reported the work done. (The remote destination already
+  accounted these correctly.)
+- Fix concurrent `--auto-deploy-rcpd` deployments sharing one temporary file, and verify the
+  transferred binary before publishing it rather than after. The temp name was built from the shell
+  variable `$$`, but every path handed to the remote shell is single-quoted, so `$$` never expanded
+  and every deployment wrote to the same literal `.rcpd-<version>.tmp.$$`. Two concurrent
+  deployments to one host therefore raced on that file, and because the publishing `mv` is a rename,
+  one could publish it while the other was still writing through its own descriptor — landing those
+  writes directly on the inode now serving as the cached `rcpd`. The name is now generated by the
+  deploying process and is unique per deployment. Separately, the SHA-256 check ran against the
+  *final* path after the rename, so a truncated or corrupt transfer was briefly reachable under the
+  name other processes execute, and stayed there after the deployment reported failure; it now runs
+  against the temp file, and a mismatch removes it instead of publishing it. A failed deployment
+  also no longer leaks its staging file: the temp path is now chosen by the caller before anything
+  can create it, and every failure between choosing it and publishing exits through one cleanup
+  funnel. Previously the path was picked inside the transfer and returned only on success, so a
+  transfer that failed after the remote shell had created the file — broken pipe, full disk, killed
+  command — left it behind, one per retry, and the old-version cleanup globs `rcpd-*`, which never
+  matches these dotfiles.
 
 ## [0.37.0] - 2026-07-15
 

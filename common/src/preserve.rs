@@ -131,9 +131,12 @@ pub struct Settings {
 /// bits, mimicking `cp`). The returned value is always confined to the
 /// permission bits (`0o7777`); file-type bits are never included.
 ///
-/// This is the single source of truth for the destination create-mode and the fd-based metadata
-/// appliers in `crate::safedir`. Files and directories share this logic; pass the relevant
-/// `mode_mask` ([`FileSettings::mode_mask`] or [`DirSettings::mode_mask`]).
+/// This is the single source of truth for the mode the fd-based metadata appliers in
+/// `crate::safedir` apply. It does NOT decide the mode a destination is *created* at: destinations
+/// are always created owner-only ([`crate::safedir::DST_FILE_CREATE_MODE`] /
+/// [`crate::safedir::DST_DIR_CREATE_MODE`]) and only widened to this value once their contents are
+/// written. Files and directories share this logic; pass the relevant `mode_mask`
+/// ([`FileSettings::mode_mask`] or [`DirSettings::mode_mask`]).
 #[must_use]
 pub fn masked_mode<Meta: Metadata>(mode_mask: ModeMask, metadata: &Meta) -> u32 {
     // confine to permission bits up front so a user-supplied mask that itself includes file-type

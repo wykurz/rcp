@@ -404,6 +404,38 @@ fn extract_bind_ip_from_host(host: &str) -> Option<String> {
     }
 }
 
+/// The diagnostic for an `rcpd` whose connection FAILED before it said what happened.
+///
+/// A dying `rcpd` reaches the master two different ways, and which one is not something the master
+/// controls: the kernel delivers an RST if the socket's receive queue was non-empty when the process
+/// died, and a clean EOF if it was not. Those surface as `Err` and `Ok(None)` respectively — the same
+/// event wearing two shapes — and both mean the same thing to the user, so both are reported the same
+/// way: as what the master did not receive rather than how the connection ended. This is the `Err`
+/// half, which keeps its transport error in the chain underneath. See [`rcpd_closed_quietly`] for the
+/// other.
+fn rcpd_went_quiet(role: &str, host: &str, expected: &str) -> String {
+    format!(
+        "{role} rcpd on '{host}' did not {expected} (the process likely died - check the remote \
+         host for crashes or OOM kills)"
+    )
+}
+
+/// The [`rcpd_went_quiet`] situation reached through a clean end-of-stream instead: the peer's
+/// control connection closed with nothing left to read, so there is no transport error to report.
+///
+/// Distinct wording rather than a shared one, for two reasons. It points somewhere different — a
+/// connection that closed cleanly but silently means the peer *exited* without sending its message
+/// (a crash, an OOM kill, a `SIGKILL`), whereas a failed one can also mean the network went away. And
+/// it makes the branch observable: this is the `Ok(None)` that the master used to `.expect()`, which
+/// under `panic = "abort"` turned a diagnosable error into `SIGABRT` with its output discarded, so the
+/// regression test for it has to be able to tell the two branches apart.
+fn rcpd_closed_quietly(role: &str, host: &str, expected: &str) -> String {
+    format!(
+        "{role} rcpd on '{host}' closed its control connection cleanly but did not {expected} (the \
+         process likely died - check the remote host for crashes or OOM kills)"
+    )
+}
+
 #[instrument]
 async fn run_rcpd_master(
     args: &Args,
@@ -668,7 +700,7 @@ async fn run_rcpd_master(
             remote::tracelog::run_receiver(source_tracing_recv, remote::tracelog::RcpdType::Source)
                 .await
         {
-            tracing::debug!("Source tracing receiver ended: {e}");
+            tracing::debug!("Source tracing receiver ended: {e:#}");
         }
     });
     let dest_tracing_task = tokio::spawn(async move {
@@ -678,7 +710,7 @@ async fn run_rcpd_master(
         )
         .await
         {
-            tracing::debug!("Destination tracing receiver ended: {e}");
+            tracing::debug!("Destination tracing receiver ended: {e:#}");
         }
     });
     // build filter settings from CLI arguments for source-side filtering
@@ -703,10 +735,15 @@ async fn run_rcpd_master(
     tracing::debug!("Waiting for source rcpd to send hello");
     let source_hello = {
         let _span = tracing::trace_span!("recv_source_hello").entered();
+        // built once and used by BOTH arms, so the two cannot drift into describing the same event
+        // differently — which is the whole point of reporting them alike.
+        let went_quiet = rcpd_went_quiet("source", &src.session().host, "send its hello");
+        let closed_quietly = rcpd_closed_quietly("source", &src.session().host, "send its hello");
         source_recv_stream
             .recv_object::<remote::protocol::SourceMasterHello>()
-            .await?
-            .expect("Failed to receive source hello from source rcpd")
+            .await
+            .with_context(|| went_quiet)?
+            .ok_or_else(|| anyhow!(closed_quietly))?
     };
     // send MasterHello to destination rcpd (include source fingerprint for mutual TLS)
     {
@@ -724,17 +761,24 @@ async fn run_rcpd_master(
     tracing::info!("Forwarded source connection info to destination");
     let source_result = {
         let _span = tracing::trace_span!("wait_for_source_result").entered();
+        let went_quiet = rcpd_went_quiet("source", &src.session().host, "report a result");
+        let closed_quietly = rcpd_closed_quietly("source", &src.session().host, "report a result");
         source_recv_stream
             .recv_object::<remote::protocol::RcpdResult>()
-            .await?
-            .expect("Failed to receive RcpdResult from source rcpd")
+            .await
+            .with_context(|| went_quiet)?
+            .ok_or_else(|| anyhow!(closed_quietly))?
     };
     let dest_result = {
         let _span = tracing::trace_span!("wait_for_dest_result").entered();
+        let went_quiet = rcpd_went_quiet("destination", &dst.session().host, "report a result");
+        let closed_quietly =
+            rcpd_closed_quietly("destination", &dst.session().host, "report a result");
         dest_recv_stream
             .recv_object::<remote::protocol::RcpdResult>()
-            .await?
-            .expect("Failed to receive RcpdResult from destination rcpd")
+            .await
+            .with_context(|| went_quiet)?
+            .ok_or_else(|| anyhow!(closed_quietly))?
     };
     tracing::debug!("Received RcpdResult from both source and destination rcpds");
     // check for failures and collect error details + runtime stats
@@ -753,6 +797,7 @@ async fn run_rcpd_master(
             summary,
             runtime_stats,
         } => {
+            // rcp-error-log-allow: RcpdResult::Failure.error is a String off the wire, not a chain
             tracing::error!("Source rcpd failed: {error}");
             errors.push(format!("Source: {error}"));
             (summary, runtime_stats)
@@ -772,6 +817,7 @@ async fn run_rcpd_master(
             summary,
             runtime_stats,
         } => {
+            // rcp-error-log-allow: RcpdResult::Failure.error is a String off the wire, not a chain
             tracing::error!("Destination rcpd failed: {error}");
             errors.push(format!("Destination: {error}"));
             (summary, runtime_stats)
@@ -793,7 +839,7 @@ async fn run_rcpd_master(
     // wait for rcpd processes to fully exit and capture any error output
     for rcpd in rcpd_processes {
         if let Err(e) = remote::wait_for_rcpd_process(rcpd.child).await {
-            tracing::error!("Failed to wait for rcpd process: {e}");
+            tracing::error!("Failed to wait for rcpd process: {e:#}");
         }
     }
     tracing::info!("All rcpd processes finished");
@@ -832,6 +878,7 @@ async fn run_rcpd_master(
     // propagate any errors from rcpd processes
     if !errors.is_empty() {
         let combined_error = errors.join("; ");
+        // rcp-error-log-allow: already-rendered messages joined into a String, not a chain
         tracing::error!("rcpd operation(s) failed: {combined_error}");
         return Err(common::copy::Error::new(
             anyhow::anyhow!("rcpd operation(s) failed: {combined_error}"),

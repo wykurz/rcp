@@ -106,7 +106,7 @@ impl PortRanges {
                     return Ok(socket);
                 }
                 Err(e) => {
-                    tracing::debug!("Failed to bind to {}:{}: {}", ip, port, e);
+                    tracing::debug!("Failed to bind to {}:{}: {:#}", ip, port, e);
                     // add small delay on port collisions to reduce thundering herd
                     let is_addr_in_use = e.kind() == std::io::ErrorKind::AddrInUse;
                     last_error = Some(e);
@@ -179,7 +179,7 @@ impl PortRanges {
                     return Ok(listener);
                 }
                 Err(e) => {
-                    tracing::debug!("Failed to bind TCP to {}:{}: {}", ip, port, e);
+                    tracing::debug!("Failed to bind TCP to {}:{}: {:#}", ip, port, e);
                     // add small delay on port collisions to reduce thundering herd
                     let is_addr_in_use = e.kind() == std::io::ErrorKind::AddrInUse;
                     last_error = Some(e);

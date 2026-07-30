@@ -15,7 +15,7 @@
 
 mod support;
 
-use support::docker_env::{DockerEnv, Result};
+use support::docker_env::{DockerEnv, Result, assert_clean_failure};
 
 /// Guard that ensures cleanup always runs, even on early return or panic.
 struct IoCleanupGuard<'a> {
@@ -103,16 +103,16 @@ fn test_chaos_io_enospc_reports_error() -> Result<()> {
         &format!("host-a:{}", src_path),
         &format!("host-b:{}", dst_path),
     ])?;
-    // verify copy failed
-    assert!(
-        !output.status.success(),
-        "copy should fail when destination disk is full"
-    );
-    // verify error message mentions the root cause
     // check both stdout (verbose logs) and stderr for the error
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = format!("{}\n{}", stdout, stderr);
+    assert_clean_failure(
+        output.status,
+        &combined,
+        "copy should report a clean error when destination disk is full",
+    );
+    // verify error message mentions the root cause
     assert!(
         combined.contains("No space left on device") || combined.contains("ENOSPC"),
         "error should mention 'No space left on device' somewhere in output, got stderr: {}",
@@ -150,16 +150,16 @@ fn test_chaos_io_permission_denied_destination() -> Result<()> {
         &format!("host-a:{}", src_path),
         &format!("host-b:{}", dst_path),
     ])?;
-    // verify copy failed
-    assert!(
-        !output.status.success(),
-        "copy should fail when destination is not writable"
-    );
-    // verify error message mentions permission denied
     // check both stdout (verbose logs) and stderr for the error
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = format!("{}\n{}", stdout, stderr);
+    assert_clean_failure(
+        output.status,
+        &combined,
+        "copy should report a clean error when destination is not writable",
+    );
+    // verify error message mentions permission denied
     assert!(
         combined.contains("Permission denied") || combined.contains("permission denied"),
         "error should mention 'Permission denied' somewhere in output, got stderr: {}",
@@ -194,16 +194,16 @@ fn test_chaos_io_permission_denied_source() -> Result<()> {
         &format!("host-a:{}", src_path),
         &format!("host-b:{}", dst_path),
     ])?;
-    // verify copy failed
-    assert!(
-        !output.status.success(),
-        "copy should fail when source is not readable"
-    );
-    // verify error message mentions permission denied
     // check both stdout (verbose logs) and stderr for the error
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = format!("{}\n{}", stdout, stderr);
+    assert_clean_failure(
+        output.status,
+        &combined,
+        "copy should report a clean error when source is not readable",
+    );
+    // verify error message mentions permission denied
     assert!(
         combined.contains("Permission denied") || combined.contains("permission denied"),
         "error should mention 'Permission denied' somewhere in output, got stderr: {}",

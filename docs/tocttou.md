@@ -171,12 +171,87 @@ the named root and every entry beneath it are opened `O_NOFOLLOW`, classified by
 fd, and operated on via fd-relative syscalls — and for chmod/chown/hard-link, via the entry's pinned
 `O_PATH` fd through `/proc/self/fd` — so a swapped-in symlink is never followed out of the subtree.
 
-**2. Permission and ownership fidelity.** The destination (`rcp`/`rlink`) or the modified entry
-(`rchm`) receives exactly the permissions and ownership of the source object that was actually read;
-a concurrent swap can never make the tool **widen** permissions or attach the wrong owner — e.g. it
-cannot write a `0600` root-owned file's contents out as world-readable. Mode and bytes are taken
-from the *same* fd, and metadata is applied through the destination's own held fd, never re-resolved
-by path.
+**2. Permission and ownership fidelity.** The permissions and ownership the destination
+(`rcp`/`rlink`) or the modified entry (`rchm`) ends up with are those of the source object that was
+**actually read**, as selected by the `--preserve` policy in force — not necessarily a byte-for-byte
+copy of the source mode. What the policy selects is a separate question from this guarantee: the
+default mask is `0o0777` (special bits stripped, like `cp`), and ownership is preserved only when
+`uid`/`gid` are requested, so by default the destination is owned by the copier. The guarantee is
+about *fidelity to the object that was read*: a concurrent swap can never make the tool **widen**
+permissions beyond what the policy selected for the source it read, or attach another object's owner
+— e.g. it cannot write a `0600` root-owned file's contents out as world-readable. Mode and bytes are
+taken from the *same* fd, and metadata is applied through the destination's own held fd, never
+re-resolved by path.
+
+**Fidelity holds throughout the copy, not only at the end: destination files are created owner-only
+until their contents are written.** A destination file is created at `0o600` and only widened to the
+source mode by the closing `fchmod`, after the last byte and after every other metadata step — the
+file counterpart of the directory split-chmod below. Creating it at the final mode instead publishes
+the destination's *audience* before its contents exist. At default settings that is an exposure of
+partial contents: the mode mask is `0o0777` (`setuid`/`setgid`/sticky stripped, matching `cp`), so a
+world-readable source yields a world-readable destination from creation onward, and anyone who can
+reach the directory can read however much has landed. No symlink swap is needed — a world-searchable
+destination directory is enough, which is the default for any repeat or incremental
+`rcp --overwrite`. Withholding the owner execute bit is deliberate as well — a half-written
+executable should not be executable.
+
+The escalation case (Scenario 4 above) needs the special bits preserved — `--preserve`, or a
+`--preserve-settings` mask of `7777` — **and** an interrupted copier. Root holds `CAP_FSETID` —
+*"don't clear set-user-ID and set-group-ID mode bits when a file is modified"* — so writing does not
+strip `S_ISUID` from a root copier's destination, and a `SIGKILL`, OOM kill, or crash after the last
+byte left a complete, functional, setuid-root executable whose contents the *source's* owner
+authored. Be precise about which window that is: the **successful** copy was never an exec window on
+Linux, because the destination stays open for writing through metadata application and `execve`
+refuses a file any process holds open for writing with `ETXTBSY`. It is the copier's *death* that
+closes that descriptor and drops the protection, which is exactly when the old creation mode had
+already published a finished-looking setuid binary.
+
+This is unconditional, not gated behind `--require-toctou-safe`: a file the copy creates is its own
+new object with no prior user-visible state to preserve, exactly like a fresh directory. The mode is
+not a parameter of the creating call, so no call site can opt out. One consequence is intended: a
+copy that is interrupted, or that fails anywhere before *or during* metadata application, leaves a
+file readable only by its **owner**, at `0o600`. "Owner", not "copier", because the chown runs
+first: a copy that preserves ownership and gets past that step has already handed the file to the
+source's uid, so a later failure leaves it owner-only under *that* uid rather than the copier's. (No
+exposure either way — the source's owner authored the contents and could already read them, and only
+a privileged copier can chown to another uid in the first place — but the file is not necessarily
+one the copier can still read.) That the mode stays `0o600` at all holds at every step because the
+widening `fchmod` runs last: metadata application is chown → utimens → chmod, chown first so it
+cannot clear the `setuid` bit the chmod restores, and chmod last so no later failure can publish the
+final mode on a file the copy is about to report as failed. The most likely instance is a copy that
+preserves ownership whose `fchown` is refused — a non-root copier copying a file owned by someone
+else gets `EPERM` at the first step. The failure is reported and the copy exits non-zero either way,
+and a later run *normally* re-copies the file: the default `--overwrite-compare` is `size,mtime`,
+and a partial file differs in size.
+
+That re-copy is not guaranteed, and the exceptions are worth stating precisely, because before this
+change a skipped retry was harmless — a failed metadata application still left the file at its
+correct final mode, whereas now it leaves the destination owner-only until something re-copies it.
+There are two. **A failure at the closing `fchmod`**: the timestamps have already been applied by
+then, so the destination matches its source on both size and mtime and is skipped. Something has to
+run last, and under the previous chown → chmod → utimens order this was the `futimens` failure
+instead; what changed is that the step which can strand a file is now also the step that no longer
+publishes a mode the copy did not finish earning. **The nanosecond concession**: `metadata_equal`
+skips the nanosecond comparison whenever *either* side's `mtime_nsec` is zero, for filesystems that
+do not store sub-second timestamps (`common/src/filecmp.rs`), so even a destination that never
+reached `futimens` — and so carries its own write time — compares **equal** to its source under the
+default `size,mtime` (mode is not compared) exactly when two conditions hold together: that write
+and the source mtime fall in the **same whole second**, **and** the nanosecond field is zero on
+**either** side. Copying a file written in that same second reaches it, as does any source carrying
+a whole-second mtime (`touch -d @<seconds>`, a tar extraction, a reproducible-build epoch) or a
+destination filesystem without sub-second timestamps. Adding the mode to the comparison
+(`--overwrite-compare=size,mtime,mode`) closes both — a stranded destination is `0o600` and its
+source is not — as does removing the destination first. Neither deleting the file on a metadata
+failure nor changing the comparison default is done here: both are behavior changes that need their
+own design.
+
+One sharp edge of that ordering is *not* transient: `--preserve-settings="f:time,7777"` asks for the
+source's mode but not its ownership, and the `fchown` is issued only when `uid` or `gid` is
+preserved — so a setuid source produces a destination that is **permanently** setuid *and* owned by
+the copier, which for a root copier is a setuid-root binary whose contents the *source's* owner
+authored. Nothing later narrows it: that is the requested outcome, not a window. It matches
+`cp --preserve=mode`, and asking for a source's mode without its ownership is an explicit choice —
+but preserve both or neither when the source tree is not yours.
 
 **"The named root"** is the final component of the operand path — the file or directory you name. It
 is opened `O_NOFOLLOW` and classified by the `fstat` of that held fd, so a swap of the root *entry
@@ -196,6 +271,20 @@ subtree's contents, so operating on the swapped-in file grants them nothing they
 have. Both guarantees above still hold across such a swap — you cannot escape the subtree
 (Containment), and permissions are never widened because mode and bytes come from the *same* fd
 (Fidelity). We do not attempt to detect or prevent concurrent modification beyond that.
+
+**Atomic replacement of a destination, or rollback of an interrupted one.** `rcp` copy semantics are
+point-in-time and non-atomic. Under `--overwrite`, a file being replaced can be left truncated (the
+copy died while writing data) or absent (it died between the removal and the create), and the
+previous contents are not recoverable in either case. The removal is deliberately ordered *after*
+the source open, so a copy that could never have produced a single byte — an unreadable or
+swapped-away source — does not destroy what it was going to replace; but that is a
+failure-*ordering* property, not cancellation safety. `Ctrl-C`, a `SIGKILL`, or a `--fail-early`
+abort triggered by an unrelated file can still land in the gap, and the data copy that follows the
+create is a far larger window than the gap itself. Closing this would mean staging every file under
+a temporary name and renaming it into place, at a cost in throughput and in orphaned staging files
+that `rcp` deliberately does not pay. This is not a security boundary: the files at risk are exactly
+the ones the copy was instructed to replace, the loss is confined to the destination subtree, and no
+privilege or containment property above depends on it.
 
 **Whether the operand path *itself* is trustworthy.** The directories *above* the named root — the
 prefix the tool follows to reach it — are resolved normally (following symlinks). The tools do
@@ -277,19 +366,30 @@ children written afterward (each child's contents stay protected by its own sour
 This is destination-only and strict-mode-only; the default path leaves reused directories exactly
 as-is (their permissions may then block writing, which is the pre-existing behavior).
 
-**Limitation — case-folding/normalizing destinations.** The lockdown coordinates each reused
-directory's lifecycle per resolved destination path, and strict *multi-source* copies are
-serialized, but sibling directories *within* one tree are still copied concurrently. If the
-destination filesystem folds or normalizes distinct source names onto one inode (e.g. `Foo/` and
-`foo/` on a case-insensitive mount), two concurrent tasks can lock down and restore the *same*
-destination inode, so one task's restore — widening the mode, or chowning back to the original owner
-— can fire while the other is still writing children, transiently reverting that shared directory to
-its un-hardened exposure for the overlap. This is narrow (it needs a folding destination *and*
-source siblings that alias on it), and the underlying concurrent merge of two source directories
-into one destination inode is pre-existing and independent of this hardening. Closing it fully
-requires coordinating every directory lifecycle — fresh *and* reused — by `(dev, ino)` across the
-local, `rlink`, and remote engines (fail closed on an in-flight alias); it is tracked as a
-follow-up.
+**Limitation — distinct source directories merging into one destination.** The lockdown coordinates
+each reused directory's lifecycle per resolved destination path, and strict *multi-source* copies
+are serialized, but sibling directories *within* one tree are still copied concurrently. Two source
+directories can end up sharing one destination inode in two ways. **Explicitly**, when the operands
+name it: `rcp A/x B/x dst/` maps both onto `dst/x`, and the default dispatch runs the operands
+concurrently. **Implicitly**, when the destination filesystem folds or normalizes distinct source
+names onto one inode (e.g. `Foo/` and `foo/` on a case-insensitive mount).
+
+Either way, two concurrent tasks share one directory's lifecycle and each finalizes it
+independently, with three consequences. A restore — widening the mode, or chowning back to the
+original owner — can fire while the other task is still writing children, transiently reverting that
+shared directory to its un-hardened exposure. A finalize that applies a non-writable source mode
+(`0o555`, say) while the other task still has children to create fails *that* task with a reported
+`EACCES`. And a nested directory the other task filtered out can be removed as locally empty before
+it is populated.
+
+None of these is a Containment or Fidelity break — children are still created
+`O_CREAT|O_EXCL|O_NOFOLLOW` through the task's own held fd, and mode and bytes still come from the
+same source fd — and the underlying concurrent merge of two source directories into one destination
+inode is pre-existing and independent of this hardening. `--require-toctou-safe` rejects duplicate
+destinations outright, so it does not reach the explicit case; the folding case is not detectable
+lexically, so it does. Closing this fully requires coordinating every directory lifecycle — fresh
+*and* reused — by `(dev, ino)` across the local, `rlink`, and remote engines (fail closed on an
+in-flight alias); it is tracked as a follow-up.
 
 **Limitation — concurrent privileged invocations require a single writer.** The lockdown coordinates
 each reused directory's lifecycle only WITHIN a single process (strict multi-source copies in one
@@ -350,6 +450,12 @@ Specific invariants enforced:
   `EINVAL`.
 - Metadata operations (chown, chmod, utimes, and critically symlink timestamps) use fd-based
   syscalls. File data is copied via `copy_file_range` between held fds.
+- **Destination objects are created narrow and widened last.** A new destination directory is
+  created at `0o700` and a new destination file at `0o600`; the source mode is applied only once the
+  object is complete (all children written, all bytes written). Nothing is ever reachable at its
+  final — possibly setuid — mode before its contents exist; see
+  [Scope of TOCTOU safety](#scope-of-toctou-safety). The file creation mode is a constant rather
+  than a parameter of the creating call, so no call site can opt out of it.
 - On overwrite paths, a `recheck` verifies that the `(dev, ino)` of the entry matches the originally
   classified handle before performing the unlink.
 - Directory names passed to any `*at()` call are validated to be single path components (no `/`,

@@ -21,6 +21,38 @@ use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, fchownat, linkat, symlinkat, 
 
 use crate::walk::EntryKind;
 
+// ── Destination creation modes ───────────────────────────────────────────────
+
+/// The mode a destination FILE is created with, before it has any contents.
+///
+/// Owner-only. The source mode is applied by [`set_file_metadata_fd`] once the last byte has been
+/// written, so the file is never visible to anyone but the copier while it is being filled in —
+/// the file counterpart of the directory split-chmod (see [`DST_DIR_CREATE_MODE`]).
+///
+/// Creating at the *final* mode instead would publish the destination before its contents exist,
+/// giving a half-written file the audience its finished form was meant to have — at the default
+/// `0o0777` mask, a world-readable source yields a world-readable destination from creation onward.
+/// The sharper case needs the special bits preserved: a root copier holds `CAP_FSETID`, so writing
+/// does not clear `S_ISUID`, and the destination carries `setuid` root while the source's owner is
+/// still authoring its contents. That is not an exec window while the copy *runs* — our own write
+/// descriptor is open, and `execve` refuses a file any process holds open for writing with `ETXTBSY`.
+/// It is the copier's **death** that closes that descriptor and drops the protection, which is
+/// exactly when the old creation mode had already published a finished-looking setuid binary (see
+/// `docs/tocttou.md`). Withholding the owner execute bit is deliberate too — a half-written
+/// executable should not be executable.
+///
+/// This is a constant rather than a [`Dir::create_file`] parameter so that no call site, present or
+/// future, can create a destination file at a wide mode. Like any creation mode it is subject to
+/// the umask, which can only narrow it further.
+pub const DST_FILE_CREATE_MODE: u32 = 0o600;
+
+/// The mode a destination DIRECTORY is created with, before it has any children.
+///
+/// Owner-only, plus the execute bit the copier needs to populate it. The source mode is applied
+/// after every child has been written — by `CopyVisitor::dir_post` locally, and on directory
+/// completion remotely.
+pub const DST_DIR_CREATE_MODE: u32 = 0o700;
+
 // ── Strict operand resolution (--require-toctou-safe) ────────────────────────
 //
 // A process-global, one-way switch armed by the TOCTOU linter (see
@@ -1093,8 +1125,11 @@ impl Dir {
 
     /// Create a new child file, failing if it already exists and never following a symlink.
     ///
-    /// `mode` is the creation mode (subject to umask); exact permissions are set
-    /// later via fchmod. Returns the open writable `File` on success.
+    /// The file is ALWAYS created at [`DST_FILE_CREATE_MODE`] — there is deliberately no mode
+    /// parameter, so a caller cannot publish a destination file at its final (possibly setuid)
+    /// mode before its contents exist. [`set_file_metadata_fd`] widens it to the source mode after
+    /// the last byte. Returns the open writable `File` on success; the returned fd is writable
+    /// whatever the mode says, having been opened `O_WRONLY` at creation.
     ///
     /// `O_EXCL` is the primary guard: combined with `O_CREAT`, it fails with
     /// `EEXIST` on any pre-existing entry — including a symlink — without
@@ -1103,7 +1138,7 @@ impl Dir {
     ///
     /// Fails with `EINVAL` if `name` is not a single path component, or `EEXIST`
     /// if a file or symlink at `name` already exists.
-    pub async fn create_file(&self, name: &OsStr, mode: u32) -> std::io::Result<std::fs::File> {
+    pub async fn create_file(&self, name: &OsStr) -> std::io::Result<std::fs::File> {
         if !is_single_component(name) {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
@@ -1116,7 +1151,7 @@ impl Dir {
                 | OFlag::O_WRONLY
                 | OFlag::O_NOFOLLOW
                 | OFlag::O_CLOEXEC;
-            let file_mode = Mode::from_bits_truncate(mode);
+            let file_mode = Mode::from_bits_truncate(DST_FILE_CREATE_MODE);
             openat(dir.as_fd(), name.as_bytes(), flags, file_mode)
                 .map(std::fs::File::from)
                 .map_err(nix_to_io)
@@ -1285,9 +1320,14 @@ pub async fn lockdown_reused_dir(
 // entry and re-touching it by name (which is why the fd-based appliers replaced
 // the path-based ones entirely).
 //
-// Every applier follows the chown → chmod → utimens ordering: chown first (it
-// clears setuid/setgid on regular files), chmod second (restores them), utimens
-// last (chown and chmod both touch ctime/mtime). All syscalls are gated through
+// Every applier does chown BEFORE chmod: an unprivileged `fchown` clears
+// setuid/setgid on a regular file, so the chmod has to come after to restore
+// them. `set_file_metadata_fd` additionally puts the chmod LAST, after utimens —
+// it is the step that widens a destination file from the owner-only mode it was
+// created at (`DST_FILE_CREATE_MODE`) to the source mode, so it must not land
+// until every other fallible step has succeeded. Ordering the two is free:
+// `fchmod` touches ctime only, never atime/mtime, so the timestamps `futimens`
+// installs are the same either way. All syscalls are gated through
 // `run_metadata_probed_blocking` with `MetadataOp::Chmod`, bucketing
 // chown/chmod/utimens together.
 
@@ -1575,8 +1615,8 @@ async fn symlink_utimes_fd(
     .await
 }
 
-/// Apply file metadata (owner, mode, timestamps) to an already-open writable
-/// file descriptor, following the chown → chmod → utimens ordering.
+/// Apply file metadata (owner, timestamps, mode) to an already-open writable
+/// file descriptor, in the chown → utimens → chmod order.
 ///
 /// `fd` must be the destination file's own fd (typically the write fd returned
 /// by [`Dir::create_file`]); this avoids the redundant `File::open` re-open a
@@ -1584,6 +1624,24 @@ async fn symlink_utimes_fd(
 /// Gating on `settings.file`: chown only when uid or gid is requested, chmod
 /// always (the masked
 /// mode honors `mode_mask`), timestamps only when requested.
+///
+/// The chmod being UNCONDITIONAL and LAST is what makes [`DST_FILE_CREATE_MODE`] safe to use for
+/// every destination file. Unconditional: this call is the single place the file's mode is decided,
+/// so no `--preserve` setting can leave a successfully copied file owner-only. Last: it is the step
+/// that *widens* the file from owner-only to the source mode, so it must not land until every other
+/// fallible step has, or a failure part-way through metadata application would publish the final
+/// mode on a file the copy is about to report as failed.
+///
+/// A file whose copy fails anywhere before that chmod therefore stays owner-only — deliberately. It
+/// is reported as an error, and its size/mtime then *normally* differ from the source so a later run
+/// re-copies it. Two cases where they do not, leaving the file owner-only until something else
+/// re-copies it: a failure at the chmod ITSELF, which comes after the timestamps have been applied,
+/// so the destination matches its source on both size and mtime; and the nanosecond concession in
+/// [`metadata_equal`], which skips that comparison when either side's `mtime_nsec` is zero, so even
+/// a file that never reached `futimens` compares equal when its write and the source's mtime land
+/// in the same whole second. See `docs/tocttou.md`.
+///
+/// [`metadata_equal`]: crate::filecmp::metadata_equal
 pub async fn set_file_metadata_fd<Meta: crate::preserve::Metadata>(
     settings: &crate::preserve::Settings,
     meta: &Meta,
@@ -1596,8 +1654,6 @@ pub async fn set_file_metadata_fd<Meta: crate::preserve::Metadata>(
         let gid = if ut.gid { Some(meta.gid()) } else { None };
         fchown_fd(fd, side, uid, gid).await?;
     }
-    let mode = crate::preserve::masked_mode(settings.file.mode_mask, meta);
-    fchmod_fd(fd, side, mode).await?;
     if ut.time {
         futimens_fd(
             fd,
@@ -1609,6 +1665,8 @@ pub async fn set_file_metadata_fd<Meta: crate::preserve::Metadata>(
         )
         .await?;
     }
+    let mode = crate::preserve::masked_mode(settings.file.mode_mask, meta);
+    fchmod_fd(fd, side, mode).await?;
     Ok(())
 }
 
@@ -1952,7 +2010,7 @@ mod tests {
             assert_eq!(dir_err.raw_os_error(), Some(libc::EINVAL));
             let file_err = root.open_file_read(OsStr::new(bad)).await.unwrap_err();
             assert_eq!(file_err.raw_os_error(), Some(libc::EINVAL));
-            let create_err = root.create_file(OsStr::new(bad), 0o644).await.unwrap_err();
+            let create_err = root.create_file(OsStr::new(bad)).await.unwrap_err();
             assert_eq!(create_err.raw_os_error(), Some(libc::EINVAL));
         }
         Ok(())
@@ -2045,7 +2103,7 @@ mod tests {
         // use a dest-side dir for the write target
         let root =
             Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
-        let mut file = root.create_file(OsStr::new("new.txt"), 0o644).await?;
+        let mut file = root.create_file(OsStr::new("new.txt")).await?;
         use std::io::Write;
         file.write_all(b"hello safedir")?;
         drop(file);
@@ -2062,10 +2120,7 @@ mod tests {
         let root =
             Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
         // "0.txt" already exists in the fixture
-        let err = root
-            .create_file(OsStr::new("0.txt"), 0o644)
-            .await
-            .unwrap_err();
+        let err = root.create_file(OsStr::new("0.txt")).await.unwrap_err();
         assert_eq!(
             err.raw_os_error(),
             Some(libc::EEXIST),
@@ -2082,7 +2137,7 @@ mod tests {
             Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
         let sub = root.make_dir(OsStr::new("sub"), 0o755).await?;
         // the returned Dir must be usable: create a file inside it
-        sub.create_file(OsStr::new("child.txt"), 0o644).await?;
+        sub.create_file(OsStr::new("child.txt")).await?;
         // and read_entries on the sub dir must show that file
         let entries = sub.read_entries().await?;
         let names: Vec<_> = entries
@@ -2192,10 +2247,7 @@ mod tests {
         let target_path = tmp.join("foo/should_not_be_created");
         tokio::fs::symlink(&target_path, &link_path).await?;
         // create_file must fail, not follow the symlink and create the target
-        let err = root
-            .create_file(OsStr::new("evil_link"), 0o644)
-            .await
-            .unwrap_err();
+        let err = root.create_file(OsStr::new("evil_link")).await.unwrap_err();
         // O_CREAT|O_EXCL returns EEXIST on an existing symlink without following it
         assert_eq!(
             err.raw_os_error(),
@@ -2664,7 +2716,7 @@ mod tests {
         let src_meta = src_handle.meta().clone();
 
         // create the destination file and write some content into it
-        let mut dst_file = root.create_file(OsStr::new("dst_meta.txt"), 0o600).await?;
+        let mut dst_file = root.create_file(OsStr::new("dst_meta.txt")).await?;
         dst_file.write_all(b"destination")?;
         dst_file.flush()?;
 
@@ -2704,7 +2756,7 @@ mod tests {
         Ok(())
     }
 
-    // set_file_metadata_fd: the chown → chmod ordering must preserve a setuid bit.
+    // set_file_metadata_fd: chown before chmod must preserve a setuid bit.
     // An unprivileged fchown (even to the current uid) clears setuid/setgid; doing
     // chown FIRST and chmod AFTER restores it. This test proves that ordering.
     #[tokio::test]
@@ -2728,7 +2780,7 @@ mod tests {
         );
 
         // destination starts without the setuid bit
-        let mut dst_file = root.create_file(OsStr::new("setuid_dst"), 0o600).await?;
+        let mut dst_file = root.create_file(OsStr::new("setuid_dst")).await?;
         dst_file.write_all(b"x")?;
         dst_file.flush()?;
 
@@ -2749,6 +2801,77 @@ mod tests {
             dst_md.permissions().mode() & 0o7777,
             0o4755,
             "setuid bit was lost — chown must run before chmod"
+        );
+        Ok(())
+    }
+
+    // set_file_metadata_fd: the widening chmod must be the LAST step. A destination file is created
+    // owner-only and this call is the only thing that widens it to the source mode, so a fallible
+    // step running AFTER the chmod would publish that final mode — here a setuid one — on a file the
+    // copy is about to report as failed. `futimens` is that step. An out-of-range nanosecond field
+    // makes it fail deterministically, with no privileged uid or hostile filesystem needed.
+    #[tokio::test]
+    async fn set_file_metadata_fd_keeps_the_file_owner_only_when_utimens_fails()
+    -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RejectedTimestamps;
+        impl crate::preserve::Metadata for RejectedTimestamps {
+            fn uid(&self) -> u32 {
+                // SAFETY: `getuid` has no preconditions and cannot fail.
+                unsafe { libc::getuid() }
+            }
+            fn gid(&self) -> u32 {
+                // SAFETY: `getgid` has no preconditions and cannot fail.
+                unsafe { libc::getgid() }
+            }
+            fn atime(&self) -> i64 {
+                0
+            }
+            fn atime_nsec(&self) -> i64 {
+                0
+            }
+            fn mtime(&self) -> i64 {
+                0
+            }
+            // utimensat rejects a nanosecond field outside [0, 999999999] that is neither UTIME_NOW
+            // nor UTIME_OMIT with EINVAL.
+            fn mtime_nsec(&self) -> i64 {
+                2_000_000_000
+            }
+            fn permissions(&self) -> std::fs::Permissions {
+                std::fs::Permissions::from_mode(0o4755)
+            }
+        }
+
+        let tmp = testutils::setup_test_dir().await?;
+        let root =
+            Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
+        let dst_file = root.create_file(OsStr::new("late_chmod")).await?;
+        let dst_path = tmp.join("foo/late_chmod");
+        assert_eq!(
+            std::fs::metadata(&dst_path)?.permissions().mode() & 0o7777,
+            DST_FILE_CREATE_MODE,
+            "every destination file starts owner-only"
+        );
+
+        // preserve_all: uid/gid so the chown runs first, time so the futimens is reached, and
+        // mode_mask 0o7777 so the chmod that must NOT run would have set the setuid bit.
+        let error = set_file_metadata_fd(
+            &crate::preserve::preserve_all(),
+            &RejectedTimestamps,
+            dst_file.as_fd(),
+            congestion::Side::Destination,
+        )
+        .await
+        .expect_err("an out-of-range nanosecond field must fail futimens");
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        drop(dst_file);
+
+        assert_eq!(
+            std::fs::metadata(&dst_path)?.permissions().mode() & 0o7777,
+            DST_FILE_CREATE_MODE,
+            "a failure during metadata application must not leave the final mode behind"
         );
         Ok(())
     }
@@ -2892,7 +3015,7 @@ mod tests {
         let original_ino = h.ino();
         // replace f with a completely new file (different inode)
         root.unlink_at(OsStr::new("f")).await?;
-        root.create_file(OsStr::new("f"), 0o644).await?;
+        root.create_file(OsStr::new("f")).await?;
         // verify the replacement has a different inode
         let fresh_via_child = root.child(OsStr::new("f")).await?;
         assert_ne!(

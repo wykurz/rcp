@@ -1107,7 +1107,6 @@ async fn link_dir_entry(
         dst_name,
         dst_path,
         &settings.copy_settings,
-        is_fresh,
     )
     .await
     .map_err(|err| {
@@ -2555,7 +2554,7 @@ mod link_tests {
         {
             Ok(_) => panic!("Expected the link to error!"),
             Err(error) => {
-                tracing::info!("{}", &error);
+                tracing::info!("{:#}", &error);
                 assert_eq!(error.summary.hard_links_created, 3);
                 assert_eq!(error.summary.copy_summary.files_copied, 0);
                 assert_eq!(error.summary.copy_summary.symlinks_created, 0);

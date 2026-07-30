@@ -1183,14 +1183,35 @@ impl WalkVisitor for CopyVisitor {
                 // strict: fd-relative probe so a symlinked destination prefix fails closed
                 matches!(strict_dry_run_dst_kind(&dst_path).await?, Some(kind) if kind != EntryKind::Dir)
             } else {
-                crate::walk::run_metadata_probed(
+                match crate::walk::run_metadata_probed(
                     congestion::Side::Destination,
                     congestion::MetadataOp::Stat,
                     tokio::fs::symlink_metadata(&dst_path),
                 )
                 .await
-                .is_ok()
-                    && !dst_path.is_dir()
+                {
+                    // Decide from the metadata already in hand rather than asking again with
+                    // `Path::is_dir()`. That call FOLLOWED symlinks, so a destination symlink — even
+                    // one pointing at a directory — read as "a directory is there, recurse", while the
+                    // real `--ignore-existing` run classifies the same entry through the parent's fd
+                    // (`O_NOFOLLOW`) as a non-directory and skips the whole subtree. The dry run
+                    // predicted a copy the real run does not perform. It was also a second,
+                    // un-throttled syscall re-resolving a path we had just probed.
+                    Ok(meta) => !meta.is_dir(),
+                    // `NotFound` is the ONE error that means the slot is empty — the same rule
+                    // [`dry_run_dst_exists`] and [`plan_dst_file`] follow. Every other failure
+                    // (`EACCES` on a destination parent, `ELOOP`, `ENOTDIR`, `EIO`) says we could not
+                    // look, and reporting those as "nothing there" made `--dry-run` announce
+                    // "would copy" and exit 0 for a subtree the real run cannot even reach.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => {
+                        return Err(Error::new(
+                            anyhow::Error::new(error)
+                                .context(format!("cannot probe destination {dst_path:?}")),
+                            Default::default(),
+                        ));
+                    }
+                }
             };
             if dst_nondir_exists {
                 match self.settings.dry_run {
@@ -1250,7 +1271,6 @@ impl WalkVisitor for CopyVisitor {
             &dst_name,
             &dst_path,
             &self.settings,
-            is_fresh,
         )
         .await?
         {
@@ -1351,6 +1371,35 @@ async fn strict_dry_run_dst_kind(dst_path: &std::path::Path) -> Result<Option<En
         })
 }
 
+/// Does anything occupy the destination path, as seen from a **dry-run**?
+///
+/// Dry-run holds no destination fd, so this is the one place a destination is probed by path rather
+/// than through a pinned parent. A real copy never calls it: there the create itself reports the
+/// conflict, which is both cheaper and not subject to a swap between probe and act.
+///
+/// Call ONLY when the answer is used (`--ignore-existing`). Under strict operand resolution the
+/// probe can *fail*, and an unused one must never fail a valid `--dry-run --delete` onto a final
+/// destination symlink.
+async fn dry_run_dst_exists(dst_path: &std::path::Path) -> Result<bool, Error> {
+    if crate::safedir::strict_operand_resolution() {
+        return Ok(strict_dry_run_dst_kind(dst_path).await?.is_some());
+    }
+    match tokio::fs::symlink_metadata(dst_path).await {
+        Ok(_) => Ok(true),
+        // `NotFound` is the ONE error that means the slot is empty — the same rule [`plan_dst_file`]
+        // and the remote destination follow. Every other failure (EACCES on a parent directory,
+        // ELOOP, ENOTDIR, EIO) says we could not LOOK, not that there is nothing there. Reporting
+        // those as vacant made `--dry-run --ignore-existing` print "would copy" and exit 0 through a
+        // destination parent it cannot even traverse — predicting a copy the real run then fails, and
+        // swallowing the one error that explains why.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error::new(
+            anyhow::Error::new(error).context(format!("cannot probe destination {dst_path:?}")),
+            Default::default(),
+        )),
+    }
+}
+
 /// Copy a regular file fd-relative: create (or overwrite) the destination via `dst_parent`,
 /// copy the bytes with `copy_file_range_all`, then apply metadata through the destination's own
 /// fd — the open is held from creation through metadata, closing the path-based re-open TOCTOU
@@ -1374,29 +1423,23 @@ async fn copy_file_fd(
     // collide with `std::os::unix::fs::MetadataExt` on `std::fs::Metadata` elsewhere in this file.
     use crate::preserve::Metadata as _;
     let src_meta = src_handle.meta();
-    // --ignore-existing: skip if the destination already exists (any type, including a dangling
-    // symlink). probe via the held dst fd in a real copy; in dry-run there is no held fd
-    // (`dst_parent` is None), so probe by path — or, under strict operand resolution, fd-relative
-    // via the destination's parent so a symlinked destination prefix fails closed. Probe ONLY when
-    // the result is used (`--ignore-existing`): an unused probe must never fail a valid
-    // `--dry-run --delete` onto a final destination symlink.
-    let dst_exists = match dst_parent {
-        Some(dst_parent) => dst_parent.child(dst_name).await.is_ok(),
-        None if !is_fresh && settings.ignore_existing => {
-            if crate::safedir::strict_operand_resolution() {
-                strict_dry_run_dst_kind(dst_path).await?.is_some()
-            } else {
-                tokio::fs::symlink_metadata(dst_path).await.is_ok()
-            }
-        }
-        None => false,
-    };
-    if !is_fresh && settings.ignore_existing && dst_exists {
+    // --ignore-existing in DRY-RUN: skip if the destination already exists (any type, including a
+    // dangling symlink). A real copy does NOT probe here — [`resolve_dst_file`] below is the single
+    // owner of every conflict decision, `--ignore-existing` included, and it reaches that decision
+    // on both of its routes, so an fd-based probe here would be a redundant `child()` whose only
+    // distinct effect was to mistake a lookup *failure* (EACCES, EMFILE, ESTALE) for a vacant slot.
+    if dst_parent.is_none()
+        && !is_fresh
+        && settings.ignore_existing
+        && dry_run_dst_exists(dst_path).await?
+    {
         if let Some(mode) = settings.dry_run {
             match mode {
                 DryRunMode::Brief => {}
                 DryRunMode::All => println!("skip file {:?}", dst_path),
-                DryRunMode::Explain => println!("skip file {:?} (destination exists)", dst_path),
+                DryRunMode::Explain => {
+                    println!("skip file {:?} (destination exists)", dst_path)
+                }
             }
         }
         tracing::debug!("destination exists, skipping (--ignore-existing)");
@@ -1417,71 +1460,116 @@ async fn copy_file_fd(
     }
     // dst_parent is guaranteed Some here: it is None only in dry-run, which returned above.
     let dst_parent = dst_parent.expect("destination parent must be open for a real copy");
-    get_file_iops_tokens(settings.chunk_size, src_meta.size()).await;
-    let mut rm_summary = RmSummary::default();
-    // when the destination tree is not known-fresh, an entry may already exist. classify it and
-    // decide whether to skip (identical / newer), error (no --overwrite), or remove it first.
-    if !is_fresh && let Ok(dst_handle) = dst_parent.child(dst_name).await {
-        if !settings.overwrite {
-            return Err(Error::new(
-                anyhow!(
-                    "destination {:?} already exists, did you intend to specify --overwrite?",
-                    dst_path
-                ),
-                Default::default(),
-            ));
-        }
-        tracing::debug!("file exists, check if it's identical");
-        if dst_handle.kind() == EntryKind::File {
-            if filecmp::metadata_equal(&settings.overwrite_compare, src_meta, dst_handle.meta()) {
-                tracing::debug!("file is identical, skipping");
-                prog_track.files_unchanged.inc();
-                return Ok(Summary {
-                    files_unchanged: 1,
-                    ..Default::default()
-                });
-            }
-            if let Some(OverwriteFilter::Newer) = settings.overwrite_filter
-                && filecmp::dest_is_newer(src_meta, dst_handle.meta())
-            {
-                tracing::debug!("dest is newer than source, skipping");
-                prog_track.files_unchanged.inc();
-                return Ok(Summary {
-                    files_unchanged: 1,
-                    ..Default::default()
-                });
-            }
-        }
-        tracing::info!("destination differs, removing existing entry");
-        rm_summary = remove_existing(
-            prog_track,
-            dst_parent,
-            dst_name,
-            dst_path,
-            &dst_handle,
-            settings,
+    // `copy_summary` accumulates what has already happened to the destination, so every error
+    // payload below reports the removals an overwrite performed.
+    let mut copy_summary = Summary::default();
+    // PLAN, then acquire, then MUTATE. Deciding what to do about the destination is separated from
+    // doing it (see [`plan_dst_file`]) so the SOURCE OPEN — the step most likely to fail for an
+    // outside reason before a single byte of replacement data exists — happens while the destination
+    // is still intact. An overwrite that unlinked before it would leave the user with neither file
+    // whenever the source turned out to be unreadable or had been swapped away: a copy that could
+    // never have produced bytes must not destroy what it was going to replace. The ordering is free,
+    // which is the whole reason to have it.
+    //
+    // This is NOT cancellation safety and does not try to be. `create_file` waits on the ops-throttle
+    // internally, so the removal below and the create after it are not one committed step:
+    // cancellation (Ctrl-C, a `--fail-early` sibling abort) can land between them and leave the
+    // destination absent, and `create_file` can itself fail with EMFILE/ENOSPC/EIO. rcp's copy
+    // semantics are point-in-time and non-atomic (docs/remote_protocol.md) — an interrupted
+    // `--overwrite` corrupting the files it was overwriting is accepted, and the data copy in the very
+    // next step would leave a truncated destination anyway. Closing that gap means staging plus
+    // rename, which costs performance rcp deliberately does not spend.
+    //
+    // A known-fresh destination skips the probe entirely and plans lazily, only if `create_file`
+    // below actually reports a conflict.
+    let plan = if is_fresh {
+        FilePlan::Vacant
+    } else {
+        match plan_dst_file(
+            prog_track, dst_parent, dst_name, dst_path, src_meta, settings,
         )
-        .await?;
-    }
-    // open the source for reading (fstat confirms it is still a regular file) and create the
-    // destination fresh. the creation mode matches what the metadata applier will chmod to, so the
-    // file has correct permissions even before metadata is fully applied. our write fd is writable
-    // regardless of those bits (it was opened O_WRONLY at creation).
-    let copy_summary = Summary {
-        rm_summary,
-        ..Default::default()
+        .await?
+        {
+            FilePlan::Skip(summary) => return Ok(skip_summary(summary, &copy_summary)),
+            plan => plan,
+        }
     };
+    get_file_iops_tokens(settings.chunk_size, src_meta.size()).await;
+    // open the source for reading (fstat confirms it is still a regular file) and create the
+    // destination fresh. the destination is created owner-only (`DST_FILE_CREATE_MODE`) and only
+    // widened to the source mode by `set_file_metadata_fd` below, after the last byte — the file
+    // counterpart of the split-chmod directories already get. our write fd is writable regardless
+    // of those bits (it was opened O_WRONLY at creation).
     let (src_file, open_meta) = src_parent
         .open_file_read(name)
         .await
         .with_context(|| format!("failed opening src file {:?} for reading", src_path))
         .map_err(|err| Error::new(err, copy_summary))?;
-    let create_mode = preserve::masked_mode(preserve.file.mode_mask, &open_meta);
-    let dst_file = dst_parent
-        .create_file(dst_name, create_mode)
-        .await
-        .with_context(|| format!("failed creating {:?}", dst_path))
-        .map_err(|err| Error::new(err, copy_summary))?;
+    // the source fd is held and the throttle budget is reserved, so the destination can now be
+    // replaced: the failure that would most often abandon this copy before any byte exists is behind
+    // us. It is not the last one — `create_file` below has its own (EMFILE, ENOSPC, EIO) and waits on
+    // the ops-throttle, so a cancellation can still land between the two; see the note above on why
+    // rcp accepts that rather than staging and renaming. `execute_dst_plan` re-checks the planned
+    // entry by inode before unlinking, so the gap since planning fails closed rather than removing
+    // whatever occupies the name now.
+    execute_dst_plan(
+        prog_track,
+        dst_parent,
+        dst_name,
+        dst_path,
+        plan,
+        settings,
+        &mut copy_summary,
+    )
+    .await?;
+    let dst_file = match dst_parent.create_file(dst_name).await {
+        Ok(dst_file) => dst_file,
+        // the destination slot is occupied. `create_file`'s `O_EXCL` is the only way either route
+        // finds out that a writer got here between our last look and now: on the known-fresh route
+        // there was no earlier look at all (freshness is an optimization hint, not an enforceable
+        // invariant — see `resolve_dst_dir` — so a concurrent writer can populate a directory we
+        // just created), and on the other route the slot was planned but has been refilled since.
+        // both cases are the same conflict, so resolve it here and honor --overwrite /
+        // --ignore-existing rather than failing the copy on EEXIST. Planning and executing are
+        // back-to-back here, unlike the route above: the source and the tokens are already held, so
+        // there is nothing left that could abandon the copy after the removal.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let plan = match plan_dst_file(
+                prog_track, dst_parent, dst_name, dst_path, src_meta, settings,
+            )
+            .await
+            // rebuild from `err.source`, never from a stringified error: the chain must survive.
+            .map_err(|err| Error::new(err.source, err.summary + copy_summary))?
+            {
+                FilePlan::Skip(summary) => return Ok(skip_summary(summary, &copy_summary)),
+                plan => plan,
+            };
+            execute_dst_plan(
+                prog_track,
+                dst_parent,
+                dst_name,
+                dst_path,
+                plan,
+                settings,
+                &mut copy_summary,
+            )
+            .await?;
+            // retry exactly once. the slot was cleared just above, so a second EEXIST means yet
+            // another writer refilled it — report that rather than looping, which against a live
+            // competing writer would never terminate.
+            dst_parent
+                .create_file(dst_name)
+                .await
+                .with_context(|| format!("failed creating {:?}", dst_path))
+                .map_err(|err| Error::new(err, copy_summary))?
+        }
+        Err(error) => {
+            return Err(Error::new(
+                anyhow::Error::new(error).context(format!("failed creating {:?}", dst_path)),
+                copy_summary,
+            ));
+        }
+    };
     tracing::debug!("copying data");
     let len = open_meta.size();
     // the data copy is the data path, not a metadata syscall — it is deliberately NOT wrapped in a
@@ -1512,7 +1600,6 @@ async fn copy_file_fd(
     .await
     .with_context(|| format!("failed setting metadata on {:?}", dst_path))
     .map_err(|err| Error::new(err, copy_summary))?;
-    let mut copy_summary = copy_summary;
     // count the file as copied only after all metadata has been applied (actual bytes, see above).
     copy_summary.bytes_copied += copied;
     copy_summary.files_copied += 1;
@@ -1534,28 +1621,23 @@ async fn copy_symlink_fd(
     preserve: &preserve::Settings,
     is_fresh: bool,
 ) -> Result<Summary, Error> {
-    // --ignore-existing: skip if the destination already exists (any type). probe via the held dst
-    // fd in a real copy; in dry-run there is no held fd (`dst_parent` is None), so probe by path —
-    // or, under strict operand resolution, fd-relative via the destination's parent so a symlinked
-    // destination prefix fails closed. Probe ONLY when the result is used (`--ignore-existing`): an
-    // unused probe must never fail a valid `--dry-run --delete` onto a final destination symlink.
-    let dst_exists = match dst_parent {
-        Some(dst_parent) => dst_parent.child(dst_name).await.is_ok(),
-        None if !is_fresh && settings.ignore_existing => {
-            if crate::safedir::strict_operand_resolution() {
-                strict_dry_run_dst_kind(dst_path).await?.is_some()
-            } else {
-                tokio::fs::symlink_metadata(dst_path).await.is_ok()
-            }
-        }
-        None => false,
-    };
-    if !is_fresh && settings.ignore_existing && dst_exists {
+    // --ignore-existing in DRY-RUN: skip if the destination already exists (any type). A real copy
+    // does NOT probe here, for the same reason [`copy_file_fd`] does not: `symlink_at` below fails
+    // `EEXIST` on an occupied slot and its recovery branch already owns `--ignore-existing`, so an
+    // fd-based probe here would be a redundant `child()` whose only distinct effect was to mistake
+    // a lookup *failure* (EACCES, EMFILE, ESTALE) for a vacant slot.
+    if dst_parent.is_none()
+        && !is_fresh
+        && settings.ignore_existing
+        && dry_run_dst_exists(dst_path).await?
+    {
         if let Some(mode) = settings.dry_run {
             match mode {
                 DryRunMode::Brief => {}
                 DryRunMode::All => println!("skip symlink {:?}", dst_path),
-                DryRunMode::Explain => println!("skip symlink {:?} (destination exists)", dst_path),
+                DryRunMode::Explain => {
+                    println!("skip symlink {:?} (destination exists)", dst_path)
+                }
             }
         }
         tracing::debug!("destination exists, skipping symlink (--ignore-existing)");
@@ -1710,6 +1792,165 @@ async fn copy_symlink_fd(
     }
 }
 
+/// What to do about whatever occupies a destination file's slot — decided WITHOUT touching it.
+#[derive(Debug)]
+enum FilePlan {
+    /// Nothing is in the way. Create straight away.
+    Vacant,
+    /// Leave the destination alone and return this summary without creating anything
+    /// (`--ignore-existing`, or a file the comparison deems identical / newer).
+    Skip(Summary),
+    /// An entry is in the way and `--overwrite` says to replace it. Carries the handle it was
+    /// classified through, which [`remove_existing`] re-checks by inode before unlinking — so the
+    /// gap between planning and executing fails closed rather than removing whatever occupies the
+    /// name by then.
+    ///
+    /// Holding the handle across that gap is what makes the recheck sound, not merely convenient:
+    /// its `O_PATH` fd keeps the classified inode alive, so the inode *number* cannot be freed and
+    /// handed to a different file that would then compare equal. The cost is one extra open fd per
+    /// in-flight overwrite, for the duration of the throttle wait and the source open.
+    Replace(Handle),
+}
+
+/// Merge a [`FilePlan::Skip`]'s summary with removals the copy already performed, producing what
+/// the caller returns.
+///
+/// Needed because a copy can plan the slot twice — once up front, then again after `create_file`
+/// reports it refilled — and a removal performed before the first create must survive into the
+/// totals rather than being dropped when the second plan decides to skip. Its progress counter has
+/// already been incremented either way.
+fn skip_summary(skip: Summary, copy_summary: &Summary) -> Summary {
+    Summary {
+        rm_summary: copy_summary.rm_summary + skip.rm_summary,
+        ..skip
+    }
+}
+
+/// Carry out the one mutating step a [`FilePlan`] can call for, folding its accounting into the
+/// running copy summary so every later error payload reports the removal that already happened.
+///
+/// Split from [`plan_dst_file`] deliberately, and the split is the point: it lets the caller put the
+/// throttle wait and the source open BETWEEN deciding to replace the destination and actually
+/// unlinking it. When the two were one step, a copy that then failed to open its source had already
+/// deleted a destination it could no longer replace. The split buys nothing against *cancellation* —
+/// see [`copy_file_fd`] for why rcp does not chase that.
+async fn execute_dst_plan(
+    prog_track: &'static progress::Progress,
+    dst_parent: &Arc<Dir>,
+    dst_name: &OsStr,
+    dst_path: &std::path::Path,
+    plan: FilePlan,
+    settings: &Settings,
+    copy_summary: &mut Summary,
+) -> Result<(), Error> {
+    let dst_handle = match plan {
+        FilePlan::Vacant => return Ok(()),
+        // the caller returns on `Skip` before reaching here; treating it as a no-op keeps this
+        // total rather than panicking on a shape only a caller bug could produce.
+        FilePlan::Skip(_) => return Ok(()),
+        FilePlan::Replace(dst_handle) => dst_handle,
+    };
+    match remove_existing(
+        prog_track,
+        dst_parent,
+        dst_name,
+        dst_path,
+        &dst_handle,
+        settings,
+    )
+    .await
+    {
+        Ok(rm_summary) => {
+            copy_summary.rm_summary = copy_summary.rm_summary + rm_summary;
+            Ok(())
+        }
+        // rebuild from `err.source`, never from a stringified error: the chain must survive.
+        Err(err) => Err(Error::new(err.source, err.summary + *copy_summary)),
+    }
+}
+
+/// Decide what to do about an entry already occupying `dst_name`: skip it (`--ignore-existing`, or
+/// an identical / newer file under `--overwrite`), replace it (`--overwrite`), or fail (no
+/// `--overwrite`). Mirrors [`copy_symlink_fd`]'s `AlreadyExists` branch, and is the file-slot
+/// counterpart of [`resolve_dst_dir`].
+///
+/// **Non-mutating.** It classifies and decides; [`execute_dst_plan`] is what removes. Keep it that
+/// way — the separation is what lets the caller finish acquiring everything the copy needs before
+/// the destination stops existing.
+///
+/// [`copy_file_fd`] calls this from both of its routes: up front when the destination is not
+/// known-fresh, and again when the destination was believed fresh but `create_file` reported the
+/// slot occupied anyway. A slot that turns out to be vacant plans to [`FilePlan::Vacant`].
+async fn plan_dst_file(
+    prog_track: &'static progress::Progress,
+    dst_parent: &Arc<Dir>,
+    dst_name: &OsStr,
+    dst_path: &std::path::Path,
+    src_meta: &FileMeta,
+    settings: &Settings,
+) -> Result<FilePlan, Error> {
+    let dst_handle = match dst_parent.child(dst_name).await {
+        Ok(dst_handle) => dst_handle,
+        // `NotFound` is the ONE error that means "nothing occupies the slot". Every other failure
+        // (EACCES on the parent, EMFILE, ESTALE, EIO) says we could not look — not that there is
+        // nothing there — and must keep its context rather than be recast as a vacant slot. The
+        // difference is user-visible in both directions: `--ignore-existing` would fail on a
+        // create instead of skipping, and the `create_file` recovery route, which reaches this
+        // function only because the slot is KNOWN occupied, would report a second bare `EEXIST`
+        // naming neither the real errno nor the fact that the lookup itself failed.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FilePlan::Vacant);
+        }
+        Err(error) => {
+            return Err(Error::new(
+                anyhow::Error::new(error)
+                    .context(format!("failed looking up destination {:?}", dst_path)),
+                Default::default(),
+            ));
+        }
+    };
+    if settings.ignore_existing {
+        tracing::debug!("destination exists, skipping (--ignore-existing)");
+        prog_track.files_unchanged.inc();
+        return Ok(FilePlan::Skip(Summary {
+            files_unchanged: 1,
+            ..Default::default()
+        }));
+    }
+    if !settings.overwrite {
+        return Err(Error::new(
+            anyhow!(
+                "destination {:?} already exists, did you intend to specify --overwrite?",
+                dst_path
+            ),
+            Default::default(),
+        ));
+    }
+    tracing::debug!("file exists, check if it's identical");
+    if dst_handle.kind() == EntryKind::File {
+        if filecmp::metadata_equal(&settings.overwrite_compare, src_meta, dst_handle.meta()) {
+            tracing::debug!("file is identical, skipping");
+            prog_track.files_unchanged.inc();
+            return Ok(FilePlan::Skip(Summary {
+                files_unchanged: 1,
+                ..Default::default()
+            }));
+        }
+        if let Some(OverwriteFilter::Newer) = settings.overwrite_filter
+            && filecmp::dest_is_newer(src_meta, dst_handle.meta())
+        {
+            tracing::debug!("dest is newer than source, skipping");
+            prog_track.files_unchanged.inc();
+            return Ok(FilePlan::Skip(Summary {
+                files_unchanged: 1,
+                ..Default::default()
+            }));
+        }
+    }
+    tracing::info!("destination differs, will replace existing entry");
+    Ok(FilePlan::Replace(dst_handle))
+}
+
 /// An opened destination directory plus the bookkeeping the caller needs.
 pub(crate) struct DirSlot {
     pub(crate) dir: Arc<Dir>,
@@ -1733,18 +1974,21 @@ pub(crate) enum DirResolution {
 /// Create the destination directory `name` under `dst_parent`, or reuse / replace an existing
 /// entry per `--overwrite`/`--ignore-existing`. Returns an open [`Dir`] handle to it.
 ///
-/// New directories are created mode `0o700` (writable so children can be populated) — the real
-/// source mode is applied later by [`CopyVisitor::dir_post`] after all children are copied, matching
-/// the path-based behavior of creating a writable directory and restricting it last.
+/// New directories are created at [`safedir::DST_DIR_CREATE_MODE`] (writable so children can be
+/// populated) — the real source mode is applied later by [`CopyVisitor::dir_post`] after all
+/// children are copied, matching the path-based behavior of creating a writable directory and
+/// restricting it last.
 pub(crate) async fn resolve_dst_dir(
     prog_track: &'static progress::Progress,
     dst_parent: &Arc<Dir>,
     name: &OsStr,
     dst_path: &std::path::Path,
     settings: &Settings,
-    is_fresh: bool,
 ) -> Result<DirResolution, Error> {
-    match dst_parent.make_dir(name, 0o700).await {
+    match dst_parent
+        .make_dir(name, safedir::DST_DIR_CREATE_MODE)
+        .await
+    {
         Ok(dir) => {
             // freshly created: children may assume the destination is empty (no conflict checks).
             prog_track.directories_created.inc();
@@ -1761,10 +2005,12 @@ pub(crate) async fn resolve_dst_dir(
             }))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            assert!(
-                !is_fresh,
-                "unexpected pre-existing directory in a fresh destination: {dst_path:?}"
-            );
+            // the destination slot is occupied — including when the caller believed the parent was
+            // fresh: freshness is an optimization hint, not an enforceable invariant. a concurrent
+            // writer (another source operand of this same invocation whose destination aliases ours,
+            // a second process, or a destination filesystem that folds two source names onto one)
+            // can populate a directory we just created. handle it exactly like any other pre-existing
+            // entry.
             let dst_handle = dst_parent
                 .child(name)
                 .await
@@ -1801,7 +2047,9 @@ pub(crate) async fn resolve_dst_dir(
                         directories_unchanged: 1,
                         ..Default::default()
                     },
-                    is_fresh,
+                    // a directory we did NOT create is never fresh: its children must run their own
+                    // existence checks.
+                    is_fresh: false,
                     we_created: false,
                     restore_owner,
                 }))
@@ -1828,7 +2076,7 @@ pub(crate) async fn resolve_dst_dir(
                 )
                 .await?;
                 let dir = dst_parent
-                    .make_dir(name, 0o700)
+                    .make_dir(name, safedir::DST_DIR_CREATE_MODE)
                     .await
                     .with_context(|| format!("cannot create directory {:?}", dst_path))
                     .map_err(|err| {
@@ -1937,6 +2185,10 @@ pub(crate) async fn remove_existing(
                 prog_track.bytes_removed.add(removed_size);
             }
             Ok(RmSummary {
+                // the summary must carry the same bytes the progress counter just took, or the
+                // end-of-run totals and the error payloads disagree with the live display. a
+                // symlink contributes none, matching `rm::rm_file`'s accounting.
+                bytes_removed: if is_symlink { 0 } else { removed_size },
                 files_removed: usize::from(!is_symlink),
                 symlinks_removed: usize::from(is_symlink),
                 ..Default::default()
@@ -2428,7 +2680,7 @@ mod copy_tests {
         {
             Ok(_) => panic!("Expected the copy to error!"),
             Err(error) => {
-                tracing::info!("{}", &error);
+                tracing::info!("{:#}", &error);
                 // foo
                 // |- 0.txt  // <- no read permission
                 // |- bar
@@ -3273,11 +3525,20 @@ mod copy_tests {
         {
             Ok(_) => panic!("Expected the copy to error!"),
             Err(error) => {
-                tracing::info!("{}", &error);
+                tracing::info!("{:#}", &error);
                 assert_eq!(error.summary.files_copied, 1);
                 assert_eq!(error.summary.symlinks_created, 2);
                 assert_eq!(error.summary.directories_created, 0);
-                assert_eq!(error.summary.rm_summary.files_removed, 2);
+                // ONE removal, not two: `foo/baz/4.txt` is unreadable, so its copy fails at the
+                // source open — which now happens BEFORE the destination is unlinked, so
+                // `bar/baz/4.txt` survives a copy that could never have replaced it. Removing it
+                // first and discovering the unreadable source afterwards is the data-loss shape
+                // `plan_dst_file`/`execute_dst_plan` exist to prevent.
+                assert_eq!(error.summary.rm_summary.files_removed, 1);
+                assert!(
+                    output_path.join("baz").join("4.txt").exists(),
+                    "the destination of an unreadable source must not be removed"
+                );
                 assert_eq!(error.summary.rm_summary.symlinks_removed, 2);
                 assert_eq!(error.summary.rm_summary.directories_removed, 0);
             }
@@ -4866,6 +5127,133 @@ mod copy_tests {
             );
             Ok(())
         }
+        /// A destination SYMLINK is a non-directory to `--ignore-existing`, even when it points at a
+        /// directory, so the whole subtree is skipped — and the dry run must predict that.
+        ///
+        /// The dry-run probe used to ask `Path::is_dir()`, which FOLLOWS symlinks, so it saw "a
+        /// directory is already there" and reported the subtree as would-be-copied. The real run
+        /// classifies the same entry through the parent's descriptor (`O_NOFOLLOW`), calls it a
+        /// non-directory, and skips it. The prediction contradicted the run it was predicting.
+        #[tokio::test]
+        #[traced_test]
+        async fn dry_run_ignore_existing_reports_dir_behind_a_symlink_as_skipped()
+        -> Result<(), anyhow::Error> {
+            let tmp = testutils::create_temp_dir().await?;
+            let src = tmp.join("src_dir");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::write(src.join("child.txt"), "content").await?;
+            // the destination is a SYMLINK pointing at a real directory
+            let link_target = tmp.join("elsewhere");
+            tokio::fs::create_dir(&link_target).await?;
+            let dst = tmp.join("dst_dir");
+            tokio::fs::symlink(&link_target, &dst).await?;
+            let summary = copy(
+                &PROGRESS,
+                &src,
+                &dst,
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    overwrite_filter: None,
+                    ignore_existing: true,
+                    chunk_size: 0,
+                    skip_specials: false,
+                    remote_copy_buffer_size: 0,
+                    filter: None,
+                    dry_run: Some(crate::config::DryRunMode::Brief),
+                    delete: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await?;
+            assert_eq!(
+                summary.directories_unchanged, 1,
+                "a destination symlink is a non-directory, so --ignore-existing skips the subtree; \
+                 dry-run must report that rather than following the link"
+            );
+            assert_eq!(
+                summary.directories_created, 0,
+                "must not report a would-be directory creation when --ignore-existing skips"
+            );
+            assert_eq!(
+                summary.files_copied, 0,
+                "the skipped subtree's children must not be reported as would-be-copied"
+            );
+            Ok(())
+        }
+
+        /// A destination lookup that FAILS is not a vacant destination: `--dry-run` must report the
+        /// failure rather than predicting a copy the real run cannot perform.
+        ///
+        /// The unprobeable destination has to be a NESTED one for this to isolate the probe. Sealing
+        /// the destination's own parent would fail the root operand's `open_parent_dir` first, and that
+        /// error is raised with or without this fix — the test would pass while proving nothing (it
+        /// did, the first time it was written). So the destination ROOT is a directory the copy can
+        /// find but not traverse (`0o600` — readable, not searchable), which only the path-based probe
+        /// for the child touches: a dry run creates and opens no destination directories, so nothing
+        /// else in the copy needs to traverse it.
+        ///
+        /// Skipped for root, which ignores the permission bits this relies on.
+        #[tokio::test]
+        #[traced_test]
+        async fn dry_run_ignore_existing_reports_an_unprobeable_destination_as_an_error()
+        -> Result<(), anyhow::Error> {
+            if nix::unistd::geteuid().is_root() {
+                eprintln!("skipping: root bypasses the directory permissions this test relies on");
+                return Ok(());
+            }
+            let tmp = testutils::create_temp_dir().await?;
+            let src = tmp.join("src_dir");
+            tokio::fs::create_dir(&src).await?;
+            // EMPTY, deliberately: a file inside it would be caught by the FILE probe
+            // ([`dry_run_dst_exists`]) instead, and the test would pass without the directory probe
+            // ever mattering. With nothing under `sub`, the directory probe is the only thing that can
+            // notice, which is what makes this test fail without the fix.
+            tokio::fs::create_dir(src.join("sub")).await?;
+            // the destination root exists but is NOT searchable, so probing `dst/sub` inside it gets
+            // EACCES — "could not look", not "nothing is there"
+            let sealed = tmp.join("dst_dir");
+            tokio::fs::create_dir(&sealed).await?;
+            tokio::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o600)).await?;
+            let result = copy(
+                &PROGRESS,
+                &src,
+                &sealed,
+                &Settings {
+                    dereference: false,
+                    fail_early: false,
+                    overwrite: false,
+                    overwrite_compare: Default::default(),
+                    overwrite_filter: None,
+                    ignore_existing: true,
+                    chunk_size: 0,
+                    skip_specials: false,
+                    remote_copy_buffer_size: 0,
+                    filter: None,
+                    dry_run: Some(crate::config::DryRunMode::Brief),
+                    delete: None,
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+            )
+            .await;
+            // restore permissions so the temp dir can be cleaned up
+            tokio::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).await?;
+            let error = result.expect_err(
+                "an unprobeable destination must be reported, not treated as vacant and predicted \
+                 as a copy",
+            );
+            let rendered = format!("{:#}", error.source);
+            assert!(
+                rendered.contains("Permission denied"),
+                "the error must keep the real cause; got: {rendered}"
+            );
+            Ok(())
+        }
+
         /// Test that root directory is always created even when nothing matches
         /// the include pattern. The root is the user-specified source — it should
         /// never be removed/skipped due to empty-dir cleanup.
@@ -5995,6 +6383,479 @@ mod copy_tests {
             oot_victim.join("sentinel.txt").exists(),
             "out-of-tree sentinel was deleted — removal re-resolved the display path through the \
              intermediate symlink instead of using the pinned fd (path-based rm regression)"
+        );
+        Ok(())
+    }
+
+    // regression: `is_fresh` is an optimization hint ("we just created the parent directory, so it
+    // must be empty"), not an enforceable invariant. a concurrent writer can populate a directory we
+    // believe we just created: another source operand of the SAME invocation whose destination
+    // aliases ours (`rcp A/x B/x dst/` maps both operands to `dst/x` and dispatches them
+    // concurrently), a second `rcp` process, or a destination filesystem that folds two source names
+    // onto one. passing `is_fresh = true` below while `dst`/`dst/sub` already exist reproduces that
+    // race deterministically, without needing actual concurrency.
+    #[tokio::test]
+    async fn copies_into_a_fresh_marked_destination_another_writer_populated()
+    -> Result<(), anyhow::Error> {
+        let tmp = testutils::create_temp_dir().await?;
+        let src = tmp.join("src");
+        tokio::fs::create_dir(&src).await?;
+        tokio::fs::create_dir(src.join("sub")).await?;
+        tokio::fs::write(src.join("sub").join("a.txt"), "a").await?;
+        // dst and dst/sub already exist (someone got there first).
+        let dst = tmp.join("dst");
+        tokio::fs::create_dir(&dst).await?;
+        tokio::fs::create_dir(dst.join("sub")).await?;
+        let summary = copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings_with_delete(None),
+            &NO_PRESERVE_SETTINGS,
+            true, // caller believes it is fresh
+        )
+        .await?;
+        assert_eq!(summary.directories_created, 0);
+        assert_eq!(summary.directories_unchanged, 2);
+        assert_eq!(summary.files_copied, 1);
+        assert_eq!(
+            tokio::fs::read_to_string(dst.join("sub").join("a.txt")).await?,
+            "a"
+        );
+        Ok(())
+    }
+
+    // the test above pins half the fix (the assert is gone) but not the other half: that a REUSED
+    // directory's children are downgraded to `is_fresh: false` rather than inheriting the caller's
+    // stale belief. that half only becomes observable when a child leaf already conflicts with the
+    // source — with `dst/sub/a.txt` pre-existing here, a leaked `is_fresh == true` would skip the
+    // conflict-check/overwrite block in `copy_file_fd` and fail closed on `create_file`'s `O_EXCL`
+    // with EEXIST instead of overwriting.
+    #[tokio::test]
+    async fn stale_fresh_hint_overwrites_preexisting_file() -> Result<(), anyhow::Error> {
+        let tmp = testutils::create_temp_dir().await?;
+        let src = tmp.join("src");
+        tokio::fs::create_dir(&src).await?;
+        tokio::fs::create_dir(src.join("sub")).await?;
+        tokio::fs::write(src.join("sub").join("a.txt"), "new").await?;
+        let dst = tmp.join("dst");
+        tokio::fs::create_dir(&dst).await?;
+        tokio::fs::create_dir(dst.join("sub")).await?;
+        tokio::fs::write(dst.join("sub").join("a.txt"), "old-content-differs").await?;
+        let summary = copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings_with_delete(delete_on()), // --delete implies --overwrite
+            &NO_PRESERVE_SETTINGS,
+            true, // caller believes it is fresh, but another writer got here first
+        )
+        .await?;
+        assert_eq!(summary.files_copied, 1);
+        assert_eq!(
+            tokio::fs::read_to_string(dst.join("sub").join("a.txt")).await?,
+            "new"
+        );
+        Ok(())
+    }
+
+    // the tests below cover the FILE sibling of the stale-hint problem: the caller passes
+    // `is_fresh = true` (the parent directory was just created, so it is presumed empty) while the
+    // destination file already exists, because another writer got there first. a file operand is the
+    // most direct way to reach `copy_file_fd` with `is_fresh == true` — it is also a real production
+    // shape, since `rlink` delegates a single file to `copy_child` with the freshness of the
+    // directory it just created. every conflict decision (`--overwrite`, `--ignore-existing`, an
+    // identical file under `--overwrite-compare`, and the no-`--overwrite` error) must be reached
+    // from here, not just from the `!is_fresh` route.
+
+    #[tokio::test]
+    async fn overwrites_a_pre_existing_file_in_a_fresh_marked_destination()
+    -> Result<(), anyhow::Error> {
+        let tmp = testutils::create_temp_dir().await?;
+        let src_file = tmp.join("src.txt");
+        let dst_file = tmp.join("dst.txt");
+        // distinct sizes so the metadata comparison treats them as different and overwrite proceeds.
+        tokio::fs::write(&src_file, "fresh source content").await?;
+        tokio::fs::write(&dst_file, "old").await?;
+        let summary = copy(
+            &PROGRESS,
+            &src_file,
+            &dst_file,
+            &Settings {
+                overwrite: true,
+                ..settings_with_delete(None)
+            },
+            &NO_PRESERVE_SETTINGS,
+            true, // caller believes it is fresh, but another writer got here first
+        )
+        .await?;
+        assert_eq!(summary.files_copied, 1);
+        assert_eq!(summary.rm_summary.files_removed, 1);
+        assert_eq!(
+            tokio::fs::read_to_string(&dst_file).await?,
+            "fresh source content"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ignores_a_pre_existing_file_in_a_fresh_marked_destination() -> Result<(), anyhow::Error>
+    {
+        let tmp = testutils::create_temp_dir().await?;
+        let src_file = tmp.join("src.txt");
+        let dst_file = tmp.join("dst.txt");
+        tokio::fs::write(&src_file, "fresh source content").await?;
+        tokio::fs::write(&dst_file, "old").await?;
+        let summary = copy(
+            &PROGRESS,
+            &src_file,
+            &dst_file,
+            &Settings {
+                ignore_existing: true,
+                ..settings_with_delete(None)
+            },
+            &NO_PRESERVE_SETTINGS,
+            true,
+        )
+        .await?;
+        assert_eq!(summary.files_unchanged, 1);
+        assert_eq!(summary.files_copied, 0);
+        assert_eq!(summary.rm_summary.files_removed, 0);
+        assert_eq!(tokio::fs::read_to_string(&dst_file).await?, "old");
+        Ok(())
+    }
+
+    // `--overwrite` with a destination the comparison deems identical must leave it alone rather
+    // than remove and rewrite it. compares on size only so the fixture doesn't have to match mtimes.
+    #[tokio::test]
+    async fn skips_an_identical_pre_existing_file_in_a_fresh_marked_destination()
+    -> Result<(), anyhow::Error> {
+        let tmp = testutils::create_temp_dir().await?;
+        let src_file = tmp.join("src.txt");
+        let dst_file = tmp.join("dst.txt");
+        tokio::fs::write(&src_file, "abc").await?;
+        tokio::fs::write(&dst_file, "xyz").await?;
+        let summary = copy(
+            &PROGRESS,
+            &src_file,
+            &dst_file,
+            &Settings {
+                overwrite: true,
+                overwrite_compare: filecmp::MetadataCmpSettings {
+                    size: true,
+                    ..Default::default()
+                },
+                ..settings_with_delete(None)
+            },
+            &NO_PRESERVE_SETTINGS,
+            true,
+        )
+        .await?;
+        assert_eq!(summary.files_unchanged, 1);
+        assert_eq!(summary.files_copied, 0);
+        assert_eq!(summary.rm_summary.files_removed, 0);
+        // untouched: an identical destination is not removed and recreated.
+        assert_eq!(tokio::fs::read_to_string(&dst_file).await?, "xyz");
+        Ok(())
+    }
+
+    // without `--overwrite` the conflict is still an error — but it must be the actionable one that
+    // names the flag, not the raw `EEXIST` from `create_file`'s `O_EXCL`.
+    #[tokio::test]
+    async fn reports_missing_overwrite_for_a_pre_existing_file_in_a_fresh_marked_destination()
+    -> Result<(), anyhow::Error> {
+        let tmp = testutils::create_temp_dir().await?;
+        let src_file = tmp.join("src.txt");
+        let dst_file = tmp.join("dst.txt");
+        tokio::fs::write(&src_file, "fresh source content").await?;
+        tokio::fs::write(&dst_file, "old").await?;
+        let error = copy(
+            &PROGRESS,
+            &src_file,
+            &dst_file,
+            &settings_with_delete(None), // neither --overwrite nor --ignore-existing
+            &NO_PRESERVE_SETTINGS,
+            true,
+        )
+        .await
+        .expect_err("a pre-existing destination without --overwrite must fail");
+        let message = format!("{:#}", &error.source);
+        assert!(
+            message.contains("did you intend to specify --overwrite?"),
+            "expected the actionable overwrite error, got: {message}"
+        );
+        // and the destination is left exactly as it was.
+        assert_eq!(tokio::fs::read_to_string(&dst_file).await?, "old");
+        Ok(())
+    }
+
+    // the `!is_fresh` counterpart of `ignores_a_pre_existing_file_in_a_fresh_marked_destination`:
+    // `--ignore-existing` on a real (non-dry-run) local file copy had no coverage here, only in
+    // dry-run and remote tests. pins that the route the helper is shared with keeps its behavior.
+    #[tokio::test]
+    async fn ignores_a_pre_existing_file_when_the_destination_is_not_fresh()
+    -> Result<(), anyhow::Error> {
+        let tmp = testutils::create_temp_dir().await?;
+        let src_file = tmp.join("src.txt");
+        let dst_file = tmp.join("dst.txt");
+        tokio::fs::write(&src_file, "fresh source content").await?;
+        tokio::fs::write(&dst_file, "old").await?;
+        let summary = copy(
+            &PROGRESS,
+            &src_file,
+            &dst_file,
+            &Settings {
+                ignore_existing: true,
+                ..settings_with_delete(None)
+            },
+            &NO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        assert_eq!(summary.files_unchanged, 1);
+        assert_eq!(summary.files_copied, 0);
+        assert_eq!(tokio::fs::read_to_string(&dst_file).await?, "old");
+        Ok(())
+    }
+
+    // THE point of splitting planning from execution: a copy that decides to replace the
+    // destination, then fails before it is ready to write one, must leave the destination alone.
+    // An unreadable source reaches `open_file_read` after the plan and before any unlink, which is
+    // exactly the window that used to delete first and discover the problem afterwards. (The same
+    // window covers cancellation and a long `--iops-throttle` wait, neither of which is injectable
+    // here; this is the deterministic member of that family.)
+    #[tokio::test]
+    async fn overwrite_keeps_the_destination_when_the_source_cannot_be_opened()
+    -> Result<(), anyhow::Error> {
+        let tmp = testutils::create_temp_dir().await?;
+        let src = tmp.join("src");
+        tokio::fs::create_dir(&src).await?;
+        tokio::fs::write(src.join("a.txt"), "new content").await?;
+        // unreadable source file; the parent directory stays traversable so the walk still
+        // classifies it and the copy still plans to replace the destination.
+        tokio::fs::set_permissions(src.join("a.txt"), std::fs::Permissions::from_mode(0o000))
+            .await?;
+        let dst = tmp.join("dst");
+        tokio::fs::create_dir(&dst).await?;
+        // different size, so `--overwrite-compare` says the destination differs and must go.
+        tokio::fs::write(dst.join("a.txt"), "PRECIOUS").await?;
+        let error = copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &Settings {
+                overwrite: true,
+                ..settings_with_delete(None)
+            },
+            &NO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await
+        .expect_err("an unreadable source must fail the copy");
+        let message = format!("{:#}", &error.source);
+        assert!(
+            message.contains("failed opening src file"),
+            "expected the source open to be the failure; got: {message}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(dst.join("a.txt")).await?,
+            "PRECIOUS",
+            "the destination must survive a copy that never got far enough to replace it"
+        );
+        assert_eq!(
+            error.summary.rm_summary.files_removed, 0,
+            "nothing was removed, and the summary must say so"
+        );
+        Ok(())
+    }
+
+    // `execute_dst_plan` is the ONLY mutating step, and it accumulates rather than overwrites: a
+    // copy can plan the slot twice — once up front, then again after `create_file` reports it
+    // refilled by a competing writer — and the first removal has to survive into the totals.
+    #[tokio::test]
+    async fn executing_a_second_replace_keeps_the_first_removal_in_the_totals()
+    -> Result<(), anyhow::Error> {
+        let tmp = testutils::create_temp_dir().await?;
+        tokio::fs::write(tmp.join("victim.txt"), "0123456").await?; // 7 bytes
+        let dst_parent =
+            Arc::new(Dir::open_root_dir(&tmp, false, congestion::Side::Destination).await?);
+        let victim: &OsStr = OsStr::new("victim.txt");
+        let plan = FilePlan::Replace(dst_parent.child(victim).await?);
+        // as if an earlier removal had already happened in this same copy.
+        let mut copy_summary = Summary {
+            rm_summary: RmSummary {
+                files_removed: 1,
+                bytes_removed: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        execute_dst_plan(
+            &PROGRESS,
+            &dst_parent,
+            victim,
+            &tmp.join("victim.txt"),
+            plan,
+            &settings_with_delete(None),
+            &mut copy_summary,
+        )
+        .await?;
+        assert_eq!(copy_summary.rm_summary.files_removed, 2);
+        assert_eq!(copy_summary.rm_summary.bytes_removed, 17);
+        assert!(!tmp.join("victim.txt").exists(), "the entry was unlinked");
+        // and `Vacant` must be a genuine no-op on the same summary.
+        execute_dst_plan(
+            &PROGRESS,
+            &dst_parent,
+            victim,
+            &tmp.join("victim.txt"),
+            FilePlan::Vacant,
+            &settings_with_delete(None),
+            &mut copy_summary,
+        )
+        .await?;
+        assert_eq!(copy_summary.rm_summary.files_removed, 2);
+        Ok(())
+    }
+
+    // the outcome most easily missed: executing the plan can FAIL. The premise of the retry route is
+    // a live competing writer, so the plausible failure is `remove_existing`'s inode recheck — and
+    // it builds its error payload from scratch, unable to see what an earlier removal already did.
+    // Swapping the entry for a different inode between planning and executing reproduces that
+    // deterministically, and is also the swap the recheck exists to catch.
+    #[tokio::test]
+    async fn executing_a_failed_replace_keeps_an_earlier_removal_in_the_totals()
+    -> Result<(), anyhow::Error> {
+        let tmp = testutils::create_temp_dir().await?;
+        tokio::fs::write(tmp.join("victim.txt"), "original").await?;
+        let dst_parent =
+            Arc::new(Dir::open_root_dir(&tmp, false, congestion::Side::Destination).await?);
+        let victim: &OsStr = OsStr::new("victim.txt");
+        let plan = FilePlan::Replace(dst_parent.child(victim).await?);
+        // a competing writer swaps in a DIFFERENT inode under the same name after we planned.
+        tokio::fs::remove_file(tmp.join("victim.txt")).await?;
+        tokio::fs::write(tmp.join("victim.txt"), "someone else's file").await?;
+        let mut copy_summary = Summary {
+            rm_summary: RmSummary {
+                files_removed: 1,
+                bytes_removed: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let error = execute_dst_plan(
+            &PROGRESS,
+            &dst_parent,
+            victim,
+            &tmp.join("victim.txt"),
+            plan,
+            &settings_with_delete(None),
+            &mut copy_summary,
+        )
+        .await
+        .expect_err("a swapped destination must fail closed, not be removed");
+        assert_eq!(error.summary.rm_summary.files_removed, 1);
+        assert_eq!(error.summary.rm_summary.bytes_removed, 10);
+        // failing closed means the swapped-in file is still there: we removed nothing.
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.join("victim.txt")).await?,
+            "someone else's file"
+        );
+        // rebuilt from `err.source`, never from a stringified error: context and root cause survive.
+        let message = format!("{:#}", &error.source);
+        assert!(
+            message.contains("changed identity before removal"),
+            "context lost: {message}"
+        );
+        assert!(
+            message.contains("Stale file handle"),
+            "root cause lost: {message}"
+        );
+        Ok(())
+    }
+
+    // the pure half of the same accounting rule: when the retry's plan says SKIP, a removal the
+    // copy already performed still has to reach the summary the caller returns.
+    #[test]
+    fn a_skip_keeps_an_earlier_removal_in_the_totals() {
+        let copy_summary = Summary {
+            rm_summary: RmSummary {
+                files_removed: 1,
+                bytes_removed: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let skip = Summary {
+            files_unchanged: 1,
+            ..Default::default()
+        };
+        let summary = skip_summary(skip, &copy_summary);
+        assert_eq!(summary.files_unchanged, 1);
+        assert_eq!(summary.rm_summary.files_removed, 1);
+        assert_eq!(summary.rm_summary.bytes_removed, 10);
+    }
+
+    // the two tests below are NOT regression tests for the file fix above — they PASS on the code
+    // that preceded it, and that is the point. `copy_symlink_fd` never consults `is_fresh` in its
+    // create path: it attempts `symlink_at` unconditionally and resolves any `AlreadyExists` through
+    // the normal ignore-existing / overwrite logic, which is the shape `copy_file_fd` was changed to
+    // adopt. these pin that the symlink sibling stays immune to a stale freshness hint, so a later
+    // refactor that teaches its `AlreadyExists` branch to trust `is_fresh` fails here instead of
+    // silently reintroducing the file bug on the symlink path.
+
+    #[tokio::test]
+    async fn stale_fresh_hint_overwrites_preexisting_symlink() -> Result<(), anyhow::Error> {
+        let tmp = testutils::create_temp_dir().await?;
+        let src_link = tmp.join("src.link");
+        let dst_link = tmp.join("dst.link");
+        tokio::fs::symlink("target-a", &src_link).await?;
+        tokio::fs::symlink("target-b", &dst_link).await?;
+        let summary = copy(
+            &PROGRESS,
+            &src_link,
+            &dst_link,
+            &Settings {
+                overwrite: true,
+                ..settings_with_delete(None)
+            },
+            &NO_PRESERVE_SETTINGS,
+            true, // caller believes it is fresh, but another writer got here first
+        )
+        .await?;
+        assert_eq!(summary.symlinks_created, 1);
+        assert_eq!(summary.rm_summary.symlinks_removed, 1);
+        assert_eq!(
+            tokio::fs::read_link(&dst_link).await?.to_str(),
+            Some("target-a")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_fresh_hint_ignores_preexisting_symlink() -> Result<(), anyhow::Error> {
+        let tmp = testutils::create_temp_dir().await?;
+        let src_link = tmp.join("src.link");
+        let dst_link = tmp.join("dst.link");
+        tokio::fs::symlink("target-a", &src_link).await?;
+        tokio::fs::symlink("target-b", &dst_link).await?;
+        let summary = copy(
+            &PROGRESS,
+            &src_link,
+            &dst_link,
+            &Settings {
+                ignore_existing: true,
+                ..settings_with_delete(None)
+            },
+            &NO_PRESERVE_SETTINGS,
+            true,
+        )
+        .await?;
+        assert_eq!(summary.symlinks_unchanged, 1);
+        assert_eq!(summary.symlinks_created, 0);
+        assert_eq!(
+            tokio::fs::read_link(&dst_link).await?.to_str(),
+            Some("target-b")
         );
         Ok(())
     }

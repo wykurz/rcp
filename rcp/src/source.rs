@@ -2474,7 +2474,7 @@ impl AcceptingSendStreamPool {
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::debug!("Data listener accept error: {}", e);
+                                        tracing::debug!("Data listener accept error: {:#}", e);
                                         break;
                                     }
                                 }

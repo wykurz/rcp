@@ -2,7 +2,10 @@ use std::os::unix::fs::PermissionsExt;
 
 #[path = "support/fixtures.rs"]
 mod fixtures;
-use fixtures::{create_test_file, get_file_content, get_file_mode, setup_test_env};
+use fixtures::{
+    create_test_file, describe_samples, get_file_content, get_file_mode, sample_while_running,
+    setup_test_env,
+};
 
 fn interpret_exit_code(code: i32) -> String {
     match code {
@@ -1887,6 +1890,18 @@ fn find_rcpd_processes() -> Vec<u32> {
         .collect()
 }
 
+/// Read a process's argv from `/proc`, space-joined. `None` if it has already exited.
+fn read_proc_cmdline(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(
+        raw.split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 /// wait for rcpd processes to exit (with timeout)
 fn wait_for_rcpd_exit(initial_pids: &[u32], timeout_secs: u64) -> bool {
     let start = std::time::Instant::now();
@@ -2034,6 +2049,353 @@ fn test_remote_rcpd_exits_when_master_killed_with_throttle() {
     assert!(
         elapsed.as_secs() < 5,
         "rcpd should exit quickly via stdin watchdog"
+    );
+}
+
+#[test]
+fn test_remote_destination_rcpd_killed_reports_error_not_abort() {
+    // regression test: the master used to `.expect()` a clean EOF when a peer's control
+    // connection closed without a message. Since the workspace sets `panic = "abort"`, that
+    // hit SIGABRT (exit 134, core dump, discarded tracing output) instead of the intended
+    // "print error chain, exit 1" path. Verify that killing the destination rcpd mid-copy now
+    // produces a clean reported error.
+    //
+    // --no-encryption is required: under TLS a dead peer surfaces as `Err` and already takes
+    // the correct path, which would make this test vacuous for the bug being verified.
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // The window in which the destination rcpd is alive but the copy has not finished has to be
+    // ENGINEERED, not hoped for. A large file on its own does not do it — 50 MiB over loopback lands
+    // in well under a second — and neither does `--ops-throttle`, which gates METADATA syscalls, of
+    // which a single-file copy has only a handful. Left to chance the copy finishes before the kill
+    // and the test fails on the "no destination rcpd of ours to kill" assert below.
+    //
+    // `--iops-throttle` is the lever that bites, because it gates the DATA path: rcpd takes
+    // `((size - 1) / chunk_size) + 1` tokens per file before it writes any of it (see
+    // `rcp::destination::process_single_file`). 50 MiB at a 1 MiB chunk is 50 tokens, and at 5
+    // tokens/sec that is a ~10s stall — deterministic, bounded, and comfortably inside the 40s
+    // `timeout` below. Both rcpds get the setting (`RcpdConfig::to_args` forwards
+    // `--iops-throttle`/`--chunk-size`), so the transfer cannot outrun the kill from either end.
+    const IOPS_THROTTLE: usize = 5;
+    const FILE_SIZE_MIB: usize = 50;
+    let src_file = src_dir.path().join("large_file.dat");
+    eprintln!("Creating {FILE_SIZE_MIB}MiB test file...");
+    create_large_test_file(&src_file, FILE_SIZE_MIB);
+    let dst_file = dst_dir.path().join("large_file.dat");
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
+    // give the rcpd processes this test spawns a marker unique to this test run, so the kill below
+    // can be scoped to them. `--rcpd-debug-log-prefix` is the only free-form string the master
+    // forwards verbatim into rcpd's argv (as `--debug-log-prefix=<value>`) - everything else rcpd
+    // is told, operands included, travels over the control connection rather than the command line.
+    // the temp dir's random name supplies the uniqueness, and holding the `TempDir` for the whole
+    // test both keeps the prefix directory alive for rcpd (which panics if it cannot create the
+    // log file) and cleans the logs up afterwards.
+    let rcpd_log_dir = tempfile::TempDir::new().expect("Failed to create rcpd debug log dir");
+    let rcpd_marker = rcpd_log_dir.path().join("rcpd-debug").display().to_string();
+    let rcpd_log_arg = format!("--rcpd-debug-log-prefix={rcpd_marker}");
+    // capture stdout/stderr via real files rather than `Stdio::piped()`: -vv is verbose enough
+    // to fill a pipe's kernel buffer well before the process exits, and nothing drains a piped
+    // child's output while we're off polling with pgrep below - that combination deadlocks the
+    // child on a blocked write(). Files have no such limit.
+    let stdout_file = tempfile::NamedTempFile::new().expect("Failed to create stdout capture file");
+    let stderr_file = tempfile::NamedTempFile::new().expect("Failed to create stderr capture file");
+    // wrap in `timeout` (as run_rcp_with_args_internal does) so a regression that hangs the
+    // master instead of erroring fails the test instead of hanging CI forever.
+    let mut cmd = std::process::Command::new("timeout");
+    cmd.args(["40", rcp_path.to_str().unwrap()]);
+    let iops_arg = format!("--iops-throttle={IOPS_THROTTLE}");
+    cmd.args([
+        "-vv",
+        "--force-remote",
+        "--no-encryption",
+        "--chunk-size=1MiB",
+        &iops_arg,
+        &rcpd_log_arg,
+        &src_remote,
+        &dst_remote,
+    ]);
+    cmd.stdout(
+        stdout_file
+            .reopen()
+            .expect("Failed to reopen stdout capture file"),
+    );
+    cmd.stderr(
+        stderr_file
+            .reopen()
+            .expect("Failed to reopen stderr capture file"),
+    );
+    let spawn_start = std::time::Instant::now();
+    eprintln!("Spawning rcp subprocess...");
+    let mut child = cmd.spawn().expect("Failed to spawn rcp");
+    // Barrier: wait until the DESTINATION rcpd has CONSUMED the MasterHello - not merely until the
+    // master sent it, and certainly not just until the destination process exists. Two properties
+    // follow, and the test needs both:
+    //
+    //   * the master is at (or immediately about to be at) the `dest_recv_stream.recv_object()`
+    //     call this test exercises. Killing earlier - while the destination has merely been spawned,
+    //     before it reports its listening address on stdout for the master to read over the SSH
+    //     channel - races a *different*, already-correct error path ("unexpected output from rcpd").
+    //
+    //   * the destination's control socket receive queue is DRAINED. That is what decides FIN vs
+    //     RST: SIGKILL yields a clean FIN only when nothing is left unread, and an RST otherwise.
+    //     A clean FIN surfaces to the master as `Ok(None)`, which is precisely the branch the
+    //     original `.expect()` panicked on. Killing with the hello still queued would produce an
+    //     RST and exercise a different branch, so the regression would only be caught by luck.
+    //
+    // rcpd logs "Received side: Destination { .. }" (rcp/src/bin/rcpd.rs) on the line immediately
+    // after that recv returns, into the per-run debug log this test already configures - so the log
+    // line IS the acknowledgement. `--role source` produces "Received side: Source", so matching on
+    // the variant name picks out the destination without needing to know the log file naming.
+    let dest_ready_marker = "Received side: Destination";
+    let rcpd_logs_contain = |needle: &str| -> bool {
+        std::fs::read_dir(rcpd_log_dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                std::fs::read_to_string(entry.path()).is_ok_and(|content| content.contains(needle))
+            })
+    };
+    let mut ready = false;
+    while spawn_start.elapsed().as_secs() < 20 {
+        if rcpd_logs_contain(dest_ready_marker) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let read_captured_output = |status: std::process::ExitStatus| -> std::process::Output {
+        std::process::Output {
+            status,
+            stdout: std::fs::read(stdout_file.path()).unwrap_or_default(),
+            stderr: std::fs::read(stderr_file.path()).unwrap_or_default(),
+        }
+    };
+    if !ready {
+        // this is a FAILURE, not a skip. The marker is logged unconditionally on the way to the
+        // `recv_object` call this test exercises, so missing it means the destination never got
+        // there - a startup regression, a hang, or a copy that finished before the kill could land.
+        // Every one of those is a real problem, and returning success here would report all of them
+        // as a passing regression test.
+        let status = child.wait().expect("Failed to wait for rcp");
+        print_command_output(&read_captured_output(status));
+        panic!(
+            "destination rcpd did not log {dest_ready_marker:?} within 20s of {:?}, so the \
+             scenario under test was never reached (startup regression, hang, or a copy that \
+             finished too quickly)",
+            spawn_start.elapsed()
+        );
+    }
+    // scope the kill to the destination rcpd THIS test spawned: match on our per-run marker and on
+    // the role, rather than `pkill -f 'rcpd --role destination'`, which would take down every
+    // matching process on the host - a developer's live remote copy, or another test's daemon on a
+    // shared CI runner. nextest's serial group orders tests within one run; it says nothing about
+    // what else is running on the machine.
+    let destination_pids: Vec<u32> = find_rcpd_processes()
+        .into_iter()
+        .filter(|pid| {
+            read_proc_cmdline(*pid).is_some_and(|cmdline| {
+                cmdline.contains(&rcpd_marker) && cmdline.contains("--role destination")
+            })
+        })
+        .collect();
+    eprintln!(
+        "Destination rcpd consumed the master's hello after {:?} (control queue drained), killing \
+         it {destination_pids:?}",
+        spawn_start.elapsed()
+    );
+    assert!(
+        !destination_pids.is_empty(),
+        "found no destination rcpd of ours to kill (it must have already exited - copy finished \
+         too quickly after the control connection came up)"
+    );
+    for pid in &destination_pids {
+        // SAFETY: `kill` has no memory-safety preconditions; a pid that has already exited just
+        // yields ESRCH, which the assert below reports.
+        let killed = unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(
+            killed,
+            0,
+            "failed to SIGKILL destination rcpd {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let status = child.wait().expect("Failed to wait for rcp master");
+    eprintln!(
+        "rcp master exited {status:?} after kill (total elapsed since spawn: {:?})",
+        spawn_start.elapsed()
+    );
+    let output = read_captured_output(status);
+    print_command_output(&output);
+    assert_not_timeout(&output);
+    // errors print via `println!("{err:?}")` (common/src/lib.rs), i.e. to stdout, not stderr -
+    // check both combined so this isn't sensitive to exactly which stream carries which text.
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected the master to report a clean error (exit 1), not abort (134) or hang; \
+         got code {:?}",
+        output.status.code()
+    );
+    assert!(
+        !combined.contains("panicked"),
+        "master should not panic; output:\n{combined}"
+    );
+    // Assert the CLEAN-EOF branch specifically, not merely "some error was reported". `Ok(None)` at
+    // the master's `recv_object` is the branch the original `.expect()` panicked on; the RST branch
+    // (`Err`) was always handled correctly and would make this test vacuous for the regression it
+    // exists to catch. The two are distinguishable because the master words them differently -
+    // `rcpd_closed_quietly` vs `rcpd_went_quiet` in rcp.rs - so this assertion fails rather than
+    // passes if the kill starts landing on the RST path.
+    //
+    // Reaching clean EOF deterministically needs the destination's control-socket receive queue to be
+    // empty when it dies, which is what the marker barrier above establishes: the destination has
+    // CONSUMED the MasterHello, and the master sends nothing further on that connection before
+    // awaiting the result. SIGKILL with an empty queue yields FIN, not RST.
+    assert!(
+        combined.contains("destination rcpd on")
+            && combined
+                .contains("closed its control connection cleanly but did not report a result"),
+        "expected the clean-EOF diagnostic naming the dead destination rcpd (not the RST-path \
+         wording, which exercises an already-correct branch); got:\n{combined}"
+    );
+    eprintln!("✓ master reported a clean error (exit 1) instead of aborting");
+}
+
+/// A writer that fills the destination slot AFTER the remote destination classified it as vacant is
+/// resolved by `--overwrite`, not failed. The destination creates with `O_CREAT|O_EXCL`, so `EEXIST` is
+/// the only way it learns of the new entry; before it recovered from that, such a file failed with
+/// "File exists" no matter what `--overwrite` / `--ignore-existing` asked for.
+///
+/// The race is made DETERMINISTIC by `--iops-throttle`, which gates the data path: each side reserves
+/// `((size - 1) / chunk_size) + 1` tokens per file, and the destination reserves them AFTER it has
+/// classified the slot — logging that it is about to. 20 MiB at 1 MiB chunks is 20 tokens, so at 4
+/// tokens/sec the destination sits in that reservation for ~5s, which is the window this test writes
+/// into. The source reserves its own budget before it even sends the header, which is why the barrier
+/// keys off the DESTINATION's marker rather than a fixed delay.
+///
+/// Both markers are asserted. Without the first, the write would race classification; without the
+/// second, a write that landed too early would take the ordinary overwrite path and the test would
+/// pass while proving nothing.
+#[test]
+fn test_remote_overwrite_recovers_when_destination_appears_after_classification() {
+    require_local_ssh();
+    const IOPS_THROTTLE: usize = 4;
+    const FILE_SIZE_MIB: usize = 20;
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("appears.dat");
+    create_large_test_file(&src_file, FILE_SIZE_MIB);
+    let dst_file = dst_dir.path().join("appears.dat");
+    // the destination must be ABSENT when the copy classifies it: that is what makes classification
+    // decide "vacant", leaving the create as the only thing that can discover the conflict.
+    assert!(
+        !dst_file.exists(),
+        "destination must start absent for the create to be what finds the conflict"
+    );
+    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
+    // per-run rcpd debug log, as in test_remote_destination_rcpd_killed_reports_error_not_abort: the
+    // markers this test synchronizes on and asserts are logged by rcpd, not by the master.
+    let rcpd_log_dir = tempfile::TempDir::new().expect("Failed to create rcpd debug log dir");
+    let rcpd_marker = rcpd_log_dir.path().join("rcpd-debug").display().to_string();
+    let rcpd_log_arg = format!("--rcpd-debug-log-prefix={rcpd_marker}");
+    let stdout_file = tempfile::NamedTempFile::new().expect("Failed to create stdout capture file");
+    let stderr_file = tempfile::NamedTempFile::new().expect("Failed to create stderr capture file");
+    let iops_arg = format!("--iops-throttle={IOPS_THROTTLE}");
+    let mut cmd = std::process::Command::new("timeout");
+    cmd.args(["60", rcp_path.to_str().unwrap()]);
+    cmd.args([
+        "-vv",
+        "--force-remote",
+        "--no-encryption",
+        "--overwrite",
+        "--chunk-size=1MiB",
+        &iops_arg,
+        &rcpd_log_arg,
+        &src_remote,
+        &dst_remote,
+    ]);
+    cmd.stdout(
+        stdout_file
+            .reopen()
+            .expect("Failed to reopen stdout capture file"),
+    );
+    cmd.stderr(
+        stderr_file
+            .reopen()
+            .expect("Failed to reopen stderr capture file"),
+    );
+    let spawn_start = std::time::Instant::now();
+    let mut child = cmd.spawn().expect("Failed to spawn rcp");
+    let rcpd_logs_contain = |needle: &str| -> bool {
+        std::fs::read_dir(rcpd_log_dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                std::fs::read_to_string(entry.path()).is_ok_and(|content| content.contains(needle))
+            })
+    };
+    // logged by rcp::destination::process_single_file between classifying the slot and reserving its
+    // I/O budget, so seeing it means classification is done and the destination is now parked.
+    let classified_marker = "destination slot classified, reserving iops budget";
+    let mut classified = false;
+    while spawn_start.elapsed().as_secs() < 40 {
+        if rcpd_logs_contain(classified_marker) {
+            classified = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let read_captured_output = |status: std::process::ExitStatus| -> std::process::Output {
+        std::process::Output {
+            status,
+            stdout: std::fs::read(stdout_file.path()).unwrap_or_default(),
+            stderr: std::fs::read(stderr_file.path()).unwrap_or_default(),
+        }
+    };
+    if !classified {
+        let status = child.wait().expect("Failed to wait for rcp");
+        print_command_output(&read_captured_output(status));
+        panic!(
+            "destination rcpd did not log {classified_marker:?} within {:?}, so the window this test \
+             writes into was never reached",
+            spawn_start.elapsed()
+        );
+    }
+    // fill the slot the destination just classified as vacant, while it waits on its I/O budget
+    std::fs::write(&dst_file, b"planted after classification")
+        .expect("Failed to plant destination");
+    let status = child.wait().expect("Failed to wait for rcp master");
+    let output = read_captured_output(status);
+    print_command_output(&output);
+    assert_not_timeout(&output);
+    assert!(
+        output.status.success(),
+        "copy should recover from the conflict and succeed, not fail the file on EEXIST"
+    );
+    // the destination must hold the SOURCE's content, not the planted file
+    let copied = std::fs::metadata(&dst_file).expect("destination should exist");
+    assert_eq!(
+        copied.len(),
+        (FILE_SIZE_MIB * 1024 * 1024) as u64,
+        "destination should hold the full source, not the planted file"
+    );
+    // prove the EEXIST branch is what ran. Without this, a write that landed before classification
+    // would take the ordinary overwrite path and this test would pass without exercising the recovery
+    // it exists for.
+    assert!(
+        rcpd_logs_contain("destination appeared after classification"),
+        "expected the destination to report recovering from a post-classification EEXIST; without it \
+         the plant raced classification and the ordinary overwrite path ran instead"
     );
 }
 
@@ -2250,6 +2612,22 @@ fn test_remote_auto_deploy_rcpd() {
     assert!(
         permissions.mode() & 0o100 != 0,
         "deployed rcpd should be executable"
+    );
+    // publication is a rename of the deployment's own temp file, so a successful deployment
+    // consumes it. Note what this does NOT prove: the implementation this replaced also left no
+    // temp file behind on success (its `mv` renamed the shared `.tmp.$$` away just the same), so
+    // this cannot tell the two apart. It guards the *leak* direction — a deployment that stages a
+    // file and then returns without publishing or removing it. The unique-name and
+    // verify-before-publish guarantees are red-greened by the unit tests in remote/src/deploy.rs.
+    let leftover_temps: Vec<_> = std::fs::read_dir(&cache_dir)
+        .expect("cache dir should exist after deployment")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp."))
+        .collect();
+    assert!(
+        leftover_temps.is_empty(),
+        "a successful deployment must leave no temp file behind, found: {leftover_temps:?}"
     );
 
     eprintln!("✓ Auto-deployment test succeeded");
@@ -2653,9 +3031,17 @@ fn test_remote_auto_deploy_error_permission_denied() {
 }
 
 #[test]
-fn test_remote_auto_deploy_error_checksum_mismatch() {
-    // test that checksum mismatch is detected and reported.
-    // this test verifies the integrity verification works
+fn test_remote_auto_deploy_redeploys_and_verifies_after_cache_eviction() {
+    // Renamed from `test_remote_auto_deploy_error_checksum_mismatch`, which is not what it does:
+    // nothing here ever produces a mismatch. A mismatch cannot be staged through the CLI — the
+    // transfer runs over SSH with no injection point — so this covers what it actually can: that
+    // evicting the cached binary triggers a fresh deployment, that the deployment succeeds, and
+    // that it reports having verified the checksum.
+    //
+    // The ORDER of that verification — checksum the staged temp file, publish only if it matches —
+    // is pinned by `transfer_command_does_not_publish` and its neighbours in remote/src/deploy.rs,
+    // which fail against a staging command that renames before verifying. That is where the
+    // red-green for publish-before-verify lives; this test cannot distinguish the two orders.
     let home = make_test_home();
     let override_home = home.path().to_str().unwrap().to_string();
     require_local_ssh();
@@ -2678,7 +3064,6 @@ fn test_remote_auto_deploy_error_checksum_mismatch() {
     );
     assert!(output.status.success(), "initial deployment should succeed");
     assert!(dst_file.exists(), "copy should succeed");
-    // now corrupt the deployed binary in cache
     let cache_dir = cache_bin_dir(home.path());
     // find the deployed rcpd binary (rcpd-0.22.0 or similar)
     let mut deployed_binary = None;
@@ -2695,8 +3080,6 @@ fn test_remote_auto_deploy_error_checksum_mismatch() {
     }
     let deployed_binary = deployed_binary.expect("should find deployed rcpd binary in cache");
     eprintln!("found deployed binary: {}", deployed_binary.display());
-    // corrupt it by writing garbage
-    std::fs::write(&deployed_binary, "corrupted binary content").expect("failed to corrupt binary");
     // clear the destination file so we try to copy again
     std::fs::remove_file(&dst_file).ok();
     // note: the current implementation verifies checksum during DEPLOYMENT, not when USING the cached binary.
@@ -2706,14 +3089,22 @@ fn test_remote_auto_deploy_error_checksum_mismatch() {
     // to test actual checksum mismatch, we'd need to: (1) intercept the transfer (not possible in integration test),
     // (2) modify the checksum verification code to inject failures (not good), or (3) test at unit level in deploy.rs (better approach).
     // for now, let's just verify that the deployment succeeds and includes checksum verification in the output stderr
-    std::fs::remove_file(&deployed_binary).expect("failed to remove corrupted binary");
-    // re-deploy (should succeed with checksum verification)
-    let output = run_rcp_with_args(&[
-        "--auto-deploy-rcpd",
-        "--rcpd-path=/nonexistent/rcpd",
-        &src_remote,
-        &dst_remote,
-    ]);
+    // unlink -- never truncate -- the cached binary: an rcpd from the previous run may still be
+    // exiting with it open for execution, which would make an in-place write fail with ETXTBSY.
+    std::fs::remove_file(&deployed_binary).expect("failed to remove cached binary");
+    // re-deploy (should succeed with checksum verification). use the same temp home as the
+    // initial deployment -- otherwise this would deploy a debug rcpd into the developer's real
+    // ~/.cache/rcp/bin, and the re-deploy would be measured against the wrong cache entirely.
+    let output = run_rcp_with_args_home_and_env(
+        &[
+            "--auto-deploy-rcpd",
+            "--rcpd-path=/nonexistent/rcpd",
+            &src_remote,
+            &dst_remote,
+        ],
+        home.path(),
+        &[("RCP_REMOTE_HOME_OVERRIDE", override_home.as_str())],
+    );
     print_command_output(&output);
     assert!(
         output.status.success(),
@@ -4953,26 +5344,35 @@ fn test_remote_preserve_settings_dir_7777() {
 #[test]
 fn test_remote_preserve_all_special_bits_on_files() {
     require_local_ssh();
+    // (mode, contents). the empty row pins that special bits survive a ZERO-LENGTH file: its
+    // transfer skips the data step entirely, so the closing chmod is the only thing standing
+    // between the owner-only create mode and the source mode.
     let test_cases: &[(u32, &str)] = &[
         (0o4755, "setuid"),
         (0o2755, "setgid"),
         (0o1755, "sticky"),
         (0o6755, "setuid+setgid"),
         (0o7755, "setuid+setgid+sticky"),
+        (0o4755, ""),
     ];
-    for &(mode, description) in test_cases {
+    for &(mode, contents) in test_cases {
+        let label = if contents.is_empty() {
+            "zero-length setuid"
+        } else {
+            contents
+        };
         let (src_dir, dst_dir) = setup_test_env();
         let src_file = src_dir.path().join(format!("test_{mode:o}.txt"));
         let dst_file = dst_dir.path().join(format!("test_{mode:o}.txt"));
-        create_test_file(&src_file, description, mode);
+        create_test_file(&src_file, contents, mode);
         let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
         let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
         run_rcp_and_expect_success(&["--preserve-settings=all", &src_remote, &dst_remote]);
-        assert_eq!(get_file_content(&dst_file), description);
+        assert_eq!(get_file_content(&dst_file), contents);
         assert_eq!(
             get_file_mode(&dst_file),
             mode,
-            "file special bits not preserved for {description} ({mode:o})"
+            "file special bits not preserved for {label} ({mode:o})"
         );
     }
 }
@@ -4980,28 +5380,113 @@ fn test_remote_preserve_all_special_bits_on_files() {
 #[test]
 fn test_remote_preserve_settings_file_7777() {
     require_local_ssh();
+    // (mode, contents), with the same zero-length row as `test_remote_preserve_all_special_bits_on_files`
     let test_cases: &[(u32, &str)] = &[
         (0o4755, "setuid"),
         (0o2755, "setgid"),
         (0o1755, "sticky"),
         (0o6755, "setuid+setgid"),
         (0o7755, "setuid+setgid+sticky"),
+        (0o4755, ""),
     ];
-    for &(mode, description) in test_cases {
+    for &(mode, contents) in test_cases {
+        let label = if contents.is_empty() {
+            "zero-length setuid"
+        } else {
+            contents
+        };
         let (src_dir, dst_dir) = setup_test_env();
         let src_file = src_dir.path().join(format!("test_{mode:o}.txt"));
         let dst_file = dst_dir.path().join(format!("test_{mode:o}.txt"));
-        create_test_file(&src_file, description, mode);
+        create_test_file(&src_file, contents, mode);
         let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
         let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
         run_rcp_and_expect_success(&["--preserve-settings", "f:7777", &src_remote, &dst_remote]);
-        assert_eq!(get_file_content(&dst_file), description);
+        assert_eq!(get_file_content(&dst_file), contents);
         assert_eq!(
             get_file_mode(&dst_file),
             mode,
-            "file special bits not preserved for {description} ({mode:o})"
+            "file special bits not preserved for {label} ({mode:o})"
         );
     }
+}
+
+/// The remote destination must keep a file owner-only until its contents have arrived, exactly as
+/// the local engine does — `rcpd` creates destination files through the same `Dir::create_file`.
+///
+/// `--ops-throttle=1` (which the master forwards to both rcpd instances) limits each of them to one
+/// metadata syscall per second, stretching the create → `fchmod` window into a full second. That is
+/// what makes the sampling deterministic instead of a race against loopback TCP.
+#[test]
+fn test_remote_copy_creates_file_owner_only_until_written() {
+    require_local_ssh();
+    /// The mode a destination file is created at (`common::safedir::DST_FILE_CREATE_MODE`).
+    const CREATE_MODE: u32 = 0o600;
+    /// The source mode, and so the mode the destination must end at.
+    const SRC_MODE: u32 = 0o4755;
+    let (src_dir, dst_dir) = setup_test_env();
+    // the reachable case: a world-searchable destination directory, i.e. any repeat or incremental
+    // copy into an existing tree
+    std::fs::set_permissions(dst_dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let src_file = src_dir.path().join("setuid.bin");
+    let dst_file = dst_dir.path().join("setuid.bin");
+    create_test_file(&src_file, "payload", SRC_MODE);
+    let full_size = std::fs::metadata(&src_file).unwrap().len();
+    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
+    // capture stdout to a real file rather than discarding it: rcp prints its error chain with
+    // `println!("{err:?}")` (common/src/lib.rs), i.e. to stdout, so throwing it away would make any
+    // failure here undiagnosable. A file, not `Stdio::piped()` - nothing drains a pipe while
+    // `sample_while_running` polls, so a full kernel buffer would deadlock the child.
+    let stdout_file = tempfile::NamedTempFile::new().expect("Failed to create stdout capture file");
+    let child = std::process::Command::new("timeout")
+        // the throttled copy takes ~11s; the wrapper only has to catch a hang
+        .args(["120", rcp_path.to_str().unwrap()])
+        .args([
+            "--force-remote",
+            "--preserve-settings=all",
+            "--ops-throttle=1",
+            &format!("localhost:{}", src_file.to_str().unwrap()),
+            &format!("localhost:{}", dst_file.to_str().unwrap()),
+        ])
+        .stdout(
+            stdout_file
+                .reopen()
+                .expect("Failed to reopen stdout capture file"),
+        )
+        .spawn()
+        .expect("Failed to execute rcp command");
+    let (status, samples) = sample_while_running(child, &dst_file);
+    let observed = describe_samples(&samples);
+    let rcp_output = std::fs::read_to_string(stdout_file.path()).unwrap_or_default();
+    assert!(
+        status.success(),
+        "remote copy failed ({}); rcp output:\n{rcp_output}\nsamples: {observed}",
+        status
+            .code()
+            .map_or_else(|| "signal".to_string(), interpret_exit_code)
+    );
+    // the destination is only ever seen owner-only while it is being filled in, or complete at the
+    // source mode — never in between
+    for &(mode, size) in &samples {
+        assert!(
+            mode == CREATE_MODE || mode == SRC_MODE,
+            "destination observed at {mode:o} (size {size}); expected {CREATE_MODE:o} while being \
+             written or {SRC_MODE:o} once complete. samples: {observed}"
+        );
+        assert!(
+            size == full_size || mode & 0o7077 == 0,
+            "an incomplete destination (size {size} of {full_size}) was observed at {mode:o}, \
+             readable outside the copier. samples: {observed}"
+        );
+    }
+    // fail loudly rather than vacuously: without the owner-only create there is no such sample
+    assert!(
+        samples.iter().any(|&(mode, _)| mode == CREATE_MODE),
+        "the destination was never observed owner-only, so rcpd published it at its final mode \
+         before writing its contents. samples: {observed}"
+    );
+    assert_eq!(get_file_mode(&dst_file), SRC_MODE);
+    assert_eq!(get_file_content(&dst_file), "payload");
 }
 
 /// Test that --skip-specials correctly skips sockets in remote copy and reports the count

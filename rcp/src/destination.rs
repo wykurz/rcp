@@ -310,79 +310,86 @@ async fn process_single_file(
         source: e,
         stream_state: StreamState::DataConsumed,
     };
-    // classify any existing destination entry through the parent's pinned fd (O_NOFOLLOW),
-    // never re-resolving file_header.dst by path. handle overwrite/--ignore-existing.
-    if let Ok(dst_handle) = dst_parent.child(dst_name).await {
-        if settings.ignore_existing {
-            tracing::debug!("destination exists, skipping (--ignore-existing)");
-            prog.files_unchanged.inc();
-            drain_file_data(file_recv_stream, file_header.size)
-                .await
-                .map_err(err_corrupted)?;
-            return Ok(());
-        }
-        if !settings.overwrite {
-            return Err(err_needs_drain(anyhow::anyhow!(
-                "destination {:?} already exists, did you intend to specify --overwrite?",
-                file_header.dst
-            )));
-        }
-        tracing::debug!("file exists, check if it's identical");
-        if dst_handle.kind() == common::walk::EntryKind::File {
-            let src_file_metadata = remote::protocol::FileMetadata {
-                metadata: &file_header.metadata,
-                size: file_header.size,
-            };
-            if common::filecmp::metadata_equal(
-                &settings.overwrite_compare,
-                &src_file_metadata,
-                dst_handle.meta(),
-            ) {
-                tracing::debug!("file is identical, skipping");
-                prog.files_unchanged.inc();
-                drain_file_data(file_recv_stream, file_header.size)
-                    .await
-                    .map_err(err_corrupted)?;
-                return Ok(());
-            }
-            if let Some(common::copy::OverwriteFilter::Newer) = settings.overwrite_filter
-                && common::filecmp::dest_is_newer(&src_file_metadata, dst_handle.meta())
-            {
-                tracing::debug!("dest is newer than source, skipping");
-                prog.files_unchanged.inc();
-                drain_file_data(file_recv_stream, file_header.size)
-                    .await
-                    .map_err(err_corrupted)?;
-                return Ok(());
-            }
-        }
-        tracing::debug!("destination differs, removing existing entry");
-        // recheck-guarded, fd-relative removal contained to dst_parent (mirrors copy.rs:1.3).
-        remove_existing_dst(
-            dst_parent,
-            dst_name,
-            &file_header.dst,
-            &dst_handle,
-            settings,
-        )
+    // PLAN, then acquire, then MUTATE — the same split as `plan_dst_file`/`execute_dst_plan` in
+    // common/src/copy.rs. Here it buys less than it does locally: there is no source open to fail,
+    // only the iops reservation to wait for, so what the ordering avoids is unlinking the destination
+    // and then sitting on `--iops-throttle` for seconds before putting anything back. It is NOT
+    // cancellation safety — `create_file` waits on the ops-throttle internally, so a cancelled
+    // transfer can still land between the removal and the create — and it does not try to be; see
+    // `common::copy::copy_file_fd` for why rcp accepts that instead of staging and renaming.
+    let plan = plan_dst_file(settings, file_header, dst_parent, dst_name)
         .await
         .map_err(err_needs_drain)?;
+    // a skipped file's bytes are already on the wire and must come off it before the next header.
+    if matches!(plan, DstFilePlan::Skip) {
+        drain_file_data(file_recv_stream, file_header.size)
+            .await
+            .map_err(err_corrupted)?;
+        return Ok(());
     }
+    // logged between deciding and waiting, so it marks the point where this side has committed to a
+    // plan but has not yet acted on it — the interval a competing writer can still slip into, and the
+    // one a throttle-bound transfer spends all its time in.
+    tracing::debug!("destination slot classified, reserving iops budget");
     throttle::get_file_iops_tokens(settings.chunk_size, file_header.size)
         .instrument(tracing::trace_span!(
             "iops_throttle",
             size = file_header.size
         ))
         .await;
+    // the reservation is held, so the old entry can go. `remove_existing_dst` re-checks the planned
+    // entry by inode first, so a swap since classification fails closed.
+    if let DstFilePlan::Replace(dst_handle) = &plan {
+        tracing::debug!("destination differs, removing existing entry");
+        // recheck-guarded, fd-relative removal contained to dst_parent (mirrors copy.rs:1.3).
+        remove_existing_dst(dst_parent, dst_name, &file_header.dst, dst_handle, settings)
+            .await
+            .map_err(err_needs_drain)?;
+    }
     // create the destination file fresh through the parent's pinned fd (O_CREAT|O_EXCL|
-    // O_NOFOLLOW): never follows a symlink, never escapes dst_parent. the creation mode
-    // matches the metadata applier's chmod target, mirroring copy.rs.
-    let create_mode = common::preserve::masked_mode(preserve.file.mode_mask, &file_header.metadata);
-    let std_file = dst_parent
-        .create_file(dst_name, create_mode)
-        .await
-        .with_context(|| format!("failed creating {:?}", file_header.dst))
-        .map_err(err_needs_drain)?;
+    // O_NOFOLLOW): never follows a symlink, never escapes dst_parent. it is created owner-only
+    // (`DST_FILE_CREATE_MODE`) and only widened to the source mode by `set_file_metadata_fd`
+    // below, after the last byte, mirroring copy.rs.
+    let std_file = match dst_parent.create_file(dst_name).await {
+        Ok(std_file) => std_file,
+        // the slot is occupied: a writer filled it between the classification above — or during the
+        // `--iops-throttle` wait after it, which can be seconds — and now. `create_file`'s `O_EXCL`
+        // is the only way this side finds out. Resolve it here and honor --overwrite /
+        // --ignore-existing rather than failing the file on EEXIST regardless of either, exactly as
+        // the local copy does (common/src/copy.rs). Planning and executing are back-to-back on this
+        // route, unlike the one above: the reservation is already held, so nothing is left to wait
+        // for between the removal and the retry.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            tracing::debug!("destination appeared after classification, re-planning");
+            let plan = plan_dst_file(settings, file_header, dst_parent, dst_name)
+                .await
+                .map_err(err_needs_drain)?;
+            if matches!(plan, DstFilePlan::Skip) {
+                drain_file_data(file_recv_stream, file_header.size)
+                    .await
+                    .map_err(err_corrupted)?;
+                return Ok(());
+            }
+            if let DstFilePlan::Replace(dst_handle) = &plan {
+                remove_existing_dst(dst_parent, dst_name, &file_header.dst, dst_handle, settings)
+                    .await
+                    .map_err(err_needs_drain)?;
+            }
+            // retry exactly once. the slot was cleared just above, so a second EEXIST means yet
+            // another writer refilled it — report that rather than looping, which against a live
+            // competing writer would never terminate.
+            dst_parent
+                .create_file(dst_name)
+                .await
+                .with_context(|| format!("failed creating {:?}", file_header.dst))
+                .map_err(err_needs_drain)?
+        }
+        Err(error) => {
+            return Err(err_needs_drain(
+                anyhow::Error::new(error).context(format!("failed creating {:?}", file_header.dst)),
+            ));
+        }
+    };
     // wrap the std file for async writes; the underlying fd is retained so its metadata
     // can be applied through the held fd (no path re-open).
     let mut file = tokio::fs::File::from_std(std_file);
@@ -440,6 +447,92 @@ async fn process_single_file(
     .map_err(err_data_consumed)?;
     drop(file);
     Ok(())
+}
+
+/// What to do about whatever occupies the destination's slot — the destination counterpart of
+/// `common::copy::FilePlan`.
+enum DstFilePlan {
+    /// Nothing occupies the slot; create the file directly.
+    Vacant,
+    /// An entry must be removed before the create (`--overwrite`).
+    Replace(common::safedir::Handle),
+    /// This file is not copied (`--ignore-existing`, or an identical / newer destination under
+    /// `--overwrite`). Its bytes are still on the wire, so the caller must drain them.
+    Skip,
+}
+
+/// Classify whatever occupies `dst_name` and decide what to do about it.
+///
+/// **Non-mutating.** It classifies and decides; the caller removes. Keep it that way — the separation
+/// is what lets the caller finish acquiring the iops reservation before the destination stops
+/// existing.
+///
+/// The mirror of `common::copy::plan_dst_file`, and it keeps that function's two rules: the lookup
+/// goes through the parent's pinned fd (`O_NOFOLLOW`) rather than re-resolving `file_header.dst` by
+/// path, and only `NotFound` is taken to mean the slot is empty.
+///
+/// [`process_single_file`] calls this from both of its routes: up front, and again when `create_file`
+/// reports `EEXIST` because a writer filled the slot after the first look. A skip decision counts
+/// itself here; draining the skipped file's bytes is the caller's job, since only it holds the stream.
+async fn plan_dst_file(
+    settings: &common::copy::Settings,
+    file_header: &remote::protocol::File,
+    dst_parent: &Arc<Dir>,
+    dst_name: &OsStr,
+) -> anyhow::Result<DstFilePlan> {
+    let prog = progress();
+    let dst_handle = match dst_parent.child(dst_name).await {
+        Ok(dst_handle) => dst_handle,
+        // `NotFound` is the ONE error that means the slot is empty. Every other failure (EACCES on
+        // the parent, EMFILE, ESTALE, EIO) says we could not look, not that there is nothing there,
+        // and must keep its own cause — mirroring `plan_dst_file`. Treating them as "vacant" made
+        // the create's error stand in for the real one, and `--ignore-existing` fail rather than
+        // skip.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DstFilePlan::Vacant);
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
+                "failed looking up destination {:?}",
+                file_header.dst
+            )));
+        }
+    };
+    if settings.ignore_existing {
+        tracing::debug!("destination exists, skipping (--ignore-existing)");
+        prog.files_unchanged.inc();
+        return Ok(DstFilePlan::Skip);
+    }
+    if !settings.overwrite {
+        return Err(anyhow::anyhow!(
+            "destination {:?} already exists, did you intend to specify --overwrite?",
+            file_header.dst
+        ));
+    }
+    tracing::debug!("file exists, check if it's identical");
+    if dst_handle.kind() == common::walk::EntryKind::File {
+        let src_file_metadata = remote::protocol::FileMetadata {
+            metadata: &file_header.metadata,
+            size: file_header.size,
+        };
+        if common::filecmp::metadata_equal(
+            &settings.overwrite_compare,
+            &src_file_metadata,
+            dst_handle.meta(),
+        ) {
+            tracing::debug!("file is identical, skipping");
+            prog.files_unchanged.inc();
+            return Ok(DstFilePlan::Skip);
+        }
+        if let Some(common::copy::OverwriteFilter::Newer) = settings.overwrite_filter
+            && common::filecmp::dest_is_newer(&src_file_metadata, dst_handle.meta())
+        {
+            tracing::debug!("dest is newer than source, skipping");
+            prog.files_unchanged.inc();
+            return Ok(DstFilePlan::Skip);
+        }
+    }
+    Ok(DstFilePlan::Replace(dst_handle))
 }
 
 /// Remove an existing destination entry (file / symlink / directory) so a fresh entry can take
@@ -981,9 +1074,10 @@ async fn build_existing_manifest(
 /// directory→symlink swap fails closed with ELOOP/ENOTDIR); replace a non-directory via the
 /// recheck-guarded [`remove_existing_dst`] then `make_dir`. A privileged destination therefore
 /// cannot be redirected by a concurrent symlink swap of the parent into creating a directory
-/// outside the destination tree. The new directory is created mode `0o700` (writable so children
-/// can be populated); its real source mode is applied later by `complete_directory_single`,
-/// mirroring the path-based / local-copy behavior.
+/// outside the destination tree. The new directory is created at
+/// [`common::safedir::DST_DIR_CREATE_MODE`] (writable so children can be populated); its real
+/// source mode is applied later by `complete_directory_single`, mirroring the path-based /
+/// local-copy behavior.
 ///
 /// Returns the result; does NOT increment progress counters — the caller defers the increment
 /// until completion (when it knows whether the directory is kept).
@@ -994,7 +1088,10 @@ async fn create_directory(
     dst: &std::path::Path,
 ) -> anyhow::Result<DirectoryCreateResult> {
     let prog = progress();
-    match dst_parent.make_dir(dst_name, 0o700).await {
+    match dst_parent
+        .make_dir(dst_name, common::safedir::DST_DIR_CREATE_MODE)
+        .await
+    {
         Ok(dir) => {
             // don't increment counter here - will be done in complete_directory
             // when we know we're keeping this directory
@@ -1042,7 +1139,7 @@ async fn create_directory(
                 tracing::info!("destination is not a directory, removing and creating a new one");
                 remove_existing_dst(dst_parent, dst_name, dst, &dst_handle, settings).await?;
                 let dir = dst_parent
-                    .make_dir(dst_name, 0o700)
+                    .make_dir(dst_name, common::safedir::DST_DIR_CREATE_MODE)
                     .await
                     .with_context(|| format!("cannot create directory {dst:?}"))?;
                 // don't increment counter here - will be done in complete_directory

@@ -30,7 +30,7 @@ pub async fn run_sender<W: tokio::io::AsyncWrite + Unpin + Send>(
         }
     } {
         if let Err(e) = send_stream.send_batch_message(&msg).await {
-            eprintln!("Failed to send tracing message: {e}");
+            eprintln!("Failed to send tracing message: {e:#}");
         }
     }
     println!("Remote tracing sender done, no more messages to send");

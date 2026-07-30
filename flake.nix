@@ -72,6 +72,9 @@
           "--skip=test_preserve_settings_dir_7777_preserves_special_bits"
           "--skip=test_preserve_settings_file_7777_preserves_special_bits"
           "--skip=test_preserve_settings_none_strips_special_bits_on_directories"
+          "--skip=copy_creates_file_owner_only_until_contents_are_written"
+          "--skip=preserves_setuid_file_mode_when_created_owner_only"
+          "--skip=interrupted_copy_leaves_partial_file_owner_only"
           # expects overwrite behavior that doesn't work in a sandbox
           "--skip=test_overwrite_behavior"
           # need network access to determine the local IP address

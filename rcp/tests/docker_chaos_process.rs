@@ -125,6 +125,28 @@ fn wait_with_timeout(
     }
 }
 
+/// Read output captured by [`DockerEnv::spawn_rcp_capturing`] and assert a clean, reported
+/// failure (exit 1) rather than a crash. See [`support::docker_env::assert_clean_failure`] for
+/// the assertion itself (shared with `docker_chaos_io.rs`).
+///
+/// Note: under TLS (the default here), a killed peer is typically caught by the TLS layer itself -
+/// rustls reports a missing `close_notify` as an `Err` before `recv_object` could ever return the
+/// clean `Ok(None)` that a prior abort bug (fixed in an earlier commit) needed. So in practice this
+/// assertion mainly guards against *any* crash in this path rather than reproducing that specific
+/// bug; the deliberate `--no-encryption` repro for it lives in
+/// `test_remote_destination_rcpd_killed_reports_error_not_abort` (rcp/tests/remote_tests.rs).
+fn assert_clean_failure(
+    status: std::process::ExitStatus,
+    stdout_path: &std::path::Path,
+    stderr_path: &std::path::Path,
+    context: &str,
+) {
+    let stdout = std::fs::read_to_string(stdout_path).unwrap_or_default();
+    let stderr = std::fs::read_to_string(stderr_path).unwrap_or_default();
+    let combined = format!("{stdout}\n{stderr}");
+    support::docker_env::assert_clean_failure(status, &combined, context);
+}
+
 /// Test that killing rcpd early (before connections established) causes rcp to fail fast.
 ///
 /// This tests the "connection refused" error path - rcpd starts but is killed before
@@ -149,7 +171,7 @@ fn test_chaos_kill_rcpd_early() -> Result<()> {
     env.add_latency("host-a", 200, None)?;
     env.add_latency("host-b", 200, None)?;
     // spawn rcp in background
-    let child = env.spawn_rcp(&[
+    let (child, stdout_file, stderr_file) = env.spawn_rcp_capturing(&[
         &format!("host-a:{}", src_path),
         &format!("host-b:{}", dst_path),
     ])?;
@@ -164,9 +186,11 @@ fn test_chaos_kill_rcpd_early() -> Result<()> {
     eprintln!("killed rcpd on both hosts (early, before connections)");
     // should fail quickly with "connection refused"
     let status = wait_with_timeout(child, Duration::from_secs(30))?;
-    assert!(
-        !status.success(),
-        "rcp should fail when rcpd is killed early"
+    assert_clean_failure(
+        status,
+        stdout_file.path(),
+        stderr_file.path(),
+        "rcp killed rcpd early (before connections established)",
     );
     // cleanup handled by _guard
     eprintln!("✓ Kill rcpd early test passed");
@@ -198,7 +222,7 @@ fn test_chaos_kill_rcpd_mid_transfer() -> Result<()> {
     env.add_latency("host-a", 200, None)?;
     env.add_latency("host-b", 200, None)?;
     // spawn rcp with shorter connection timeout to speed up failure detection
-    let child = env.spawn_rcp(&[
+    let (child, stdout_file, stderr_file) = env.spawn_rcp_capturing(&[
         "--remote-copy-conn-timeout-sec=5",
         &format!("host-a:{}", src_path),
         &format!("host-b:{}", dst_path),
@@ -216,9 +240,11 @@ fn test_chaos_kill_rcpd_mid_transfer() -> Result<()> {
     eprintln!("killed rcpd on both hosts (mid-transfer)");
     // longer timeout - TCP may take a while to detect dead peer
     let status = wait_with_timeout(child, Duration::from_secs(120))?;
-    assert!(
-        !status.success(),
-        "rcp should fail when rcpd is killed mid-transfer"
+    assert_clean_failure(
+        status,
+        stdout_file.path(),
+        stderr_file.path(),
+        "rcp killed rcpd mid-transfer",
     );
     // cleanup handled by _guard
     eprintln!("✓ Kill rcpd mid-transfer test passed");
