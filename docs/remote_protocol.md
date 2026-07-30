@@ -581,6 +581,12 @@ struct DirectoryState {
 }
 ```
 
+**File creation mode.** The destination creates each file at `0o600` (`O_CREAT|O_EXCL|O_NOFOLLOW`
+relative to the parent's pinned fd) and only applies the source mode through the file's own fd once
+every byte of the transfer has arrived and been flushed, so a file is never reachable at its final —
+possibly setuid — mode before its contents exist. This mirrors the local engine exactly (both go
+through `Dir::create_file`) and is destination-local: no protocol message carries a creation mode.
+
 **Reused-directory lockdown (`--require-toctou-safe`).** When the destination REUSES an existing
 directory under strict operand resolution (the `AlreadyExisted` outcome of directory creation), it
 takes the directory over before any child is written: it inode-rechecks the opened fd against the

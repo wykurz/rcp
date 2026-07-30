@@ -29,3 +29,40 @@ pub fn get_file_content(path: &std::path::Path) -> String {
 pub fn get_file_mode(path: &std::path::Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
 }
+
+/// Render `(mode, size)` samples with the mode in octal — plain `{:?}` prints a decimal mode,
+/// which is unreadable in a permissions failure.
+pub fn describe_samples(samples: &[(u32, u64)]) -> String {
+    samples
+        .iter()
+        .map(|(mode, size)| format!("(mode {mode:o}, size {size})"))
+        .collect::<Vec<_>>()
+        .join(" -> ")
+}
+
+/// Run `child` to completion, recording each distinct `(mode, size)` the entry at `path` passes
+/// through, ending with the state it is left in. Consecutive identical samples are collapsed, so
+/// what comes back is the sequence of states rather than thousands of repeats of each.
+pub fn sample_while_running(
+    mut child: std::process::Child,
+    path: &std::path::Path,
+) -> (std::process::ExitStatus, Vec<(u32, u64)>) {
+    let mut samples: Vec<(u32, u64)> = Vec::new();
+    let sample = |samples: &mut Vec<(u32, u64)>| {
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            let observed = (meta.permissions().mode() & 0o7777, meta.len());
+            if samples.last() != Some(&observed) {
+                samples.push(observed);
+            }
+        }
+    };
+    let status = loop {
+        sample(&mut samples);
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
+    sample(&mut samples);
+    (status, samples)
+}

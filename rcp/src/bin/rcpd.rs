@@ -307,7 +307,7 @@ async fn stdin_monitor() {
                     }
                     _ => {
                         // other errors are likely permanent - treat as disconnect
-                        tracing::warn!("stdin read error ({}), treating as master disconnect", e);
+                        tracing::warn!("stdin read error ({:#}), treating as master disconnect", e);
                         return;
                     }
                 }
@@ -332,7 +332,11 @@ where
         .recv_object::<remote::protocol::MasterHello>()
         .await
         .context("Failed to receive hello message from master")?
-        .unwrap();
+        // a clean EOF here means the master went away before saying which role we play (it may
+        // have failed between spawning us and sending our hello); report it rather than abort.
+        .ok_or_else(|| {
+            anyhow::anyhow!("master closed the control connection before sending its hello")
+        })?;
     tracing::info!("Received side: {:?}", master_hello);
     // build tcp_config first so we can use its effective_buffer_size()
     let tcp_config = args.to_tcp_config();
@@ -556,7 +560,7 @@ async fn async_main(
             if let Err(e) =
                 remote::tracelog::run_sender(tracing_receiver, tracing_send_stream, cancel).await
             {
-                tracing::warn!("Tracing sender failed: {e}");
+                tracing::warn!("Tracing sender failed: {e:#}");
             }
         })
     };
@@ -656,6 +660,7 @@ async fn async_main(
             summary: _,
             runtime_stats: _,
         } => {
+            // rcp-error-log-allow: RcpdResult::Failure.error is a String off the wire, not a chain
             tracing::error!("rcpd operation failed: {error}");
             Err(anyhow::anyhow!("rcpd operation failed: {error}"))
         }

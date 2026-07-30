@@ -62,7 +62,28 @@ tracing::error!("operation failed: {:#}", &error);
 tracing::error!("operation failed: {}", &error);
 ```
 
-Enforced by `scripts/check-error-logging.sh`.
+This holds at every `tracing` level, not just `error!`; for inline captures (write `{e:#}`, never a
+bare `{e}`); and for structured fields (`?error` records Debug and is fine, `%error` records Display
+and is not).
+
+`scripts/check-error-logging.sh` is a **heuristic backstop, not a proof** — it is awk, so it cannot
+pair format placeholders with arguments in general and it recognises errors by name. Its rules are
+deliberately sound rather than complete: a clean run means "none of the known shapes", so still read
+log lines you touch. Its exact behaviour in both directions is pinned by
+`scripts/test-check-error-logging.sh` against the fixtures in `scripts/tests/error-logging/` — add a
+case there whenever you change a rule.
+
+If a binding only *looks* like an error — most often a `String` carrying an already-rendered
+message, where `{:#}` would add nothing — opt out on the line above, with a reason. That placement
+is the only one accepted, and deliberately so: the marker must be a comment on the line
+**immediately** above the macro, with no blank line between. A marker in a trailing comment, inside
+the format string, or on any preceding line of code does not suppress anything — otherwise an
+unrelated mention of the word could silence a real violation without a reason attached to it.
+
+```rust
+// rcp-error-log-allow: RcpdResult::Failure.error is a String off the wire, not a chain
+tracing::error!("rcpd operation failed: {error}");
+```
 
 ### Error Chain Preservation
 

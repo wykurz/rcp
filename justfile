@@ -13,6 +13,8 @@ lint:
     ./scripts/check-doc-format.sh
     @echo "🔍 Running clippy..."
     cargo clippy --workspace --all-targets -- -D warnings
+    @echo "🔍 Testing the error logging linter..."
+    ./scripts/test-check-error-logging.sh
     @echo "🔍 Checking error logging format..."
     ./scripts/check-error-logging.sh
     @echo "🔍 Checking anyhow::Error::msg usage..."

@@ -28,6 +28,37 @@ fn print_command_output(output: &Output, context: &str) {
     eprintln!("=== END RCP OUTPUT ===\n");
 }
 
+/// Assert that `status` represents a clean, reported failure (exit 1) rather than a crash.
+///
+/// `!status.success()` alone also accepts a crash: the workspace builds with `panic = "abort"`, so
+/// a panic surfaces as SIGABRT (exit 134, core dump) rather than the intended "print error chain,
+/// exit 1" path, and a signal kill shows up as `None`. A loose assertion like that is a real gap
+/// worth closing on its own merits, since it accepts any crash in place of the clean failure a
+/// test actually means to check for. Reject anything but a clean exit 1, and confirm no panic
+/// message leaked out either.
+///
+/// `combined_output` should be the test's stdout and stderr concatenated: rcp's own errors print
+/// via `println!("{err:?}")` (`common/src/lib.rs`), i.e. to stdout, not stderr, so checking only
+/// one stream isn't reliable.
+#[allow(dead_code)]
+pub fn assert_clean_failure(
+    status: std::process::ExitStatus,
+    combined_output: &str,
+    context: &str,
+) {
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "{context}: expected a clean, reported error (exit 1), not a crash (134/abort) or a \
+         signal kill (None); got code {:?}. output:\n{combined_output}",
+        status.code()
+    );
+    assert!(
+        !combined_output.contains("panicked"),
+        "{context}: rcp should not panic; output:\n{combined_output}"
+    );
+}
+
 /// Represents the Docker test environment with multiple containers
 pub struct DockerEnv {
     /// Path to the rcp binary to use
@@ -103,6 +134,45 @@ impl DockerEnv {
         cmd.stderr(std::process::Stdio::null());
         let child = cmd.spawn()?;
         Ok(child)
+    }
+
+    /// Spawn rcp command in the background like [`spawn_rcp`](Self::spawn_rcp), but capture
+    /// stdout/stderr to temp files instead of discarding them.
+    ///
+    /// For callers that need to inspect the output after the process exits (e.g. to confirm a
+    /// clean error was reported rather than a panic). Captures to real files rather than
+    /// `Stdio::piped()`: `-vv` output is verbose enough to fill a pipe's kernel buffer well before
+    /// the process exits, and nothing drains a piped child's output while the caller is off
+    /// polling with `try_wait()` - that combination deadlocks the child on a blocked write().
+    /// Files have no such limit.
+    ///
+    /// The caller is responsible for waiting on the child. The returned temp files must be kept
+    /// alive (not dropped) until after their content has been read, since dropping unlinks them.
+    #[allow(dead_code)]
+    pub fn spawn_rcp_capturing(
+        &self,
+        args: &[&str],
+    ) -> Result<(
+        std::process::Child,
+        tempfile::NamedTempFile,
+        tempfile::NamedTempFile,
+    )> {
+        let mut cmd = Command::new("docker");
+        cmd.args([
+            "exec",
+            "-u",
+            "testuser",
+            "rcp-test-master",
+            &self.rcp_binary,
+        ]);
+        cmd.arg("-vv");
+        cmd.args(args);
+        let stdout_file = tempfile::NamedTempFile::new()?;
+        let stderr_file = tempfile::NamedTempFile::new()?;
+        cmd.stdout(stdout_file.reopen()?);
+        cmd.stderr(stderr_file.reopen()?);
+        let child = cmd.spawn()?;
+        Ok((child, stdout_file, stderr_file))
     }
 
     /// Execute arbitrary command in a container
