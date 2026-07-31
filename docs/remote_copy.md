@@ -391,6 +391,11 @@ failed to connect to <addr>
 | SSH connection       | ~30s                                | SSH config                       |
 | Master → rcpd        | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
 | Destination → Source | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Dead-peer detection  | 120s (0 disables)                   | `--remote-keepalive-sec`         |
+
+Dead-peer detection covers idle connections everywhere, and unacknowledged data on control
+connections only — a data transfer to a vanished host still falls back to the kernel's
+retransmission limit (~15 min). See [remote_protocol.md](remote_protocol.md#84-connection-liveness).
 
 Example:
 
@@ -466,6 +471,7 @@ cargo build --target x86_64-unknown-linux-gnu
 | `--rcpd-path=PATH`                 | Override rcpd binary path on remote hosts                      |
 | `--auto-deploy-rcpd`               | Automatically deploy rcpd to remote hosts                      |
 | `--remote-copy-conn-timeout-sec=N` | Connection timeout (default: 15; 60 with `--auto-deploy-rcpd`) |
+| `--remote-keepalive-sec=N`         | Dead-peer detection budget, 0 disables (default: 120)          |
 | `--port-ranges=RANGES`             | Restrict TCP to specific ports (e.g., "8000-8999")             |
 | `--max-connections=N`              | Maximum concurrent data connections (default: 100)             |
 | `--network-profile=PROFILE`        | Buffer sizing: `datacenter` (default) or `internet`            |

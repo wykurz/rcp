@@ -67,8 +67,21 @@ for dir in $SEARCH_DIRS; do
     while IFS= read -r file; do
         [ "$file" = "$EXEMPT" ] && continue
         # strip line comments before matching so prose mentioning the call is fine, then fold
-        # rustfmt's multi-line call chains so the receiver and the method are seen together
-        matches=$(sed 's://.*::' "$file" > "$tmp" && fold_continuations "$tmp" \
+        # rustfmt's multi-line call chains so the receiver and the method are seen together.
+        #
+        # The fold runs on its own rather than inside the pipeline below, so that awk's own failure — a
+        # syntax error in the program above, an unreadable file — is seen. Piped, its status is
+        # discarded, and its empty output is indistinguishable from a clean file: the check would report
+        # success for a scan that never ran. Fatal rather than counted as a violation, because a linter
+        # that did not run is not a finding about the code.
+        sed 's://.*::' "$file" > "$tmp"
+        folded=$(fold_continuations "$tmp") || {
+            echo -e "${RED}ERROR: this check failed to run (awk exited $?)${NC}"
+            echo "  while checking: $file"
+            echo "  This is a bug in scripts/check-tls-handshake-timeout.sh, not a violation in that file."
+            exit 1
+        }
+        matches=$(printf '%s\n' "$folded" \
             | grep -E '\.(accept|connect)[[:space:]]*\(' \
             | grep -E '(acceptor|connector)' || true)
         if [ -n "$matches" ]; then

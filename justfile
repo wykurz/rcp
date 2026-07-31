@@ -5,7 +5,7 @@
 default:
     @just --list
 
-# Run all lints (fmt, markdown formatting, clippy, error logging, anyhow error msg, rust version, remote test naming, package metadata, walk-driver usage, source-read fidelity)
+# Run all lints (fmt, markdown formatting, clippy, error logging, anyhow error msg, rust version, remote test naming, package metadata, walk-driver usage, source-read fidelity, TLS handshake timeouts, TCP socket configuration)
 lint:
     @echo "🔍 Checking formatting..."
     cargo fmt --check
@@ -31,6 +31,8 @@ lint:
     ./scripts/check-source-read-fidelity.sh
     @echo "🔍 Checking TLS handshake timeouts..."
     ./scripts/check-tls-handshake-timeout.sh
+    @echo "🔍 Checking TCP socket configuration..."
+    ./scripts/check-tcp-socket-config.sh
     @echo "✅ All lints passed!"
 
 # Format code and markdown docs

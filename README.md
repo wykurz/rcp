@@ -356,6 +356,8 @@ Manual deployment is still supported and may be preferred for:
 - `--port-ranges` - restrict TCP data ports to specific ranges (e.g., "8000-8999")
 - `--remote-copy-conn-timeout-sec` - connection timeout in seconds (default: 15; 60 with
   `--auto-deploy-rcpd`)
+- `--remote-keepalive-sec` - liveness budget for every rcp TCP connection in seconds, 0 disables
+  (default: 120); idle connections everywhere, unacknowledged data on control connections only
 
 **Architecture:** The remote copy uses a three-node architecture:
 

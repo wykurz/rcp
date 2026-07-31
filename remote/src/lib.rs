@@ -48,6 +48,7 @@
 //! - [`create_tcp_data_listener`] - Create TCP listener for data connections
 //! - [`connect_tcp_control`] - Connect to a TCP control server
 //! - [`get_tcp_listener_addr`] - Get externally-routable address of a listener
+//! - [`configure_tcp_socket`] - Apply the standard socket options to every established connection
 //!
 //! ## Port Range Configuration
 //!
@@ -204,10 +205,19 @@ pub struct TcpConfig {
     pub max_connections: usize,
     /// Multiplier for pending file writes (max pending = max_connections × multiplier)
     pub pending_writes_multiplier: usize,
+    /// Liveness budget for every rcp TCP connection (seconds), 0 disables it.
+    /// See [`configure_tcp_socket`].
+    pub keepalive_sec: u64,
 }
 
 /// Default multiplier for pending writes (4× max_connections)
 pub const DEFAULT_PENDING_WRITES_MULTIPLIER: usize = 4;
+
+/// Default liveness budget for an rcp TCP connection (seconds).
+///
+/// Detects a vanished peer host in about two minutes while surviving any stall shorter than that.
+/// Exposed as `--remote-keepalive-sec`; see [`configure_tcp_socket`].
+pub const DEFAULT_REMOTE_KEEPALIVE_SEC: u64 = 120;
 
 impl Default for TcpConfig {
     fn default() -> Self {
@@ -218,6 +228,7 @@ impl Default for TcpConfig {
             buffer_size: None,
             max_connections: 100,
             pending_writes_multiplier: DEFAULT_PENDING_WRITES_MULTIPLIER,
+            keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
         }
     }
 }
@@ -226,12 +237,8 @@ impl TcpConfig {
     /// Create TcpConfig with custom timeout values
     pub fn with_timeout(conn_timeout_sec: u64) -> Self {
         Self {
-            port_ranges: None,
             conn_timeout_sec,
-            network_profile: NetworkProfile::default(),
-            buffer_size: None,
-            max_connections: 100,
-            pending_writes_multiplier: DEFAULT_PENDING_WRITES_MULTIPLIER,
+            ..Self::default()
         }
     }
     /// Set port ranges
@@ -257,6 +264,11 @@ impl TcpConfig {
     /// Set pending writes multiplier
     pub fn with_pending_writes_multiplier(mut self, multiplier: usize) -> Self {
         self.pending_writes_multiplier = multiplier;
+        self
+    }
+    /// Set the connection liveness budget (0 disables it)
+    pub fn with_keepalive_sec(mut self, keepalive_sec: u64) -> Self {
+        self.keepalive_sec = keepalive_sec;
         self
     }
     /// Get the effective buffer size (explicit or profile default)
@@ -1174,12 +1186,13 @@ pub fn get_tcp_listener_addr(
     }
 }
 
-/// Connect to a TCP control server with timeout
-#[instrument]
+/// Connect to a TCP control server, applying the connect timeout and the standard socket options
+#[instrument(skip(config))]
 pub async fn connect_tcp_control(
     addr: std::net::SocketAddr,
-    timeout_sec: u64,
+    config: &TcpConfig,
 ) -> anyhow::Result<tokio::net::TcpStream> {
+    let timeout_sec = config.conn_timeout_sec;
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_sec),
         tokio::net::TcpStream::connect(addr),
@@ -1187,21 +1200,104 @@ pub async fn connect_tcp_control(
     .await
     .with_context(|| format!("connection to {} timed out after {}s", addr, timeout_sec))?
     .with_context(|| format!("failed to connect to {}", addr))?;
-    stream.set_nodelay(true)?;
+    configure_tcp_socket(
+        &stream,
+        config.network_profile,
+        config.keepalive_sec,
+        ConnectionKind::Control,
+    );
     tracing::debug!("connected to TCP control server at {}", addr);
     Ok(stream)
 }
 
-/// Configure TCP socket buffer sizes for high throughput
+/// Number of unacknowledged keepalive probes tolerated before a connection is declared dead.
 ///
-/// Similar to `maximize_socket_buffers` for UDP, but for TCP sockets.
-pub fn configure_tcp_buffers(stream: &tokio::net::TcpStream, profile: NetworkProfile) {
-    use socket2::SockRef;
+/// Decides the outcome only where `TCP_USER_TIMEOUT` is NOT set — on Linux the user timeout
+/// overrides the probe count, so this is inert on [`ConnectionKind::Control`] and is what actually
+/// ends a dead [`ConnectionKind::Data`] connection (after idle + retries × interval).
+pub const TCP_KEEPALIVE_RETRIES: u32 = 6;
+
+/// What an rcp TCP connection carries, which decides whether `TCP_USER_TIMEOUT` applies.
+///
+/// The user timeout aborts a connection whose data stays unacknowledged for the budget — and a
+/// peer that has simply STOPPED READING is indistinguishable from a dead one at that level. It is
+/// therefore only safe on a connection that application backpressure never legitimately blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionKind {
+    /// Protocol messages: master↔rcpd (control and tracing) and source↔destination control.
+    /// Reads are driven by a dispatch loop that does not block on transfer-sized work.
+    Control,
+    /// Pooled source→destination bulk file transfer, where the receiver legitimately stops
+    /// reading for as long as its throttles make it wait.
+    Data,
+}
+
+impl std::fmt::Display for ConnectionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Control => write!(f, "control"),
+            Self::Data => write!(f, "data"),
+        }
+    }
+}
+
+/// Configure an rcp TCP connection: no-delay, buffer sizes, and dead-peer detection.
+///
+/// This is the ONE place these options are set — call it at every site that establishes or accepts
+/// an rcp TCP connection. They used to be hand-paired per connection (`set_nodelay` at 7 sites,
+/// buffer sizing at 4, so two sites got no buffer sizing at all), which is the missed-exit-path
+/// smell: a new option has to be copied into every site and eventually is not.
+/// `scripts/check-tcp-socket-config.sh` enforces that no other site sets any of these options
+/// itself, and that every file opening or accepting a TCP connection routes through here.
+///
+/// `keepalive_sec` is the budget for noticing that the peer's HOST has vanished (power loss,
+/// severed link, destroyed VM). Such a peer sends neither FIN nor RST, so an await on it never
+/// completes — the master waiting for `RcpdResult` hangs forever, and so do the control reads on
+/// both rcpds. Two options cover different halves of that, and `kind` decides which apply:
+///
+/// - `SO_KEEPALIVE` (`TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT`), on EVERY connection, probes an
+///   IDLE one — the awaiting-`RcpdResult` case, the control streams generally, and a data
+///   connection between transfers.
+/// - `TCP_USER_TIMEOUT`, on [`ConnectionKind::Control`] ONLY, bounds how long UNACKED data may
+///   stay outstanding. Keepalive never fires while data is in flight, so without it the kernel
+///   retransmits for roughly 15 minutes (`tcp_retries2`) before giving up.
+///
+/// **Why data connections do not get the user timeout.** It cannot tell a dead peer from a live
+/// one that has stopped reading: with the receiver's window at zero and every zero-window probe
+/// ACKed, the sender is still aborted once the budget expires. The destination does exactly that —
+/// it awaits its per-file iops reservation after reading a file header and before reading any of
+/// its bytes, so `--iops-throttle 50` on a 10 GiB file at 1 MiB chunks leaves that socket unread
+/// for minutes. Under a shared budget the copy would FAIL where it used to merely run slow. The
+/// price is stated plainly: a host that vanishes MID-TRANSFER is detected only by the kernel's
+/// retransmission limit (~15 minutes), exactly as before this option existed — an idle data
+/// connection is still caught by keepalive after idle + retries × interval.
+///
+/// Control connections are not backpressure-free in the strict sense — the destination's control
+/// dispatch loop takes a single ops token per message — but that is one token against the data
+/// path's thousands, so reaching the budget there needs a pathological `--ops-throttle`. Known
+/// residual, not a claim of immunity.
+///
+/// The keepalive sub-values are derived from the single budget rather than exposed individually, so
+/// their relationship stays correct by construction: idle at half the budget, probes every twelfth
+/// of it, [`TCP_KEEPALIVE_RETRIES`] of them. `keepalive_sec == 0` disables both mechanisms and
+/// leaves only no-delay and buffer sizing.
+///
+/// Every option is best effort: a failure is logged and tolerated, because a socket option that a
+/// platform or a container policy refuses is not a reason to fail a copy.
+pub fn configure_tcp_socket(
+    stream: &tokio::net::TcpStream,
+    profile: NetworkProfile,
+    keepalive_sec: u64,
+    kind: ConnectionKind,
+) {
+    if let Err(err) = stream.set_nodelay(true) {
+        tracing::warn!("failed to set TCP_NODELAY: {err:#}");
+    }
     let (send_buf, recv_buf) = match profile {
         NetworkProfile::Datacenter => (16 * 1024 * 1024, 16 * 1024 * 1024),
         NetworkProfile::Internet => (2 * 1024 * 1024, 2 * 1024 * 1024),
     };
-    let sock_ref = SockRef::from(stream);
+    let sock_ref = socket2::SockRef::from(stream);
     if let Err(err) = sock_ref.set_send_buffer_size(send_buf) {
         tracing::warn!("failed to set TCP send buffer size: {err:#}");
     }
@@ -1214,6 +1310,41 @@ pub fn configure_tcp_buffers(stream: &tokio::net::TcpStream, profile: NetworkPro
             bytesize::ByteSize(send as u64),
             bytesize::ByteSize(recv as u64),
         );
+    }
+    if keepalive_sec == 0 {
+        tracing::debug!("TCP keepalive and user timeout disabled on {kind} connection");
+        return;
+    }
+    // clamped to 1s: the kernel rejects a zero idle/interval, which a budget under 12s would
+    // otherwise produce
+    let idle_sec = std::cmp::max(keepalive_sec / 2, 1);
+    let interval_sec = std::cmp::max(keepalive_sec / 12, 1);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(idle_sec))
+        .with_interval(std::time::Duration::from_secs(interval_sec))
+        .with_retries(TCP_KEEPALIVE_RETRIES);
+    // each log reports what LANDED, not what was attempted: `set_tcp_keepalive` turns SO_KEEPALIVE
+    // on and then bails on the first sub-option that fails, so a partial failure leaves keepalive
+    // enabled at the system defaults (7200s idle) — a line claiming the configured values would be
+    // actively misleading about how long a dead peer goes unnoticed
+    match sock_ref.set_tcp_keepalive(&keepalive) {
+        Ok(()) => tracing::debug!(
+            "TCP keepalive on {kind} connection: idle {idle_sec}s, interval {interval_sec}s, retries {TCP_KEEPALIVE_RETRIES}"
+        ),
+        Err(err) => tracing::warn!(
+            "failed to configure TCP keepalive on {kind} connection (it may be enabled at system defaults): {err:#}"
+        ),
+    }
+    // TCP_USER_TIMEOUT is Linux-only; elsewhere keepalive alone covers the idle case
+    #[cfg(target_os = "linux")]
+    if kind == ConnectionKind::Control {
+        let user_timeout = std::time::Duration::from_secs(keepalive_sec);
+        match sock_ref.set_tcp_user_timeout(Some(user_timeout)) {
+            Ok(()) => {
+                tracing::debug!("TCP_USER_TIMEOUT on control connection: {keepalive_sec}s")
+            }
+            Err(err) => tracing::warn!("failed to set TCP_USER_TIMEOUT: {err:#}"),
+        }
     }
 }
 
@@ -1542,5 +1673,212 @@ mod tests {
             err_msg.contains("invalid IP address"),
             "error should mention invalid IP address, got: {err_msg}"
         );
+    }
+
+    /// A real connected pair on loopback. The accepted half is returned so the caller keeps it
+    /// alive — dropping it would reset the connection under the socket being inspected.
+    async fn connected_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        (client.unwrap(), accepted.unwrap().0)
+    }
+
+    // The options are read back with getsockopt rather than trusted: a wrong constant, a value the
+    // kernel rejects, or a call that a socket2 feature gate silently compiled out would otherwise
+    // leave the connection with no liveness detection at all and nothing to show for it.
+    #[tokio::test]
+    async fn configure_tcp_socket_applies_every_option() {
+        let (stream, _accepted) = connected_pair().await;
+        configure_tcp_socket(
+            &stream,
+            NetworkProfile::Datacenter,
+            120,
+            ConnectionKind::Control,
+        );
+        let sock = socket2::SockRef::from(&stream);
+        assert!(stream.nodelay().unwrap(), "TCP_NODELAY must be set");
+        assert!(sock.keepalive().unwrap(), "SO_KEEPALIVE must be on");
+        assert_eq!(
+            sock.tcp_keepalive_time().unwrap(),
+            std::time::Duration::from_secs(60),
+            "TCP_KEEPIDLE must be half the budget"
+        );
+        assert_eq!(
+            sock.tcp_keepalive_interval().unwrap(),
+            std::time::Duration::from_secs(10),
+            "TCP_KEEPINTVL must be a twelfth of the budget"
+        );
+        assert_eq!(
+            sock.tcp_keepalive_retries().unwrap(),
+            TCP_KEEPALIVE_RETRIES,
+            "TCP_KEEPCNT must be the configured retry count"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            sock.tcp_user_timeout().unwrap(),
+            Some(std::time::Duration::from_secs(120)),
+            "TCP_USER_TIMEOUT must be the budget itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_tcp_socket_derives_keepalive_from_the_budget() {
+        let (stream, _accepted) = connected_pair().await;
+        configure_tcp_socket(
+            &stream,
+            NetworkProfile::Internet,
+            60,
+            ConnectionKind::Control,
+        );
+        let sock = socket2::SockRef::from(&stream);
+        assert_eq!(
+            sock.tcp_keepalive_time().unwrap(),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            sock.tcp_keepalive_interval().unwrap(),
+            std::time::Duration::from_secs(5)
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            sock.tcp_user_timeout().unwrap(),
+            Some(std::time::Duration::from_secs(60))
+        );
+    }
+
+    // a budget under 12s would derive a zero interval, which the kernel rejects outright — the
+    // whole keepalive call would then fail and leave the connection unprotected
+    #[tokio::test]
+    async fn configure_tcp_socket_clamps_sub_second_derivations() {
+        let (stream, _accepted) = connected_pair().await;
+        configure_tcp_socket(
+            &stream,
+            NetworkProfile::Datacenter,
+            1,
+            ConnectionKind::Control,
+        );
+        let sock = socket2::SockRef::from(&stream);
+        assert!(sock.keepalive().unwrap(), "SO_KEEPALIVE must still be on");
+        assert_eq!(
+            sock.tcp_keepalive_time().unwrap(),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            sock.tcp_keepalive_interval().unwrap(),
+            std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_tcp_socket_leaves_keepalive_off_when_disabled() {
+        let (stream, _accepted) = connected_pair().await;
+        configure_tcp_socket(
+            &stream,
+            NetworkProfile::Datacenter,
+            0,
+            ConnectionKind::Control,
+        );
+        let sock = socket2::SockRef::from(&stream);
+        assert!(
+            !sock.keepalive().unwrap(),
+            "SO_KEEPALIVE must stay off when the budget is 0"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            sock.tcp_user_timeout().unwrap(),
+            None,
+            "TCP_USER_TIMEOUT must stay at the system default when the budget is 0"
+        );
+        assert!(
+            stream.nodelay().unwrap(),
+            "no-delay is not part of liveness detection and must still be set"
+        );
+    }
+
+    // A data connection must NOT get TCP_USER_TIMEOUT: the destination stops reading for the whole
+    // of its per-file iops reservation, and the user timeout would abort that live-but-silent peer
+    // — failing a copy that used to merely run slow. Keepalive stays on, so an IDLE data connection
+    // to a vanished host is still caught.
+    #[tokio::test]
+    async fn configure_tcp_socket_omits_user_timeout_on_data_connections() {
+        let (stream, _accepted) = connected_pair().await;
+        configure_tcp_socket(
+            &stream,
+            NetworkProfile::Datacenter,
+            120,
+            ConnectionKind::Data,
+        );
+        let sock = socket2::SockRef::from(&stream);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            sock.tcp_user_timeout().unwrap(),
+            None,
+            "a data connection must be left at the system retransmission limit"
+        );
+        assert!(
+            sock.keepalive().unwrap(),
+            "keepalive still covers an idle data connection"
+        );
+        assert_eq!(
+            sock.tcp_keepalive_time().unwrap(),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            sock.tcp_keepalive_retries().unwrap(),
+            TCP_KEEPALIVE_RETRIES,
+            "with no user timeout to override it, TCP_KEEPCNT is what ends a dead data connection"
+        );
+        assert!(stream.nodelay().unwrap());
+    }
+
+    // Absolute sizes are not assertable — the kernel doubles the request and clamps it to
+    // net.core.{r,w}mem_max — but a THIRD, untouched socket from the same host pins the baseline,
+    // so the comparison fails if the sizing calls are removed. Comparing the two profiles to each
+    // other cannot: they collapse to equality whenever both clamp to the same maximum.
+    #[tokio::test]
+    async fn configure_tcp_socket_sizes_buffers_by_profile() {
+        let (datacenter, _a) = connected_pair().await;
+        let (internet, _b) = connected_pair().await;
+        let (untouched, _c) = connected_pair().await;
+        configure_tcp_socket(
+            &datacenter,
+            NetworkProfile::Datacenter,
+            0,
+            ConnectionKind::Data,
+        );
+        configure_tcp_socket(&internet, NetworkProfile::Internet, 0, ConnectionKind::Data);
+        let (dc, net, base) = (
+            socket2::SockRef::from(&datacenter),
+            socket2::SockRef::from(&internet),
+            socket2::SockRef::from(&untouched),
+        );
+        assert!(
+            dc.send_buffer_size().unwrap() > base.send_buffer_size().unwrap(),
+            "datacenter send buffer must exceed the system default ({} vs {})",
+            dc.send_buffer_size().unwrap(),
+            base.send_buffer_size().unwrap(),
+        );
+        assert!(
+            dc.recv_buffer_size().unwrap() > base.recv_buffer_size().unwrap(),
+            "datacenter receive buffer must exceed the system default ({} vs {})",
+            dc.recv_buffer_size().unwrap(),
+            base.recv_buffer_size().unwrap(),
+        );
+        assert!(
+            net.send_buffer_size().unwrap() > base.send_buffer_size().unwrap(),
+            "internet send buffer must exceed the system default ({} vs {})",
+            net.send_buffer_size().unwrap(),
+            base.send_buffer_size().unwrap(),
+        );
+        assert!(
+            net.recv_buffer_size().unwrap() > base.recv_buffer_size().unwrap(),
+            "internet receive buffer must exceed the system default ({} vs {})",
+            net.recv_buffer_size().unwrap(),
+            base.recv_buffer_size().unwrap(),
+        );
+        assert!(dc.send_buffer_size().unwrap() >= net.send_buffer_size().unwrap());
+        assert!(dc.recv_buffer_size().unwrap() >= net.recv_buffer_size().unwrap());
     }
 }

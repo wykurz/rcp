@@ -384,6 +384,10 @@ pub struct RcpdConfig {
     pub progress: bool,
     pub progress_delay: Option<String>,
     pub remote_copy_conn_timeout_sec: u64,
+    /// Mirror of master's --remote-keepalive-sec: the liveness budget for every rcp TCP
+    /// connection this rcpd establishes or accepts. Without propagation the master would
+    /// recover from a vanished host while both rcpds keep hanging.
+    pub remote_keepalive_sec: u64,
     /// Network profile for buffer sizing
     pub network_profile: crate::NetworkProfile,
     /// Buffer size for file transfers (defaults to profile-specific value)
@@ -464,6 +468,10 @@ impl RcpdConfig {
         args.push(format!(
             "--remote-copy-conn-timeout-sec={}",
             self.remote_copy_conn_timeout_sec
+        ));
+        args.push(format!(
+            "--remote-keepalive-sec={}",
+            self.remote_keepalive_sec
         ));
         // network profile
         args.push(format!("--network-profile={}", self.network_profile));
@@ -775,6 +783,7 @@ mod tests {
             progress: false,
             progress_delay: None,
             remote_copy_conn_timeout_sec: 30,
+            remote_keepalive_sec: crate::DEFAULT_REMOTE_KEEPALIVE_SEC,
             network_profile: crate::NetworkProfile::default(),
             buffer_size: None,
             max_connections: 1,
@@ -818,6 +827,40 @@ mod tests {
                 .iter()
                 .any(|a| a == "--require-toctou-safe"),
             "flag must be omitted when off"
+        );
+    }
+
+    // an rcpd that does not get the budget keeps hanging on a vanished peer while the master
+    // recovers — which looks fixed and is worse than today's symmetric hang
+    #[test]
+    fn to_args_propagates_remote_keepalive_sec() {
+        let mut config = minimal_rcpd_config();
+        config.remote_keepalive_sec = 45;
+        assert!(
+            config
+                .to_args()
+                .iter()
+                .any(|a| a == "--remote-keepalive-sec=45"),
+            "expected the keepalive budget in {:?}",
+            config.to_args()
+        );
+        // 0 disables keepalive and must travel as faithfully as any other value
+        config.remote_keepalive_sec = 0;
+        assert!(
+            config
+                .to_args()
+                .iter()
+                .any(|a| a == "--remote-keepalive-sec=0"),
+            "expected the disabling value to be passed through, not dropped"
+        );
+        let default_args = minimal_rcpd_config().to_args();
+        assert!(
+            default_args.iter().any(|a| a
+                == &format!(
+                    "--remote-keepalive-sec={}",
+                    crate::DEFAULT_REMOTE_KEEPALIVE_SEC
+                )),
+            "the default must be passed explicitly so rcpd cannot drift from the master: {default_args:?}"
         );
     }
 

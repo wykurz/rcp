@@ -1,25 +1,28 @@
 // Fixture for scripts/test-check-error-logging.sh — NOT part of any crate and never compiled.
 //
-// This is VALID Rust that the linter's lexer nonetheless cannot get through. `strip_comments` and
-// `paren_delta` treat `"` as a string delimiter, which a RAW string breaks: the quote inside `r#"…"#`
-// reads as the closing one, so the rest of the literal is scanned as code and its `(` is counted as a
-// real paren. The call's parens then never balance and the collector wedges.
-//
-// The point of the fixture is not the raw string — it is that a wedged collector must SAY SO. It stops
-// checking the rest of the file, so the real violation below goes unexamined, and a linter that stayed
-// quiet about that would report "passed" for a file it barely read. That is the one outcome this check
+// The `UNPARSED` guard covers one situation: the lexer reaches end of file still collecting a call.
+// It stops checking the file at that point, so everything after goes unexamined, and a linter that
+// stayed quiet would report "passed" for a file it barely read. That is the one outcome this check
 // must never produce, so the guard is pinned here.
 //
-// It needs its own file precisely because of that blast radius: dropped into violations.rs it would
-// swallow every EXPECT-VIOLATION marker below it. Written as valid Rust rather than as unbalanced
-// source so it does not sit in the editor as a permanent syntax error.
+// This fixture used to be `tracing::debug!(r#"quote " then an open paren ("#);` — a construct the
+// lexer did not understand YET. Once it learned raw strings, that line parsed cleanly, the guard
+// stopped firing, and the test kept passing while proving nothing. What is below instead is a call
+// whose parens GENUINELY never balance: no amount of better lexing finds its terminator, because the
+// file ends first.
+//
+// The trade the replacement makes, deliberately: unlike its predecessor this is not valid Rust, so
+// an editor shows a permanent syntax error on it. It has to — an end-of-file wedge is precisely what
+// "not valid Rust" means here, and a fixture that is valid Rust is a fixture some future lexer can
+// learn its way out of. It also still needs its own file for the blast radius: dropped into
+// violations.rs it would swallow every EXPECT-VIOLATION marker below it.
 
-fn a_raw_string_containing_a_quote_and_an_open_paren() {
-    tracing::debug!(r#"quote " then an open paren ("#);
-}
+// the call the collector can never terminate: `foo(` is never closed, by this line or any other
+fn the_call_that_never_ends() {
+    tracing::error!("unterminated", foo(
 
-// unreachable for the linter, and that is the point — the guard exists so this being missed is
-// announced rather than silently tolerated
-fn a_real_violation_hidden_behind_it() {
+// unreachable for the linter, which is the point — the guard exists so that this being missed is
+// ANNOUNCED rather than silently tolerated
+fn a_real_violation_hidden_behind_the_wedge() {
     tracing::error!("operation failed: {}", &error);
 }

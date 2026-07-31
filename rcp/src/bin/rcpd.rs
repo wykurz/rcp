@@ -151,6 +151,20 @@ struct Args {
     )]
     remote_copy_conn_timeout_sec: u64,
 
+    /// Liveness budget for every rcp TCP connection in seconds, 0 disables (set by rcp master)
+    ///
+    /// Mirrors the master's --remote-keepalive-sec. Without it this rcpd would keep hanging on
+    /// a peer whose host vanished while the master recovered on its own. Keepalive applies to
+    /// every connection; TCP_USER_TIMEOUT only to control connections (see
+    /// remote::configure_tcp_socket).
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = remote::DEFAULT_REMOTE_KEEPALIVE_SEC,
+        help_heading = "Remote copy options"
+    )]
+    remote_keepalive_sec: u64,
+
     /// Network profile for TCP tuning
     #[arg(
         long,
@@ -248,6 +262,7 @@ impl Args {
             buffer_size: self.buffer_size,
             max_connections: self.max_connections,
             pending_writes_multiplier: self.pending_writes_multiplier,
+            keepalive_sec: self.remote_keepalive_sec,
         }
     }
     /// Build the copy settings shared by the source and destination arms. `filter`/`dry_run` come
@@ -518,7 +533,6 @@ async fn async_main(
         .flush()
         .context("failed to flush stderr")?;
     tracing::info!("Listening for master connections on {}", listen_addr);
-    let conn_timeout = std::time::Duration::from_secs(args.remote_copy_conn_timeout_sec);
     // helper to accept a connection and optionally wrap with TLS
     //
     // BOTH the TCP accept and the TLS handshake are bounded. These accepts are sequential and the
@@ -528,26 +542,32 @@ async fn async_main(
     async fn accept_connection(
         listener: &tokio::net::TcpListener,
         tls_acceptor: Option<&tokio_rustls::TlsAcceptor>,
-        timeout: std::time::Duration,
+        tcp_config: &remote::TcpConfig,
         purpose: &str,
     ) -> anyhow::Result<(
         remote::streams::BoxedSendStream,
         remote::streams::BoxedRecvStream,
     )> {
+        let timeout = std::time::Duration::from_secs(tcp_config.conn_timeout_sec);
         let (stream, addr) = tokio::time::timeout(timeout, listener.accept())
             .await
             .with_context(|| format!("timeout waiting for master {} connection", purpose))?
             .with_context(|| format!("failed to accept {} connection", purpose))?;
         tracing::info!("Accepted {} connection from {}", purpose, addr);
-        stream.set_nodelay(true)?;
+        remote::configure_tcp_socket(
+            &stream,
+            tcp_config.network_profile,
+            tcp_config.keepalive_sec,
+            remote::ConnectionKind::Control,
+        );
         remote::tls::accept_bounded(tls_acceptor, stream, timeout, purpose).await
     }
     // accept control connection (TCP + TLS handshake, both bounded)
     let (master_send_stream, master_recv_stream) =
-        accept_connection(&listener, tls_acceptor.as_ref(), conn_timeout, "control").await?;
+        accept_connection(&listener, tls_acceptor.as_ref(), &tcp_config, "control").await?;
     // accept tracing connection (TCP + TLS handshake, both bounded)
     let (tracing_send_stream, _tracing_recv_stream) =
-        accept_connection(&listener, tls_acceptor.as_ref(), conn_timeout, "tracing").await?;
+        accept_connection(&listener, tls_acceptor.as_ref(), &tcp_config, "tracing").await?;
     tracing::info!(
         "Master connections established (encryption={})",
         !args.no_encryption

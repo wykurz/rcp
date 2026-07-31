@@ -42,7 +42,8 @@ rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.11"
-socket2 = "0.6"
+# "all" gates the keepalive tuning getters/setters (TCP_KEEPCNT) and TCP_USER_TIMEOUT
+socket2 = { version = "0.6", features = ["all"] }
 strum = { version = "0.28", features = ["derive"] }
 tokio = { version = "1.52", features = ["full", "parking_lot", "tracing"] }
 tokio-rustls = "0.26"

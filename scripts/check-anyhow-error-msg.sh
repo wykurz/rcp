@@ -73,7 +73,16 @@ check_file() {
 for dir in $SEARCH_DIRS; do
     if [ -d "$dir" ]; then
         while IFS= read -r file; do
-            matches=$(check_file "$file")
+            # awk's own failure — a syntax error in the program above, an unreadable file — produces
+            # empty output, which is indistinguishable from a clean file, so the check would report
+            # success for a scan that never ran. Fatal rather than counted as a violation: a linter
+            # that did not run is not a finding about the code.
+            matches=$(check_file "$file") || {
+                echo -e "${RED}ERROR: this check failed to run (awk exited $?)${NC}"
+                echo "  while checking: $file"
+                echo "  This is a bug in scripts/check-anyhow-error-msg.sh, not a violation in that file."
+                exit 1
+            }
             if [ -n "$matches" ]; then
                 echo -e "${RED}Found violation in $file:${NC}"
                 while IFS=: read -r line_num line_content; do
