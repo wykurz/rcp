@@ -223,6 +223,23 @@ struct Args {
     )]
     remote_copy_conn_timeout_sec: u64,
 
+    /// Liveness budget for every rcp TCP connection in seconds (0 disables)
+    ///
+    /// A peer whose host vanishes (power loss, severed link, destroyed VM) sends neither FIN
+    /// nor RST, so a copy waiting on it would otherwise hang forever. Every connection is probed
+    /// when idle (TCP keepalive); control connections additionally bound unacknowledged data
+    /// (TCP_USER_TIMEOUT). The bulk data connections deliberately do not, because a throttled
+    /// receiver legitimately stops reading mid-file — so a host that vanishes mid-transfer is
+    /// still only detected by the kernel's retransmission limit (~15 min). Widen it on a flaky
+    /// WAN; a stall shorter than the budget is survived untouched. Propagated to both rcpds.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = remote::DEFAULT_REMOTE_KEEPALIVE_SEC,
+        help_heading = "Remote copy options"
+    )]
+    remote_keepalive_sec: u64,
+
     /// Network profile for TCP tuning
     ///
     /// 'datacenter' (default): Optimized for datacenter networks (<1ms RTT, 25-100 Gbps).
@@ -448,14 +465,15 @@ async fn run_rcpd_master(
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
-    // build TCP config (will be used for source↔dest connections later)
-    let _tcp_config = remote::TcpConfig {
+    // build TCP config (used for the master's own connections to each rcpd)
+    let tcp_config = remote::TcpConfig {
         port_ranges: args.port_ranges.clone(),
         conn_timeout_sec: args.remote_copy_conn_timeout_sec,
         network_profile: args.network_profile,
         buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
         max_connections: args.max_connections,
         pending_writes_multiplier: args.pending_writes_multiplier,
+        keepalive_sec: args.remote_keepalive_sec,
     };
     let mut rcpd_processes: Vec<remote::RcpdProcess> = vec![];
     // generate master's TLS certificate for authenticating to rcpd (when encryption enabled)
@@ -519,6 +537,7 @@ async fn run_rcpd_master(
         progress: args.common.progress,
         progress_delay: args.common.progress_delay.clone(),
         remote_copy_conn_timeout_sec: args.remote_copy_conn_timeout_sec,
+        remote_keepalive_sec: args.remote_keepalive_sec,
         network_profile: args.network_profile,
         buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
         max_connections: args.max_connections,
@@ -603,17 +622,17 @@ async fn run_rcpd_master(
         dest_rcpd.conn_info.addr,
         dest_rcpd.conn_info.fingerprint.is_some()
     );
-    let rcpd_connect_timeout = std::time::Duration::from_secs(args.remote_copy_conn_timeout_sec);
     // helper to connect to an rcpd and wrap with TLS if needed
     async fn connect_to_rcpd(
         conn_info: &remote::RcpdConnectionInfo,
         master_cert: Option<&remote::tls::CertifiedKey>,
-        timeout: std::time::Duration,
+        tcp_config: &remote::TcpConfig,
         purpose: &str,
     ) -> anyhow::Result<(
         remote::streams::BoxedSendStream,
         remote::streams::BoxedRecvStream,
     )> {
+        let timeout = std::time::Duration::from_secs(tcp_config.conn_timeout_sec);
         let stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(conn_info.addr))
             .await
             .with_context(|| format!("timeout connecting to rcpd for {}", purpose))?
@@ -623,7 +642,14 @@ async fn run_rcpd_master(
                     conn_info.addr, purpose
                 )
             })?;
-        stream.set_nodelay(true)?;
+        // this is the connection the master then awaits `RcpdResult` on, with no timeout of its
+        // own — keepalive is what stops a vanished rcpd host from hanging the master forever
+        remote::configure_tcp_socket(
+            &stream,
+            tcp_config.network_profile,
+            tcp_config.keepalive_sec,
+            remote::ConnectionKind::Control,
+        );
         tracing::debug!("Connected to rcpd at {} for {}", conn_info.addr, purpose);
         match (conn_info.fingerprint, master_cert) {
             (Some(rcpd_fingerprint), Some(cert)) => {
@@ -664,14 +690,14 @@ async fn run_rcpd_master(
     let (mut source_send_stream, mut source_recv_stream) = connect_to_rcpd(
         &source_rcpd.conn_info,
         master_cert.as_ref(),
-        rcpd_connect_timeout,
+        &tcp_config,
         "source control",
     )
     .await?;
     let (source_tracing_send, source_tracing_recv) = connect_to_rcpd(
         &source_rcpd.conn_info,
         master_cert.as_ref(),
-        rcpd_connect_timeout,
+        &tcp_config,
         "source tracing",
     )
     .await?;
@@ -681,14 +707,14 @@ async fn run_rcpd_master(
     let (mut dest_send_stream, mut dest_recv_stream) = connect_to_rcpd(
         &dest_rcpd.conn_info,
         master_cert.as_ref(),
-        rcpd_connect_timeout,
+        &tcp_config,
         "dest control",
     )
     .await?;
     let (dest_tracing_send, dest_tracing_recv) = connect_to_rcpd(
         &dest_rcpd.conn_info,
         master_cert.as_ref(),
-        rcpd_connect_timeout,
+        &tcp_config,
         "dest tracing",
     )
     .await?;

@@ -2083,7 +2083,8 @@ enum RecvResult {
 /// This happens when destination fails (e.g., fail-early error) and closes connections
 /// without sending DestinationDone:
 /// 1. Receive `StreamClosed` from control stream
-/// 2. Break main loop with Ok (stream closed is not an error)
+/// 2. Warn that the destination aborted or died, break main loop with Ok (not an error *here* —
+///    see the arm itself for why re-reporting it would be wrong)
 /// 3. **Critical**: Signal pool shutdown via `pool_shutdown.cancel()` BEFORE draining
 /// 4. Drain remaining tasks - they now return error from `borrow()` instead of hanging
 /// 5. Return Ok (errors during unexpected shutdown are logged but not propagated)
@@ -2198,9 +2199,51 @@ async fn dispatch_control_messages_tcp(
             recv_result = msg_rx.recv() => {
                 let message = match recv_result {
                     Some(RecvResult::Message(m)) => m,
-                    // control stream closed (destination done) or errored/aborted; break the loop.
-                    // The fd-budget is released ONCE after the loop, covering every exit arm.
-                    Some(RecvResult::StreamClosed) | None => break Ok(()), // stream closed
+                    // clean EOF on the destination's control stream. `shutdown_initiated` can never
+                    // be true here — the `DestinationDone` arm below breaks the loop itself — so this
+                    // arm ALWAYS means "EOF without DestinationDone": the destination aborted or
+                    // died mid-copy, the unexpected-shutdown flow this function's doc comment
+                    // describes. Both cases reach it, and the wording must fit both — a `--fail-early`
+                    // destination closes this stream DELIBERATELY, while still alive, as the teardown
+                    // signal (docs/remote_protocol.md, `DirectorySkipped` §2.2, "a data-path abort is
+                    // signaled by closing the control stream"), whereas a crashed or SIGKILLed one
+                    // sends nothing at all.
+                    // Deliberately NOT an error, and the reason is the MASTER's read — NOT that the
+                    // destination reports its own failure, which is only true when it is alive to do
+                    // so. The master's read of the destination's `RcpdResult` is MANDATORY (see
+                    // `rcp/src/bin/rcp.rs`): a destination that dies silently yields `Err` or
+                    // `Ok(None)` there and the master `?`s out non-zero regardless. So staying quiet
+                    // here conceals nothing, while returning `Err` would add a second report of one
+                    // event. Note the claim is about this BRANCH, not the source process — the same
+                    // close still fails the source through the budget-wakeup teardown at the end of
+                    // `handle_connection`, and its own in-flight sends fail against a dead peer.
+                    // The warning is the whole delivered value — a log read after the fact says the
+                    // destination went away instead of "finished dispatching control messages".
+                    // The fd-budget is released ONCE after the loop, covering every arm.
+                    Some(RecvResult::StreamClosed) => {
+                        tracing::warn!(
+                            "Destination closed its control stream without sending DestinationDone - \
+                             it aborted or died mid-copy. Not failed here: the master's read of the \
+                             destination's result is mandatory, so the copy fails there either way - \
+                             see the master's output for the destination's own error, or for its \
+                             report that the destination never sent one"
+                        );
+                        break Ok(());
+                    }
+                    // not the same event as a peer EOF, and a defensive arm rather than a reachable
+                    // one: the recv task always sends a terminal `StreamClosed`/`Error` before it
+                    // ends, and the channel is FIFO, so a bare `None` means its sender was dropped
+                    // without one — a panic in the receive path (re-raised where we join it, below),
+                    // or the runtime dropping the task. Not the destination going away, so it does
+                    // not borrow that wording; the control flow is identical because there is
+                    // likewise nothing here that the master's mandatory read would miss.
+                    None => {
+                        tracing::warn!(
+                            "Control receive task ended without reporting stream closure or an error \
+                             - ending dispatch"
+                        );
+                        break Ok(());
+                    }
                     Some(RecvResult::Error(e)) => break Err(e),
                 };
                 match message {
@@ -2425,6 +2468,7 @@ impl AcceptingSendStreamPool {
         data_listener: tokio::net::TcpListener,
         pool_size: usize,
         profile: remote::NetworkProfile,
+        keepalive_sec: u64,
         conn_timeout_sec: u64,
         tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
     ) -> (Self, PoolShutdownToken, tokio::task::JoinHandle<()>) {
@@ -2449,8 +2493,15 @@ impl AcceptingSendStreamPool {
                                 match result {
                                     Ok((stream, addr)) => {
                                         tracing::debug!("Accepted data connection from {}", addr);
-                                        stream.set_nodelay(true).ok();
-                                        remote::configure_tcp_buffers(&stream, profile);
+                                        // Data: no TCP_USER_TIMEOUT — a throttled destination
+                                        // legitimately stops reading mid-file, and aborting that
+                                        // sender would fail a copy that used to just run slow.
+                                        remote::configure_tcp_socket(
+                                            &stream,
+                                            profile,
+                                            keepalive_sec,
+                                            remote::ConnectionKind::Data,
+                                        );
                                         // Wrap with TLS if configured. This handshake runs INLINE in
                                         // the accept loop, so its bound is what stops one stalled
                                         // peer from blocking every further data connection. Only the
@@ -2562,23 +2613,22 @@ async fn handle_connection(
     settings: &common::copy::Settings,
     src: &std::path::Path,
     dst: &std::path::Path,
-    pool_size: usize,
-    max_pending_files: usize,
-    network_profile: remote::NetworkProfile,
-    conn_timeout_sec: u64,
+    tcp_config: &remote::TcpConfig,
     error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
     tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Destination control connection established");
-    // configure TCP buffers for high throughput
-    remote::configure_tcp_buffers(&control_stream, network_profile);
+    let pool_size = tcp_config.max_connections;
+    let max_pending_files = pool_size * tcp_config.pending_writes_multiplier;
+    // the control stream's socket options (no-delay, buffers, liveness) were applied by the caller
+    // when it accepted the connection
     // wrap control connection with TLS if configured; the handshake is bounded because a peer that
     // establishes TCP then stalls it would otherwise hang the source here indefinitely, before any
     // teardown state exists
     let (control_send_stream, control_recv_stream) = remote::tls::accept_bounded(
         tls_acceptor.as_deref(),
         control_stream,
-        std::time::Duration::from_secs(conn_timeout_sec),
+        std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
         "control",
     )
     .await?;
@@ -2589,8 +2639,9 @@ async fn handle_connection(
     let (stream_pool, pool_shutdown, accept_task) = AcceptingSendStreamPool::new(
         data_listener,
         pool_size,
-        network_profile,
-        conn_timeout_sec,
+        tcp_config.network_profile,
+        tcp_config.keepalive_sec,
+        tcp_config.conn_timeout_sec,
         tls_acceptor,
     );
     let stream_pool = std::sync::Arc::new(stream_pool);
@@ -3533,12 +3584,17 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
     // wait for destination to connect with a timeout
     let error_collector = std::sync::Arc::new(common::error_collector::ErrorCollector::default());
     let accept_timeout = std::time::Duration::from_secs(tcp_config.conn_timeout_sec);
-    let pool_size = tcp_config.max_connections;
-    let max_pending_files = pool_size * tcp_config.pending_writes_multiplier;
     match tokio::time::timeout(accept_timeout, control_listener.accept()).await {
         Ok(Ok((stream, addr))) => {
             tracing::info!("Destination control connection from {}", addr);
-            stream.set_nodelay(true)?;
+            // configured here rather than per flow below, so the dry-run path gets the same
+            // socket options as the normal one
+            remote::configure_tcp_socket(
+                &stream,
+                tcp_config.network_profile,
+                tcp_config.keepalive_sec,
+                remote::ConnectionKind::Control,
+            );
             // in dry-run mode, do simplified flow: traverse, log, and tell destination we're done
             if let Some(dry_run_mode) = settings.dry_run {
                 return handle_dry_run_connection(
@@ -3559,10 +3615,7 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
                 settings,
                 src,
                 dst,
-                pool_size,
-                max_pending_files,
-                tcp_config.network_profile,
-                tcp_config.conn_timeout_sec,
+                tcp_config,
                 error_collector.clone(),
                 tls_acceptor,
             )

@@ -67,21 +67,26 @@ else
     echo -e "${GREEN}  ✓ no false positives on the clean fixture${NC}"
 fi
 
-# ── the unparsed fixture: a call the collector cannot terminate must be ANNOUNCED ───────────────
-# The linter stops checking a file once its collector wedges, so the one outcome it must never produce
-# is "passed". Pinned separately because such a file swallows any marker placed below it.
+# ── the unparsed fixtures: text the lexer stops reading must be ANNOUNCED ───────────────────────
+# Once the lexer stops reading a file the linter checks no more of it, so the one outcome it must never
+# produce is "passed". Pinned separately because such a file swallows any marker placed below it, and
+# in one directory because the two shapes reach end of file differently: a call whose parens never
+# balance, and a raw string that never closes. Each is asserted by its own message — a single grep for
+# `UNPARSED` would let one shape cover for the other going quiet.
 set +e
 unparsed_output=$("$LINTER" "$FIXTURES/unparsed" 2>&1)
 unparsed_status=$?
 set -e
 
-if [ "$unparsed_status" -ne 1 ] || ! echo "$unparsed_output" | grep -q 'UNPARSED'; then
-    echo -e "${RED}FAIL: an unterminated call must be reported as UNPARSED and exit 1${NC}"
+if [ "$unparsed_status" -ne 1 ] ||
+    ! echo "$unparsed_output" | grep -q 'UNPARSED: could not find where this call ends' ||
+    ! echo "$unparsed_output" | grep -q 'UNPARSED: a raw string opened here and never closed'; then
+    echo -e "${RED}FAIL: an unterminated call and an unterminated raw string must each be reported as UNPARSED, exiting 1${NC}"
     echo "  got status $unparsed_status, output:"
     echo "$unparsed_output" | sed 's/^/    /'
     FAILED=1
 else
-    echo -e "${GREEN}  ✓ an unparseable call is announced instead of silently skipping the file${NC}"
+    echo -e "${GREEN}  ✓ text the lexer cannot get through is announced instead of silently skipping the file${NC}"
 fi
 
 # ── an empty sweep must fail rather than report success ──────────────────────────────────────────

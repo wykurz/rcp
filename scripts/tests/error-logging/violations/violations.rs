@@ -139,6 +139,39 @@ fn the_opt_out_marker_only_counts_as_a_comment_above() {
     tracing::error!("failed: {}", error); // EXPECT-VIOLATION
 }
 
+// A raw string used to desynchronize this lexer for the REST of the file: the quote inside `r#"…"#`
+// read as the terminator, the `(` in the body counted as one of the call's own parens, and the
+// collector wedged. The violation below then simply vanished — and a vanished violation is
+// indistinguishable from a clean file. This case is what proves the lexer RECOVERED, rather than
+// merely that it did not crash; the clean-fixture cases only prove it stopped shouting.
+fn a_violation_after_a_raw_string_is_still_reported() {
+    tracing::debug!(r#"a quote " and an open paren ( in the body: {:#}"#, &error);
+    let _multi = r##"a body holding "# -- which does not close a two-hash literal"##;
+    tracing::error!("operation failed: {}", &error); // EXPECT-VIOLATION
+}
+
+// The same recovery, for a MULTI-LINE raw string — the shape that hid an entire file. Its body quotes
+// a `tracing` call, as a usage message naturally would; read as code that armed the collector on
+// prose, whose parens never balanced because every following line was correctly dropped as body. The
+// violation below is what proves the collector came back, rather than merely that nothing crashed.
+fn a_violation_after_a_multi_line_raw_string_is_still_reported() {
+    let _usage = r#"Bad: tracing::error!("failed: {}",
+    e)
+Good: tracing::error!("failed: {:#}", e)
+"#;
+    tracing::error!("operation failed: {}", &error); // EXPECT-VIOLATION
+}
+
+// A marker in a raw string's BODY is prose, not a justification. The opener line strips to blank once
+// its body is dropped — the same shape a comment line has — so arming has to require an actual `//`
+// comment, which is the only placement AGENTS.md documents, rather than the marker text appearing
+// anywhere on a line that happens to strip empty.
+fn a_marker_inside_a_raw_string_does_not_arm_the_opt_out() {
+    let _usage =
+        r#"rcp-error-log-allow: prose inside a literal, not a justification
+"#; tracing::error!("operation failed: {}", &error); // EXPECT-VIOLATION
+}
+
 // a marker misplaced INSIDE a call neither silences that call nor leaks to the next one. Without the
 // second guarantee a stray marker silently disabled the check for whatever followed it.
 fn misplaced_marker_neither_applies_nor_leaks() {

@@ -2188,6 +2188,43 @@ fn test_remote_destination_rcpd_killed_reports_error_not_abort() {
             spawn_start.elapsed()
         );
     }
+    // second barrier, for the SOURCE-side half of this test (the close-attribution warning asserted
+    // at the end). It is the same FIN-vs-RST argument as above, applied to the OTHER control
+    // connection: the destination also holds a control connection to the source rcpd, and the source
+    // sends exactly one message on it for a single-file copy - `DirStructureComplete`. Kill the
+    // destination with that message still queued and its kernel answers with an RST, which the source
+    // reads as `RecvResult::Error` and reports as a transport failure - a different branch, so the
+    // warning would only be observed by luck. The destination logs this marker immediately after
+    // consuming that message (rcp/src/destination.rs), so seeing it means the queue is drained and
+    // SIGKILL yields a clean FIN, which is the `RecvResult::StreamClosed` branch under test.
+    //
+    // Waiting for it does not weaken the master-side barrier above: the master sends nothing on its
+    // own control connection to the destination after `MasterHello::Destination`, so that queue stays
+    // drained no matter how much later the kill lands. And the copy cannot finish first: the source
+    // reserves the whole file's iops budget before it opens the file at all (rcp/src/source.rs), so
+    // it is ~10s from sending even the header when this marker appears.
+    let structure_marker = "Received DirStructureComplete";
+    // its own origin, not `spawn_start`: the barrier above may already have consumed most of that
+    // budget, and a timeout measured from it would blame this marker for the first barrier's delay
+    let structure_wait_start = std::time::Instant::now();
+    let mut structure_seen = false;
+    while structure_wait_start.elapsed().as_secs() < 20 {
+        if rcpd_logs_contain(structure_marker) {
+            structure_seen = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if !structure_seen {
+        let status = child.wait().expect("Failed to wait for rcp");
+        print_command_output(&read_captured_output(status));
+        panic!(
+            "destination rcpd did not log {structure_marker:?} within {:?} of consuming the master's \
+             hello, so the source's control stream to it was never drained and the kill would land \
+             on the RST branch instead of the clean-EOF branch this test asserts",
+            structure_wait_start.elapsed()
+        );
+    }
     // scope the kill to the destination rcpd THIS test spawned: match on our per-run marker and on
     // the role, rather than `pkill -f 'rcpd --role destination'`, which would take down every
     // matching process on the host - a developer's live remote copy, or another test's daemon on a
@@ -2267,6 +2304,21 @@ fn test_remote_destination_rcpd_killed_reports_error_not_abort() {
          wording, which exercises an already-correct branch); got:\n{combined}"
     );
     eprintln!("✓ master reported a clean error (exit 1) instead of aborting");
+    // the SOURCE saw the same death on its own control connection, as EOF without a preceding
+    // `DestinationDone`. That path still returns Ok by design - not because the destination reported
+    // its own failure (it was SIGKILLed, so it reported NOTHING, which is exactly what the assertion
+    // above pins), but because the master's read of the destination's result is mandatory and fails
+    // the copy either way. Staying quiet there conceals nothing, which is precisely why this has to
+    // be visible in the log rather than in an exit code. Assert against the rcpd debug log rather
+    // than the master's forwarded output: only the source rcpd runs the dispatch loop that emits
+    // this, and the log file is written before the master is anywhere near exiting - the master
+    // reads the SOURCE's result first (rcp/src/bin/rcp.rs), which the source only sends after this.
+    assert!(
+        rcpd_logs_contain("closed its control stream without sending DestinationDone"),
+        "expected the source rcpd to warn that the destination went away without DestinationDone; \
+         without it a log read after the fact reports the abort-or-death as a clean finish"
+    );
+    eprintln!("✓ source rcpd attributed the control-stream close to the destination going away");
 }
 
 /// A writer that fills the destination slot AFTER the remote destination classified it as vacant is

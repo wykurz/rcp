@@ -338,8 +338,11 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
     as graceful regardless of whether `DestinationDone` preceded it. A benign LATE reconnect that
     fails after `DestinationDone` also stashes a cause, but the transfer completed (`is_done()`), so
     the gate never fires and it is dropped. (A destination-side gate failure is sufficient: the
-    master fails the copy if EITHER rcpd fails. Making the source ALSO distinguish a close with vs.
-    without a prior `DestinationDone` is a deferred defense-in-depth backstop.)
+    master fails the copy if EITHER rcpd fails. The source now DOES distinguish a close with vs.
+    without a prior `DestinationDone` — it warns on the latter, naming the abort-or-death, since a
+    reader of the source's log would otherwise see the early close reported as a clean finish. Only
+    the failing half remains deferred: the source still returns success for that branch, because the
+    master's read of the destination's `RcpdResult` is mandatory and fails the copy either way.)
   - **Every TLS handshake is bounded.** All of them go through `remote::tls::accept_bounded` /
     `connect_bounded`, which apply the timeout and are the only place a handshake is performed; a
     bare `TlsAcceptor::accept`/`TlsConnector::connect` elsewhere is rejected by
@@ -1036,6 +1039,8 @@ destination drains it.
 Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
 
 - `--remote-copy-conn-timeout-sec=N` (default: 15) - Connection timeout for remote operations
+- `--remote-keepalive-sec=N` (default: 120, `0` disables) - Liveness budget for every rcp TCP
+  connection
 - `--port-ranges=RANGES` (optional) - Restrict TCP to specific port ranges (e.g., "8000-8999")
 - `--max-connections=N` (default: 100) - Maximum concurrent data connections
 - `--pending-writes-multiplier=N` (default: 4) - Multiplier for pending file tasks (backpressure)
@@ -1058,3 +1063,57 @@ Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
 - **Datacenter**: Use default settings for best performance
 - **Internet/WAN**: Use `--network-profile=internet` for better behavior on higher-latency links
 - **Firewall-restricted**: Use `--port-ranges` to specify allowed ports
+
+### 8.4 Connection Liveness
+
+Every rcp TCP connection — master↔rcpd (control and tracing), source↔destination control, and each
+pooled data connection — is configured through one entry point (`remote::configure_tcp_socket`) that
+applies `TCP_NODELAY`, the profile's buffer sizes, and dead-peer detection. A peer whose HOST
+vanishes (power loss, severed link, destroyed VM) sends neither `FIN` nor `RST`, so without
+detection a read on it never completes: the master awaits `RcpdResult` with no timeout of its own,
+and the source↔destination control reads behave the same way, so all three processes hang.
+
+`--remote-keepalive-sec=N` is the budget for noticing this. It arms two options, and **which ones
+apply depends on what the connection carries** — the entry point takes a `ConnectionKind` (`Control`
+or `Data`) precisely so each call site declares that:
+
+|                                                                                  | control connections                                         | data connections                         |
+| -------------------------------------------------------------------------------- | ----------------------------------------------------------- | ---------------------------------------- |
+| what they carry                                                                  | master↔rcpd (control + tracing), source↔destination control | pooled source→destination file transfers |
+| `SO_KEEPALIVE` (`TCP_KEEPIDLE` = N/2, `TCP_KEEPINTVL` = N/12, `TCP_KEEPCNT` = 6) | yes                                                         | yes                                      |
+| `TCP_USER_TIMEOUT` = N                                                           | yes                                                         | **no**                                   |
+
+`SO_KEEPALIVE` probes an **idle** connection — the awaiting-`RcpdResult` case, the control streams
+generally, and a data connection between transfers. `TCP_USER_TIMEOUT` bounds how long
+**unacknowledged** data may stay outstanding, which keepalive cannot cover because it never fires
+while data is in flight.
+
+**Why data connections are excluded.** `TCP_USER_TIMEOUT` cannot distinguish a dead peer from a live
+one that has stopped reading: with the receiver's window at zero and every zero-window probe ACKed,
+the sender is still aborted when the budget expires. The destination does exactly that — it awaits
+its per-file iops reservation *after* reading a file header and *before* reading any of the file's
+bytes, so `--iops-throttle 50` on a 10 GiB file at 1 MiB chunks leaves that socket unread for
+minutes. Applying the budget there would turn a copy that merely ran slow into a copy that
+**fails**.
+
+The consequence is stated rather than glossed: a host that vanishes **mid-transfer** on a data
+connection is detected only by the kernel's retransmission limit (`tcp_retries2`, roughly 15
+minutes) — the behavior that predates this option, so no regression, but not a 2-minute detection
+either. An **idle** data connection is still caught by keepalive after idle + retries × interval.
+Note also that on Linux `TCP_USER_TIMEOUT` overrides the keepalive probe count, so `TCP_KEEPCNT` is
+inert on control connections and is what actually ends a dead data connection.
+
+Control connections are not entirely backpressure-free: the destination's control dispatch loop
+takes one ops token per message, so a pathological `--ops-throttle` could in principle stall a
+control read toward the budget. That is one token against the data path's thousands per file — a
+known residual, not a claim of immunity.
+
+The sub-values are derived from the single budget rather than configured individually, so their
+relationship stays correct by construction. `N = 0` disables both, leaving no-delay and buffer
+sizing.
+
+The master mirrors its value into each rcpd's spawn arguments (via `RcpdConfig::to_args()`, like
+`--require-toctou-safe` in §1.2); without that the master would recover from a vanished host while
+both rcpds kept hanging. This is a spawn-argument change, not a wire-format change. Setting an
+option is best effort — one that a platform or container policy refuses is logged and tolerated, not
+a copy failure.

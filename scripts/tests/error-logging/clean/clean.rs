@@ -145,3 +145,89 @@ fn known_gap_mixed_placeholders_with_a_non_final_error() {
     tracing::error!("failed: {:#} while copying {}", &error, dst);
     tracing::error!("{} failed: {} for {:#}", name, count, &error);
 }
+
+// A RAW string is a string literal the `"` scan cannot read on its own: raw strings have no escapes,
+// so the quote inside `r#"…"#` is body text and not the terminator. Reading it as the terminator
+// ended the literal early and handed the rest of its body to the code scan, which desynchronized
+// every rule below it.
+fn raw_strings_are_string_literals() {
+    tracing::debug!(r#"a "quoted" word: {:#}"#, &error);
+    tracing::debug!(r"no hashes, still raw: {:#}", &error);
+}
+
+// a raw string whose body holds an UNBALANCED paren. The call's own parens balance on the line; the
+// body's do not, and counting them left the collector one paren short — wedged, for the whole file.
+fn a_raw_string_containing_an_unbalanced_paren() {
+    tracing::info!(r#"an open paren ( and a quote " in the body: {:#}"#, &error);
+    tracing::warn!(r#"a close paren ) on its own: {:#}"#, &error);
+}
+
+// the terminator's hash count must MATCH the opener's. `r##"…"##` is not closed by the `"#` sitting
+// in its body; assuming a single hash ends the literal early and hands the rest of the line, closing
+// paren included, back to the code scan.
+fn the_hash_count_is_matched_not_assumed() {
+    tracing::debug!(r##"contains a "# inside, then: {:#}"##, &error);
+}
+
+// the byte and C prefixes open the same literal
+fn byte_and_c_raw_strings() {
+    tracing::debug!("payload {:?} failed: {:#}", br#"{"k": "v"}"#, &error);
+    tracing::debug!("payload {:?} failed: {:#}", cr#"a "quoted" C string"#, &error);
+}
+
+// `'('` is a char literal, not a paren, and `'"'` is not a string opener. Counting either as what it
+// resembles left the collector's paren depth wrong for the rest of the file.
+fn char_literals_are_not_parens_or_quotes() {
+    tracing::debug!("split on {:?} failed: {:#}", '(', &error);
+    tracing::debug!("split on {:?} failed: {:#}", ')', &error);
+    tracing::debug!("quote {:?} and backslash {:?}: {:#}", '"', '\\', &error);
+    tracing::debug!("an escaped quote {:?}: {:#}", '\'', &error);
+    tracing::debug!("a newline {:?} and a long escape {:?}: {:#}", '\n', '\u{1F600}', &error);
+}
+
+// THE TRAP. `'` also opens a LIFETIME, and a loop LABEL. Reading one as a char literal makes the
+// scan run forward to the next quote and swallow the code in between — here, the two closing parens
+// on the argument line, so the call's parens would never balance and the rest of the file would be
+// announced as unchecked. That turns a construct the lexer did not understand into a FALSE ALARM,
+// which is strictly worse than the fragility it replaced, so lifetimes consume only their tick.
+fn a_lifetime_is_not_a_char_literal<'a>(x: &'a str, y: &'a [&'a str]) -> &'a str {
+    tracing::debug!("comparing {} and {}: {:#}", x, y.len(), &error);
+    tracing::error!(
+        "failed on {}: {:#}",
+        y.iter().collect::<Vec<&'a str>>().len(),
+        &error
+    );
+    'outer: for item in y {
+        tracing::debug!("visiting {}: {:#}", item, &error);
+        break 'outer;
+    }
+    x
+}
+
+// the other lifetime spellings, including two in a row — a one-character lifetime followed by
+// another tick is the shape most likely to read as a char literal
+fn every_lifetime_spelling<'a, 'b>(x: &'a str, y: &'b str, z: &'_ str, s: &'static str) {
+    tracing::debug!("comparing {} {} {} {}: {:#}", x, y, z, s, &error);
+}
+
+// A multi-line raw string is not code on ANY of its lines, including the one that opens it. A usage
+// message quoting a `tracing` call is the obvious way to get here, and reading the opener's body as
+// code armed the collector on prose whose parens never balance — every following line being correctly
+// dropped as body — so the whole rest of the file went unchecked behind one help text.
+fn a_multi_line_raw_string_body_is_never_code() {
+    let _usage = r#"Bad: tracing::error!("failed: {}",
+    e)
+Good: tracing::error!("failed: {:#}", e)
+"#;
+    tracing::debug!("printed usage for {}: {:#}", topic, &error);
+}
+
+// `r#type` is a RAW IDENTIFIER, not a raw string: the hashes must be followed by a quote. Without
+// that requirement the `r#` opens a literal with no terminator anywhere, and the rest of the file is
+// swallowed as its body — which the UNPARSED guard would announce, from this very fixture.
+fn raw_identifiers_are_not_raw_strings() {
+    let r#type = classify();
+    let r#match = lookup();
+    let r#fn = describe();
+    tracing::debug!("{} {} {}: {:#}", r#type, r#match, r#fn, &error);
+}

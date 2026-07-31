@@ -672,6 +672,18 @@ fn test_remote_copy_timeout() {
         .success();
 }
 
+/// Test that --remote-keepalive-sec accepts a budget and the disabling 0
+#[test]
+fn test_remote_keepalive_sec() {
+    for value in ["45", "0"] {
+        Command::cargo_bin("rcp")
+            .unwrap()
+            .args(["--remote-keepalive-sec", value, "--help"])
+            .assert()
+            .success();
+    }
+}
+
 // ============================================================================
 // TOCTOU Safety Flag Tests
 // ============================================================================

@@ -54,6 +54,13 @@ jobs:
     - name: Check markdown formatting
       run: ./scripts/check-doc-format.sh
 
+    # Runs BEFORE the linter it tests, so a linter that has stopped detecting anything fails here
+    # rather than passing quietly below. The fixtures pin both directions — every marked violation
+    # reported, nothing in the clean fixture reported — and they also catch a linter whose awk program
+    # will not parse, which otherwise produces no output and so looks exactly like a clean tree.
+    - name: Test the error logging linter
+      run: ./scripts/test-check-error-logging.sh
+
     - name: Check error logging format
       run: ./scripts/check-error-logging.sh
 
@@ -74,6 +81,9 @@ jobs:
 
     - name: Check TLS handshake timeouts
       run: ./scripts/check-tls-handshake-timeout.sh
+
+    - name: Check TCP socket configuration
+      run: ./scripts/check-tcp-socket-config.sh
 
     - name: Check package metadata
       run: ./scripts/check-package-metadata.sh

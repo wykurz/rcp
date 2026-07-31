@@ -102,6 +102,8 @@
 //!
 //! - `--port-ranges`: Restrict TCP data ports to specific ranges (e.g., "8000-8999")
 //! - `--remote-copy-conn-timeout-sec`: Connection timeout in seconds (default: 15; 60 with `--auto-deploy-rcpd`)
+//! - `--remote-keepalive-sec`: Liveness budget for every rcp TCP connection in seconds, 0 disables (default: 120).
+//!   Keepalive on every connection; `TCP_USER_TIMEOUT` on control connections only
 //!
 //! # Architecture
 //!

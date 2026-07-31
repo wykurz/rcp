@@ -120,6 +120,11 @@ struct ConnectErrors {
 struct DataConnectionPool {
     data_addr: std::net::SocketAddr,
     network_profile: remote::NetworkProfile,
+    /// Liveness budget applied to each data connection (see `remote::configure_tcp_socket`).
+    /// These are `ConnectionKind::Data`: keepalive only, no `TCP_USER_TIMEOUT` — this side stops
+    /// reading for as long as its iops reservation makes it wait, and a user timeout cannot tell
+    /// that from a dead peer.
+    keepalive_sec: u64,
     /// Semaphore to limit concurrent connections
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     /// Optional TLS connector for encrypted connections
@@ -142,12 +147,14 @@ impl DataConnectionPool {
         data_addr: std::net::SocketAddr,
         max_connections: usize,
         network_profile: remote::NetworkProfile,
+        keepalive_sec: u64,
         tls_connector: Option<std::sync::Arc<tokio_rustls::TlsConnector>>,
         conn_timeout_sec: u64,
     ) -> Self {
         Self {
             data_addr,
             network_profile,
+            keepalive_sec,
             semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections)),
             tls_connector,
             conn_timeout: std::time::Duration::from_secs(conn_timeout_sec),
@@ -220,8 +227,12 @@ impl DataConnectionPool {
     /// data connection).
     async fn connect_and_handshake(&self) -> anyhow::Result<remote::streams::BoxedRecvStream> {
         let stream = tokio::net::TcpStream::connect(self.data_addr).await?;
-        stream.set_nodelay(true)?;
-        remote::configure_tcp_buffers(&stream, self.network_profile);
+        remote::configure_tcp_socket(
+            &stream,
+            self.network_profile,
+            self.keepalive_sec,
+            remote::ConnectionKind::Data,
+        );
         let (_send_stream, recv_stream) = remote::tls::connect_bounded(
             self.tls_connector.as_deref(),
             remote::tls::SERVER_NAME_SOURCE,
@@ -1615,11 +1626,9 @@ pub async fn run_destination(
         src_control_addr,
         src_data_addr
     );
-    // connect to source's control port
-    let control_stream =
-        remote::connect_tcp_control(*src_control_addr, tcp_config.conn_timeout_sec).await?;
+    // connect to source's control port (socket options applied by the connect helper)
+    let control_stream = remote::connect_tcp_control(*src_control_addr, tcp_config).await?;
     tracing::info!("Connected to source control port");
-    remote::configure_tcp_buffers(&control_stream, tcp_config.network_profile);
     // wrap control connection with TLS if configured
     // the handshake is bounded because a peer that establishes TCP then stalls it would otherwise
     // hang here indefinitely, BEFORE any teardown state exists (only the TCP connect above was
@@ -1647,6 +1656,7 @@ pub async fn run_destination(
         *src_data_addr,
         tcp_config.max_connections,
         tcp_config.network_profile,
+        tcp_config.keepalive_sec,
         tls_connector,
         tcp_config.conn_timeout_sec,
     ));
@@ -1988,6 +1998,7 @@ mod teardown_tests {
             "127.0.0.1:1".parse().unwrap(),
             1,
             remote::NetworkProfile::default(),
+            remote::DEFAULT_REMOTE_KEEPALIVE_SEC,
             None,
             1,
         ))

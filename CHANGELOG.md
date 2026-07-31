@@ -7,6 +7,68 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Add `--remote-keepalive-sec` (default 120, `0` disables): a liveness budget for every TCP
+  connection a remote copy makes. A peer whose host vanishes — power loss, a severed link, a
+  destroyed VM — sends neither `FIN` nor `RST`, so until now such a copy simply hung. The master
+  awaits each `rcpd`'s result with no timeout of its own; the connection is idle, so nothing
+  provokes a retransmission, and the same holds for the source↔destination control reads, leaving
+  all three processes waiting forever. The budget arms two kernel mechanisms, because neither covers
+  the other's case: TCP keepalive (`SO_KEEPALIVE` with `TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT`)
+  probes an *idle* connection, which is the master-awaiting-a-result case and the control streams
+  generally, while `TCP_USER_TIMEOUT` bounds how long *unacknowledged* data may stay outstanding,
+  which is the source→destination data pool — keepalive never fires there, and the kernel would
+  otherwise retransmit for roughly 15 minutes (`tcp_retries2`) before giving up. The keepalive
+  sub-values are derived from the single budget rather than exposed separately (idle at half of it,
+  probes every twelfth of it, six of them), so they cannot be set into an inconsistent relationship.
+  The default detects a vanished host in about two minutes while surviving any stall shorter than
+  that; widen it on a flaky WAN, or pass `0` to disable both mechanisms. The value is propagated to
+  both `rcpd` processes — without that the master would recover while both `rcpd`s kept hanging,
+  which looks fixed and is worse than the symmetric hang it replaces. Applying an option is best
+  effort: one that a platform or a container policy refuses is logged rather than failing the copy.
+
+  `TCP_USER_TIMEOUT` is applied to **control** connections only (master↔`rcpd`, and the
+  source↔destination control stream) — never to the pooled data connections. It cannot distinguish a
+  dead peer from a live one that has stopped reading: with the receiver's window at zero and every
+  zero-window probe acknowledged, the sender is still aborted once the budget expires. The
+  destination stops reading exactly that way, waiting for its per-file iops reservation between a
+  file's header and its bytes, so `--iops-throttle 50` on a 10 GiB file at 1 MiB chunks leaves that
+  socket unread for minutes; applying the budget there would fail a copy that previously just ran
+  slow. The price is stated rather than glossed: a host that vanishes **mid-transfer** is still
+  detected only by the kernel's retransmission limit (roughly 15 minutes) — unchanged from before
+  this release, not a 2-minute detection — while an **idle** data connection is caught by keepalive
+  after idle + retries × interval. Control connections are not strictly backpressure-free either
+  (their dispatch loop takes one ops token per message, versus thousands per file on the data path),
+  which is a known residual rather than a claim of immunity.
+
+  These options join no-delay and buffer sizing in a single `remote::configure_tcp_socket` entry
+  point, called at every site that establishes or accepts a connection, and taking a
+  `ConnectionKind` so each site declares which of the two it is. Previously `set_nodelay` was
+  applied at 7 sites and buffer sizing at 4, hand-paired at each connection, so two sites got no
+  buffer sizing at all — the master↔`rcpd` control and tracing connections, and the source's dry-run
+  control connection, now get the profile's buffer sizes as well. A new lint
+  (`scripts/check-tcp-socket-config.sh`) fails the build on a socket option set outside that entry
+  point, and on a file that opens or accepts a TCP connection without routing it through there.
+
+### Changed
+
+- `rcp-tools-remote` (the internal support library) has two breaking API changes from the TCP
+  configuration consolidation above: `configure_tcp_buffers` is **removed** — it is subsumed by
+  `configure_tcp_socket`, which additionally applies no-delay and the liveness options — and
+  `connect_tcp_control` now takes `&TcpConfig` in place of a bare `timeout_sec`, so it can apply the
+  full socket configuration itself instead of leaving each caller to remember the buffer call. The
+  crate is documented as internal to the rcp tools and is not intended for direct use, but it is
+  published, so the change is recorded here.
+
+- A source `rcpd` whose destination peer goes away now says so in its log. End-of-stream on the
+  destination's control connection was recorded as a normal end of dispatch whether or not
+  `DestinationDone` ever arrived, so a log read after the fact reported a destination that aborted
+  or died mid-copy as a clean finish. Behavior is deliberately unchanged, and the reason is the
+  master rather than the destination: the master's read of the destination's result is mandatory, so
+  a destination that dies silently still fails the copy there. Staying quiet on the source therefore
+  conceals nothing, while failing there would add a second report of one event.
+
 ### Security
 
 - Destination files are now created owner-only (`0o600`) and only widened to the source mode once
@@ -270,6 +332,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   transfer that failed after the remote shell had created the file — broken pipe, full disk, killed
   command — left it behind, one per retry, and the old-version cleanup globs `rcpd-*`, which never
   matches these dotfiles.
+- `scripts/check-error-logging.sh` now reads Rust's other literal forms, so a `tracing` call written
+  near one is checked rather than misparsed. The linter does real lexing to decide where a call ends
+  and to separate its format string from its argument list, and all four of those scans treated `"`
+  as the only string delimiter. A **raw string** desynchronized them — raw strings have no escapes,
+  so the quote inside `r#"…"#` is body text, and reading it as the terminator ended the literal
+  early and left the rest of the body to be scanned as code, a `(` in it counted as one of the
+  call's own parens. A `'('` **char literal** was counted as a real paren outright. Both are now
+  understood, including the byte and C prefixes (`br`, `cr`) and any hash count, which is *matched*
+  rather than assumed to be one — `r##"…"#…"##` is closed by the `"##` at its end, not by the `"#`
+  in its body. Neither construct was ever checked *wrongly*: each wedged the collector, which the
+  existing `UNPARSED` guard announces, so the old state was fragile rather than unsound — the first
+  raw string written near a `tracing` call produced a false alarm someone had to diagnose.
+
+  The tick is shared with **lifetimes** and loop labels, which are far more common than an
+  unreadable char literal, so `'` opens a char literal only where exactly one character (or a
+  backslash escape) is followed by a closing quote; anything else consumes the tick alone, and a
+  long escape (`'\u{1F600}'`) with no closing quote inside a bounded window falls back to the
+  lifetime reading. Reading `&'a str` as a char literal would consume forward to the next quote and
+  swallow the code in between, turning a construct the lexer merely did not understand into a false
+  alarm — the one outcome this check must never produce. A raw string spanning lines is now tracked
+  the way a block comment already was, its body skipped instead of scanned as code, and one still
+  open at end of file is announced by the same `UNPARSED` guard: a new way for the lexer to stop
+  reading a file has to be as loud as the old one, because silence from a lexer that stopped reading
+  is indistinguishable from a clean file. The fixture that pinned that guard is replaced — it was a
+  raw string the lexer did not understand *yet*, so it would have gone on passing while proving
+  nothing — by a call whose parens genuinely never balance before the end of the file.
 
 ## [0.37.0] - 2026-07-15
 

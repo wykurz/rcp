@@ -101,11 +101,17 @@ async fn test_remote_tcp_connect_with_timeout() -> Result<()> {
     // spawn a task to accept the connection
     let accept_handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
-        stream.set_nodelay(true)?;
+        remote::configure_tcp_socket(
+            &stream,
+            config.network_profile,
+            config.keepalive_sec,
+            remote::ConnectionKind::Control,
+        );
         Ok::<_, std::io::Error>(())
     });
     // connect to the server
-    let stream = remote::connect_tcp_control(server_addr, 5).await?;
+    let stream =
+        remote::connect_tcp_control(server_addr, &remote::TcpConfig::with_timeout(5)).await?;
     assert!(stream.nodelay()?, "TCP_NODELAY should be set");
     // wait for accept to complete
     accept_handle.await??;
