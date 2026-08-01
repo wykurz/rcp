@@ -250,6 +250,56 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   copy tears down cleanly instead of hanging. The failure is now also reported with its real cause
   (for example a file's `Permission denied`) rather than the internal budget-release wakeup that
   unblocks the parked walk.
+- Fix two indefinite hangs in remote `rcp -L`/`--dereference` copies, on source entries that change
+  while the copy walks them. Both need `-L` and nothing else — no ACLs, no `--fail-early`.
+
+  A directory's `entry_count` is fixed when its `Directory` message is sent, and the walk descends
+  into the children it counted only afterwards. A child that vanished, changed type, or stopped
+  matching the filter in between produced no message at all, so the destination's parent never
+  reached its expected entry count, `DestinationDone` was never sent, and the copy hung with both
+  peers alive — which no keepalive or timeout ends. Such a child now gets the same `FileSkipped` the
+  hardened (non-`-L`) walk has always sent for one it counted and then could not open. There were
+  four such exits rather than one, so they now report through a single funnel that the compiler
+  makes every exit declare itself to, instead of each having to remember the compensation on its
+  own.
+
+  The ROOT hung for a different reason: the walk re-`stat`ed a root the caller had already
+  classified, so a root that was a directory at the first read and a regular file at the second
+  announced `DirStructureComplete { has_root_item: true }` and then sent nothing at all, leaving the
+  destination waiting on root completion forever. The walk is now handed the caller's single
+  classification — the one-classification rule the hardened root already followed — so the two
+  cannot disagree. A root that changes type after being classified now fails its enumeration and
+  takes the committed-but-unreadable-directory route (a 0-entry `Directory` the destination can
+  complete) with the error reported, so the copy exits non-zero instead of hanging. One consequence:
+  a `-L` root that disappears after being classified now leaves an empty destination directory and a
+  non-zero exit, where it previously failed with nothing created — matching what the hardened path
+  already did for the same window.
+
+- Fix a silent data loss when a source directory is replaced by a regular file mid-copy, in remote
+  copies **both** with and without `-L`. The source's two passes could each account for the same
+  name: Pass 1 counts a child as a directory and accounts for it (its own `Directory` message, or a
+  `FileSkipped` when it can no longer be sent), and Pass 2 — which re-enumerates the directory
+  rather than inheriting Pass 1's classification — counts it AGAIN as one of that directory's
+  expected files, because it is one by then. Since the destination expects exactly the
+  traversal-time entry count, the surplus was truncated away in `readdir` order, and when the
+  casualty was a genuinely counted file that file was never transferred: the destination completed
+  normally and the copy exited `0` with a source file quietly missing. The two passes are now
+  mutually exclusive by name — the names Pass 1 counted as directories or symlinks are retained with
+  the file count and skipped by Pass 2, whatever they look like by then.
+
+  Independently of that, having more files than the traversal counted is no longer a muted warning.
+  The extras cannot all be sent, so one of them is dropped and that may be a file the copy was asked
+  to make; it is now recorded as an error, and such a copy exits non-zero naming the directory
+  instead of reporting success. The remaining case is a file genuinely created mid-copy, which can
+  still displace a counted one under that rule — reported, not silent.
+
+  The `-L` walk also stopped reporting one of these outright: a counted child that is a regular file
+  by the time the walk reaches it is not copied at all (its name belongs to Pass 1), which now
+  records an error like every other entry the source cannot send, matching what the non-`-L` walk
+  already did. And the `-L` walk's directory-open now takes a metadata-throttle token like every
+  other metadata syscall in it — it was the one call escaping `--ops-throttle` entirely, while its
+  hardened counterpart was already gated.
+
 - Fix a silent data-loss bug in remote (`rcpd`) copies under `--fail-early`: a regular file that
   could not be written at the destination (for example into a pre-existing directory with no write
   permission) was logged and then dropped, and the destination reported success — the copy exited

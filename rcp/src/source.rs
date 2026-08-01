@@ -38,20 +38,62 @@ fn progress() -> &'static common::progress::Progress {
 #[derive(Clone)]
 enum SourceRead {
     Hardened(Arc<SourceDirMap>),
-    DereferencePath(DereferenceCountMap),
+    DereferencePath(DereferenceContentsMap),
 }
 
-/// Source-side `path → file_count` map for the `-L`/`--dereference` walk, the
+/// What Pass 1 counted inside one directory, carried across the network round-trip to Pass 2.
+///
+/// Pass 2 does not inherit Pass 1's classification — it re-enumerates the directory with a fresh
+/// `readdir` — so without this the two passes can both account for the SAME name. An entry Pass 1
+/// counted as a directory or symlink has already been accounted for BY Pass 1 (its own
+/// `Directory`/`Symlink` message, or a compensating `FileSkipped`); if it is a regular FILE by the
+/// time Pass 2 enumerates, Pass 2 reads it as one of that directory's expected files and takes a
+/// SECOND of the parent's `entry_count` slots. The `files_found > file_count` truncation then drops
+/// a genuinely counted sibling to keep the total at `file_count`, the destination still reaches
+/// `entries_expected` and completes, and the copy exits 0 with a source file silently missing —
+/// strictly worse than the hang it replaced.
+///
+/// The passes are therefore made mutually exclusive BY NAME: Pass 1 owns every name in
+/// `non_files`, Pass 2 owns the rest and drops any enumerated name in this set before it counts
+/// anything. The set has to be complete when the `Directory` message is sent, and it is — the
+/// destination can ack that message, and Pass 2 can start, before Pass 1 has even descended into
+/// those children, so a set accumulated as the compensations happen would race Pass 2 and lose.
+///
+/// Only non-file names are carried, not the file names: they are the smaller set (Pass 1 already
+/// drops its file list as soon as the count is taken), and they are the whole of what Pass 1 owns.
+/// The residual is a name Pass 1 never counted at all — a file genuinely created mid-copy — which
+/// can still displace a counted file under truncation; that is reported as an error rather than
+/// silently warned (see [`send_files_in_directory_tcp`]).
+struct Pass1Contents {
+    /// Number of child FILES Pass 1 counted. Authoritative for Pass 2's truncation and for its
+    /// synthetic-`FileSkipped` deficit logic.
+    file_count: usize,
+    /// Names Pass 1 counted as directories or symlinks, and therefore accounts for itself.
+    non_files: std::collections::HashSet<std::ffi::OsString>,
+}
+
+impl Pass1Contents {
+    /// The bookkeeping for a directory committed to the wire with a 0-entry `Directory` (unreadable
+    /// or vanished): no files for Pass 2 to send, and no names for it to avoid.
+    fn empty() -> Self {
+        Self {
+            file_count: 0,
+            non_files: std::collections::HashSet::new(),
+        }
+    }
+}
+
+/// Source-side `path → `[`Pass1Contents`] map for the `-L`/`--dereference` walk, the
 /// dereference analogue of the hardened [`SourceDirMap`] minus the held fd and the
 /// fd-budget permit.
 ///
 /// With the destination no longer echoing `file_count` in `DirectoryCreated`, the
-/// `-L` path (which holds no fd-map) must retain its own Pass-1 count: Pass 1
-/// inserts each directory's count as it sends the `Directory` message, and
+/// `-L` path (which holds no fd-map) must retain its own Pass-1 bookkeeping: Pass 1
+/// inserts each directory's contents as it sends the `Directory` message, and
 /// [`resolve_pass2_source`] takes it back when the matching `DirectoryCreated`
-/// triggers Pass 2. A missing entry is treated as count 0 with a debug log — `-L`
+/// triggers Pass 2. A missing entry is treated as empty contents with a debug log — `-L`
 /// is intentionally not hardened, so a miss is not a TOCTOU/fail-closed condition.
-type DereferenceCountMap = Arc<std::sync::Mutex<HashMap<std::path::PathBuf, usize>>>;
+type DereferenceContentsMap = Arc<std::sync::Mutex<HashMap<std::path::PathBuf, Pass1Contents>>>;
 
 impl SourceRead {
     /// The hardened fd-map, or `None` in dereference mode. Used by Pass 1 to decide
@@ -66,7 +108,7 @@ impl SourceRead {
     /// The `-L`/--dereference `path → file_count` map, or `None` in hardened mode.
     /// Used by Pass 1's path-based body to record each directory's count and by
     /// [`resolve_pass2_source`] to recover it (no count is echoed over the wire).
-    fn deref_counts(&self) -> Option<&DereferenceCountMap> {
+    fn deref_counts(&self) -> Option<&DereferenceContentsMap> {
         match self {
             SourceRead::Hardened(_) => None,
             SourceRead::DereferencePath(counts) => Some(counts),
@@ -147,12 +189,12 @@ struct SourceDirMap {
 /// no fd-budget permit, and Pass 2 for it sends zero files and needs no fd.
 enum MapEntry {
     /// A readable directory: its held fd (Pass 2 opens file DATA fd-relative through
-    /// it), the Pass-1 expected `file_count` (authoritative for Pass 2's truncation /
-    /// synthetic-`FileSkipped` logic), and the fd-budget permit that bounds how many
+    /// it), the Pass-1 bookkeeping ([`Pass1Contents`] — the expected `file_count` plus the names
+    /// Pass 1 accounts for itself), and the fd-budget permit that bounds how many
     /// real directory fds Pass 1 holds in flight (released when this drops).
     Readable {
         dir: Arc<Dir>,
-        file_count: usize,
+        contents: Pass1Contents,
         _permit: tokio::sync::OwnedSemaphorePermit,
     },
     /// A committed-but-unreadable directory (0-entry `Directory` sent). Holds no fd and
@@ -181,14 +223,15 @@ impl SourceDirMap {
         }
     }
 
-    /// Store the directory's `Arc<Dir>` plus its Pass-1 expected `file_count`,
+    /// Store the directory's `Arc<Dir>` plus its Pass-1 [`Pass1Contents`],
     /// keyed by source path, first acquiring a dir-fd-in-flight permit (awaiting if
-    /// the bound is reached). Only Pass 1 calls this.
+    /// the bound is reached). Only Pass 1 calls this, and only with the contents COMPLETE — see
+    /// [`Pass1Contents`] for why they cannot be amended afterwards.
     async fn insert(
         &self,
         src: std::path::PathBuf,
         dir: Arc<Dir>,
-        file_count: usize,
+        contents: Pass1Contents,
     ) -> anyhow::Result<()> {
         let permit = self
             .fd_budget
@@ -200,7 +243,7 @@ impl SourceDirMap {
             src,
             MapEntry::Readable {
                 dir,
-                file_count,
+                contents,
                 _permit: permit,
             },
         );
@@ -343,11 +386,42 @@ async fn read_dir_acls_by_path(src: &std::path::Path) -> std::io::Result<common:
     common::safedir::read_acls_fd(dir.as_fd(), common::Side::Source, true).await
 }
 
+/// Whether one step of the `-L` Pass-1 walk sent a protocol message accounting for its entry.
+///
+/// The destination expects exactly one response per entry its parent's `Directory { entry_count }`
+/// tallied, so a nested step that ends without sending anything has to be compensated for —
+/// otherwise that parent never reaches `entries_expected`, `DestinationDone` is never sent, and the
+/// copy HANGS with both peers alive, which no keepalive or timeout ends (docs/remote_protocol.md
+/// §2.2, §3.3). Returning this from the walk body instead of `()` turns "did this exit path account
+/// for the entry?" into a question the compiler asks at every `return`, and lets the single funnel
+/// in [`send_directories_and_symlinks`] compensate for all the "nothing sent" exits in one place
+/// rather than each of them having to remember to.
+#[derive(Debug, Clone, Copy)]
+enum Pass1Commit {
+    /// A message accounting for this entry was sent: a `Directory`, or (from the walk's symlink
+    /// arms, which `-L` never reaches — see [`send_pass1_entry`]) a `Symlink`/`SymlinkSkipped`.
+    Sent,
+    /// Nothing was sent for this entry — it vanished, changed type, or stopped passing the filter
+    /// between its parent's pre-read and this step.
+    Nothing,
+}
+
 /// The `-L`/`--dereference` path-based Pass-1 walk (directories + symlinks). The hardened
 /// (non-`-L`) walk lives in [`send_directory_fd_walk`] (nested) and [`send_root_hardened`] (root);
 /// this function is reached only in dereference mode, so every read here is path-based by design
 /// (following symlinks is requested; documented not hardened).
-#[instrument(skip(error_collector, control_send_stream, deref_counts))]
+///
+/// This is the per-entry accounting funnel: [`send_pass1_entry`] does the work and reports whether
+/// it committed a message, and a NESTED entry that committed none is accounted for here with one
+/// [`send_child_failed_skip`] — the same compensation the hardened walk applies to a child it
+/// counted and then failed to `open_dir`.
+///
+/// A ROOT that commits nothing needs no compensation and must not be given a `FileSkipped`, which
+/// would not set the destination's `root_complete`. The only root exits that send nothing are the
+/// ones [`send_fs_objects_tcp`] has already resolved to `has_root_item: false` — a filtered-out root
+/// or a skipped special — and it decides that from the very snapshot it passes in as
+/// `root_metadata`, so the two cannot disagree; the destination is released by
+/// `DirStructureComplete { has_root_item: false }`.
 #[async_recursion]
 #[allow(clippy::too_many_arguments)]
 async fn send_directories_and_symlinks(
@@ -356,34 +430,101 @@ async fn send_directories_and_symlinks(
     src: &std::path::Path,
     dst: &std::path::Path,
     source_root: &std::path::Path,
-    is_root: bool,
+    root_metadata: Option<&std::fs::Metadata>,
     control_send_stream: &remote::streams::BoxedSharedSendStream,
     error_collector: &std::sync::Arc<common::error_collector::ErrorCollector>,
     // the `-L`/--dereference `path → file_count` map: Pass 1 records each directory's Pass-1 file
     // count here so [`resolve_pass2_source`] can recover it without a wire echo (no count is echoed
     // over the wire).
-    deref_counts: Option<&DereferenceCountMap>,
+    deref_counts: Option<&DereferenceContentsMap>,
 ) -> anyhow::Result<()> {
-    tracing::debug!("Sending data from {:?} to {:?}", &src, dst);
-    let src_metadata = match common::walk::run_metadata_probed(
-        common::Side::Source,
-        common::MetadataOp::Stat,
-        // `-L`-only path: always follow symlinks (dereference is always set here).
-        tokio::fs::metadata(&src),
+    let commit = send_pass1_entry(
+        settings,
+        capture,
+        src,
+        dst,
+        source_root,
+        root_metadata,
+        control_send_stream,
+        error_collector,
+        deref_counts,
     )
-    .await
-    {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!("Failed reading metadata from src {src:?}: {e:#}");
-            // for root items, failing to read metadata is fatal - we can't proceed
-            // and the protocol would hang waiting for root completion
-            if settings.fail_early || is_root {
-                return Err(e.into());
+    .await?;
+    match commit {
+        Pass1Commit::Sent => Ok(()),
+        // the root needs no compensation and must not be given one (see this function's docs).
+        Pass1Commit::Nothing if root_metadata.is_some() => Ok(()),
+        Pass1Commit::Nothing => send_child_failed_skip(src, dst, control_send_stream).await,
+    }
+}
+
+/// One step of the `-L` Pass-1 walk: classify `src`, send its `Directory`/`Symlink` message and
+/// recurse into its children, reporting whether it committed a message for `src` (see
+/// [`Pass1Commit`] and the funnel in [`send_directories_and_symlinks`], the only caller).
+///
+/// `root_metadata` is `Some` for the ROOT call ONLY, and carries the single classification
+/// [`send_fs_objects_tcp`] already made of it — the same snapshot that decided `has_root_item` and
+/// the file-vs-directory dispatch. The root is deliberately NOT re-stat'ed here: doing so is the
+/// double-stat window [`send_root_hardened`] closes for the hardened walk, where a root that is a
+/// directory at the caller's stat and a regular file at this one announces `has_root_item: true`,
+/// sends no root message, and hangs the destination on `root_complete` forever. With one snapshot
+/// driving both, a root that changes type is instead caught where every other unreadable directory
+/// is — the enumeration below fails `ENOTDIR`/`ENOENT` and commits a 0-entry `Directory`, exactly as
+/// the hardened root does when its `open_dir` fails.
+///
+/// A nested child passes `None` and IS re-classified here, mirroring the hardened walk's per-child
+/// `open_dir`: a child that changed under us is caught rather than trusted, and the funnel accounts
+/// for it.
+///
+/// The symlink arms below (here and in the child loop) are UNREACHABLE in practice and kept only as
+/// defensive classification: every classification on this walk comes from `tokio::fs::metadata`,
+/// which follows symlinks, so `is_symlink()` is never true — that is what `-L` means. A symlink to
+/// a directory arrives as a directory, one to a file as a file, and a broken one fails the
+/// classification. They are left in place rather than deleted so the arm set still mirrors the
+/// hardened walk's, but nothing in `-L` exercises them.
+#[instrument(
+    skip(error_collector, control_send_stream, deref_counts),
+    fields(is_root = root_metadata.is_some())
+)]
+#[allow(clippy::too_many_arguments)]
+async fn send_pass1_entry(
+    settings: &common::copy::Settings,
+    capture: ExtendedMetadataCapture,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    source_root: &std::path::Path,
+    root_metadata: Option<&std::fs::Metadata>,
+    control_send_stream: &remote::streams::BoxedSharedSendStream,
+    error_collector: &std::sync::Arc<common::error_collector::ErrorCollector>,
+    deref_counts: Option<&DereferenceContentsMap>,
+) -> anyhow::Result<Pass1Commit> {
+    tracing::debug!("Sending data from {:?} to {:?}", &src, dst);
+    let is_root = root_metadata.is_some();
+    let src_metadata = match root_metadata {
+        // the root's classification is the caller's, made once — see this function's docs.
+        Some(metadata) => metadata.clone(),
+        None => match common::walk::run_metadata_probed(
+            common::Side::Source,
+            common::MetadataOp::Stat,
+            // `-L`-only path: always follow symlinks (dereference is always set here).
+            tokio::fs::metadata(&src),
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("Failed reading metadata from src {src:?}: {e:#}");
+                if settings.fail_early {
+                    // the parent's child loop accounts for this entry when the descent
+                    // returns `Err`, so the funnel must not also skip it.
+                    return Err(e.into());
+                }
+                error_collector.push(e.into());
+                // the child vanished between its parent's pre-read (which counted it) and
+                // this classification: nothing to send, so the funnel compensates.
+                return Ok(Pass1Commit::Nothing);
             }
-            error_collector.push(e.into());
-            return Ok(());
-        }
+        },
     };
     // apply filter if configured (applies to all items including root)
     if let Some(ref filter) = settings.filter {
@@ -403,12 +544,40 @@ async fn send_directories_and_symlinks(
             _ => {
                 tracing::debug!("Filtered out {:?}: {:?}", src, result);
                 count_skipped(&src_metadata);
-                return Ok(());
+                // a nested entry only lands here when it changed type since its parent
+                // pre-read it — the same path and patterns gave `Included` then, and
+                // `should_include` folds `could_contain_matches` in, so a directory whose
+                // kind did not change cannot flip. Its parent counted it either way, so the
+                // funnel compensates. For the root this is `has_root_item: false`, decided
+                // by the caller from this same snapshot.
+                return Ok(Pass1Commit::Nothing);
             }
         }
     }
     if src_metadata.is_file() {
-        return Ok(());
+        // a counted child that is a regular file NOW but was a directory when its parent
+        // pre-read it. It is not copied at all: the walk sends directories and symlinks, and its
+        // NAME belongs to Pass 1 (`Pass1Contents`), so Pass 2 will not pick it up as a file
+        // either. A source entry that is silently not copied must not leave the copy reporting
+        // success, so this is recorded as an error — the same answer the hardened walk gives when
+        // its `open_dir` on a counted child fails `ENOTDIR`. The funnel then compensates the
+        // parent's count. The root never reaches here — `send_fs_objects_tcp` calls this
+        // walk only for a root its single classification says is not a file, and that same
+        // classification is what `src_metadata` holds.
+        let err = anyhow::anyhow!(
+            "copy: {:?} -> {:?} failed, source entry changed from a directory to a regular file \
+             during the copy",
+            src,
+            dst
+        );
+        tracing::error!("{:#}", &err);
+        if settings.fail_early {
+            // the parent's child loop accounts for this entry when the descent returns `Err`,
+            // so the funnel must not also skip it.
+            return Err(err);
+        }
+        error_collector.push(err);
+        return Ok(Pass1Commit::Nothing);
     }
     if src_metadata.is_symlink() {
         let target = match common::walk::run_metadata_probed(
@@ -428,7 +597,9 @@ async fn send_directories_and_symlinks(
                     return Err(e.into());
                 }
                 error_collector.push(e.into());
-                return Ok(());
+                // `SymlinkSkipped` is itself the accounting message (it advances the
+                // parent's tally, and for a root it sets `root_complete`).
+                return Ok(Pass1Commit::Sent);
             }
         };
         let symlink = remote::protocol::SourceMessage::Symlink {
@@ -438,11 +609,12 @@ async fn send_directories_and_symlinks(
             metadata: remote::protocol::Metadata::from(&src_metadata),
             is_root,
         };
-        return control_send_stream
+        control_send_stream
             .lock()
             .await
             .send_batch_message(&symlink)
-            .await;
+            .await?;
+        return Ok(Pass1Commit::Sent);
     }
     if !src_metadata.is_dir() {
         if !src_metadata.is_file() {
@@ -468,12 +640,20 @@ async fn send_directories_and_symlinks(
                 error_collector.push(err);
             }
         }
-        return Ok(());
+        // specials produce no protocol message at all. For a nested entry that means one its
+        // parent counted as a directory or symlink and that has since become a socket / FIFO /
+        // device, so the funnel compensates; for a root it is the `has_root_item: false` the
+        // caller derived from this same snapshot.
+        return Ok(Pass1Commit::Nothing);
     }
-    // pre-read directory children to compute entry counts before sending Directory message
+    // pre-read directory children to compute entry counts before sending Directory message.
+    // The open takes an ops token like every other metadata syscall in this walk — the hardened
+    // twin (`Dir::read_entries`) already does, and without it this one call escapes
+    // `--ops-throttle` entirely.
     let mut file_children: Vec<ChildEntry> = Vec::new();
     let mut dir_children: Vec<ChildEntry> = Vec::new();
     let mut symlink_children: Vec<ChildEntry> = Vec::new();
+    throttle::get_ops_token().await;
     let mut entries = match tokio::fs::read_dir(&src).await {
         Ok(e) => e,
         Err(e) => {
@@ -483,11 +663,15 @@ async fn send_directories_and_symlinks(
             }
             error_collector.push(e.into());
             // directory unreadable but we already committed to sending it -
-            // send with 0 entries so destination can still complete. Record a
-            // 0 count for this `-L` directory so Pass 2's count lookup resolves
-            // (no wire echo carries it anymore).
+            // send with 0 entries so destination can still complete. This is also where a
+            // ROOT that changed type under us lands (`ENOTDIR`), and it is the same answer
+            // `send_root_hardened` gives when its `open_dir` fails. Record empty contents for
+            // this `-L` directory so Pass 2's lookup resolves (no wire echo carries them).
             if let Some(deref_counts) = deref_counts {
-                deref_counts.lock().unwrap().insert(src.to_path_buf(), 0);
+                deref_counts
+                    .lock()
+                    .unwrap()
+                    .insert(src.to_path_buf(), Pass1Contents::empty());
             }
             // no ACLs on this one, deliberately: the directory could not be opened, so there is no
             // fd to read them from and no honest answer to give. The destination therefore CLEARS
@@ -505,7 +689,7 @@ async fn send_directories_and_symlinks(
                 .await
                 .send_batch_message(&dir)
                 .await?;
-            return Ok(());
+            return Ok(Pass1Commit::Sent);
         }
     };
     loop {
@@ -654,17 +838,25 @@ async fn send_directories_and_symlinks(
     } else {
         metadata
     };
-    // record this `-L` directory's Pass-1 file count so Pass 2 can recover it
-    // without a wire echo (the count lives only on the source now). Inserted before
-    // the `Directory` send so it is present before the destination can ack
+    // record this `-L` directory's Pass-1 bookkeeping so Pass 2 can recover it
+    // without a wire echo (it lives only on the source now): the file count, plus the names Pass 1
+    // accounts for itself so Pass 2 cannot account for them a second time (see `Pass1Contents`).
+    // Inserted before the `Directory` send so it is present before the destination can ack
     // `DirectoryCreated` and trigger the Pass-2 lookup — and after the fallible work above, so a
-    // directory that is never sent leaves no count behind for a `DirectoryCreated` that can never
+    // directory that is never sent leaves nothing behind for a `DirectoryCreated` that can never
     // arrive.
     if let Some(deref_counts) = deref_counts {
-        deref_counts
-            .lock()
-            .unwrap()
-            .insert(src.to_path_buf(), file_count);
+        deref_counts.lock().unwrap().insert(
+            src.to_path_buf(),
+            Pass1Contents {
+                file_count,
+                non_files: dir_children
+                    .iter()
+                    .chain(symlink_children.iter())
+                    .filter_map(|child| child.src_path.file_name().map(|n| n.to_owned()))
+                    .collect(),
+            },
+        );
     }
     // send Directory message with pre-computed entry count
     let dir = remote::protocol::SourceMessage::Directory {
@@ -687,10 +879,17 @@ async fn send_directories_and_symlinks(
         .await
         .send_batch_message(&dir)
         .await?;
-    // recurse into non-file children (symlinks first, then directories).
-    // this path-based body only runs when the fd-map is inactive (`-L` mode), so
-    // the recursive calls carry `None` for the hardened fd-map and forward the
-    // dereference count map.
+    // recurse into non-file children (symlinks first, then directories) through the funnel, which
+    // accounts for any child it sends nothing for. this path-based body only runs when the fd-map
+    // is inactive (`-L` mode), so the recursive calls carry `None` for the hardened fd-map, `None`
+    // for the root classification (they are not the root), and forward the dereference count map.
+    //
+    // Both loops additionally account for a child whose recursion returned `Err` with
+    // `send_child_failed_skip`, exactly as the hardened walk does: the child was already counted in
+    // this directory's `entry_count`, so without it the destination's parent never reaches
+    // `entries_expected`, `DestinationDone` is never sent, and the copy HANGS with both peers alive
+    // (no timeout saves it). See `send_child_failed_skip` for why liveness is favored over precision
+    // when the child had already self-accounted.
     for child in symlink_children {
         if let Err(e) = send_directories_and_symlinks(
             settings,
@@ -698,7 +897,7 @@ async fn send_directories_and_symlinks(
             &child.src_path,
             &child.dst_path,
             source_root,
-            false,
+            None,
             control_send_stream,
             error_collector,
             deref_counts,
@@ -720,7 +919,7 @@ async fn send_directories_and_symlinks(
             &child.src_path,
             &child.dst_path,
             source_root,
-            false,
+            None,
             control_send_stream,
             error_collector,
             deref_counts,
@@ -735,7 +934,7 @@ async fn send_directories_and_symlinks(
             error_collector.push(e);
         }
     }
-    Ok(())
+    Ok(Pass1Commit::Sent)
 }
 
 /// Emit a 0-entry `Directory` message for a directory that we committed to
@@ -786,7 +985,11 @@ async fn send_unreadable_directory(
     // Pass 2 / the dispatch loop looks it up.
     if let Some(dir_map) = dir_map {
         match dir {
-            Some(dir) => dir_map.insert(src.to_path_buf(), dir, 0).await?,
+            Some(dir) => {
+                dir_map
+                    .insert(src.to_path_buf(), dir, Pass1Contents::empty())
+                    .await?
+            }
             None => dir_map.insert_tombstone(src.to_path_buf()),
         }
     }
@@ -1052,14 +1255,27 @@ async fn send_directory_fd_walk(
         entry_count,
         keep_if_empty,
     };
-    // store this directory's held fd + authoritative file_count so Pass 2 can open
-    // file data fd-relative and size its truncation / synthetic-skip logic. Acquiring
+    // store this directory's held fd + its authoritative Pass-1 contents so Pass 2 can open
+    // file data fd-relative, size its truncation / synthetic-skip logic, and skip the names
+    // Pass 1 accounts for itself (`Pass1Contents`). Acquiring
     // the permit here bounds how many dir fds Pass 1 holds ahead of the network-paced
     // Pass 2 (prevents EMFILE); it must precede the `Directory` send so the entry is
     // present before the destination can echo `DirectoryCreated` and trigger Pass 2's
-    // lookup.
+    // lookup — which is also why the contents must be complete HERE and cannot be amended as
+    // the child loops below discover failures.
     dir_map
-        .insert(src.to_path_buf(), dir.clone(), file_count)
+        .insert(
+            src.to_path_buf(),
+            dir.clone(),
+            Pass1Contents {
+                file_count,
+                non_files: dir_children
+                    .iter()
+                    .chain(symlink_children.iter())
+                    .map(|child| child.name.clone())
+                    .collect(),
+            },
+        )
         .await?;
     tracing::debug!(
         "Sending directory: {:?} -> {:?} (entries={}, files={})",
@@ -1185,7 +1401,10 @@ async fn send_fs_objects_tcp(
     // has_root_item, filtering, metadata, and dispatch from that single snapshot — no second path
     // stat. This closes the root-kind-swap double-stat window (a dir/symlink→file swap between the
     // has_root_item decision and the dispatch could otherwise announce a root item but send none,
-    // hanging the destination). `-L` keeps the path-based flow below (documented not hardened).
+    // hanging the destination). `-L` follows the path-based flow below — still unhardened by design
+    // (it follows symlinks), but classifying its root exactly once in the same way: the one stat
+    // taken here drives has_root_item, the dispatch, AND the walk, which is handed that snapshot
+    // instead of taking a second.
     if !settings.dereference {
         return send_root_hardened(
             settings,
@@ -1265,7 +1484,10 @@ async fn send_fs_objects_tcp(
             src,
             dst,
             src, // source_root is src for the root item
-            true,
+            // the walk gets THIS classification of the root rather than taking another stat
+            // of its own — the same single-snapshot rule `send_root_hardened` follows, and what
+            // keeps `has_root_item` below and the walk's dispatch from ever disagreeing.
+            Some(&src_metadata),
             &control_send_stream,
             &error_collector,
             source_read.deref_counts(),
@@ -1274,13 +1496,14 @@ async fn send_fs_objects_tcp(
     {
         // a root walk failure is ALWAYS fatal, even in non-fail-early mode (protocol §3.3 Root Item
         // Failure Invariant), matching the hardened twin in `send_root_hardened`. The walk returns
-        // `Err` for the root only when it committed NOTHING for it — a metadata or ACL read that
-        // failed before the `Directory` was sent, an unsupported root type, or a transport failure;
-        // every case it can compensate for (an unreadable directory, an unreadable symlink, a
-        // failed child) it handles internally and returns `Ok`. Continuing would send
-        // `DirStructureComplete { has_root_item: true }` below with no root message ever committed,
-        // leaving the destination waiting on `root_complete` forever — a hang with both peers
-        // alive, which no timeout ends.
+        // `Err` for the root only when it committed NOTHING for it — an ACL read that failed before
+        // the `Directory` was sent, an unsupported root type, or a transport failure; every case it
+        // can compensate for (an unreadable or vanished directory, an unreadable symlink, a failed
+        // child) it handles internally and returns `Ok`, and the cases where it sends nothing at all
+        // are exactly the ones `has_root_item` is false for (see the walk's funnel). Continuing
+        // would send `DirStructureComplete { has_root_item: true }` below with no root message ever
+        // committed, leaving the destination waiting on `root_complete` forever — a hang with both
+        // peers alive, which no timeout ends.
         tracing::error!("Failed to send root directories and symlinks: {e:#}");
         return Err(e);
     }
@@ -1731,17 +1954,28 @@ struct FileToSend {
 ///   re-enumerates by path (unchanged).
 enum Pass2Source {
     Hardened(MapEntry),
-    DereferencePath { file_count: usize },
+    DereferencePath(Pass1Contents),
 }
 
 impl Pass2Source {
     /// The authoritative expected file count for this directory: the Pass-1 count
-    /// stored in the map entry (hardened) or recovered from the `-L` count map.
+    /// stored in the map entry (hardened) or recovered from the `-L` contents map.
     fn file_count(&self) -> usize {
         match self {
-            Pass2Source::Hardened(MapEntry::Readable { file_count, .. }) => *file_count,
+            Pass2Source::Hardened(MapEntry::Readable { contents, .. }) => contents.file_count,
             Pass2Source::Hardened(MapEntry::Tombstone) => 0,
-            Pass2Source::DereferencePath { file_count } => *file_count,
+            Pass2Source::DereferencePath(contents) => contents.file_count,
+        }
+    }
+
+    /// Names Pass 1 already accounts for and Pass 2 must therefore ignore, whatever they look like
+    /// now. Empty for a tombstone (a 0-entry `Directory` claims no children at all). See
+    /// [`Pass1Contents`] for what goes wrong without this.
+    fn non_files(&self) -> Option<&std::collections::HashSet<std::ffi::OsString>> {
+        match self {
+            Pass2Source::Hardened(MapEntry::Readable { contents, .. }) => Some(&contents.non_files),
+            Pass2Source::Hardened(MapEntry::Tombstone) => None,
+            Pass2Source::DereferencePath(contents) => Some(&contents.non_files),
         }
     }
 
@@ -1795,14 +2029,15 @@ fn resolve_pass2_source(
             }
         },
         SourceRead::DereferencePath(counts) => {
-            let file_count = counts.lock().unwrap().remove(src).unwrap_or_else(|| {
+            let contents = counts.lock().unwrap().remove(src).unwrap_or_else(|| {
                 tracing::debug!(
-                    "no recorded -L file count for {src:?} on DirectoryCreated; defaulting to 0 \
-                     (dereference path is not hardened, so this is not a fail-closed condition)"
+                    "no recorded -L Pass-1 contents for {src:?} on DirectoryCreated; defaulting to \
+                     empty (dereference path is not hardened, so this is not a fail-closed \
+                     condition)"
                 );
-                0
+                Pass1Contents::empty()
             });
-            Ok(Pass2Source::DereferencePath { file_count })
+            Ok(Pass2Source::DereferencePath(contents))
         }
     }
 }
@@ -1876,8 +2111,16 @@ async fn send_files_in_directory_tcp(
 ) -> anyhow::Result<()> {
     // the Pass-1 count is authoritative for this directory's send logic (truncation
     // and synthetic `FileSkipped`). It comes entirely from the source side now (the
-    // consumed map entry or the `-L` count map); the destination echoes nothing.
+    // consumed map entry or the `-L` contents map); the destination echoes nothing.
     let file_count = pass2_source.file_count();
+    // names Pass 1 counted as directories or symlinks and therefore accounts for itself. This
+    // enumeration re-reads the directory, so any of them that has since become a regular file
+    // would otherwise be counted a SECOND time against the same parent — see `Pass1Contents`.
+    let owned_by_pass1 = |name: &std::ffi::OsStr| {
+        pass2_source
+            .non_files()
+            .is_some_and(|names| names.contains(name))
+    };
     let src_dir = pass2_source.dir();
     tracing::info!(
         "Sending files from {src:?} (expected file_count={})",
@@ -1909,6 +2152,11 @@ async fn send_files_in_directory_tcp(
             }
         };
         for (entry_name, _hint) in raw_entries {
+            // Pass 1 owns this name (it counted it as a directory or symlink) — skip it before
+            // the classify, which would otherwise cost a syscall to reach the same conclusion.
+            if owned_by_pass1(&entry_name) {
+                continue;
+            }
             let entry_path = src.join(&entry_name);
             let dst_path = dst.join(&entry_name);
             let handle = match dir.child(&entry_name).await {
@@ -1956,8 +2204,10 @@ async fn send_files_in_directory_tcp(
             });
         }
     } else {
-        // path-based enumeration (`-L`/--dereference): unchanged from the original
-        // behavior — nested symlink following is intentionally not hardened.
+        // path-based enumeration (`-L`/--dereference): nested symlink following is intentionally
+        // not hardened. The open takes an ops token for the same reason Pass 1's does — the
+        // hardened `Dir::read_entries` in the branch above already does.
+        throttle::get_ops_token().await;
         let mut entries = match tokio::fs::read_dir(&src).await {
             Ok(e) => e,
             Err(e) => {
@@ -1983,6 +2233,12 @@ async fn send_files_in_directory_tcp(
                 Ok(Some((entry, _file_type))) => {
                     let entry_path = entry.path();
                     let entry_name = entry_path.file_name().unwrap().to_owned();
+                    // Pass 1 owns this name (it counted it as a directory or symlink) — skip it
+                    // before the stat, which would otherwise cost a syscall to reach the same
+                    // conclusion.
+                    if owned_by_pass1(&entry_name) {
+                        continue;
+                    }
                     let dst_path = dst.join(&entry_name);
                     let entry_metadata = match common::walk::run_metadata_probed(
                         common::Side::Source,
@@ -2059,20 +2315,29 @@ async fn send_files_in_directory_tcp(
     // files actually found at send time (the directory may have changed since the
     // Pass-1 pre-read)
     if files_found > file_count {
-        // extra files appeared since traversal - only send up to file_count
-        tracing::warn!(
-            "Directory {:?} has {} extra files since traversal, ignoring extras",
+        // More files than Pass 1 counted, and the destination is expecting exactly `file_count`
+        // responses for this directory, so `files_found - file_count` of them cannot be sent at
+        // all. Which ones are dropped is `readdir` order, so the casualty can be a file Pass 1
+        // genuinely counted — a source file silently missing from the destination. That must
+        // never leave a copy reporting success, so it is an ERROR rather than a warning:
+        // truncating keeps the destination's accounting balanced (it still completes rather than
+        // hanging), and the recorded error makes the copy exit non-zero naming the directory.
+        //
+        // Names Pass 1 counted as directories or symlinks are already excluded above, so this is
+        // now reached only by a name Pass 1 never counted — a file genuinely created mid-copy.
+        let err = anyhow::anyhow!(
+            "directory {:?} contents changed: expected {} files, found {} — {} file(s) will not \
+             be copied (the destination expects exactly the traversal-time count)",
             src,
+            file_count,
+            files_found,
             files_found - file_count
         );
+        tracing::error!("{:#}", &err);
         if settings.fail_early {
-            return Err(anyhow::anyhow!(
-                "directory {:?} contents changed: expected {} files, found {}",
-                src,
-                file_count,
-                files_found
-            ));
+            return Err(err);
         }
+        error_collector.push(err);
         file_entries.truncate(file_count);
     }
     let files_to_send = file_entries.len();

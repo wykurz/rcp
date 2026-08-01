@@ -6092,6 +6092,478 @@ fn test_remote_source_counted_child_open_failure_does_not_hang() {
     );
 }
 
+/// Run a remote copy and fire `mutate` the instant `trigger` has appeared `occurrence` times in
+/// rcp's `-vv` log, then return the finished process output (checked for the timeout wrapper, as
+/// [`run_rcp_with_args`] does).
+///
+/// The regression tests below all need a source entry to change between two points INSIDE one rcpd
+/// walk — a window on the far side of two process boundaries that no filesystem state reveals. Two
+/// things make hitting it deterministic rather than lucky:
+///
+/// - `--ops-throttle=1`: the token bucket is topped up to exactly one token per one-second tick, so
+///   every metadata syscall in rcpd is granted AT a tick and the next one cannot run for a further
+///   second. (`=2` would not do: two tokens per tick let a pair of syscalls run back to back, and
+///   the window between them collapses to nothing.)
+/// - a log line emitted between the two syscalls that bracket the window. It is ordered by program
+///   order, not by wall clock: the mutation is guaranteed to land after the earlier syscall, and the
+///   later one is a full throttle tick away — 200x the 5 ms poll interval here.
+///
+/// That throttle also sets the price: each test's runtime is roughly its source tree's metadata
+/// **op count × one second**, and nothing about a faster machine shortens it. Keep the fixtures
+/// minimal — every extra source entry costs about a second, invisibly, against the 90 s wrapper.
+///
+/// If the trigger never appears this panics rather than passing vacuously.
+///
+/// Output is captured to files, not pipes: `-vv` fills a pipe's kernel buffer long before rcp
+/// exits, and nothing drains it while this function is polling (see the same note in
+/// `test_remote_killed_destination_rcpd_reports_error`).
+fn run_rcp_with_log_trigger(
+    args: &[&str],
+    trigger: &str,
+    occurrence: usize,
+    mutate: impl FnOnce(),
+) -> std::process::Output {
+    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
+    let stdout_file = tempfile::NamedTempFile::new().expect("Failed to create stdout capture file");
+    let stderr_file = tempfile::NamedTempFile::new().expect("Failed to create stderr capture file");
+    let mut cmd = std::process::Command::new("timeout");
+    cmd.args(["90", rcp_path.to_str().unwrap()]);
+    cmd.arg("-vv");
+    cmd.arg("--force-remote");
+    cmd.args(args);
+    cmd.stdout(
+        stdout_file
+            .reopen()
+            .expect("Failed to reopen stdout capture file"),
+    );
+    cmd.stderr(
+        stderr_file
+            .reopen()
+            .expect("Failed to reopen stderr capture file"),
+    );
+    let mut child = cmd.spawn().expect("Failed to execute rcp command");
+    let mut mutate = Some(mutate);
+    let status = loop {
+        if mutate.is_some()
+            && std::fs::read_to_string(stdout_file.path())
+                .unwrap_or_default()
+                .matches(trigger)
+                .count()
+                >= occurrence
+        {
+            (mutate.take().unwrap())();
+        }
+        if let Some(status) = child.try_wait().expect("Failed to wait for rcp") {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let output = std::process::Output {
+        status,
+        stdout: std::fs::read(stdout_file.path()).unwrap_or_default(),
+        stderr: std::fs::read(stderr_file.path()).unwrap_or_default(),
+    };
+    print_command_output(&output);
+    // a hang is reported as a hang first: reaching the timeout without the trigger having fired is
+    // some OTHER hang, and blaming the race window would send the next reader the wrong way.
+    assert_not_timeout(&output);
+    assert!(
+        mutate.is_none(),
+        "the copy finished without ever logging {trigger:?} x{occurrence} — the race window this \
+         test needs no longer exists, so it would have passed without testing anything"
+    );
+    output
+}
+
+/// Regression for the `-L` ROOT hang: a root operand that is a directory when the source classifies
+/// it and a regular file by the time the walk descends into it must not hang the copy.
+///
+/// `send_fs_objects_tcp` stats the root once to decide `has_root_item` and whether to walk it or
+/// send it as a file. The `-L` walk then used to stat it a SECOND time, and a dir→file swap in
+/// between made the two disagree: the walk returned early having sent nothing, the caller still
+/// announced `DirStructureComplete { has_root_item: true }` from its own (stale) snapshot, and the
+/// destination waited on `root_complete` forever — a hang with both peers alive that no timeout or
+/// keepalive ends. The fix hands the walk the caller's single classification, which is what
+/// `send_root_hardened` has always done for the hardened root; a root that changes type is then
+/// caught at the enumeration (`ENOTDIR`) and answered with the 0-entry `Directory` every other
+/// committed-but-unreadable directory gets.
+///
+/// The window is between the two stats, so the trigger is the walk's own entry log — the SECOND
+/// `Sending data from` for the root (the first is `send_fs_objects_tcp`'s, emitted before its stat).
+#[test]
+fn test_remote_dereference_root_kind_swap_does_not_hang() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // what the root symlink points at: a real directory (with content, so a successful copy is
+    // unmistakable) and a real file to swap to. Both live outside the copied tree.
+    let real_dir = src_dir.path().join("real_dir");
+    std::fs::create_dir(&real_dir).unwrap();
+    create_test_file(&real_dir.join("inside.txt"), "inside content", 0o644);
+    let real_file = src_dir.path().join("real_file");
+    create_test_file(&real_file, "file content", 0o644);
+    // the root operand: a symlink, so the swap is a single atomic rename rather than an
+    // rmdir+create that would expose an unrelated "root vanished" state in between.
+    let root_link = src_dir.path().join("root_link");
+    std::os::unix::fs::symlink(&real_dir, &root_link).unwrap();
+    let dst_root = dst_dir.path().join("root_link");
+    let src_remote = format!("localhost:{}", root_link.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    let trigger = format!("Sending data from {root_link:?}");
+    let output = run_rcp_with_log_trigger(
+        &["-L", "--ops-throttle=1", &src_remote, &dst_remote],
+        &trigger,
+        2,
+        || {
+            let staged = src_dir.path().join("root_link.staged");
+            std::os::unix::fs::symlink(&real_file, &staged).unwrap();
+            std::fs::rename(&staged, &root_link).unwrap();
+        },
+    );
+    // the copy must COMPLETE (the harness already failed us on a 90s timeout/hang) and report the
+    // root it could not copy.
+    assert!(
+        !output.status.success(),
+        "copy should report a non-zero exit for a root that changed type mid-walk"
+    );
+    // the root lands as the empty directory the 0-entry `Directory` describes — the same answer the
+    // hardened root gives when its `open_dir` fails. Its former content must not have followed.
+    assert!(
+        dst_root.is_dir(),
+        "destination root should be the empty directory the source committed to"
+    );
+    assert!(
+        !dst_root.join("inside.txt").exists(),
+        "content of the directory the root no longer points at must not have been copied"
+    );
+    // and it must get there by the route the protocol documents (§3.3): the enumeration failing
+    // ENOTDIR on a root the caller already classified. Asserting only on the destination state
+    // would pass just as well if the swap landed a syscall later and the walk instead enumerated
+    // the old directory and failed on its children — same visible outcome, different code path,
+    // and the documented one then untested.
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        log.contains("Cannot open directory") && log.contains("Not a directory"),
+        "expected the root's enumeration to fail ENOTDIR (the committed-but-unreadable route); \
+         the swap may no longer be landing inside the intended window"
+    );
+}
+
+/// Regression for the `-L` NESTED hang, vanish variant: a child counted in its parent's
+/// `Directory { entry_count }` that disappears before the walk recurses into it must not hang the
+/// copy.
+///
+/// The parent pre-reads and counts every child, then recurses. A child that vanished in between
+/// fails the recursion's metadata read, which used to log, collect the error and return `Ok` having
+/// sent NOTHING — so the destination's parent never reached `entries_expected`,
+/// `DestinationDone` was never sent, and the copy hung with both peers alive. The hardened walk has
+/// compensated for its equivalent (a counted child whose `open_dir` fails) since PR #247 with a
+/// `FileSkipped`; this is the same compensation on the `-L` walk, applied in one funnel that covers
+/// every "counted but nothing sent" exit.
+///
+/// The window is between the parent's pre-read and the recursion, so the trigger is the parent's
+/// `Sending directory` log — emitted after the pre-read counted the child and before the first
+/// recursion.
+#[test]
+fn test_remote_dereference_vanished_child_does_not_hang() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // outside the copied tree: what the racing child points at.
+    let real_dir = src_dir.path().join("real_dir");
+    std::fs::create_dir(&real_dir).unwrap();
+    create_test_file(&real_dir.join("inside.txt"), "inside content", 0o644);
+    // the copied tree: a file, a subtree that must survive the racing child's failure, and the
+    // child itself (a symlink, which `-L` counts as the directory it resolves to).
+    let src_root = src_dir.path().join("root");
+    std::fs::create_dir(&src_root).unwrap();
+    create_test_file(&src_root.join("top.txt"), "top content", 0o644);
+    let src_keep = src_root.join("keep");
+    std::fs::create_dir(&src_keep).unwrap();
+    create_test_file(&src_keep.join("keep.txt"), "keep content", 0o644);
+    let child = src_root.join("child");
+    std::os::unix::fs::symlink(&real_dir, &child).unwrap();
+    let dst_root = dst_dir.path().join("root");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    let trigger = format!("Sending directory: {src_root:?}");
+    let output = run_rcp_with_log_trigger(
+        &["-L", "--ops-throttle=1", &src_remote, &dst_remote],
+        &trigger,
+        1,
+        || std::fs::remove_file(&child).unwrap(),
+    );
+    // the copy must COMPLETE (the harness already failed us on a 90s timeout/hang), report the
+    // child it could not read, and still deliver everything else.
+    assert!(
+        !output.status.success(),
+        "copy should report a non-zero exit for a child that vanished mid-walk"
+    );
+    assert_eq!(get_file_content(&dst_root.join("top.txt")), "top content");
+    assert_eq!(
+        get_file_content(&dst_root.join("keep/keep.txt")),
+        "keep content"
+    );
+    assert!(
+        !dst_root.join("child").exists(),
+        "a child that vanished before the source reached it must not be created"
+    );
+}
+
+/// Regression for the `-L` walk's FILTER exit — the fourth way a counted child can end its step
+/// with nothing sent, and the one that needs both a filter and a type change to reach.
+///
+/// The filter is re-applied when the walk descends into a child, and its verdict depends on whether
+/// the entry is a directory. A child counted as a directory is traversed because it *could contain*
+/// matches (`should_include` folds `could_contain_matches` in); once it is a regular file, the same
+/// patterns judge it on its own name and can exclude it. The step then returns having sent nothing
+/// for an entry its parent counted — the same hang as the other three exits, which is why every
+/// exit reports through one funnel rather than each remembering the compensation.
+///
+/// `--include '*.txt'` gives exactly that asymmetry: `subdir` is traversed as a directory, and
+/// `subdir` as a plain file matches no pattern.
+#[test]
+fn test_remote_dereference_filtered_child_kind_swap_does_not_hang() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // outside the copied tree: the directory the racing child points at, and the file it becomes.
+    let real_dir = src_dir.path().join("real_dir");
+    std::fs::create_dir(&real_dir).unwrap();
+    create_test_file(&real_dir.join("inside.txt"), "inside content", 0o644);
+    let real_file = src_dir.path().join("real_file");
+    create_test_file(&real_file, "file content", 0o644);
+    let src_root = src_dir.path().join("root");
+    std::fs::create_dir(&src_root).unwrap();
+    // matches the include pattern, so it must still arrive.
+    create_test_file(&src_root.join("keep.txt"), "keep content", 0o644);
+    // counted as a directory (traversed because it could contain `*.txt`), excluded once it is a
+    // file called `subdir`.
+    let subdir = src_root.join("subdir");
+    std::os::unix::fs::symlink(&real_dir, &subdir).unwrap();
+    let dst_root = dst_dir.path().join("root");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    let trigger = format!("Sending directory: {src_root:?}");
+    let output = run_rcp_with_log_trigger(
+        &[
+            "-L",
+            "--include",
+            "*.txt",
+            "--ops-throttle=1",
+            &src_remote,
+            &dst_remote,
+        ],
+        &trigger,
+        1,
+        || {
+            let staged = src_dir.path().join("subdir.staged");
+            std::os::unix::fs::symlink(&real_file, &staged).unwrap();
+            std::fs::rename(&staged, &subdir).unwrap();
+        },
+    );
+    print_command_output(&output);
+    // the copy must COMPLETE (the harness already failed us on a 90s timeout/hang) and still
+    // deliver the file that does match. A filtered-out entry is not an error, so the exit code is
+    // deliberately not asserted here — the liveness and the delivered content are the contract.
+    assert_eq!(
+        get_file_content(&dst_root.join("keep.txt")),
+        "keep content",
+        "the matching file must still be copied when a sibling is filtered out mid-walk"
+    );
+    assert!(
+        !dst_root.join("subdir").exists(),
+        "an entry the filter excludes must not be created"
+    );
+}
+
+/// A SPECIAL file as the root operand: skipped cleanly with `--skip-specials`, fatal without it.
+///
+/// Neither is new behavior, but neither was covered, and the skip case is one of only two ways to
+/// reach the `-L` walk's "root committed nothing" exit (the other is a filtered-out root). That
+/// exit must NOT be compensated with a `FileSkipped` — a root has no parent to account to, and
+/// `FileSkipped` does not set the destination's `root_complete` — so the destination is released by
+/// `DirStructureComplete { has_root_item: false }` instead. If the funnel ever compensated a root,
+/// this is the test that would notice the stray message.
+#[test]
+fn test_remote_special_root_skipped_or_fatal() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // the socket file outlives the listener; hold it so the special exists for both runs.
+    let src_socket = src_dir.path().join("root_socket");
+    let _listener = std::os::unix::net::UnixListener::bind(&src_socket).unwrap();
+    let src_remote = format!("localhost:{}", src_socket.to_str().unwrap());
+    let dst_socket = dst_dir.path().join("root_socket");
+    let dst_remote = format!("localhost:{}", dst_socket.to_str().unwrap());
+    // with --skip-specials the copy succeeds having copied nothing.
+    let output = run_rcp_with_args(&["--skip-specials", &src_remote, &dst_remote]);
+    print_command_output(&output);
+    assert!(
+        output.status.success(),
+        "a special root with --skip-specials should finish cleanly"
+    );
+    assert!(
+        !dst_socket.exists(),
+        "a skipped special root must not create anything at the destination"
+    );
+    // without it, the unsupported root type fails the copy (matching the hardened root).
+    let output = run_rcp_with_args(&[&src_remote, &dst_remote]);
+    print_command_output(&output);
+    assert!(
+        !output.status.success(),
+        "a special root without --skip-specials should fail the copy"
+    );
+    assert!(!dst_socket.exists());
+}
+
+/// Regression for the `-L` NESTED hang, type-change variant, AND for the silent data loss the first
+/// fix for it introduced.
+///
+/// Same accounting contract as the vanish case, reached through the walk's other "counted but
+/// nothing sent" exits: a child that is now a regular FILE (the walk sends directories and symlinks),
+/// and one that is now a SPECIAL (sockets/FIFOs/devices never produce a protocol message at all).
+/// Both used to return `Ok` having sent nothing for an entry the parent had already counted, and
+/// either one alone hangs the copy.
+///
+/// `sibling.txt` is what makes this also a DATA-LOSS test, and it must be asserted on contents
+/// rather than on the exit code, because the failure it guards is silent. Compensating the changed
+/// child with a `FileSkipped` is only half the fix: Pass 2 re-enumerates the parent by path, and a
+/// child that is a regular file by then reads as one of its expected files, taking a SECOND of the
+/// parent's entry slots. The `files_found > file_count` truncation then evicts a genuinely counted
+/// file — `sibling.txt` — to keep the total at `file_count`; the destination still completes, and
+/// the copy exits 0 having quietly not copied it. The two passes are now mutually exclusive by name
+/// (`Pass1Contents`), so the changed child cannot take a file slot at all.
+#[test]
+fn test_remote_dereference_child_kind_swap_does_not_hang() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // outside the copied tree: what the racing children point at before and after the swap.
+    let real_dir = src_dir.path().join("real_dir");
+    std::fs::create_dir(&real_dir).unwrap();
+    create_test_file(&real_dir.join("inside.txt"), "inside content", 0o644);
+    let real_file = src_dir.path().join("real_file");
+    create_test_file(&real_file, "file content", 0o644);
+    // the socket file outlives the listener, but hold it anyway so the special exists for the whole
+    // copy rather than only for as long as the binding.
+    let real_socket = src_dir.path().join("real_socket");
+    let _listener = std::os::unix::net::UnixListener::bind(&real_socket).unwrap();
+    // `keep/` must survive both failures; `sibling.txt` is the file whose Pass-2 slot the changed
+    // child would steal (it is the parent's only counted file, so an eviction is unmistakable).
+    let src_root = src_dir.path().join("root");
+    std::fs::create_dir(&src_root).unwrap();
+    create_test_file(&src_root.join("sibling.txt"), "sibling content", 0o644);
+    let src_keep = src_root.join("keep");
+    std::fs::create_dir(&src_keep).unwrap();
+    create_test_file(&src_keep.join("keep.txt"), "keep content", 0o644);
+    let to_file = src_root.join("to_file");
+    std::os::unix::fs::symlink(&real_dir, &to_file).unwrap();
+    let to_special = src_root.join("to_special");
+    std::os::unix::fs::symlink(&real_dir, &to_special).unwrap();
+    let dst_root = dst_dir.path().join("root");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    let trigger = format!("Sending directory: {src_root:?}");
+    let retarget = |link: &std::path::Path, target: &std::path::Path| {
+        let staged = link.with_extension("staged");
+        std::os::unix::fs::symlink(target, &staged).unwrap();
+        std::fs::rename(&staged, link).unwrap();
+    };
+    let output = run_rcp_with_log_trigger(
+        &["-L", "--ops-throttle=1", &src_remote, &dst_remote],
+        &trigger,
+        1,
+        || {
+            retarget(&to_file, &real_file);
+            retarget(&to_special, &real_socket);
+        },
+    );
+    // the copy must COMPLETE (the harness already failed us on a 90s timeout/hang), report the
+    // entries it could not copy, and still deliver everything it counted.
+    assert!(
+        !output.status.success(),
+        "copy should report a non-zero exit for the source entries that changed type"
+    );
+    // the data-loss assertion: an unrelated counted file must not be evicted by the changed child.
+    // Existence is asserted before content so the failure names the bug rather than surfacing as a
+    // "No such file or directory" out of the fixture helper.
+    assert!(
+        dst_root.join("sibling.txt").is_file(),
+        "a counted source file was silently dropped in favour of an entry Pass 1 had already \
+         accounted for"
+    );
+    assert_eq!(
+        get_file_content(&dst_root.join("sibling.txt")),
+        "sibling content"
+    );
+    assert_eq!(
+        get_file_content(&dst_root.join("keep/keep.txt")),
+        "keep content"
+    );
+    for changed in ["to_file", "to_special"] {
+        assert!(
+            !dst_root.join(changed).exists(),
+            "{changed} changed type before the source reached it and must not be created"
+        );
+    }
+}
+
+/// Regression for the same double-count on the HARDENED (default, non-`-L`) walk, where it is
+/// reached without any dereference: a counted child DIRECTORY that is a regular file by the time
+/// Pass 2 re-enumerates must not take a second entry slot and evict a counted sibling.
+///
+/// Pass 1 classifies `child` as a directory (fd-relative `fstatat`) and counts it, then fails to
+/// `open_dir` it once it has been replaced by a file and compensates with a `FileSkipped`. Pass 2
+/// then enumerates the parent from its held fd, sees a regular file at that same name, and — before
+/// the fix — counted it as one of the parent's expected files; `files_found(2) > file_count(1)`
+/// truncated to one, and whichever `readdir` returned first won. When that was `child`,
+/// `sibling.txt` was never sent, the parent still reached `entries_expected`, and the copy reported
+/// only the `open_dir` error while quietly dropping a file that never changed at all.
+///
+/// The window here is wide and needs no atomic swap: it spans Pass 1's classification through the
+/// network round-trip to Pass 2's enumeration, so a plain remove-then-create lands inside it.
+#[test]
+fn test_remote_counted_dir_becoming_file_does_not_evict_sibling() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_root = src_dir.path().join("root");
+    std::fs::create_dir(&src_root).unwrap();
+    // the parent's only counted FILE - the eviction casualty.
+    create_test_file(&src_root.join("sibling.txt"), "sibling content", 0o644);
+    // the counted DIRECTORY that becomes a regular file mid-copy.
+    let child = src_root.join("child");
+    std::fs::create_dir(&child).unwrap();
+    create_test_file(&child.join("inner.txt"), "inner content", 0o644);
+    let dst_root = dst_dir.path().join("root");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    let trigger = format!("Sending directory: {src_root:?}");
+    let output = run_rcp_with_log_trigger(
+        // default mode: no `-L`, so this is the hardened fd-walk.
+        &["--ops-throttle=1", &src_remote, &dst_remote],
+        &trigger,
+        1,
+        || {
+            std::fs::remove_dir_all(&child).unwrap();
+            std::fs::write(&child, "now a regular file").unwrap();
+        },
+    );
+    assert!(
+        !output.status.success(),
+        "copy should report a non-zero exit for the child directory it could not open"
+    );
+    // existence first, so a regression reads as data loss rather than a fixture-helper panic.
+    assert!(
+        dst_root.join("sibling.txt").is_file(),
+        "a counted source file was silently dropped in favour of an entry Pass 1 had already \
+         accounted for"
+    );
+    assert_eq!(
+        get_file_content(&dst_root.join("sibling.txt")),
+        "sibling content"
+    );
+    assert!(
+        !dst_root.join("child").exists(),
+        "the replaced child was accounted for by Pass 1 and must not be copied by Pass 2 either"
+    );
+}
+
 /// TOCTOU hardening (Scenario 2 — destination write-escape): a symlink planted at an
 /// intermediate DESTINATION directory path must NOT be followed when the remote `rcpd`
 /// destination creates the subtree under it. The destination opens each tracked directory
