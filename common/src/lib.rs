@@ -151,7 +151,7 @@ pub use progress::{RcpdProgressPrinter, SerializableProgress};
 // `runtime_setup` so downstream binaries keep reaching them as
 // `common::collect_runtime_stats`, etc.
 pub use runtime_setup::{
-    collect_runtime_stats, generate_debug_log_filename, generate_trace_filename,
+    NOTICE_TARGET, collect_runtime_stats, generate_debug_log_filename, generate_trace_filename,
 };
 pub use settings_parse::{
     parse_compare_settings, parse_metadata_cmp_settings, parse_preserve_settings,

@@ -142,11 +142,14 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
 
 - **Purpose**: Provide configuration and connection details
 - **Variants**:
-  - `Source { src, dst, dest_cert_fingerprint, filter, dry_run }`: Tells source rcpd what to copy
+  - `Source { src, dst, dest_cert_fingerprint, filter, dry_run, capture }`: Tells source rcpd what
+    to copy
     - `filter`: Optional filter settings for include/exclude patterns (source-side filtering reduces
       network traffic)
     - `dry_run`: Optional dry-run mode (brief, all, or explain) for previewing operations without
       transferring files
+    - `capture: ExtendedMetadataCapture { file_acl, dir_acl }`: what EXTENDED per-entry metadata the
+      source must read beyond the `stat` it already does — currently POSIX ACLs. See §2.5.
   - `Destination { source_control_addr, source_data_addr, server_name, preserve, source_cert_fingerprint }`:
     Tells destination where to connect (both control and data addresses). Note: empty directory
     cleanup decisions are communicated per-directory via `keep_if_empty` in `Directory` messages
@@ -370,6 +373,109 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
 - **Format**: Length-delimited serialized header, then raw bytes (exactly `size` bytes)
 - **Connection model**: Connections are pooled and reused for multiple files. The `size` field
   delimits file boundaries within a connection. Destination reads headers in a loop until EOF.
+
+### 2.5 Entry Metadata and POSIX ACLs
+
+Every message that describes an entry (`Directory`, `Symlink`, `File`, and each `ExistingEntry` in a
+`DirectoryManifestChunk`) carries a `Metadata`:
+
+```rust
+struct Metadata {
+    mode: u32, uid: u32, gid: u32,
+    atime: i64, mtime: i64, atime_nsec: i64, mtime_nsec: i64,
+    acl_access:  Option<Vec<u8>>,   // system.posix_acl_access
+    acl_default: Option<Vec<u8>>,   // system.posix_acl_default (directories only)
+}
+```
+
+**The ACL fields carry the SOURCE kernel's bytes verbatim.** They are never parsed, rebuilt or
+reordered in flight. POSIX.1e requires canonical entry order (`USER_OBJ`, named users by ascending
+uid, `GROUP_OBJ`, named groups by ascending gid, `MASK`, `OTHER`) and the kernel rejects anything
+else with `EINVAL`, so passing through what the source kernel already validated sidesteps the
+problem entirely. The on-disk format is defined little-endian (`__le16`/`__le32`), so it is portable
+across hosts as-is; the destination kernel validates on `fsetxattr`. rcp requires an exact rcp/rcpd
+version match (see [remote_copy.md](remote_copy.md)), so adding these fields has no back-compat
+cost.
+
+**`None` means "the source has no such ACL", which the destination reproduces by REMOVING the
+attribute — not by leaving the destination alone.** A destination directory's default ACL is
+inherited by every entry created beneath it, including ones rcp creates itself, so "do nothing when
+the source has no ACL" would hand the copy permissions the source never granted.
+
+**Which messages actually carry ACLs:**
+
+| message                                                              | carries                    | why                                                                                                                           |
+| -------------------------------------------------------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `File`                                                               | access only, when captured | read from the SAME fd whose bytes are sent, so permissions and contents cannot desync                                         |
+| `Directory`                                                          | both, when captured        | read from the held `O_NOFOLLOW` fd whose children were enumerated; the default ACL is what the destination's children inherit |
+| a committed-but-unreadable directory whose ENUMERATION failed (§7.1) | both, when captured        | the directory itself was reachable — only `getdents` failed — so it answers the probe like any other                          |
+| a committed directory that could not be OPENED at all (§7.1)         | nothing                    | no fd to read them from, and that entry's copy is already recorded as an error                                                |
+| `Symlink`                                                            | nothing                    | the kernel has no symlink ACL; the settings parser rejects `l:acl`                                                            |
+| `ExistingEntry` (manifest)                                           | nothing                    | the manifest answers `--overwrite-compare`, which has no `acl` term — see the hole below                                      |
+
+Reading a source entry's ACL from the same fd as its payload is the same read-side fidelity rule the
+rest of the source walk follows (Guarantee 2 in [tocttou.md](tocttou.md)): a probe by path could be
+answered by a different inode than the one whose bytes and metadata are on the wire, pairing one
+entry's permissions with another's contents. The `-L`/`--dereference` walk holds no directory fd, so
+there the directory ACL read opens by path — the same intentionally-unhardened choice that walk
+already makes everywhere else.
+
+**A failed ACL read FAILS the entry; it never degrades to "no ACL".** Because `None` means CLEAR,
+sending it for an ACL the source could not read would make an `EMFILE`, `EACCES` or `ENOENT` STRIP
+the destination's ACLs — including a directory's default ACL, which then governs everything created
+beneath it. That is strictly worse than failing, and it mirrors the destination's rule for the same
+situation in the other direction (a destination that cannot HOLD an ACL fails the entry rather than
+dropping it quietly).
+
+Because that failure happens BEFORE the entry's message is sent, the destination is never told to
+expect it, and the source compensates on both exit paths — otherwise the destination's parent
+directory never reaches `entries_expected`, `DestinationDone` is never sent, and the copy HANGS with
+both peers alive, which no keepalive or timeout ends:
+
+- **A nested entry** is accounted with a `FileSkipped` (§2.2), exactly as for any other counted
+  child the source can no longer process.
+- **A root entry** fails the copy outright, before `DirStructureComplete` — the Root Item Failure
+  Invariant in §3.3. Continuing would announce `has_root_item: true` with no root message ever
+  committed.
+
+Both walks follow this rule, and the file path inherits it from the same accounting: an ACL read
+failure on a file takes the same `FileSkipped` route as a failed open.
+
+**`MasterHello::Source { capture: ExtendedMetadataCapture { file_acl, dir_acl } }`.** Only
+`MasterHello::Destination` carries `preserve`, so without this field the source could not know
+whether ACLs are wanted and would have to probe unconditionally — a syscall per entry that `stat`
+cannot fold in, on every remote copy including ones that do not want ACLs. With every field false
+the source issues no xattr syscall at all.
+
+It is deliberately NOT the whole `preserve` struct. The source decides only what to **read**; the
+destination remains the sole authority on what is **applied**. Handing the source a `preserve` would
+invite a later reader to act on, say, `preserve.file.mode_mask` source-side, which would be a bug.
+The master derives `capture` from the same `preserve` it sends the destination, at one call site, so
+the two cannot disagree — which matters, because the destination reads an all-`None` `Metadata` as
+"clear", so a capture that said `false` under a `preserve` that said `true` would strip every ACL
+instead of copying it. This is a wire-format change, not a spawn-argument one.
+
+**Application (destination).** File ACLs are applied through the created file's own fd in
+`process_single_file`, directory ACLs through the directory's own held fd when it completes
+(`DirectoryTracker::complete_directory_single`). Both go through the shared appliers
+(`common::safedir::set_file_metadata_fd` / `set_reused_dir_metadata_fd`), so the remote path
+inherits the local one's ordering rule: an access ACL is the step that WIDENS the destination from
+its owner-only create mode, so it runs last and the `fchmod` before it is narrowed to carry only the
+special bits (see the create-mode note in §5.1 and [tocttou.md](tocttou.md)). Neither is a new
+protocol message: the wire change is confined to the two `Metadata` fields and the `capture` field.
+
+**Not on the wire: the destination's own containment.** Under `--require-toctou-safe` the
+destination `rcpd` also strips the ACLs of every directory it creates and snapshots/restores the
+default ACL of every directory it reuses, so nothing created beneath one inherits. That is
+destination-local behavior driven by the mirrored flag, not by any message, and it applies whether
+or not `capture` asked the source for anything. See [acls.md](acls.md) and [tocttou.md](tocttou.md).
+
+**Known hole (unchanged by ACL transport):** a file the manifest shows as identical under
+`--overwrite-compare` (default `size,mtime`) is not transferred and keeps its old destination ACL.
+This is the same shape as `mode`, which the default comparison also ignores.
+
+The whole ACL model — both widening directions, the measured costs, the apply ordering and the
+strict-mode invariant — lives in [acls.md](acls.md); this section covers only what crosses the wire.
 
 ## 3. Error Communication Design
 

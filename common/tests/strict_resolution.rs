@@ -362,3 +362,234 @@ async fn strict_reuse_rlink_owned_readonly_dir_becomes_writable() -> anyhow::Res
     assert_eq!(md.gid(), egid, "owner gid must be unchanged");
     Ok(())
 }
+
+// ── ACL containment for a reused directory (`--require-toctou-safe`) ─────────
+//
+// The lockdown snapshots and strips a reused destination directory's access AND
+// default ACLs, so nothing written during the copy inherits them, and puts them
+// back at finalize. rlink reaches that finalize through `link_dir_contents`,
+// which is a DIFFERENT restore site from copy's `finalize_dir` and the remote
+// destination's `complete_directory_single` — so it needs its own test rather
+// than inheriting confidence from theirs.
+
+const ACL_ACCESS: &std::ffi::CStr = c"system.posix_acl_access";
+const ACL_DEFAULT: &std::ffi::CStr = c"system.posix_acl_default";
+
+/// Encode an ACL in the kernel's `system.posix_acl_*` layout: a `__le32` version
+/// followed by `{__le16 tag, __le16 perm, __le32 id}` entries. Written directly
+/// because `setfacl` is not in the dev shell.
+fn encode_acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+    let mut out = 2u32.to_le_bytes().to_vec();
+    for &(tag, perm, id) in entries {
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&perm.to_le_bytes());
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+    out
+}
+
+/// `u::rwx u:65534:rwx g::r-x m::rwx o::r-x` — a permissive entry, as an
+/// administrator's default ACL on a destination tree.
+fn granting_acl() -> Vec<u8> {
+    encode_acl(&[
+        (0x01, 7, 0xffff_ffff),
+        (0x02, 7, 65534),
+        (0x04, 5, 0xffff_ffff),
+        (0x10, 7, 0xffff_ffff),
+        (0x20, 5, 0xffff_ffff),
+    ])
+}
+
+fn set_acl(path: &std::path::Path, name: &std::ffi::CStr, value: &[u8]) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: both pointers are NUL-terminated C strings that outlive the call, and `value` points
+    // at `value.len()` readable bytes.
+    let rc = unsafe {
+        libc::setxattr(
+            cpath.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "cannot write {name:?} on {path:?}: {}. This test needs a filesystem that holds POSIX \
+         ACLs; it fails rather than skips.",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Read `name` from `path`, or `None` if the entry genuinely has none. Only `ENODATA` yields
+/// `None`: a getter that shrugged at a wrong path would let every assertion below pass vacuously.
+fn get_acl(path: &std::path::Path, name: &std::ffi::CStr) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let mut buf = [0u8; 1024];
+    // SAFETY: as above; the kernel writes at most `buf.len()` bytes into `buf`.
+    let n = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if n >= 0 {
+        return Some(buf[..n as usize].to_vec());
+    }
+    let err = std::io::Error::last_os_error();
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ENODATA),
+        "getxattr({name:?}) on {path:?} failed with {err} — only ENODATA means \"no such attribute\""
+    );
+    None
+}
+
+/// rlink's restore site: strict reuse of a directory carrying a default ACL neither lets the
+/// hard links it materializes inherit it nor loses it — with `d:acl` off, so what comes back is
+/// the DESTINATION's own ACL rather than anything from the source.
+#[tokio::test]
+async fn strict_reuse_rlink_restores_a_reused_dirs_acls() -> anyhow::Result<()> {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2)");
+        return Ok(());
+    }
+    let tmp = tempfile::tempdir()?;
+    let tmp = tokio::fs::canonicalize(tmp.path()).await?;
+    let src = tmp.join("src");
+    tokio::fs::create_dir(&src).await?;
+    tokio::fs::write(src.join("a.txt"), b"payload").await?;
+    tokio::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).await?;
+    // reused destination directory carrying a permissive DEFAULT ACL, which `chmod` alone cannot
+    // contain: it is untouched by a mode change, so every child created during the copy would
+    // inherit it.
+    let dst = tmp.join("dst");
+    tokio::fs::create_dir(&dst).await?;
+    let default = granting_acl();
+    set_acl(&dst, ACL_DEFAULT, &default);
+    let link_settings = common::link::Settings {
+        copy_settings: overwrite_copy_settings(),
+        update_compare: Default::default(),
+        update_exclusive: false,
+        filter: None,
+        dry_run: None,
+        preserve: common::preserve::preserve_none(),
+    };
+    common::safedir::enable_strict_operand_resolution();
+    let result = common::link::link(
+        common::get_progress(),
+        &tmp,
+        &src,
+        &dst,
+        &None,
+        &link_settings,
+        false,
+    )
+    .await;
+    if let Err(e) = result {
+        panic!("strict reuse rlink must succeed, got: {:#}", e.source);
+    }
+    let linked = dst.join("a.txt");
+    assert_eq!(
+        get_acl(&linked, ACL_ACCESS),
+        None,
+        "the hard link inherited the reused directory's default ACL — and because it SHARES the \
+         source's inode, that ACL is on the source tree too"
+    );
+    assert_eq!(
+        get_acl(&dst, ACL_DEFAULT).as_deref(),
+        Some(default.as_slice()),
+        "the reused directory permanently lost the default ACL it had before the link run"
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&dst)?.permissions().mode() & 0o777,
+        0o755,
+        "final mode must equal the source directory mode"
+    );
+    Ok(())
+}
+
+/// Cancelling `lockdown_reused_dir` at ANY point must never cost the directory its default ACL.
+///
+/// The lockdown removes that ACL from the filesystem and holds the only copy in memory, so there is
+/// a window in which the bytes exist nowhere durable. If the guard that owns them is constructed
+/// AFTER the removal, a task cancelled in between loses them as a bare `Option<Vec<u8>>` with no
+/// destructor — and the removal still happens, because `spawn_blocking` cannot be cancelled once
+/// submitted and a dropped `JoinHandle` detaches rather than cancels. `--fail-early` reaches exactly
+/// this: a sibling fails, `join_and_fold` drops the `JoinSet`, and every in-flight lockdown is
+/// aborted mid-await.
+///
+/// Cancellation is driven by POLL COUNT rather than elapsed time, which matters: the window is a
+/// single `spawn_blocking` round trip, tens of microseconds inside a call that takes a few hundred,
+/// and a timer-based sweep walks straight past it (measured — it does not catch the bug). Each
+/// `.await` on the blocking pool yields exactly one `Pending`, so dropping the future after exactly
+/// N polls lands the cancellation on the Nth await, deterministically, and sweeping N covers every
+/// one of them including the strip.
+///
+/// Every iteration must end with the ACL present, whichever of the three outcomes it lands in: the
+/// lockdown never got that far, it completed and the guard was dropped, or it was cancelled between
+/// the two — the case that used to lose them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lockdown_reused_dir_never_loses_the_default_acl_when_cancelled() -> anyhow::Result<()> {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2)");
+        return Ok(());
+    }
+    let tmp = tempfile::tempdir()?;
+    let tmp = tokio::fs::canonicalize(tmp.path()).await?;
+    common::safedir::enable_strict_operand_resolution();
+    let default = granting_acl();
+    let mut completed = 0usize;
+    for budget in 0..24usize {
+        let name = format!("reused{budget}");
+        let dir_path = tmp.join(&name);
+        tokio::fs::create_dir(&dir_path).await?;
+        set_acl(&dir_path, ACL_DEFAULT, &default);
+        let root =
+            common::safedir::Dir::open_root_dir(&tmp, false, common::Side::Destination).await?;
+        let entry = std::ffi::OsString::from(&name);
+        let handle = root.child(&entry).await?;
+        let dir = root.open_dir(&entry).await?;
+        // poll the lockdown at most `budget` times, then drop it mid-flight
+        let outcome = {
+            let mut fut = Box::pin(common::safedir::lockdown_reused_dir(&dir, &handle));
+            let mut polls = 0usize;
+            std::future::poll_fn(move |cx| {
+                if polls >= budget {
+                    return std::task::Poll::Ready(None);
+                }
+                polls += 1;
+                fut.as_mut().poll(cx).map(Some)
+            })
+            .await
+        };
+        if matches!(&outcome, Some(Ok(Some(_)))) {
+            completed += 1;
+        }
+        drop(outcome);
+        // let any DETACHED blocking closure land: a `spawn_blocking` already submitted when the
+        // future was dropped still runs, and that is precisely how the ACL used to disappear after
+        // the cancellation rather than during it. Without this wait the assertion could pass by
+        // checking too early.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let got = get_acl(&dir_path, ACL_DEFAULT);
+        assert_eq!(
+            got.as_deref(),
+            Some(default.as_slice()),
+            "cancelling after {budget} poll(s) lost the directory's default ACL — those bytes \
+             existed only in memory between the removal and the guard that owns them"
+        );
+    }
+    // the sweep must actually reach completed lockdowns, or it only ever tested the trivial
+    // "cancelled before anything happened" case and proves nothing about the window
+    assert!(
+        completed > 0,
+        "no iteration ran the lockdown to completion, so the sweep never covered the window"
+    );
+    Ok(())
+}

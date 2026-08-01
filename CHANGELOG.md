@@ -9,6 +9,79 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- POSIX ACL preservation, opt-in via `--preserve-settings=all+acl` or a per-type `acl` attribute
+  (`f:acl` / `d:acl`), for `rcp` (local and remote) and `rlink`. Both `system.posix_acl_access` and,
+  on directories, `system.posix_acl_default` are carried; the bytes cross the wire verbatim, since
+  POSIX.1e requires canonical entry order and the kernel rejects anything else with `EINVAL`, so
+  passing through what the source kernel already validated sidesteps the problem. This closes two
+  independent ways a copy could end up **more permissive than its source**, both of which were
+  reproduced on ext4. First, the reported one: a source ACL entry narrower than `other` acts as a
+  deny in effect — POSIX.1e has no literal deny entry, but no mode can express "everyone except this
+  uid" — so copying the mode and dropping the ACL granted exactly what the source withheld. Second,
+  one found while designing the fix, which needs nothing unusual on the source: a destination
+  directory carrying a **default** ACL passes it to every entry created beneath it, including the
+  directories rcp creates itself, and rcp's own finalize `chmod` then re-derives the ACL mask from
+  the mode's group bits and makes those inherited entries *effective*. The design consequence is
+  that faithful preservation means **clearing** as well as setting — a source with no ACL requires
+  an explicit removal on the destination — and that in turn is why an ACL that cannot be read on the
+  source **fails** the entry rather than degrading: an absent ACL is an instruction to clear, so a
+  transient `EMFILE` that degraded would *strip* the destination's ACLs, a directory's inheritance
+  policy included.
+
+  `--preserve-settings=all` deliberately does **not** include ACLs, and neither does the deprecated
+  `--preserve`. There is no bit in `stat` saying whether an entry has an ACL, so merely detecting
+  one costs a syscall on every entry — measured at 1057 ns against the 949 ns `stat` rcp already
+  pays, roughly doubling the per-entry metadata cost of the flag most people reach for by default.
+  The read probe is `listxattr`-first (591 ns, and a miss is the overwhelming majority) with a
+  `getxattr` only for a name actually present, and every ACL syscall goes through the same
+  congestion gate as `stat`/`chmod`. That the default path really pays nothing is asserted on
+  syscall count rather than on outcome. What it *does* pay is one `listxattr` on the source **root**
+  per run — a constant, free at any tree size — which warns when that root carries an ACL the copy
+  is about to drop; a heuristic, since a root without one says nothing about its children.
+
+  That notice is printed at the **default verbosity**, unlike every other warning these tools emit,
+  because the user it exists for is precisely the one who will not think to pass `-v`. It gets there
+  through a tracing target of its own (`rcp::notice`) with its own filter directive, so nothing else
+  becomes noisier — raising the global default to `warn` instead would have unmuted 14 per-entry
+  `warn!` sites, and one failed subtree would print thousands of lines. On a remote copy the notice
+  keeps that target across the wire so the master renders it too; both ends need the directive,
+  since a source `rcpd` at the default verbosity would otherwise not even send it. `--quiet`
+  suppresses it; the copy still succeeds and its exit code is unchanged.
+
+  Two settings combinations are rejected at parse time rather than silently ignored: `l:acl` (the
+  kernel has no symlink ACL) and `acl` alongside a mode mask that narrows the rwx bits (an ACL *is*
+  the permission state, so a mask stripping group and other while the ACL puts them back is a
+  contradiction — masks that strip only the special bits stay legal, since the ACL carries no
+  setuid/setgid/sticky). The `+` preset grammar is new: a string is a preset only when its first
+  `+`-token is `all` or `none`, so `+` remains an ordinary character in the per-type DSL and no
+  existing settings string changed meaning.
+
+  Applying an access ACL is itself a mode-changing operation — `fsetxattr` drives the mode's rwx
+  bits from `USER_OBJ`/`MASK`/`OTHER` — so it takes over as the single step that widens a
+  destination from the owner-only mode it was created at, and the `fchmod` before it is narrowed to
+  carry only the special bits. The invariant from the previous release is preserved exactly for
+  files: one widening step, and it is the last fallible one. Directories take the same two-branch
+  shape but keep `futimens` after it, as they did before — a directory's mtime is bumped by every
+  child created in it, so its timestamps can only be applied once its children exist.
+
+  Under `--require-toctou-safe` the *destination* side is contained as well, which is a different
+  bug from the above and is closed at a different price: every directory rcp creates has both ACLs
+  removed after the `mkdirat` (two syscalls per directory, none per file — stripping the default ACL
+  stops the inheritance chain for the whole subtree), and every reused directory has its default ACL
+  snapshotted and restored around the copy. The two flags deliberately do not imply each other —
+  strict mode contains inherited *destination* ACLs but does not preserve the *source's* — so pair
+  them where source ACLs are security-relevant; the root warning says so under that flag. One
+  consequence is intended and documented: under strict mode without `d:acl`, a freshly created
+  destination directory ends with no ACL even where its parent's default ACL would have given it
+  one. Containment beats inheritance; `d:acl` is the escape.
+
+  Known holes, documented rather than fixed: a file that compares equal under `--overwrite-compare`
+  (default `size,mtime`) is skipped and keeps its old ACL, the same shape as `mode`, which the
+  default comparison also ignores; inherited destination ACLs are not contained on the default path;
+  and NFSv4 ACLs (`system.nfs4_acl`) are neither handled nor detected. `rlink`'s hard-linked files
+  share the source inode, so `f:acl` never writes through one — it applies only where `rlink` really
+  copies. See the new [POSIX ACLs](docs/acls.md) document for the full model.
+
 - Add `--remote-keepalive-sec` (default 120, `0` disables): a liveness budget for every TCP
   connection a remote copy makes. A peer whose host vanishes — power loss, a severed link, a
   destroyed VM — sends neither `FIN` nor `RST`, so until now such a copy simply hung. The master
@@ -157,14 +230,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   also fails) — never wider than it already was. Second, an actor holding a directory fd opened
   before the lockdown can still observe the names of children written afterward (child contents stay
   protected by their own source-derived mode). A non-owning, non-privileged copier that cannot chown
-  the reused directory fails closed for that directory. Limitations: the lockdown restricts the
-  directory MODE only — POSIX access/default ACLs are not snapshotted, stripped, or restored, so a
-  permissive **default** ACL is still inherited by freshly written children (the interim `0o700`
-  does neutralize a directory's own access ACL, because `chmod` rewrites the ACL mask from the group
-  bits; ACL handling is deferred); and on a backend that does not honor `chown`/`chmod` (e.g. CIFS
-  without unix extensions) the takeover or finalize fails closed but may leave the reused directory
-  copier-owned at its original, possibly permissive, mode. The default (non-strict) path is
-  unchanged: reused directories are left as-is.
+  the reused directory fails closed for that directory. The lockdown also snapshots and removes the
+  directory's POSIX **default** ACL for the copy's duration, restoring it at finalize (or from an
+  RAII guard on abort), because a `chmod` cannot reach a default ACL and freshly written children
+  would otherwise inherit it; its **access** ACL needs no strip, since the interim `0o700` rewrites
+  the ACL mask from the group bits and leaves every named entry granting nothing. Limitation: on a
+  backend that does not honor `chown`/`chmod` (e.g. CIFS without unix extensions) the takeover or
+  finalize fails closed but may leave the reused directory copier-owned at its original, possibly
+  permissive, mode. The default (non-strict) path is unchanged: reused directories are left as-is.
 
 ### Fixed
 

@@ -199,6 +199,34 @@ pub fn generate_trace_filename(prefix: &str, identifier: &str, extension: &str) 
     format!("{prefix}-{identifier}-{hostname}-{pid}-{timestamp}.{extension}")
 }
 
+/// The tracing target for rcp's own user-facing NOTICES: advice about the invocation that a user
+/// must see without having to ask for it with `-v`.
+///
+/// The verbose-level filter (`build_verbose_env_filter`, below) gives this target its own `warn`
+/// directive, which is more specific than the global level, so a notice renders at the DEFAULT
+/// verbosity while everything else stays at `error`. That targeting is the whole point. Raising the
+/// global default to `warn` instead would unmute every other `warn!` in the tools, 14 of which sit
+/// in per-entry paths (e.g. "Skipping directory {:?} - ancestor failed to create"), so one failed
+/// subtree would print thousands of lines.
+///
+/// **The bar for putting an event here** is that it is advice about the INVOCATION — constant in
+/// volume however large the tree, and actionable by changing the command line. A per-entry event
+/// does not qualify, however important it looks. Today there is exactly one notice: the
+/// source-root ACL notice in [`crate::safedir`].
+///
+/// Three things hold, deliberately:
+///
+/// - `--quiet` suppresses it, along with everything else — no subscriber is installed at all. That
+///   is the supported way to turn a notice off.
+/// - `RUST_LOG` does NOT suppress it. The directive is added after `EnvFilter::from_default_env`
+///   and replaces any directive for the same target, exactly as the `tokio` / `quinn` / `rustls` /
+///   `h2` directives and the verbosity level itself already do. `RUST_LOG` still raises verbosity
+///   for targets this filter does not name.
+/// - It is a `warn!` and not an `error!`: the copy succeeds and its exit code is unchanged. A
+///   notice is advice, and the ACL one is a heuristic besides — the same tree copied one level
+///   deeper would not produce it, so failing on it would read as capricious.
+pub const NOTICE_TARGET: &str = "rcp::notice";
+
 /// Build the verbose-level [`tracing_subscriber::EnvFilter`] used by every
 /// non-profile tracing layer (file, fmt, remote). Excludes noisy deps that are
 /// rarely useful when debugging rcp.
@@ -211,6 +239,12 @@ fn build_verbose_env_filter(verbose: u8) -> tracing_subscriber::EnvFilter {
     };
     tracing_subscriber::EnvFilter::from_default_env()
         .add_directive(level_directive)
+        // rcp's own notices, visible at every verbosity including the default. Built from the
+        // constant rather than spelled out, so the target and the directive cannot drift apart.
+        // This layer builder is shared by the master's console/file layers AND by an rcpd's
+        // forwarding layer, so one directive covers both ends of a remote copy: without it here,
+        // an rcpd at the default verbosity would never even SEND the notice.
+        .add_directive(format!("{NOTICE_TARGET}=warn").parse().unwrap())
         .add_directive("tokio=info".parse().unwrap())
         .add_directive("runtime=info".parse().unwrap())
         .add_directive("quinn=warn".parse().unwrap())

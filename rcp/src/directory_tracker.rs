@@ -66,10 +66,11 @@ struct DirectoryState {
     entries_processed: usize,
     /// whether to keep this directory if it ends up empty
     keep_if_empty: bool,
-    /// original `(uid, gid)` to restore at completion, `Some` iff this reused directory was locked
-    /// down under strict operand resolution (see [`common::safedir::lockdown_reused_dir`]); `None`
-    /// for a freshly created directory, which must never be restore-chowned
-    restore_owner: Option<(u32, u32)>,
+    /// what the lockdown must undo at completion (original owner + original ACLs), `Some` iff this
+    /// reused directory was locked down under strict operand resolution (see
+    /// [`common::safedir::lockdown_reused_dir`]); `None` for a freshly created directory, which must
+    /// never be restore-chowned and whose inherited ACLs were stripped outright at creation
+    reused_lock: Option<common::safedir::ReusedDirLock>,
 }
 
 /// Tracks directory entry counts and completion state for remote copy operations.
@@ -205,8 +206,8 @@ impl DirectoryTracker {
     /// * `entry_count` - total child entries (files + dirs + symlinks)
     /// * `keep_if_empty` - whether to keep this directory if empty
     /// * `existing` - pre-existing destination entries to include in the `DirectoryCreated` manifest
-    /// * `restore_owner` - original `(uid, gid)` to restore at completion for a strict-mode locked
-    ///   reused directory (`None` for fresh dirs and the default path)
+    /// * `reused_lock` - what to undo at completion (original owner + original ACLs) for a
+    ///   strict-mode locked reused directory (`None` for fresh dirs and the default path)
     #[allow(clippy::too_many_arguments)]
     pub async fn add_directory(
         &mut self,
@@ -219,7 +220,7 @@ impl DirectoryTracker {
         entry_count: usize,
         keep_if_empty: bool,
         existing: Vec<remote::protocol::ExistingEntry>,
-        restore_owner: Option<(u32, u32)>,
+        reused_lock: Option<common::safedir::ReusedDirLock>,
     ) -> anyhow::Result<()> {
         // store metadata for later application
         self.metadata.insert(dst.to_path_buf(), metadata);
@@ -240,7 +241,7 @@ impl DirectoryTracker {
                 entries_expected: entry_count,
                 entries_processed: 0,
                 keep_if_empty,
-                restore_owner,
+                reused_lock,
             },
         );
         // stream the pre-existing-entry manifest as chunks (each well under the control stream's
@@ -394,11 +395,13 @@ impl DirectoryTracker {
         // remove from pending
         let state = self.pending_directories.remove(dst);
         let keep_if_empty = state.as_ref().is_none_or(|s| s.keep_if_empty);
-        // original owner to restore before applying metadata, for a strict-mode locked reused dir.
-        let restore_owner = state.as_ref().and_then(|s| s.restore_owner);
         if state.is_none() {
             tracing::warn!("directory {:?} was not in pending when completing", dst);
         }
+        // what the lockdown must undo before/while applying metadata, for a strict-mode locked
+        // reused dir. Moved out of `state` rather than copied: it carries the directory's original
+        // ACL bytes.
+        let reused_lock = state.and_then(|s| s.reused_lock);
         // drop this directory's own fd from the fd-map: it is completing, no more
         // children will be created under it. The own fd is kept locally below for the
         // metadata application (the clone keeps it alive even though it's now out of
@@ -461,14 +464,20 @@ impl DirectoryTracker {
         if let Some(metadata) = self.metadata.remove(dst) {
             match own_dir.as_ref() {
                 Some(dir) => {
-                    // for a reused directory locked down under strict mode, restore the original
-                    // owner component-wise then apply source metadata (see set_reused_dir_metadata_fd
-                    // — no transient window hands the directory to a hostile prior owner); None for
-                    // fresh dirs.
+                    // for a reused directory locked down under strict mode, put back the ACLs the
+                    // lockdown stripped and restore the original owner component-wise, then apply
+                    // source metadata (see set_reused_dir_metadata_fd — no transient window hands the
+                    // directory to a hostile prior owner); None for fresh dirs.
+                    // The source's access AND default ACLs travel in the stored wire metadata and
+                    // are handed over unconditionally; an all-`None` value means the source had none
+                    // and the destination's must be CLEARED (see the same note in `destination.rs`).
+                    // The default ACL matters most here: it is what every child created beneath this
+                    // directory inherits.
                     let apply_result = common::safedir::set_reused_dir_metadata_fd(
                         &self.preserve,
                         &metadata,
-                        restore_owner,
+                        Some(&metadata.acls()),
+                        reused_lock,
                         dir,
                     )
                     .await;
@@ -613,6 +622,8 @@ mod tests {
             mtime: 0,
             atime_nsec: 0,
             mtime_nsec: 0,
+            acl_access: None,
+            acl_default: None,
         }
     }
     async fn open_dir(path: &std::path::Path) -> Arc<Dir> {

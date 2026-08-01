@@ -63,6 +63,17 @@ Local file operation tests in each tool's `tests/` directory:
 - **rlink**: Hard-linking operations
 - **rcmp**: File comparison
 
+**POSIX ACL tests** (`rcp/tests/acls.rs`, `rlink/tests/acls.rs`, and unit tests in
+`common/src/safedir.rs`) need a temp filesystem that can hold `system.posix_acl_*` extended
+attributes. Per the repo's convention they **fail rather than skip** when it cannot, so a lost
+feature cannot pass unnoticed — a failure there means `TMPDIR` is on a filesystem without ACL
+support, not that the code is broken. Fixtures write the xattrs directly rather than shelling out to
+`setfacl`, so no runtime dependency is added; `pkgs.acl` is in the dev shell so `getfacl` is on hand
+for reading an ACL by eye while debugging, but nothing in the suite uses it. A few of these tests
+count syscalls with `strace(1)` (the whole point of `acl` being opt-in is that the default path
+costs nothing, which no outcome-only check can show), so `strace` must be installed — it is in the
+dev shell. See [POSIX ACLs](acls.md).
+
 ### Remote Integration Tests
 
 Tests using localhost SSH (`rcp/tests/remote_tests.rs`):

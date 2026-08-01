@@ -71,6 +71,49 @@ pub struct Metadata {
     pub mtime: i64,
     pub atime_nsec: i64,
     pub mtime_nsec: i64,
+    /// The source's `system.posix_acl_access`, as the SOURCE kernel's opaque bytes. `None` means
+    /// the source entry has no access ACL — which the destination reproduces by REMOVING the
+    /// attribute, not by leaving whatever it inherited (see [`common::safedir::apply_acls_fd`]).
+    /// Only ever filled when the master asked for it via [`ExtendedMetadataCapture`].
+    pub acl_access: Option<Vec<u8>>,
+    /// The source's `system.posix_acl_default`; directories only (files have no default ACL), and
+    /// the same `None` semantics as `acl_access`.
+    pub acl_default: Option<Vec<u8>>,
+}
+
+impl Metadata {
+    /// Attach a source entry's POSIX ACLs, carrying the kernel's bytes VERBATIM.
+    ///
+    /// The bytes are never rebuilt or reordered. POSIX.1e requires canonical entry order
+    /// (`USER_OBJ`, named users by ascending uid, `GROUP_OBJ`, named groups by ascending gid,
+    /// `MASK`, `OTHER`) and the kernel rejects anything else with `EINVAL` — passing through what
+    /// the source kernel already validated sidesteps that entirely. The format is defined
+    /// little-endian (`__le16`/`__le32`), so it is portable across hosts as-is. Any future code
+    /// that CONSTRUCTS an ACL (id remapping, a synthesized entry) must sort canonically itself.
+    ///
+    /// This is a builder rather than a field the [`From`] impls fill because neither of them has an
+    /// fd to read from: every site that SHOULD carry ACLs is therefore a visible call, and a site
+    /// that does not simply carries `None`.
+    #[must_use]
+    pub fn with_acls(mut self, acls: &common::safedir::Acls) -> Self {
+        self.acl_access = acls.access.clone();
+        self.acl_default = acls.default.clone();
+        self
+    }
+
+    /// The ACLs this wire metadata carries, in the shape the destination applier takes.
+    ///
+    /// An all-`None` result means "the source had no ACL", which is a request to CLEAR, not to
+    /// leave the destination alone. That is safe to hand the applier unconditionally because the
+    /// source only reads ACLs when the master asked it to, and the master derives that request
+    /// from the very same `preserve` settings it hands the destination — see
+    /// [`ExtendedMetadataCapture::for_preserve`].
+    pub fn acls(&self) -> common::safedir::Acls {
+        common::safedir::Acls {
+            access: self.acl_access.clone(),
+            default: self.acl_default.clone(),
+        }
+    }
 }
 
 impl common::preserve::Metadata for Metadata {
@@ -122,6 +165,9 @@ impl common::preserve::Metadata for &Metadata {
 }
 
 impl From<&std::fs::Metadata> for Metadata {
+    /// ACLs are left `None`: a `stat` snapshot carries no fd, and reading an ACL by path would
+    /// answer from whatever inode the name resolves to now rather than the one this snapshot
+    /// describes. Call sites that should carry ACLs add them with [`Metadata::with_acls`].
     fn from(metadata: &std::fs::Metadata) -> Self {
         Metadata {
             mode: metadata.mode(),
@@ -131,6 +177,8 @@ impl From<&std::fs::Metadata> for Metadata {
             mtime: metadata.mtime(),
             atime_nsec: metadata.atime_nsec(),
             mtime_nsec: metadata.mtime_nsec(),
+            acl_access: None,
+            acl_default: None,
         }
     }
 }
@@ -140,6 +188,9 @@ impl From<&common::safedir::FileMeta> for Metadata {
     /// snapshot (obtained via `fstat`/`fstatat` during a TOCTOU-safe walk),
     /// reading every field through the shared `preserve::Metadata` trait so it
     /// stays in lock-step with the `&std::fs::Metadata` conversion above.
+    ///
+    /// ACLs are left `None` here too: a `FileMeta` is a detached snapshot, not the fd it came
+    /// from, so it cannot answer an ACL probe. See [`Metadata::with_acls`].
     fn from(meta: &common::safedir::FileMeta) -> Self {
         use common::preserve::Metadata as _;
         Metadata {
@@ -150,6 +201,8 @@ impl From<&common::safedir::FileMeta> for Metadata {
             mtime: meta.mtime(),
             atime_nsec: meta.atime_nsec(),
             mtime_nsec: meta.mtime_nsec(),
+            acl_access: None,
+            acl_default: None,
         }
     }
 }
@@ -158,6 +211,12 @@ impl From<&common::safedir::FileMeta> for Metadata {
 /// source can skip transferring identical files. `name` is the child name (serialized as a
 /// `PathBuf`, matching the rest of the protocol's path handling). `metadata`/`size` are only
 /// meaningful when `is_file`.
+///
+/// The `metadata`'s ACL fields are always `None` here and deliberately so: the manifest exists to
+/// answer `--overwrite-compare` (default `size,mtime`), which has no `acl` term, so an ACL-only
+/// difference does not make a file "changed" and a skipped file keeps its old ACL. That is the same
+/// shape as `mode`, which the default comparison also ignores; closing it means an `acl` term in
+/// the compare DSL as well as the bytes here, and is a follow-up rather than part of ACL transport.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExistingEntry {
     pub name: std::path::PathBuf,
@@ -597,6 +656,44 @@ pub struct TracingHello {
 /// TLS certificate fingerprint (SHA-256 of DER-encoded certificate).
 pub type CertFingerprint = [u8; 32];
 
+/// What EXTENDED per-entry metadata the SOURCE must read, beyond the `stat` it already does.
+///
+/// Carried in [`MasterHello::Source`] because the source otherwise has no way to know: only
+/// [`MasterHello::Destination`] carries `preserve`, so without this the source would have to probe
+/// unconditionally and every remote copy — including every one that does not want ACLs — would pay
+/// a syscall per entry that `stat` cannot fold in. That cost is the whole reason `acl` is opt-in.
+///
+/// Deliberately NOT the whole `preserve` struct, and named for what it is. The source decides only
+/// what to READ; the destination remains the sole authority on what is APPLIED. Handing the source
+/// a `preserve` would invite a later reader to act on, say, `preserve.file.mode_mask` source-side,
+/// which would be a bug. Every field [`MasterHello::Source`] already carries (`filter`, `dry_run`)
+/// is of this same "what to read/send" kind. The name leaves room for an `-X`-style xattr option to
+/// land here rather than growing another field.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExtendedMetadataCapture {
+    /// Read each source FILE's `system.posix_acl_access`.
+    pub file_acl: bool,
+    /// Read each source DIRECTORY's access AND default ACLs.
+    pub dir_acl: bool,
+}
+
+impl ExtendedMetadataCapture {
+    /// What a copy preserving `preserve` requires the source to read.
+    ///
+    /// The ONE derivation, called at the single master site that also sends `preserve` to the
+    /// destination, so the two cannot disagree. That matters: the destination treats an all-`None`
+    /// [`Metadata::acls`] as "the source had none, so CLEAR", so a capture that said `false` while
+    /// the destination's `preserve` said `true` would silently strip every ACL instead of copying
+    /// it. Symlinks are absent by construction — the kernel has no symlink ACL, and the settings
+    /// parser rejects `l:acl`.
+    pub fn for_preserve(preserve: &common::preserve::Settings) -> Self {
+        Self {
+            file_acl: preserve.file.acl,
+            dir_acl: preserve.dir.acl,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum MasterHello {
     Source {
@@ -608,6 +705,9 @@ pub enum MasterHello {
         filter: Option<common::filter::FilterSettings>,
         /// Dry-run mode for previewing operations
         dry_run: Option<common::config::DryRunMode>,
+        /// Extended metadata the source must read per entry (currently: POSIX ACLs). When every
+        /// field is false the source issues no xattr syscall at all.
+        capture: ExtendedMetadataCapture,
     },
     Destination {
         /// TCP address for control connection to source
@@ -663,6 +763,8 @@ mod tests {
                 mtime: 0,
                 atime_nsec: 0,
                 mtime_nsec: 0,
+                acl_access: None,
+                acl_default: None,
             },
             size: 0,
         }
@@ -754,6 +856,80 @@ mod tests {
         assert!(
             flat.iter().zip(&entries).all(|(a, b)| a.name == b.name),
             "reassembly must preserve order"
+        );
+    }
+
+    #[test]
+    fn metadata_carries_acl_bytes_verbatim_through_a_wire_round_trip() {
+        // the bytes must survive serialization UNCHANGED and in order: POSIX.1e requires canonical
+        // entry order and the destination kernel rejects anything else with EINVAL, so any
+        // re-encoding on the way through would fail at `fsetxattr` rather than silently.
+        let access: Vec<u8> = (0u8..=200).collect();
+        let default: Vec<u8> = (0u8..=100).rev().collect();
+        let meta = mk_entry("f").metadata.with_acls(&common::safedir::Acls {
+            access: Some(access.clone()),
+            default: Some(default.clone()),
+        });
+        // through the same codec the streams use, so this pins the real wire behavior
+        let bytes = bitcode::serialize(&meta).unwrap();
+        let back: Metadata = bitcode::deserialize(&bytes).unwrap();
+        assert_eq!(back.acl_access.as_deref(), Some(access.as_slice()));
+        assert_eq!(back.acl_default.as_deref(), Some(default.as_slice()));
+        // and the round trip reproduces the applier-side shape exactly
+        assert_eq!(
+            back.acls(),
+            common::safedir::Acls {
+                access: Some(access),
+                default: Some(default),
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_built_from_a_stat_snapshot_carries_no_acls() {
+        // neither `From` impl has an fd to probe, so both must leave the fields empty rather than
+        // guess — a site that should carry ACLs makes a visible `with_acls` call instead. An
+        // all-`None` value is a request to CLEAR the destination's, which is the correct reading
+        // ONLY because the source reads ACLs exactly when the master asked it to.
+        let meta = Metadata::from(&std::fs::metadata(".").unwrap());
+        assert_eq!(meta.acls(), common::safedir::Acls::default());
+    }
+
+    #[test]
+    fn with_acls_round_trips_the_absent_case_as_a_clear_request() {
+        let meta = mk_entry("f")
+            .metadata
+            .with_acls(&common::safedir::Acls::default());
+        assert_eq!(meta.acl_access, None);
+        assert_eq!(meta.acl_default, None);
+    }
+
+    #[test]
+    fn capture_mirrors_the_preserve_settings_it_is_derived_from() {
+        // the one derivation: a capture that said `false` while the destination's `preserve` said
+        // `true` would make every entry arrive with all-`None` ACLs, which the destination reads as
+        // "clear" — stripping ACLs instead of copying them. Pinned per type, since the two flags are
+        // independent.
+        assert_eq!(
+            ExtendedMetadataCapture::for_preserve(&common::preserve::preserve_all_with_acls()),
+            ExtendedMetadataCapture {
+                file_acl: true,
+                dir_acl: true
+            }
+        );
+        assert_eq!(
+            ExtendedMetadataCapture::for_preserve(&common::preserve::preserve_all()),
+            ExtendedMetadataCapture::default(),
+            "`all` deliberately excludes ACLs, so it must not make the source pay the probe"
+        );
+        let mut file_only = common::preserve::preserve_none();
+        file_only.file.acl = true;
+        assert_eq!(
+            ExtendedMetadataCapture::for_preserve(&file_only),
+            ExtendedMetadataCapture {
+                file_acl: true,
+                dir_acl: false
+            }
         );
     }
 

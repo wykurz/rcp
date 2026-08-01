@@ -1,5 +1,7 @@
 use std::os::unix::fs::PermissionsExt;
 
+#[path = "support/acl.rs"]
+mod acl;
 #[path = "support/fixtures.rs"]
 mod fixtures;
 use fixtures::{
@@ -6581,7 +6583,7 @@ fn test_remote_require_toctou_safe_copies() {
 /// PRE-EXISTING (reused) destination directory locks it down for the copy
 /// (`create_directory`: verify_same_inode → secure_as_copier → 0o700) and restores
 /// it at completion (`complete_directory_single`: chown_to + the tracker threading
-/// through `DirectoryState.restore_owner`). The reused dir starts NON-WRITABLE at
+/// through `DirectoryState.reused_lock.restore_owner`). The reused dir starts NON-WRITABLE at
 /// 0o500 (like the local test): without the lockdown (which fchmods it to 0o700) the
 /// copier could not write the child into it, so a successful copy PROVES the lockdown
 /// fired — not a vacuous pass. The source dir is at 0o755; a successful copy must
@@ -6923,4 +6925,528 @@ fn test_remote_fail_early_saturated_budget_reports_real_cause() {
             std::fs::Permissions::from_mode(0o600),
         );
     }
+}
+
+// ── POSIX ACLs over the wire ────────────────────────────────────────────────────────────────────
+//
+// The local engine reads a source entry's ACLs from the fd it is copying and applies them through
+// the destination's fd. The remote engine cannot: the two fds live on different hosts, so the ACLs
+// travel in `protocol::Metadata` as the source kernel's opaque bytes. These tests pin that
+// transport end to end — including the CLEARING half, which is what stops a destination tree's
+// default ACL from silently widening entries rcp creates beneath it.
+
+use acl::{ACL_ACCESS, ACL_DEFAULT, denying_acl, describe_acl, get_acl, granting_acl, set_acl};
+
+/// Build the source tree both round-trip directions copy, and arm the destination parent with a
+/// permissive default ACL so INHERITANCE is genuinely in play.
+///
+/// ```text
+/// tree/                 access = denying, default = granting
+/// tree/secret.txt       access = denying
+/// tree/plain.txt        (no ACL)
+/// tree/nested/          (no ACL)
+/// tree/nested/deep.txt  (no ACL)
+/// ```
+///
+/// The entries with no ACL are the point of the fixture, not filler: every one of them is created
+/// under a destination directory carrying a default ACL, so each INHERITS one at creation and the
+/// copy has to remove it again to stay faithful to a source that had none.
+fn build_acl_fixture(
+    src_root: &std::path::Path,
+    dst_parent: &std::path::Path,
+) -> std::path::PathBuf {
+    let tree = src_root.join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir(tree.join("nested")).unwrap();
+    create_test_file(&tree.join("secret.txt"), "secret", 0o700);
+    create_test_file(&tree.join("plain.txt"), "plain", 0o640);
+    create_test_file(&tree.join("nested/deep.txt"), "deeper", 0o640);
+    set_acl(&tree, ACL_ACCESS, &denying_acl());
+    set_acl(&tree, ACL_DEFAULT, &granting_acl());
+    set_acl(&tree.join("secret.txt"), ACL_ACCESS, &denying_acl());
+    // the destination side of §1.2: an administrator's default ACL on the tree rcp writes into
+    set_acl(dst_parent, ACL_DEFAULT, &granting_acl());
+    tree
+}
+
+/// Assert the copy reproduced the fixture's ACLs exactly — both the ones it had to SET and the ones
+/// it had to CLEAR.
+fn assert_acl_fixture_copied(dst_tree: &std::path::Path) {
+    let access = get_acl(dst_tree, ACL_ACCESS);
+    assert_eq!(
+        access.as_deref(),
+        Some(denying_acl().as_slice()),
+        "the source directory's access ACL did not survive the wire; got {}",
+        describe_acl(access.as_ref())
+    );
+    let default = get_acl(dst_tree, ACL_DEFAULT);
+    assert_eq!(
+        default.as_deref(),
+        Some(granting_acl().as_slice()),
+        "the source directory's DEFAULT ACL did not survive the wire — dropping it silently changes \
+         what every entry later created under the destination inherits; got {}",
+        describe_acl(default.as_ref())
+    );
+    let secret = get_acl(&dst_tree.join("secret.txt"), ACL_ACCESS);
+    assert_eq!(
+        secret.as_deref(),
+        Some(denying_acl().as_slice()),
+        "the source file's access ACL did not survive the wire; without the named deny, uid 65534 \
+         gains the read and execute that `other` grants and the source withheld. Got {}",
+        describe_acl(secret.as_ref())
+    );
+    // and the clearing half: every entry whose source had no ACL must have none, even though each
+    // was created under a directory whose default ACL it inherited.
+    for rel in ["plain.txt", "nested", "nested/deep.txt"] {
+        let path = dst_tree.join(rel);
+        let got = get_acl(&path, ACL_ACCESS);
+        assert_eq!(
+            got,
+            None,
+            "{path:?} kept an inherited access ACL ({}); its source had none, so uid 65534 was \
+             granted access the source never gave",
+            describe_acl(got.as_ref())
+        );
+        let got_default = get_acl(&path, ACL_DEFAULT);
+        assert_eq!(
+            got_default,
+            None,
+            "{path:?} kept an inherited default ACL ({}), which would go on to widen anything \
+             created under it later",
+            describe_acl(got_default.as_ref())
+        );
+    }
+    assert_eq!(get_file_content(&dst_tree.join("secret.txt")), "secret");
+    assert_eq!(
+        get_file_content(&dst_tree.join("nested/deep.txt")),
+        "deeper"
+    );
+}
+
+/// Local source, remote destination. Also the regression pin for `all+acl` remote copies being
+/// possible at all: before ACLs were on the wire, the destination had no source ACLs to apply and
+/// failed every entry rather than silently dropping them.
+#[test]
+fn test_remote_acl_round_trip_local_to_remote() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = build_acl_fixture(src_dir.path(), dst_dir.path());
+    let dst_tree = dst_dir.path().join("tree");
+    let dst_remote = format!("localhost:{}", dst_tree.to_str().unwrap());
+    run_rcp_and_expect_success(&[
+        "--preserve-settings=all+acl",
+        src_tree.to_str().unwrap(),
+        &dst_remote,
+    ]);
+    assert_acl_fixture_copied(&dst_tree);
+}
+
+/// Remote source, local destination — the other direction, so a read path that only worked when the
+/// source happened to be the master's own side would fail here.
+#[test]
+fn test_remote_acl_round_trip_remote_to_local() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = build_acl_fixture(src_dir.path(), dst_dir.path());
+    let dst_tree = dst_dir.path().join("tree");
+    let src_remote = format!("localhost:{}", src_tree.to_str().unwrap());
+    run_rcp_and_expect_success(&[
+        "--preserve-settings=all+acl",
+        &src_remote,
+        dst_tree.to_str().unwrap(),
+    ]);
+    assert_acl_fixture_copied(&dst_tree);
+}
+
+/// Absolute path to `strace`, baked into the wrapper below so it does not depend on the PATH sshd
+/// hands a non-interactive command.
+fn strace_binary() -> String {
+    let output = std::process::Command::new("sh")
+        .args(["-c", "command -v strace"])
+        .output()
+        .expect("failed to look for strace");
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(
+        output.status.success() && !path.is_empty(),
+        "cannot find strace. This test asserts on syscall COUNT rather than outcome, because the \
+         whole point of putting a capture flag on the wire is that a copy without `acl` does not \
+         pay the per-entry probe — an outcome-only check cannot see that regress. Install strace."
+    );
+    path
+}
+
+/// Run a remote copy with both rcpd processes under `strace`, and return the ACL-probe syscall
+/// lines they issued.
+///
+/// `strace` on `rcp` cannot see this: the source and destination rcpds are started by sshd, not by
+/// rcp, so they are in a different process tree entirely. `--rcpd-path` is the seam — it points
+/// both spawns at a wrapper that execs the real rcpd under strace. One trace file per pid
+/// (`rcpd.$$`) keeps the two rcpds, and the separate `--protocol-version` probe, from clobbering
+/// each other's output.
+fn count_rcpd_xattr_syscalls(args: &[&str]) -> Vec<String> {
+    let strace = strace_binary();
+    let scratch = tempfile::tempdir().unwrap();
+    let traces = scratch.path().join("traces");
+    std::fs::create_dir(&traces).unwrap();
+    let wrapper = scratch.path().join("rcpd-under-strace");
+    let rcpd = assert_cmd::cargo::cargo_bin("rcpd");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec {} -f -o \"{}/rcpd.$$\" \
+             -e trace=getxattr,fgetxattr,lgetxattr,listxattr,flistxattr,llistxattr {} \"$@\"\n",
+            strace,
+            traces.display(),
+            rcpd.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let rcpd_path = format!("--rcpd-path={}", wrapper.display());
+    let mut full = vec![rcpd_path.as_str()];
+    full.extend_from_slice(args);
+    run_rcp_and_expect_success(&full);
+    let mut lines = Vec::new();
+    for entry in std::fs::read_dir(&traces).unwrap() {
+        let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        lines.extend(
+            text.lines()
+                .filter(|l| l.contains("getxattr(") || l.contains("listxattr("))
+                .map(str::to_string),
+        );
+    }
+    lines
+}
+
+/// `--preserve-settings=all` must cost the SOURCE nothing in ACL probes on a remote copy.
+///
+/// This is the whole reason `MasterHello::Source` carries a capture field: the source is told
+/// `preserve` by nobody (only the destination hello carries it), so without the flag it would have
+/// to probe every entry unconditionally — a syscall per entry that `stat` cannot fold in, on every
+/// remote copy including ones that do not want ACLs. Asserted on syscall count, because an
+/// outcome-only check passes just as happily when the source probes and throws the answer away.
+#[test]
+fn test_remote_acl_off_issues_no_source_probe() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = src_dir.path().join("tree");
+    std::fs::create_dir(&src_tree).unwrap();
+    for i in 0..8 {
+        create_test_file(&src_tree.join(format!("f{i}.txt")), "payload", 0o644);
+    }
+    set_acl(&src_tree.join("f0.txt"), ACL_ACCESS, &denying_acl());
+    let plain_dst = dst_dir.path().join("plain");
+    let plain_remote = format!("localhost:{}", plain_dst.to_str().unwrap());
+    let src_remote = format!("localhost:{}", src_tree.to_str().unwrap());
+    let traced =
+        count_rcpd_xattr_syscalls(&["--preserve-settings=all", &src_remote, &plain_remote]);
+    // exactly ONE ACL syscall for the whole run: the constant source-root probe behind the "this
+    // copy drops the root's ACL" warning. The bound is on the CONSTANT rather than on zero, because
+    // what must never come back is a probe that scales with the tree.
+    assert!(
+        traced.len() <= 1,
+        "`all` made the rcpd processes issue {} ACL probe syscall(s) — more than the one constant \
+         source-root probe, so every remote copy that does not want ACLs now pays per entry:\n{}",
+        traced.len(),
+        traced.join("\n")
+    );
+    assert!(
+        traced.iter().all(|line| line.contains("/proc/self/fd/")),
+        "the ACL syscall `all` issued is not the constant source-root probe (which goes through \
+         the root handle's /proc/self/fd magic symlink):\n{}",
+        traced.join("\n")
+    );
+    // `-L` runs an entirely separate Pass-1 walk with its own directory-ACL gate, so the check
+    // above says nothing about it: removing that gate leaves this assertion passing. Cover it here
+    // rather than assume the two walks stay in step.
+    let deref_dst = dst_dir.path().join("plain_deref");
+    let deref_remote = format!("localhost:{}", deref_dst.to_str().unwrap());
+    let traced = count_rcpd_xattr_syscalls(&[
+        "--dereference",
+        "--preserve-settings=all",
+        &src_remote,
+        &deref_remote,
+    ]);
+    assert!(
+        traced.len() <= 1,
+        "`all --dereference` made the rcpd processes issue {} ACL probe syscall(s) — more than the \
+         one constant source-root probe; the `-L` walk has its own gate and must honor the capture \
+         flag too:\n{}",
+        traced.len(),
+        traced.join("\n")
+    );
+    // and prove the counter is not vacuous: the same copy WITH `acl` must show the per-entry probe.
+    // Without this the assertion above would also pass if the wrapper never traced anything at all.
+    let acl_dst = dst_dir.path().join("with_acl");
+    let acl_remote = format!("localhost:{}", acl_dst.to_str().unwrap());
+    let traced =
+        count_rcpd_xattr_syscalls(&["--preserve-settings=all+acl", &src_remote, &acl_remote]);
+    assert!(
+        traced.len() > 1,
+        "`all+acl` issued {} ACL syscall(s) — no more than the constant root probe `all` pays, so \
+         the counter proves nothing about `all`",
+        traced.len()
+    );
+    assert_eq!(
+        get_acl(&acl_dst.join("f0.txt"), ACL_ACCESS).as_deref(),
+        Some(denying_acl().as_slice())
+    );
+    assert_eq!(get_acl(&plain_dst.join("f0.txt"), ACL_ACCESS), None);
+}
+
+/// Run `rcp` at the DEFAULT verbosity and return everything it wrote.
+///
+/// Every other test here goes through `run_rcp_with_args`, which pins `-vv`. That is right for
+/// diagnosing a failure but wrong for this one: the whole question is whether a user who passed no
+/// verbosity flag sees the notice, and `-vv` answers it for free by turning on `info` globally.
+/// So this reimplements the two things that still matter — the timeout guard and `--force-remote`
+/// for the `localhost:` operands — and nothing else.
+fn run_rcp_at_default_verbosity(args: &[&str]) -> String {
+    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
+    let mut cmd = std::process::Command::new("timeout");
+    cmd.args(["90", rcp_path.to_str().unwrap()]);
+    cmd.arg("--force-remote");
+    cmd.args(args);
+    let output = cmd.output().expect("Failed to execute rcp command");
+    assert_not_timeout(&output);
+    assert!(
+        output.status.success(),
+        "rcp {args:?} failed: {}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// The source-root ACL notice has to survive TWO filters and a wire hop: the root is on the source
+/// host, so the probe runs in the source `rcpd`, whose own filter decides whether the notice is
+/// even sent, and the master's filter then decides whether the forwarded line is rendered.
+///
+/// A local-only test cannot see any of that — `rcpd` is a child of sshd, and its log lines are
+/// forwarded over a separate connection rather than printed. This runs at the DEFAULT verbosity
+/// deliberately: at `-v` both filters pass everything and the test would hold even with the
+/// dedicated tracing target removed from either end.
+#[test]
+fn test_remote_source_root_acl_warning_reaches_the_master() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = src_dir.path().join("tree");
+    std::fs::create_dir(&src_tree).unwrap();
+    create_test_file(&src_tree.join("f.txt"), "payload", 0o644);
+    set_acl(&src_tree, ACL_ACCESS, &denying_acl());
+    let src_remote = format!("localhost:{}", src_tree.to_str().unwrap());
+    let warned_remote = format!(
+        "localhost:{}",
+        dst_dir.path().join("warned").to_str().unwrap()
+    );
+    let log =
+        run_rcp_at_default_verbosity(&["--preserve-settings=all", &src_remote, &warned_remote]);
+    assert!(
+        log.contains("carries a POSIX ACL that this copy will NOT preserve"),
+        "the source rcpd's root ACL notice never reached the master at the default verbosity, so a \
+         remote user copying a tree whose root carries an ACL is told nothing:\n{log}"
+    );
+    assert!(
+        log.contains("remote::source::"),
+        "the notice must be tagged as coming from the SOURCE rcpd — if it is being emitted by the \
+         master instead, it is probing the wrong host's filesystem:\n{log}"
+    );
+    // and silent when the copy does preserve them, so this is not just "rcpd logs something"
+    let quiet_remote = format!(
+        "localhost:{}",
+        dst_dir.path().join("quiet").to_str().unwrap()
+    );
+    let log =
+        run_rcp_at_default_verbosity(&["--preserve-settings=all+acl", &src_remote, &quiet_remote]);
+    assert!(
+        !log.contains("carries a POSIX ACL that this copy will NOT preserve"),
+        "warned about an ACL the remote copy is preserving:\n{log}"
+    );
+}
+
+/// `-L`/`--dereference` reaches a different Pass-1 walk on the source: it holds no directory fd, so
+/// its ACL read opens the directory by path instead of reading the held one. Without this the
+/// dereference walk would quietly send no directory ACLs — and "no ACL" is a request to CLEAR, so
+/// the destination would end up stripping them rather than merely failing to copy them.
+#[test]
+fn test_remote_acl_round_trip_with_dereference() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = build_acl_fixture(src_dir.path(), dst_dir.path());
+    let dst_tree = dst_dir.path().join("tree");
+    let src_remote = format!("localhost:{}", src_tree.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_tree.to_str().unwrap());
+    run_rcp_and_expect_success(&[
+        "--dereference",
+        "--preserve-settings=all+acl",
+        &src_remote,
+        &dst_remote,
+    ]);
+    assert_acl_fixture_copied(&dst_tree);
+}
+
+/// The remote reused-destination-directory lockdown, with `d:acl` ON — the case where the finalize
+/// re-stat verify has to reconcile a mode that comes from two places at once.
+///
+/// A `--require-toctou-safe --overwrite --preserve-settings=all+acl` remote copy into a PRE-EXISTING
+/// destination directory that carries its own ACLs. The source directory is SETGID and carries both
+/// an access and a default ACL, which is what makes this the sharp case: the destination's special
+/// bits come from the finalize chmod and its rwx bits from the source's ACL, and the verify checks
+/// both against `masked_mode` in one comparison. That only works because the source's own mode's rwx
+/// bits were themselves derived from that same ACL by the kernel — reasoning that is load-bearing
+/// enough to want a test rather than a comment.
+///
+/// The lockdown's snapshot of the destination's original ACLs is DISCARDED here, because `d:acl`
+/// asked for the source's: a copy preserving ACLs must not resurrect whatever the destination
+/// happened to carry before. The reused dir starts at 0o500 so that a successful copy also proves
+/// the lockdown fired at all — without the chmod to 0o700 the copier could not write into it.
+#[test]
+fn test_remote_strict_reused_dir_takes_the_source_acls_over_its_own() {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2), --require-toctou-safe refuses");
+        return;
+    }
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // canonicalize: TMPDIR itself may contain symlinked components, which strict resolution refuses
+    let src_base = src_dir.path().canonicalize().unwrap();
+    let dst_base = dst_dir.path().canonicalize().unwrap();
+    let src_tree = src_base.join("tree");
+    std::fs::create_dir(&src_tree).unwrap();
+    create_test_file(&src_tree.join("a.txt"), "payload", 0o644);
+    std::fs::set_permissions(&src_tree, std::fs::Permissions::from_mode(0o2700)).unwrap();
+    let access = denying_acl();
+    let default = granting_acl();
+    set_acl(&src_tree, ACL_ACCESS, &access);
+    set_acl(&src_tree, ACL_DEFAULT, &default);
+    assert_eq!(
+        get_file_mode(&src_tree),
+        0o2755,
+        "fixture: the source keeps setgid while its access ACL sets the rwx bits"
+    );
+    // the pre-existing destination directory, with ACLs of its OWN that the copy must overwrite
+    // rather than restore, and non-writable so the copy's success proves the lockdown fired
+    let dst_tree = dst_base.join("tree");
+    std::fs::create_dir(&dst_tree).unwrap();
+    set_acl(&dst_tree, ACL_DEFAULT, &denying_acl());
+    std::fs::set_permissions(&dst_tree, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let src_remote = format!("localhost:{}", src_tree.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_tree.to_str().unwrap());
+    let output = run_rcp_and_expect_success(&[
+        "--require-toctou-safe",
+        "--overwrite",
+        "--preserve-settings=all+acl",
+        "--summary",
+        &src_remote,
+        &dst_remote,
+    ]);
+    // the child landed → the reused dir was made writable for the copy, then restored
+    assert_eq!(get_file_content(&dst_tree.join("a.txt")), "payload");
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(
+        summary.directories_created, 0,
+        "the destination directory was reused, not created"
+    );
+    assert_eq!(
+        get_file_mode(&dst_tree),
+        0o2755,
+        "setgid from the finalize chmod, rwx from the source's ACL — the reused-directory verify \
+         checks both against the source's mode in one comparison"
+    );
+    let got_access = get_acl(&dst_tree, ACL_ACCESS);
+    assert_eq!(
+        got_access.as_deref(),
+        Some(access.as_slice()),
+        "the source directory's access ACL did not survive lockdown + finalize; got {}",
+        describe_acl(got_access.as_ref())
+    );
+    let got_default = get_acl(&dst_tree, ACL_DEFAULT);
+    assert_eq!(
+        got_default.as_deref(),
+        Some(default.as_slice()),
+        "the destination kept its OWN default ACL instead of taking the source's — with `d:acl` the \
+         lockdown snapshot must be discarded, not restored; got {}",
+        describe_acl(got_default.as_ref())
+    );
+    // the file was created inside the locked-down (stripped) directory, so it inherited nothing;
+    // its source had no ACL and neither does it
+    assert_eq!(get_acl(&dst_tree.join("a.txt"), ACL_ACCESS), None);
+}
+
+/// The remote mirror of the local `strict_mode_contains_and_restores_a_reused_directorys_acls`: the
+/// `d:acl`-OFF branch, where the reused directory's OWN ACLs are what has to come back.
+///
+/// The remote destination restores through its own site (`complete_directory_single`, threading the
+/// lock through `DirectoryState`) rather than the local copy's `finalize_dir`, so the two paths can
+/// regress independently. As locally, the source directory's mode (`0o700`) differs from the mode
+/// the destination's access ACL implies (`0o755`), so the final mode says unambiguously which one
+/// won.
+#[test]
+fn test_remote_strict_reused_dir_restores_its_own_acls() {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2), --require-toctou-safe refuses");
+        return;
+    }
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_base = src_dir.path().canonicalize().unwrap();
+    let dst_base = dst_dir.path().canonicalize().unwrap();
+    // source with no ACLs at all, so every ACL seen on the destination is the destination's own
+    let src_tree = src_base.join("tree");
+    std::fs::create_dir(&src_tree).unwrap();
+    create_test_file(&src_tree.join("a.txt"), "payload", 0o644);
+    std::fs::set_permissions(&src_tree, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dst_tree = dst_base.join("tree");
+    std::fs::create_dir(&dst_tree).unwrap();
+    let access = denying_acl();
+    let default = granting_acl();
+    set_acl(&dst_tree, ACL_ACCESS, &access);
+    set_acl(&dst_tree, ACL_DEFAULT, &default);
+    assert_eq!(
+        get_file_mode(&dst_tree),
+        0o755,
+        "fixture: mode comes from the ACL"
+    );
+    let src_remote = format!("localhost:{}", src_tree.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_tree.to_str().unwrap());
+    run_rcp_and_expect_success(&[
+        "--require-toctou-safe",
+        "--overwrite",
+        &src_remote,
+        &dst_remote,
+    ]);
+    // containment: the file was created inside the stripped directory, so it inherited nothing
+    let child = get_acl(&dst_tree.join("a.txt"), ACL_ACCESS);
+    assert_eq!(
+        child,
+        None,
+        "the child inherited the reused directory's default ACL ({}) — the remote lockdown must \
+         strip it, not merely restrict the mode",
+        describe_acl(child.as_ref())
+    );
+    // restore: the directory's own ACLs came back, and its mode is the SOURCE's
+    let got_default = get_acl(&dst_tree, ACL_DEFAULT);
+    assert_eq!(
+        got_default.as_deref(),
+        Some(default.as_slice()),
+        "the reused directory permanently lost the default ACL it had before the copy; got {}",
+        describe_acl(got_default.as_ref())
+    );
+    let got_access = get_acl(&dst_tree, ACL_ACCESS);
+    assert!(
+        got_access.is_some(),
+        "the reused directory's own access ACL was not put back at all"
+    );
+    assert_eq!(
+        get_file_mode(&dst_tree),
+        0o700,
+        "the reused directory must end at the SOURCE mode; restoring its access ACL after the \
+         finalize chmod instead of before would leave it at its own original 0o755"
+    );
+    assert_eq!(get_file_content(&dst_tree.join("a.txt")), "payload");
 }

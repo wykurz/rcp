@@ -3,7 +3,9 @@ use async_recursion::async_recursion;
 // trait-only import: brings FileMeta::size()/uid()/... into scope without shadowing std::fs::Metadata
 use common::preserve::Metadata as _;
 use common::safedir::Dir;
+use remote::protocol::ExtendedMetadataCapture;
 use std::collections::HashMap;
+use std::os::fd::AsFd as _;
 use std::sync::Arc;
 use tracing::{Instrument, instrument};
 
@@ -316,6 +318,31 @@ async fn send_symlink_skipped(
         .await
 }
 
+/// Read a directory's access + default ACLs on the `-L`/`--dereference` walk, which holds no
+/// directory fd.
+///
+/// The hardened walk reads a directory's ACLs from the very fd whose contents it enumerates
+/// ([`Dir::read_acls`]); `-L` has no such fd, so the directory is opened by path here. That is the
+/// same choice the rest of this walk already makes — following symlinks is the point of `-L`, and
+/// the path is documented as not hardened — and it is strictly better than the alternative of
+/// reporting "no ACL", which would silently WIDEN the destination (a source with no ACL is copied
+/// by CLEARING the destination's, so an unread ACL is indistinguishable from an absent one).
+/// Called only when the master asked for directory ACLs, so a copy without `d:acl` pays nothing.
+///
+/// The open in front of the probe is rate-gated like every other path-based metadata read in this
+/// module: `read_acls_fd` gates its own `flistxattr`/`fgetxattr` as `MetadataOp::Stat`, and an
+/// unthrottled `open` bolted onto the front would leave the `-L` ACL probe the one metadata
+/// operation in rcp that escapes the throttle.
+async fn read_dir_acls_by_path(src: &std::path::Path) -> std::io::Result<common::safedir::Acls> {
+    let dir = common::walk::run_metadata_probed(
+        common::Side::Source,
+        common::MetadataOp::Stat,
+        tokio::fs::File::open(src), // rcp-toctou-allow: -L path (dereference, documented not hardened)
+    )
+    .await?;
+    common::safedir::read_acls_fd(dir.as_fd(), common::Side::Source, true).await
+}
+
 /// The `-L`/`--dereference` path-based Pass-1 walk (directories + symlinks). The hardened
 /// (non-`-L`) walk lives in [`send_directory_fd_walk`] (nested) and [`send_root_hardened`] (root);
 /// this function is reached only in dereference mode, so every read here is path-based by design
@@ -325,6 +352,7 @@ async fn send_symlink_skipped(
 #[allow(clippy::too_many_arguments)]
 async fn send_directories_and_symlinks(
     settings: &common::copy::Settings,
+    capture: ExtendedMetadataCapture,
     src: &std::path::Path,
     dst: &std::path::Path,
     source_root: &std::path::Path,
@@ -461,6 +489,9 @@ async fn send_directories_and_symlinks(
             if let Some(deref_counts) = deref_counts {
                 deref_counts.lock().unwrap().insert(src.to_path_buf(), 0);
             }
+            // no ACLs on this one, deliberately: the directory could not be opened, so there is no
+            // fd to read them from and no honest answer to give. The destination therefore CLEARS
+            // (never widens) an entry whose copy is already recorded as failed above.
             let dir = remote::protocol::SourceMessage::Directory {
                 src: src.to_path_buf(),
                 dst: dst.to_path_buf(),
@@ -599,10 +630,36 @@ async fn send_directories_and_symlinks(
     } else {
         true
     };
+    // this directory's ACLs, when the master asked for them (`d:acl`). `-L` holds no directory fd,
+    // so the read opens the directory by path — the same choice the rest of this walk already makes
+    // (following symlinks is what `-L` is for; documented not hardened). Read only AFTER the
+    // enumeration above succeeded, so an unreadable directory still degrades to the 0-entry
+    // `Directory` above rather than becoming a hard failure it is not today.
+    //
+    // A failure here FAILS the directory rather than degrading to "no ACL": an all-`None` `Acls` is
+    // a request to CLEAR, so sending one would make an unreadable ACL STRIP the destination's —
+    // including a directory's default ACL, which then governs everything created beneath it. That
+    // is strictly worse than failing, and it mirrors the destination's rule (D5) for the same
+    // situation in the other direction. This returns BEFORE the `Directory` message is sent, so the
+    // destination is never told to expect this subtree; both callers account for that — the child
+    // loops below with `send_child_failed_skip`, and `send_fs_objects_tcp` by failing the copy for
+    // a root.
+    let metadata = remote::protocol::Metadata::from(&src_metadata);
+    let metadata = if capture.dir_acl {
+        metadata.with_acls(
+            &read_dir_acls_by_path(src)
+                .await
+                .with_context(|| format!("cannot read ACLs from directory {src:?}"))?,
+        )
+    } else {
+        metadata
+    };
     // record this `-L` directory's Pass-1 file count so Pass 2 can recover it
     // without a wire echo (the count lives only on the source now). Inserted before
     // the `Directory` send so it is present before the destination can ack
-    // `DirectoryCreated` and trigger the Pass-2 lookup.
+    // `DirectoryCreated` and trigger the Pass-2 lookup — and after the fallible work above, so a
+    // directory that is never sent leaves no count behind for a `DirectoryCreated` that can never
+    // arrive.
     if let Some(deref_counts) = deref_counts {
         deref_counts
             .lock()
@@ -613,7 +670,7 @@ async fn send_directories_and_symlinks(
     let dir = remote::protocol::SourceMessage::Directory {
         src: src.to_path_buf(),
         dst: dst.to_path_buf(),
-        metadata: remote::protocol::Metadata::from(&src_metadata),
+        metadata,
         is_root,
         entry_count,
         keep_if_empty,
@@ -637,6 +694,7 @@ async fn send_directories_and_symlinks(
     for child in symlink_children {
         if let Err(e) = send_directories_and_symlinks(
             settings,
+            capture,
             &child.src_path,
             &child.dst_path,
             source_root,
@@ -648,6 +706,7 @@ async fn send_directories_and_symlinks(
         .await
         {
             tracing::error!("Failed to send symlink {:?}: {e:#}", child.src_path);
+            send_child_failed_skip(&child.src_path, &child.dst_path, control_send_stream).await?;
             if settings.fail_early {
                 return Err(e);
             }
@@ -657,6 +716,7 @@ async fn send_directories_and_symlinks(
     for child in dir_children {
         if let Err(e) = send_directories_and_symlinks(
             settings,
+            capture,
             &child.src_path,
             &child.dst_path,
             source_root,
@@ -668,6 +728,7 @@ async fn send_directories_and_symlinks(
         .await
         {
             tracing::error!("Failed to send directory {:?}: {e:#}", child.src_path);
+            send_child_failed_skip(&child.src_path, &child.dst_path, control_send_stream).await?;
             if settings.fail_early {
                 return Err(e);
             }
@@ -811,14 +872,16 @@ struct FdChildEntry {
 /// path-based body, store `dir`'s `Arc<Dir>` in the fd-map for Pass 2, and recurse
 /// into child directories opened `O_NOFOLLOW` from `dir`.
 ///
-/// `dir` is the already-open handle to `src` itself; its wire metadata is read from that same fd
-/// (`Dir::meta`), so the directory's metadata pairs with the contents enumerated here (read-side
-/// fidelity). `is_root` drives `keep_if_empty` and the `Directory`/`Symlink` message flags exactly
-/// as the path-based body does.
+/// `dir` is the already-open handle to `src` itself; its wire metadata — including its ACLs when
+/// the master asked for them — is read from that same fd (`Dir::meta` / `Dir::read_acls`), so the
+/// directory's metadata pairs with the contents enumerated here (read-side fidelity). `is_root`
+/// drives `keep_if_empty` and the `Directory`/`Symlink` message flags exactly as the path-based
+/// body does.
 #[async_recursion]
 #[allow(clippy::too_many_arguments)]
 async fn send_directory_fd_walk(
     settings: &common::copy::Settings,
+    capture: ExtendedMetadataCapture,
     src: &std::path::Path,
     dst: &std::path::Path,
     source_root: &std::path::Path,
@@ -836,6 +899,19 @@ async fn send_directory_fd_walk(
             .await
             .with_context(|| format!("cannot read directory metadata from {src:?}"))?,
     );
+    // both ACLs, from that same fd. Only when the master asked (`d:acl`): the probe is a syscall
+    // per directory that `stat` cannot fold in, so a copy that does not want ACLs must not pay it.
+    // A directory's DEFAULT ACL rides along because it is what the destination's children inherit —
+    // dropping it would silently change the destination tree's inheritance policy.
+    let metadata = if capture.dir_acl {
+        metadata.with_acls(
+            &dir.read_acls()
+                .await
+                .with_context(|| format!("cannot read ACLs from directory {src:?}"))?,
+        )
+    } else {
+        metadata
+    };
     // enumerate children; `read_entries` returns names + a best-effort d_type hint
     // (advisory only — `child()` re-classifies authoritatively via fstat below).
     // the directory's held fd is stored in the map only once `file_count` is known
@@ -1059,6 +1135,7 @@ async fn send_directory_fd_walk(
         };
         if let Err(e) = send_directory_fd_walk(
             settings,
+            capture,
             &child.src_path,
             &child.dst_path,
             source_root,
@@ -1091,8 +1168,10 @@ async fn send_directory_fd_walk(
 
 #[instrument(skip(error_collector, stream_pool, control_send_stream, source_read))]
 #[async_recursion]
+#[allow(clippy::too_many_arguments)]
 async fn send_fs_objects_tcp(
     settings: &common::copy::Settings,
+    capture: ExtendedMetadataCapture,
     src: &std::path::Path,
     dst: &std::path::Path,
     control_send_stream: remote::streams::BoxedSharedSendStream,
@@ -1110,6 +1189,7 @@ async fn send_fs_objects_tcp(
     if !settings.dereference {
         return send_root_hardened(
             settings,
+            capture,
             src,
             dst,
             control_send_stream,
@@ -1138,6 +1218,27 @@ async fn send_fs_objects_tcp(
             return Err(e.into());
         }
     };
+    // the same constant source-root ACL warning the hardened root gets in `send_root_hardened`.
+    // This walk holds no root handle, so the root is classified through its parent for the probe
+    // alone — `O_NOFOLLOW`, hence a root that is itself a symlink is skipped rather than followed;
+    // that narrows an already-heuristic warning and never widens it. A parent that cannot be opened
+    // is left to the walk below to diagnose.
+    // The guard comes FIRST: `open_root_parent` is a `split_root_operand` plus an `open_parent_dir`
+    // that this walk needs for nothing else, so calling it before asking whether a probe is even
+    // wanted would charge every remote `-L` copy — including `all+acl`, which has nothing to warn
+    // about — for a probe that then declines to run.
+    if common::safedir::root_acl_probe_worth_reaching(capture.file_acl, capture.dir_acl)
+        && let Ok((parent, name)) = open_root_parent(src).await
+    {
+        common::safedir::warn_if_root_acl_unpreserved_at(
+            &parent,
+            &name,
+            src,
+            capture.file_acl,
+            capture.dir_acl,
+        )
+        .await;
+    }
     // determine if we have a root item to send (for DirStructureComplete message)
     // special files (sockets, FIFOs, devices) never produce protocol messages,
     // so they never count as root items regardless of --skip-specials
@@ -1160,6 +1261,7 @@ async fn send_fs_objects_tcp(
     if !src_metadata.is_file()
         && let Err(e) = send_directories_and_symlinks(
             settings,
+            capture,
             src,
             dst,
             src, // source_root is src for the root item
@@ -1170,11 +1272,17 @@ async fn send_fs_objects_tcp(
         )
         .await
     {
-        tracing::error!("Failed to send directories and symlinks: {e:#}");
-        if settings.fail_early {
-            return Err(e);
-        }
-        error_collector.push(e);
+        // a root walk failure is ALWAYS fatal, even in non-fail-early mode (protocol §3.3 Root Item
+        // Failure Invariant), matching the hardened twin in `send_root_hardened`. The walk returns
+        // `Err` for the root only when it committed NOTHING for it — a metadata or ACL read that
+        // failed before the `Directory` was sent, an unsupported root type, or a transport failure;
+        // every case it can compensate for (an unreadable directory, an unreadable symlink, a
+        // failed child) it handles internally and returns `Ok`. Continuing would send
+        // `DirStructureComplete { has_root_item: true }` below with no root message ever committed,
+        // leaving the destination waiting on `root_complete` forever — a hang with both peers
+        // alive, which no timeout ends.
+        tracing::error!("Failed to send root directories and symlinks: {e:#}");
+        return Err(e);
     }
     let mut stream = control_send_stream.lock().await;
     stream
@@ -1192,6 +1300,7 @@ async fn send_fs_objects_tcp(
         // not hardened). The hardened (non-`-L`) root file is handled in `send_root_hardened`.
         if let Err(e) = send_file_tcp(
             settings,
+            capture,
             src,
             dst,
             src_metadata.len(),
@@ -1221,8 +1330,10 @@ async fn send_fs_objects_tcp(
 /// destination. Wire metadata comes from the fd-pinned classification (Guarantee 2) and the file /
 /// symlink reads are fd-relative `O_NOFOLLOW` (Guarantee 1).
 #[instrument(skip(error_collector, stream_pool, control_send_stream, source_read))]
+#[allow(clippy::too_many_arguments)]
 async fn send_root_hardened(
     settings: &common::copy::Settings,
+    capture: ExtendedMetadataCapture,
     src: &std::path::Path,
     dst: &std::path::Path,
     control_send_stream: remote::streams::BoxedSharedSendStream,
@@ -1247,6 +1358,17 @@ async fn send_root_hardened(
         }
     };
     let kind = handle.kind();
+    // One `listxattr` on the source ROOT per rcpd run — a constant, not a per-entry probe — warning
+    // that a source root carrying an ACL is about to be copied by settings that drop it. The
+    // warning reaches the user over the existing tracing connection like any other rcpd log line.
+    // It goes through the `/proc/self/fd` form precisely because `handle` is `O_PATH` (see below).
+    common::safedir::warn_if_root_acl_unpreserved(&handle, src, capture.file_acl, capture.dir_acl)
+        .await;
+    // no ACLs attached here: `handle` is an `O_PATH` classify handle, which the kernel will not
+    // answer an xattr probe on. Every use below that needs them re-reads from a real fd — a root
+    // FILE from its data fd in `send_file_tcp`, a root DIRECTORY from the `O_NOFOLLOW` handle the
+    // fd-walk opens — and a root SYMLINK has no ACL to carry. The one use that keeps this value is
+    // the unopenable-root-directory case, which has no fd to read from and is already an error.
     let meta = remote::protocol::Metadata::from(handle.meta());
     // has_root_item from the authoritative kind: specials never produce a message; otherwise the
     // root-item filter decides (anchored patterns match inside the source, not the root itself).
@@ -1274,6 +1396,7 @@ async fn send_root_hardened(
                 Ok(dir) => {
                     if let Err(e) = send_directory_fd_walk(
                         settings,
+                        capture,
                         src,
                         dst,
                         src, // source_root is src for the root item
@@ -1377,6 +1500,7 @@ async fn send_root_hardened(
             progress().files_skipped.inc();
         } else if let Err(e) = send_file_tcp(
             settings,
+            capture,
             src,
             dst,
             handle.meta().size(),
@@ -1420,6 +1544,7 @@ enum FileRead {
 #[allow(clippy::too_many_arguments)]
 async fn send_file_tcp(
     settings: &common::copy::Settings,
+    capture: ExtendedMetadataCapture,
     src: &std::path::Path,
     dst: &std::path::Path,
     size: u64,
@@ -1465,10 +1590,26 @@ async fn send_file_tcp(
         .await
         .map(|file| (file, None)),
     };
-    let (file, read_meta) = match open_result {
+    // read the source ACL from the SAME fd whose bytes are about to be sent (read-side fidelity,
+    // docs/tocttou.md): a probe by path could be answered by a different inode than the one being
+    // transferred, pairing one file's permissions with another's contents. Files have no default
+    // ACL, so only the access one is asked for. Only when the master asked at all — with `f:acl`
+    // off this issues no xattr syscall, which is the whole reason the capture field is on the wire.
+    // Folded into `open_result` so a failure takes the same accounted path as a failed open: the
+    // header has not been sent, so the destination is still owed exactly one entry for this file.
+    let open_result = match open_result {
+        Ok((file, meta)) if capture.file_acl => {
+            common::safedir::read_acls_fd(file.as_fd(), common::Side::Source, false)
+                .await
+                .map(|acls| (file, meta, Some(acls)))
+        }
+        Ok((file, meta)) => Ok((file, meta, None)),
+        Err(e) => Err(e),
+    };
+    let (file, read_meta, src_acls) = match open_result {
         Ok(f) => f,
         Err(e) => {
-            tracing::error!("Failed to open file {src:?}: {e:#}");
+            tracing::error!("Failed to read file {src:?} for sending: {e:#}");
             // stream is returned to pool via Drop when pooled_stream goes out of scope
             // for root file copies, failing to open the file is a fatal error -
             // there's nothing else to transfer and the protocol would hang
@@ -1514,6 +1655,11 @@ async fn send_file_tcp(
             (meta.size(), remote::protocol::Metadata::from(meta))
         }
         None => (size, metadata),
+    };
+    // attach the ACLs read above (both branches: they came from the data fd either way).
+    let metadata = match &src_acls {
+        Some(acls) => metadata.with_acls(acls),
+        None => metadata,
     };
     // wrap file in a buffered reader for better network throughput
     // buffer size is set by tcp_config.effective_remote_copy_buffer_size() based on network profile,
@@ -1710,6 +1856,7 @@ async fn send_files_missing_directory(
 #[allow(clippy::too_many_arguments)]
 async fn send_files_in_directory_tcp(
     settings: common::copy::Settings,
+    capture: ExtendedMetadataCapture,
     src: std::path::PathBuf,
     dst: std::path::PathBuf,
     source_root: std::path::PathBuf,
@@ -2002,6 +2149,7 @@ async fn send_files_in_directory_tcp(
         join_set.spawn(async move {
             let result = send_file_tcp(
                 &settings,
+                capture,
                 &src_path,
                 &dst_path,
                 size,
@@ -2108,6 +2256,7 @@ enum RecvResult {
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_control_messages_tcp(
     settings: common::copy::Settings,
+    capture: ExtendedMetadataCapture,
     source_root: std::path::PathBuf,
     mut control_recv_stream: remote::streams::BoxedRecvStream,
     control_send_stream: remote::streams::BoxedSharedSendStream,
@@ -2291,6 +2440,7 @@ async fn dispatch_control_messages_tcp(
                         let settings = settings.clone();
                         join_set.spawn(send_files_in_directory_tcp(
                             settings,
+                            capture,
                             src.clone(),
                             dst.clone(),
                             source_root.clone(),
@@ -2611,6 +2761,7 @@ async fn handle_connection(
     control_stream: tokio::net::TcpStream,
     data_listener: tokio::net::TcpListener,
     settings: &common::copy::Settings,
+    capture: ExtendedMetadataCapture,
     src: &std::path::Path,
     dst: &std::path::Path,
     tcp_config: &remote::TcpConfig,
@@ -2675,6 +2826,7 @@ async fn handle_connection(
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let dispatch_task = tokio::spawn(dispatch_control_messages_tcp(
         settings.clone(),
+        capture,
         src.to_path_buf(),
         control_recv_stream,
         control_send_stream.clone(),
@@ -2690,6 +2842,7 @@ async fn handle_connection(
     // and destination is notified via FileSkipped messages on the control channel.
     let send_result = send_fs_objects_tcp(
         settings,
+        capture,
         src,
         dst,
         control_send_stream,
@@ -3534,6 +3687,9 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
     src: &std::path::Path,
     dst: &std::path::Path,
     settings: &common::copy::Settings,
+    // what extended per-entry metadata (ACLs) the master wants read; all-false means this source
+    // issues no xattr syscall at all.
+    capture: ExtendedMetadataCapture,
     tcp_config: &remote::TcpConfig,
     bind_ip: Option<&str>,
     cert_key: Option<&remote::tls::CertifiedKey>,
@@ -3613,6 +3769,7 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
                 stream,
                 data_listener,
                 settings,
+                capture,
                 src,
                 dst,
                 tcp_config,

@@ -58,7 +58,7 @@ impl Metadata for std::fs::Metadata {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct UserAndTimeSettings {
     pub uid: bool,
     pub gid: bool,
@@ -74,10 +74,14 @@ impl UserAndTimeSettings {
 
 pub type ModeMask = u32;
 
-#[derive(Copy, Clone, Debug, Deserialize, Serialize)]
+#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct FileSettings {
     pub user_and_time: UserAndTimeSettings,
     pub mode_mask: ModeMask,
+    /// Preserve the POSIX.1e access ACL (`system.posix_acl_access`).
+    ///
+    /// Opt-in, and deliberately not part of [`preserve_all`] — see the comment there.
+    pub acl: bool,
 }
 
 impl Default for FileSettings {
@@ -85,14 +89,20 @@ impl Default for FileSettings {
         Self {
             user_and_time: UserAndTimeSettings::default(),
             mode_mask: 0o0777, // remove sticky bit, setuid and setgid to mimic "cp" tool
+            acl: false,
         }
     }
 }
 
-#[derive(Copy, Clone, Debug, Deserialize, Serialize)]
+#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DirSettings {
     pub user_and_time: UserAndTimeSettings,
     pub mode_mask: ModeMask,
+    /// Preserve the POSIX.1e access *and* default ACLs (`system.posix_acl_access` and
+    /// `system.posix_acl_default`).
+    ///
+    /// Opt-in, and deliberately not part of [`preserve_all`] — see the comment there.
+    pub acl: bool,
 }
 
 impl Default for DirSettings {
@@ -100,11 +110,17 @@ impl Default for DirSettings {
         Self {
             user_and_time: UserAndTimeSettings::default(),
             mode_mask: 0o0777,
+            acl: false,
         }
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize)]
+/// Symlink preserve settings.
+///
+/// There is deliberately no `acl` field: the kernel has no symlink ACL, so asking to preserve one
+/// is a request that could only ever be silently ignored. The settings parser rejects `l:acl`
+/// instead.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SymlinkSettings {
     pub user_and_time: UserAndTimeSettings,
 }
@@ -116,11 +132,25 @@ impl SymlinkSettings {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Settings {
     pub file: FileSettings,
     pub dir: DirSettings,
     pub symlink: SymlinkSettings,
+}
+
+impl Settings {
+    /// Turn ACL preservation on (or off) for files and directories.
+    ///
+    /// Symlinks are untouched — see [`SymlinkSettings`]. This is the single place that knows which
+    /// object types can carry an ACL, so the `all+acl` preset, the `none+acl` preset and
+    /// [`preserve_all_with_acls`] cannot drift apart.
+    #[must_use]
+    pub fn with_acl(mut self, acl: bool) -> Self {
+        self.file.acl = acl;
+        self.dir.acl = acl;
+        self
+    }
 }
 
 /// Compute the permission bits to apply, honoring the mode mask.
@@ -151,6 +181,10 @@ pub fn masked_mode<Meta: Metadata>(mode_mask: ModeMask, metadata: &Meta) -> u32 
     }
 }
 
+/// Preserve uid, gid, timestamps and the full mode (including setuid/setgid/sticky).
+///
+/// This does **not** preserve ACLs; use [`preserve_all_with_acls`], equivalent to the `all+acl`
+/// settings string, for that.
 #[must_use]
 pub fn preserve_all() -> Settings {
     let user_and_time = UserAndTimeSettings {
@@ -158,18 +192,36 @@ pub fn preserve_all() -> Settings {
         gid: true,
         time: true,
     };
-
     Settings {
         file: FileSettings {
             user_and_time,
             mode_mask: 0o7777,
+            // `all` deliberately does NOT preserve ACLs, and this stays spelled out rather than
+            // riding on `..Default::default()`. There is no bit in `stat` saying whether an entry
+            // has an ACL, so merely finding out costs an extra syscall on every single entry -
+            // roughly doubling the per-entry metadata cost of the flag most people reach for by
+            // default. ACLs are therefore opt-in via `all+acl` / `preserve_all_with_acls`.
+            acl: false,
         },
         dir: DirSettings {
             user_and_time,
             mode_mask: 0o7777,
+            // see the file settings above: opt-in for the same per-entry cost reason (and
+            // directories pay for two ACLs, access and default)
+            acl: false,
         },
         symlink: SymlinkSettings { user_and_time },
     }
+}
+
+/// [`preserve_all`] plus POSIX ACLs on files and directories, equivalent to the `all+acl` settings
+/// string.
+///
+/// The settings parser does not call this — it applies the `+acl` modifier generically to whichever
+/// preset it saw. The two agree because both route through [`Settings::with_acl`].
+#[must_use]
+pub fn preserve_all_with_acls() -> Settings {
+    preserve_all().with_acl(true)
 }
 
 #[must_use]
@@ -246,5 +298,42 @@ mod tests {
         let all = preserve_all();
         assert_eq!(all.file.mode_mask, 0o7777);
         assert_eq!(all.dir.mode_mask, 0o7777);
+    }
+    #[test]
+    fn shipped_defaults_and_preserve_all_leave_acls_off() {
+        // ACLs are opt-in because detecting one costs a syscall per entry; a silent flip here would
+        // impose that cost on every default copy
+        assert!(!FileSettings::default().acl);
+        assert!(!DirSettings::default().acl);
+        let all = preserve_all();
+        assert!(!all.file.acl);
+        assert!(!all.dir.acl);
+        let none = preserve_none();
+        assert!(!none.file.acl);
+        assert!(!none.dir.acl);
+    }
+    #[test]
+    fn preserve_all_with_acls_enables_acls_without_changing_anything_else() {
+        // whole-value equality, so any extra field `with_acl` touches shows up here rather than
+        // slipping past a hand-written list of assertions
+        let mut expected = preserve_all();
+        expected.file.acl = true;
+        expected.dir.acl = true;
+        assert_eq!(preserve_all_with_acls(), expected);
+    }
+    #[test]
+    fn with_acl_touches_only_the_acl_fields() {
+        let mut expected = preserve_none();
+        expected.file.acl = true;
+        expected.dir.acl = true;
+        assert_eq!(preserve_none().with_acl(true), expected);
+    }
+    #[test]
+    fn with_acl_is_idempotent_and_reversible() {
+        assert_eq!(
+            preserve_none().with_acl(true).with_acl(true),
+            preserve_none().with_acl(true)
+        );
+        assert_eq!(preserve_all_with_acls().with_acl(false), preserve_all());
     }
 }
