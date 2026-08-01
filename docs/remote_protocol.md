@@ -203,11 +203,15 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
 
 **`FileSkipped`**
 
-- **Purpose**: Notify destination that a file failed to send
+- **Purpose**: Notify destination that an entry its parent already counted will not be sent
 - **Fields**: `src`, `dst`
-- **Usage**: Sent when file open fails (before any data connection is used). Counts as a processed
-  entry for the parent directory's completion tracking. Transport failures after connection is
-  established are fatal.
+- **Usage**: Sent when a file open fails (before any data connection is used), and — with no file
+  involved — for any child a parent's `entry_count` already tallied that the source can no longer
+  send: one whose `open_dir` failed, or that vanished, changed type, or stopped matching the filter
+  between its parent's pre-read and the walk's descent into it (§7.1). It is the right message for
+  all of them because the source has no trustworthy type left to assert. Counts as a processed entry
+  for the parent directory's completion tracking. Transport failures after connection is established
+  are fatal.
 
 **`FileUnchanged`**
 
@@ -492,8 +496,9 @@ The protocol uses asymmetric error communication between source and destination:
   track entry counts correctly — an optimization notification (the destination already matched), not
   a failure, but it serves the same count-tracking role as `FileSkipped`
 - Without these notifications, destination would hang waiting for entries that will never arrive
-- **Note**: `FileSkipped` is only sent for file open failures. Transport failures (send errors after
-  connection established) are fatal and abort the entire transfer
+- **Note**: `FileSkipped` covers every counted-but-unsendable entry, not only failed file opens
+  (§2.2). Transport failures (send errors after connection established) are fatal and abort the
+  entire transfer
 
 **Destination → Source: Does NOT communicate failures (one exception: directory acks)**
 
@@ -536,6 +541,21 @@ Root items require special handling to prevent protocol hangs:
 **Source side:** If metadata reading fails for a root item (directory or symlink), source MUST
 return an error rather than silently continuing. Otherwise, no messages would be sent for the root
 item, leaving destination waiting forever for `root_complete` to be set.
+
+**One classification, no re-stat.** The root is classified ONCE, and that single snapshot drives
+`has_root_item`, the file-vs-directory dispatch, and the walk — which is handed the classification
+rather than taking one of its own. Two reads would let the two answers disagree: a root that is a
+directory at the first and a regular file at the second announces `has_root_item: true` and then
+sends no root message at all, which is exactly the hang above, with both peers alive. The hardened
+walk classifies through the trusted parent's fd; `-L` uses the one path stat it already takes.
+
+A root that changes AFTER that classification is not a classification failure, and outside
+`--fail-early` it is not fatal either: the open/enumeration fails (`ENOTDIR`/`ENOENT`) and the root
+takes the committed-but-unreadable-directory route of §7.1 — a 0-entry `Directory`, which sets
+`root_complete` — with the error recorded, so the copy reports the failure and still terminates.
+Under `--fail-early` that same failure returns `Err` before the 0-entry `Directory` is sent, which
+is fatal per the invariant above; nothing has been committed for the root at that point, so the
+destination is torn down rather than left waiting for it.
 
 **Empty source case:** When no root item will be sent (dry-run mode or filtered root item), source
 sets `DirStructureComplete { has_root_item: false }`. Destination uses this flag to immediately mark
@@ -915,13 +935,37 @@ continue as an empty directory unless `--fail-early`" behavior for both root and
 directories. (A *true* miss — a directory that was never committed, or whose entry was already
 consumed — still fails closed.)
 
+**Counted-but-unsendable child (Pass 1):** A directory's `entry_count` is fixed when its `Directory`
+message goes out, but the walk descends into its children only afterwards. A child that vanished,
+changed type, or stopped matching the filter in between produces no message of its own — nor does
+one whose descent returns `Err`, or one the hardened walk fails to `open_dir` — so the source sends
+a `FileSkipped` (§2.2) to close its slot. Without it the parent never reaches `entries_expected`,
+`DestinationDone` is never sent, and the copy hangs with both peers alive, which no keepalive or
+timeout ends. Both walks do this; the `-L` walk routes every "sent nothing" exit through a single
+funnel, so the compensation cannot be forgotten when another such exit is added.
+
+**The two passes are mutually exclusive BY NAME.** Pass 2 does not inherit Pass 1's classification —
+it re-enumerates the directory — so the names Pass 1 counted as directories or symlinks are retained
+alongside the file count and **skipped** by Pass 2, whatever they look like by then. Without that,
+one name can take TWO of the parent's entry slots: Pass 1 accounts for it (its own message, or the
+compensating `FileSkipped` above) and Pass 2 counts it again as a file, because it is one now. The
+`files_found > file_count` rule then drops a genuinely counted sibling to keep the total at
+`file_count` — the destination completes, and the copy exits `0` with a source file silently
+missing, which is strictly worse than the hang. The retained set has to be complete when the
+`Directory` message is sent, and it is: the destination can ack that message, and Pass 2 can begin,
+before Pass 1 has even descended into those children.
+
 **Handling source modifications during copy:** Directory contents may change between the source's
 pre-read (during traversal) and the actual file sending (after receiving `DirectoryCreated`):
 
 - **Files disappeared:** source sends synthetic `FileSkipped` for missing files, so destination's
   `entries_processed` still reaches `entries_expected`
-- **Extra files appeared:** source ignores them (only sends up to the retained file count), logs
-  warning
+- **A counted directory or symlink is now a file:** ignored by Pass 2 — that name belongs to Pass 1
+  (above)
+- **Extra files appeared:** the destination expects exactly the traversal-time count, so the source
+  can only send that many and the surplus is dropped. Which ones is `readdir` order, so a counted
+  file can be the casualty; this is therefore recorded as an **error** (the copy exits non-zero
+  naming the directory), not a warning
 - **Extra directories/symlinks appeared:** source ignores them (already sent during traversal)
 - **Directory unreadable at send time:** source sends one synthetic `FileSkipped` per retained
   expected file so destination can still complete
