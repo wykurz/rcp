@@ -21,10 +21,21 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 echo "🔍 Checking source-read fidelity (no by-name/path source payload reads)..."
 
-FILES="common/src/copy.rs common/src/link.rs rcp/src/source.rs"
+# safedir.rs is scanned too because it is where the fd-paired primitives themselves live: a by-path
+# read added next to them is exactly the regression the `*xattr` patterns below exist to catch, and
+# it would not be caught by scanning only the callers. Its own tests read by path deliberately and
+# sit below the single `#[cfg(test)]`, which this scan already excludes.
+FILES="common/src/copy.rs common/src/link.rs common/src/safedir.rs rcp/src/source.rs"
 # the by-name / by-path SOURCE payload reads. NOT metadata/symlink_metadata: those have legitimate
 # dst-existence / -L / test uses and are not the drift vector (metadata pairing is structural).
-PATTERNS=".read_link_at( tokio::fs::read_link( tokio::fs::File::open( std::fs::File::open("
+#
+# The `*xattr` entries cover POSIX ACL reads, which are a source payload like any other: an ACL read
+# by PATH can be answered by a different inode than the one whose bytes and metadata were read from
+# the held fd, pairing one entry's permissions with another's contents. The fd forms (`fgetxattr` /
+# `flistxattr`, used by `safedir::read_acls_fd`) are the correct ones and are deliberately absent
+# here. The `l`-prefixed forms are listed too: they do not follow a final symlink, but they still
+# resolve the name.
+PATTERNS=".read_link_at( tokio::fs::read_link( tokio::fs::File::open( std::fs::File::open( libc::getxattr( libc::lgetxattr( libc::listxattr( libc::llistxattr("
 MARKER="rcp-toctou-allow:"
 VIOLATIONS=0
 

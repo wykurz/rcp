@@ -86,8 +86,12 @@ struct Args {
     ///
     /// Defaults to "all" if not specified. Presets: "all" preserves uid, gid, time, and full
     /// mode (0o7777); "none" uses minimal defaults (no uid/gid/time, mode mask 0o0777).
+    /// Neither preserves POSIX ACLs: detecting an ACL costs an extra syscall on every entry,
+    /// so it is opt-in via the "+acl" modifier, e.g. "all+acl".
     /// Custom format: "`<type>:<attrs>` ..." where type is f (file), d (directory), l (symlink),
-    /// and attrs is a comma-separated list of uid, gid, time, or a 4-digit octal mode mask.
+    /// and attrs is a comma-separated list of uid, gid, time, acl, or a 4-digit octal mode mask.
+    /// "acl" is not valid for symlinks, and cannot be combined with a mode mask that narrows
+    /// the rwx bits.
     ///
     /// Hard-linked files always share metadata with their source via the inode - preserve
     /// settings have no effect on them. Settings apply to directories and symlinks in all

@@ -328,43 +328,57 @@ directory's group, and finalize cannot repair the group of a child already creat
 also pinned to the value captured at classification: taking uid ownership freezes the group (only
 the copier or root can change it now), and if a prior owner raced a `chgrp` into the takeover window
 the copier resets it, so a setgid directory cannot funnel freshly written children into an
-attacker-chosen group. At finalize — after all children and any `--delete` prune — the directory's
-original owner is restored and the source metadata re-applied (the final owner is the source owner
-for each `--preserve`d component and the original owner otherwise, and the mode is the same masked
-metadata the unhardened copy would apply — the source directory's, or the update tree's for
-`rlink --update`), so a successful copy leaves the directory byte-identical to a copy without this
-hardening — with one strict-mode refinement: under `--require-toctou-safe`, finalize additionally
-re-stats each reused directory and fails closed if the restored owner or mode did not take effect
-(catching a backend that does not honor `chown`/`chmod`); a setgid bit that the kernel drops because
-the copier is not in the directory's group and is not privileged is reported as a WARNING (narrower
-than the source, and not a failure — matching the best-effort behavior of a non-strict copy). Two
-side effects are accepted, not hidden. First, a reused directory whose processing is *aborted after
-lockdown* — by a `--fail-early` abort, or by any per-directory error that returns before finalize
-(e.g. an enumeration failure) even *without* `--fail-early` — is left no wider than a successful
-copy's result: the local path leaves it *secured* (copier-owned at `0o700`), while the remote path
-may instead have already restored it to its transparent final state (source mode with the
-original/source owner). The lockdown restricts the mode to `0o700` immediately after taking
-ownership, and the takeover is VERIFIED (uid + exactly `0o700`) before any further step, so on a
-filesystem that honors these syscalls any later failure leaves the directory secured. Three
-exceptions still fail closed (no child written) but leave the directory no narrower than requested —
-possibly its ORIGINAL, pre-lockdown mode, which may be wider than the `0o700` a mid-copy directory
-holds (though never wider than the directory already was before rcp ran): (1) the restricting
-`chmod` fails but the ownership rollback SUCCEEDS — the directory is returned to its original owner
-and mode (the failed `chmod` changed nothing); (2) BOTH the `chmod` and the rollback fail (a
-read-only or failing backend), reported with both errnos, leaving it copier-owned at its original
-mode; and (3) a backend reports `chmod`/`chown` success without taking effect (e.g. CIFS without
-unix extensions), so the verification fails. rcp cannot force a non-honoring backend narrower and
-does not retain the directory's original mode to re-restrict — and it does not chown a secured
-directory back to the prior owner (that would re-widen) — so it reports the true observed owner/mode
-and leaves repair to the operator. Restoration is likewise deliberately *not* forced onto the normal
-abort paths: doing so would re-widen the directory (chown it back to the prior owner and re-apply
-the source mode) while its children may be incomplete — the opposite of failing closed. On a
-honoring backend the secured `0o700` is the outcome and no abort yields a wider directory than the
+attacker-chosen group. The directory's **default ACL** is snapshotted and removed at the same point,
+for the same reason the mode is restricted: a `chmod` cannot reach it, so children created during
+the copy would otherwise inherit it and be granted access beyond their `mode` (its *access* ACL
+needs no strip — the `fchmod(0o700)` rewrites `ACL_MASK` to `---`, so every named entry grants
+nothing for the duration). At finalize — after all children and any `--delete` prune — the
+directory's original owner is restored and the source metadata re-applied (the final owner is the
+source owner for each `--preserve`d component and the original owner otherwise, and the mode is the
+same masked metadata the unhardened copy would apply — the source directory's, or the update tree's
+for `rlink --update`), so a successful copy leaves the directory byte-identical to a copy without
+this hardening — with one strict-mode refinement: under `--require-toctou-safe`, finalize
+additionally re-stats each reused directory and fails closed if the restored owner or mode did not
+take effect (catching a backend that does not honor `chown`/`chmod`); a setgid bit that the kernel
+drops because the copier is not in the directory's group and is not privileged is reported as a
+WARNING (narrower than the source, and not a failure — matching the best-effort behavior of a
+non-strict copy). Two side effects are accepted, not hidden. First, a reused directory whose
+processing is *aborted after lockdown* — by a `--fail-early` abort, or by any per-directory error
+that returns before finalize (e.g. an enumeration failure) even *without* `--fail-early` — is left
+no wider than a successful copy's result: the local path leaves it *secured* (copier-owned at
+`0o700`), while the remote path may instead have already restored it to its transparent final state
+(source mode with the original/source owner). The lockdown restricts the mode to `0o700` immediately
+after taking ownership, and the takeover is VERIFIED (uid + exactly `0o700`) before any further
+step, so on a filesystem that honors these syscalls any later failure leaves the directory secured.
+Three exceptions still fail closed (no child written) but leave the directory no narrower than
+requested — possibly its ORIGINAL, pre-lockdown mode, which may be wider than the `0o700` a mid-copy
+directory holds (though never wider than the directory already was before rcp ran): (1) the
+restricting `chmod` fails but the ownership rollback SUCCEEDS — the directory is returned to its
+original owner and mode (the failed `chmod` changed nothing); (2) BOTH the `chmod` and the rollback
+fail (a read-only or failing backend), reported with both errnos, leaving it copier-owned at its
+original mode; and (3) a backend reports `chmod`/`chown` success without taking effect (e.g. CIFS
+without unix extensions), so the verification fails. rcp cannot force a non-honoring backend
+narrower and does not retain the directory's original mode to re-restrict — and it does not chown a
+secured directory back to the prior owner (that would re-widen) — so it reports the true observed
+owner/mode and leaves repair to the operator. Restoration is likewise deliberately *not* forced onto
+the normal abort paths: doing so would re-widen the directory (chown it back to the prior owner and
+re-apply the source mode) while its children may be incomplete — the opposite of failing closed. On
+a honoring backend the secured `0o700` is the outcome and no abort yields a wider directory than the
 mid-copy state; the exceptions above only ever return the directory toward the state it already had.
-Second, an actor holding a directory fd opened *before* the lockdown can still read the *names* of
-children written afterward (each child's contents stay protected by its own source-derived mode).
-This is destination-only and strict-mode-only; the default path leaves reused directories exactly
-as-is (their permissions may then block writing, which is the pre-existing behavior).
+The directory's snapshotted **default ACL** is the one thing an abort must not merely leave alone:
+the lockdown removed it and holds the only copy of those bytes in memory, so losing it would be
+permanent data destruction rather than a permission left narrow. Its restore therefore runs from an
+RAII guard rather than from finalize alone, so every path that locks a directory and then never
+reaches finalize — a `--fail-early` abort that drops in-flight siblings, a per-directory error, a
+remote destination that fails between locking and registering — still puts it back. A failed restore
+there is logged with the directory and the ACL bytes, since a destructor cannot report an error —
+but as an ordinary `warn!`, so it needs `-v` to be seen (it is per-directory and unbounded on a mass
+abort, which is exactly what disqualifies it from the always-visible notice channel). See
+[acls.md](acls.md#--require-toctou-safe-containment). Second, an actor holding a directory fd opened
+*before* the lockdown can still read the *names* of children written afterward (each child's
+contents stay protected by its own source-derived mode). This is destination-only and
+strict-mode-only; the default path leaves reused directories exactly as-is (their permissions may
+then block writing, which is the pre-existing behavior).
 
 **Limitation — distinct source directories merging into one destination.** The lockdown coordinates
 each reused directory's lifecycle per resolved destination path, and strict *multi-source* copies
@@ -463,13 +477,15 @@ Specific invariants enforced:
 - **Source payload and metadata come from the same fd (read-side fidelity).** For each copied or
   sent source object, the data and the metadata applied/sent for it are read from one open file
   description, so a same-name swap cannot pair one inode's bytes/target with another inode's
-  mode/owner/timestamps: a regular file via `open_file_read` → `(File, FileMeta)`; a symlink via the
-  `O_PATH` handle's `read_symlink` (target + metadata off the one fd); a directory via the
-  enumerated `Dir` fd (`read_entries` + `meta`). The remote *destination* is fidelity-safe by
-  construction — it writes the received bytes and applies the received metadata to its single
-  created fd, so there are no two source fds to mismatch. `scripts/check-source-read-fidelity.sh`
-  (run in CI) backstops this by forbidding by-name source-payload reads (`read_link_at`,
-  `File::open`) in the hardened modules, outside the `-L`/`--dereference` path.
+  mode/owner/timestamps — or, under `acl`, with another inode's ACL, which is read from that same fd
+  (`read_acls_fd` on a file's data fd, `Dir::read_acls` on the enumerated directory fd): a regular
+  file via `open_file_read` → `(File, FileMeta)`; a symlink via the `O_PATH` handle's `read_symlink`
+  (target + metadata off the one fd); a directory via the enumerated `Dir` fd (`read_entries` +
+  `meta`). The remote *destination* is fidelity-safe by construction — it writes the received bytes
+  and applies the received metadata to its single created fd, so there are no two source fds to
+  mismatch. `scripts/check-source-read-fidelity.sh` (run in CI) backstops this by forbidding by-name
+  source-payload reads (`read_link_at`, `File::open`) in the hardened modules, outside the
+  `-L`/`--dereference` path.
 
 ### Strict operand resolution (`--require-toctou-safe`)
 
@@ -591,10 +607,11 @@ fails closed instead of being followed. See
 
 ## What Is Not Hardened
 
-The following are **not TOCTOU-hardened**. The flag- and platform-level items (`-L`, non-Linux) are
-reported as "not safe" by `--toctou-check`; the runtime filesystem-property items (POSIX ACLs) are
-NOT — `--toctou-check` inspects operand form and flags, not the runtime state of the destination
-filesystem, so it cannot detect them:
+The following are **not TOCTOU-hardened**, or — for POSIX ACLs, which are a fidelity and containment
+concern rather than a race — not covered by default. The flag- and platform-level items (`-L`,
+non-Linux) are reported as "not safe" by `--toctou-check`; the runtime filesystem-property item
+(POSIX ACLs) is NOT — `--toctou-check` inspects operand form and flags, not the runtime state of the
+filesystems involved, so it cannot detect it:
 
 - **`--dereference` / `-L`**: Following symlinks is the requested behavior. A swapped link is
   followed by design. Do not use `-L` in privileged sudo rules over attacker-writable trees.
@@ -604,21 +621,57 @@ filesystem, so it cannot detect them:
 - **`rcmp`** (read-only compare): `rcmp` cannot mis-permission or destroy files. A concurrent swap
   could cause a wrong comparison result (treating an unintended file as equal or unequal), but no
   data is written. This is accepted and `rcmp` is out of scope.
-- **POSIX ACLs**: rcp does not process POSIX ACLs anywhere. The reused-destination-directory
-  lockdown restricts the directory **mode** only — it does not snapshot, strip, or restore a
-  directory's access ACL or default ACL, under `--require-toctou-safe` or otherwise. The interim
-  `fchmod(0o700)` does nonetheless contain a directory's *access* ACL: on Linux `chmod` rewrites the
-  `ACL_MASK` entry from the new group bits, so `0o700` sets the mask to `---` and every named
-  `user:`/`group:` entry — and the owning group — is rendered ineffective for the duration of the
-  copy. The entries survive; they grant nothing. A permissive **default ACL** is NOT contained:
-  `chmod` does not touch it, so children created during the copy inherit it and are granted access
-  beyond their `mode`. The finalize `chmod` likewise re-derives the mask from the restored mode's
-  group bits rather than from the directory's original mask — the same rewrite an unhardened copy's
-  directory-metadata step performs, so the end state is unchanged by this hardening. Where a reused
-  destination tree may carry security-relevant default ACLs, do not rely on the lockdown. Because an
-  ACL is a property of the destination filesystem at runtime (not of the operand path or flags),
-  `--toctou-check` does not — and cannot — detect or report this. Handling ACLs (including across
-  the remote transport) is deferred.
+- **POSIX ACLs — the source's are not preserved unless you ask.** rcp does process POSIX ACLs, both
+  locally and across the remote transport, but only when `--preserve-settings` requests `acl`
+  (`all+acl`, or a per-type `f:acl`/`d:acl`). Detecting an ACL costs a syscall on every entry —
+  there is no bit in `stat` for it — so the flag people reach for by default deliberately does not
+  pay it. A copy that does not request `acl` therefore ends up with the source's **mode** and no
+  ACL, and a source ACL entry narrower than `other` acts as a deny in effect, so dropping it grants
+  exactly what the source withheld. **`--require-toctou-safe` does not close this**; see the table
+  below. The full model, both widening directions and the measured costs are in [acls.md](acls.md).
+
+  Two things the strict mode *does* do, both containment rather than fidelity — no destination entry
+  rcp **creates** carries an ACL entry that did not come from its source. (A *reused* directory was
+  already there and keeps its own access ACL; only what the copy writes is in scope.)
+
+  - Every directory rcp **creates** has both its ACLs removed after the `mkdirat`, so nothing
+    created beneath it can inherit one. Two syscalls per directory and none per file: stripping the
+    default ACL stops the inheritance chain for the whole subtree. The window between `mkdirat` and
+    the strip is not exploitable — the directory is at `0o700` and the kernel intersects inherited
+    entries with the create mode, leaving `m::---`, so every named entry grants nothing.
+  - Every **reused** directory has its DEFAULT ACL snapshotted and removed for the copy's duration,
+    and restored at finalize (or by an RAII guard if the copy aborts first). Its **access** ACL is
+    deliberately left alone: the lockdown's `fchmod(0o700)` already neuters it, because on Linux
+    `chmod` rewrites the `ACL_MASK` entry from the new group bits, so `0o700` sets the mask to `---`
+    and every named `user:`/`group:` entry — and the owning group — grants nothing for the duration.
+    The entries survive; note that "ineffective" is not "absent", and the finalize `chmod`
+    re-derives the mask from the restored mode's group bits, which is the same rewrite an unhardened
+    copy's directory-metadata step performs. Removing the **default** ACL is what the `chmod` could
+    not do for itself: `chmod` does not touch it, so without the strip children created during the
+    copy would inherit it and be granted access beyond their `mode`.
+
+  Consequence worth knowing: under `--require-toctou-safe` **without** `d:acl`, a freshly created
+  destination directory ends with no ACL even where its parent's default ACL would ordinarily have
+  given it one. That is the intended trade — the flag's contract is that the destination reflects
+  its source and nothing else, so containment beats inheritance — and `d:acl` is the escape. See
+  [acls.md](acls.md#a-consequence-not-an-oversight).
+
+  Because an ACL is a property of the filesystem at runtime (not of the operand path or flags),
+  `--toctou-check` does not — and cannot — detect or report any of this.
+
+  |                               | dropped SOURCE ACL | inherited DESTINATION ACL     |
+  | ----------------------------- | ------------------ | ----------------------------- |
+  | default                       | open               | open                          |
+  | `--preserve-settings=all+acl` | closed             | closed, repaired at finalize  |
+  | `--require-toctou-safe`       | **open**           | closed, prevented at creation |
+  | both                          | closed             | closed, prevented at creation |
+
+  **Pair `--require-toctou-safe` with `--preserve-settings=all+acl`** where the source's ACLs are
+  security-relevant. The flags close different bugs and deliberately do not imply each other:
+  auto-enabling `acl` would impose the per-entry probe on a flag people reach for a different
+  reason, and would silently override an explicit `--preserve-settings`. One `listxattr` on the
+  source root per run warns when that root carries an ACL the copy is about to drop — a heuristic,
+  since a root without one says nothing about its children.
 
 ## Residual Preconditions
 
@@ -864,7 +917,7 @@ caller-provided option string.
 | Symlink following (leaf)                     | Hardened (Linux): `O_NOFOLLOW` on every entry open                                                                                                                                                                                                                                            |
 | Intermediate directory swaps                 | Hardened (Linux): every dir opened fd-relative from parent                                                                                                                                                                                                                                    |
 | FIFO swap (DoS/side-effect)                  | Hardened (Linux): `O_NONBLOCK` + `fstat`+`S_ISREG`                                                                                                                                                                                                                                            |
-| Metadata ops (chown/chmod/utimes)            | Hardened (Linux): fd-based, no path re-resolution                                                                                                                                                                                                                                             |
+| Metadata ops (chown/chmod/utimes/ACLs)       | Hardened (Linux): fd-based, no path re-resolution                                                                                                                                                                                                                                             |
 | File data copy                               | Hardened (Linux): `copy_file_range` between held fds                                                                                                                                                                                                                                          |
 | `--delete` pruning                           | Hardened (Linux): fd-relative enumeration and removal                                                                                                                                                                                                                                         |
 | Remote copy (source side)                    | Hardened (Linux): two-pass dir-fd map                                                                                                                                                                                                                                                         |
@@ -873,6 +926,7 @@ caller-provided option string.
 | `--dereference` / `-L`                       | **Not hardened** (follows symlinks by design)                                                                                                                                                                                                                                                 |
 | Non-Linux builds                             | **Not hardened** (path-based code, documented)                                                                                                                                                                                                                                                |
 | `rcmp`                                       | Out of scope (read-only; no mis-permissioning possible)                                                                                                                                                                                                                                       |
+| POSIX ACLs                                   | Source ACLs preserved only with `--preserve-settings=all+acl`; `--require-toctou-safe` contains inherited *destination* ACLs but does not preserve the *source's* — pair the two (see [acls.md](acls.md))                                                                                     |
 | *Which* in-subtree file a swap makes us read | Out of scope — reads are not inode-pinned; a same-directory regular-file swap can change which file is read, but cannot escape the subtree or widen permissions (see [Scope of TOCTOU safety](#scope-of-toctou-safety))                                                                       |
 | Prefix trust (path above the named root)     | Caller's responsibility by default; under `--require-toctou-safe`, operands must be absolute + lexically normal and resolve `RESOLVE_NO_SYMLINKS` — a spliced symlink fails closed; prefix-writer renames stay in scope of the caller (see [Scope of TOCTOU safety](#scope-of-toctou-safety)) |
 | `fs.protected_hardlinks=0`                   | **Not defended** (userspace cannot close this gap)                                                                                                                                                                                                                                            |

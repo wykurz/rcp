@@ -456,6 +456,17 @@ pub async fn copy_with_filter_base(
             Arc::new(parent.into_tree())
         }
     };
+    // One `listxattr` on the source ROOT per run — a constant, not a per-entry probe — warning that
+    // a source root carrying an ACL is about to be copied by settings that drop it. Skipped
+    // entirely once ACLs are preserved for both kinds, and after the first root of the run.
+    crate::safedir::warn_if_root_acl_unpreserved_at(
+        &src_parent,
+        src_name,
+        src,
+        preserve.file.acl,
+        preserve.dir.acl,
+    )
+    .await;
     // Authoritative destination split (runs AFTER the filter, preserving default-mode ordering): a
     // `.`/`..`/`/` destination is not a meaningful copy target, and rejecting it avoids clobbering
     // the cwd. empty parent (a single-component relative path) means the current directory.
@@ -612,11 +623,15 @@ struct CopyDirState {
     dst_name: OsString,
     /// Whether we created the destination directory (vs. reused an existing one).
     we_created: bool,
-    /// The original `(uid, gid)` restored at finalize before source metadata is re-applied,
-    /// `Some` iff this reused directory was locked down (strict mode). See [`DirSlot::restore_owner`].
-    restore_owner: Option<(u32, u32)>,
+    /// What the strict-mode lockdown must put back at finalize (original owner + original ACLs),
+    /// `Some` iff this reused directory was locked down. See [`DirSlot::reused_lock`].
+    reused_lock: Option<safedir::ReusedDirLock>,
     /// The source directory's metadata, applied to the destination post-order.
     src_meta: FileMeta,
+    /// The source directory's access + default ACLs, read from the same fd as `src_meta` and
+    /// applied post-order alongside it. `None` when `d:acl` was not requested (so nothing was read)
+    /// or in dry-run (nothing is applied).
+    src_acls: Option<safedir::Acls>,
     /// Whether this is the user-specified root directory (never empty-dir-cleaned up).
     is_root: bool,
     /// The `directories_created`/`directories_unchanged` contribution from resolving this
@@ -787,8 +802,9 @@ impl CopyVisitor {
             dst_parent,
             dst_name,
             src_meta,
+            src_acls,
             we_created,
-            restore_owner,
+            reused_lock,
             is_root,
         } = fin;
         let src_path = &cx.real_path;
@@ -881,12 +897,14 @@ impl CopyVisitor {
             // For a reused directory locked down under strict mode, `set_reused_dir_metadata_fd`
             // restores the original owner component-wise — so no transient window hands the directory
             // back to a hostile prior owner — then applies the source metadata (mode last, so
-            // setgid/special bits survive). `restore_owner` is None for fresh dirs / non-strict reuse.
+            // setgid/special bits survive) and puts back the ACLs the lockdown stripped.
+            // `reused_lock` is None for fresh dirs / non-strict reuse.
             Some(dst_dir) => {
                 safedir::set_reused_dir_metadata_fd(
                     &self.preserve,
                     &src_meta,
-                    restore_owner,
+                    src_acls.as_ref(),
+                    reused_lock,
                     dst_dir,
                 )
                 .await
@@ -922,8 +940,9 @@ struct FinalizeDir {
     dst_parent: Option<Arc<Dir>>,
     dst_name: OsString,
     src_meta: FileMeta,
+    src_acls: Option<safedir::Acls>,
     we_created: bool,
-    restore_owner: Option<(u32, u32)>,
+    reused_lock: Option<safedir::ReusedDirLock>,
     is_root: bool,
 }
 
@@ -1247,13 +1266,30 @@ impl WalkVisitor for CopyVisitor {
                     // treat as "created" so empty-dir cleanup can suppress the dry-run count.
                     we_created: true,
                     // dry-run never opens/locks a destination directory, so nothing to restore.
-                    restore_owner: None,
+                    reused_lock: None,
                     src_meta,
+                    // dry-run applies no metadata at all, so it never reads ACLs either.
+                    src_acls: None,
                     is_root,
                     base,
                 },
             });
         }
+        // the directory's ACLs come from the same fd as `src_meta`, for the same read-side fidelity
+        // reason. Both ACLs: a directory's DEFAULT ACL is what its children inherit, so dropping it
+        // would silently change the destination tree's inheritance policy. Only when `d:acl` was
+        // requested — the probe is a per-entry syscall an ordinary copy must not pay for.
+        let src_acls = if self.preserve.dir.acl {
+            Some(
+                src_dir
+                    .read_acls()
+                    .await
+                    .with_context(|| format!("cannot read ACLs from directory {:?}", src_path))
+                    .map_err(|err| Error::new(err, Default::default()))?,
+            )
+        } else {
+            None
+        };
         // real copy: the destination parent is Some (None only in dry-run, handled above).
         let dst_parent = parent_ctx
             .dst_dir
@@ -1264,7 +1300,7 @@ impl WalkVisitor for CopyVisitor {
             summary: base,
             is_fresh: child_is_fresh,
             we_created,
-            restore_owner,
+            reused_lock,
         } = match resolve_dst_dir(
             self.prog_track,
             dst_parent,
@@ -1288,8 +1324,9 @@ impl WalkVisitor for CopyVisitor {
                 dst_parent: Some(Arc::clone(dst_parent)),
                 dst_name,
                 we_created,
-                restore_owner,
+                reused_lock,
                 src_meta,
+                src_acls,
                 is_root,
                 base,
             },
@@ -1308,8 +1345,9 @@ impl WalkVisitor for CopyVisitor {
             dst_parent,
             dst_name,
             we_created,
-            restore_owner,
+            reused_lock,
             src_meta,
+            src_acls,
             is_root,
             base,
         } = state;
@@ -1344,8 +1382,9 @@ impl WalkVisitor for CopyVisitor {
                 dst_parent,
                 dst_name,
                 src_meta,
+                src_acls,
                 we_created,
-                restore_owner,
+                reused_lock,
                 is_root,
             },
             cx,
@@ -1505,6 +1544,20 @@ async fn copy_file_fd(
         .await
         .with_context(|| format!("failed opening src file {:?} for reading", src_path))
         .map_err(|err| Error::new(err, copy_summary))?;
+    // read the source ACL from the SAME fd whose bytes are about to be copied (read-side fidelity,
+    // docs/tocttou.md), and before the destination is touched — an unreadable source must not cost
+    // the user the file being overwritten. Only when `acl` was requested: the probe is a syscall per
+    // entry that `stat` cannot fold in, so an ordinary copy must not pay for it.
+    let src_acls = if preserve.file.acl {
+        Some(
+            safedir::read_acls_fd(src_file.as_fd(), src_parent.side(), false)
+                .await
+                .with_context(|| format!("failed reading ACLs from {:?}", src_path))
+                .map_err(|err| Error::new(err, copy_summary))?,
+        )
+    } else {
+        None
+    };
     // the source fd is held and the throttle budget is reserved, so the destination can now be
     // replaced: the failure that would most often abandon this copy before any byte exists is behind
     // us. It is not the last one — `create_file` below has its own (EMFILE, ENOSPC, EIO) and waits on
@@ -1594,6 +1647,7 @@ async fn copy_file_fd(
     safedir::set_file_metadata_fd(
         preserve,
         &open_meta,
+        src_acls.as_ref(),
         dst_file.as_fd(),
         congestion::Side::Destination,
     )
@@ -1957,10 +2011,12 @@ pub(crate) struct DirSlot {
     pub(crate) summary: Summary,
     pub(crate) is_fresh: bool,
     pub(crate) we_created: bool,
-    /// The original `(uid, gid)` to restore at finalize, `Some` iff this directory was LOCKED
-    /// (strict operand resolution + a reused existing directory). `None` for a freshly created
-    /// directory, which must never be restore-chowned. Its presence is the "locked" marker.
-    pub(crate) restore_owner: Option<(u32, u32)>,
+    /// What the lockdown must undo at finalize (the original owner and the original ACLs), `Some`
+    /// iff this directory was LOCKED (strict operand resolution + a reused existing directory).
+    /// `None` for a freshly created directory, which must never be restore-chowned and whose
+    /// inherited ACLs were stripped outright by `make_dir` rather than snapshotted. Its presence is
+    /// the "locked" marker.
+    pub(crate) reused_lock: Option<safedir::ReusedDirLock>,
 }
 
 /// Outcome of resolving a destination directory.
@@ -2000,8 +2056,9 @@ pub(crate) async fn resolve_dst_dir(
                 },
                 is_fresh: true,
                 we_created: true,
-                // fresh dirs are already created copier-owned at 0o700; nothing to restore.
-                restore_owner: None,
+                // fresh dirs are already created copier-owned at 0o700, and `make_dir` stripped any
+                // ACL they inherited; nothing to restore.
+                reused_lock: None,
             }))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -2034,7 +2091,7 @@ pub(crate) async fn resolve_dst_dir(
                 // the copy's duration (no-op / None in the default path). A recheck or EPERM failure
                 // surfaces as this directory's error, honoring --fail-early; `dir_pre` returning Err
                 // skips descent, so no child is ever written into an unsecured directory.
-                let restore_owner = safedir::lockdown_reused_dir(&dir, &dst_handle)
+                let reused_lock = safedir::lockdown_reused_dir(&dir, &dst_handle)
                     .await
                     .with_context(|| {
                         format!("cannot secure reused destination directory {:?}", dst_path)
@@ -2051,7 +2108,7 @@ pub(crate) async fn resolve_dst_dir(
                     // existence checks.
                     is_fresh: false,
                     we_created: false,
-                    restore_owner,
+                    reused_lock,
                 }))
             } else if settings.ignore_existing {
                 // a non-directory exists and --ignore-existing was set: skip the whole subtree.
@@ -2098,8 +2155,9 @@ pub(crate) async fn resolve_dst_dir(
                     },
                     is_fresh: true,
                     we_created: true,
-                    // freshly created after removing a non-dir: copier-owned at 0o700, nothing to restore.
-                    restore_owner: None,
+                    // freshly created after removing a non-dir: copier-owned at 0o700 with its
+                    // inherited ACLs stripped by `make_dir`; nothing to restore.
+                    reused_lock: None,
                 }))
             } else {
                 Err(Error::new(

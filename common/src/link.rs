@@ -102,6 +102,12 @@ impl std::fmt::Display for Summary {
 /// fd and, if it is an identical hard link (same dev+ino), left as is; otherwise it is removed via
 /// the recheck-guarded [`copy::remove_existing`] and the link is retried — mirroring copy's
 /// fd-relative overwrite branches.
+///
+/// No metadata is applied here, and `f:acl` in particular must never reach this path: a hard-linked
+/// destination SHARES the source's inode, so writing an ACL "to the destination" would rewrite the
+/// SOURCE's permissions. There is nothing to apply anyway — the shared inode already carries the
+/// source's metadata verbatim, which is the whole point of a hard link. `f:acl` therefore applies
+/// only on rlink's real copy path ([`copy::copy_child`], for changed files under `--update`).
 #[instrument(skip(prog_track, settings))]
 #[allow(clippy::too_many_arguments)]
 async fn hard_link_entry_fd(
@@ -413,6 +419,19 @@ pub async fn link(
             Arc::new(parent.into_tree())
         }
     };
+    // One `listxattr` on the source ROOT per run — a constant, not a per-entry probe — warning that
+    // a source root carrying an ACL is about to be linked by settings that drop it. Files count as
+    // already safe whatever `f:acl` says: a hard-linked destination file IS the source inode, so
+    // its ACL cannot be dropped (and must never be written through, which is why `f:acl` applies
+    // only on rlink's real copy path).
+    crate::safedir::warn_if_root_acl_unpreserved_at(
+        &src_parent,
+        src_name,
+        src,
+        true,
+        settings.preserve.dir.acl,
+    )
+    .await;
     // In dry-run we never touch the destination, so we don't open its parent at all (it may not
     // even exist). `dst_parent == None` is the signal throughout the walk that destination
     // operations must be skipped. In a real link, reuse the strict-validated parent, or open it
@@ -1100,7 +1119,7 @@ async fn link_dir_entry(
         summary: base,
         is_fresh: child_is_fresh,
         we_created,
-        restore_owner,
+        reused_lock,
     } = match copy::resolve_dst_dir(
         prog_track,
         dst_parent,
@@ -1141,7 +1160,7 @@ async fn link_dir_entry(
         dst_path,
         we_created,
         child_is_fresh,
-        restore_owner,
+        reused_lock,
         settings,
         Summary {
             copy_summary: base,
@@ -1174,7 +1193,7 @@ async fn link_dir_contents(
     dst_path: &std::path::Path,
     we_created_this_dir: bool,
     is_fresh: bool,
-    restore_owner: Option<(u32, u32)>,
+    reused_lock: Option<crate::safedir::ReusedDirLock>,
     settings: &Settings,
     base: Summary,
 ) -> Result<Summary, Error> {
@@ -1645,15 +1664,25 @@ async fn link_dir_contents(
     let metadata_result = match dst_dir {
         Some(dst_dir) => {
             let meta_dir = update_dir.unwrap_or(src_dir);
-            // for a reused directory locked down under strict mode, restore the original owner
-            // component-wise then apply source metadata (see set_reused_dir_metadata_fd — no
-            // transient window hands the directory to a hostile prior owner); None for fresh dirs.
+            // for a reused directory locked down under strict mode, put back the ACLs the
+            // lockdown stripped and restore the original owner component-wise, then apply source
+            // metadata (see set_reused_dir_metadata_fd — no transient window hands the directory to
+            // a hostile prior owner); None for fresh dirs.
             async {
                 let preserve_meta = meta_dir.meta().await?;
+                // the ACLs come from the same fd as the metadata, and only when `d:acl` was asked
+                // for — rlink creates its directories fresh, so unlike files there is no shared
+                // inode and applying them is ordinary destination work.
+                let preserve_acls = if settings.preserve.dir.acl {
+                    Some(meta_dir.read_acls().await?)
+                } else {
+                    None
+                };
                 crate::safedir::set_reused_dir_metadata_fd(
                     &settings.preserve,
                     &preserve_meta,
-                    restore_owner,
+                    preserve_acls.as_ref(),
+                    reused_lock,
                     dst_dir,
                 )
                 .await

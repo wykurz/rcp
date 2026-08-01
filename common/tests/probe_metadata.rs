@@ -43,6 +43,37 @@ fn install_sink() -> std::sync::Arc<CollectingSink> {
     sink
 }
 
+/// Spend the process-global source-root ACL probe before any counting starts.
+///
+/// The probe (`safedir::warn_if_root_acl_unpreserved_at`) fires at most once per PROCESS and costs
+/// 2 source-side metadata ops. Under a runner that puts several tests in ONE process — plain
+/// `cargo test`, which is what `nix build`'s `checkPhase` runs — whichever `copy`/`link` test
+/// happens to go first pays those 2 and the rest do not, so any per-entry accounting here is
+/// otherwise order-dependent and fails nondeterministically. (Under nextest every test gets its own
+/// process and they all pay, which is why `just ci` stayed green while `nix build .#rcp-all` did
+/// not.) Spending it up front, in every process, makes these counts describe the WALK alone.
+///
+/// The probe's own cost is owned by `root_acl_probe_cost.rs`, which needs a process where it has
+/// not yet been spent — hence a separate integration binary rather than a test in here.
+async fn spend_root_acl_probe() {
+    let tmp = make_tempdir("spend_acl_probe").await;
+    let src = tmp.join("src");
+    tokio::fs::create_dir_all(&src).await.expect("create src");
+    tokio::fs::write(src.join("f.txt"), b"x")
+        .await
+        .expect("write file");
+    copy::copy(
+        &PROGRESS,
+        &src,
+        &tmp.join("dst"),
+        &default_copy_settings(),
+        &preserve::preserve_all(),
+        true,
+    )
+    .await
+    .expect("warm-up copy succeeds");
+}
+
 fn default_copy_settings() -> copy::Settings {
     copy::Settings {
         dereference: false,
@@ -101,6 +132,7 @@ async fn rm_emits_one_metadata_sample_per_tree_entry() {
 #[tokio::test]
 async fn copy_emits_one_metadata_sample_per_tree_entry() {
     let _guard = SINK_GUARD.lock().await;
+    spend_root_acl_probe().await;
     let sink = install_sink();
     let tmp = make_tempdir("copy_samples").await;
     let src = tmp.join("src");
@@ -129,6 +161,9 @@ async fn copy_emits_one_metadata_sample_per_tree_entry() {
     //   - 3 files:   child(stat) + open_file_read(fstat)           × 3         = 6
     //   (read_entries / getdents is deliberately unprobed; each directory's applied metadata is
     //    read from its own opened fd via `Dir::meta` — read-side fidelity, one fstat per dir)
+    //
+    // The source-root ACL probe is deliberately NOT in this number: `spend_root_acl_probe` above
+    // burns it first, so this counts the walk alone. Its cost is owned by `root_acl_probe_cost.rs`.
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Source),
         16,
@@ -318,6 +353,7 @@ async fn link_update_path_emits_probes_for_update_tree() {
     // the 4 preserve probes per update file (× 3 = 12) and the src
     // count would drop by the per-file `symlink_metadata` (× 3 = 3).
     let _guard = SINK_GUARD.lock().await;
+    spend_root_acl_probe().await;
     let sink = install_sink();
     let tmp = make_tempdir("link_update_samples").await;
     let src = tmp.join("src");
@@ -391,6 +427,7 @@ async fn link_update_path_emits_probes_for_update_tree() {
 #[tokio::test]
 async fn link_emits_one_metadata_sample_per_tree_entry() {
     let _guard = SINK_GUARD.lock().await;
+    spend_root_acl_probe().await;
     let sink = install_sink();
     let tmp = make_tempdir("link_samples").await;
     let src = tmp.join("src");
@@ -426,6 +463,10 @@ async fn link_emits_one_metadata_sample_per_tree_entry() {
     //   - 3 files:   child(stat) only — a hard link reads the src via `linkat` (no open_file_read)
     //                                                  × 3             = 3
     //   (each directory's applied metadata is read from its own opened fd via `Dir::meta`)
+    //
+    // The source-root ACL probe is burned by `spend_root_acl_probe` above, so it is not counted
+    // here. rlink asks about DIRECTORY roots only: a hard-linked destination file IS the source
+    // inode, so its ACL cannot be dropped.
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Source),
         13,

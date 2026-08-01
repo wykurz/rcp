@@ -58,6 +58,8 @@ API documentation for the command-line tools is available on docs.rs:
 - [Congestion Control](docs/congestion_control.md) - Adaptive metadata throttling design and tuning
 - [Testing](docs/testing.md) - Test infrastructure and Docker multi-host testing
 - [TOCTTOU Vulnerabilities](docs/tocttou.md) - TOCTTOU threat model and fd-based hardening
+- [POSIX ACLs](docs/acls.md) - what `acl` preserves, why it is opt-in, and the two ways a copy can
+  widen
 
 # Examples
 
@@ -72,6 +74,17 @@ Copy while preserving metadata, overwrite/update destination if it already exist
 ```fish
 > rcp <foo> <bar> --preserve-settings=all --progress --summary --overwrite
 ```
+
+`all` covers uid, gid, timestamps and the full mode, but **not POSIX ACLs** -- detecting an ACL
+costs an extra syscall on every entry, so it is opt-in. Use `all+acl` where a source ACL is
+security-relevant:
+
+```fish
+> rcp <foo> <bar> --preserve-settings=all+acl --progress --summary --overwrite
+```
+
+See [POSIX ACLs](docs/acls.md) for the model, the measured costs, and the two ways a copy can end up
+more permissive than its source.
 
 Remote copy from one host to another:
 
@@ -93,6 +106,8 @@ Copy from local machine to remote host and preserve metadata:
 ```fish
 > rcp /local/path host:/remote/path --progress --summary --preserve-settings=all
 ```
+
+(`all+acl` works the same way for a remote copy; the ACL probe runs on the source host.)
 
 Remote copy with automatic rcpd deployment:
 
@@ -154,12 +169,28 @@ ignored. Roughly equivalent to: `rsync -a --link-dest=<foo> <bar> <baz>`.
 Control which metadata is preserved with `--preserve-settings`:
 
 ```fish
+# preserve everything except POSIX ACLs (uid, gid, time, full mode)
+> rlink <foo> <bar> --preserve-settings=all
+
+# ...and POSIX ACLs too
+> rlink <foo> <bar> --preserve-settings=all+acl
+
 # preserve nothing (directories get default mode, no uid/gid/time)
 > rlink <foo> <bar> --preserve-settings=none
 
 # custom: preserve uid, gid, and time on files and dirs
 > rlink <foo> <bar> --preserve-settings="f:uid,gid,time,0777 d:uid,gid,time,0777 l:uid,gid,time"
+
+# custom, including ACLs on files and directories
+> rlink <foo> <bar> --preserve-settings="f:uid,gid,time,acl,7777 d:uid,gid,time,acl,7777 l:uid,gid,time"
 ```
+
+**`all` does not preserve POSIX ACLs.** Detecting an ACL costs an extra syscall on every entry --
+there is no bit in `stat` for it -- so it is opt-in via the `+acl` preset modifier or the per-type
+`acl` attribute. Two combinations are rejected at parse time rather than silently ignored: `l:acl`
+(the kernel has no symlink ACL) and `acl` alongside a mode mask that narrows the rwx bits (an ACL
+*is* the permission state, so the two contradict each other). See [POSIX ACLs](docs/acls.md) for the
+model, the measured costs, and the two ways a copy can end up more permissive than its source.
 
 Hard-linked files always share metadata with their source via the inode -- preserve settings affect
 directories and symlinks in all modes, and additionally files that are copied (not linked) during

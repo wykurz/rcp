@@ -76,8 +76,11 @@
 //!
 //! ## Metadata Preservation
 //!
-//! - `--preserve`: Preserve all metadata (owner, group, mode, timestamps)
-//! - `--preserve-settings`: Fine-grained control over what to preserve
+//! - `--preserve`: Preserve owner, group, mode and timestamps (deprecated; use
+//!   `--preserve-settings=all`). Does NOT preserve POSIX ACLs — detecting one costs a syscall on
+//!   every entry, so ACLs are opt-in.
+//! - `--preserve-settings`: Fine-grained control over what to preserve, including `all+acl` and the
+//!   per-type `acl` attribute for POSIX ACLs
 //!
 //! ## Error Handling
 //!

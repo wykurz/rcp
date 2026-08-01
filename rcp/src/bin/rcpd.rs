@@ -362,6 +362,7 @@ where
             dest_cert_fingerprint,
             filter,
             dry_run,
+            capture,
         } => {
             // build settings with filter from MasterHello
             let settings = args.to_copy_settings(filter, dry_run, &tcp_config)?;
@@ -372,6 +373,7 @@ where
                 &src,
                 &dst,
                 &settings,
+                capture,
                 &tcp_config,
                 args.bind_ip.as_deref(),
                 cert_key.as_ref(),
@@ -617,9 +619,30 @@ async fn async_main(
     let rcpd_result = if let Some(watchdog) = stdin_watchdog {
         // stdin is available - monitor for disconnection
         // CANCEL SAFETY: both branches are cancel-safe. `run_operation` is a
-        // high-level future that can be dropped safely. When the watchdog
-        // branch wins (stdin closed), we exit(1) immediately so there's no
-        // concern about partial state from the cancelled `run_operation`.
+        // high-level future that can be dropped safely.
+        //
+        // The watchdog branch must NOT `process::exit` here, and that is a
+        // correctness requirement rather than tidiness. `run_operation` owns the
+        // `DirectoryTracker`, whose `pending_directories` holds a
+        // `common::safedir::ReusedDirLock` for every destination directory
+        // currently locked down under `--require-toctou-safe`. Each of those
+        // guards holds the ONLY copy of that directory's original default ACL —
+        // the lockdown removed it from the filesystem — and puts it back in its
+        // `Drop`. `process::exit` does not unwind, so exiting from inside this
+        // branch would terminate with `run_operation`'s future still alive and
+        // permanently destroy every one of those ACLs.
+        //
+        // This is not an exotic path: it is the normal consequence of the master
+        // going away, INCLUDING a master `--fail-early` abort (master exits, SSH
+        // closes, our stdin hits EOF, watchdog fires). So it returns a Failure
+        // instead. The `select!` then drops `run_operation`'s future, the tail
+        // below maps Failure to `Err`, and `common::run` drops the tokio runtime
+        // — which drops every remaining task, and with them every `Arc` clone of
+        // the tracker — before `main` exits 1. The guards fire during that
+        // runtime drop rather than racing it.
+        //
+        // The older comment here said there was no point cleaning up because the
+        // master is dead. That predates the lockdown; there is a point now.
         tokio::select! {
             result = run_operation(args.clone(), master_send_stream, master_recv_stream, cert_key.clone()) => {
                 match result {
@@ -635,14 +658,19 @@ async fn async_main(
                 }
             }
             _ = watchdog => {
-                // stdin closed - master disconnected, exit immediately
-                // no point in cleanup since master is dead and can't receive results
+                // stdin closed - master disconnected. Wind down through the normal
+                // return path (see CANCEL SAFETY above) rather than exiting here,
+                // so armed reused-directory lockdowns restore their ACLs.
                 tracing::error!(
                     "Master (rcp) disconnected - stdin closed. \
                      This usually means the master process was killed or the SSH connection was terminated. \
-                     Exiting immediately."
+                     Shutting down."
                 );
-                std::process::exit(1);
+                remote::protocol::RcpdResult::Failure {
+                    error: "master (rcp) disconnected - stdin closed".to_string(),
+                    summary: common::copy::Summary::default(),
+                    runtime_stats: common::collect_runtime_stats(),
+                }
             }
         }
     } else {

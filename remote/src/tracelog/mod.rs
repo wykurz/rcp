@@ -76,6 +76,16 @@ pub async fn run_receiver<R: tokio::io::AsyncRead + Unpin + Send>(
                     tracing::Level::ERROR => {
                         tracing::error!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
                     }
+                    // A forwarded NOTICE keeps its own target instead of the blanket `remote` one.
+                    // Re-emitting it as `remote` would hand it to the master's filter, which at the
+                    // default verbosity passes only `error` and `rcp::notice` — so the notice would
+                    // survive the rcpd's filter, cross the wire, and then be dropped one step from
+                    // the user. That is the exact gap the dedicated target exists to close, and it
+                    // is invisible unless a test runs a real remote copy. The `remote::<role>::`
+                    // provenance stays in the message text, as for every other forwarded line.
+                    tracing::Level::WARN if target == common::NOTICE_TARGET => {
+                        tracing::warn!(target: common::NOTICE_TARGET, "[{}] {}: {}", timestamp_str, remote_target, message)
+                    }
                     tracing::Level::WARN => {
                         tracing::warn!(target: "remote", "[{}] {}: {}", timestamp_str, remote_target, message)
                     }

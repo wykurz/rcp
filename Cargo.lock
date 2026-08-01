@@ -1928,6 +1928,7 @@ dependencies = [
  "assert_cmd",
  "bytesize",
  "clap",
+ "libc",
  "predicates",
  "rcp-tools-common",
  "tempfile",

@@ -149,7 +149,10 @@ jobs:
     - name: Install musl toolchain deps
       run: |
         sudo apt-get update
-        sudo apt-get install -y musl-tools pkg-config
+        # strace: `all_does_not_pay_the_acl_probe` counts a traced rcp run's ACL-probe syscalls.
+        # The point of making ACLs opt-in is that the default path costs nothing, and only a
+        # syscall count can show that; an outcome check would pass while the cost crept back.
+        sudo apt-get install -y musl-tools pkg-config strace
         sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
 
     - name: Setup SSH for localhost
@@ -219,7 +222,10 @@ jobs:
     - name: Install musl toolchain deps
       run: |
         sudo apt-get update
-        sudo apt-get install -y musl-tools pkg-config
+        # strace: `all_does_not_pay_the_acl_probe` counts a traced rcp run's ACL-probe syscalls.
+        # The point of making ACLs opt-in is that the default path costs nothing, and only a
+        # syscall count can show that; an outcome check would pass while the cost crept back.
+        sudo apt-get install -y musl-tools pkg-config strace
         sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
 
     - name: Setup SSH for localhost

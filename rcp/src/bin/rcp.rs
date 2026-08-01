@@ -108,7 +108,8 @@ struct Args {
     #[arg(short = 'L', long, help_heading = "Copy options")]
     dereference: bool,
 
-    /// [DEPRECATED: use --preserve-settings=all] Preserve file metadata: file owner, group, setuid, setgid, mtime, atime and mode
+    /// [DEPRECATED: use --preserve-settings=all] Preserve file metadata: file owner, group, setuid, setgid, mtime, atime and mode.
+    /// Does NOT preserve POSIX ACLs - use --preserve-settings=all+acl for those.
     #[arg(short, long, help_heading = "Copy options")]
     preserve: bool,
 
@@ -116,9 +117,13 @@ struct Args {
     ///
     /// Presets: "all" preserves uid, gid, time, and full mode (0o7777);
     /// "none" uses minimal defaults (no uid/gid/time, mode mask 0o0777).
+    /// Neither preserves POSIX ACLs: detecting an ACL costs an extra syscall on every
+    /// entry, so it is opt-in via the "+acl" modifier, e.g. "all+acl".
     /// Custom format: "`<type1>:<attributes1> <type2>:<attributes2>` ..." where
     /// `<type>` is one of f (file), d (directory), l (symlink), and `<attributes>` is
-    /// a comma-separated list of uid, gid, time, or a 4-digit octal mode mask.
+    /// a comma-separated list of uid, gid, time, acl, or a 4-digit octal mode mask.
+    /// "acl" is not valid for symlinks, and cannot be combined with a mode mask that
+    /// narrows the rwx bits.
     /// If specified, the --preserve flag is ignored.
     ///
     /// Example: "f:uid,gid,time,0777 d:uid,gid,time,0777 l:uid,gid,time"
@@ -755,6 +760,9 @@ async fn run_rcpd_master(
                 dest_cert_fingerprint: dest_rcpd.conn_info.fingerprint,
                 filter,
                 dry_run: args.dry_run,
+                // derived from the SAME `preserve` the destination is handed below, so what the
+                // source reads and what the destination applies cannot drift apart.
+                capture: remote::protocol::ExtendedMetadataCapture::for_preserve(preserve),
             })
             .await?;
     }

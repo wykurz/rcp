@@ -24,6 +24,8 @@ path = "src/main.rs"
 
 [dev-dependencies]
 assert_cmd = "2"
+# the ACL tests write `system.posix_acl_*` xattrs directly; `setfacl` is not in the dev shell
+libc = "0.2"
 predicates = "3"
 tempfile = "3"
 

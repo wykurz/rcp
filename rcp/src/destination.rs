@@ -447,9 +447,15 @@ async fn process_single_file(
     prog.bytes_copied.add(file_header.size);
     // metadata errors happen after all bytes consumed - stream is at clean boundary.
     // apply through the file's OWN fd (fd-relative): no path re-resolution of dst.
+    // The source's ACLs travel in the wire header, so they are handed over unconditionally: an
+    // all-`None` value means the source had none and the destination's must be CLEARED, not left
+    // alone (an inherited default ACL would otherwise widen this file past its source). The applier
+    // ignores them entirely unless `f:acl` was requested, and the source only reads them when the
+    // master asked — from the same `preserve` this applier uses, so the two cannot disagree.
     common::safedir::set_file_metadata_fd(
         preserve,
         &file_header.metadata,
+        Some(&file_header.metadata.acls()),
         file.as_fd(),
         common::Side::Destination,
     )
@@ -1015,9 +1021,9 @@ enum DirectoryCreateResult {
     /// directory was created by us (new), with its open fd
     Created(Arc<Dir>),
     /// directory already existed (reused), with its open fd and, under strict operand resolution,
-    /// the original `(uid, gid)` to restore at completion (`None` in the default path — see
-    /// [`common::safedir::lockdown_reused_dir`])
-    AlreadyExisted(Arc<Dir>, Option<(u32, u32)>),
+    /// what the lockdown must undo at completion — the original owner and the original ACLs
+    /// (`None` in the default path — see [`common::safedir::lockdown_reused_dir`])
+    AlreadyExisted(Arc<Dir>, Option<common::safedir::ReusedDirLock>),
     /// skipped due to --ignore-existing (destination is not a directory)
     Skipped,
     /// failed to create directory
@@ -1122,12 +1128,13 @@ async fn create_directory(
                     .open_dir(dst_name)
                     .await
                     .with_context(|| format!("cannot open existing directory {dst:?}"))?;
-                // strict-only lockdown: take over the reused directory and restrict it to 0o700 for
-                // the copy's duration, restoring the original owner at completion (no-op / None in
-                // the default path). A recheck or EPERM failure propagates as this directory's
-                // create error — the caller marks it Failed (or aborts under --fail-early), so no
-                // child is written into an unsecured directory.
-                let restore_owner = common::safedir::lockdown_reused_dir(&dir, &dst_handle)
+                // strict-only lockdown: take over the reused directory, restrict it to 0o700 and
+                // strip both its ACLs for the copy's duration, restoring the original owner and
+                // ACLs at completion (no-op / None in the default path). A recheck, EPERM or ACL
+                // failure propagates as this directory's create error — the caller marks it Failed
+                // (or aborts under --fail-early), so no child is written into an unsecured
+                // directory, nor one whose default ACL children would still inherit.
+                let reused_lock = common::safedir::lockdown_reused_dir(&dir, &dst_handle)
                     .await
                     .with_context(|| {
                         format!("cannot secure reused destination directory {dst:?}")
@@ -1135,7 +1142,7 @@ async fn create_directory(
                 prog.directories_unchanged.inc();
                 Ok(DirectoryCreateResult::AlreadyExisted(
                     Arc::new(dir),
-                    restore_owner,
+                    reused_lock,
                 ))
             } else if settings.ignore_existing {
                 // not a directory but ignore_existing is set - skip the subtree
@@ -1362,15 +1369,19 @@ async fn process_control_stream(
                 // failure (vs an --ignore-existing skip).
                 let was_created = matches!(create_result, DirectoryCreateResult::Created(_));
                 let create_failed = matches!(create_result, DirectoryCreateResult::Failed);
-                // the original owner to restore at completion — Some only for a strict-mode locked
-                // reused directory (see create_directory / lockdown_reused_dir); None otherwise.
-                let restore_owner = match &create_result {
-                    DirectoryCreateResult::AlreadyExisted(_, restore_owner) => *restore_owner,
-                    _ => None,
+                // split the resolved directory from what its lockdown must undo at completion — the
+                // latter is Some only for a strict-mode locked reused directory (see
+                // create_directory / lockdown_reused_dir). Destructured by value rather than copied
+                // out first: it carries the directory's original ACL bytes and is not `Copy`.
+                let resolved = match create_result {
+                    DirectoryCreateResult::Created(dir) => Some((dir, None)),
+                    DirectoryCreateResult::AlreadyExisted(dir, reused_lock) => {
+                        Some((dir, reused_lock))
+                    }
+                    DirectoryCreateResult::Skipped | DirectoryCreateResult::Failed => None,
                 };
-                match create_result {
-                    DirectoryCreateResult::Created(dir)
-                    | DirectoryCreateResult::AlreadyExisted(dir, _) => {
+                match resolved {
+                    Some((dir, reused_lock)) => {
                         // build the manifest only for a REUSED dir under overwrite/ignore-existing;
                         // a freshly-created dir is empty and feature-off needs no manifest.
                         let existing =
@@ -1394,12 +1405,12 @@ async fn process_control_stream(
                                 entry_count,
                                 keep_if_empty,
                                 existing,
-                                restore_owner,
+                                reused_lock,
                             )
                             .await
                             .context("Failed to add directory to tracker")?;
                     }
-                    DirectoryCreateResult::Skipped | DirectoryCreateResult::Failed => {
+                    None => {
                         // mark as failed - descendants will be skipped.
                         // for Skipped (--ignore-existing), this is intentional and not an error.
                         // for Failed, push the synthetic "not a directory" error when

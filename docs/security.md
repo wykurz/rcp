@@ -191,6 +191,11 @@ User
   path fails closed. Path *policy* — and keeping prefix directories non-writable by lesser-
   privileged actors — remains the caller's responsibility; see the
   [Scope of TOCTOU safety](tocttou.md#scope-of-toctou-safety) section.
+- **POSIX ACLs, unless requested**: a copy that does not ask for `acl` reproduces the source's mode
+  and drops its ACL, and a source ACL entry narrower than `other` acts as a deny in effect — so
+  dropping it grants what the source withheld. `--require-toctou-safe` does not close this; it
+  contains the *destination* tree's inherited ACLs, which is a different bug. Pair it with
+  `--preserve-settings=all+acl` where source ACLs are security-relevant. See [POSIX ACLs](acls.md).
 
 On Linux, the default (non-`-L`) local hardening is implemented through a single shared safe-walk
 driver (`common/src/walk_driver.rs`): `rcp` (copy), `rchm`, and `rrm` are `WalkVisitor`
