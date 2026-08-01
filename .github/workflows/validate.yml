@@ -22,7 +22,7 @@ jobs:
   lint-and-docs:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ inputs.ref || github.sha }}
 
@@ -93,7 +93,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint-and-docs
     steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ inputs.ref || github.sha }}
 
@@ -127,7 +127,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint-and-docs
     steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ inputs.ref || github.sha }}
 
@@ -197,7 +197,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint-and-docs
     steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ inputs.ref || github.sha }}
 
@@ -267,7 +267,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint-and-docs
     steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ inputs.ref || github.sha }}
 
@@ -283,12 +283,12 @@ jobs:
         sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
 
     - name: Install just
-      uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
+      uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2
       with:
         tool: just
 
     - name: Install cargo-nextest
-      uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
+      uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2
       with:
         tool: cargo-nextest@0.9.85
 
@@ -349,7 +349,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint-and-docs
     steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ inputs.ref || github.sha }}
 
@@ -366,7 +366,7 @@ jobs:
   nix:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         ref: ${{ inputs.ref || github.sha }}
 
