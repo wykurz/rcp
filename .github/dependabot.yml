@@ -18,6 +18,14 @@ updates:
         patterns:
           - "*"
 
+  # SCHEDULED FOR REMOVAL, deliberately still here. `.github/workflows/cargo-update.yml` replaces
+  # this ecosystem with an MSRV-aware job, but that job cannot run until its GitHub App exists --
+  # it fails its own preflight without one. Deleting this block before then would leave the
+  # repository with no cargo dependency updates at all, so the two are not in fact racing yet.
+  #
+  # Remove this whole entry, `ignore` list included, once the App is configured and one dispatched
+  # run has been compared against a Dependabot pull request. Keeping both until that comparison is
+  # possible is the point: it is much easier to diff them while both still exist.
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:

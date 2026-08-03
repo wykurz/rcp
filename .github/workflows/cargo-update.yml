@@ -1,0 +1,344 @@
+name: Cargo update
+
+# Monthly MSRV-aware dependency update, replacing Dependabot's cargo ecosystem.
+#
+# Dependabot has no MSRV awareness for cargo (dependabot-core#5423): it always offers the newest
+# version, so a crate that raises its `rust-version` above ours reddened the `msrv` job and blocked
+# every other bump in the batch until someone added an `ignore` entry by hand. `just update-deps`
+# reads `rust-version` instead, in both halves (cargo upgrade for manifests, resolver 3 for the
+# lockfile), so the constraint is derived on every run rather than maintained as a list -- and a
+# hold-back releases itself once the MSRV is raised.
+#
+# ── Why three jobs ─────────────────────────────────────────────────────────────────────────────
+# `cargo upgrade`/`cargo update`/`cargo check` all execute code from the dependencies being
+# upgraded -- build scripts and proc macros run at check time -- and that code has not been
+# reviewed by anyone. It must therefore never share a machine with a write credential:
+#
+#   preflight  no checkout. Reads the App secret only to confirm it is set, so a misconfigured
+#              repository fails in seconds instead of after a 20-minute build.
+#   build      runs the untrusted dependency code. No credentials at all, and the checkout keeps
+#              none. Its only output is a patch, uploaded as an artifact.
+#   publish    a fresh runner and a fresh checkout: nothing the dependency code touched exists
+#              here. Only now is the App token minted, and only this job ever holds it.
+#
+# Doing the build and the push in one job is not enough even if the token is minted last: a build
+# script can drop a `.git/hooks/pre-commit` into the shared checkout, and `git commit` would then
+# run it with the token in the environment. A discarded filesystem removes that whole class.
+#
+# ── One-time setup, outside this repository ────────────────────────────────────────────────────
+# This needs a GitHub App because pull requests opened with the default GITHUB_TOKEN do NOT
+# trigger workflow runs; with `main` protected by required checks, such a PR could never be
+# merged. Create an App with Contents: Read and write + Pull requests: Read and write, install it
+# on this repository, then set:
+#   vars.DEPS_APP_ID              -- the App's ID
+#   secrets.DEPS_APP_PRIVATE_KEY  -- the App's generated private key (PEM)
+
+on:
+  schedule:
+    # 06:00 UTC on the 1st, matching the monthly cadence the cargo ecosystem used
+    - cron: "0 6 1 * *"
+  workflow_dispatch:
+
+# Least privilege: the workflow's own token needs nothing beyond reading the repo. Write access
+# comes from the short-lived App token minted in `publish`, which is also what makes the resulting
+# pull request trigger CI.
+permissions:
+  contents: read
+
+concurrency:
+  group: cargo-update
+  cancel-in-progress: false
+
+jobs:
+  # No checkout, so no dependency code exists in this job -- the App secret is only ever referenced
+  # on a runner with nothing untrusted on it. Without this, a missing App fails deep inside the
+  # token action with "Input required and not supplied: app-id", which says nothing useful.
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check the App credentials are configured
+      env:
+        APP_ID: ${{ vars.DEPS_APP_ID }}
+        PRIVATE_KEY: ${{ secrets.DEPS_APP_PRIVATE_KEY }}
+      run: |
+        if [ -z "$APP_ID" ] || [ -z "$PRIVATE_KEY" ]; then
+          echo "::error::This workflow needs a GitHub App: set vars.DEPS_APP_ID and" \
+               "secrets.DEPS_APP_PRIVATE_KEY. See the one-time setup notes at the top of" \
+               ".github/workflows/cargo-update.yml."
+          exit 1
+        fi
+
+  build:
+    needs: preflight
+    runs-on: ubuntu-latest
+    outputs:
+      has-changes: ${{ steps.diff.outputs.has-changes }}
+      sha: ${{ steps.base.outputs.sha }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+    # `ref` is explicit because a `workflow_dispatch` run uses whatever branch or tag was picked in
+    # the UI. Without it, dispatching from a topic branch would upgrade *that* branch's manifests
+    # and then open the result against main, publishing unrelated commits as a dependency update.
+    #
+    # `persist-credentials: false` keeps the default token out of .git/config, where the dependency
+    # code compiled below would be able to read it. Nothing in this job authenticates anyway.
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.event.repository.default_branch }}
+        persist-credentials: false
+
+    # Record exactly which commit the update is built and MSRV-checked against. `publish` checks
+    # this out rather than resolving the branch again: the default branch can advance during the
+    # ~20 minutes this job takes, and applying the patch to a newer tree would publish a
+    # combination nothing ever validated -- precisely the red automated PR this workflow exists to
+    # avoid. Basing the branch on a slightly older commit is normal for a pull request; CI tests
+    # the merge result, so a genuinely incompatible pairing is still caught, out in the open.
+    - name: Record the base commit
+      id: base
+      run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+    # Run through the devshell so cargo and cargo-edit are the versions pinned by flake.lock --
+    # the same ones `just update-deps` uses locally, so a maintainer can reproduce this run.
+    - name: Update dependencies
+      run: |
+        nix develop --no-update-lock-file --command \
+          just update-deps --report-out "$RUNNER_TEMP/msrv-report.md"
+
+    # Captured BEFORE anything compiles. `cargo upgrade` and `cargo update` only read the registry
+    # and rewrite manifests -- neither runs a build script -- whereas the MSRV check below compiles
+    # the workspace and therefore executes build scripts and proc macros from the very versions
+    # just selected. Taking the patch first means the artifact `publish` trusts was produced while
+    # no dependency code had run, so a build script cannot rewrite the manifests, the lockfile or
+    # the report into something that was never verified.
+    #
+    # Restricting the diff to the manifests and the lockfile also leaves behind anything else in
+    # the working tree, rather than letting it travel to the job that holds the token.
+    - name: Collect the update as a patch
+      id: diff
+      run: |
+        set -euo pipefail
+        git diff -- Cargo.toml '*/Cargo.toml' Cargo.lock > "$RUNNER_TEMP/update.patch"
+        if [ -s "$RUNNER_TEMP/update.patch" ]; then
+          echo "has-changes=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has-changes=false" >> "$GITHUB_OUTPUT"
+          echo "No dependency changes."
+        fi
+
+    # Uploaded before anything compiles, not merely captured before it. A build script runs as the
+    # runner user and can write anywhere the runner can, RUNNER_TEMP included -- so a patch sitting
+    # on disk while the MSRV check runs could be rewritten underneath us and then uploaded as if it
+    # were the verified one. Once the artifact has left the machine it is out of reach, which is
+    # what actually makes `publish` able to trust it.
+    - name: Upload the patch
+      id: upload
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: cargo-update
+        path: |
+          ${{ runner.temp }}/update.patch
+          ${{ runner.temp }}/msrv-report.md
+        if-no-files-found: error
+        retention-days: 7
+
+    # Resolver 3's rust-version handling is a preference, not a constraint: where a requirement
+    # admits no MSRV-compatible version, it picks an incompatible one rather than failing. So the
+    # lockfile produced above can still exceed the MSRV, which would open a pull request that
+    # fails the `msrv` job -- the exact regression this automation exists to prevent. Check here
+    # instead, so the failure lands on this job with the reason, and no such PR is created.
+    #
+    # Last, so that the only step which executes dependency code can no longer affect anything
+    # `publish` consumes. It still gates publication: a failure fails this job, and `publish`
+    # needs it, so the uploaded artifact is simply never used.
+    - name: Verify the update still builds on the MSRV
+      run: |
+        if ! nix develop --no-update-lock-file --command just msrv; then
+          echo "::error::The updated dependencies do not build on the MSRV. Cargo's resolver falls" \
+               "back to an incompatible version when a requirement admits no compatible one, so" \
+               "this needs a human: pin the offending crate, or raise rust-version."
+          exit 1
+        fi
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    # Every one of these has a silent failure mode if it arrives empty or malformed, and each
+    # silently does the WRONG thing rather than nothing: an empty `artifact-ids` makes
+    # download-artifact fetch every artifact in the run, an empty `ref` makes checkout quietly take
+    # the default one, and a `has-changes` that is neither "true" nor "false" falls through to the
+    # branch that closes a pull request. Job outputs can go missing for dull reasons (a step that
+    # failed to write one, a rename) as well as interesting ones, so check them once, up front,
+    # before anything consumes them.
+    - name: Validate the build job's outputs
+      env:
+        ARTIFACT_ID: ${{ needs.build.outputs.artifact-id }}
+        BUILD_SHA: ${{ needs.build.outputs.sha }}
+        HAS_CHANGES: ${{ needs.build.outputs.has-changes }}
+      run: |
+        set -euo pipefail
+        bad=0
+        case "$HAS_CHANGES" in
+          true | false) ;;
+          *) echo "::error::has-changes is '$HAS_CHANGES', expected true or false"; bad=1 ;;
+        esac
+        case "$BUILD_SHA" in
+          [0-9a-f]*) [ "${#BUILD_SHA}" -eq 40 ] || { echo "::error::sha is not a full commit id: '$BUILD_SHA'"; bad=1; } ;;
+          *) echo "::error::sha is missing or malformed: '$BUILD_SHA'"; bad=1 ;;
+        esac
+        if [ "$HAS_CHANGES" = "true" ]; then
+          case "$ARTIFACT_ID" in
+            "" | *[!0-9]*) echo "::error::artifact-id is missing or malformed: '$ARTIFACT_ID'"; bad=1 ;;
+          esac
+        fi
+        [ "$bad" -eq 0 ]
+
+    # A fresh checkout on a fresh runner: no build script has ever run here, so .git/hooks and
+    # .git/config are the ones GitHub just cloned.
+    #
+    # Pinned to the commit `build` validated, not to the branch tip, so the tree pushed below is
+    # exactly the one the MSRV check passed on. The pull request still targets the branch, so it
+    # merges forward normally.
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ needs.build.outputs.sha }}
+        persist-credentials: false
+
+    # Fetched by ID, not by name. Artifacts are immutable once finalised, so substituting content
+    # means deleting and re-uploading -- which yields a *different* id. Asking for the exact id the
+    # upload returned therefore fails closed: a replacement is not found rather than silently
+    # trusted. That matters because the MSRV check runs on the same runner afterwards, and code it
+    # compiles could otherwise reach the artifact API with the run's own credentials.
+    - name: Download the patch
+      if: needs.build.outputs.has-changes == 'true'
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        artifact-ids: ${{ needs.build.outputs.artifact-id }}
+        path: ${{ runner.temp }}/artifact
+
+    # Applied before the token exists, and filtered to the paths this workflow is allowed to
+    # touch: `--include` makes `git apply` drop every other path in the patch, so a poisoned diff
+    # cannot reach outside the manifests and the lockfile.
+    - name: Apply the update
+      if: needs.build.outputs.has-changes == 'true'
+      run: |
+        set -euo pipefail
+        git apply \
+          --include='Cargo.toml' --include='*/Cargo.toml' --include='Cargo.lock' \
+          "$RUNNER_TEMP/artifact/update.patch"
+
+        unexpected=$(git status --porcelain -- . \
+          ':(exclude)Cargo.toml' ':(exclude)*/Cargo.toml' ':(exclude)Cargo.lock')
+        if [ -n "$unexpected" ]; then
+          echo "::error::The patch touched files outside the manifests and lockfile:"
+          echo "$unexpected"
+          exit 1
+        fi
+
+    - name: Mint a GitHub App token
+      id: app-token
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      with:
+        app-id: ${{ vars.DEPS_APP_ID }}
+        private-key: ${{ secrets.DEPS_APP_PRIVATE_KEY }}
+        # Ask for exactly what the push and the pull request need. Omitting these mints a token
+        # carrying every permission the installation happens to hold, so the setup notes above
+        # would be the only thing keeping this narrow -- and a permission added to the App later,
+        # for any reason, would silently widen this token too.
+        permission-contents: write
+        permission-pull-requests: write
+
+    - name: Open or update the pull request
+      env:
+        GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        BASE: ${{ github.event.repository.default_branch }}
+        BRANCH: automated/cargo-update
+        HAS_CHANGES: ${{ needs.build.outputs.has-changes }}
+      run: |
+        set -euo pipefail
+
+        # Belt and braces on top of the fresh checkout: never run a repository hook while holding
+        # the token, whatever put one there.
+        git config core.hooksPath /dev/null
+
+        # `gh pr list --head` matches on ref name alone and cannot be scoped to an owner, so a fork
+        # carrying a branch of the same name shows up in the results -- and the branch name here is
+        # guessable. Since the two callers close and edit whatever comes back, that is somebody
+        # else's pull request being retracted. The REST endpoint does accept an owner-qualified
+        # head, so ask it directly and always operate by number.
+        find_our_pr() {
+          gh api \
+            --method GET "/repos/${GITHUB_REPOSITORY}/pulls" \
+            -f "head=${GITHUB_REPOSITORY_OWNER}:${BRANCH}" \
+            -f "base=${BASE}" \
+            -f state=open \
+            --jq '.[0].number // empty'
+        }
+
+        if [ "$HAS_CHANGES" != "true" ]; then
+          # An earlier run's pull request may still be open, proposing an update that no longer
+          # applies -- everything in it has since landed some other way. Leaving it would let a
+          # stale, CI-green PR sit there looking mergeable, so retract it.
+          stale=$(find_our_pr)
+          if [ -n "$stale" ]; then
+            echo "Closing stale automation PR #$stale."
+            gh pr close "$stale" \
+              --comment "Superseded: the scheduled run found no dependency changes left to make." \
+              --delete-branch
+          else
+            echo "No dependency changes and no open automation PR; nothing to do."
+          fi
+          exit 0
+        fi
+
+        # The checkout deliberately kept no credentials, so give git one now, for the push only.
+        # The token is a registered secret, so it is masked if it ever reaches a log.
+        git remote set-url origin \
+          "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+        # Attribute the commit to the App, using the bot account's numeric id as GitHub requires
+        # for a noreply address to link correctly.
+        bot_id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+        git config user.name "${APP_SLUG}[bot]"
+        git config user.email "${bot_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+        git checkout -b "$BRANCH"
+        git add -- Cargo.toml '*/Cargo.toml' Cargo.lock
+        git commit -m "Update cargo dependencies" \
+          -m "Generated by the cargo-update workflow via 'just update-deps'."
+
+        # The branch is disposable and always rebuilt from the default branch, so force is the point.
+        git push --force origin "$BRANCH"
+
+        {
+          echo "Monthly dependency update from \`just update-deps\`, which reads \`rust-version\`"
+          echo "so that no MSRV-breaking version is ever *preferred*. Cargo can still fall back to"
+          echo "one where a requirement admits no compatible version, so this branch was checked"
+          echo "with \`just msrv\` before the pull request was opened. Reproduce locally with:"
+          echo
+          echo '```'
+          echo "just update-deps -n"
+          echo '```'
+          echo
+          if [ -s "$RUNNER_TEMP/artifact/msrv-report.md" ]; then
+            cat "$RUNNER_TEMP/artifact/msrv-report.md"
+          else
+            echo "Nothing is currently held back by the MSRV."
+          fi
+        } > "$RUNNER_TEMP/pr-body.md"
+
+        existing=$(find_our_pr)
+        if [ -n "$existing" ]; then
+          echo "Updating existing pull request #$existing."
+          gh pr edit "$existing" --body-file "$RUNNER_TEMP/pr-body.md"
+        else
+          gh pr create \
+            --base "$BASE" \
+            --head "$BRANCH" \
+            --title "Update cargo dependencies" \
+            --body-file "$RUNNER_TEMP/pr-body.md"
+        fi
