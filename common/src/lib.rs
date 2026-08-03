@@ -677,9 +677,15 @@ where
                 tokio::time::timeout(std::time::Duration::from_secs(1), handle).await
             });
         }
+        // Bounded shutdown instead of a plain drop, which WAITS for every running blocking-pool
+        // closure. A blocking syscall parked on dead media (an NFS readdir that never returns, the
+        // stdin watchdog's read(2) that only unblocks when sshd notices) would otherwise keep the
+        // process alive indefinitely after the operation itself already failed and reported.
+        // Async tasks are still dropped normally — destructors (reused-directory ACL rollbacks
+        // included) run before the wait begins; only stuck blocking threads are abandoned to
+        // process exit once the deadline passes.
+        runtime.shutdown_timeout(std::time::Duration::from_secs(10));
         res
-        // runtime drops here, cancelling all spawned tasks (control
-        // loop, adapter, replenishers) and releasing their permits.
     };
     // Clear process-wide state so a second `run()` in the same process
     // starts on a clean slate. Without this, a later run inherits the

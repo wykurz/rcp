@@ -982,6 +982,50 @@ fn test_remote_overwrite_directory_with_directory() {
     assert_eq!(summary.bytes_copied, 24); // "content1" (8) + "content2" (8) + "content3" (8)
 }
 
+/// A reused destination directory's `DirectoryCreated` runs from a per-directory task — it must
+/// first build the overwrite manifest (`remote_protocol.md` §2.3) — while symlink/subdirectory
+/// children arrive as Pass-1 control messages that do NOT wait for that trigger. A source
+/// directory holding only such children can therefore have every entry processed while the
+/// manifest is still being enumerated, and completing it then would send `DestinationDone` and
+/// close the control send stream out from under the directory's own queued announce: the copy
+/// did everything right and still exited 1 with a broken-pipe/closed-stream announce failure.
+/// Completion is gated on the announce (`DirectoryTracker::mark_announced`); this test pins the
+/// end-to-end symptom.
+///
+/// The window is deterministic by SIZE, not sleeps or luck: enumerating + stat'ing the reused
+/// root's 20k pre-existing entries takes orders of magnitude longer than the millisecond in
+/// which the destination processes the source's entire Pass-1 (one symlink plus
+/// `DirStructureComplete`) — before the gate, that always reached `DestinationDone` first.
+#[test]
+fn test_remote_overwrite_reused_dir_completes_only_after_announce() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // symlink target: a real file OUTSIDE the copied root, so the tree holds NO file entries —
+    // files are requested via the Pass-2 trigger and would mask the race by keeping the
+    // directory's count open until after the announce
+    let target = src_dir.path().join("outside.txt");
+    create_test_file(&target, "symlink target", 0o644);
+    let src_root = src_dir.path().join("tree");
+    std::fs::create_dir(&src_root).unwrap();
+    std::os::unix::fs::symlink(&target, src_root.join("link")).unwrap();
+    // reused destination root, pre-populated so the manifest build is slow relative to Pass-1
+    let dst_root = dst_dir.path().join("tree");
+    std::fs::create_dir(&dst_root).unwrap();
+    for i in 0..20_000 {
+        std::fs::File::create(dst_root.join(format!("pre{i:05}"))).unwrap();
+    }
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    let output =
+        run_rcp_and_expect_success(&["--overwrite", "--summary", &src_remote, &dst_remote]);
+    let dst_link = dst_root.join("link");
+    assert!(dst_link.is_symlink(), "the symlink must have been copied");
+    assert_eq!(std::fs::read_link(&dst_link).unwrap(), target);
+    let summary = parse_summary_from_output(&output).expect("Failed to parse summary");
+    assert_eq!(summary.symlinks_created, 1);
+    assert_eq!(summary.directories_unchanged, 1); // the reused root
+}
+
 #[test]
 fn test_remote_overwrite_file_with_directory() {
     require_local_ssh();
@@ -2619,9 +2663,11 @@ fn test_remote_auto_deploy_rcpd() {
     let semantic_version = version_json["semantic"]
         .as_str()
         .expect("Missing semantic version");
+    // the deployed filename carries the wire revision too (see ProtocolVersion::cache_tag)
+    let deployed_tag = semantic_version.replace('+', "-");
     // clean up any previously deployed rcpd for this version to force deployment
     let cache_dir = cache_bin_dir(home.path());
-    let deployed_rcpd = cache_dir.join(format!("rcpd-{}", semantic_version));
+    let deployed_rcpd = cache_dir.join(format!("rcpd-{}", deployed_tag));
     if deployed_rcpd.exists() {
         eprintln!(
             "Removing existing deployed rcpd to force re-deployment: {}",
@@ -2728,8 +2774,9 @@ fn test_remote_auto_deploy_reuses_cached_binary() {
     let semantic_version = version_json["semantic"]
         .as_str()
         .expect("Missing semantic version");
+    let deployed_tag = semantic_version.replace('+', "-");
     let cache_dir = cache_bin_dir(home.path());
-    let deployed_rcpd = cache_dir.join(format!("rcpd-{}", semantic_version));
+    let deployed_rcpd = cache_dir.join(format!("rcpd-{}", deployed_tag));
     let first_mtime = std::fs::metadata(&deployed_rcpd)
         .expect("deployed rcpd should exist")
         .modified()
@@ -2835,7 +2882,12 @@ fn test_remote_auto_deploy_cleanup_old_versions() {
     let old_version = cache_dir.join(format!("rcpd-{}", &old_versions[1]));
     let newer_version = cache_dir.join(format!("rcpd-{}", &old_versions[2]));
     let newest_old_version = cache_dir.join(format!("rcpd-{}", &old_versions[3]));
-    let current_version_path = cache_dir.join(format!("rcpd-{}", current_version));
+    // the deployed filename carries the wire revision (ProtocolVersion::cache_tag)
+    let current_version_path = cache_dir.join(format!(
+        "rcpd-{}-w{}",
+        current_version,
+        common::version::WIRE_REVISION
+    ));
     // check which versions remain
     let oldest_exists = oldest_version.exists();
     let old_exists = old_version.exists();
@@ -2926,7 +2978,8 @@ fn test_remote_auto_deploy_on_version_mismatch() {
 
     // clean up any previously deployed rcpd for this version to force deployment
     let cache_dir = cache_bin_dir(home.path());
-    let deployed_rcpd = cache_dir.join(format!("rcpd-{}", semantic_version));
+    let deployed_tag = semantic_version.replace('+', "-");
+    let deployed_rcpd = cache_dir.join(format!("rcpd-{}", deployed_tag));
     if deployed_rcpd.exists() {
         match std::fs::remove_file(&deployed_rcpd) {
             Ok(()) => {}

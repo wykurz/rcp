@@ -40,11 +40,14 @@
             binutils = pkgs.pkgsCross.musl64.buildPackages.binutils;
           } else null;
 
-        # Build inputs needed for the Rust project
-        buildInputs = with pkgs; lib.optionals stdenv.isDarwin [
-          darwin.apple_sdk.frameworks.Security
-          darwin.apple_sdk.frameworks.SystemConfiguration
-        ];
+        # Build inputs needed for the Rust project. Deliberately empty on every platform: nixpkgs
+        # removed the `darwin.apple_sdk.frameworks.*` compatibility stubs this used to list for
+        # Security/SystemConfiguration (evaluating them now throws, turning `nix flake check
+        # --all-systems` unconditionally red) — the Darwin stdenv ships the SDK itself and this
+        # project needs no framework beyond it. See the "Darwin legacy frameworks" section of the
+        # nixpkgs manual. Kept as a binding (rather than deleted) so the package/dev-shell
+        # definitions below keep one obvious place to add a real build input.
+        buildInputs = [ ];
 
         nativeBuildInputs =
           [ rustToolchain pkgs.pkg-config ]
@@ -100,6 +103,18 @@
           "--skip=no_setid_dry_run_reports_but_does_not_clear_bits"
           "--skip=no_setid_respects_filter_and_per_type_scope"
           "--skip=no_setid_retains_sticky_and_clears_setgid_on_directory"
+          # write POSIX ACLs onto the sandbox build dir, whose filesystem does not hold
+          # them (setxattr system.posix_acl_* -> EOPNOTSUPP); reading/probing is fine,
+          # so only the writers are skipped
+          "--skip=safedir::tests::guarded_default_acl_write_is_skipped_once_disarmed"
+          "--skip=strict_reuse_rlink_restores_a_reused_dirs_acls"
+          "--skip=lockdown_reused_dir_never_loses_the_default_acl_when_cancelled"
+          "--skip=strict_direct_file_into_default_acl_parent_carries_no_acl"
+          "--skip=aborted_strict_finalize_removes_the_default_acl_it_installed"
+          "--skip=strict_finalize_installs_source_default_acl_and_keeps_it"
+          "--skip=create_after_reused_dir_rollback_strips_inherited_acl"
+          "--skip=cancelled_strict_finalize_restores_the_destinations_default_acl"
+          "--skip=strict_make_dir_under_default_acl_parent_strips_both_inherited_acls"
           # ACL tests that additionally set setuid/setgid, for the same EPERM reason
           "--skip=safedir::tests::set_file_metadata_fd_applies_a_setuid_source_mode_and_its_acl"
           "--skip=safedir::tests::set_file_metadata_fd_keeps_the_file_owner_only_when_the_acl_fails"
@@ -269,6 +284,16 @@
                 pkgs.gdb
                 pkgs.just
                 pkgs.llvmPackages.bintools
+                pkgs.tokio-console
+
+                # Additional useful tools
+                pkgs.gh
+                pkgs.pkg-config
+              ]
+              ++ buildInputs
+              # Linux-only tools: neither package evaluates on Darwin, so listing them
+              # unconditionally breaks `nix flake check --all-systems` at evaluation time.
+              ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
                 # `getfacl`/`setfacl`, for reading a POSIX ACL by hand when debugging the ACL
                 # tests. Nothing depends on it: the fixtures write the xattrs directly, precisely
                 # so the suite needs no runtime tool.
@@ -277,13 +302,7 @@
                 # syscalls: the point of making ACLs opt-in is that the default path costs
                 # nothing, which no outcome-only check can show. `just test` fails without it.
                 pkgs.strace
-                pkgs.tokio-console
-
-                # Additional useful tools
-                pkgs.gh
-                pkgs.pkg-config
               ]
-              ++ buildInputs
               ++ pkgs.lib.optionals (muslTools != null) [
                 muslTools.gcc
                 muslTools.binutils

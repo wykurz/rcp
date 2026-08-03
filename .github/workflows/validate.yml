@@ -82,6 +82,12 @@ jobs:
     - name: Check TLS handshake timeouts
       run: ./scripts/check-tls-handshake-timeout.sh
 
+    # Runs BEFORE the linter it tests, for the same reason as the error-logging harness above: the
+    # fixtures pin both directions, so a rule that quietly stops matching fails here rather than
+    # letting an unconfigured connection land below.
+    - name: Test the TCP socket configuration linter
+      run: ./scripts/test-check-tcp-socket-config.sh
+
     - name: Check TCP socket configuration
       run: ./scripts/check-tcp-socket-config.sh
 

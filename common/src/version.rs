@@ -31,6 +31,21 @@ pub struct ProtocolVersion {
     pub git_hash: Option<String>,
 }
 
+/// The remote wire-schema revision, carried INSIDE [`ProtocolVersion::semantic`] as semver build
+/// metadata (`0.38.0+w1`) rather than as a separate field — deliberately, for symmetry: the
+/// compatibility check is a string equality on `semantic`, so a build predating this constant
+/// rejects a current one exactly as a current build rejects it ("0.38.0" != "0.38.0+w1"), no
+/// matter which side was upgraded first. A separate field would protect only the new side — an
+/// old parser ignores unknown JSON fields and would accept the changed schema.
+///
+/// Bump this on ANY wire-visible change to `remote/src/protocol` — a message added, removed, or
+/// reshaped; an enum variant added; a field's meaning changed — whenever the crate version does
+/// not also change. The crate version alone cannot tell two 0.38.0-dev builds apart, so a stale
+/// same-version `rcpd` (on `PATH` or in the deploy cache) would otherwise pass the compatibility
+/// check and then fail — or misbehave — mid-copy when the schemas diverge. Revision 1 covers the
+/// 0.38.0-dev `WireAcls` reshape.
+pub const WIRE_REVISION: u32 = 1;
+
 impl ProtocolVersion {
     /// Get the current protocol version
     ///
@@ -39,10 +54,17 @@ impl ProtocolVersion {
     /// may be absent if the build was done without git available.
     pub fn current() -> Self {
         Self {
-            semantic: env!("CARGO_PKG_VERSION").to_string(),
+            semantic: format!("{}+w{}", env!("CARGO_PKG_VERSION"), WIRE_REVISION),
             git_describe: option_env!("RCP_GIT_DESCRIBE").map(String::from),
             git_hash: option_env!("RCP_GIT_HASH").map(String::from),
         }
+    }
+
+    /// The crate version alone — `semantic` with the `+w<revision>` build metadata stripped.
+    /// This is what user-facing remedies quote (`cargo install --version <this>`); the wire
+    /// revision is not a cargo version.
+    pub fn crate_version(&self) -> &str {
+        self.semantic.split('+').next().unwrap_or(&self.semantic)
     }
 
     /// Check if this version is compatible with another version
@@ -71,8 +93,21 @@ impl ProtocolVersion {
     /// ```
     pub fn is_compatible_with(&self, other: &Self) -> bool {
         // exact version match for now
-        // in the future, we might allow minor version skew (e.g., 0.22.x compatible with 0.22.y)
+        // in the future, we might allow minor version skew (e.g., 0.22.x compatible with 0.22.y).
+        // `semantic` embeds the wire revision as build metadata (see WIRE_REVISION), so this one
+        // string equality also rejects two same-release builds straddling a wire change — in BOTH
+        // directions, including a peer built before the revision existed.
         self.semantic == other.semantic
+    }
+
+    /// The deployed-binary cache filename component for this version: the semantic string with
+    /// its `+` made filename-friendly (`0.38.0+w1` → `0.38.0-w1`).
+    ///
+    /// One string for BOTH the discovery probe and the deploy target, so an incompatible
+    /// same-release cached binary is never found (its filename carries the old revision) and a
+    /// fresh deploy never overwrites a binary another wire revision still resolves to.
+    pub fn cache_tag(&self) -> String {
+        self.semantic.replace('+', "-")
     }
 
     /// Get a human-readable version string
@@ -193,6 +228,32 @@ mod tests {
             git_hash: None,
         };
         assert_eq!(v2.display(), "0.22.0 (v0.21.1-7-g644da27)");
+    }
+
+    #[test]
+    fn wire_revision_mismatch_is_incompatible_in_both_directions() {
+        let a = ProtocolVersion::current();
+        assert!(a.is_compatible_with(&a.clone()));
+        assert!(
+            a.semantic.contains("+w"),
+            "the wire revision must ride inside `semantic`, where even a pre-revision peer's              string comparison sees it"
+        );
+        let mut b = a.clone();
+        b.semantic = format!("{}+w{}", a.crate_version(), WIRE_REVISION + 1);
+        assert!(
+            !a.is_compatible_with(&b),
+            "same release with a different wire schema must be rejected"
+        );
+        // a build predating the revision reports the bare crate version; the SAME string
+        // equality both sides have always used rejects it — symmetry is the point
+        let legacy = ProtocolVersion {
+            semantic: a.crate_version().to_string(),
+            git_describe: None,
+            git_hash: None,
+        };
+        assert!(!a.is_compatible_with(&legacy));
+        assert!(!legacy.is_compatible_with(&a));
+        assert_eq!(a.cache_tag(), a.semantic.replace('+', "-"));
     }
 
     #[test]

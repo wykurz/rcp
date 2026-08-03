@@ -66,12 +66,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Under `--require-toctou-safe` the *destination* side is contained as well, which is a different
   bug from the above and is closed at a different price: every directory rcp creates has both ACLs
-  removed after the `mkdirat` (two syscalls per directory, none per file — stripping the default ACL
-  stops the inheritance chain for the whole subtree), and every reused directory has its default ACL
-  snapshotted and restored around the copy. The two flags deliberately do not imply each other —
-  strict mode contains inherited *destination* ACLs but does not preserve the *source's* — so pair
-  them where source ACLs are security-relevant; the root warning says so under that flag. One
-  consequence is intended and documented: under strict mode without `d:acl`, a freshly created
+  removed after the `mkdirat` (two syscalls per directory, none per file beneath a directory rcp
+  created or locked down — stripping the default ACL stops the inheritance chain for the whole
+  subtree; the one exception is a direct FILE operand, whose ambient parent rcp neither creates nor
+  locks down, paying one strip per operand — see docs/acls.md), and every reused directory has its
+  default ACL snapshotted and restored around the copy. The two flags deliberately do not imply each
+  other — strict mode contains inherited *destination* ACLs but does not preserve the *source's* —
+  so pair them where source ACLs are security-relevant; the root warning says so under that flag.
+  One consequence is intended and documented: under strict mode without `d:acl`, a freshly created
   destination directory ends with no ACL even where its parent's default ACL would have given it
   one. Containment beats inheritance; `d:acl` is the escape.
 
@@ -90,16 +92,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   all three processes waiting forever. The budget arms two kernel mechanisms, because neither covers
   the other's case: TCP keepalive (`SO_KEEPALIVE` with `TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT`)
   probes an *idle* connection, which is the master-awaiting-a-result case and the control streams
-  generally, while `TCP_USER_TIMEOUT` bounds how long *unacknowledged* data may stay outstanding,
-  which is the source→destination data pool — keepalive never fires there, and the kernel would
-  otherwise retransmit for roughly 15 minutes (`tcp_retries2`) before giving up. The keepalive
-  sub-values are derived from the single budget rather than exposed separately (idle at half of it,
-  probes every twelfth of it, six of them), so they cannot be set into an inconsistent relationship.
-  The default detects a vanished host in about two minutes while surviving any stall shorter than
-  that; widen it on a flaky WAN, or pass `0` to disable both mechanisms. The value is propagated to
-  both `rcpd` processes — without that the master would recover while both `rcpd`s kept hanging,
-  which looks fixed and is worse than the symmetric hang it replaces. Applying an option is best
-  effort: one that a platform or a container policy refuses is logged rather than failing the copy.
+  generally, while `TCP_USER_TIMEOUT` bounds how long *unacknowledged* data may stay outstanding —
+  on **control** connections only (see the later entry in this release): on the data pool it cannot
+  tell a dead peer from a throttled receiver that has legitimately stopped reading, so a data
+  connection relies on keepalive when idle and on the kernel's retransmission limit (roughly 15
+  minutes, `tcp_retries2`) mid-transfer. The keepalive sub-values are derived from the single budget
+  rather than exposed separately (idle at half of it, probes every twelfth of it, six of them), so
+  they cannot be set into an inconsistent relationship. The default detects a vanished host in about
+  two minutes while surviving any stall shorter than that; widen it on a flaky WAN, or pass `0` to
+  disable both mechanisms. The value is propagated to both `rcpd` processes — without that the
+  master would recover while both `rcpd`s kept hanging, which looks fixed and is worse than the
+  symmetric hang it replaces. Applying an option is best effort: one that a platform or a container
+  policy refuses is logged rather than failing the copy.
 
   `TCP_USER_TIMEOUT` is applied to **control** connections only (master↔`rcpd`, and the
   source↔destination control stream) — never to the pooled data connections. It cannot distinguish a
@@ -481,6 +485,96 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is indistinguishable from a clean file. The fixture that pinned that guard is replaced — it was a
   raw string the lexer did not understand *yet*, so it would have gone on passing while proving
   nothing — by a call whose parens genuinely never balance before the end of the file.
+- `rcpd` now watches the master control connection for the entire operation, not just until the
+  hello. The master sends nothing on that connection after `MasterHello` — it holds it open to await
+  the final result — so the socket's only remaining signals are an EOF (the master exited or
+  aborted) and a transport error, which is how the keepalive and `TCP_USER_TIMEOUT` configured on it
+  surface a master HOST that vanished. Nothing read the socket, so the kernel marking it dead
+  cancelled nothing: with the master gone, the source and destination `rcpd`s kept copying to each
+  other — or waiting on each other — indefinitely, because the stdin watchdog only fires when SSH
+  itself notices the death, which a network partition can delay far past `--remote-keepalive-sec`
+  (and with stdin unavailable it never fires at all). Either signal now cancels the operation
+  through the same teardown the stdin watchdog uses, reused-directory ACL restores included. The
+  watchdog stands down once the final result is committed to the master: it used to keep racing
+  through the stream close as well, so a master that consumed both results and closed its side first
+  could make `rcpd` report a finished copy as a master loss and exit 1 — the close now runs after
+  the guarded region, best-effort.
+- The remote destination no longer stalls its control receive loop while it builds a reused
+  directory's `--overwrite`/`--ignore-existing` manifest. The build — enumerating and stat'ing up to
+  `--overwrite-manifest-max-entries` (default 5,000,000) pre-existing entries — ran inline between
+  two reads of the control socket, so for its whole duration the source's messages went unread, the
+  receive window closed, and after `--remote-keepalive-sec` of zero-window stall the
+  `TCP_USER_TIMEOUT` on the source's control socket terminated an otherwise healthy copy (Linux
+  counts data stuck behind a zero window toward that timeout; the peer answering window probes does
+  not reset it). Each manifest is now built in a per-directory task (one build at a time, so peak
+  memory is unchanged) that then sends the directory's manifest chunks and its `DirectoryCreated`
+  itself; the chunks stay contiguous with their trigger, other directories' messages may interleave
+  around them — the source already accumulates chunks keyed by destination path — and the receive
+  loop keeps draining the socket throughout. Message processing for other directories no longer
+  queues behind one huge enumeration, either. A directory's completion now also waits for its own
+  announce: symlink and subdirectory children arrive over the control stream without waiting for the
+  Pass-2 trigger, so a reused directory holding only those could complete — and send
+  `DestinationDone`, closing the control send stream — while its announce task was still
+  enumerating, failing a healthy copy with a broken-pipe announce error (and handing the source a
+  `DestinationDone` with a `Directory` still unanswered). And when the source tears down mid-copy,
+  outstanding manifest builds are aborted rather than drained: a queued build would only scan a
+  complete directory to fail its announce against the closed peer, which under `-L` (where the
+  source's dir-fd budget does not bound them) could stall failure shutdown without bound. The `-L`
+  walk itself now carries an outstanding-directory **credit** mirroring the hardened walk's dir-fd
+  budget — one credit per unacknowledged `Directory`, returned by its
+  `DirectoryCreated`/`DirectorySkipped`, closed on dispatch exit with the same typed marker — so a
+  slow ack path (one large reused-directory manifest) can no longer let the path-based walk register
+  an entire tree at the destination (an open fd, stored metadata, and possibly a queued manifest per
+  directory, bounded by nothing but tree size).
+- Four corrections to the (unreleased) strict-mode ACL containment and its rollback, each closing a
+  way the destination could end with ACL state that came from neither the source nor its own past: a
+  **direct file operand** copied into a parent carrying a default ACL kept the inherited entries
+  (inert at the owner-only create mode, activated by the final `chmod` re-deriving the ACL mask — a
+  strict copy of a plain `0640` file granted a named user read access its source never did; files
+  created in the one directory kind rcp neither creates nor locks down now strip the inherited ACL
+  inside the create itself); a remote source directory that **could not be opened** encoded its
+  unknown ACLs the same as "has none", which the destination applied as an authoritative clear,
+  permanently stripping a reused destination directory's access and default ACLs on an
+  already-failing copy (the wire now distinguishes `Unknown` from `Captured`, and unknown means the
+  destination's ACLs are left alone, a locked directory's original default ACL restored); the
+  reused-directory lockdown guard could not roll back a **partially-applied source default ACL** on
+  a directory that originally had none, and a finalize ACL write detached on the blocking pool could
+  land *after* the guard's abort-restore and silently undo it (the guard now has an explicit
+  armed/disarmed state that stays armed through the final re-stat verification — a cancelled or
+  verify-rejected finalize rolls the directory back rather than keeping the source's default ACL,
+  and armed-with-no-original removes what a partial finalize installed — and every finalize write to
+  the guarded attribute is serialized against the rollback, skipped if the restore already ran); and
+  `make_dir`'s create → re-open → strip sequence spanned separate cancellation points, so a
+  `--fail-early` sibling abort could abandon an rcp-created directory still carrying the
+  destination's inherited default ACL, indistinguishable from a user directory on any later run
+  (creation, open and sanitization now share one uncancellable blocking closure — which is also why
+  the congestion controller now sees one `MkDir` probe per created directory rather than a `MkDir`
+  and a `Stat`; a directory whose open or strip fails is removed rather than left behind).
+- Same-release builds with different remote wire schemas now reject each other **in both
+  directions**: `rcpd --protocol-version` carries a wire-schema revision inside the semantic version
+  itself, as semver build metadata (`0.38.0+w1`), so the exact string equality every build —
+  including ones predating the revision — has always used for compatibility fails closed no matter
+  which side was upgraded first. The revision is bumped on any wire-visible protocol change that the
+  crate version does not capture (a stale same-version `rcpd` on `PATH` or in the deploy cache
+  previously passed the check and failed mid-copy), the deploy-cache filename carries it
+  (`rcpd-0.38.0-w1`), and the version-mismatch error explains the `+w` component with a remedy that
+  quotes the plain crate version cargo can actually install.
+- `scripts/check-tcp-socket-config.sh` now confines establishing and accepting TCP connections to
+  configured helpers in `remote/src/lib.rs`: raw `TcpStream::connect`/`.accept()` are forbidden
+  everywhere else, and inside that file every connecting or accepting function must itself call
+  `configure_tcp_socket` (a per-file mention count previously passed a file with one configured and
+  one unconfigured connection — and in the funnel file, whose declaration and tests inflate the
+  count, it would have admitted several). The four call sites outside the funnel moved into new
+  `connect_tcp_data`/`accept_tcp_control`/`accept_tcp_data` helpers beside the existing
+  `connect_tcp_control`. Also `scripts/check-error-logging.sh` now carries a **multi-line raw format
+  string** into the call it is collecting, so a chain-losing `{}` in one is reported; its body was
+  previously dropped wholesale (correct for classification, where literal prose must not arm
+  anything, but the placeholders of a format string live in exactly that body). Fixtures pin both
+  directions.
+- The Nix flake evaluates on Darwin again, un-breaking `nix flake check --all-systems` in CI:
+  nixpkgs removed the `darwin.apple_sdk.frameworks.*` compatibility stubs the flake listed (the
+  Darwin stdenv now ships the SDK itself, and the project needs no framework beyond it), and the
+  `acl`/`strace` dev-shell tools are Linux-only and are now gated accordingly.
 
 ## [0.37.0] - 2026-07-15
 

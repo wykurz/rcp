@@ -132,21 +132,24 @@ copy. "Do nothing when the source has no ACL" is not correct — and that single
 Widening direction 2 is a **privileged-copy** concern, not an everyday-correctness one, and it is
 treated that way. There are three levels, and no cost is imposed on the default path:
 
-| mode                                                | direction 2 contained?                                                        | cost                                                                                 |
-| --------------------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| default (neither `acl` nor `--require-toctou-safe`) | no — documented, see [Known holes](#known-holes)                              | none                                                                                 |
-| `acl` requested                                     | yes, repaired at finalize: the applier's clear step removes inherited entries | the [per-entry probe](#why-acl-is-opt-in)                                            |
-| `--require-toctou-safe`                             | yes, prevented at creation                                                    | 2 syscalls per created **directory**, none per file (a reused one pays more — below) |
+| mode                                                | direction 2 contained?                                                        | cost                                                                                                                                          |
+| --------------------------------------------------- | ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| default (neither `acl` nor `--require-toctou-safe`) | no — documented, see [Known holes](#known-holes)                              | none                                                                                                                                          |
+| `acl` requested                                     | yes, repaired at finalize: the applier's clear step removes inherited entries | the [per-entry probe](#why-acl-is-opt-in)                                                                                                     |
+| `--require-toctou-safe`                             | yes, prevented at creation                                                    | 2 syscalls per created **directory**, none per file beneath it (a reused one pays more, and a direct **file** operand pays one strip — below) |
 
 The strict-mode containment is the cheap one because stripping a directory's ACLs once stops the
 chain for everything created beneath it: a child of a stripped directory comes out with no ACL at
 all, with no per-file work.
 
-The "2 syscalls" is the cost for a directory rcp **creates** — one `fremovexattr` per ACL after the
-`mkdirat`. A **reused** directory costs more, because its own ACL has to survive the copy: a
+The "2 syscalls" is the cost for a directory rcp **creates** — one `fremovexattr` per ACL inside the
+creation call. A **reused** directory costs more, because its own ACL has to survive the copy: a
 `listxattr` plus an `fgetxattr` to snapshot the default ACL and an `fremovexattr` to strip it at
 lockdown, then an `fsetxattr` to put it back at finalize. Still per-directory, and still nothing per
-file.
+file — with one narrow exception: a file created **directly in the ambient operand parent** (a
+direct file operand's destination, the one directory rcp neither creates nor locks down) pays a
+single `fremovexattr` inside its create, because no directory-level strip ever ran there. That is
+one syscall per *operand*, not per file of a tree.
 
 ## Why `acl` is opt-in
 
@@ -364,22 +367,25 @@ or it will fail at `fsetxattr`.
 
 ## Remote copies
 
-The wire carries the same opaque bytes: `protocol::Metadata` gained `acl_access` and `acl_default`,
-and `MasterHello::Source` gained a `capture: ExtendedMetadataCapture { file_acl, dir_acl }` field so
-the source knows whether to probe at all. Without it the source — which is told `preserve` by nobody
-— would have to probe unconditionally, landing the per-entry cost on every remote copy including
-ones that do not want ACLs.
+The wire carries the same opaque bytes: `protocol::Metadata` gained an `acls: WireAcls` field — an
+enum distinguishing `Captured { access, default }` (authoritative, including the "has none" case)
+from `Unknown` (no ACL information at all: capture off, or the source could not read them) — and
+`MasterHello::Source` gained a `capture: ExtendedMetadataCapture { file_acl, dir_acl }` field so the
+source knows whether to probe at all. Without it the source — which is told `preserve` by nobody —
+would have to probe unconditionally, landing the per-entry cost on every remote copy including ones
+that do not want ACLs.
 
 [remote_protocol.md §2.5](remote_protocol.md) is the authority: which messages carry which ACL, why
-`None` means CLEAR, and how a failed read is accounted. Do not duplicate it here.
+a `Captured` `None` means CLEAR while `Unknown` means the destination's ACLs are left untouched, and
+how a failed read is accounted. Do not duplicate it here.
 
 One case is worth naming because getting it wrong would have been actively destructive. The remote
 `--dereference` (`-L`) directory walk holds **no directory fd**, so it cannot read a directory's ACL
-from the fd whose contents it enumerated. Sending `None` would not merely have failed to carry the
-source's ACLs — it would have **stripped the destination's**. So that walk opens the directory by
-path instead, after enumeration succeeds. That is the same concession `-L` already makes everywhere
-else (it is documented as not TOCTOU-hardened), and it is the honest answer rather than a silently
-destructive one.
+from the fd whose contents it enumerated. Reporting "no ACL" would not merely have failed to carry
+the source's ACLs — an authoritative absence is an instruction to CLEAR, so it would have **stripped
+the destination's**. So that walk opens the directory by path instead, after enumeration succeeds.
+That is the same concession `-L` already makes everywhere else (it is documented as not
+TOCTOU-hardened), and it is the honest answer rather than a silently destructive one.
 
 ## `--require-toctou-safe` containment
 
@@ -387,23 +393,25 @@ The invariant:
 
 > Under `--require-toctou-safe`, no destination entry that rcp **creates** carries an ACL entry that
 > did not come from its source. Every destination directory rcp creates or reuses is prevented from
-> passing an inherited ACL on, so nothing created beneath one can inherit.
+> passing an inherited ACL on — and in the one directory rcp writes into without creating or reusing
+> it (the ambient parent of a direct operand), the created entry itself is scrubbed instead.
 
 The "that rcp creates" is load-bearing, not throat-clearing. A **reused** directory is one that was
 already there, and rcp was not asked to change it: it keeps its own access ACL throughout, and the
 default ACL it had before the copy is put back at the end. The invariant is about what the copy
 *writes*, not about scrubbing a destination tree.
 
-That covers widening direction 2 completely, because the only way for an entry to escape is to live
-in a directory rcp neither creates nor reuses — which by construction means rcp is not writing
-there. Two sites, because direction 2 reaches through both:
+One directory kind is left: the **ambient operand parent** — the pre-existing directory a *direct*
+operand is written into (`rcp file.txt existing-dir/`), which rcp neither creates nor reuses as a
+copy destination. rcp does write there — exactly one entry — so containment needs three sites:
 
-**Freshly created directories.** After `mkdirat`, both `system.posix_acl_access` and
-`system.posix_acl_default` are removed. Two syscalls per directory and **none per file**: stripping
-the default ACL stops the inheritance chain for the whole subtree beneath it. There is a window
-between the `mkdirat` and the strip, but it is not exploitable — the directory is at `0o700`, and
-the kernel intersects inherited entries with the create mode, leaving `m::---` so every named entry
-grants nothing.
+**Freshly created directories.** The `mkdirat`, the re-open, and the removal of both
+`system.posix_acl_access` and `system.posix_acl_default` all run inside **one blocking closure**,
+which runs to completion once submitted: no cancellation (a `--fail-early` sibling abort dropping
+the future) can abandon a created-but-unsanitized directory, and a directory whose open or strip
+fails is removed (best-effort, it is empty) rather than left carrying inherited ACLs an
+indistinguishable rerun would then faithfully "restore". Two syscalls per directory and **none per
+file** beneath one: stripping the default ACL stops the inheritance chain for the whole subtree.
 
 **Reused directories.** The lockdown that restricts a reused destination directory to `0o700` for
 the copy's duration already neuters its *access* ACL (the `chmod` rewrites `MASK`), but a `chmod`
@@ -412,9 +420,26 @@ lockdown therefore also **snapshots and removes the default ACL** for the copy's
 it back at finalize. Its access ACL is deliberately left alone: rcp was not asked to change a
 directory that already existed.
 
-At finalize the directory's default ACL is resolved one of three ways, in order: with `d:acl` on,
-the **source's** ACL is set or cleared over it and the snapshot is discarded; otherwise the snapshot
-is restored; otherwise there was none and nothing happens.
+**Direct files in the ambient parent.** A file created there has no sanitized directory above it, so
+`create_file` removes the inherited access ACL **inside the creation closure** (files carry no
+default ACL, so one attribute suffices). Without it the inherited entries sit inert under the
+owner-only create mode — and the final chmod to the source mode re-derives `ACL_MASK` from the group
+bits and activates them: a strict copy of a plain `0640` file would grant a named user effective
+read access its source never did. Files created beneath rcp-created or locked directories skip this
+(the chain was already broken above them), so the cost is per direct operand, not per file.
+
+At finalize a locked directory's default ACL is resolved through the lockdown guard, one of two
+ways: with `d:acl` on, the **source's** default ACL is installed (nothing to write when the source
+has none — the lockdown already left the directory bare, which is the correct end state); otherwise
+the snapshot is restored (nothing to do when there was none). The guard stays **armed** through
+every remaining fallible step — including the final re-stat verification and every cancellation
+point up to the successful return, so a cancelled or verify-rejected finalize rolls back rather than
+keeping the source's ACL — and armed even when the directory originally had no default ACL, because
+the rollback then means *removing* whatever a partial finalize installed, not leaving it. Every
+finalize write to the guarded attribute is **serialized against the guard's rollback**: finalize
+runs on a blocking pool that cannot be cancelled, so a dropped future detaches its write, and an
+unserialized write could land *after* the `Drop` rollback and silently undo it. A write that finds
+the guard already disarmed is skipped instead.
 
 Restoring a snapshot runs **first**, unwinding the lockdown in the reverse of the order it was
 applied — ACL removed last, so restored first; then the owner; then the mode. Two reasons, neither

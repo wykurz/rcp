@@ -588,7 +588,7 @@ async fn discover_rcpd_path_internal<S: DiscoverySession + ?Sized>(
     // if HOME is not set, skip cache check
     let cache_path = match session.remote_home().await {
         Ok(home) => {
-            let path = format!("{}/.cache/rcp/bin/rcpd-{}", home, local_version.semantic);
+            let path = format!("{}/.cache/rcp/bin/rcpd-{}", home, local_version.cache_tag());
             tracing::debug!("Trying deployed cache path: {}", path);
             if session.test_executable(&path).await? {
                 tracing::info!("Found rcpd in deployed cache: {}", path);
@@ -630,7 +630,7 @@ async fn discover_rcpd_path_internal<S: DiscoverySession + ?Sized>(
         - Install rcpd manually: cargo install rcp-tools-rcp --version {}\n\
         - Specify explicit path: rcp --rcpd-path=/path/to/rcpd ...",
         searched.join("\n"),
-        local_version.semantic
+        local_version.crate_version()
     ))
 }
 
@@ -682,7 +682,7 @@ async fn check_rcpd_version(
             - cargo install rcp-tools-rcp --version {}",
             remote_host,
             stderr,
-            local_version.semantic
+            local_version.crate_version()
         ));
     }
 
@@ -703,7 +703,10 @@ async fn check_rcpd_version(
             Local:  rcp {}\n\
             Remote: rcpd {} on host '{}'\n\
             \n\
-            The rcpd version on the remote host must exactly match the rcp version.\n\
+            The rcpd version on the remote host must exactly match the rcp version,\n\
+            including the +w wire revision — two builds of the same release can\n\
+            differ when the development wire schema moved between them (then\n\
+            reinstall/redeploy the remote build rather than pinning a version).\n\
             \n\
             To fix this, install the matching version on the remote host:\n\
             - ssh {} 'cargo install rcp-tools-rcp --version {}'",
@@ -711,7 +714,7 @@ async fn check_rcpd_version(
             remote_version,
             remote_host,
             shell_escape(remote_host),
-            local_version.semantic
+            local_version.crate_version()
         ));
     }
 
@@ -775,7 +778,7 @@ pub async fn start_rcpd(
                     let deployed_path = deploy::deploy_rcpd(
                         &ssh_session,
                         &local_rcpd,
-                        &local_version.semantic,
+                        &local_version.cache_tag(),
                         remote_host,
                     )
                     .await
@@ -1210,6 +1213,62 @@ pub async fn connect_tcp_control(
     Ok(stream)
 }
 
+/// Connect a TCP data connection, applying the standard socket options.
+///
+/// Deliberately NOT bounded here: the data pool bounds TCP connect + TLS handshake under ONE
+/// caller-side deadline, and an inner timeout would double-count it. Takes the profile and
+/// keepalive budget rather than a whole [`TcpConfig`] because that is what the pool carries.
+///
+/// These helpers exist so no connection can be established without its socket options:
+/// `scripts/check-tcp-socket-config.sh` forbids raw `TcpStream::connect`/`.accept()` outside this
+/// file, and inside it requires every connecting/accepting function to configure what it opened.
+pub async fn connect_tcp_data(
+    addr: std::net::SocketAddr,
+    profile: NetworkProfile,
+    keepalive_sec: u64,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let stream = tokio::net::TcpStream::connect(addr).await?;
+    configure_tcp_socket(&stream, profile, keepalive_sec, ConnectionKind::Data);
+    Ok(stream)
+}
+
+/// Accept one TCP control connection, applying the standard socket options before returning it.
+///
+/// The wait is bounded by the CALLER (each control accept awaits one specific peer under its own
+/// timeout and error wording); the configuration lives here so no accepted control connection can
+/// miss it. Cancel-safe exactly as `TcpListener::accept` is: the accept is the only await, and the
+/// configuration runs synchronously in the same poll that completes it.
+pub async fn accept_tcp_control(
+    listener: &tokio::net::TcpListener,
+    config: &TcpConfig,
+) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+    let (stream, addr) = listener.accept().await?;
+    configure_tcp_socket(
+        &stream,
+        config.network_profile,
+        config.keepalive_sec,
+        ConnectionKind::Control,
+    );
+    Ok((stream, addr))
+}
+
+/// Accept one TCP data connection, applying the standard socket options before returning it.
+///
+/// Data connections get no `TCP_USER_TIMEOUT` — a throttled receiver legitimately stops reading
+/// mid-file, and aborting that sender would fail a copy that used to just run slow (see
+/// [`configure_tcp_socket`]). Unbounded like [`connect_tcp_data`]: the source's accept loop runs
+/// for the life of the pool. Cancel-safe as `TcpListener::accept` is (see
+/// [`accept_tcp_control`]), so it can sit in a `select!` arm.
+pub async fn accept_tcp_data(
+    listener: &tokio::net::TcpListener,
+    profile: NetworkProfile,
+    keepalive_sec: u64,
+) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+    let (stream, addr) = listener.accept().await?;
+    configure_tcp_socket(&stream, profile, keepalive_sec, ConnectionKind::Data);
+    Ok((stream, addr))
+}
+
 /// Number of unacknowledged keepalive probes tolerated before a connection is declared dead.
 ///
 /// Decides the outcome only where `TCP_USER_TIMEOUT` is NOT set — on Linux the user timeout
@@ -1273,9 +1332,13 @@ impl std::fmt::Display for ConnectionKind {
 /// connection is still caught by keepalive after idle + retries × interval.
 ///
 /// Control connections are not backpressure-free in the strict sense — the destination's control
-/// dispatch loop takes a single ops token per message — but that is one token against the data
-/// path's thousands, so reaching the budget there needs a pathological `--ops-throttle`. Known
-/// residual, not a claim of immunity.
+/// dispatch loop takes a single ops token per message, and directory COMPLETIONS run their
+/// congestion-gated finalize syscalls (chown/chmod/ACL/utimens, chained bottom-up) on that same
+/// loop — so a pathological `--ops-throttle` or badly stalled destination storage can stop the
+/// reads. The budget only starts once the multi-megabyte receive buffer has filled and closed the
+/// window on top of that. Known residual, not a claim of immunity; if it ever bites, the
+/// structural fix is decoupling finalization from the receive loop, exactly as the manifest build
+/// already was.
 ///
 /// The keepalive sub-values are derived from the single budget rather than exposed individually, so
 /// their relationship stays correct by construction: idle at half the budget, probes every twelfth
@@ -1488,7 +1551,10 @@ mod tests {
             .with_which(None);
         session.set_test_response("/custom/bin/rcpd", false);
         let local_version = common::version::ProtocolVersion::current();
-        let cache_path = format!("/home/rcp/.cache/rcp/bin/rcpd-{}", local_version.semantic);
+        let cache_path = format!(
+            "/home/rcp/.cache/rcp/bin/rcpd-{}",
+            local_version.cache_tag()
+        );
         session.set_test_response(&cache_path, true);
         let path =
             discover_rcpd_path_internal(&session, None, Some(PathBuf::from("/custom/bin/rcp")))
@@ -1854,30 +1920,23 @@ mod tests {
             socket2::SockRef::from(&internet),
             socket2::SockRef::from(&untouched),
         );
-        assert!(
-            dc.send_buffer_size().unwrap() > base.send_buffer_size().unwrap(),
-            "datacenter send buffer must exceed the system default ({} vs {})",
-            dc.send_buffer_size().unwrap(),
-            base.send_buffer_size().unwrap(),
-        );
-        assert!(
-            dc.recv_buffer_size().unwrap() > base.recv_buffer_size().unwrap(),
-            "datacenter receive buffer must exceed the system default ({} vs {})",
-            dc.recv_buffer_size().unwrap(),
-            base.recv_buffer_size().unwrap(),
-        );
-        assert!(
-            net.send_buffer_size().unwrap() > base.send_buffer_size().unwrap(),
-            "internet send buffer must exceed the system default ({} vs {})",
-            net.send_buffer_size().unwrap(),
-            base.send_buffer_size().unwrap(),
-        );
-        assert!(
-            net.recv_buffer_size().unwrap() > base.recv_buffer_size().unwrap(),
-            "internet receive buffer must exceed the system default ({} vs {})",
-            net.recv_buffer_size().unwrap(),
-            base.recv_buffer_size().unwrap(),
-        );
+        // What is (and is not) assertable across kernels: an explicit SO_SNDBUF/SO_RCVBUF is
+        // CLAMPED to `wmem_max`/`rmem_max`, and on hosts whose sysctls leave those at the default
+        // (~208 KiB) while TCP auto-tuning grows untouched sockets into megabytes — GitHub's
+        // runners measure 425984 configured vs 2626560 untouched — the configured size sits BELOW
+        // the untouched default no matter what this code does. So "configured > default" is a
+        // property of the host, not of configure_tcp_socket, and is deliberately NOT asserted.
+        // What the code does guarantee: both profiles issue a set (asserted as ordering below —
+        // Datacenter requests 8x Internet, so wherever the clamp permits any distinction the
+        // ordering holds, and equality is exactly the fully-clamped case), and the sizes are sane.
+        for (name, sock) in [("datacenter", &dc), ("internet", &net)] {
+            assert!(
+                sock.send_buffer_size().unwrap() > 0 && sock.recv_buffer_size().unwrap() > 0,
+                "{name} buffer sizes must be readable and non-zero"
+            );
+        }
+        // the untouched socket is read (not asserted against) so a debugging run shows all three
+        let _ = (base.send_buffer_size(), base.recv_buffer_size());
         assert!(dc.send_buffer_size().unwrap() >= net.send_buffer_size().unwrap());
         assert!(dc.recv_buffer_size().unwrap() >= net.recv_buffer_size().unwrap());
     }

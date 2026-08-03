@@ -182,3 +182,39 @@ fn misplaced_marker_neither_applies_nor_leaks() {
     );
     tracing::error!("also still flagged: {}", &error); // EXPECT-VIOLATION
 }
+
+// A MULTI-LINE raw string as the FORMAT STRING. Its body is dropped from classification (prose in a
+// literal must not arm or match anything — the cases above), but a format string's placeholders live
+// in exactly that body: dropping it from the COLLECTED call hid the bare `{}` below, and a
+// chain-losing call was accepted. The literal is reattached to the call under collection, so the
+// rules see it; the report lands on the macro line, as for every multi-line call.
+fn a_multi_line_raw_format_string_is_still_checked() {
+    tracing::error!( // EXPECT-VIOLATION
+        r#"first line of a long message
+    operation failed: {}"#,
+        &error
+    );
+}
+
+// the same, with the literal opening on the macro line itself — the other collection shape
+fn a_multi_line_raw_format_string_opening_on_the_macro_line_is_still_checked() {
+    tracing::error!(r#"long message that starts here // EXPECT-VIOLATION
+    and fails with: {}"#, &error);
+}
+
+// two more multi-line raw shapes, pinned so the reattachment covers the whole family: an INLINE
+// capture whose only placeholder lives in the body, and the zero-hash `r"…"` form
+fn an_inline_capture_in_a_multi_line_raw_string_is_still_checked() {
+    tracing::warn!( // EXPECT-VIOLATION
+        r#"something
+        failed: {e}"#
+    );
+}
+
+fn a_no_hash_multi_line_raw_format_string_is_still_checked() {
+    tracing::error!( // EXPECT-VIOLATION
+        r"something
+        failed: {}",
+        &error
+    );
+}

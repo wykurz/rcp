@@ -420,15 +420,20 @@ pub async fn link(
         }
     };
     // One `listxattr` on the source ROOT per run — a constant, not a per-entry probe — warning that
-    // a source root carrying an ACL is about to be linked by settings that drop it. Files count as
-    // already safe whatever `f:acl` says: a hard-linked destination file IS the source inode, so
-    // its ACL cannot be dropped (and must never be written through, which is why `f:acl` applies
-    // only on rlink's real copy path).
+    // a source root carrying an ACL is about to be linked by settings that drop it. WITHOUT
+    // `--update`, files count as already safe whatever `f:acl` says: a hard-linked destination
+    // file IS the source inode, so its ACL cannot be dropped (and must never be written through,
+    // which is why `f:acl` applies only on rlink's real copy path). WITH `--update` that certainty
+    // is gone — a changed file is materialized by COPYING the update-tree entry, which drops its
+    // ACL unless `f:acl` is on — so the file half then defers to the setting like any copy. (The
+    // probe still examines the SOURCE root; whether the update entry differs — and so whether the
+    // copy path actually runs — is not known yet, matching the probe's documented
+    // root-only-heuristic character.)
     crate::safedir::warn_if_root_acl_unpreserved_at(
         &src_parent,
         src_name,
         src,
-        true,
+        update.is_none() || settings.preserve.file.acl,
         settings.preserve.dir.acl,
     )
     .await;

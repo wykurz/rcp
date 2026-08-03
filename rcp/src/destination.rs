@@ -226,13 +226,9 @@ impl DataConnectionPool {
     /// the whole TCP-connect + handshake; only the read half is kept (this side never sends on a
     /// data connection).
     async fn connect_and_handshake(&self) -> anyhow::Result<remote::streams::BoxedRecvStream> {
-        let stream = tokio::net::TcpStream::connect(self.data_addr).await?;
-        remote::configure_tcp_socket(
-            &stream,
-            self.network_profile,
-            self.keepalive_sec,
-            remote::ConnectionKind::Data,
-        );
+        let stream =
+            remote::connect_tcp_data(self.data_addr, self.network_profile, self.keepalive_sec)
+                .await?;
         let (_send_stream, recv_stream) = remote::tls::connect_bounded(
             self.tls_connector.as_deref(),
             remote::tls::SERVER_NAME_SOURCE,
@@ -447,15 +443,18 @@ async fn process_single_file(
     prog.bytes_copied.add(file_header.size);
     // metadata errors happen after all bytes consumed - stream is at clean boundary.
     // apply through the file's OWN fd (fd-relative): no path re-resolution of dst.
-    // The source's ACLs travel in the wire header, so they are handed over unconditionally: an
-    // all-`None` value means the source had none and the destination's must be CLEARED, not left
-    // alone (an inherited default ACL would otherwise widen this file past its source). The applier
-    // ignores them entirely unless `f:acl` was requested, and the source only reads them when the
-    // master asked — from the same `preserve` this applier uses, so the two cannot disagree.
+    // The source's ACLs travel in the wire header. A `Captured` all-`None` value means the source
+    // had none and the destination's must be CLEARED, not left alone (an inherited default ACL
+    // would otherwise widen this file past its source); `Unknown` (capture off) hands the applier
+    // `None`, which it ignores with `f:acl` off — and refuses, fail-closed, if `f:acl` were on,
+    // which cannot happen: the master derives capture from the same `preserve` this applier uses.
+    // (A source that cannot READ a file's ACL sends `FileSkipped`, never a `File` header, so an
+    // `Unknown` here is never a degraded read.)
+    let src_acls = file_header.metadata.captured_acls();
     common::safedir::set_file_metadata_fd(
         preserve,
         &file_header.metadata,
-        Some(&file_header.metadata.acls()),
+        src_acls.as_ref(),
         file.as_fd(),
         common::Side::Destination,
     )
@@ -1047,21 +1046,22 @@ async fn build_existing_manifest(
     if max_entries == 0 {
         return Vec::new();
     }
-    let entries = match dir.read_entries().await {
-        Ok(entries) => entries,
+    // capped enumeration: an over-cap directory stops at cap+1 instead of being read in full
+    // only to be discarded — the full read was unbounded, uncancellable work on the blocking pool
+    let entries = match dir.read_entries_capped(max_entries).await {
+        Ok(Some(entries)) => entries,
+        Ok(None) => {
+            tracing::debug!(
+                "manifest: directory exceeds cap {}, skipping manifest (files will transfer)",
+                max_entries
+            );
+            return Vec::new();
+        }
         Err(e) => {
             tracing::debug!("manifest: cannot enumerate destination directory: {:#}", e);
             return Vec::new();
         }
     };
-    if entries.len() > max_entries {
-        tracing::debug!(
-            "manifest: {} entries exceeds cap {}, skipping manifest (files will transfer)",
-            entries.len(),
-            max_entries
-        );
-        return Vec::new();
-    }
     let mut manifest = Vec::with_capacity(entries.len());
     for (name, _hint) in entries {
         match dir.child(&name).await {
@@ -1288,20 +1288,104 @@ async fn create_symlink(
     }
 }
 
-#[instrument(skip(error_collector, control_recv_stream, directory_tracker))]
+/// Announce a registered directory to the source: its manifest chunks (if any), then its
+/// `DirectoryCreated` trigger — then mark it announced, which is what unlocks its completion
+/// (see `DirectoryTracker::mark_announced`) and completes it on the spot when its entries are
+/// already all processed: always for a 0-entry directory, and whenever every child (symlinks,
+/// subdirectories) landed off Pass-1 messages while the manifest was still being built.
+///
+/// The chunks stay contiguous with their trigger under ONE stream-lock hold (the per-directory
+/// FIFO guarantee of `remote_protocol.md` §2.3); messages for DIFFERENT directories may
+/// interleave freely around them — the source accumulates chunks keyed by `dst`. The stream mutex
+/// (INNER) is taken WITHOUT the tracker mutex (OUTER) and released before OUTER is taken below:
+/// never hold INNER while acquiring OUTER (see the lock-order note in `run_destination`).
+///
+/// An announce-time completion runs the done-check itself (exactly as the data workers do after
+/// the last file): this announce can run from a per-directory task AFTER the control loop's final
+/// per-message check, so leaving `DestinationDone` to the loop would hang a copy whose last
+/// completing directory finishes here.
+async fn announce_directory_created(
+    directory_tracker: &directory_tracker::SharedDirectoryTracker,
+    control_send: &remote::streams::BoxedSharedSendStream,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    existing: Vec<remote::protocol::ExistingEntry>,
+    entry_count: usize,
+) -> anyhow::Result<()> {
+    let manifest_entries = existing.len();
+    let chunks =
+        remote::protocol::chunk_manifest(existing, remote::protocol::MANIFEST_CHUNK_BYTE_BUDGET);
+    {
+        let mut stream = control_send.lock().await;
+        for entries in chunks {
+            let chunk_msg = remote::protocol::DestinationMessage::DirectoryManifestChunk {
+                dst: dst.to_path_buf(),
+                entries,
+            };
+            stream.send_batch_message(&chunk_msg).await?;
+        }
+        let message = remote::protocol::DestinationMessage::DirectoryCreated {
+            src: src.to_path_buf(),
+            dst: dst.to_path_buf(),
+        };
+        stream.send_control_message(&message).await?;
+    }
+    tracing::info!(
+        "Sent DirectoryCreated: {:?} -> {:?} (entries={}, manifest={})",
+        src,
+        dst,
+        entry_count,
+        manifest_entries
+    );
+    let mut tracker = directory_tracker.lock().await;
+    tracker
+        .mark_announced(dst)
+        .await
+        .context("Failed to complete announced directory")?;
+    if tracker.is_done() {
+        tracing::info!("All operations complete, sending DestinationDone");
+        tracker.send_destination_done().await?;
+    }
+    Ok(())
+}
+
+#[instrument(skip(
+    error_collector,
+    control_recv_stream,
+    directory_tracker,
+    control_send_stream,
+    data_pool
+))]
+#[allow(clippy::too_many_arguments)]
 async fn process_control_stream(
     settings: &common::copy::Settings,
     overwrite_manifest_max_entries: usize,
     preserve: &common::preserve::Settings,
     mut control_recv_stream: remote::streams::BoxedRecvStream,
     directory_tracker: directory_tracker::SharedDirectoryTracker,
+    control_send_stream: remote::streams::BoxedSharedSendStream,
+    data_pool: std::sync::Arc<DataConnectionPool>,
     error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
 ) -> anyhow::Result<()> {
+    // per-directory manifest/announce tasks (see the Directory arm below). Owned by this function
+    // so an abort that ends the loop early drops (and cancels) them with it, rather than leaving
+    // detached writers on the control stream; drained after the loop on the ordinary paths.
+    let mut manifest_tasks = tokio::task::JoinSet::new();
+    // one manifest build at a time: the task exists to keep the RECEIVE LOOP reading, not to
+    // parallelize builds — a single slot preserves the previous serial build's peak-memory
+    // profile (one manifest Vec in flight)
+    let manifest_build_slot = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
     while let Some(source_message) = control_recv_stream
         .recv_object::<remote::protocol::SourceMessage>()
         .await
         .context("Failed to receive source message")?
     {
+        // reap announce tasks that already finished: without this the set grows by one JoinHandle
+        // per reused directory for the whole copy, and a join failure would surface only after
+        // the loop ends
+        while let Some(joined) = manifest_tasks.try_join_next() {
+            reap_announce_task(joined, &directory_tracker, &data_pool, &error_collector).await;
+        }
         throttle::get_ops_token().await;
         tracing::debug!("Received source message: {:?}", source_message);
         let prog = progress();
@@ -1382,33 +1466,89 @@ async fn process_control_stream(
                 };
                 match resolved {
                     Some((dir, reused_lock)) => {
-                        // build the manifest only for a REUSED dir under overwrite/ignore-existing;
+                        // register FIRST, before the next message is processed: children resolve
+                        // their parent through the tracker's fd-map, and the source's Pass-1
+                        // Directory messages for children do not wait for this directory's
+                        // DirectoryCreated.
+                        directory_tracker.lock().await.register_directory(
+                            dst,
+                            dir.clone(),
+                            metadata.clone(),
+                            is_root,
+                            was_created,
+                            entry_count,
+                            keep_if_empty,
+                            reused_lock,
+                        );
+                        // a manifest exists only for a REUSED dir under overwrite/ignore-existing;
                         // a freshly-created dir is empty and feature-off needs no manifest.
-                        let existing =
-                            if !was_created && (settings.overwrite || settings.ignore_existing) {
-                                build_existing_manifest(&dir, overwrite_manifest_max_entries).await
-                            } else {
-                                Vec::new()
-                            };
-                        // add to tracker (sends DirectoryCreated, stores the dir fd in the fd-map)
-                        // tracker handles root directory tracking internally
-                        directory_tracker
-                            .lock()
-                            .await
-                            .add_directory(
+                        let needs_manifest =
+                            !was_created && (settings.overwrite || settings.ignore_existing);
+                        if needs_manifest {
+                            // Build the manifest OFF the receive loop. Building it inline
+                            // (enumerating and stat'ing up to --overwrite-manifest-max-entries =
+                            // 5M entries) stalls all reads from the control socket for its whole
+                            // duration; the source keeps sending Pass-1 messages meanwhile, the
+                            // receive window closes, and after --remote-keepalive-sec of zero
+                            // window the TCP_USER_TIMEOUT on the SOURCE's control socket
+                            // terminates an otherwise healthy copy. The task announces the
+                            // directory itself (chunks, then DirectoryCreated); per-directory
+                            // ordering is preserved inside the task, and cross-directory
+                            // interleaving is fine — the source accumulates chunks keyed by dst.
+                            let tracker = directory_tracker.clone();
+                            let control_send = control_send_stream.clone();
+                            let data_pool = data_pool.clone();
+                            let error_collector = error_collector.clone();
+                            let build_slot = manifest_build_slot.clone();
+                            let src = src.clone();
+                            let dst = dst.clone();
+                            let dir = dir.clone();
+                            manifest_tasks.spawn(async move {
+                                // hold the single build slot across the build: one manifest in
+                                // memory at a time preserves the serial build's peak-memory
+                                // profile — the point of the task is to unblock the RECEIVE
+                                // LOOP, not to parallelize builds
+                                let _slot = build_slot
+                                    .acquire_owned()
+                                    .await
+                                    .expect("manifest build slot semaphore is never closed");
+                                let existing =
+                                    build_existing_manifest(&dir, overwrite_manifest_max_entries)
+                                        .await;
+                                if let Err(e) = announce_directory_created(
+                                    &tracker,
+                                    &control_send,
+                                    &src,
+                                    &dst,
+                                    existing,
+                                    entry_count,
+                                )
+                                .await
+                                {
+                                    // record and signal the source EAGERLY (idempotent): without
+                                    // the trigger the source never sends this directory's files
+                                    // and waits forever — the same rule the data workers follow
+                                    tracing::error!(
+                                        "Failed to announce directory {:?} to the source: {:#}",
+                                        dst,
+                                        e
+                                    );
+                                    error_collector.push(e);
+                                    signal_source_teardown(&tracker, &data_pool).await;
+                                }
+                            });
+                        } else {
+                            announce_directory_created(
+                                &directory_tracker,
+                                &control_send_stream,
                                 src,
                                 dst,
-                                dir,
-                                metadata.clone(),
-                                is_root,
-                                was_created,
+                                Vec::new(),
                                 entry_count,
-                                keep_if_empty,
-                                existing,
-                                reused_lock,
                             )
                             .await
-                            .context("Failed to add directory to tracker")?;
+                            .context("Failed to announce directory to the source")?;
+                        }
                     }
                     None => {
                         // mark as failed - descendants will be skipped.
@@ -1593,10 +1733,56 @@ async fn process_control_stream(
             break;
         }
     }
+    // Drain or abort the per-directory announce tasks, depending on WHY the loop exited.
+    //
+    // With DestinationDone sent, every registered directory completed — and completion is
+    // announce-gated (see DirectoryTracker::mark_announced) — so every announce is already on the
+    // wire and the tasks are done or finishing: this drain is quick, and reaping keeps a
+    // JoinError from being silently discarded.
+    //
+    // Without it, the source closed its stream mid-copy (a Pass-2 abort, a vanished host): the
+    // copy is failing, and the outstanding tasks are pure liability — each queued one would
+    // acquire the single build slot and scan its complete directory (up to
+    // --overwrite-manifest-max-entries = 5M entries) only to fail its announce against the closed
+    // peer. Those scans are NOT bounded by the source's dir-fd budget under -L (the path→count
+    // walk holds no fds), so draining them could stall failure shutdown arbitrarily long. Abort
+    // instead: shutdown() cancels queued tasks at their slot acquire and active ones at their
+    // next await (the manifest's per-child stat loop awaits between children; at most one
+    // already-submitted read_entries enumeration keeps running detached on the blocking pool —
+    // bounded by a single directory). The cancelled tasks' JoinErrors are deliberately discarded,
+    // not reaped: cancellation here is not a failure — the incomplete transfer is reported by
+    // choose_final_result, and an announce that genuinely failed before this point already
+    // recorded its own error. The `?` error exits above skip both paths deliberately: dropping
+    // the JoinSet cancels in-flight tasks, and run_destination signals the source right after.
+    if directory_tracker.lock().await.destination_done_sent() {
+        while let Some(joined) = manifest_tasks.join_next().await {
+            reap_announce_task(joined, &directory_tracker, &data_pool, &error_collector).await;
+        }
+    } else {
+        manifest_tasks.shutdown().await;
+    }
     // close recv stream
     control_recv_stream.close().await;
     tracing::info!("Control stream processing completed");
     Ok(())
+}
+
+/// Record one joined announce task's outcome. A `JoinError` here is close to unreachable — the
+/// workspace builds `panic = "abort"`, so a panicking task ends the process, and the drain paths
+/// never abort tasks before joining them — but silently discarding one would hide a lost
+/// `DirectoryCreated`, so it is recorded and the source signaled (idempotent) like any worker
+/// abort.
+async fn reap_announce_task(
+    joined: Result<(), tokio::task::JoinError>,
+    directory_tracker: &directory_tracker::SharedDirectoryTracker,
+    data_pool: &std::sync::Arc<DataConnectionPool>,
+    error_collector: &std::sync::Arc<common::error_collector::ErrorCollector>,
+) {
+    if let Err(e) = joined {
+        tracing::error!("directory announce task failed to join: {e:#}");
+        error_collector.push(e.into());
+        signal_source_teardown(directory_tracker, data_pool).await;
+    }
 }
 
 #[instrument(skip(cert_key))]
@@ -1657,7 +1843,7 @@ pub async fn run_destination(
     tracing::info!("Created control streams");
     let error_collector = std::sync::Arc::new(common::error_collector::ErrorCollector::default());
     let directory_tracker = directory_tracker::make_shared(
-        control_send_stream,
+        control_send_stream.clone(),
         *preserve,
         settings.fail_early,
         error_collector.clone(),
@@ -1684,6 +1870,8 @@ pub async fn run_destination(
         preserve,
         control_recv_stream,
         directory_tracker.clone(),
+        control_send_stream,
+        data_pool.clone(),
         error_collector.clone(),
     );
     tokio::pin!(file_handler_future);
@@ -1695,14 +1883,17 @@ pub async fn run_destination(
     // The source is signaled to tear down (`signal_source_teardown` → `close_stream`) CONCURRENTLY
     // with the loser via `tokio::join!`, NOT inline before awaiting it. This avoids a held-but-unpolled
     // deadlock: `close_stream` takes the tracker mutex (OUTER), and the loser (`process_control_stream`
-    // mid-`add_directory`) can be SUSPENDED holding OUTER across a control-stream send. Awaiting the
-    // signal inline would park it on OUTER while the loser — the very next statement — is never polled
-    // to release it. `join!` polls both, so the loser drains its send, releases OUTER, and the signal
-    // then acquires it. This is deadlock-free because the lock order is strictly OUTER ≺ INNER (the
-    // `control_send_stream` mutex; INNER is only ever taken through a `&mut DirectoryTracker` method,
-    // which holds OUTER first), so no cycle is possible, and the source drains the control stream
-    // continuously so the loser's send always completes. DO NOT reintroduce an inline `signal.await`
-    // here, and DO NOT acquire OUTER while holding INNER anywhere, or this deadlock returns.
+    // mid-`send_directory_skipped` or mid-`complete_directory`) can be SUSPENDED holding OUTER across
+    // a control-stream send. Awaiting the signal inline would park it on OUTER while the loser — the
+    // very next statement — is never polled to release it. `join!` polls both, so the loser drains its
+    // send, releases OUTER, and the signal then acquires it. This is deadlock-free because the lock
+    // order is strictly OUTER ≺ INNER (the `control_send_stream` mutex): INNER is taken either through
+    // a `&mut DirectoryTracker` method, which holds OUTER first, or by `announce_directory_created`
+    // WITHOUT OUTER — which releases INNER before it takes OUTER for a 0-entry completion, so no one
+    // ever holds INNER while acquiring OUTER and no cycle is possible; the source drains the control
+    // stream continuously so the loser's send always completes. DO NOT reintroduce an inline
+    // `signal.await` here, and DO NOT acquire OUTER while holding INNER anywhere, or this deadlock
+    // returns.
     let (file_result, control_result) = tokio::select! {
         file_result = &mut file_handler_future => {
             let ((), control_result) = tokio::join!(
@@ -1922,7 +2113,7 @@ mod teardown_tests {
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
 
         // the loser acquires the lock and then suspends WHILE STILL HOLDING it (mirrors
-        // process_control_stream suspended mid-`add_directory` holding the tracker lock).
+        // process_control_stream suspended mid-`send_directory_skipped` holding the tracker lock).
         let loser = {
             let lock = lock.clone();
             let release = release.clone();

@@ -593,3 +593,366 @@ async fn lockdown_reused_dir_never_loses_the_default_acl_when_cancelled() -> any
     );
     Ok(())
 }
+
+/// The direct-file half of the containment invariant: a strict copy of a plain file INTO an
+/// existing parent that carries a permissive default ACL must not leave the destination file
+/// with inherited ACL entries. That parent is the one directory kind rcp neither creates nor
+/// locks down (the ambient operand parent), so the strip happens inside `create_file` itself.
+/// The regression this guards was real: the create-mode mask kept the inherited entries inert
+/// at `0o600`, and the final chmod to the source mode re-derived `ACL_MASK` from the group bits
+/// and ACTIVATED them — a named user gained effective read access the `0o640` source never
+/// granted.
+#[tokio::test]
+async fn strict_direct_file_into_default_acl_parent_carries_no_acl() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2)");
+        return Ok(());
+    }
+    let tmp = tempfile::tempdir()?;
+    let tmp = tokio::fs::canonicalize(tmp.path()).await?;
+    let src = tmp.join("plain.txt");
+    tokio::fs::write(&src, b"payload").await?;
+    tokio::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o640)).await?;
+    // the destination parent is a pre-existing user directory with a granting default ACL —
+    // exactly the directory the copy neither creates nor reuses-and-locks
+    let dst_parent = tmp.join("dst");
+    tokio::fs::create_dir(&dst_parent).await?;
+    let default = granting_acl();
+    set_acl(&dst_parent, ACL_DEFAULT, &default);
+    common::safedir::enable_strict_operand_resolution();
+    let dst = dst_parent.join("plain.txt");
+    let result = common::copy::copy(
+        common::get_progress(),
+        &src,
+        &dst,
+        &overwrite_copy_settings(),
+        &common::preserve::preserve_none(),
+        false,
+    )
+    .await;
+    if let Err(e) = result {
+        panic!("strict direct-file copy must succeed, got: {:#}", e.source);
+    }
+    assert_eq!(
+        get_acl(&dst, ACL_ACCESS),
+        None,
+        "the destination file inherited the parent's default ACL — the final chmod makes those \
+         entries effective"
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&dst)?.permissions().mode() & 0o7777,
+        0o640,
+        "final mode must equal the source file mode"
+    );
+    // the parent itself is untouched: rcp was not asked to change a directory it only wrote into
+    assert_eq!(
+        get_acl(&dst_parent, ACL_DEFAULT).as_deref(),
+        Some(default.as_slice()),
+        "the ambient parent's own default ACL must survive the copy"
+    );
+    Ok(())
+}
+
+/// An aborted strict finalize must ROLL BACK a source default ACL it installed on a reused
+/// directory that originally had NONE. This is the state a bare `Option`-as-guard could not
+/// represent — its `None` doubled as "disarmed", so the partially-applied ACL survived the
+/// abort and the originally ACL-less destination kept an ACL the source run never completed.
+#[tokio::test]
+async fn aborted_strict_finalize_removes_the_default_acl_it_installed() -> anyhow::Result<()> {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2)");
+        return Ok(());
+    }
+    let tmp = tempfile::tempdir()?;
+    let tmp = tokio::fs::canonicalize(tmp.path()).await?;
+    let dst = tmp.join("reused_no_acl");
+    tokio::fs::create_dir(&dst).await?;
+    common::safedir::enable_strict_operand_resolution();
+    let root = common::safedir::Dir::open_root_dir(&tmp, false, common::Side::Destination).await?;
+    let entry = std::ffi::OsString::from("reused_no_acl");
+    let handle = root.child(&entry).await?;
+    let dir = root.open_dir(&entry).await?;
+    let lock = common::safedir::lockdown_reused_dir(&dir, &handle)
+        .await?
+        .expect("strict mode must lock a reused directory");
+    // simulate the finalize's partial progress: the source's default ACL already landed...
+    set_acl(&dst, ACL_DEFAULT, &granting_acl());
+    // ...and then the copy aborted before the guard was disarmed
+    drop(lock);
+    assert_eq!(
+        get_acl(&dst, ACL_DEFAULT),
+        None,
+        "the rollback must remove the ACL the aborted finalize installed — the directory had \
+         none before the copy"
+    );
+    Ok(())
+}
+
+/// The successful counterpart: with `d:acl` on, a strict finalize installs the SOURCE's default
+/// ACL on an originally ACL-less reused directory, and it stays installed (the guard disarms
+/// instead of rolling it back).
+#[tokio::test]
+async fn strict_finalize_installs_source_default_acl_and_keeps_it() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2)");
+        return Ok(());
+    }
+    let tmp = tempfile::tempdir()?;
+    let tmp = tokio::fs::canonicalize(tmp.path()).await?;
+    let src = tmp.join("src_dir");
+    tokio::fs::create_dir(&src).await?;
+    tokio::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).await?;
+    let dst = tmp.join("reused_dst");
+    tokio::fs::create_dir(&dst).await?;
+    common::safedir::enable_strict_operand_resolution();
+    let root = common::safedir::Dir::open_root_dir(&tmp, false, common::Side::Destination).await?;
+    let src_meta = root
+        .child(std::ffi::OsStr::new("src_dir"))
+        .await?
+        .meta()
+        .clone();
+    let entry = std::ffi::OsString::from("reused_dst");
+    let handle = root.child(&entry).await?;
+    let dir = root.open_dir(&entry).await?;
+    let lock = common::safedir::lockdown_reused_dir(&dir, &handle)
+        .await?
+        .expect("strict mode must lock a reused directory");
+    let source_default = granting_acl();
+    common::safedir::set_reused_dir_metadata_fd(
+        &common::preserve::preserve_all_with_acls(),
+        &src_meta,
+        Some(&common::safedir::Acls {
+            access: None,
+            default: Some(source_default.clone()),
+        }),
+        Some(lock),
+        &dir,
+    )
+    .await?;
+    assert_eq!(
+        get_acl(&dst, ACL_DEFAULT).as_deref(),
+        Some(source_default.as_slice()),
+        "a completed finalize must keep the source's default ACL it installed"
+    );
+    assert_eq!(
+        get_acl(&dst, ACL_ACCESS),
+        None,
+        "the source had no access ACL, so the destination must end without one"
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&dst)?.permissions().mode() & 0o777,
+        0o755,
+        "final mode must equal the source directory mode"
+    );
+    Ok(())
+}
+
+/// A file created AFTER a reused-directory rollback must still strip what it inherits: the
+/// rollback restores the directory's original default ACL, so the "children cannot inherit" state
+/// the lockdown recorded is RE-ARMED by the guard (store before the restore syscall). Without the
+/// re-arm, a create landing after a fail-early rollback — including one whose blocking closure was
+/// already submitted when the guard dropped — inherited the restored ACL with the strip skipped:
+/// mask-inert at the create mode, activated by any later chmod. The mid-flight interleaving is not
+/// deterministically schedulable from a test; this pins the reachable end state that decides both
+/// (create_file consults the flag after its openat, so an openat that sees the restored ACL also
+/// sees the re-armed flag).
+#[tokio::test]
+async fn create_after_reused_dir_rollback_strips_inherited_acl() -> anyhow::Result<()> {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2)");
+        return Ok(());
+    }
+    let tmp = tempfile::tempdir()?;
+    let tmp = tokio::fs::canonicalize(tmp.path()).await?;
+    let dst = tmp.join("reused_rollback");
+    tokio::fs::create_dir(&dst).await?;
+    set_acl(&dst, ACL_DEFAULT, &granting_acl());
+    common::safedir::enable_strict_operand_resolution();
+    let root = common::safedir::Dir::open_root_dir(&tmp, false, common::Side::Destination).await?;
+    let entry = std::ffi::OsString::from("reused_rollback");
+    let handle = root.child(&entry).await?;
+    let dir = root.open_dir(&entry).await?;
+    let lock = common::safedir::lockdown_reused_dir(&dir, &handle)
+        .await?
+        .expect("strict mode must lock a reused directory");
+    // the copy aborts: the rollback restores the default ACL — and must re-arm the strip
+    drop(lock);
+    let file = dir.create_file(std::ffi::OsStr::new("late.txt")).await?;
+    drop(file);
+    assert_eq!(
+        get_acl(&dst.join("late.txt"), ACL_ACCESS),
+        None,
+        "a file created after the rollback inherited the restored default ACL without a strip — \
+         inert now, activated by the next chmod"
+    );
+    Ok(())
+}
+
+/// Cancelling the strict finalize at ANY point before its successful return must leave the reused
+/// directory holding its OWN original default ACL — never the source's.
+///
+/// The finalize installs the source's default ACL early (through the lockdown guard, while the
+/// copier still owns the directory) and then runs several more fallible steps: the owner restore,
+/// the inner metadata applier, and the final re-stat verification. A cancellation landing anywhere
+/// in that tail is a FAILED copy of this directory, and failing toward *unchanged* requires the
+/// guard to still be armed there so its `Drop` rolls the just-installed source ACL back. The guard
+/// used to be disarmed BEFORE the verification: a cancellation at the re-stat await (or an fstat
+/// error, or a verification failure) then skipped the rollback and left the source's default ACL
+/// installed after a failed copy.
+///
+/// Cancellation is driven by POLL COUNT, exactly as in
+/// `lockdown_reused_dir_never_loses_the_default_acl_when_cancelled` (see there for why a
+/// timer-based sweep walks past these windows). The per-iteration assertion is state-based — for
+/// EVERY budget the directory must end in one of the two legal states (cancelled → the original
+/// ACL, completed → the source's) — so the sweep stays sound even if the poll↔await mapping
+/// shifts; the `completed > 0` backstop proves it reached the latest windows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_strict_finalize_restores_the_destinations_default_acl() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2)");
+        return Ok(());
+    }
+    let tmp = tempfile::tempdir()?;
+    let tmp = tokio::fs::canonicalize(tmp.path()).await?;
+    let src = tmp.join("src_dir");
+    tokio::fs::create_dir(&src).await?;
+    tokio::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).await?;
+    common::safedir::enable_strict_operand_resolution();
+    let root = common::safedir::Dir::open_root_dir(&tmp, false, common::Side::Destination).await?;
+    let src_meta = root
+        .child(std::ffi::OsStr::new("src_dir"))
+        .await?
+        .meta()
+        .clone();
+    // the destination's own ACL and the source's must be DISTINGUISHABLE byte-wise, or a leaked
+    // source install would satisfy an "ACL is present" assertion (named user gets 5, mask 5,
+    // vs the granting ACL's 7/7)
+    let original = encode_acl(&[
+        (0x01, 7, 0xffff_ffff),
+        (0x02, 5, 65534),
+        (0x04, 5, 0xffff_ffff),
+        (0x10, 5, 0xffff_ffff),
+        (0x20, 5, 0xffff_ffff),
+    ]);
+    let source_default = granting_acl();
+    assert_ne!(original, source_default);
+    let mut completed = 0usize;
+    for budget in 0..48usize {
+        let name = format!("reused{budget}");
+        let dir_path = tmp.join(&name);
+        tokio::fs::create_dir(&dir_path).await?;
+        set_acl(&dir_path, ACL_DEFAULT, &original);
+        let entry = std::ffi::OsString::from(&name);
+        let handle = root.child(&entry).await?;
+        let dir = root.open_dir(&entry).await?;
+        let lock = common::safedir::lockdown_reused_dir(&dir, &handle)
+            .await?
+            .expect("strict mode must lock a reused directory");
+        // poll the finalize at most `budget` times, then drop it mid-flight (the dropped future
+        // drops the still-armed lock, whose rollback is what this sweep pins)
+        let preserve = common::preserve::preserve_all_with_acls();
+        let acls = common::safedir::Acls {
+            access: None,
+            default: Some(source_default.clone()),
+        };
+        let outcome = {
+            let mut fut = Box::pin(common::safedir::set_reused_dir_metadata_fd(
+                &preserve,
+                &src_meta,
+                Some(&acls),
+                Some(lock),
+                &dir,
+            ));
+            let mut polls = 0usize;
+            std::future::poll_fn(move |cx| {
+                if polls >= budget {
+                    return std::task::Poll::Ready(None);
+                }
+                polls += 1;
+                fut.as_mut().poll(cx).map(Some)
+            })
+            .await
+        };
+        let finished = match &outcome {
+            Some(Ok(())) => true,
+            Some(Err(e)) => panic!("finalize failed on its own (budget {budget}): {e:#}"),
+            None => false,
+        };
+        drop(outcome);
+        // let any DETACHED blocking closure land before checking, as in the lockdown sweep: a
+        // `spawn_blocking` already submitted when the future was dropped still runs, serialized
+        // against the guard's rollback by the state mutex.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let got = get_acl(&dir_path, ACL_DEFAULT);
+        if finished {
+            completed += 1;
+            assert_eq!(
+                got.as_deref(),
+                Some(source_default.as_slice()),
+                "a finalize that ran to completion must keep the source's default ACL it \
+                 installed (budget {budget})"
+            );
+        } else {
+            assert_eq!(
+                got.as_deref(),
+                Some(original.as_slice()),
+                "cancelling after {budget} poll(s) must roll the directory back to its OWN \
+                 original default ACL — a failed copy must not leave the source's installed"
+            );
+        }
+    }
+    assert!(
+        completed > 0,
+        "no iteration ran the finalize to completion, so the sweep never covered the \
+         late-cancellation windows"
+    );
+    Ok(())
+}
+
+/// A directory rcp CREATES under a default-ACL parent is sanitized inside the creation call
+/// itself: both inherited ACLs are stripped, so nothing created beneath it inherits anything —
+/// files beneath it pay no per-file strip.
+#[tokio::test]
+async fn strict_make_dir_under_default_acl_parent_strips_both_inherited_acls() -> anyhow::Result<()>
+{
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2)");
+        return Ok(());
+    }
+    let tmp = tempfile::tempdir()?;
+    let tmp = tokio::fs::canonicalize(tmp.path()).await?;
+    let holder = tmp.join("holder");
+    tokio::fs::create_dir(&holder).await?;
+    set_acl(&holder, ACL_DEFAULT, &granting_acl());
+    common::safedir::enable_strict_operand_resolution();
+    let root = common::safedir::Dir::open_root_dir(&tmp, false, common::Side::Destination).await?;
+    let holder_dir = root.open_dir(std::ffi::OsStr::new("holder")).await?;
+    let made = holder_dir
+        .make_dir(
+            std::ffi::OsStr::new("fresh"),
+            common::safedir::DST_DIR_CREATE_MODE,
+        )
+        .await?;
+    let fresh = holder.join("fresh");
+    assert_eq!(
+        get_acl(&fresh, ACL_ACCESS),
+        None,
+        "a created directory must not keep the access ACL it inherited"
+    );
+    assert_eq!(
+        get_acl(&fresh, ACL_DEFAULT),
+        None,
+        "a created directory must not keep the default ACL it inherited — every child would"
+    );
+    // and a file created beneath it inherits nothing, because the chain was broken above
+    let _file = made.create_file(std::ffi::OsStr::new("f.txt")).await?;
+    assert_eq!(
+        get_acl(&fresh.join("f.txt"), ACL_ACCESS),
+        None,
+        "a file beneath a sanitized directory must carry no inherited ACL"
+    );
+    Ok(())
+}
