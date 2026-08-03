@@ -91,6 +91,13 @@ jobs:
     - name: Check TCP socket configuration
       run: ./scripts/check-tcp-socket-config.sh
 
+    # The report filter reads `cargo update --verbose` output, a human format. If cargo reflows
+    # that line the filter silently reports nothing and the monthly update still looks healthy, so
+    # it has to be exercised somewhere. This job enumerates its scripts rather than running
+    # `just lint`, so a new linter test needs adding in both places.
+    - name: Test the update-deps MSRV report filter
+      run: ./scripts/test-update-deps.sh
+
     - name: Check package metadata
       run: ./scripts/check-package-metadata.sh
 

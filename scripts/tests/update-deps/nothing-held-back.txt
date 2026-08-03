@@ -1,0 +1,4 @@
+    Updating crates.io index
+    Updating zerocopy v0.8.27 -> v0.8.55
+    Updating zeroize v1.8.2 -> v1.9.0
+warning: not updating lockfile due to dry run
