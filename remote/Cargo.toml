@@ -26,7 +26,7 @@ anyhow = "1.0"
 async-channel = "2.5"
 bytesize = "2.3"
 async-recursion = "1.1"
-base64 = "0.22"
+base64 = "0.23"
 bitcode = { version = "0.6", features = ["serde"] }
 bytes = "1.11"
 chrono = "0.4"
