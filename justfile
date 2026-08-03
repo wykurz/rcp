@@ -1,6 +1,11 @@
 # rcp development task runner
 # See https://github.com/casey/just for more info
 
+# Expose recipe arguments to the shell as "$@" rather than only as `{{...}}` interpolation, which
+# is textual and so splits a value containing spaces into several arguments. No recipe here used
+# shell positionals before this, so nothing else is affected.
+set positional-arguments
+
 # List available commands
 default:
     @just --list
@@ -35,6 +40,8 @@ lint:
     ./scripts/test-check-tcp-socket-config.sh
     @echo "🔍 Checking TCP socket configuration..."
     ./scripts/check-tcp-socket-config.sh
+    @echo "🔍 Testing the update-deps MSRV report filter..."
+    ./scripts/test-update-deps.sh
     @echo "✅ All lints passed!"
 
 # Format code and markdown docs
@@ -71,6 +78,13 @@ check:
 # devShell's `msrv-check` wrapper. GitHub CI enforces the same via the `msrv` job.
 msrv:
     msrv-check
+
+# Upgrade dependencies, staying within the MSRV. Both halves read `rust-version`:
+# `cargo upgrade` for the manifests, resolver 3 for the lockfile. Anything held
+# back is reported rather than silently skipped. The monthly `cargo-update`
+# workflow runs exactly this; pass `-n` to preview without touching the tree.
+update-deps *ARGS:
+    ./scripts/update-deps.sh "$@"
 
 # Build all packages
 build:

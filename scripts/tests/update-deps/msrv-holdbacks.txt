@@ -1,0 +1,9 @@
+    Updating crates.io index
+   Unchanged enum-map v2.7.3 (available: v3.1.0, requires Rust 1.95)
+   Unchanged matchit v0.8.4 (available: v0.8.6)
+   Unchanged base64ct v1.6.0 (available: v2.0.1, requires Rust 1.93.0)
+   Unchanged sysinfo v0.38.4 (available: v0.39.6, requires Rust 1.95)
+    Updating zerocopy v0.8.27 -> v0.8.55
+    Updating zeroize v1.8.2 -> v1.9.0
+note: pass `--verbose` to see 3 unchanged dependencies behind latest
+warning: not updating lockfile due to dry run
