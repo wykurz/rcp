@@ -33,3 +33,7 @@ updates:
       # sysinfo >= 0.39 needs rustc 1.95 > MSRV 1.91.1
       - dependency-name: "sysinfo"
         versions: [">= 0.39"]
+      # enum-map >= 3 needs rustc 1.95 > MSRV 1.91.1; it also pulls in
+      # enum-map-derive 1.0, which declares the same rustc 1.95.
+      - dependency-name: "enum-map"
+        versions: [">= 3"]
