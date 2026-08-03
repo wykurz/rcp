@@ -31,6 +31,8 @@ lint:
     ./scripts/check-source-read-fidelity.sh
     @echo "🔍 Checking TLS handshake timeouts..."
     ./scripts/check-tls-handshake-timeout.sh
+    @echo "🔍 Testing the TCP socket configuration linter..."
+    ./scripts/test-check-tcp-socket-config.sh
     @echo "🔍 Checking TCP socket configuration..."
     ./scripts/check-tcp-socket-config.sh
     @echo "✅ All lints passed!"

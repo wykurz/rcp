@@ -62,6 +62,35 @@ use std::os::unix::prelude::PermissionsExt;
 /// by default — rcp typically runs on large hosts; the cap is a backstop, not a normal limit.
 pub const DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES: usize = 5_000_000;
 
+/// A source entry's ACL payload as captured for the wire — or the fact that it was never captured.
+///
+/// The distinction between the two non-carrying states is load-bearing (`docs/remote_protocol.md`
+/// §2.5). `Captured` with `None` fields is an AUTHORITATIVE "the source has no such ACL", which
+/// the destination reproduces by REMOVING the attribute — not by leaving whatever it inherited
+/// (see [`common::safedir::apply_acls_fd`]). `Unknown` says the wire carries no ACL information at
+/// all: either the master never asked ([`ExtendedMetadataCapture`]), or the source COULD NOT read
+/// them (a committed directory that failed to open, whose copy is already recorded as an error) —
+/// and the destination must leave the destination entry's ACLs alone. Collapsing the two (the
+/// previous shape, a pair of bare `Option`s) turned that source-side read failure into an
+/// authoritative clear, permanently stripping a reused destination directory's access and default
+/// ACLs on a copy that was already failing.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum WireAcls {
+    /// No ACL information: not captured, or unreadable at the source. The destination must not
+    /// touch the destination entry's ACLs (for a strict-mode locked reused directory, its
+    /// original default ACL is restored by the lockdown guard).
+    Unknown,
+    /// Read from the source entry (its own fd on the hardened walk; by path under `-L`):
+    /// authoritative, including the "has none" case.
+    Captured {
+        /// `system.posix_acl_access`; `None` = the source has none (an instruction to REMOVE).
+        access: Option<Vec<u8>>,
+        /// `system.posix_acl_default`; directories only (files have no default ACL), same `None`
+        /// semantics.
+        default: Option<Vec<u8>>,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Metadata {
     pub mode: u32,
@@ -71,14 +100,10 @@ pub struct Metadata {
     pub mtime: i64,
     pub atime_nsec: i64,
     pub mtime_nsec: i64,
-    /// The source's `system.posix_acl_access`, as the SOURCE kernel's opaque bytes. `None` means
-    /// the source entry has no access ACL — which the destination reproduces by REMOVING the
-    /// attribute, not by leaving whatever it inherited (see [`common::safedir::apply_acls_fd`]).
-    /// Only ever filled when the master asked for it via [`ExtendedMetadataCapture`].
-    pub acl_access: Option<Vec<u8>>,
-    /// The source's `system.posix_acl_default`; directories only (files have no default ACL), and
-    /// the same `None` semantics as `acl_access`.
-    pub acl_default: Option<Vec<u8>>,
+    /// The source's POSIX ACLs — or [`WireAcls::Unknown`] when they were never read (capture off,
+    /// or the source could not read them). Only ever `Captured` when the master asked via
+    /// [`ExtendedMetadataCapture`].
+    pub acls: WireAcls,
 }
 
 impl Metadata {
@@ -93,25 +118,33 @@ impl Metadata {
     ///
     /// This is a builder rather than a field the [`From`] impls fill because neither of them has an
     /// fd to read from: every site that SHOULD carry ACLs is therefore a visible call, and a site
-    /// that does not simply carries `None`.
+    /// that does not stays [`WireAcls::Unknown`] — which the destination reads as "leave the
+    /// destination's ACLs alone", never as a clear.
     #[must_use]
     pub fn with_acls(mut self, acls: &common::safedir::Acls) -> Self {
-        self.acl_access = acls.access.clone();
-        self.acl_default = acls.default.clone();
+        self.acls = WireAcls::Captured {
+            access: acls.access.clone(),
+            default: acls.default.clone(),
+        };
         self
     }
 
-    /// The ACLs this wire metadata carries, in the shape the destination applier takes.
+    /// The ACLs this wire metadata carries, in the shape the destination applier takes — or
+    /// `None` when they are [`WireAcls::Unknown`] and the destination must not touch the
+    /// destination entry's ACLs.
     ///
-    /// An all-`None` result means "the source had no ACL", which is a request to CLEAR, not to
-    /// leave the destination alone. That is safe to hand the applier unconditionally because the
+    /// A `Some` holding all-`None` fields means "the source had no ACL", which is a request to
+    /// CLEAR, not to leave the destination alone. That is safe to hand the applier because the
     /// source only reads ACLs when the master asked it to, and the master derives that request
     /// from the very same `preserve` settings it hands the destination — see
     /// [`ExtendedMetadataCapture::for_preserve`].
-    pub fn acls(&self) -> common::safedir::Acls {
-        common::safedir::Acls {
-            access: self.acl_access.clone(),
-            default: self.acl_default.clone(),
+    pub fn captured_acls(&self) -> Option<common::safedir::Acls> {
+        match &self.acls {
+            WireAcls::Unknown => None,
+            WireAcls::Captured { access, default } => Some(common::safedir::Acls {
+                access: access.clone(),
+                default: default.clone(),
+            }),
         }
     }
 }
@@ -165,9 +198,11 @@ impl common::preserve::Metadata for &Metadata {
 }
 
 impl From<&std::fs::Metadata> for Metadata {
-    /// ACLs are left `None`: a `stat` snapshot carries no fd, and reading an ACL by path would
-    /// answer from whatever inode the name resolves to now rather than the one this snapshot
-    /// describes. Call sites that should carry ACLs add them with [`Metadata::with_acls`].
+    /// ACLs stay [`WireAcls::Unknown`]: a `stat` snapshot carries no fd, and reading an ACL by
+    /// path would answer from whatever inode the name resolves to now rather than the one this
+    /// snapshot describes. Call sites that should carry ACLs add them with
+    /// [`Metadata::with_acls`]; a site that cannot (the source failed to read them) correctly
+    /// leaves them `Unknown`, which the destination reads as "do not touch", never as a clear.
     fn from(metadata: &std::fs::Metadata) -> Self {
         Metadata {
             mode: metadata.mode(),
@@ -177,8 +212,7 @@ impl From<&std::fs::Metadata> for Metadata {
             mtime: metadata.mtime(),
             atime_nsec: metadata.atime_nsec(),
             mtime_nsec: metadata.mtime_nsec(),
-            acl_access: None,
-            acl_default: None,
+            acls: WireAcls::Unknown,
         }
     }
 }
@@ -189,8 +223,8 @@ impl From<&common::safedir::FileMeta> for Metadata {
     /// reading every field through the shared `preserve::Metadata` trait so it
     /// stays in lock-step with the `&std::fs::Metadata` conversion above.
     ///
-    /// ACLs are left `None` here too: a `FileMeta` is a detached snapshot, not the fd it came
-    /// from, so it cannot answer an ACL probe. See [`Metadata::with_acls`].
+    /// ACLs stay [`WireAcls::Unknown`] here too: a `FileMeta` is a detached snapshot, not the fd
+    /// it came from, so it cannot answer an ACL probe. See [`Metadata::with_acls`].
     fn from(meta: &common::safedir::FileMeta) -> Self {
         use common::preserve::Metadata as _;
         Metadata {
@@ -201,8 +235,7 @@ impl From<&common::safedir::FileMeta> for Metadata {
             mtime: meta.mtime(),
             atime_nsec: meta.atime_nsec(),
             mtime_nsec: meta.mtime_nsec(),
-            acl_access: None,
-            acl_default: None,
+            acls: WireAcls::Unknown,
         }
     }
 }
@@ -763,8 +796,7 @@ mod tests {
                 mtime: 0,
                 atime_nsec: 0,
                 mtime_nsec: 0,
-                acl_access: None,
-                acl_default: None,
+                acls: WireAcls::Unknown,
             },
             size: 0,
         }
@@ -873,35 +905,34 @@ mod tests {
         // through the same codec the streams use, so this pins the real wire behavior
         let bytes = bitcode::serialize(&meta).unwrap();
         let back: Metadata = bitcode::deserialize(&bytes).unwrap();
-        assert_eq!(back.acl_access.as_deref(), Some(access.as_slice()));
-        assert_eq!(back.acl_default.as_deref(), Some(default.as_slice()));
         // and the round trip reproduces the applier-side shape exactly
         assert_eq!(
-            back.acls(),
-            common::safedir::Acls {
+            back.captured_acls(),
+            Some(common::safedir::Acls {
                 access: Some(access),
                 default: Some(default),
-            }
+            })
         );
     }
 
     #[test]
-    fn metadata_built_from_a_stat_snapshot_carries_no_acls() {
-        // neither `From` impl has an fd to probe, so both must leave the fields empty rather than
-        // guess — a site that should carry ACLs makes a visible `with_acls` call instead. An
-        // all-`None` value is a request to CLEAR the destination's, which is the correct reading
-        // ONLY because the source reads ACLs exactly when the master asked it to.
+    fn metadata_built_from_a_stat_snapshot_carries_unknown_acls() {
+        // neither `From` impl has an fd to probe, so both must leave the ACLs Unknown rather than
+        // guess — a site that should carry ACLs makes a visible `with_acls` call instead. Unknown
+        // tells the destination to leave the destination entry's ACLs alone; only a visible
+        // capture may produce the all-`None` CLEAR request.
         let meta = Metadata::from(&std::fs::metadata(".").unwrap());
-        assert_eq!(meta.acls(), common::safedir::Acls::default());
+        assert_eq!(meta.captured_acls(), None);
     }
 
     #[test]
     fn with_acls_round_trips_the_absent_case_as_a_clear_request() {
+        // Captured-with-both-None is distinct from Unknown: it is the authoritative "the source
+        // has no ACL", which the destination applies by REMOVING the attributes.
         let meta = mk_entry("f")
             .metadata
             .with_acls(&common::safedir::Acls::default());
-        assert_eq!(meta.acl_access, None);
-        assert_eq!(meta.acl_default, None);
+        assert_eq!(meta.captured_acls(), Some(common::safedir::Acls::default()));
     }
 
     #[test]

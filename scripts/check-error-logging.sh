@@ -179,6 +179,11 @@ check_file() {
                     in_raw_string = 1
                     raw_string_hashes = RAW_HASHES
                     raw_string_line = NR
+                    # stash the dropped opener + body: dropped from CODE (prose in a literal must
+                    # not arm or match anything), but when this line belongs to a tracing call
+                    # under collection the literal is the FORMAT STRING and the rules must see its
+                    # placeholders — the main block reattaches it to the collected text only
+                    raw_string_pending = substr(line, i)
                     return out
                 }
                 out = out substr(line, i, e - i + 1)
@@ -427,6 +432,7 @@ check_file() {
         in_raw_string = 0
         raw_string_hashes = 0
         raw_string_line = 0
+        raw_string_pending = ""
     }
 
     # ONE main block, rather than a rule per line shape: every line needs its comments removed before
@@ -437,8 +443,15 @@ check_file() {
         # comment, because a `*/` in a raw string'\''s body closes nothing.
         if (in_raw_string) {
             close_at = raw_string_end(line, 1, raw_string_hashes)
-            if (close_at == 0) { next }
+            if (close_at == 0) {
+                # the body of a literal reattached to an active collection (see raw_string_pending)
+                # holds the format strings placeholders — keep feeding it to the collected text;
+                # outside a collection it stays dropped, exactly as before
+                if (in_error_call) { error_text = error_text " " line }
+                next
+            }
             in_raw_string = 0
+            if (in_error_call) { error_text = error_text " " substr(line, 1, close_at) }
             line = substr(line, close_at + 1)
         }
         # inside a block comment, nothing is code until it closes
@@ -449,6 +462,13 @@ check_file() {
             line = substr(line, close_at + 2)
         }
         code = strip_comments(line)
+        # a multi-line raw string OPENED on this line: its opener and body were dropped from
+        # `code` — for CLASSIFICATION, which must never arm or match on prose — but a call under
+        # collection (or one starting on this line) owns that literal as its format string, so it
+        # is reattached to the COLLECTED text below. Captured-and-cleared every line, so a literal
+        # opened outside any call can never leak into a later one.
+        pending_literal = raw_string_pending
+        raw_string_pending = ""
 
         # A line with no code left is a comment or a blank. It cannot be part of a call, but it CAN arm
         # the allow marker for the call below it — and that is the only placement AGENTS.md documents:
@@ -463,11 +483,15 @@ check_file() {
             # string strips to blank too, so the marker text appearing anywhere in a literal'\''s body — a
             # usage message quoting the opt-out, say — would otherwise arm it.
             if (!in_error_call) { armed = ($0 ~ /^[[:space:]]*\/\/.*rcp-error-log-allow/) }
+            # a line that strips to blank can still have OPENED the format-string literal of the
+            # call being collected (nothing but the opener on it) — carry the literal
+            else if (pending_literal != "") { error_text = error_text " " pending_literal }
             next
         }
 
         if (in_error_call) {
             error_text = error_text " " code
+            if (pending_literal != "") { error_text = error_text " " pending_literal }
             depth += paren_delta(code)
             if (depth <= 0) {
                 in_error_call = 0
@@ -480,6 +504,7 @@ check_file() {
         if (code ~ /tracing::(error|warn|info|debug|trace)!/) {
             error_start_line = NR
             error_text = code
+            if (pending_literal != "") { error_text = error_text " " pending_literal }
             allowed = armed
             armed = 0
             # count only the CALL'\''s parens — those from the macro name rightwards. A `);` belonging to

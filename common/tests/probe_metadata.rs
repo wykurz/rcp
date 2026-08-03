@@ -169,15 +169,18 @@ async fn copy_emits_one_metadata_sample_per_tree_entry() {
         16,
         "expected 16 src metadata probes for the fd-based walk",
     );
-    // Destination-side metadata (28 total):
+    // Destination-side metadata (25 total):
     //   - 1 open_root_dir(dst parent)                                          = 1
-    //   - 3 dirs:  make_dir(mkdir + open_dir) + 3 preserve (chown/chmod/utimens) = 5 each = 15
+    //   - 3 dirs:  make_dir + 3 preserve (chown/chmod/utimens)                 = 4 each = 12
     //   - 3 files: create_file + 3 preserve (chown/chmod/utimens)              = 4 each = 12
-    //   (copy_file_range is the data path, unprobed)
+    //   (make_dir is ONE probed op: its mkdirat + re-open — and, under strict mode, the
+    //    inherited-ACL strip — share one blocking closure so no cancellation point can abandon a
+    //    created-but-unsanitized directory; the controller sees one slightly longer MkDir sample
+    //    instead of a MkDir + a Stat. copy_file_range is the data path, unprobed)
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Destination),
-        28,
-        "expected 28 dst metadata probes for the fd-based walk",
+        25,
+        "expected 25 dst metadata probes for the fd-based walk",
     );
 }
 
@@ -410,16 +413,17 @@ async fn link_update_path_emits_probes_for_update_tree() {
         "expected 22 src metadata probes — drops if the update-walk path stops spawning copies \
          for u*.txt",
     );
-    // Destination-side (31 total):
+    // Destination-side (28 total):
     //   - open_root_dir(dst parent)                                              = 1
-    //   - 3 dirs (root + a + b): make_dir(mkdir + open_dir) + 3 preserve         = 5 each = 15
+    //   - 3 dirs (root + a + b): make_dir (one probed op, see the copy test)
+    //     + 3 preserve                                                           = 4 each = 12
     //   - 3 src .txt files hard-linked: linkat only (no metadata)                = 1 each = 3
     //   - 3 update-only files via copy_child: create_file + 3 preserve           = 4 each = 12
-    //   1 + 15 + 3 + 12 = 31. (Drops if the update-walk path stops spawning copies for u*.txt.)
+    //   1 + 12 + 3 + 12 = 28. (Drops if the update-walk path stops spawning copies for u*.txt.)
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Destination),
-        31,
-        "expected 31 dst metadata probes — drops if the update-walk path stops spawning copies \
+        28,
+        "expected 28 dst metadata probes — drops if the update-walk path stops spawning copies \
          for u*.txt",
     );
 }
@@ -472,13 +476,14 @@ async fn link_emits_one_metadata_sample_per_tree_entry() {
         13,
         "expected 13 src metadata probes for the fd-based link walk",
     );
-    // Destination-side metadata (19 total):
+    // Destination-side metadata (16 total):
     //   - 1 open_root_dir(dst parent)                                            = 1
-    //   - 3 dirs:  make_dir(mkdir + open_dir) + 3 preserve (chown/chmod/utimens) = 5 each = 15
+    //   - 3 dirs:  make_dir (one probed op, see the copy test) + 3 preserve
+    //     (chown/chmod/utimens)                                                  = 4 each = 12
     //   - 3 files: hard_link_at (linkat) only — a hard link copies no metadata   = 1 each = 3
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Destination),
-        19,
-        "expected 19 dst metadata probes for the fd-based link walk",
+        16,
+        "expected 16 dst metadata probes for the fd-based link walk",
     );
 }

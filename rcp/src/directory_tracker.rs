@@ -14,7 +14,9 @@
 //! 1. Source pre-reads directory children and sends `Directory` with entry counts
 //! 2. Destination creates directories, stores metadata, sends `DirectoryCreated`
 //! 3. Source sends files; destination also processes child directories and symlinks
-//! 4. When all entries processed, destination applies stored metadata
+//! 4. When all entries are processed AND the directory's announce (`DirectoryCreated`) has
+//!    flushed, destination applies stored metadata — see [`DirectoryTracker::mark_announced`]
+//!    for why completion must wait for the announce
 //! 5. Child directories notify their parent upon completion (not creation),
 //!    propagating bottom-up so parents only complete after all children finish
 //! 6. When all directories complete and structure is done, send `DestinationDone`
@@ -64,6 +66,12 @@ struct DirectoryState {
     entries_expected: usize,
     /// child entries processed so far
     entries_processed: usize,
+    /// has this directory's announce — manifest chunks, then `DirectoryCreated` — reached the
+    /// wire? Completion is gated on it (see [`DirectoryTracker::mark_announced`]): entries can all
+    /// be processed first (symlink/subdirectory-only content arrives in Pass 1, not gated on the
+    /// trigger), and completing then would let `DestinationDone` overtake the announce and close
+    /// the control send stream it still needs
+    announced: bool,
     /// whether to keep this directory if it ends up empty
     keep_if_empty: bool,
     /// what the lockdown must undo at completion (original owner + original ACLs), `Some` iff this
@@ -194,10 +202,18 @@ impl DirectoryTracker {
     pub fn set_root_parent_dir(&mut self, dir: Arc<Dir>) {
         self.root_parent_dir = Some(dir);
     }
-    /// Add a successfully created directory to tracking.
-    /// Sends `DirectoryCreated` to source (the Pass-2 trigger; no count is echoed —
-    /// the source retains its own authoritative Pass-1 file count).
-    /// If `entry_count` is 0, the directory completes immediately.
+    /// Register a successfully resolved directory for tracking: fd-map, stored metadata, pending
+    /// entry count, root/created bookkeeping, and — for a strict-mode locked reused directory —
+    /// the lockdown to undo at completion.
+    ///
+    /// Registration is deliberately SEPARATE from announcing `DirectoryCreated` (see
+    /// `announce_directory_created` in `destination.rs`): it must land before the control receive
+    /// loop processes the next message — children resolve their parent through the fd-map, and
+    /// the source's Pass-1 `Directory` messages for children do not wait for this directory's
+    /// trigger — while the announce may follow later, from a per-directory task, once the
+    /// overwrite manifest has been built. No directory completes here, whatever its entry count:
+    /// completion follows the LATER of its last processed entry and its announce (see
+    /// [`Self::mark_announced`]).
     ///
     /// # Arguments
     /// * `dir` - the open `Dir` fd for this directory (stored in the fd-map so its
@@ -205,13 +221,11 @@ impl DirectoryTracker {
     /// * `was_created` - true if we created this directory, false if it already existed
     /// * `entry_count` - total child entries (files + dirs + symlinks)
     /// * `keep_if_empty` - whether to keep this directory if empty
-    /// * `existing` - pre-existing destination entries to include in the `DirectoryCreated` manifest
     /// * `reused_lock` - what to undo at completion (original owner + original ACLs) for a
     ///   strict-mode locked reused directory (`None` for fresh dirs and the default path)
     #[allow(clippy::too_many_arguments)]
-    pub async fn add_directory(
+    pub fn register_directory(
         &mut self,
-        src: &std::path::Path,
         dst: &std::path::Path,
         dir: Arc<Dir>,
         metadata: remote::protocol::Metadata,
@@ -219,9 +233,8 @@ impl DirectoryTracker {
         was_created: bool,
         entry_count: usize,
         keep_if_empty: bool,
-        existing: Vec<remote::protocol::ExistingEntry>,
         reused_lock: Option<common::safedir::ReusedDirLock>,
-    ) -> anyhow::Result<()> {
+    ) {
         // store metadata for later application
         self.metadata.insert(dst.to_path_buf(), metadata);
         // store the open dir fd so children resolve relative to it (fd-map).
@@ -234,53 +247,26 @@ impl DirectoryTracker {
         if was_created {
             self.created_directories.insert(dst.to_path_buf());
         }
-        // add to pending with known entry count
+        // add to pending with known entry count; not announced yet — the announce follows
+        // (inline, or from a per-directory manifest task) and is what unlocks completion
         self.pending_directories.insert(
             dst.to_path_buf(),
             DirectoryState {
                 entries_expected: entry_count,
                 entries_processed: 0,
+                announced: false,
                 keep_if_empty,
                 reused_lock,
             },
         );
-        // stream the pre-existing-entry manifest as chunks (each well under the control stream's
-        // frame limit) BEFORE DirectoryCreated, then send the trigger. The control stream is FIFO,
-        // so the source has the full manifest before it sees DirectoryCreated. The lock is held
-        // across the whole sequence so a directory's chunks stay contiguous with its trigger.
-        let manifest_entries = existing.len();
-        let chunks = remote::protocol::chunk_manifest(
-            existing,
-            remote::protocol::MANIFEST_CHUNK_BYTE_BUDGET,
-        );
-        {
-            let mut stream = self.control_send_stream.lock().await;
-            for entries in chunks {
-                let chunk_msg = remote::protocol::DestinationMessage::DirectoryManifestChunk {
-                    dst: dst.to_path_buf(),
-                    entries,
-                };
-                stream.send_batch_message(&chunk_msg).await?;
-            }
-            let message = remote::protocol::DestinationMessage::DirectoryCreated {
-                src: src.to_path_buf(),
-                dst: dst.to_path_buf(),
-            };
-            stream.send_control_message(&message).await?;
-        }
-        tracing::info!(
-            "Sent DirectoryCreated: {:?} -> {:?} (entries={}, manifest={})",
-            src,
+        tracing::debug!(
+            "Registered directory {:?} (entries={}, created={})",
             dst,
             entry_count,
-            manifest_entries
+            was_created
         );
-        // if entry_count is 0, directory is immediately complete
-        if entry_count == 0 {
-            self.complete_directory(dst).await?;
-        }
-        Ok(())
     }
+
     /// Mark a directory as failed (creation error). Records the failure only; the caller sends a
     /// `DirectorySkipped` nack (not `DirectoryCreated`), so the source won't send files for it.
     pub fn mark_directory_failed(&mut self, dst: &std::path::Path) {
@@ -306,8 +292,8 @@ impl DirectoryTracker {
             state.entries_processed,
             state.entries_expected
         );
-        // check completion
-        if state.entries_processed >= state.entries_expected {
+        // check completion (gated on the announce having flushed — see mark_announced)
+        if state.entries_processed >= state.entries_expected && state.announced {
             self.complete_directory(dst_dir).await?;
             Ok(true)
         } else {
@@ -332,9 +318,32 @@ impl DirectoryTracker {
             state.entries_processed,
             state.entries_expected
         );
-        // check completion
-        if state.entries_processed >= state.entries_expected {
+        // check completion (gated on the announce having flushed — see mark_announced)
+        if state.entries_processed >= state.entries_expected && state.announced {
             self.complete_directory(parent_dst).await?;
+        }
+        Ok(())
+    }
+    /// Record that this directory's announce — its manifest chunks, then `DirectoryCreated` — is
+    /// on the wire, and complete the directory if its children already finished while the
+    /// announce was pending (always the case for a 0-entry directory, which nothing else will
+    /// complete).
+    ///
+    /// Completion is gated on the announce (`DirectoryState::announced`) because entries do not
+    /// wait for it: a directory whose children are all symlinks/subdirectories has every entry
+    /// processed straight off Pass-1 messages, which can all land while the directory's manifest
+    /// is still being built. Completing it then would let `DestinationDone` win the race against
+    /// its own announce — closing the control send stream the announce task still needs (failing
+    /// a healthy copy with a broken pipe) and violating the one-response-per-`Directory` contract
+    /// (docs/remote_protocol.md §2.2). No-op for an untracked directory, mirroring
+    /// `process_child_entry`.
+    pub async fn mark_announced(&mut self, dst: &std::path::Path) -> anyhow::Result<()> {
+        let Some(state) = self.pending_directories.get_mut(dst) else {
+            return Ok(());
+        };
+        state.announced = true;
+        if state.entries_processed >= state.entries_expected {
+            self.complete_directory(dst).await?;
         }
         Ok(())
     }
@@ -345,6 +354,9 @@ impl DirectoryTracker {
     /// now all processed, completes the parent too, and so on up the tree.
     /// This ensures parent directories only complete after all children finish,
     /// so empty-directory cleanup decisions are correct.
+    ///
+    /// Callers have already established the completion conditions — all entries processed AND the
+    /// announce on the wire; the upward walk re-checks both for each parent it reaches.
     async fn complete_directory(&mut self, dst: &std::path::Path) -> anyhow::Result<()> {
         let mut current = dst.to_path_buf();
         loop {
@@ -367,8 +379,8 @@ impl DirectoryTracker {
                 state.entries_processed,
                 state.entries_expected
             );
-            if state.entries_processed < state.entries_expected {
-                break; // parent not complete yet
+            if state.entries_processed < state.entries_expected || !state.announced {
+                break; // parent not complete yet (still counting, or its announce has not flushed)
             }
             // parent is now complete, continue loop to complete it
             current = parent.to_path_buf();
@@ -468,15 +480,26 @@ impl DirectoryTracker {
                     // lockdown stripped and restore the original owner component-wise, then apply
                     // source metadata (see set_reused_dir_metadata_fd — no transient window hands the
                     // directory to a hostile prior owner); None for fresh dirs.
-                    // The source's access AND default ACLs travel in the stored wire metadata and
-                    // are handed over unconditionally; an all-`None` value means the source had none
-                    // and the destination's must be CLEARED (see the same note in `destination.rs`).
-                    // The default ACL matters most here: it is what every child created beneath this
-                    // directory inherits.
+                    // The source's access AND default ACLs travel in the stored wire metadata; a
+                    // `Captured` all-`None` value means the source had none and the destination's
+                    // must be CLEARED (see the same note in `destination.rs`). `Unknown` means the
+                    // source could not READ them (a committed directory that failed to open — its
+                    // copy is already recorded as failed) or capture was off: this directory's ACL
+                    // preservation is disabled for the one call, so the destination's ACLs are left
+                    // alone and a locked reused directory gets its ORIGINAL default ACL back
+                    // instead of an authoritative clear of state the source never observed.
+                    let acls = metadata.captured_acls();
+                    let preserve_for_entry = if acls.is_none() {
+                        let mut p = self.preserve;
+                        p.dir.acl = false;
+                        p
+                    } else {
+                        self.preserve
+                    };
                     let apply_result = common::safedir::set_reused_dir_metadata_fd(
-                        &self.preserve,
+                        &preserve_for_entry,
                         &metadata,
-                        Some(&metadata.acls()),
+                        acls.as_ref(),
                         reused_lock,
                         dir,
                     )
@@ -547,6 +570,13 @@ impl DirectoryTracker {
     /// close from a mid-transfer truncation.
     pub fn is_closing(&self) -> bool {
         self.closing
+    }
+    /// Whether `DestinationDone` has been sent — i.e. the copy reached completion and the send
+    /// stream carried its final message. After the control receive loop exits, this distinguishes
+    /// normal completion (drain the announce tasks) from a source-initiated teardown (abort them
+    /// — see `process_control_stream`).
+    pub fn destination_done_sent(&self) -> bool {
+        self.done_sent
     }
     /// Send DestinationDone and close the send stream.
     /// Returns true if DestinationDone was sent, false if already sent.
@@ -622,8 +652,7 @@ mod tests {
             mtime: 0,
             atime_nsec: 0,
             mtime_nsec: 0,
-            acl_access: None,
-            acl_default: None,
+            acls: remote::protocol::WireAcls::Unknown,
         }
     }
     async fn open_dir(path: &std::path::Path) -> Arc<Dir> {
@@ -701,40 +730,69 @@ mod tests {
         let child_dir = open_dir(&child_path).await;
         let mut t = new_tracker();
         // the root parent expects exactly one child entry (the subdirectory).
-        t.add_directory(
-            &parent_path,
-            &parent_path,
-            parent_dir,
-            meta(),
-            true,
-            true,
-            1,
-            true,
-            vec![],
-            None,
-        )
-        .await
-        .unwrap();
+        t.register_directory(&parent_path, parent_dir, meta(), true, true, 1, true, None);
+        t.mark_announced(&parent_path).await.unwrap();
         assert!(!t.is_done(), "the parent still awaits its child");
-        // the child has no entries: it completes immediately, notifies the parent, and completes it.
-        t.add_directory(
-            &child_path,
-            &child_path,
-            child_dir,
-            meta(),
-            false,
-            true,
-            0,
-            true,
-            vec![],
-            None,
-        )
-        .await
-        .unwrap();
+        // the child has no entries: its announce completes it, which notifies the parent and
+        // completes it too.
+        t.register_directory(&child_path, child_dir, meta(), false, true, 0, true, None);
+        t.mark_announced(&child_path).await.unwrap();
         t.set_structure_complete(true);
         assert!(
             t.is_done(),
             "completing the child must propagate bottom-up and complete the root parent"
+        );
+    }
+    #[tokio::test]
+    async fn completion_waits_for_the_announce() {
+        // the DestinationDone-overtakes-DirectoryCreated race: a reused directory's children can
+        // ALL be processed straight off Pass-1 messages (symlinks/subdirectories) while its
+        // manifest is still being built — the directory must NOT complete, and DestinationDone
+        // must not become sendable, until its announce has flushed.
+        let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("root");
+        std::fs::create_dir(&root_path).unwrap();
+        let root_dir = open_dir(&root_path).await;
+        let mut t = new_tracker();
+        // reused root whose single entry (a symlink) arrives before the announce
+        t.register_directory(&root_path, root_dir, meta(), true, false, 1, true, None);
+        t.set_structure_complete(true);
+        t.process_child_entry(&root_path).await.unwrap();
+        assert!(
+            !t.is_done(),
+            "all entries processed, but the announce has not flushed — completing now would \
+             let DestinationDone overtake DirectoryCreated"
+        );
+        t.mark_announced(&root_path).await.unwrap();
+        assert!(
+            t.is_done(),
+            "the announce completes the already-fully-counted directory"
+        );
+    }
+    #[tokio::test]
+    async fn parent_completion_waits_for_the_parents_own_announce() {
+        // the announce gate must also hold during bottom-up propagation: a completing child fills
+        // the parent's count, but the parent stays pending until its OWN announce flushes.
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_path = tmp.path().join("parent");
+        let child_path = parent_path.join("child");
+        std::fs::create_dir_all(&child_path).unwrap();
+        let parent_dir = open_dir(&parent_path).await;
+        let child_dir = open_dir(&child_path).await;
+        let mut t = new_tracker();
+        t.register_directory(&parent_path, parent_dir, meta(), true, false, 1, true, None);
+        t.register_directory(&child_path, child_dir, meta(), false, true, 0, true, None);
+        t.set_structure_complete(true);
+        t.mark_announced(&child_path).await.unwrap();
+        assert!(
+            !t.is_done(),
+            "the child completed and filled the parent's count, but the parent's announce has \
+             not flushed"
+        );
+        t.mark_announced(&parent_path).await.unwrap();
+        assert!(
+            t.is_done(),
+            "the parent's announce completes it once its entries are already counted"
         );
     }
     #[tokio::test]
@@ -746,21 +804,10 @@ mod tests {
         // the root's parent fd (the trusted destination parent) backs the fd-relative rmdir.
         t.set_root_parent_dir(open_dir(tmp.path()).await);
         let root_dir = open_dir(&root_path).await;
-        // created, empty (entry_count=0), keep_if_empty=false → removed via the parent's pinned fd.
-        t.add_directory(
-            &root_path,
-            &root_path,
-            root_dir,
-            meta(),
-            true,
-            true,
-            0,
-            false,
-            vec![],
-            None,
-        )
-        .await
-        .unwrap();
+        // created, empty (entry_count=0), keep_if_empty=false → removed via the parent's pinned
+        // fd once its announce completes it.
+        t.register_directory(&root_path, root_dir, meta(), true, true, 0, false, None);
+        t.mark_announced(&root_path).await.unwrap();
         assert!(
             !root_path.exists(),
             "an empty created directory with keep_if_empty=false must be removed"

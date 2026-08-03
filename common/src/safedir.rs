@@ -336,9 +336,48 @@ pub struct Dir {
     fd: Arc<OwnedFd>,
     /// Which filesystem side this directory lives on, for congestion gating.
     side: congestion::Side,
+    /// Whether a file created in THIS directory may inherit an access ACL that rcp has not
+    /// sanitized — i.e. whether the directory may still carry a default ACL rcp took no
+    /// responsibility for.
+    ///
+    /// `true` for every directory rcp merely OPENED: the ambient parent above a named operand
+    /// (`open_parent_dir` / `open_root_dir`) and any reused directory before its lockdown. `false`
+    /// only once rcp has made inheritance impossible: a `make_dir` (which strips both ACLs at
+    /// creation under strict operand resolution) or a [`lockdown_reused_dir`] (which removes the
+    /// default ACL for the copy's duration) — the ONLY two sites that clear it, via
+    /// `Self::mark_children_cannot_inherit`.
+    ///
+    /// Consulted ONLY by [`Self::create_file`], ONLY under `--require-toctou-safe`. The polarity is
+    /// deliberately fail-safe: a stale `true` on an already-sanitized parent costs one wasted
+    /// `fremovexattr` per created file; a wrong `false` would silently reopen the containment hole
+    /// (docs/acls.md, "containment"), so nothing but the two sanitizing sites may clear it — and
+    /// the ONE re-arming site may set it back: [`ReusedDirLock`]'s rollback restores the
+    /// directory's original default ACL, so it stores `true` (before the restore syscall) or a
+    /// file created after the rollback would inherit that ACL with the strip skipped. `Arc`d so
+    /// `create_file`'s blocking closure can consult it AFTER its `openat` (a pre-closure snapshot
+    /// races the rollback: the closure can run after the restore with a stale `false`).
+    children_may_inherit: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Dir {
+    /// Wrap a directory fd rcp merely OPENED (as opposed to created): its inherited-ACL state is
+    /// unknown, so files created in it must assume the worst — see `children_may_inherit`.
+    fn opened(fd: OwnedFd, side: congestion::Side) -> Dir {
+        Dir {
+            fd: Arc::new(fd),
+            side,
+            children_may_inherit: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    /// Record that nothing created in this directory can inherit an ACL anymore — called by the
+    /// two sanitizing sites (`make_dir`'s creation strip and [`lockdown_reused_dir`]'s default-ACL
+    /// removal) and nothing else; see `children_may_inherit`.
+    fn mark_children_cannot_inherit(&self) {
+        self.children_may_inherit
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Which filesystem side this directory lives on (for congestion gating).
     #[must_use]
     pub fn side(&self) -> congestion::Side {
@@ -380,26 +419,17 @@ impl Dir {
                         ));
                     }
                     return openat2_no_symlinks(&path, flags)
-                        .map(|fd| Dir {
-                            fd: Arc::new(fd),
-                            side,
-                        })
+                        .map(|fd| Dir::opened(fd, side))
                         .map_err(nix_to_io);
                 }
             }
             match openat(AT_FDCWD, &path, flags, mode) {
-                Ok(fd) => Ok(Dir {
-                    fd: Arc::new(fd),
-                    side,
-                }),
+                Ok(fd) => Ok(Dir::opened(fd, side)),
                 Err(nix::errno::Errno::ELOOP) if dereference => {
                     // final component is a symlink; follow it only when dereference=true
                     let follow_flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
                     openat(AT_FDCWD, &path, follow_flags, mode)
-                        .map(|fd| Dir {
-                            fd: Arc::new(fd),
-                            side,
-                        })
+                        .map(|fd| Dir::opened(fd, side))
                         .map_err(nix_to_io)
                 }
                 Err(e) => Err(nix_to_io(e)),
@@ -446,24 +476,14 @@ impl Dir {
             {
                 if strict_operand_resolution() {
                     return openat2_no_symlinks(&path, flags)
-                        .map(|fd| {
-                            TrustedDir(Dir {
-                                fd: Arc::new(fd),
-                                side,
-                            })
-                        })
+                        .map(|fd| TrustedDir(Dir::opened(fd, side)))
                         .map_err(nix_to_io);
                 }
             }
             // a normal directory open: the kernel resolves the whole path following
             // symlinks, including the final (trusted parent) component. No O_NOFOLLOW.
             openat(AT_FDCWD, &path, flags, Mode::empty())
-                .map(|fd| {
-                    TrustedDir(Dir {
-                        fd: Arc::new(fd),
-                        side,
-                    })
-                })
+                .map(|fd| TrustedDir(Dir::opened(fd, side)))
                 .map_err(nix_to_io)
         })
         .await
@@ -491,10 +511,7 @@ impl Dir {
         run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
             let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
             openat(dir.as_fd(), name.as_bytes(), flags, Mode::empty())
-                .map(|fd| Dir {
-                    fd: Arc::new(fd),
-                    side,
-                })
+                .map(|fd| Dir::opened(fd, side))
                 .map_err(nix_to_io)
         })
         .await
@@ -819,18 +836,31 @@ impl Dir {
     /// Fails with `EINVAL` if `name` is not a single path component, or `EEXIST` if
     /// a directory (or any other entry) at `name` already exists.
     ///
-    /// This is a two-step operation: `mkdirat` (gated as `MkDir`) to create the
-    /// directory, followed by `open_dir` (gated as `Stat`) to open and return it.
+    /// The `mkdirat`, the re-open, and (under strict operand resolution) the inherited-ACL strip
+    /// all run inside ONE blocking closure, gated once as `MkDir`. That is a cancellation-safety
+    /// requirement, not packaging: a `spawn_blocking` closure runs to completion once submitted, so
+    /// there is NO await point at which the directory exists but its sanitization has not happened.
+    /// Splitting the steps across separate gated calls (as an earlier version did) leaves windows a
+    /// `--fail-early` sibling abort can land in, abandoning an rcp-created directory that still
+    /// carries the destination's inherited default ACL — inert at that moment (created owner-only,
+    /// `ACL_MASK` empty), but poisoning the containment invariant for anything created under it
+    /// later, including a rerun that cannot tell such an orphan from a user's own directory. For
+    /// the same reason, a directory whose open or strip FAILS is removed (best-effort; it is empty
+    /// and just created) inside the same closure rather than left behind unsanitized.
     ///
     /// # Inherited ACLs, and why the strip lives here
     ///
     /// A directory created under a parent that carries a DEFAULT ACL inherits both an access and a
     /// default ACL from it, and its own children then inherit in turn — so a destination tree's
     /// inheritance policy reaches straight through the directories rcp creates itself. Under
-    /// [`strict_operand_resolution`] (`--require-toctou-safe`) that is contained by stripping both
-    /// ACLs from the new directory (`strip_inherited_acls_fd`), which stops the chain for the
-    /// directory's ENTIRE subtree: nothing created inside a stripped directory inherits anything.
-    /// That is why the cost is 2 syscalls per DIRECTORY and none per file.
+    /// [`strict_operand_resolution`] (`--require-toctou-safe`) that is contained by removing both
+    /// ACLs from the new directory, which stops the chain for the directory's ENTIRE subtree:
+    /// nothing created inside a stripped directory inherits anything. This is the containment half
+    /// of the `--require-toctou-safe` invariant — *no destination entry that rcp CREATES carries an
+    /// ACL entry that did not come from its source* — and stripping per DIRECTORY is what makes it
+    /// 2 syscalls per directory and none per file created beneath one ([`Self::create_file`] pays
+    /// its own single strip only in a parent rcp did NOT sanitize — the ambient parent of a direct
+    /// file operand; see `children_may_inherit`).
     ///
     /// The strip belongs HERE rather than at each caller because this is the only `mkdirat` in the
     /// crate, and therefore the single creation site for both the local (`copy`/`link`) and remote
@@ -838,9 +868,11 @@ impl Dir {
     /// hole open. The default path is untouched: it pays nothing, which is the whole point of making
     /// containment a strict-mode concern.
     ///
-    /// The window between the `mkdirat` and the strip is not exploitable: every destination caller
-    /// creates owner-only ([`DST_DIR_CREATE_MODE`]) and the kernel intersects inherited entries with
-    /// the create `mode`, leaving `ACL_MASK` empty, so every named entry inherited grants nothing.
+    /// `ENODATA` and `EOPNOTSUPP` are success for the strip (see `apply_one_acl`) — a directory
+    /// with no inherited ACL, or on a filesystem that cannot hold one, already satisfies the
+    /// post-condition. Any other errno fails the create (after the best-effort removal above), and
+    /// the caller must fail closed rather than descend: an un-strippable default ACL is one every
+    /// child written afterwards would inherit.
     ///
     /// **A consequence, deliberately taken.** Under `--require-toctou-safe` WITHOUT `d:acl` a fresh
     /// destination directory ends with NO ACL, even where the parent's default ACL would ordinarily
@@ -857,23 +889,65 @@ impl Dir {
         let dir = self.fd.clone();
         let side = self.side;
         let name_owned = name.to_owned();
-        run_metadata_probed_blocking(side, congestion::MetadataOp::MkDir, move || {
-            mkdirat(
-                dir.as_fd(),
-                name_owned.as_bytes(),
-                Mode::from_bits_truncate(mode),
-            )
-            .map_err(nix_to_io)
+        let strict = strict_operand_resolution();
+        let created =
+            run_metadata_probed_blocking(side, congestion::MetadataOp::MkDir, move || {
+                mkdirat(
+                    dir.as_fd(),
+                    name_owned.as_bytes(),
+                    Mode::from_bits_truncate(mode),
+                )
+                .map_err(nix_to_io)?;
+                let open_flags =
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+                let fd = match openat(
+                    dir.as_fd(),
+                    name_owned.as_bytes(),
+                    open_flags,
+                    Mode::empty(),
+                )
+                .map_err(nix_to_io)
+                {
+                    Ok(fd) => fd,
+                    Err(err) => {
+                        // could not open what was just created: remove it best-effort. No fd
+                        // exists to anchor an inode recheck on, but the exposure is bounded —
+                        // `RemoveDir` refuses anything but an empty directory, so a swapped-in
+                        // file or symlink fails it and a swapped-in populated directory survives
+                        let _ =
+                            unlinkat(dir.as_fd(), name_owned.as_bytes(), UnlinkatFlags::RemoveDir);
+                        return Err(err);
+                    }
+                };
+                if strict {
+                    // both ACLs, the default (inheritance-carrying) one first — see the doc
+                    // comment for why this must happen inside the creation closure
+                    if let Err(err) = apply_one_acl(fd.as_raw_fd(), ACL_DEFAULT_XATTR, None)
+                        .and_then(|()| apply_one_acl(fd.as_raw_fd(), ACL_ACCESS_XATTR, None))
+                    {
+                        // the strip failed: remove the directory rather than leave an orphan that
+                        // still carries inherited ACLs — recheck-guarded, so the name is removed
+                        // only while it is still OUR inode
+                        remove_created_if_same_inode(
+                            dir.as_fd(),
+                            name_owned.as_bytes(),
+                            fd.as_fd(),
+                            UnlinkatFlags::RemoveDir,
+                        );
+                        return Err(err);
+                    }
+                }
+                Ok(fd)
+            })
+            .await?;
+        Ok(Dir {
+            fd: Arc::new(created),
+            side,
+            // under strict mode the closure above stripped both ACLs, so nothing created in this
+            // directory can inherit; outside strict mode inheritance is the documented default
+            // behavior and the flag is never consulted
+            children_may_inherit: Arc::new(std::sync::atomic::AtomicBool::new(!strict)),
         })
-        .await?;
-        // A failure past this point leaves the directory created but unreported — the same orphan
-        // the pre-existing `open_dir` failure already leaves, and harmless: it is empty, owner-only
-        // and copier-owned, and the caller treats the error as a create failure and skips descent.
-        let created = self.open_dir(name).await?;
-        if strict_operand_resolution() {
-            strip_inherited_acls_fd(created.fd.as_fd(), created.side).await?;
-        }
-        Ok(created)
     }
 
     /// Enumerate the directory's entries (excluding `.` and `..`).
@@ -940,6 +1014,54 @@ impl Dir {
             }
             // nix_dir drops here, closing the dup'd fd; self's fd is unaffected
             Ok(entries)
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
+    /// Enumerate at most `cap` entries (excluding `.` and `..`), or report the directory as
+    /// over-cap. Returns `Ok(None)` as soon as a `cap + 1`-th entry is seen — the whole point:
+    /// a caller that will DISCARD an over-cap listing (the overwrite-manifest build against its
+    /// `--overwrite-manifest-max-entries` bound) must not pay for, or sit uncancellably in, a
+    /// full enumeration of a directory arbitrarily larger than its bound. The early break leaves
+    /// the shared read offset mid-directory; the borrowing iterator's `Drop` rewinds it exactly
+    /// as on the full-read and error paths of [`Self::read_entries`], so re-enumeration on the
+    /// same `Dir` stays sound.
+    pub async fn read_entries_capped(
+        &self,
+        cap: usize,
+    ) -> std::io::Result<Option<Vec<(std::ffi::OsString, Option<EntryKind>)>>> {
+        throttle::get_ops_token().await;
+        let dir = self.fd.clone();
+        tokio::task::spawn_blocking(move || {
+            // dup + rewind contract: see read_entries
+            let dup_raw: RawFd =
+                nix::fcntl::fcntl(dir.as_fd(), nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0))
+                    .map_err(nix_to_io)?;
+            // SAFETY: dup_raw is a freshly-dup'd fd that we own exclusively; no
+            // other reference to it exists.
+            let dup_owned = unsafe { OwnedFd::from_raw_fd(dup_raw) };
+            let mut nix_dir = nix::dir::Dir::from_fd(dup_owned).map_err(nix_to_io)?;
+            let mut entries = Vec::new();
+            for entry_result in nix_dir.iter() {
+                let entry = entry_result.map_err(nix_to_io)?;
+                let name_cstr = entry.file_name();
+                if name_cstr == c"." || name_cstr == c".." {
+                    continue;
+                }
+                if entries.len() >= cap {
+                    return Ok(None);
+                }
+                let name = std::ffi::OsStr::from_bytes(name_cstr.to_bytes()).to_owned();
+                let kind = entry.file_type().map(|t| match t {
+                    nix::dir::Type::Directory => EntryKind::Dir,
+                    nix::dir::Type::Symlink => EntryKind::Symlink,
+                    nix::dir::Type::File => EntryKind::File,
+                    _ => EntryKind::Special,
+                });
+                entries.push((name, kind));
+            }
+            Ok(Some(entries))
         })
         .await
         .map_err(std::io::Error::other)?
@@ -1182,6 +1304,20 @@ impl Dir {
     /// following it. `O_NOFOLLOW` is the fallback that would still refuse to
     /// follow a symlink (with `ELOOP`) should `O_EXCL` ever be bypassed.
     ///
+    /// # The ambient-parent ACL strip
+    ///
+    /// Under [`strict_operand_resolution`] a file created in a parent rcp did NOT sanitize — the
+    /// ambient parent of a direct file operand, the one directory kind rcp neither creates nor
+    /// locks down (`children_may_inherit`) — has its inherited access ACL removed in the SAME
+    /// blocking closure as the create. Without it, a parent's default ACL hands the fresh file
+    /// named `user:`/`group:` entries; they are inert at [`DST_FILE_CREATE_MODE`] (the create mode
+    /// leaves `ACL_MASK` empty), but the final `fchmod` to the source mode re-derives the mask
+    /// from the group bits and ACTIVATES them — a strict copy of a plain `0640` file granting a
+    /// named user read access its source never did. Files created beneath a sanitized directory
+    /// pay nothing: the parent-side strip already broke the inheritance chain, which is the flag's
+    /// whole point. A strip failure fails the create (after a best-effort unlink of the empty
+    /// file), because the caller's later chmod would otherwise publish the inherited entries.
+    ///
     /// Fails with `EINVAL` if `name` is not a single path component, or `EEXIST`
     /// if a file or symlink at `name` already exists.
     pub async fn create_file(&self, name: &OsStr) -> std::io::Result<std::fs::File> {
@@ -1191,6 +1327,14 @@ impl Dir {
         let dir = self.fd.clone();
         let side = self.side;
         let name = name.to_owned();
+        // the flag travels INTO the closure and is read AFTER the openat: a pre-submit snapshot
+        // races the reused-dir rollback — a fail-early abort can restore the parent's default ACL
+        // between this submit and the queued openat, and the file created then DOES inherit. The
+        // rollback stores `true` before its restore syscall and this load runs after the openat;
+        // syscalls order as full fences, so an openat that observed the restored ACL cannot then
+        // load a stale `false`. A wasted strip on a not-yet-restored parent remains harmless.
+        let strict = strict_operand_resolution();
+        let may_inherit = Arc::clone(&self.children_may_inherit);
         run_metadata_probed_blocking(side, congestion::MetadataOp::OpenCreate, move || {
             let flags = OFlag::O_CREAT
                 | OFlag::O_EXCL
@@ -1198,9 +1342,26 @@ impl Dir {
                 | OFlag::O_NOFOLLOW
                 | OFlag::O_CLOEXEC;
             let file_mode = Mode::from_bits_truncate(DST_FILE_CREATE_MODE);
-            openat(dir.as_fd(), name.as_bytes(), flags, file_mode)
+            let file = openat(dir.as_fd(), name.as_bytes(), flags, file_mode)
                 .map(std::fs::File::from)
-                .map_err(nix_to_io)
+                .map_err(nix_to_io)?;
+            if strict && may_inherit.load(std::sync::atomic::Ordering::SeqCst) {
+                // same-closure for the same reason as `make_dir`: once submitted this runs to
+                // completion, so no cancellation can abandon a created-but-unsanitized file.
+                // The failure-path removal is recheck-guarded — this closure runs in the AMBIENT
+                // operand parent, the one directory rcp neither creates nor locks down, so the
+                // name must be removed only while it still refers to the file just created
+                if let Err(err) = apply_one_acl(file.as_raw_fd(), ACL_ACCESS_XATTR, None) {
+                    remove_created_if_same_inode(
+                        dir.as_fd(),
+                        name.as_bytes(),
+                        file.as_fd(),
+                        UnlinkatFlags::NoRemoveDir,
+                    );
+                    return Err(err);
+                }
+            }
+            Ok(file)
         })
         .await
     }
@@ -1326,10 +1487,14 @@ pub async fn strict_probe_dst_kind(
 ///
 /// So the restore lives in [`Drop`] instead, and holds on every exit path that drops the value: an
 /// early return, a `?`, a `break`, and — the case the abort paths above actually need — a cancelled
-/// task, since dropping a future drops its locals. [`set_reused_dir_metadata_fd`] defuses the guard
-/// by taking the snapshot once it has been dealt with deliberately, which is why the field is
-/// private: nothing outside this module can arm, disarm, or duplicate it. `Clone` is deliberately
-/// NOT derived — exactly one of these exists per lockdown, and a copy would restore twice.
+/// task, since dropping a future drops its locals. [`set_reused_dir_metadata_fd`] disarms the guard
+/// once the default ACL has been dealt with deliberately AND nothing after it can fail, which is
+/// why the state is private: nothing outside this module can arm, disarm, or duplicate it. The
+/// armed/disarmed distinction is an explicit enum (`DefaultAclGuard`) rather than the emptiness
+/// of the snapshot, because a directory that HAD no default ACL still needs an armed rollback: a
+/// partial finalize may have installed the source's, and only an armed guard removes it. `Clone`
+/// is deliberately NOT derived — exactly one of these exists per lockdown, and a copy would
+/// restore twice.
 ///
 /// **The guard must exist before anything is destroyed, not after.** "Dropped on every exit path"
 /// says nothing about the window in which the value does not exist yet, and that window is where
@@ -1362,52 +1527,185 @@ pub async fn strict_probe_dst_kind(
 /// Only the default ACL. An aborted lockdown still leaves the directory owned by the copier at
 /// `0o700` — that outcome is already documented in `docs/tocttou.md`, and unlike ACL loss it is
 /// narrow, visible, and repairable: an operator sees the mode and fixes it. Nothing is destroyed.
+/// The armed/disarmed state of a [`ReusedDirLock`]'s default-ACL rollback, shared (behind one
+/// mutex) between the guard's `Drop` restore and every finalize write to the guarded attribute.
+///
+/// Two conflations this enum exists to prevent:
+///
+/// - **"Had no original ACL" is not "nothing to undo".** With `d:acl` on, finalize INSTALLS the
+///   source's default ACL before later steps that can still fail; a directory that originally had
+///   none must then get that installation REMOVED on rollback, or a failed copy leaves it carrying
+///   an ACL the destination never had. A bare `Option<Vec<u8>>` (the previous shape) could not
+///   express that arm: its `None` doubled as "disarmed", so the partial application survived.
+/// - **A detached write must not undo the restore.** Finalize ACL writes run on the blocking pool,
+///   which cannot be cancelled — a dropped future detaches the closure, which lands whenever the
+///   pool schedules it, possibly AFTER the guard's `Drop` has already put the original back.
+///   Serializing every guarded write and the restore through this one mutex, with a write that
+///   observes [`Self::Disarmed`] SKIPPING, closes the race in both directions: a write mid-syscall
+///   holds the mutex, so the restore waits and then lands over it (correct — the copy is
+///   aborting); a write not yet started finds the guard disarmed and never lands.
+#[derive(Debug)]
+enum DefaultAclGuard {
+    /// The lockdown is live. On abort, put the directory's default ACL back to `original`:
+    /// `Some` bytes are restored; `None` means the directory had no default ACL, so whatever a
+    /// partial finalize may have installed is REMOVED.
+    Armed { original: Option<Vec<u8>> },
+    /// Finalize resolved the default ACL deliberately (or the restore already ran). Nothing is
+    /// left to undo, and any still-queued guarded write must NOT land.
+    Disarmed,
+}
+
 #[derive(Debug)]
 pub struct ReusedDirLock {
     /// The directory's original `(uid, gid)`, taken from the classify handle before the takeover.
     pub restore_owner: (u32, u32),
-    /// The directory's original DEFAULT ACL, removed for the copy's duration. `None` when it had
-    /// none — then there is nothing to lose and `Drop` is a no-op.
-    ///
-    /// Taking this is what defuses the guard, so there is no separate flag to keep in step with it.
-    restore_default_acl: Option<Vec<u8>>,
+    /// The rollback state plus the original default ACL, shared (`Arc`) with in-flight guarded
+    /// writes so the `Drop` restore serializes against them — see `DefaultAclGuard`.
+    state: Arc<std::sync::Mutex<DefaultAclGuard>>,
     /// The locked directory's fd, shared with the `Dir` it came from. An `Arc` rather than a `dup`:
     /// it costs no descriptor and no syscall, and it keeps the fd open for exactly as long as the
     /// guard can still need it, so `Drop` writes to the pinned inode rather than re-resolving a path
     /// an attacker may have swapped.
     fd: Arc<OwnedFd>,
+    /// The locked `Dir`'s inherit flag, shared so the rollback can RE-ARM it (`store(true)` before
+    /// the restore syscall): restoring the original default ACL makes inheritance possible again,
+    /// and a file created in the window after the rollback must strip what it inherited — see
+    /// `Dir::children_may_inherit` and `Dir::create_file`.
+    children_may_inherit: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ReusedDirLock {
-    /// Take responsibility for the snapshotted default ACL, defusing the `Drop` restore.
+    /// The original default ACL the lockdown snapshotted (`None` when the directory had none).
+    /// Peeks without disarming; a caller restores it via [`Self::write_default_acl_guarded`].
+    fn original_default_acl(&self) -> Option<Vec<u8>> {
+        match &*self.state.lock().unwrap() {
+            DefaultAclGuard::Armed { original } => original.clone(),
+            DefaultAclGuard::Disarmed => None,
+        }
+    }
+
+    /// Declare the default ACL deliberately resolved: the `Drop` restore becomes a no-op and any
+    /// still-queued guarded write is refused. Only called once every finalize step that could
+    /// still fail has succeeded.
+    fn disarm(&self) {
+        *self.state.lock().unwrap() = DefaultAclGuard::Disarmed;
+    }
+
+    /// Install `blob` as the locked directory's DEFAULT ACL, serialized against the guard's
+    /// rollback (see `DefaultAclGuard`): the state mutex is held across the syscall, and a write
+    /// that finds the guard already disarmed is SKIPPED — landing it would silently undo a restore
+    /// that already ran. Every finalize-path write to this attribute MUST go through here; an
+    /// unguarded `set_or_remove_acl_fd` on the blocking pool is exactly the detached-write hazard
+    /// the guard exists to close. Only ever needs to SET: after the lockdown the directory
+    /// provably carries no default ACL, so "remove" cases have nothing to do.
     ///
-    /// Returns the bytes to install, or `None` when the directory had no default ACL (or the
-    /// snapshot was already taken). Callers must only take it once they are about to put something
-    /// deliberate in its place — either the directory's own ACL back, or the source's over it.
-    fn take_default_acl(&mut self) -> Option<Vec<u8>> {
-        self.restore_default_acl.take()
+    /// Gated as `MetadataOp::Chmod`, like every other single-inode permission write.
+    async fn write_default_acl_guarded(
+        &self,
+        side: congestion::Side,
+        blob: Vec<u8>,
+    ) -> std::io::Result<()> {
+        let state = Arc::clone(&self.state);
+        let fd = Arc::clone(&self.fd);
+        run_metadata_probed_blocking(side, congestion::MetadataOp::Chmod, move || {
+            let guard = state.lock().unwrap();
+            match &*guard {
+                DefaultAclGuard::Armed { .. } => {
+                    apply_one_acl(fd.as_raw_fd(), ACL_DEFAULT_XATTR, Some(&blob))
+                }
+                DefaultAclGuard::Disarmed => {
+                    // this write's owner was cancelled and the dropped guard already restored;
+                    // landing the write now would silently overwrite that restore
+                    tracing::debug!(
+                        "skipped a default-ACL write that lost its race against the lockdown \
+                         guard's restore ({} bytes)",
+                        blob.len(),
+                    );
+                    Ok(())
+                }
+            }
+        })
+        .await
     }
 }
 
 impl Drop for ReusedDirLock {
     fn drop(&mut self) {
-        let Some(blob) = self.restore_default_acl.take() else {
+        // re-arm the inherit flag BEFORE the restore syscall (which may run detached below): once
+        // the original default ACL is back, a file created in this directory inherits it and must
+        // strip — `create_file` loads the flag after its openat, so this ordering (store, then
+        // restore; openat, then load) leaves no interleaving where the openat sees the restored
+        // ACL but the load sees `false`
+        self.children_may_inherit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Taking the mutex is what serializes this restore against an in-flight guarded write: a
+        // write mid-syscall holds it, so the restore must wait and then deliberately land OVER
+        // it. But WAITING here would block whatever thread runs this destructor — on the
+        // cancellation paths that is an EXECUTOR thread (`--fail-early` dropping tracker state, a
+        // watchdog dropping the operation), and the wait is bounded only by the write's
+        // `fsetxattr`, which on dead network storage is unbounded. So: uncontended (the ordinary
+        // case — no write in flight) restores inline; contended detaches the SAME serialized
+        // wait-then-restore to its own thread. The `Arc`s keep the state and fd alive for it, and
+        // process exit may abandon the thread exactly as it abandons the stalled write itself.
+        let state = match self.state.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let state = Arc::clone(&self.state);
+                let fd = Arc::clone(&self.fd);
+                let flag_note = "detached (a guarded write held the rollback mutex)";
+                std::thread::spawn(move || {
+                    // a poisoned mutex is unreachable under panic = "abort"; fail toward doing
+                    // the restore anyway rather than silently dropping it
+                    let guard = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    rollback_default_acl(guard, &fd, flag_note);
+                });
+                return;
+            }
+            // unreachable under panic = "abort"; restore anyway rather than skip
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        rollback_default_acl(state, &self.fd, "inline");
+    }
+}
+
+/// The rollback itself, run with the guard's mutex HELD (see `DefaultAclGuard`): flips the state
+/// to `Disarmed` and puts the directory's original default ACL back (or removes what a partial
+/// finalize installed, when there was none). Split from `ReusedDirLock::drop` so the contended
+/// path can run it on a detached thread with the same serialization.
+fn rollback_default_acl(
+    mut state: std::sync::MutexGuard<'_, DefaultAclGuard>,
+    fd: &OwnedFd,
+    how: &str,
+) {
+    {
+        let DefaultAclGuard::Armed { original } =
+            std::mem::replace(&mut *state, DefaultAclGuard::Disarmed)
+        else {
             return;
         };
-        let raw = self.fd.as_raw_fd();
+        let raw = fd.as_raw_fd();
+        let _ = how;
         // name the directory rather than the descriptor: a mass abort restores many at once, and
         // "fd 47" tells an operator nothing about which tree to repair. Best-effort — a fd whose
         // target is gone falls back to the raw number rather than failing the restore.
         let path = std::fs::read_link(format!("/proc/self/fd/{raw}"))
             .map_or_else(|_| format!("<fd {raw}>"), |p| p.display().to_string());
-        match apply_one_acl(raw, ACL_DEFAULT_XATTR, Some(&blob)) {
-            Ok(()) => tracing::debug!(
+        let restore = apply_one_acl(raw, ACL_DEFAULT_XATTR, original.as_deref());
+        match (restore, &original) {
+            (Ok(()), Some(blob)) => tracing::debug!(
                 "restored the default ACL of reused destination directory {} after an aborted \
                  copy ({} bytes)",
                 path,
                 blob.len(),
             ),
-            Err(error) => tracing::warn!(
+            (Ok(()), None) => tracing::debug!(
+                "ensured reused destination directory {} carries no default ACL after an aborted \
+                 copy (it had none before it)",
+                path,
+            ),
+            (Err(error), Some(blob)) => tracing::warn!(
                 "could not restore the default ACL of reused destination directory {} after an \
                  aborted copy: {:#}. It is left with NO default ACL; it had {} bytes ({:02x?}), \
                  which must be re-applied by hand to restore what entries created beneath it \
@@ -1416,6 +1714,14 @@ impl Drop for ReusedDirLock {
                 &error,
                 blob.len(),
                 blob,
+            ),
+            (Err(error), None) => tracing::warn!(
+                "could not remove a partially-applied default ACL from reused destination \
+                 directory {} after an aborted copy: {:#}. The directory had NO default ACL \
+                 before the copy; whatever the aborted finalize installed remains and must be \
+                 removed by hand.",
+                path,
+                &error,
             ),
         }
     }
@@ -1503,16 +1809,18 @@ pub async fn lockdown_reused_dir(
     // race the read (step 4). Mode-neutral. `read_acls_fd` also reads the access ACL when one is
     // present, which is one wasted `fgetxattr` on a reused directory that has one — not worth a
     // second read path for. Nothing is destroyed yet, so a cancellation here loses nothing.
-    let restore_default_acl = read_acls_fd(dir.fd.as_fd(), dir.side, true).await?.default;
-    let needs_strip = restore_default_acl.is_some();
+    let original = read_acls_fd(dir.fd.as_fd(), dir.side, true).await?.default;
+    let needs_strip = original.is_some();
     // ARM THE GUARD BEFORE DESTROYING ANYTHING (step 5). The snapshot is the only copy of these
     // bytes once the removal lands, so it must already be inside a value whose `Drop` puts it back
     // before the removal is issued — otherwise a task cancelled between the two loses it as a bare
-    // `Option<Vec<u8>>` with no destructor.
+    // `Option<Vec<u8>>` with no destructor. Armed even when the directory has no default ACL: the
+    // rollback then means "keep it that way" — removing whatever a partial finalize installs.
     let lock = ReusedDirLock {
         restore_owner,
-        restore_default_acl,
+        state: Arc::new(std::sync::Mutex::new(DefaultAclGuard::Armed { original })),
         fd: Arc::clone(&dir.fd),
+        children_may_inherit: Arc::clone(&dir.children_may_inherit),
     };
     if needs_strip {
         let raw = dir.fd.as_raw_fd();
@@ -1538,6 +1846,10 @@ pub async fn lockdown_reused_dir(
         // is atomic, so the ACL is either gone (the restore puts it back) or never left (the
         // restore is a no-op) — never a partial state.
     }
+    // the directory now provably has no default ACL (either it never had one, or the strip above
+    // succeeded), so files created in it during the copy cannot inherit — `create_file` need not
+    // pay the ambient-parent strip here
+    dir.mark_children_cannot_inherit();
     Ok(Some(lock))
 }
 
@@ -1648,9 +1960,10 @@ pub async fn apply_acls_fd(
 /// Install `blob` as `name` on `fd`, or REMOVE `name` when `blob` is `None`, through the module's
 /// metadata gate.
 ///
-/// The async half of [`apply_one_acl`], and the granularity the reused-directory lockdown needs:
-/// it touches ONE of the two ACLs, where [`apply_acls_fd`] always resolves both (an all-`None`
-/// [`Acls`] means "clear them", so it cannot express "leave the access ACL alone").
+/// The async half of `apply_one_acl`, at single-attribute granularity: [`apply_acls_fd`] (its
+/// one caller) resolves the two ACLs one at a time through it. A LOCKED reused directory's
+/// default ACL must NOT come through here — that write has to serialize against the lockdown
+/// guard's rollback; `ReusedDirLock::write_default_acl_guarded` is the only correct writer.
 ///
 /// Gated as `MetadataOp::Chmod`, the bucket for single-inode permission writes.
 async fn set_or_remove_acl_fd(
@@ -1664,34 +1977,6 @@ async fn set_or_remove_acl_fd(
         apply_one_acl(owned.as_raw_fd(), name, blob.as_deref())
     })
     .await
-}
-
-/// Remove BOTH ACLs from a destination directory rcp has just CREATED, so nothing created beneath
-/// it can inherit one.
-///
-/// This is the containment half of the `--require-toctou-safe` invariant — *no destination entry
-/// that rcp CREATES carries an ACL entry that did not come from its source*. The scope matters: a
-/// REUSED directory is exempt, and correctly keeps its own access ACL, because rcp was not asked to
-/// change a directory that already existed (see [`lockdown_reused_dir`], which strips only the
-/// DEFAULT ACL and puts it back at finalize).
-///
-/// So this has exactly ONE caller, [`Dir::make_dir`]. It kept a second, `lockdown_reused_dir`, until
-/// that narrowed to the default ACL alone.
-///
-/// Removing both is what makes the cost per-DIRECTORY for a created directory: the default ACL is
-/// what children inherit, so clearing it once stops the chain for the whole subtree; the access ACL
-/// goes with it because nothing at finalize would otherwise remove an INHERITED one — with `d:acl`
-/// off the finalize chmod would instead re-derive its mask and make it effective.
-///
-/// `ENODATA` and `EOPNOTSUPP` are success (see [`apply_one_acl`]) — a directory with no ACL, or on a
-/// filesystem that cannot hold one, already satisfies the post-condition. Any other errno fails, and
-/// the caller must fail closed rather than descend: an un-strippable default ACL is one every child
-/// written afterwards would inherit.
-async fn strip_inherited_acls_fd(
-    fd: BorrowedFd<'_>,
-    side: congestion::Side,
-) -> std::io::Result<()> {
-    apply_acls_fd(fd, side, &Acls::default(), true).await
 }
 
 /// Resolve the ACL payload an applier should install: `None` when ACL preservation is off for this
@@ -1869,6 +2154,28 @@ fn apply_one_acl(fd: RawFd, name: &CStr, blob: Option<&[u8]>) -> std::io::Result
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Best-effort, recheck-guarded removal of a JUST-CREATED entry on a creation-closure failure
+/// path: remove `name` from `dir` only while the name still refers to the same inode as
+/// `created` — the name↔inode discipline every other removal here follows (`remove_existing_dst`
+/// in the engines re-checks the same way), so a concurrent swap of the name costs the swapper
+/// nothing: what rcp did not create, rcp does not remove. Sync, for use inside `spawn_blocking`
+/// creation closures; every error is swallowed — the caller is already failing with the creation
+/// error, and a survivor entry is the documented orphan case.
+fn remove_created_if_same_inode(
+    dir: BorrowedFd<'_>,
+    name: &[u8],
+    created: BorrowedFd<'_>,
+    flags: UnlinkatFlags,
+) {
+    let Ok(want) = fstat(created) else { return };
+    let Ok(got) = fstatat(dir, name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+        return;
+    };
+    if want.st_dev == got.st_dev && want.st_ino == got.st_ino {
+        let _ = unlinkat(dir, name, flags);
     }
 }
 
@@ -2465,6 +2772,22 @@ pub async fn set_dir_metadata_fd<Meta: crate::preserve::Metadata>(
     acls: Option<&Acls>,
     dir: &Dir,
 ) -> std::io::Result<()> {
+    set_dir_metadata_fd_inner(settings, meta, acls, dir, true).await
+}
+
+/// The body of [`set_dir_metadata_fd`], parameterized over whether the DEFAULT ACL is applied
+/// here. `apply_default` is `false` for exactly one caller — [`set_reused_dir_metadata_fd`]'s
+/// locked path, which owns the default ACL through the lockdown guard: that write must serialize
+/// against the guard's rollback, and an unguarded write from here is precisely the detached-write
+/// hazard the guard closes (see `DefaultAclGuard`). Everything else — including the access ACL's
+/// claim on the widening slot — is identical in both modes.
+async fn set_dir_metadata_fd_inner<Meta: crate::preserve::Metadata>(
+    settings: &crate::preserve::Settings,
+    meta: &Meta,
+    acls: Option<&Acls>,
+    dir: &Dir,
+    apply_default: bool,
+) -> std::io::Result<()> {
     let side = dir.side();
     let fd = dir.fd.as_fd();
     let ut = &settings.dir.user_and_time;
@@ -2478,14 +2801,14 @@ pub async fn set_dir_metadata_fd<Meta: crate::preserve::Metadata>(
     if let Some(acls) = acls.filter(|acls| acls.access.is_some()) {
         // the ACL is the widening step; this chmod carries only the special bits
         fchmod_fd(fd, side, (mode & 0o7000) | DST_DIR_CREATE_MODE).await?;
-        apply_acls_fd(fd, side, acls, true).await?;
+        apply_acls_fd(fd, side, acls, apply_default).await?;
     } else {
         // no source access ACL, so the chmod is the widening step and stays last. Both applies that
         // can run here are safe before it: clearing an inherited ACL can only narrow, and SETTING a
         // default ACL is mode-neutral — it governs what children inherit, never this directory's
         // own mode (a source can have a default ACL and no access one).
         if let Some(acls) = acls {
-            apply_acls_fd(fd, side, acls, true).await?;
+            apply_acls_fd(fd, side, acls, apply_default).await?;
         }
         fchmod_fd(fd, side, mode).await?;
     }
@@ -2520,39 +2843,53 @@ pub async fn set_dir_metadata_fd<Meta: crate::preserve::Metadata>(
 ///
 /// # Resolving the two ACLs
 ///
-/// Each of the access and default ACL is resolved independently:
+/// The ACCESS ACL keeps its usual applier semantics (set or cleared by the inner applier when
+/// `d:acl` is on, untouched otherwise). The DEFAULT ACL of a LOCKED directory is different: it is
+/// resolved HERE, first, through the lockdown guard, and the inner applier is told to leave it
+/// alone (`set_dir_metadata_fd_inner(…, apply_default: false)`):
 ///
-/// 1. `settings.dir.acl` on → the SOURCE's ACL is applied (set or cleared) by
-///    [`set_dir_metadata_fd`], and the lockdown snapshot is discarded. The copy is preserving ACLs,
-///    so what the destination directory happened to carry before is not what it should end with.
-/// 2. otherwise, the snapshot holds one → the directory's ORIGINAL ACL is restored here. rcp was
-///    not asked to change this directory's ACLs; the lockdown stripped them only so that children
-///    created during the copy could not inherit them, and failing to put them back would
+/// 1. `settings.dir.acl` on → the SOURCE's default ACL is installed. When the source has none
+///    there is nothing to write: the lockdown already left the directory without one, which is the
+///    correct end state. The copy is preserving ACLs, so what the destination carried before is
+///    not what it should end with.
+/// 2. otherwise → the directory's ORIGINAL default ACL is restored (nothing to do when there was
+///    none). rcp was not asked to change this directory's ACLs; the lockdown removed it only so
+///    children created during the copy could not inherit it, and failing to put it back would
 ///    permanently destroy an ACL the destination had before the copy. That makes a failure here an
-///    ERROR, unlike the strip, where `EOPNOTSUPP` is tolerated (a filesystem that cannot hold an ACL
-///    cannot have had one).
-/// 3. otherwise → nothing to do; there was none.
+///    ERROR, unlike the lockdown strip, where `EOPNOTSUPP` is tolerated (a filesystem that cannot
+///    hold an ACL cannot have had one).
 ///
-/// The restore runs FIRST, unwinding the lockdown in the reverse of the order it was applied (ACL
-/// removed last, so restored first; then the owner; then the mode, via the chmod inside
-/// [`set_dir_metadata_fd`]). Two things make that placement deliberate:
+/// Both writes go through `ReusedDirLock::write_default_acl_guarded`, which serializes them
+/// against the guard's `Drop` rollback: this future can be cancelled with the write already
+/// detached on the blocking pool, and an unserialized write could land AFTER the rollback and
+/// silently undo it (see `DefaultAclGuard`). The guard stays armed through every remaining
+/// fallible step — INCLUDING the final re-stat verification and every cancellation point up to
+/// the successful return — and is disarmed only immediately before `Ok(())`, so a failure or a
+/// cancellation anywhere in between rolls the directory back to ITS OWN original default ACL —
+/// including the case where that original is "none" and the rollback must REMOVE a source ACL
+/// that was just installed.
+///
+/// The guarded write runs FIRST, unwinding the lockdown in the reverse of the order it was applied
+/// (ACL removed last, so resolved first; then the owner; then the mode, via the chmod inside the
+/// inner applier). Two things make that placement deliberate:
 ///
 /// - **It runs while the copier still owns the directory**, before the owner is handed back. Only
 ///   an owner or a `CAP_FOWNER` copier may write these attributes.
-/// - **It fails toward *unchanged*.** If a later step fails, the directory is left holding the ACL
-///   it had before the copy. Deferring the restore past the chmod would instead fail toward
-///   *damaged* — a directory permanently stripped of an ACL it owned before rcp touched it, which
-///   is the one outcome this function is required to treat as an error rather than produce.
+/// - **It fails toward *unchanged*.** If a later step fails, the armed guard leaves the directory
+///   holding (or rolled back to) the default ACL it had before the copy. Deferring it past the
+///   chmod would instead fail toward *damaged* — a directory permanently stripped of an ACL it
+///   owned before rcp touched it, which is the one outcome this function is required to treat as
+///   an error rather than produce.
 ///
-/// The restore is mode-neutral, so unlike the SOURCE-ACL applies in [`set_dir_metadata_fd`] it does
-/// not compete with the finalize chmod for the widening slot: only a default ACL is ever restored
-/// here, and a default ACL never moves its own directory's mode. That is a consequence of the
-/// lockdown narrowing to the default ACL alone (see [`lockdown_reused_dir`]) and is worth stating,
-/// because it was not always true: while the lockdown also stripped the ACCESS ACL, the restore had
-/// to precede the chmod or it would install the DESTINATION's original rwx bits over the source's
-/// mode — the snapshot's `USER_OBJ`/`MASK`/`OTHER` agree with the directory's original mode, not the
-/// source's — and the re-stat verify below would then reject the copy. Anything that reintroduces an
-/// access-ACL restore here inherits that constraint.
+/// The guarded write is mode-neutral, so unlike the SOURCE-ACL applies in the inner applier it
+/// does not compete with the finalize chmod for the widening slot: only a DEFAULT ACL ever goes
+/// through it, and a default ACL never moves its own directory's mode. That is a consequence of
+/// the lockdown narrowing to the default ACL alone (see [`lockdown_reused_dir`]) and is worth
+/// stating, because it was not always true: while the lockdown also stripped the ACCESS ACL, the
+/// restore had to precede the chmod or it would install the DESTINATION's original rwx bits over
+/// the source's mode — the snapshot's `USER_OBJ`/`MASK`/`OTHER` agree with the directory's
+/// original mode, not the source's — and the re-stat verify below would then reject the copy.
+/// Anything that reintroduces an access-ACL restore here inherits that constraint.
 pub async fn set_reused_dir_metadata_fd<Meta: crate::preserve::Metadata>(
     settings: &crate::preserve::Settings,
     meta: &Meta,
@@ -2566,21 +2903,23 @@ pub async fn set_reused_dir_metadata_fd<Meta: crate::preserve::Metadata>(
     // gets the restore + final verify below.
     // NB: `ReusedDirLock` is an RAII guard, so it cannot be destructured by move — and must not be,
     // since dropping its parts separately is exactly the bug it exists to prevent. It stays whole
-    // until the snapshot is deliberately taken from it below.
-    let Some(mut lock) = lock else {
+    // until it is deliberately disarmed below.
+    let Some(lock) = lock else {
         return set_dir_metadata_fd(settings, meta, acls, dir).await;
     };
     let (orig_uid, orig_gid) = lock.restore_owner;
-    // case 2: put the directory's own default ACL back, before the owner and the mode go back. The
-    // snapshot is CLONED rather than taken until the write succeeds — on failure this returns `Err`
-    // with the guard still armed, so `Drop` gets one synchronous attempt at it rather than the bytes
-    // dying with the error. Case 1 (`settings.dir.acl` on) leaves the guard armed through
-    // `set_dir_metadata_fd` and defuses it after, so a failure part-way there still restores. Case 3
-    // (the directory had no default ACL) costs nothing: the snapshot is `None` throughout.
-    if !settings.dir.acl && lock.restore_default_acl.is_some() {
-        let blob = lock.restore_default_acl.clone();
-        set_or_remove_acl_fd(dir.fd.as_fd(), dir.side, ACL_DEFAULT_XATTR, blob).await?;
-        lock.take_default_acl();
+    // resolve the default ACL first, through the guard — see "Resolving the two ACLs" above for
+    // the two cases, the serialization against the guard's rollback, and why a failure must leave
+    // the guard armed (`Drop` then gets one synchronous rollback attempt rather than the bytes
+    // dying with the error)
+    let final_default = if settings.dir.acl {
+        // fail closed exactly as the applier does when the call site carried no ACLs
+        acls_to_apply(true, acls)?.and_then(|acls| acls.default.clone())
+    } else {
+        lock.original_default_acl()
+    };
+    if let Some(blob) = final_default {
+        lock.write_default_acl_guarded(dir.side, blob).await?;
     }
     let ut = &settings.dir.user_and_time;
     {
@@ -2590,19 +2929,16 @@ pub async fn set_reused_dir_metadata_fd<Meta: crate::preserve::Metadata>(
             fchown_fd(dir.fd.as_fd(), dir.side, uid, gid).await?;
         }
     }
-    set_dir_metadata_fd(settings, meta, acls, dir).await?;
-    // case 1: with `d:acl` on, the SOURCE's default ACL has now been set (or cleared) over whatever
-    // the destination carried, so the snapshot is deliberately obsolete — defuse. Done here rather
-    // than up front so that a failure anywhere above still leaves the guard armed, and done before
-    // the verify so that a verify failure does not undo a finalize that actually landed.
+    // the default ACL is excluded (`apply_default: false`): it was resolved through the guard
+    // above, and only the guard's serialized writer may touch it while the lockdown is live
+    set_dir_metadata_fd_inner(settings, meta, acls, dir, false).await?;
+    // The guard stays ARMED through the verify below: a re-stat error, a verification failure, or
+    // this future being cancelled at the `meta()` await all mean the copy of this directory FAILED,
+    // and failure must leave the directory as it was — the armed guard's `Drop` rolls the default
+    // ACL back to the destination's original (REMOVING a just-installed source ACL when the
+    // original was "none") rather than leaving the directory half-converted to the source.
+    // Disarming any earlier reopens exactly that window; see the disarm at the end.
     //
-    // Note what "still armed" means precisely when `set_dir_metadata_fd` fails PART-WAY: it applies
-    // the source's default ACL before its chmod, so a failure at the chmod leaves the guard to
-    // overwrite a default ACL that was just successfully applied, reverting it to the destination's
-    // original. That is intended — a failed copy leaves the directory as it was rather than
-    // half-converted to the source — but it is a restore OVER a partial apply, not merely a restore
-    // of something untouched.
-    lock.take_default_acl();
     // Re-stat and verify the finalize actually landed. A backend that reports chown/chmod success
     // without honoring it (e.g. CIFS without unix extensions) would otherwise leave a strict reused
     // directory silently owned by the copier or at the wrong mode. A lone dropped S_ISGID bit is a
@@ -2657,6 +2993,10 @@ pub async fn set_reused_dir_metadata_fd<Meta: crate::preserve::Metadata>(
             ));
         }
     }
+    // Disarm only here, with the finalize verified and nothing fallible (or cancellable) left
+    // before the successful return: every earlier exit — error or cancellation — leaves the guard
+    // armed so its `Drop` restores the destination's original default ACL.
+    lock.disarm();
     Ok(())
 }
 
@@ -2900,6 +3240,7 @@ mod tests {
         let shared = Dir {
             fd: root.fd.clone(),
             side: root.side,
+            children_may_inherit: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         drop(root);
         // the shared handle's open file description is still alive; ops succeed
@@ -4650,8 +4991,11 @@ mod tests {
             }),
             Some(ReusedDirLock {
                 restore_owner: (uid, gid),
-                restore_default_acl: None,
+                state: Arc::new(std::sync::Mutex::new(DefaultAclGuard::Armed {
+                    original: None,
+                })),
                 fd: Arc::clone(&dst_dir.fd),
+                children_may_inherit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }),
             &dst_dir,
         )
@@ -4697,6 +5041,31 @@ mod tests {
             congestion::Side::Destination,
         )
         .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guarded_default_acl_write_is_skipped_once_disarmed() -> anyhow::Result<()> {
+        let tmp = testutils::setup_test_dir().await?;
+        let root =
+            Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
+        let dir = root.make_dir(OsStr::new("locked"), 0o700).await?;
+        // a guard whose restore has already run (the owning future was cancelled and the guard
+        // dropped): a finalize write detached on the blocking pool must observe that and SKIP —
+        // landing it would silently overwrite the restore
+        let lock = ReusedDirLock {
+            restore_owner: (0, 0),
+            state: Arc::new(std::sync::Mutex::new(DefaultAclGuard::Disarmed)),
+            fd: Arc::clone(&dir.fd),
+            children_may_inherit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        lock.write_default_acl_guarded(congestion::Side::Destination, restrictive_access_acl())
+            .await?;
+        assert_eq!(
+            get_xattr_at(&tmp.join("foo/locked"), ACL_DEFAULT_XATTR),
+            None,
+            "a disarmed guard must refuse the write — landing it would undo the restore"
+        );
         Ok(())
     }
 }

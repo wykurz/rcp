@@ -231,3 +231,15 @@ fn raw_identifiers_are_not_raw_strings() {
     let r#fn = describe();
     tracing::debug!("{} {} {}: {:#}", r#type, r#match, r#fn, &error);
 }
+
+// A multi-line raw string as the format string, correctly formatted. The reattached body must be
+// READ as the format string (the violations fixture pins the `{}` case) without turning its prose
+// into arguments or its parens into the call's own — the `(` in the body must not unbalance the
+// collector.
+fn a_multi_line_raw_format_string_with_alternate_display_is_clean() {
+    tracing::error!(
+        r#"first line (with a stray paren
+    operation failed: {:#}"#,
+        &error
+    );
+}

@@ -140,7 +140,9 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
 
 **`MasterHello`** (Master → rcpd, bidirectional stream)
 
-- **Purpose**: Provide configuration and connection details
+- **Purpose**: Provide configuration and connection details. This is the ONLY message the master
+  ever sends on this connection; it then holds the connection open to await `RcpdResult`, and each
+  rcpd keeps a reader on it as a liveness watchdog for the whole operation (§6.3).
 - **Variants**:
   - `Source { src, dst, dest_cert_fingerprint, filter, dry_run, capture }`: Tells source rcpd what
     to copy
@@ -241,13 +243,25 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
   `metadata`, `size`)
 - **Usage**: A directory's manifest is split into one or more chunks, each well under the control
   stream's frame limit (`LengthDelimitedCodec`, 8 MiB), and **all** of them are sent **before** that
-  directory's `DirectoryCreated`. The control stream is FIFO, so the source has the complete
-  manifest by the time it processes `DirectoryCreated`. No chunks are sent when the directory was
-  freshly created (not reused), when neither `--overwrite` nor `--ignore-existing` is active, or
-  when the directory's entry count exceeds the manifest cap (`--overwrite-manifest-max-entries`,
-  default 5,000,000) — in which case that directory falls back to transferring-and-draining (the
-  baseline behavior). Chunking the manifest (rather than inlining it in `DirectoryCreated`) ensures
-  the cap stays meaningful without any single control frame exceeding the frame limit. See §7.9.
+  directory's `DirectoryCreated` — the two stay contiguous under one send-stream lock hold, so the
+  control stream's FIFO gives the source the complete manifest by the time it processes
+  `DirectoryCreated`. That guarantee is **per-directory** only: the destination builds each reused
+  directory's manifest in a per-directory task (one build at a time) so its control **receive** loop
+  keeps draining the socket during a long build — otherwise a multi-million-entry enumeration would
+  close the receive window for minutes and the `TCP_USER_TIMEOUT` on the source's control socket
+  (§"vanished hosts") would abort a healthy copy. Messages for **different** directories may
+  therefore interleave with a directory's chunks; the source accumulates chunks keyed by `dst`, so
+  the interleaving is invisible to it. No chunks are sent when the directory was freshly created
+  (not reused), when neither `--overwrite` nor `--ignore-existing` is active, or when the
+  directory's entry count exceeds the manifest cap (`--overwrite-manifest-max-entries`, default
+  5,000,000) — in which case that directory falls back to transferring-and-draining (the baseline
+  behavior). Chunking the manifest (rather than inlining it in `DirectoryCreated`) ensures the cap
+  stays meaningful without any single control frame exceeding the frame limit. See §7.9. On a
+  source-initiated teardown (control EOF before `DestinationDone`), outstanding manifest builds are
+  **aborted**, not drained: their directories can never receive files, and a queued build would only
+  scan a complete directory to fail its announce against the closed peer — under `-L` the number of
+  queued builds is not bounded by the source's dir-fd budget, so draining them could stall failure
+  shutdown arbitrarily long.
 
 **`DirectoryCreated`**
 
@@ -257,7 +271,10 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
   it. This is purely the Pass-2 trigger: it tells the source the destination created the directory
   and is ready to receive its files. The source already retains the authoritative child-file count
   it computed during the Pass-1 pre-read (hardened: in the fd-map entry; `-L`: in a path→count map),
-  so no count is echoed back. Triggers source to send files. See §7.1.
+  so no count is echoed back. Triggers source to send files. See §7.1. On the destination it is also
+  the directory's **completion gate**: child entries processed off Pass-1 messages
+  (symlinks/subdirectories) never complete a directory before its own announce is on the wire (§5.2)
+  — a directory completes at the LATER of its last processed entry and its announce.
 
 **`DirectorySkipped`**
 
@@ -279,24 +296,28 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
   `--require-toctou-safe` lockdown that cannot secure a reused directory, or an I/O failure), a
   transport failure on either stream, or the destination closing its control stream. So the source
   MUST NOT depend on receiving an ack/nack for every directory: it releases the **entire** dir-fd
-  budget (`close_fd_budget`) whenever its control-message dispatch loop exits for ANY reason
-  (control-stream close, a transport-task error, or a panic), once after the loop and before
-  draining tasks, so a Pass-1 walk parked on the budget always unblocks and the source tears down
-  cleanly instead of hanging. On such an abort the top-level cause depends on which side detected
-  it. A **source-side** cause (e.g. a source file's `Permission denied` on read) is published to a
-  shared slot before the budget is released, and the teardown surfaces it in place of the synthetic
-  budget-closed wakeup (a typed `FdBudgetClosed` marker, detected by type) that unblocks the parked
-  walk. A **destination-side** cause (e.g. the destination cannot create a file) is not visible to
-  the source — its slot stays empty, so the source reports only a benign teardown symptom (a
-  meaningful "destination closed the control connection before the source finished sending" message,
-  or a broken-pipe Pass-2 send error — never the internal `FdBudgetClosed` marker, which is
-  substituted), while the **destination** reports the real cause, preferring its own recorded
-  operation error over the connection-teardown symptom, and the master prefixes it `Destination:`.
-  So a destination-side abort still fails the copy with the real cause named — on the destination's
-  half of the aggregated error — while the source adds only the benign teardown symptom alongside
-  it. (Fully suppressing that source-side symptom is deferred: once the peer has aborted, the
-  source's own Pass-2 sends genuinely fail, and a benign peer-abort is not reliably distinguishable
-  there from a real transport fault.)
+  budget (`close_fd_budget`) — and, under `-L`, closes the outstanding-directory credit that
+  replaces it (the path-based walk holds no fds, so one credit per unacknowledged `Directory`,
+  released by that directory's `DirectoryCreated`/`DirectorySkipped`, is what keeps a slow ack path
+  from letting the walk flood the destination with an unbounded backlog of registered directories,
+  each holding an open fd and possibly a queued manifest) — whenever its control-message dispatch
+  loop exits for ANY reason (control-stream close, a transport-task error, or a panic), once after
+  the loop and before draining tasks, so a Pass-1 walk parked on the budget always unblocks and the
+  source tears down cleanly instead of hanging. On such an abort the top-level cause depends on
+  which side detected it. A **source-side** cause (e.g. a source file's `Permission denied` on read)
+  is published to a shared slot before the budget is released, and the teardown surfaces it in place
+  of the synthetic budget-closed wakeup (a typed `FdBudgetClosed` marker, detected by type) that
+  unblocks the parked walk. A **destination-side** cause (e.g. the destination cannot create a file)
+  is not visible to the source — its slot stays empty, so the source reports only a benign teardown
+  symptom (a meaningful "destination closed the control connection before the source finished
+  sending" message, or a broken-pipe Pass-2 send error — never the internal `FdBudgetClosed` marker,
+  which is substituted), while the **destination** reports the real cause, preferring its own
+  recorded operation error over the connection-teardown symptom, and the master prefixes it
+  `Destination:`. So a destination-side abort still fails the copy with the real cause named — on
+  the destination's half of the aggregated error — while the source adds only the benign teardown
+  symptom alongside it. (Fully suppressing that source-side symptom is deferred: once the peer has
+  aborted, the source's own Pass-2 sends genuinely fail, and a benign peer-abort is not reliably
+  distinguishable there from a real transport fault.)
   - **A data-path abort is signaled by closing the control stream.** A fatal error on a *data*
     connection — a `--fail-early` file/metadata failure, or a corrupted data stream — propagates out
     of the data worker; the destination records it and closes its control send stream (the
@@ -387,8 +408,17 @@ Every message that describes an entry (`Directory`, `Symlink`, `File`, and each 
 struct Metadata {
     mode: u32, uid: u32, gid: u32,
     atime: i64, mtime: i64, atime_nsec: i64, mtime_nsec: i64,
-    acl_access:  Option<Vec<u8>>,   // system.posix_acl_access
-    acl_default: Option<Vec<u8>>,   // system.posix_acl_default (directories only)
+    acls: WireAcls,
+}
+
+enum WireAcls {
+    /// No ACL information at all: not captured, or unreadable at the source.
+    Unknown,
+    /// Read from the source entry: authoritative, including the "has none" case.
+    Captured {
+        access:  Option<Vec<u8>>,   // system.posix_acl_access
+        default: Option<Vec<u8>>,   // system.posix_acl_default (directories only)
+    },
 }
 ```
 
@@ -401,10 +431,21 @@ across hosts as-is; the destination kernel validates on `fsetxattr`. rcp require
 version match (see [remote_copy.md](remote_copy.md)), so adding these fields has no back-compat
 cost.
 
-**`None` means "the source has no such ACL", which the destination reproduces by REMOVING the
-attribute — not by leaving the destination alone.** A destination directory's default ACL is
-inherited by every entry created beneath it, including ones rcp creates itself, so "do nothing when
-the source has no ACL" would hand the copy permissions the source never granted.
+**`Captured` with `None` means "the source has no such ACL", which the destination reproduces by
+REMOVING the attribute — not by leaving the destination alone.** A destination directory's default
+ACL is inherited by every entry created beneath it, including ones rcp creates itself, so "do
+nothing when the source has no ACL" would hand the copy permissions the source never granted.
+
+**`Unknown` means the wire carries no ACL information, and the destination must NOT touch the
+destination entry's ACLs.** It arrives in exactly two situations: the master never asked for ACLs
+(`capture` all-false — the destination's `preserve` then never applies them either), or the source
+COULD NOT read them (a committed directory that failed to open — that entry's copy is already
+recorded as an error on the source). The distinction from `Captured` all-`None` is load-bearing:
+collapsing the two turns a source-side read failure into an authoritative clear, permanently
+stripping a REUSED destination directory's access and default ACLs on a copy that is already
+failing. The destination implements `Unknown` by disabling ACL preservation for that one entry's
+metadata application; for a strict-mode locked reused directory that restores the directory's
+ORIGINAL default ACL (the lockdown snapshot) — the same outcome as `d:acl` off.
 
 **Which messages actually carry ACLs:**
 
@@ -413,9 +454,9 @@ the source has no ACL" would hand the copy permissions the source never granted.
 | `File`                                                               | access only, when captured | read from the SAME fd whose bytes are sent, so permissions and contents cannot desync                                         |
 | `Directory`                                                          | both, when captured        | read from the held `O_NOFOLLOW` fd whose children were enumerated; the default ACL is what the destination's children inherit |
 | a committed-but-unreadable directory whose ENUMERATION failed (§7.1) | both, when captured        | the directory itself was reachable — only `getdents` failed — so it answers the probe like any other                          |
-| a committed directory that could not be OPENED at all (§7.1)         | nothing                    | no fd to read them from, and that entry's copy is already recorded as an error                                                |
+| a committed directory that could not be OPENED at all (§7.1)         | `Unknown`                  | no fd to read them from and no honest answer to give: the destination leaves the destination directory's ACLs untouched       |
 | `Symlink`                                                            | nothing                    | the kernel has no symlink ACL; the settings parser rejects `l:acl`                                                            |
-| `ExistingEntry` (manifest)                                           | nothing                    | the manifest answers `--overwrite-compare`, which has no `acl` term — see the hole below                                      |
+| `ExistingEntry` (manifest)                                           | `Unknown`                  | the manifest answers `--overwrite-compare`, which has no `acl` term — see the hole below                                      |
 
 Reading a source entry's ACL from the same fd as its payload is the same read-side fidelity rule the
 rest of the source walk follows (Guarantee 2 in [tocttou.md](tocttou.md)): a probe by path could be
@@ -745,6 +786,14 @@ copy (see Section 7.1 for handling of source modifications).
 - `pending_directories.is_empty()` (all directories complete)
 - `root_complete == true` (root item processed)
 
+A directory leaves `pending_directories` only when BOTH its entries are all processed AND its
+announce — manifest chunks, then `DirectoryCreated` — is on the wire. Without the announce gate, a
+directory whose children are all symlinks/subdirectories could complete straight off Pass-1 messages
+while its manifest is still being built (§2.3); `DestinationDone` would then overtake the queued
+announce, close the very control send stream the announce task still needs (failing a healthy copy
+with a broken pipe), and reach the source with a `Directory` message still unanswered — violating
+the one-response-per-`Directory` contract (§2.2).
+
 ### 5.3 Key Operations
 
 **On `Directory` message:**
@@ -752,11 +801,19 @@ copy (see Section 7.1 for handling of source modifications).
 - If ancestor in `failed_directories`: skip, log warning; call `process_child_entry(parent)` to
   count this entry (directory won't have children to process)
 - Try to create directory (see directory creation semantics below)
-- If success: add to `pending_directories` with `entries_expected` from message,
-  `entries_processed = 0`, store metadata, send `DirectoryCreated { src, dst }` back to source (the
-  Pass-2 trigger; no count is echoed — the source retains its own file count). Do NOT notify parent
-  yet — parent is notified when this directory completes (via `complete_directory`), ensuring
-  bottom-up completion order.
+- If success: REGISTER the directory synchronously — add to `pending_directories` with
+  `entries_expected` from message, `entries_processed = 0`, store metadata and the held fd — before
+  the next message is processed (children resolve their parent through the fd-map). The ANNOUNCE —
+  manifest chunks, then `DirectoryCreated { src, dst }` (the Pass-2 trigger; no count is echoed —
+  the source retains its own file count) — follows separately: inline for a directory with no
+  manifest to build, from a per-directory task otherwise (§2.3). The announce is the directory's
+  completion gate (§5.2): the directory completes at the LATER of its last processed entry and its
+  announce, so marking it announced also completes it when its entries already all arrived — always
+  for a 0-entry directory, and whenever every child landed off Pass-1 messages during the manifest
+  build. An announce-time completion runs the `DestinationDone` check itself, exactly as a data
+  worker does after the last file — the announce may run after the receive loop's final per-message
+  check. Do NOT notify parent on registration — parent is notified when this directory completes
+  (via `complete_directory`), ensuring bottom-up completion order.
 - If failure: add to `failed_directories`; if `is_root`, set `root_complete = true` to avoid hang;
   if not root, call `process_child_entry(parent)` (directory won't go through `complete_directory`)
 
@@ -885,8 +942,20 @@ EOF handshake.
 
 **rcpd Lifecycle Management:**
 
-- **stdin watchdog**: Monitors stdin for EOF to detect master disconnection
-- If master dies unexpectedly, rcpd detects EOF and exits immediately
+- **stdin watchdog**: Monitors stdin for EOF to detect master disconnection (SSH-level: fires when
+  the SSH connection itself closes)
+- **master-control watchdog**: After `MasterHello`, the master sends nothing further on the control
+  connection — it holds it open to await `RcpdResult` — so each rcpd keeps a reader on it for the
+  entire operation. An EOF (master exited or aborted) or a transport error (the keepalive +
+  `TCP_USER_TIMEOUT` on that socket marking a vanished master HOST dead) cancels the in-flight
+  operation and reports a failure. This bounds vanished-master detection by `--remote-keepalive-sec`
+  even when SSH's own liveness settings are slower — or when stdin is unavailable and the stdin
+  watchdog cannot fire at all. Any post-hello frame is a protocol violation: a stray re-sent
+  `MasterHello` is logged and ignored, while a frame that does not decode as one is treated as a
+  connection failure — deliberately, since version-matched binaries mean no legitimate master sends
+  post-hello traffic.
+- If master dies unexpectedly, rcpd detects it and winds down through the normal return path (so
+  strict-mode lockdown guards restore reused-directory ACLs)
 - No orphaned processes remain on remote hosts
 
 ## 7. Design Rationale

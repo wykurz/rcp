@@ -41,6 +41,17 @@ enum SourceRead {
     DereferencePath(DereferenceContentsMap),
 }
 
+impl SourceRead {
+    /// Close whichever Pass-1 pacing gate this mode uses — the hardened dir-fd budget or the `-L`
+    /// outstanding-directory credit — releasing a parked walk with the typed [`FdBudgetClosed`].
+    fn close_pass1_gate(&self) {
+        match self {
+            SourceRead::Hardened(map) => map.close_fd_budget(),
+            SourceRead::DereferencePath(state) => state.close_credit(),
+        }
+    }
+}
+
 /// What Pass 1 counted inside one directory, carried across the network round-trip to Pass 2.
 ///
 /// Pass 2 does not inherit Pass 1's classification — it re-enumerates the directory with a fresh
@@ -93,7 +104,49 @@ impl Pass1Contents {
 /// [`resolve_pass2_source`] takes it back when the matching `DirectoryCreated`
 /// triggers Pass 2. A missing entry is treated as empty contents with a debug log — `-L`
 /// is intentionally not hardened, so a miss is not a TOCTOU/fail-closed condition.
-type DereferenceContentsMap = Arc<std::sync::Mutex<HashMap<std::path::PathBuf, Pass1Contents>>>;
+type DereferenceContentsMap = Arc<DereferenceWalkState>;
+
+/// The `-L` walk's shared Pass-1 state: the `path → Pass1Contents` bookkeeping map, plus the
+/// outstanding-directory CREDIT — the pacing the hardened walk gets for free from its dir-fd
+/// budget. Without it the path-based walk recursively sends `Directory` for the entire tree with
+/// no acknowledgement budget, while the destination retains an open fd, stored metadata, and (for
+/// reused directories) a queued manifest task per registered directory — so one slow root
+/// manifest lets an arbitrarily large tree exhaust destination fds or memory, bounded by nothing.
+/// One credit is taken per `Directory` sent and returned by that directory's
+/// `DirectoryCreated`/`DirectorySkipped`; the budget size mirrors the hardened walk's
+/// (`max_pending_files`). `close_credit` releases a parked walk on teardown with the same typed
+/// [`FdBudgetClosed`] marker the hardened budget uses, so teardown attribution is unchanged.
+struct DereferenceWalkState {
+    contents: std::sync::Mutex<HashMap<std::path::PathBuf, Pass1Contents>>,
+    credit: tokio::sync::Semaphore,
+}
+
+impl DereferenceWalkState {
+    fn new(credit: usize) -> Self {
+        Self {
+            contents: std::sync::Mutex::new(HashMap::new()),
+            credit: tokio::sync::Semaphore::new(credit),
+        }
+    }
+    /// Take one outstanding-directory credit (parking the walk at the budget), or fail with the
+    /// typed [`FdBudgetClosed`] marker once [`Self::close_credit`] ran.
+    async fn acquire_credit(&self) -> anyhow::Result<()> {
+        self.credit
+            .acquire()
+            .await
+            .map_err(|_| anyhow::Error::new(FdBudgetClosed))?
+            .forget();
+        Ok(())
+    }
+    /// Return one credit — called on this directory's `DirectoryCreated` or `DirectorySkipped`.
+    fn release_credit(&self) {
+        self.credit.add_permits(1);
+    }
+    /// Close the credit gate so a parked walk fails with [`FdBudgetClosed`] instead of hanging.
+    fn close_credit(&self) {
+        self.credit.close();
+    }
+}
 
 impl SourceRead {
     /// The hardened fd-map, or `None` in dereference mode. Used by Pass 1 to decide
@@ -298,13 +351,11 @@ impl SourceDirMap {
 /// which then returns the synthetic `FdBudgetClosed` and lets the source tear down instead of
 /// hanging. `close_fd_budget` is idempotent, so on the normal path (explicit close already done)
 /// this drop is a no-op.
-struct FdBudgetCloser(Option<Arc<SourceDirMap>>);
+struct FdBudgetCloser(SourceRead);
 
 impl Drop for FdBudgetCloser {
     fn drop(&mut self) {
-        if let Some(map) = &self.0 {
-            map.close_fd_budget();
-        }
+        self.0.close_pass1_gate();
     }
 }
 
@@ -669,13 +720,17 @@ async fn send_pass1_entry(
             // this `-L` directory so Pass 2's lookup resolves (no wire echo carries them).
             if let Some(deref_counts) = deref_counts {
                 deref_counts
+                    .contents
                     .lock()
                     .unwrap()
                     .insert(src.to_path_buf(), Pass1Contents::empty());
             }
-            // no ACLs on this one, deliberately: the directory could not be opened, so there is no
-            // fd to read them from and no honest answer to give. The destination therefore CLEARS
-            // (never widens) an entry whose copy is already recorded as failed above.
+            // ACLs stay UNKNOWN on this one: the directory could not be opened, so there is no fd
+            // to read them from and no honest answer to give. `WireAcls::Unknown` tells the
+            // destination to leave the destination directory's ACLs ALONE (a locked reused
+            // directory gets its original default ACL back from the lockdown guard) — an absence
+            // we never observed must not arrive as an authoritative CLEAR of a reused
+            // destination's ACLs. The entry's copy is already recorded as failed above.
             let dir = remote::protocol::SourceMessage::Directory {
                 src: src.to_path_buf(),
                 dst: dst.to_path_buf(),
@@ -846,7 +901,7 @@ async fn send_pass1_entry(
     // directory that is never sent leaves nothing behind for a `DirectoryCreated` that can never
     // arrive.
     if let Some(deref_counts) = deref_counts {
-        deref_counts.lock().unwrap().insert(
+        deref_counts.contents.lock().unwrap().insert(
             src.to_path_buf(),
             Pass1Contents {
                 file_count,
@@ -874,6 +929,12 @@ async fn send_pass1_entry(
         entry_count,
         file_count
     );
+    // outstanding-directory credit, taken BEFORE the send: caps how many unacknowledged
+    // `Directory` messages this walk may have in flight (see `DereferenceWalkState`) — a closed
+    // gate (teardown) surfaces the typed marker instead of parking forever
+    if let Some(deref_counts) = deref_counts {
+        deref_counts.acquire_credit().await?;
+    }
     control_send_stream
         .lock()
         .await
@@ -1587,11 +1648,15 @@ async fn send_root_hardened(
     // It goes through the `/proc/self/fd` form precisely because `handle` is `O_PATH` (see below).
     common::safedir::warn_if_root_acl_unpreserved(&handle, src, capture.file_acl, capture.dir_acl)
         .await;
-    // no ACLs attached here: `handle` is an `O_PATH` classify handle, which the kernel will not
-    // answer an xattr probe on. Every use below that needs them re-reads from a real fd — a root
-    // FILE from its data fd in `send_file_tcp`, a root DIRECTORY from the `O_NOFOLLOW` handle the
-    // fd-walk opens — and a root SYMLINK has no ACL to carry. The one use that keeps this value is
-    // the unopenable-root-directory case, which has no fd to read from and is already an error.
+    // ACLs stay UNKNOWN here: the classify handle's inode is not necessarily the one whose bytes
+    // will be sent (read-side fidelity — an ACL read now could describe an inode a same-name swap
+    // replaces before the copy), so every use below that needs them re-reads from the real fd it
+    // is about to use — a root FILE from its data fd in `send_file_tcp`, a root DIRECTORY from
+    // the `O_NOFOLLOW` handle the fd-walk opens — and a root SYMLINK has no ACL to carry. The one
+    // use that keeps this value is the unopenable-root-directory case, which has no fd to read
+    // from and is already an error; `WireAcls::Unknown` then tells the destination to leave the
+    // (often REUSED) destination root's ACLs alone rather than clearing state the source never
+    // observed.
     let meta = remote::protocol::Metadata::from(handle.meta());
     // has_root_item from the authoritative kind: specials never produce a message; otherwise the
     // root-item filter decides (anchored patterns match inside the source, not the root itself).
@@ -2029,7 +2094,9 @@ fn resolve_pass2_source(
             }
         },
         SourceRead::DereferencePath(counts) => {
-            let contents = counts.lock().unwrap().remove(src).unwrap_or_else(|| {
+            // the created ack returns this directory's outstanding-directory credit
+            counts.release_credit();
+            let contents = counts.contents.lock().unwrap().remove(src).unwrap_or_else(|| {
                 tracing::debug!(
                     "no recorded -L Pass-1 contents for {src:?} on DirectoryCreated; defaulting to \
                      empty (dereference path is not hardened, so this is not a fail-closed \
@@ -2540,7 +2607,7 @@ async fn dispatch_control_messages_tcp(
     // panic-safety backstop: if the dispatch loop below unwinds, close the fd-budget on drop so a
     // Pass-1 walk parked on it is released (every NORMAL exit still closes it explicitly, before the
     // task drain). Held from here so it covers the whole body.
-    let _fd_budget_closer = FdBudgetCloser(source_read.dir_map().cloned());
+    let _fd_budget_closer = FdBudgetCloser(source_read.clone());
     // create semaphore to limit pending file tasks for backpressure
     let pending_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_pending_files));
     tracing::info!(
@@ -2749,7 +2816,9 @@ async fn dispatch_control_messages_tcp(
                             // here so a skipped subtree's counts don't grow until the connection
                             // ends (mirrors the DirectoryCreated consume + the hardened nack).
                             SourceRead::DereferencePath(counts) => {
-                                counts.lock().unwrap().remove(src);
+                                counts.contents.lock().unwrap().remove(src);
+                                // the nack returns the credit exactly as a created ack does
+                                counts.release_credit();
                             }
                         }
                     }
@@ -2781,9 +2850,7 @@ async fn dispatch_control_messages_tcp(
     // unblocks it; closing here, once post-loop rather than per-arm, is what stops a Pass-2 task
     // error under `--fail-early` from deadlocking the walk. Idempotent, and a no-op on a clean close
     // (the walk has already finished by then).
-    if let SourceRead::Hardened(map) = &source_read {
-        map.close_fd_budget();
-    }
+    source_read.close_pass1_gate();
     // if we're exiting with an error, abort the recv task immediately
     // (otherwise it would block waiting for more messages from destination)
     if had_fatal_error {
@@ -2903,20 +2970,12 @@ impl AcceptingSendStreamPool {
                 _ = async {
                     loop {
                         tokio::select! {
-                            // accept new connections from destination
-                            result = data_listener.accept() => {
+                            // accept new connections from destination (the helper applies the
+                            // Data socket options — no TCP_USER_TIMEOUT, see configure_tcp_socket)
+                            result = remote::accept_tcp_data(&data_listener, profile, keepalive_sec) => {
                                 match result {
                                     Ok((stream, addr)) => {
                                         tracing::debug!("Accepted data connection from {}", addr);
-                                        // Data: no TCP_USER_TIMEOUT — a throttled destination
-                                        // legitimately stops reading mid-file, and aborting that
-                                        // sender would fail a copy that used to just run slow.
-                                        remote::configure_tcp_socket(
-                                            &stream,
-                                            profile,
-                                            keepalive_sec,
-                                            remote::ConnectionKind::Data,
-                                        );
                                         // Wrap with TLS if configured. This handshake runs INLINE in
                                         // the accept loop, so its bound is what stops one stalled
                                         // peer from blocking every further data connection. Only the
@@ -3076,7 +3135,7 @@ async fn handle_connection(
     // instead carries a shared `path → file_count` map so Pass 2 can recover each
     // directory's Pass-1 count (the destination no longer echoes it over the wire).
     let source_read = if settings.dereference {
-        SourceRead::DereferencePath(Arc::new(std::sync::Mutex::new(HashMap::new())))
+        SourceRead::DereferencePath(Arc::new(DereferenceWalkState::new(max_pending_files)))
     } else {
         SourceRead::Hardened(Arc::new(SourceDirMap::new(max_pending_files)))
     };
@@ -4005,17 +4064,16 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
     // wait for destination to connect with a timeout
     let error_collector = std::sync::Arc::new(common::error_collector::ErrorCollector::default());
     let accept_timeout = std::time::Duration::from_secs(tcp_config.conn_timeout_sec);
-    match tokio::time::timeout(accept_timeout, control_listener.accept()).await {
+    // the accept helper applies the Control socket options before returning, so the dry-run path
+    // below gets the same configuration as the normal one
+    match tokio::time::timeout(
+        accept_timeout,
+        remote::accept_tcp_control(&control_listener, tcp_config),
+    )
+    .await
+    {
         Ok(Ok((stream, addr))) => {
             tracing::info!("Destination control connection from {}", addr);
-            // configured here rather than per flow below, so the dry-run path gets the same
-            // socket options as the normal one
-            remote::configure_tcp_socket(
-                &stream,
-                tcp_config.network_profile,
-                tcp_config.keepalive_sec,
-                remote::ConnectionKind::Control,
-            );
             // in dry-run mode, do simplified flow: traverse, log, and tell destination we're done
             if let Some(dry_run_mode) = settings.dry_run {
                 return handle_dry_run_connection(

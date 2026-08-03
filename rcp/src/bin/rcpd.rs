@@ -331,12 +331,44 @@ async fn stdin_monitor() {
     }
 }
 
+/// Map an operation's outcome to the `RcpdResult` sent to the master, extracting the real
+/// summary from a `common::copy::Error` when one is carried.
+fn rcpd_result_from(
+    result: anyhow::Result<(String, common::copy::Summary)>,
+) -> remote::protocol::RcpdResult {
+    let runtime_stats = common::collect_runtime_stats();
+    match result {
+        Ok((message, summary)) => remote::protocol::RcpdResult::Success {
+            message,
+            summary,
+            runtime_stats,
+        },
+        Err(error) => {
+            // try to extract the real summary from common::copy::Error
+            let (error_msg, summary) = match error.downcast::<common::copy::Error>() {
+                Ok(copy_error) => (format!("{:#}", copy_error.source), copy_error.summary),
+                Err(other_error) => (format!("{other_error:#}"), common::copy::Summary::default()),
+            };
+            remote::protocol::RcpdResult::Failure {
+                error: error_msg,
+                summary,
+                runtime_stats,
+            }
+        }
+    }
+}
+
 /// async operation for rcpd - runs the actual source or destination logic
+///
+/// `result_committed` is flipped true the moment the final `RcpdResult` has been sent to the
+/// master — the outer stdin watchdog consults it so a master that consumes the result and then
+/// closes the SSH channel (stdin EOF) is not misread as a mid-operation disconnect.
 async fn run_operation<W, R>(
     args: Args,
-    mut master_send_stream: remote::streams::SendStream<W>,
+    master_send_stream: remote::streams::SendStream<W>,
     mut master_recv_stream: remote::streams::RecvStream<R>,
     cert_key: Option<remote::tls::CertifiedKey>,
+    result_committed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<remote::protocol::RcpdResult>
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -353,6 +385,51 @@ where
             anyhow::anyhow!("master closed the control connection before sending its hello")
         })?;
     tracing::info!("Received side: {:?}", master_hello);
+    // The master sends NOTHING further on this connection after `MasterHello` (see
+    // docs/remote_protocol.md §2.1: it holds the connection open to await our `RcpdResult`), so
+    // the only signals this read can produce are an EOF — the master exited, finished or killed —
+    // and a transport error, which is how the keepalive + TCP_USER_TIMEOUT configured on this
+    // accepted socket surface a VANISHED master host. Keeping a reader on the socket is
+    // load-bearing, not tidiness: the stdin watchdog in `async_main` fires only when SSH itself
+    // notices the death, which a network partition can delay far beyond `--remote-keepalive-sec`
+    // (SSH has its own, often slower, liveness settings) — and when stdin is unavailable it never
+    // fires at all. Without this reader the kernel marks the socket dead and nothing observes it:
+    // both rcpds keep copying to each other, or waiting on each other, indefinitely. The
+    // `select!`s below cancel the operation the moment this fires; dropping the operation future
+    // is the same cancel-safe teardown the stdin watchdog performs (see CANCEL SAFETY in
+    // `async_main` — in particular, reused-directory lockdown guards restore on drop).
+    let master_watchdog = async move {
+        loop {
+            match master_recv_stream
+                .recv_object::<remote::protocol::MasterHello>()
+                .await
+            {
+                // Any frame after the hello is a protocol violation. One that happens to decode
+                // as a MasterHello is logged and ignored; anything ELSE fails the decode and is
+                // treated as a failed connection by the arm below — deliberately, not as a gap:
+                // binaries are version-matched (remote_copy.md), so no legitimate master sends
+                // post-hello traffic, and an undecodable frame means a confused or corrupted
+                // peer, which is exactly what this watchdog exists to stop.
+                Ok(Some(unexpected)) => tracing::warn!(
+                    "ignoring an unexpected message from the master after its hello: {unexpected:?}"
+                ),
+                Ok(None) => return "master closed its control connection".to_string(),
+                Err(error) => return format!("master control connection failed: {error:#}"),
+            }
+        }
+    };
+    tokio::pin!(master_watchdog);
+    let master_vanished = |cause: String| {
+        tracing::error!(
+            "Master (rcp) control connection lost mid-operation - {cause}. This usually means \
+             the master process was killed or its host became unreachable. Shutting down."
+        );
+        remote::protocol::RcpdResult::Failure {
+            error: format!("master control connection lost: {cause}"),
+            summary: common::copy::Summary::default(),
+            runtime_stats: common::collect_runtime_stats(),
+        }
+    };
     // build tcp_config first so we can use its effective_buffer_size()
     let tcp_config = args.to_tcp_config();
     let rcpd_result = match master_hello {
@@ -368,50 +445,56 @@ where
             let settings = args.to_copy_settings(filter, dry_run, &tcp_config)?;
             tracing::info!("Starting source");
             let shared_send = std::sync::Arc::new(tokio::sync::Mutex::new(master_send_stream));
-            let result = match source::run_source(
-                shared_send.clone(),
-                &src,
-                &dst,
-                &settings,
-                capture,
-                &tcp_config,
-                args.bind_ip.as_deref(),
-                cert_key.as_ref(),
-                dest_cert_fingerprint,
-            )
-            .await
-            {
-                Ok((message, summary)) => {
-                    let runtime_stats = common::collect_runtime_stats();
-                    remote::protocol::RcpdResult::Success {
-                        message,
-                        summary,
-                        runtime_stats,
-                    }
-                }
-                Err(error) => {
-                    let runtime_stats = common::collect_runtime_stats();
-                    // try to extract the real summary from common::copy::Error
-                    let (error_msg, summary) = match error.downcast::<common::copy::Error>() {
-                        Ok(copy_error) => (format!("{:#}", copy_error.source), copy_error.summary),
-                        Err(other_error) => {
-                            (format!("{other_error:#}"), common::copy::Summary::default())
-                        }
-                    };
-                    remote::protocol::RcpdResult::Failure {
-                        error: error_msg,
-                        summary,
-                        runtime_stats,
-                    }
-                }
+            let operation = async {
+                let result = rcpd_result_from(
+                    source::run_source(
+                        shared_send.clone(),
+                        &src,
+                        &dst,
+                        &settings,
+                        capture,
+                        &tcp_config,
+                        args.bind_ip.as_deref(),
+                        cert_key.as_ref(),
+                        dest_cert_fingerprint,
+                    )
+                    .await,
+                );
+                // send the result back to master — once this returns it is COMMITTED: the
+                // master can consume it regardless of when the close below lands
+                shared_send
+                    .lock()
+                    .await
+                    .send_control_message(&result)
+                    .await?;
+                result_committed.store(true, std::sync::atomic::Ordering::SeqCst);
+                anyhow::Ok(result)
             };
-            // send result back to master
-            {
-                let mut send = shared_send.lock().await;
-                send.send_control_message(&result).await?;
-                send.close().await?;
+            // no result-send on the watchdog branch: the master is gone, so there is no one to
+            // send to — attempting it would only replace the real cause with a send error
+            let (rcpd_result, committed) = tokio::select! {
+                // biased: the operation branch is POLLED first, so whenever both branches are
+                // ready in the same poll the finished operation wins. The watchdog guards the
+                // COPY and the result send ONLY — the select ends the moment the result is
+                // committed, so the master consuming it and closing its side (EOF on the
+                // watchdog's reader) can no longer be misread as a master loss and fail a
+                // successful copy. An EOF that genuinely precedes the committed result IS a
+                // master loss and is reported.
+                biased;
+                result = operation => (result?, true),
+                cause = &mut master_watchdog => (master_vanished(cause), false),
+            };
+            if committed {
+                // best-effort close, OUTSIDE the watchdog's race: the master may already have
+                // consumed the result and closed the connection, and a close error carries no
+                // information the master does not already hold
+                if let Err(error) = shared_send.lock().await.close().await {
+                    tracing::debug!(
+                        "closing the master control stream after the result: {error:#}"
+                    );
+                }
             }
-            result
+            rcpd_result
         }
         remote::protocol::MasterHello::Destination {
             source_control_addr,
@@ -425,55 +508,50 @@ where
             // via keep_if_empty in the Directory message.
             let settings = args.to_copy_settings(None, None, &tcp_config)?;
             tracing::info!("Starting destination");
-            match destination::run_destination(
-                &source_control_addr,
-                &source_data_addr,
-                &server_name,
-                &settings,
-                args.overwrite_manifest_max_entries,
-                &preserve,
-                &tcp_config,
-                cert_key.as_ref(),
-                source_cert_fingerprint,
-            )
-            .await
-            {
-                Ok((message, summary)) => {
-                    // send result to master
-                    master_send_stream
-                        .send_control_message(&remote::protocol::RcpdResult::Success {
-                            message: message.clone(),
-                            summary,
-                            runtime_stats: common::collect_runtime_stats(),
-                        })
-                        .await?;
-                    master_send_stream.close().await?;
-                    let runtime_stats = common::collect_runtime_stats();
-                    remote::protocol::RcpdResult::Success {
-                        message,
-                        summary,
-                        runtime_stats,
-                    }
-                }
-                Err(error) => {
-                    let runtime_stats = common::collect_runtime_stats();
-                    // try to extract the real summary from common::copy::Error
-                    let (error_msg, summary) = match error.downcast::<common::copy::Error>() {
-                        Ok(copy_error) => (format!("{:#}", copy_error.source), copy_error.summary),
-                        Err(other_error) => {
-                            (format!("{other_error:#}"), common::copy::Summary::default())
-                        }
-                    };
-                    let result = remote::protocol::RcpdResult::Failure {
-                        error: error_msg,
-                        summary,
-                        runtime_stats,
-                    };
-                    master_send_stream.send_control_message(&result).await?;
-                    master_send_stream.close().await?;
-                    result
+            // same Arc<Mutex> shape as the source arm: the best-effort close runs AFTER the
+            // select, so the stream must outlive the (dropped) operation future
+            let shared_send = std::sync::Arc::new(tokio::sync::Mutex::new(master_send_stream));
+            let operation = async {
+                let result = rcpd_result_from(
+                    destination::run_destination(
+                        &source_control_addr,
+                        &source_data_addr,
+                        &server_name,
+                        &settings,
+                        args.overwrite_manifest_max_entries,
+                        &preserve,
+                        &tcp_config,
+                        cert_key.as_ref(),
+                        source_cert_fingerprint,
+                    )
+                    .await,
+                );
+                // send the result back to master — once this returns it is COMMITTED, as above
+                shared_send
+                    .lock()
+                    .await
+                    .send_control_message(&result)
+                    .await?;
+                result_committed.store(true, std::sync::atomic::Ordering::SeqCst);
+                anyhow::Ok(result)
+            };
+            // no result-send on the watchdog branch, as above: the master is gone
+            let (rcpd_result, committed) = tokio::select! {
+                // biased, and the watchdog guards only through the result commit — see the
+                // source arm for the full rationale
+                biased;
+                result = operation => (result?, true),
+                cause = &mut master_watchdog => (master_vanished(cause), false),
+            };
+            if committed {
+                // best-effort close outside the watchdog's race, as above
+                if let Err(error) = shared_send.lock().await.close().await {
+                    tracing::debug!(
+                        "closing the master control stream after the result: {error:#}"
+                    );
                 }
             }
+            rcpd_result
         }
     };
     Ok(rcpd_result)
@@ -551,17 +629,13 @@ async fn async_main(
         remote::streams::BoxedRecvStream,
     )> {
         let timeout = std::time::Duration::from_secs(tcp_config.conn_timeout_sec);
-        let (stream, addr) = tokio::time::timeout(timeout, listener.accept())
-            .await
-            .with_context(|| format!("timeout waiting for master {} connection", purpose))?
-            .with_context(|| format!("failed to accept {} connection", purpose))?;
+        // the accept helper applies the Control socket options before returning
+        let (stream, addr) =
+            tokio::time::timeout(timeout, remote::accept_tcp_control(listener, tcp_config))
+                .await
+                .with_context(|| format!("timeout waiting for master {} connection", purpose))?
+                .with_context(|| format!("failed to accept {} connection", purpose))?;
         tracing::info!("Accepted {} connection from {}", purpose, addr);
-        remote::configure_tcp_socket(
-            &stream,
-            tcp_config.network_profile,
-            tcp_config.keepalive_sec,
-            remote::ConnectionKind::Control,
-        );
         remote::tls::accept_bounded(tls_acceptor, stream, timeout, purpose).await
     }
     // accept control connection (TCP + TLS handshake, both bounded)
@@ -643,21 +717,41 @@ async fn async_main(
         //
         // The older comment here said there was no point cleaning up because the
         // master is dead. That predates the lockdown; there is a point now.
-        tokio::select! {
-            result = run_operation(args.clone(), master_send_stream, master_recv_stream, cert_key.clone()) => {
-                match result {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let runtime_stats = common::collect_runtime_stats();
-                        remote::protocol::RcpdResult::Failure {
-                            error: format!("{e:#}"),
-                            summary: common::copy::Summary::default(),
-                            runtime_stats,
-                        }
-                    }
+        let result_committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation = run_operation(
+            args.clone(),
+            master_send_stream,
+            master_recv_stream,
+            cert_key.clone(),
+            result_committed.clone(),
+        );
+        tokio::pin!(operation);
+        let map_result = |result: anyhow::Result<remote::protocol::RcpdResult>| match result {
+            Ok(r) => r,
+            Err(e) => {
+                let runtime_stats = common::collect_runtime_stats();
+                remote::protocol::RcpdResult::Failure {
+                    error: format!("{e:#}"),
+                    summary: common::copy::Summary::default(),
+                    runtime_stats,
                 }
             }
+        };
+        tokio::select! {
+            // biased: a finished operation beats a simultaneously-ready stdin EOF
+            biased;
+            result = &mut operation => map_result(result),
             _ = watchdog => {
+                if result_committed.load(std::sync::atomic::Ordering::SeqCst) {
+                    // the master consumed our result and exited — its SSH channel closing is the
+                    // ORDINARY end of a finished operation, not a disconnect. Finish the (short,
+                    // best-effort) tail of the operation instead of rewriting a committed success
+                    // into an exit-1 master loss.
+                    tracing::debug!(
+                        "stdin closed after the result was committed; finishing shutdown"
+                    );
+                    map_result(operation.await)
+                } else {
                 // stdin closed - master disconnected. Wind down through the normal
                 // return path (see CANCEL SAFETY above) rather than exiting here,
                 // so armed reused-directory lockdowns restore their ACLs.
@@ -671,6 +765,7 @@ async fn async_main(
                     summary: common::copy::Summary::default(),
                     runtime_stats: common::collect_runtime_stats(),
                 }
+                }
             }
         }
     } else {
@@ -680,6 +775,7 @@ async fn async_main(
             master_send_stream,
             master_recv_stream,
             cert_key.clone(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         {
@@ -694,9 +790,15 @@ async fn async_main(
             }
         }
     };
-    // cancel tracing task and wait for it to finish
+    // cancel tracing task and wait for it to finish — BOUNDED: the sender polls its cancellation
+    // token only between messages, so one suspended mid-send on a partitioned (or
+    // stopped-reading) master would otherwise hold this await for a whole transport timeout
+    // (another keepalive budget, or the kernel's ~15min retransmission limit with keepalive
+    // disabled), defeating the watchdog's prompt teardown. On the ordinary path the final flush
+    // completes in milliseconds; a sender that cannot flush within the bound has no one left
+    // reading it — stop waiting and let process exit reclaim the socket.
     tracing_cancel.cancel();
-    let _ = tracing_task.await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tracing_task).await;
     match rcpd_result {
         remote::protocol::RcpdResult::Success {
             message,

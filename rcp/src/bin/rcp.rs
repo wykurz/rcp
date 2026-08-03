@@ -638,23 +638,12 @@ async fn run_rcpd_master(
         remote::streams::BoxedRecvStream,
     )> {
         let timeout = std::time::Duration::from_secs(tcp_config.conn_timeout_sec);
-        let stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(conn_info.addr))
-            .await
-            .with_context(|| format!("timeout connecting to rcpd for {}", purpose))?
-            .with_context(|| {
-                format!(
-                    "failed to connect to rcpd at {} for {}",
-                    conn_info.addr, purpose
-                )
-            })?;
         // this is the connection the master then awaits `RcpdResult` on, with no timeout of its
-        // own — keepalive is what stops a vanished rcpd host from hanging the master forever
-        remote::configure_tcp_socket(
-            &stream,
-            tcp_config.network_profile,
-            tcp_config.keepalive_sec,
-            remote::ConnectionKind::Control,
-        );
+        // own — the keepalive the connect helper configures is what stops a vanished rcpd host
+        // from hanging the master forever
+        let stream = remote::connect_tcp_control(conn_info.addr, tcp_config)
+            .await
+            .with_context(|| format!("connecting to rcpd for {purpose}"))?;
         tracing::debug!("Connected to rcpd at {} for {}", conn_info.addr, purpose);
         match (conn_info.fingerprint, master_cert) {
             (Some(rcpd_fingerprint), Some(cert)) => {
