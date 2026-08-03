@@ -1,5 +1,10 @@
 [workspace]
-resolver = "2"
+# Resolver 3 is resolver 2 plus MSRV-aware version selection: it will not pick a dependency whose
+# `rust-version` exceeds ours (1.91.1) unless there is no other choice. Feature unification is
+# unchanged from resolver 2. This is what keeps a *transitive* dependency from raising the MSRV --
+# `cargo upgrade` only sees the direct dependencies written in the manifests, so without this the
+# lockfile half of `just update-deps` would be unguarded.
+resolver = "3"
 
 members = [
   "common",
