@@ -11,7 +11,18 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay }:
-    flake-utils.lib.eachDefaultSystem (system:
+    # Systems are enumerated explicitly rather than via `eachDefaultSystem`, which would also
+    # claim x86_64-darwin: nixpkgs 26.11 dropped that platform, and merely importing nixpkgs for
+    # it now throws, turning `nix flake check --all-systems` unconditionally red. Listing the
+    # systems here makes an upstream platform removal a one-line edit instead of an eval failure
+    # from a transitive input. Linux is what CI builds and tests; the Darwin outputs only have to
+    # evaluate (the code is cfg-gated for non-Linux, with the hardened walk disabled there).
+    # See https://nixos.org/manual/nixpkgs/unstable/release-notes#x86_64-darwin-26.11
+    flake-utils.lib.eachSystem [
+      "x86_64-linux"
+      "aarch64-linux"
+      "aarch64-darwin"
+    ] (system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
