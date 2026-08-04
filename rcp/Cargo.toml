@@ -35,14 +35,14 @@ tempfile = "3"
 # `test-util` (for `#[tokio::test(start_paused = true)]`) is NOT implied by `full`. Without it this
 # package's tests only build when a workspace-wide run unifies the feature in from another crate's
 # dev-dependency — `cargo test -p rcp-tools-rcp` and `nix build .#rcp` would fail on their own.
-tokio = { version = "1.52", features = ["full", "parking_lot", "tracing", "test-util"] }
+tokio = { version = "1.53", features = ["full", "parking_lot", "tracing", "test-util"] }
 
 [dependencies]
 anyhow = "1.0"
 async-channel = "2.5"
 async-recursion = "1.1"
-bytes = "1.11"
-bytesize = "2.3"
+bytes = "1.12"
+bytesize = "2.7"
 clap = { version = "4", features = ["derive"] }
 common = { workspace = true }
 enum-map = "2.7"
@@ -50,13 +50,13 @@ futures = "0.3"
 hex = "0.4"
 libc = "0.2"
 rand = "0.10"
-regex = "1.12"
+regex = "1.13"
 remote = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 throttle = { workspace = true }
-tokio = { version = "1.52", features = ["full", "parking_lot", "tracing"] }
+tokio = { version = "1.53", features = ["full", "parking_lot", "tracing"] }
 tokio-rustls = "0.26"
 tokio-util = "0.7"
 tracing = "0.1"

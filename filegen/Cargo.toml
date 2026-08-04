@@ -28,13 +28,13 @@ assert_cmd = "2"
 [dependencies]
 anyhow = "1.0"
 async-recursion = "1.1"
-bytesize = "2.3"
+bytesize = "2.7"
 clap = { version = "4", features = ["derive"] }
 common = { workspace = true }
 rand = "0.10"
 thiserror = "2.0"
 throttle = { workspace = true }
-tokio = { version = "1.52", features = ["full", "parking_lot", "tracing"] }
+tokio = { version = "1.53", features = ["full", "parking_lot", "tracing"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 

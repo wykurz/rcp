@@ -25,8 +25,8 @@ name = "common"
 [dependencies]
 anyhow = "1.0"
 async-recursion = "1.1"
-bytes = "1.11"
-bytesize = "2.3"
+bytes = "1.12"
+bytesize = "2.7"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
@@ -36,8 +36,8 @@ console-subscriber = "0.5"
 enum-map = "2.7"
 futures = "0.3"
 globset = "0.4"
-hdrhistogram = { version = "7.5", default-features = false, features = ["serialization"] }
-humantime = "2.3"
+hdrhistogram = { version = "7.6", default-features = false, features = ["serialization"] }
+humantime = "2.4"
 indicatif = "0.18"
 libc = "0.2"
 nix = { version = "0.31", features = ["dir", "fs", "hostname", "user", "zerocopy"] }
@@ -46,7 +46,7 @@ rand = "0.10"
 sysinfo = "0.38"
 thiserror = "2.0"
 throttle = { workspace = true }
-tokio = { version = "1.52", features = ["full", "parking_lot", "tracing"] }
+tokio = { version = "1.53", features = ["full", "parking_lot", "tracing"] }
 tracing = "0.1"
 tracing-chrome = "0.7"
 tracing-flame = "0.2"

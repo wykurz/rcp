@@ -24,17 +24,17 @@ name = "remote"
 [dependencies]
 anyhow = "1.0"
 async-channel = "2.5"
-bytesize = "2.3"
+bytesize = "2.7"
 async-recursion = "1.1"
 base64 = "0.23"
 bitcode = { version = "0.6", features = ["serde"] }
-bytes = "1.11"
+bytes = "1.12"
 chrono = "0.4"
 common = { workspace = true }
 enum-map = "2.7"
 futures = "0.3"
 hex = "0.4"
-humantime = "2.3"
+humantime = "2.4"
 if-addrs = "0.15"
 openssh = "0.11"
 rand = "0.10"
@@ -45,7 +45,7 @@ sha2 = "0.11"
 # "all" gates the keepalive tuning getters/setters (TCP_KEEPCNT) and TCP_USER_TIMEOUT
 socket2 = { version = "0.6", features = ["all"] }
 strum = { version = "0.28", features = ["derive"] }
-tokio = { version = "1.52", features = ["full", "parking_lot", "tracing"] }
+tokio = { version = "1.53", features = ["full", "parking_lot", "tracing"] }
 tokio-rustls = "0.26"
 tokio-util = "0.7"
 tracing = "0.1"

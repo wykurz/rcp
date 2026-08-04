@@ -30,11 +30,11 @@ tempfile = "3"
 
 [dependencies]
 anyhow = "1.0"
-bytesize = "2.3"
+bytesize = "2.7"
 clap = { version = "4", features = ["derive"] }
 common = { workspace = true }
 thiserror = "2.0"
-tokio = { version = "1.52", features = ["full", "parking_lot", "tracing"] }
+tokio = { version = "1.53", features = ["full", "parking_lot", "tracing"] }
 tracing = "0.1"
 
 [package.metadata.deb]
