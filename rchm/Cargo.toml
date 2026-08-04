@@ -31,7 +31,7 @@ tempfile = "3"
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
 common = { workspace = true }
-tokio = { version = "1.52", features = ["full", "parking_lot", "tracing"] }
+tokio = { version = "1.53", features = ["full", "parking_lot", "tracing"] }
 tracing = "0.1"
 
 [package.metadata.deb]
