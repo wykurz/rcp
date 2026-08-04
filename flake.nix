@@ -41,7 +41,34 @@
         msrvToolchain = pkgs.rust-bin.stable."1.91.1".minimal.override {
           targets = [ "x86_64-unknown-linux-gnu" "x86_64-unknown-linux-musl" ];
         };
+        # `cargo` resolves `rustc` from PATH -- NOT from beside its own binary, the way a rustup
+        # shim would. Running the MSRV cargo inside this devshell therefore used to compile with
+        # the devshell's latest-stable rustc, which made the whole check vacuous: cargo derives
+        # "the current Rust version" for its `rust-version` resolve check from the rustc it finds,
+        # so a dependency needing 1.95 was accepted. Verified on the same tree -- enum-map 3.1.0
+        # (requires 1.95) exited 0 with the devshell rustc on PATH and 101 with the MSRV one.
+        #
+        # So pin the compiler explicitly, three ways: RUSTC for cargo itself, RUSTDOC for doc
+        # targets, and the PATH prefix for anything (build scripts, proc-macro tooling) that
+        # resolves `rustc` by name. The assertion then fails loudly if a future edit drops one of
+        # them, rather than silently going back to passing everything.
         msrvCheck = pkgs.writeShellScriptBin "msrv-check" ''
+          set -euo pipefail
+          export RUSTC="${msrvToolchain}/bin/rustc"
+          export RUSTDOC="${msrvToolchain}/bin/rustdoc"
+          export PATH="${msrvToolchain}/bin:$PATH"
+
+          pinned="$("$RUSTC" --version)"
+          resolved="$(rustc --version)"
+          if [ "$pinned" != "$resolved" ]; then
+            echo "msrv-check: PATH resolves a different rustc than RUSTC pins," >&2
+            echo "  RUSTC: $pinned" >&2
+            echo "  PATH:  $resolved" >&2
+            echo "cargo would compile with the PATH one and the check would not test the MSRV." >&2
+            exit 1
+          fi
+          echo "msrv-check: using $pinned"
+
           exec ${msrvToolchain}/bin/cargo check --workspace --locked --all-targets --target x86_64-unknown-linux-gnu --target x86_64-unknown-linux-musl "$@"
         '';
 
