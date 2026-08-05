@@ -212,7 +212,7 @@
         # Package builder for RCP tools with custom binary names
         mkRcpPackage = { packageName, binaryName, description }: pkgs.rustPlatform.buildRustPackage {
           pname = binaryName;
-          version = "0.38.0";
+          version = "0.39.0";
           src = ./.;
 
           cargoLock = {
@@ -276,7 +276,7 @@
           # All tools in one package
           rcp-all = pkgs.rustPlatform.buildRustPackage {
             pname = "rcp-all";
-            version = "0.38.0";
+            version = "0.39.0";
             src = ./.;
 
             cargoLock = {
