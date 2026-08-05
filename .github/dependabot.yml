@@ -18,30 +18,12 @@ updates:
         patterns:
           - "*"
 
-  # SCHEDULED FOR REMOVAL, deliberately still here. `.github/workflows/cargo-update.yml` replaces
-  # this ecosystem with an MSRV-aware job, but that job cannot run until its GitHub App exists --
-  # it fails its own preflight without one. Deleting this block before then would leave the
-  # repository with no cargo dependency updates at all, so the two are not in fact racing yet.
-  #
-  # Remove this whole entry, `ignore` list included, once the App is configured and one dispatched
-  # run has been compared against a Dependabot pull request. Keeping both until that comparison is
-  # possible is the point: it is much easier to diff them while both still exist.
-  - package-ecosystem: "cargo"
-    directory: "/"
-    schedule:
-      interval: "monthly"
-    groups:
-      all-cargo:
-        patterns:
-          - "*"
-    # Dependabot has no MSRV awareness for cargo (dependabot-core#5423): it would
-    # otherwise propose bumps that exceed our rust-version and fail the CI `msrv` job.
-    # Pin offenders below the MSRV-raising version; the `msrv` job is the backstop.
-    ignore:
-      # sysinfo >= 0.39 needs rustc 1.95 > MSRV 1.91.1
-      - dependency-name: "sysinfo"
-        versions: [">= 0.39"]
-      # enum-map >= 3 needs rustc 1.95 > MSRV 1.91.1; it also pulls in
-      # enum-map-derive 1.0, which declares the same rustc 1.95.
-      - dependency-name: "enum-map"
-        versions: [">= 3"]
+# There is deliberately no `cargo` ecosystem here. `.github/workflows/cargo-update.yml` does that
+# job instead, because Dependabot has no MSRV awareness for cargo (dependabot-core#5423): it always
+# offers the newest version, so a crate raising its `rust-version` past ours failed the `msrv` job
+# and blocked every other bump in the batch until someone hand-wrote an `ignore` entry. That
+# happened twice, for `sysinfo` and `enum-map`. The replacement derives the same constraint from
+# `rust-version` on every run, and a hold-back releases itself once the MSRV is raised.
+#
+# Dependabot SECURITY updates for cargo are configured separately from these version updates and
+# are unaffected by the absence of this entry.
