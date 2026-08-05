@@ -309,12 +309,110 @@ async fn setup_ssh_session(
         (None, None) => format!("ssh://{host}"),
     };
     tracing::debug!("Connecting to SSH destination: {}", destination);
+    let mut builder = openssh::SessionBuilder::default();
+    builder.known_hosts_check(openssh::KnownHosts::Accept);
+    if let Some(dir) = ssh_control_directory() {
+        tracing::debug!("Using SSH control directory: {}", dir.display());
+        builder.control_directory(dir);
+    }
     let session = std::sync::Arc::new(
-        openssh::Session::connect(destination, openssh::KnownHosts::Accept)
+        builder
+            .connect(destination)
             .await
             .context("Failed to establish SSH connection")?,
     );
     Ok(session)
+}
+
+/// Where to put the SSH connection-multiplexing socket.
+///
+/// `openssh` defaults this to `$XDG_STATE_HOME`, else `$HOME/.local/state`, and the resulting
+/// socket path is subject to `sockaddr_un`'s 108-byte `sun_path` limit -- a limit that counts the
+/// terminating NUL, the `/.ssh-connectionXXXXXX/master` the library appends, AND the further
+/// `.XXXXXXXXXXXXXXXX` that ssh(1) itself appends while creating the socket before renaming it.
+/// That leaves only about 48 bytes for `$HOME`, and exceeding it fails with ssh's rather opaque
+/// `unix_listener: path "..." too long for Unix domain socket`, which names neither `$HOME` nor
+/// rcp. (Kept as an inline span rather than an indented block: rustdoc reads an indented block as
+/// a doctest, and a doctest on a private item is denied by the workspace rustdoc lints.)
+///
+/// 48 bytes is not a comfortable margin: container workspaces, network homes and CI checkout paths
+/// routinely run longer.
+///
+/// Candidates are tried in order and the first genuinely usable one wins:
+///
+/// 1. `$XDG_RUNTIME_DIR` -- typically `/run/user/<uid>`, ~14 bytes, and semantically the right
+///    home for a runtime socket: per-user, mode 0700, cleared when the session ends.
+/// 2. `std::env::temp_dir()` -- honours `TMPDIR`, so it follows a sandbox that redirects it.
+/// 3. `/tmp` -- for when `TMPDIR` itself points somewhere long or unusable.
+///
+/// Falling through to 2 and 3 is the point rather than a nicety: the environments named above as
+/// motivation -- containers, CI runners, `su` sessions -- are exactly the ones that tend NOT to set
+/// `$XDG_RUNTIME_DIR`, so stopping at step 1 would have left the intended beneficiaries on the very
+/// `$HOME`-derived path this exists to avoid. The socket directory itself is created by `openssh`
+/// through `tempfile`, which makes it mode 0700, so a shared `/tmp` parent is still private.
+///
+/// Returns `None` only when nothing is usable, leaving the library's own default in place rather
+/// than forcing a location known to be broken.
+fn ssh_control_directory() -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::with_capacity(3);
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        candidates.push(runtime_dir.into());
+    }
+    candidates.push(std::env::temp_dir());
+    candidates.push(std::path::PathBuf::from("/tmp"));
+
+    candidates
+        .into_iter()
+        .find(|dir| control_dir_is_usable(dir))
+}
+
+/// Longest socket path `sockaddr_un` can hold, counting the terminating NUL.
+const SUN_PATH_MAX: usize = 108;
+
+/// What gets appended to the control directory before the socket finally exists:
+///
+/// - `/.ssh-connectionXXXXXX` (22) -- the private dir `openssh` makes inside it via `tempfile`
+/// - `/master` (7) -- the `ControlPath` itself
+/// - `.XXXXXXXXXXXXXXXX` (17) -- the temporary name ssh(1) creates it under before renaming
+const CONTROL_PATH_SUFFIX: usize = 22 + 7 + 17;
+
+/// Whether `dir` can actually host the control socket: short enough to leave room for everything
+/// appended to it, and writable by us.
+///
+/// Both halves matter. Length is the original bug. Writability is what makes the candidate list
+/// above mean anything -- a directory that merely *exists* is not enough, and `$XDG_RUNTIME_DIR`
+/// surviving into a `su`/`sudo -u` session while pointing at the original user's `/run/user/<uid>`
+/// is a common way to get one that is present but unusable. Without this check we would select it
+/// confidently and fail, instead of moving on to `/tmp`.
+fn control_dir_is_usable(dir: &std::path::Path) -> bool {
+    if dir.as_os_str().is_empty() || !dir.is_dir() {
+        return false;
+    }
+    if dir.as_os_str().len() + CONTROL_PATH_SUFFIX >= SUN_PATH_MAX {
+        tracing::debug!(
+            "skipping SSH control directory {}: too long to hold the socket path",
+            dir.display()
+        );
+        return false;
+    }
+    // Probe rather than inspect the mode: ownership, ACLs and read-only mounts all decide this,
+    // and creating a directory is exactly what `openssh` is about to do anyway.
+    let probe = dir.join(format!(".rcp-control-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir(&probe); // a probe left by a previous crashed run
+    match std::fs::create_dir(&probe) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir(&probe);
+            true
+        }
+        Err(error) => {
+            tracing::debug!(
+                "skipping SSH control directory {}: not writable: {:#}",
+                dir.display(),
+                &error
+            );
+            false
+        }
+    }
 }
 
 #[instrument]

@@ -62,7 +62,14 @@ fn run_rcp_with_args_internal(
         cmd.env("HOME", home);
     }
     for (key, value) in extra_env {
-        cmd.env(key, value);
+        // An empty value REMOVES the variable rather than setting it to "". Some behaviour differs
+        // between "unset" and "set but empty" -- notably which SSH control directory gets picked --
+        // and a test that could only ever set variables would silently exercise the wrong branch.
+        if value.is_empty() {
+            cmd.env_remove(key);
+        } else {
+            cmd.env(key, value);
+        }
     }
     let output = cmd.output().expect("Failed to execute rcp command");
     // CRITICAL: check for timeout immediately. this ensures tests that expect failure
@@ -89,16 +96,33 @@ fn cache_bin_dir(home: &std::path::Path) -> std::path::PathBuf {
     home.join(".cache/rcp/bin")
 }
 
-fn make_test_home() -> tempfile::TempDir {
-    let temp_home = tempfile::tempdir().unwrap();
+fn link_real_ssh_dir(temp_home: &std::path::Path) {
     if let Ok(real_home) = std::env::var("HOME") {
         let ssh_src = std::path::Path::new(&real_home).join(".ssh");
-        let ssh_dest = temp_home.path().join(".ssh");
+        let ssh_dest = temp_home.join(".ssh");
         if ssh_src.exists() && !ssh_dest.exists() {
             // allow SSH to find existing keys/known_hosts when we override HOME
             let _ = std::os::unix::fs::symlink(&ssh_src, &ssh_dest);
         }
     }
+}
+
+fn make_test_home() -> tempfile::TempDir {
+    let temp_home = tempfile::tempdir().unwrap();
+    link_real_ssh_dir(temp_home.path());
+    temp_home
+}
+
+/// A test HOME deliberately longer than the ~48 bytes that the SSH control socket path used to
+/// leave for it. Rooted at `/tmp` rather than at the ambient temp dir so its length is a property
+/// of this fixture and not of whatever `TMPDIR` the caller happens to have -- under nix-shell, for
+/// example, `TMPDIR` alone is already 39 bytes, which is how this bug was found.
+fn make_long_test_home() -> tempfile::TempDir {
+    let temp_home = tempfile::Builder::new()
+        .prefix("rcp-home-long-enough-to-overflow-the-ssh-control-socket-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    link_real_ssh_dir(temp_home.path());
     temp_home
 }
 
@@ -238,6 +262,98 @@ fn parse_summary_from_output(output: &std::process::Output) -> Option<common::co
     } else {
         None
     }
+}
+
+/// A long `$HOME` must not break remote copies.
+///
+/// The SSH connection-multiplexing socket used to live under `$HOME/.local/state`, and
+/// `sockaddr_un` caps the entire socket path at 108 bytes -- a budget that also has to cover the
+/// `/.ssh-connectionXXXXXX/master` the ssh library appends and the further `.XXXXXXXXXXXXXXXX`
+/// that ssh(1) itself appends while creating the socket before renaming it. That left roughly 48
+/// bytes for `$HOME`; anything longer died with
+///
+///     unix_listener: path "..." too long for Unix domain socket
+///
+/// which names neither `$HOME` nor rcp. 48 bytes is not much: container workspaces, network homes
+/// and nested temp dirs all exceed it, and this was originally hit by nine tests at once simply
+/// because `TMPDIR` under nix-shell is 39 bytes before the fixture adds anything.
+///
+/// Both environment variables are set explicitly rather than inherited, so the test asserts the
+/// same thing on every machine: a home long enough to have failed before, and a runtime dir short
+/// enough that the fix has somewhere to put the socket.
+#[test]
+fn test_remote_copy_with_a_home_too_long_for_the_ssh_control_socket() {
+    require_local_ssh();
+    let home = make_long_test_home();
+    // Guard the fixture itself: if the prefix above were ever shortened, this test would keep
+    // passing while no longer exercising anything.
+    let home_len = home.path().as_os_str().len();
+    assert!(
+        home_len > 48,
+        "fixture home is only {home_len} bytes, too short to exercise the old limit: {}",
+        home.path().display()
+    );
+    let runtime_dir = tempfile::Builder::new()
+        .prefix("rt")
+        .tempdir_in("/tmp")
+        .unwrap();
+
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("long_home.txt");
+    let dst_file = dst_dir.path().join("long_home.txt");
+    create_test_file(&src_file, "long home content", 0o644);
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+
+    let output = run_rcp_with_args_home_and_env(
+        &[src_file.to_str().unwrap(), &dst_remote],
+        home.path(),
+        &[("XDG_RUNTIME_DIR", runtime_dir.path().to_str().unwrap())],
+    );
+    print_command_output(&output);
+    assert!(
+        output.status.success(),
+        "remote copy failed with a {home_len}-byte HOME"
+    );
+    assert_eq!(get_file_content(&dst_file), "long home content");
+}
+
+/// The same long `$HOME`, but with no `$XDG_RUNTIME_DIR` at all.
+///
+/// This is the case that actually matters in production and the one the first fix missed. The
+/// environments cited as motivation for caring about long homes -- containers, CI runners, `su`
+/// sessions -- are precisely the ones that tend not to set `$XDG_RUNTIME_DIR`, so a fix that only
+/// consulted that variable would have helped desktop users, who rarely have a long home anyway,
+/// and left everyone else on the broken path. Here the socket has to land in the temp-dir fallback
+/// instead.
+#[test]
+fn test_remote_copy_with_a_long_home_and_no_runtime_dir() {
+    require_local_ssh();
+    let home = make_long_test_home();
+    let home_len = home.path().as_os_str().len();
+    assert!(
+        home_len > 48,
+        "fixture home is only {home_len} bytes, too short to exercise the old limit: {}",
+        home.path().display()
+    );
+
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("no_runtime_dir.txt");
+    let dst_file = dst_dir.path().join("no_runtime_dir.txt");
+    create_test_file(&src_file, "no runtime dir content", 0o644);
+    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
+
+    let output = run_rcp_with_args_home_and_env(
+        &[src_file.to_str().unwrap(), &dst_remote],
+        home.path(),
+        // Empty value means env_remove: genuinely unset, not set-to-empty.
+        &[("XDG_RUNTIME_DIR", "")],
+    );
+    print_command_output(&output);
+    assert!(
+        output.status.success(),
+        "remote copy failed with a {home_len}-byte HOME and no XDG_RUNTIME_DIR"
+    );
+    assert_eq!(get_file_content(&dst_file), "no runtime dir content");
 }
 
 #[test]
