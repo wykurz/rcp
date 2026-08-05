@@ -8,6 +8,14 @@
 #   cargo upgrade  -- bumps requirements in the manifests; respects `rust-version` by default
 #                     (`--ignore-rust-version` is the opt-out). `--incompatible allow` is what makes
 #                     it cross semver-major boundaries, matching what Dependabot used to do.
+#
+#                     `--compatible` is left at its default of `allow`, so a requirement is also
+#                     tightened when the new version is semver-compatible: `tokio = "1.52"` becomes
+#                     `"1.53"` even though the old range still matched. This is a deliberate choice
+#                     to update aggressively, and it is where the tool differs most visibly from
+#                     Dependabot, which rewrites a requirement only when forced to. The trade is
+#                     that our published crates get a rising minimum-version floor; `--compatible
+#                     ignore` is the knob if that ever becomes a problem for a downstream user.
 #   cargo update   -- refreshes the lockfile; MSRV-aware because the workspace sets resolver = "3".
 #                     This is the half that keeps a *transitive* dependency from raising the floor,
 #                     which `cargo upgrade` cannot see.
