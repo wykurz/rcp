@@ -7,6 +7,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-08-05
+
 ### Added
 
 - POSIX ACL preservation, opt-in via `--preserve-settings=all+acl` or a per-type `acl` attribute
@@ -571,10 +573,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   previously dropped wholesale (correct for classification, where literal prose must not arm
   anything, but the placeholders of a format string live in exactly that body). Fixtures pin both
   directions.
+- Fix remote copies failing with `unix_listener: path "..." too long for Unix domain socket` when
+  `$HOME` is long. The SSH connection-multiplexing socket lived under `$XDG_STATE_HOME` (else
+  `$HOME/.local/state`), and `sockaddr_un` caps the whole path at 108 bytes — of which the suffixes
+  the SSH layer appends leave only about 48 for the home directory, thin for container workspaces,
+  network homes, and CI checkout paths. The error named neither `rcp` nor `HOME`, so it gave the
+  user nothing to act on. The control directory is now taken from the first genuinely usable
+  candidate among `$XDG_RUNTIME_DIR`, `$TMPDIR`, and `/tmp` — "usable" meaning short enough to hold
+  the socket path *and* writable, since a `$XDG_RUNTIME_DIR` inherited into a `su`/`sudo -u` session
+  commonly names a directory that exists but cannot be written.
 - The Nix flake evaluates on Darwin again, un-breaking `nix flake check --all-systems` in CI:
   nixpkgs removed the `darwin.apple_sdk.frameworks.*` compatibility stubs the flake listed (the
   Darwin stdenv now ships the SDK itself, and the project needs no framework beyond it), and the
-  `acl`/`strace` dev-shell tools are Linux-only and are now gated accordingly.
+  `acl`/`strace` dev-shell tools are Linux-only and are now gated accordingly. The flake's systems
+  are now listed explicitly and no longer include `x86_64-darwin`, which nixpkgs 26.11 dropped —
+  importing nixpkgs for it throws outright; `aarch64-darwin` stays.
 
 ## [0.37.0] - 2026-07-15
 
@@ -931,7 +944,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 See git history for changes in previous versions.
 
-[Unreleased]: https://github.com/wykurz/rcp/compare/v0.37.0...HEAD
+[Unreleased]: https://github.com/wykurz/rcp/compare/v0.38.0...HEAD
+[0.38.0]: https://github.com/wykurz/rcp/compare/v0.37.0...v0.38.0
 [0.37.0]: https://github.com/wykurz/rcp/compare/v0.36.0...v0.37.0
 [0.36.0]: https://github.com/wykurz/rcp/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/wykurz/rcp/compare/v0.34.0...v0.35.0
