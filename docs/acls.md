@@ -217,7 +217,8 @@ of quiet lie this feature exists to remove:
 
 `all` not preserving ACLs is only defensible if a user who has not read this page finds out. So one
 `listxattr` on the **source root** per run — a constant, free at any tree size — warns once when the
-root carries an ACL while `acl` is not requested:
+root carries an ACL while `acl` is not requested, **provided the run asked for metadata fidelity in
+the first place**:
 
 ```
 WARN Source root "/data/project" carries a POSIX ACL that this copy will NOT preserve
@@ -230,6 +231,52 @@ Under `--require-toctou-safe` the same probe, at the same cost, carries a sharpe
 mode contains inherited destination ACLs but does **not** preserve the source's, so the copy can
 still end up more permissive than what it copied — see
 [the two flags close different bugs](#the-two-flags-close-different-bugs).
+
+### What arms it
+
+The notice is armed by the run **asking** for the fidelity a dropped ACL would undermine, not by an
+ACL merely existing. Two things arm it, independently:
+
+- The resolved `--preserve`/`--preserve-settings` requesting anything beyond the shipped default —
+  `all`, a bare `f:uid`, a `7777` mode mask, anything.
+- `--require-toctou-safe`, whatever the preserve settings say. It is a request about permissions on
+  its own, and it is where a user is most likely to assume the source's ACLs came along; it gets the
+  sharper wording above.
+
+Everything else is silent, probe included — a copy that did not ask pays nothing at all, not even
+the one `listxattr`:
+
+| Invocation                                | Notice                          |
+| ----------------------------------------- | ------------------------------- |
+| `rcp src dst`                             | silent                          |
+| `rcp --preserve-settings=none src dst`    | silent                          |
+| `rcp --preserve-settings=all src dst`     | warns                           |
+| `rcp --preserve-settings=d:uid src dst`   | warns                           |
+| `rcp --require-toctou-safe src dst`       | warns (strict wording)          |
+| `rcp --preserve-settings=all+acl src dst` | silent — the ACLs are preserved |
+| `rlink src dst`                           | warns — rlink defaults to `all` |
+
+The reason a bare `rcp` is silent is consistency about what the default claims. Left alone, rcp
+reproduces the source's `rwx` bits like `cp` and nothing else: uid, gid, timestamps and the
+setuid/setgid/sticky bits are all dropped without a word. A run that makes no claim about the
+destination's metadata does not need advice about one more attribute it also does not carry, and
+singling ACLs out there would be the one loud omission among several silent ones. Ask for anything —
+that is the claim — and the advice becomes worth printing.
+
+`rlink` sits on the other side of the same rule rather than being an exception to it: its default
+**is** `all`, because metadata fidelity is what the tool is for, so a bare `rlink` has asked. Only
+`rlink --preserve-settings=none` (or settings that resolve back to the shipped default) turns the
+notice off there.
+
+The gate reads the RESOLVED settings, and the baseline it compares against is the **shipped
+default** (`preserve_none`) — not whatever the tool would have used had you passed nothing. So
+`--preserve-settings=none` and its longhand spelling `f:0777 d:0777` are equivalent to each other
+and both silent, in either tool. There is no separate "was the flag typed" bit.
+
+The two baselines coincide for `rcp`, whose CLI default *is* the shipped default, so there passing
+nothing and passing `none` behave alike. They do not coincide for `rlink`, whose CLI default is
+`all`: `rlink src dst` warns while `rlink --preserve-settings='f:0777 d:0777' src dst` is silent.
+Nothing special-cases the tool — the two invocations resolve to different settings.
 
 **This is a heuristic, not a guarantee.** A root without an ACL says nothing about its children, and
 the probe deliberately does not walk: probing enough entries to be sure *is* the per-entry cost that
@@ -370,10 +417,13 @@ or it will fail at `fsetxattr`.
 The wire carries the same opaque bytes: `protocol::Metadata` gained an `acls: WireAcls` field — an
 enum distinguishing `Captured { access, default }` (authoritative, including the "has none" case)
 from `Unknown` (no ACL information at all: capture off, or the source could not read them) — and
-`MasterHello::Source` gained a `capture: ExtendedMetadataCapture { file_acl, dir_acl }` field so the
-source knows whether to probe at all. Without it the source — which is told `preserve` by nobody —
-would have to probe unconditionally, landing the per-entry cost on every remote copy including ones
-that do not want ACLs.
+`MasterHello::Source` gained a
+`capture: ExtendedMetadataCapture { file_acl, dir_acl,
+root_acl_notice }` field so the source knows
+whether to probe at all. Without it the source — which is told `preserve` by nobody — would have to
+probe unconditionally, landing the per-entry cost on every remote copy including ones that do not
+want ACLs. The first two flags drive the per-entry reads; `root_acl_notice` only arms the
+one-per-run [source-root notice](#the-source-root-warning) and never populates a `Metadata`.
 
 [remote_protocol.md §2.5](remote_protocol.md) is the authority: which messages carry which ACL, why
 a `Captured` `None` means CLEAR while `Unknown` means the destination's ACLs are left untouched, and

@@ -43,8 +43,9 @@ pub struct ProtocolVersion {
 /// not also change. The crate version alone cannot tell two 0.38.0-dev builds apart, so a stale
 /// same-version `rcpd` (on `PATH` or in the deploy cache) would otherwise pass the compatibility
 /// check and then fail — or misbehave — mid-copy when the schemas diverge. Revision 1 covers the
-/// 0.38.0-dev `WireAcls` reshape.
-pub const WIRE_REVISION: u32 = 1;
+/// 0.38.0-dev `WireAcls` reshape; revision 2 the 0.39.0-dev `ExtendedMetadataCapture` gaining
+/// `root_acl_notice`, which lengthens `MasterHello::Source` by a field.
+pub const WIRE_REVISION: u32 = 2;
 
 impl ProtocolVersion {
     /// Get the current protocol version

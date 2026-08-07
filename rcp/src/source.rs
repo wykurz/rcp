@@ -1507,17 +1507,11 @@ async fn send_fs_objects_tcp(
     // that this walk needs for nothing else, so calling it before asking whether a probe is even
     // wanted would charge every remote `-L` copy — including `all+acl`, which has nothing to warn
     // about — for a probe that then declines to run.
-    if common::safedir::root_acl_probe_worth_reaching(capture.file_acl, capture.dir_acl)
+    let notice = common::safedir::RootAclNotice::from(capture);
+    if common::safedir::root_acl_probe_worth_reaching(notice)
         && let Ok((parent, name)) = open_root_parent(src).await
     {
-        common::safedir::warn_if_root_acl_unpreserved_at(
-            &parent,
-            &name,
-            src,
-            capture.file_acl,
-            capture.dir_acl,
-        )
-        .await;
+        common::safedir::warn_if_root_acl_unpreserved_at(&parent, &name, src, notice).await;
     }
     // determine if we have a root item to send (for DirStructureComplete message)
     // special files (sockets, FIFOs, devices) never produce protocol messages,
@@ -1646,8 +1640,12 @@ async fn send_root_hardened(
     // that a source root carrying an ACL is about to be copied by settings that drop it. The
     // warning reaches the user over the existing tracing connection like any other rcpd log line.
     // It goes through the `/proc/self/fd` form precisely because `handle` is `O_PATH` (see below).
-    common::safedir::warn_if_root_acl_unpreserved(&handle, src, capture.file_acl, capture.dir_acl)
-        .await;
+    common::safedir::warn_if_root_acl_unpreserved(
+        &handle,
+        src,
+        common::safedir::RootAclNotice::from(capture),
+    )
+    .await;
     // ACLs stay UNKNOWN here: the classify handle's inode is not necessarily the one whose bytes
     // will be sent (read-side fidelity — an ACL read now could describe an inode a same-name swap
     // replaces before the copy), so every use below that needs them re-reads from the real fd it

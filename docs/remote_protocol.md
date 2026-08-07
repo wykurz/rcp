@@ -150,8 +150,10 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
       network traffic)
     - `dry_run`: Optional dry-run mode (brief, all, or explain) for previewing operations without
       transferring files
-    - `capture: ExtendedMetadataCapture { file_acl, dir_acl }`: what EXTENDED per-entry metadata the
-      source must read beyond the `stat` it already does — currently POSIX ACLs. See §2.5.
+    - `capture: ExtendedMetadataCapture { file_acl, dir_acl, root_acl_notice }`: what EXTENDED
+      metadata the source must read beyond the `stat` it already does — currently POSIX ACLs. The
+      first two are per-entry reads whose bytes are sent; `root_acl_notice` buys one read on the
+      ROOT whose only product is a log line. See §2.5.
   - `Destination { source_control_addr, source_data_addr, server_name, preserve, source_cert_fingerprint }`:
     Tells destination where to connect (both control and data addresses). Note: empty directory
     cleanup decisions are communicated per-directory via `keep_if_empty` in `Directory` messages
@@ -438,14 +440,16 @@ nothing when the source has no ACL" would hand the copy permissions the source n
 
 **`Unknown` means the wire carries no ACL information, and the destination must NOT touch the
 destination entry's ACLs.** It arrives in exactly two situations: the master never asked for ACLs
-(`capture` all-false — the destination's `preserve` then never applies them either), or the source
-COULD NOT read them (a committed directory that failed to open — that entry's copy is already
-recorded as an error on the source). The distinction from `Captured` all-`None` is load-bearing:
-collapsing the two turns a source-side read failure into an authoritative clear, permanently
-stripping a REUSED destination directory's access and default ACLs on a copy that is already
-failing. The destination implements `Unknown` by disabling ACL preservation for that one entry's
-metadata application; for a strict-mode locked reused directory that restores the directory's
-ORIGINAL default ACL (the lockdown snapshot) — the same outcome as `d:acl` off.
+(`capture.file_acl` / `capture.dir_acl` both false — the destination's `preserve` then never applies
+them either; `capture.root_acl_notice` is irrelevant here, since it buys a log line and never
+populates a `Metadata`), or the source COULD NOT read them (a committed directory that failed to
+open — that entry's copy is already recorded as an error on the source). The distinction from
+`Captured` all-`None` is load-bearing: collapsing the two turns a source-side read failure into an
+authoritative clear, permanently stripping a REUSED destination directory's access and default ACLs
+on a copy that is already failing. The destination implements `Unknown` by disabling ACL
+preservation for that one entry's metadata application; for a strict-mode locked reused directory
+that restores the directory's ORIGINAL default ACL (the lockdown snapshot) — the same outcome as
+`d:acl` off.
 
 **Which messages actually carry ACLs:**
 
@@ -486,19 +490,30 @@ both peers alive, which no keepalive or timeout ends:
 Both walks follow this rule, and the file path inherits it from the same accounting: an ACL read
 failure on a file takes the same `FileSkipped` route as a failed open.
 
-**`MasterHello::Source { capture: ExtendedMetadataCapture { file_acl, dir_acl } }`.** Only
-`MasterHello::Destination` carries `preserve`, so without this field the source could not know
+**`MasterHello::Source { capture: ExtendedMetadataCapture { file_acl, dir_acl, root_acl_notice } }`.**
+Only `MasterHello::Destination` carries `preserve`, so without this field the source could not know
 whether ACLs are wanted and would have to probe unconditionally — a syscall per entry that `stat`
 cannot fold in, on every remote copy including ones that do not want ACLs. With every field false
-the source issues no xattr syscall at all.
+the source issues no xattr syscall at all — except under `--require-toctou-safe`, which arms the
+root notice from the source's own mirrored flag rather than from here, so a strict run still pays
+the one root `listxattr` on an all-false capture. Nothing per-entry is reachable that way: only
+`file_acl` and `dir_acl` open that door.
 
-It is deliberately NOT the whole `preserve` struct. The source decides only what to **read**; the
-destination remains the sole authority on what is **applied**. Handing the source a `preserve` would
-invite a later reader to act on, say, `preserve.file.mode_mask` source-side, which would be a bug.
-The master derives `capture` from the same `preserve` it sends the destination, at one call site, so
-the two cannot disagree — which matters, because the destination reads an all-`None` `Metadata` as
-"clear", so a capture that said `false` under a `preserve` that said `true` would strip every ACL
-instead of copying it. This is a wire-format change, not a spawn-argument one.
+`root_acl_notice` arms the one-per-run source-root probe behind the notice in
+[acls.md](acls.md#the-source-root-warning), and is independent of the two per-entry flags in both
+directions: it is set when the master's `preserve` asks for metadata fidelity **at all**, whereas
+they are set when it asks for `acl` specifically — which is exactly the case where there is nothing
+to warn about. A remote copy left at the shipped default clears all three. `--require-toctou-safe`
+arms the notice too but does not travel here: it reaches the source `rcpd` as its own mirrored flag
+and is read from the process-global strict state on the host that runs the probe.
+
+`capture` is deliberately NOT the whole `preserve` struct. The source decides only what to **read**;
+the destination remains the sole authority on what is **applied**. Handing the source a `preserve`
+would invite a later reader to act on, say, `preserve.file.mode_mask` source-side, which would be a
+bug. The master derives `capture` from the same `preserve` it sends the destination, at one call
+site, so the two cannot disagree — which matters, because the destination reads an all-`None`
+`Metadata` as "clear", so a capture that said `false` under a `preserve` that said `true` would
+strip every ACL instead of copying it. This is a wire-format change, not a spawn-argument one.
 
 **Application (destination).** File ACLs are applied through the created file's own fd in
 `process_single_file`, directory ACLs through the directory's own held fd when it completes

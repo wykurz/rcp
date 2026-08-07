@@ -428,13 +428,17 @@ pub async fn link(
     // ACL unless `f:acl` is on — so the file half then defers to the setting like any copy. (The
     // probe still examines the SOURCE root; whether the update entry differs — and so whether the
     // copy path actually runs — is not known yet, matching the probe's documented
-    // root-only-heuristic character.)
+    // root-only-heuristic character.) Whether the notice is wanted AT ALL still comes from the
+    // preserve settings, which for rlink default to `all` — metadata fidelity is what the tool is
+    // for — so a bare `rlink` asks for it where a bare `rcp` does not.
     crate::safedir::warn_if_root_acl_unpreserved_at(
         &src_parent,
         src_name,
         src,
-        update.is_none() || settings.preserve.file.acl,
-        settings.preserve.dir.acl,
+        crate::safedir::RootAclNotice {
+            file_acl_preserved: update.is_none() || settings.preserve.file.acl,
+            ..crate::safedir::RootAclNotice::for_preserve(&settings.preserve)
+        },
     )
     .await;
     // In dry-run we never touch the destination, so we don't open its parent at all (it may not

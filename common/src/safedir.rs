@@ -2181,10 +2181,16 @@ fn remove_created_if_same_inode(
 
 // ── The source-root ACL warning ─────────────────────────────────────────────────
 //
-// `all` does not preserve ACLs, and a user who does not know that gets a silently
-// wider destination. Telling them costs one `listxattr` on the SOURCE ROOT per
-// run — a constant, not a per-entry probe, so it is affordable on the very path
-// whose whole point is that it pays nothing per entry.
+// `all` does not preserve ACLs, and a user who asked for it and does not know
+// that gets a silently wider destination. Telling them costs one `listxattr` on
+// the SOURCE ROOT per run — a constant, not a per-entry probe, so it is
+// affordable on the very path whose whole point is that it pays nothing per
+// entry.
+//
+// armed by ASKING (`RootAclNotice`), not by an ACL merely existing: a run left at
+// the shipped default already drops uid, gid, timestamps and the special mode bits
+// without a word, so it is not the place to be loud about one more attribute it
+// also does not carry — and it pays nothing to find that out.
 //
 // It is a HEURISTIC and must be read as one: a root without an ACL says nothing
 // about its children. The alternative — probing enough entries to be sure — IS
@@ -2193,6 +2199,74 @@ fn remove_created_if_same_inode(
 /// Guards the probe so it runs at most once per process, no matter how many source operands (or
 /// `--dereference` recursions into `copy`) reach a call site.
 static ROOT_ACL_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What a run's settings say about the source-root ACL notice: whether it is wanted at all, and
+/// which kinds are already covered.
+///
+/// The single home of the rule, so the two entry points below, the cheap pre-check a caller uses to
+/// skip work, and the remote source all decide the same way.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RootAclNotice {
+    /// Whether this run asked for the kind of fidelity a dropped ACL would undermine, normally
+    /// [`crate::preserve::Settings::requests_preservation`].
+    ///
+    /// `false` silences the notice outright — probe included, so a run that did not ask pays
+    /// nothing at all. A copy left at the shipped default already drops uid, gid, timestamps and
+    /// the setuid/setgid/sticky bits without a word; singling ACLs out there would be advice about
+    /// permission completeness nobody claimed. It is also independent of
+    /// [`strict_operand_resolution`], which arms the notice on its own: `--require-toctou-safe` is
+    /// a request about permissions whatever the preserve settings say, and it gets its own wording.
+    pub wanted: bool,
+    /// Whether a FILE root's ACL is already safe — normally the `acl` preserve setting for files,
+    /// but `true` also covers a kind whose ACL cannot be lost by construction (`rlink` passes it
+    /// for files without `--update`, which share the source inode through the hard link).
+    pub file_acl_preserved: bool,
+    /// Whether a DIRECTORY root's ACLs (access and default) are already safe.
+    pub dir_acl_preserved: bool,
+}
+
+impl RootAclNotice {
+    /// The notice a copy governed by `preserve` wants.
+    #[must_use]
+    pub fn for_preserve(preserve: &crate::preserve::Settings) -> Self {
+        Self {
+            wanted: preserve.requests_preservation(),
+            file_acl_preserved: preserve.file.acl,
+            dir_acl_preserved: preserve.dir.acl,
+        }
+    }
+
+    /// Whether a root of `kind` could produce a notice: the run wants one and that kind's ACLs are
+    /// not already being carried across.
+    ///
+    /// Symlinks and special files answer `false` without consulting anything — the kernel has no
+    /// symlink ACL (the settings parser rejects `l:acl`), and a special file is not copied as an
+    /// object whose permissions rcp reproduces.
+    ///
+    /// Reads the process-global strict flag, so it must not be called before
+    /// [`enable_strict_operand_resolution`] has run — every call site is well past the linter that
+    /// sets it.
+    fn could_warn_for(self, kind: EntryKind) -> bool {
+        self.could_warn_for_strict(kind, strict_operand_resolution())
+    }
+
+    /// [`could_warn_for`](Self::could_warn_for) with the strict flag passed in rather than read, so
+    /// the rule itself can be pinned without a process-global to arrange.
+    fn could_warn_for_strict(self, kind: EntryKind, strict: bool) -> bool {
+        (self.wanted || strict)
+            && match kind {
+                EntryKind::File => !self.file_acl_preserved,
+                EntryKind::Dir => !self.dir_acl_preserved,
+                EntryKind::Symlink | EntryKind::Special => false,
+            }
+    }
+
+    /// Whether ANY root could produce a notice — [`could_warn_for`](Self::could_warn_for) with the
+    /// root's kind not yet known, which is the only thing a caller holding just a path can ask.
+    fn could_warn(self) -> bool {
+        self.could_warn_for(EntryKind::File) || self.could_warn_for(EntryKind::Dir)
+    }
+}
 
 /// Whether the inode an `O_PATH` [`Handle`] pins carries either POSIX ACL, probed through its
 /// `/proc/self/fd/N` magic symlink.
@@ -2228,8 +2302,8 @@ async fn has_acl_via_proc_fd(handle: &Handle, side: congestion::Side) -> std::io
 /// entry points below use it to skip an `openat`, and `rcp`'s remote `-L` source uses it to skip
 /// resolving and opening the root's parent, which it does not otherwise need.
 #[must_use]
-pub fn root_acl_probe_worth_reaching(file_acl_preserved: bool, dir_acl_preserved: bool) -> bool {
-    if file_acl_preserved && dir_acl_preserved {
+pub fn root_acl_probe_worth_reaching(notice: RootAclNotice) -> bool {
+    if !notice.could_warn() {
         return false;
     }
     !ROOT_ACL_PROBED.load(std::sync::atomic::Ordering::Relaxed)
@@ -2250,28 +2324,17 @@ fn claim_root_acl_probe() -> bool {
 /// Probe `handle` and warn if it carries an ACL this copy will not carry across. The shared body
 /// of the two entry points below, so the message and the kind rule live in one place.
 ///
-/// A symlink or special root is skipped without a syscall — neither can carry an ACL. Failure to
-/// probe is logged at `debug!` and nothing else: this produces advice, so a missing `/proc` or an
-/// exotic filesystem must not turn into a copy error.
-async fn warn_root_acl(
-    handle: &Handle,
-    src_root: &Path,
-    file_acl_preserved: bool,
-    dir_acl_preserved: bool,
-) {
-    let already_preserved = match handle.kind() {
-        EntryKind::File => file_acl_preserved,
-        EntryKind::Dir => dir_acl_preserved,
-        // symlinks have no ACL (the settings parser rejects `l:acl`), and a special file is not
-        // copied as an object whose permissions rcp reproduces
-        EntryKind::Symlink | EntryKind::Special => return,
-    };
-    if already_preserved {
+/// The root's kind is the LAST thing the rule needs, and the only one a caller cannot supply, so
+/// this is where [`RootAclNotice::could_warn_for`] is asked authoritatively — a symlink or special
+/// root, and a kind whose ACLs are already carried across, are turned away without a syscall.
+/// Failure to probe is logged at `debug!` and nothing else: this produces advice, so a missing
+/// `/proc` or an exotic filesystem must not turn into a copy error.
+async fn warn_root_acl(handle: &Handle, src_root: &Path, notice: RootAclNotice) {
+    if !notice.could_warn_for(handle.kind()) {
         return;
     }
-    // Claim LAST. A symlink/special root, or a kind whose ACLs are already preserved, returns above
-    // without spending the one per-process run, so it cannot silence a later operand that had
-    // something to say.
+    // claim LAST. A root that could not have warned returns above without spending the one
+    // per-process run, so it cannot silence a later operand that had something to say.
     if !claim_root_acl_probe() {
         return;
     }
@@ -2304,26 +2367,19 @@ async fn warn_root_acl(
 
 /// Warn once per run when the source ROOT carries a POSIX ACL that this copy will not carry across.
 ///
-/// `handle` is the root's `O_PATH` classify handle and `src_root` its path, for the message. The
-/// two flags say whether each kind's ACL is already safe — normally the `acl` preserve setting for
-/// that kind, but `true` also covers a kind whose ACL cannot be lost by construction (`rlink`
-/// passes it for files, which share the source inode through the hard link). The probe consults
-/// whichever flag matches the root's own kind, so `f:acl` does not silence a directory root.
+/// `handle` is the root's `O_PATH` classify handle and `src_root` its path, for the message;
+/// `notice` is what the run's settings say (see [`RootAclNotice`]). The probe consults whichever of
+/// its per-kind flags matches the root's own kind, so `f:acl` does not silence a directory root.
 ///
 /// "Once" is per PROCESS, which is what makes this affordable: a `--dereference` walk recurses into
 /// `copy` per resolved symlink, and a multi-operand run has several roots. The first root that can
 /// carry an ACL spends the probe; the rest are silent even if they would have warned. That is the
 /// heuristic being cheap on purpose — the alternative is the per-entry cost that made `acl` opt-in.
-pub async fn warn_if_root_acl_unpreserved(
-    handle: &Handle,
-    src_root: &Path,
-    file_acl_preserved: bool,
-    dir_acl_preserved: bool,
-) {
-    if !root_acl_probe_worth_reaching(file_acl_preserved, dir_acl_preserved) {
+pub async fn warn_if_root_acl_unpreserved(handle: &Handle, src_root: &Path, notice: RootAclNotice) {
+    if !root_acl_probe_worth_reaching(notice) {
         return;
     }
-    warn_root_acl(handle, src_root, file_acl_preserved, dir_acl_preserved).await;
+    warn_root_acl(handle, src_root, notice).await;
 }
 
 /// [`warn_if_root_acl_unpreserved`] for a caller that holds the root's PARENT rather than the root
@@ -2331,22 +2387,21 @@ pub async fn warn_if_root_acl_unpreserved(
 /// walk.
 ///
 /// The `openat` is skipped when nothing could be warned about and when the per-process run is
-/// already spent, so a copy that preserves ACLs — and every call after the first — normally costs
-/// nothing at all. Two operands racing can both pass that check and both open their root; the
-/// loser of the claim has then spent one `openat` and nothing more. A root that cannot be opened is
-/// left to the walk to diagnose.
+/// already spent, so a copy that did not ask for the notice or already preserves ACLs — and every
+/// call after the first — costs nothing at all. Two operands racing can both pass that check and
+/// both open their root; the loser of the claim has then spent one `openat` and nothing more. A
+/// root that cannot be opened is left to the walk to diagnose.
 pub async fn warn_if_root_acl_unpreserved_at(
     parent: &Dir,
     name: &OsStr,
     src_root: &Path,
-    file_acl_preserved: bool,
-    dir_acl_preserved: bool,
+    notice: RootAclNotice,
 ) {
-    if !root_acl_probe_worth_reaching(file_acl_preserved, dir_acl_preserved) {
+    if !root_acl_probe_worth_reaching(notice) {
         return;
     }
     match parent.child(name).await {
-        Ok(handle) => warn_root_acl(&handle, src_root, file_acl_preserved, dir_acl_preserved).await,
+        Ok(handle) => warn_root_acl(&handle, src_root, notice).await,
         Err(err) => {
             tracing::debug!("cannot open source root {src_root:?} for a POSIX ACL probe: {err:#}");
         }
@@ -3081,6 +3136,81 @@ mod tests {
     use crate::preserve::Metadata;
     use crate::testutils;
     use std::io::Read;
+
+    const EVERY_KIND: [EntryKind; 4] = [
+        EntryKind::File,
+        EntryKind::Dir,
+        EntryKind::Symlink,
+        EntryKind::Special,
+    ];
+
+    #[test]
+    fn a_run_that_asked_for_nothing_wants_no_root_acl_notice() {
+        // the gate this whole type exists for: a copy at the shipped default already drops uid,
+        // gid, timestamps and the special mode bits silently, so an ACL notice there is advice
+        // about a completeness nobody claimed — and it must cost nothing, kind unknown included.
+        let notice = RootAclNotice::for_preserve(&crate::preserve::preserve_none());
+        assert!(!notice.wanted);
+        for kind in EVERY_KIND {
+            assert!(
+                !notice.could_warn_for_strict(kind, false),
+                "a {kind:?} root warned under settings that asked for no preservation"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_resolution_arms_the_notice_on_its_own() {
+        // `--require-toctou-safe` is a request ABOUT permissions whatever `--preserve-settings`
+        // says, and the two flags deliberately do not imply each other, so it must arm the notice
+        // by itself — with its own wording, which `warn_root_acl` picks the same way.
+        let notice = RootAclNotice::for_preserve(&crate::preserve::preserve_none());
+        assert!(notice.could_warn_for_strict(EntryKind::Dir, true));
+        assert!(notice.could_warn_for_strict(EntryKind::File, true));
+    }
+
+    #[test]
+    fn the_notice_consults_the_setting_for_the_roots_own_kind() {
+        // `f:acl` and `d:acl` are independent. Getting this wrong is silent in both directions:
+        // one way it warns about an ACL the copy is carrying across, the other it stays quiet
+        // about one being dropped.
+        let file_only = RootAclNotice {
+            wanted: true,
+            file_acl_preserved: true,
+            dir_acl_preserved: false,
+        };
+        assert!(!file_only.could_warn_for_strict(EntryKind::File, false));
+        assert!(file_only.could_warn_for_strict(EntryKind::Dir, false));
+        assert!(
+            file_only.could_warn(),
+            "a directory root can still warn, so the kind-unknown pre-check must not skip the probe"
+        );
+    }
+
+    #[test]
+    fn a_root_that_cannot_carry_an_acl_never_warns() {
+        // the kernel has no symlink ACL, and a special file is not copied as an object whose
+        // permissions rcp reproduces — so neither reaches the probe, armed or not
+        let armed = RootAclNotice {
+            wanted: true,
+            file_acl_preserved: false,
+            dir_acl_preserved: false,
+        };
+        for kind in [EntryKind::Symlink, EntryKind::Special] {
+            assert!(!armed.could_warn_for_strict(kind, true));
+        }
+    }
+
+    #[test]
+    fn preserving_both_kinds_acls_leaves_nothing_to_warn_about() {
+        let notice = RootAclNotice::for_preserve(&crate::preserve::preserve_all_with_acls());
+        assert!(notice.wanted, "`all+acl` did ask for preservation");
+        assert!(
+            !notice.could_warn(),
+            "both kinds' ACLs are carried across, so even an armed run has nothing to say — and \
+             must not pay the probe to find that out"
+        );
+    }
 
     #[tokio::test]
     async fn child_classifies_file_dir_symlink_and_rejects_nofollow() -> anyhow::Result<()> {

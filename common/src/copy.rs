@@ -458,13 +458,13 @@ pub async fn copy_with_filter_base(
     };
     // One `listxattr` on the source ROOT per run — a constant, not a per-entry probe — warning that
     // a source root carrying an ACL is about to be copied by settings that drop it. Skipped
-    // entirely once ACLs are preserved for both kinds, and after the first root of the run.
+    // entirely by a copy that asked for no preservation at all, once ACLs are preserved for both
+    // kinds, and after the first root of the run.
     crate::safedir::warn_if_root_acl_unpreserved_at(
         &src_parent,
         src_name,
         src,
-        preserve.file.acl,
-        preserve.dir.acl,
+        crate::safedir::RootAclNotice::for_preserve(preserve),
     )
     .await;
     // Authoritative destination split (runs AFTER the filter, preserving default-mode ordering): a
