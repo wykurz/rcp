@@ -7910,6 +7910,82 @@ fn test_remote_source_root_acl_warning_reaches_the_master() {
     );
 }
 
+/// A remote copy that asked for no preservation must cost the source NOTHING for a notice it does
+/// not want: the arming flag rides in `capture`, so getting this wrong on the wire is invisible
+/// locally — the master would stay silent while the source still paid for the probe.
+#[test]
+fn test_remote_copy_without_preserve_settings_issues_no_root_acl_probe() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = src_dir.path().join("tree");
+    std::fs::create_dir(&src_tree).unwrap();
+    create_test_file(&src_tree.join("f.txt"), "payload", 0o644);
+    set_acl(&src_tree, ACL_ACCESS, &denying_acl());
+    let src_remote = format!("localhost:{}", src_tree.to_str().unwrap());
+    let bare_remote = format!(
+        "localhost:{}",
+        dst_dir.path().join("bare").to_str().unwrap()
+    );
+    let traced = count_rcpd_xattr_syscalls(&[&src_remote, &bare_remote]);
+    assert!(
+        traced.is_empty(),
+        "a remote copy at the shipped default made the rcpd processes issue {} ACL syscall(s); it \
+         asked for no preservation, so `capture` should have disarmed the root probe entirely:\n{}",
+        traced.len(),
+        traced.join("\n")
+    );
+    // the notice itself is likewise absent at the master end
+    let log = run_rcp_at_default_verbosity(&[
+        &src_remote,
+        &format!(
+            "localhost:{}",
+            dst_dir.path().join("quiet").to_str().unwrap()
+        ),
+    ]);
+    assert!(
+        !log.contains("carries a POSIX ACL that this copy will NOT preserve"),
+        "a remote copy that asked for no preservation still warned about a dropped ACL:\n{log}"
+    );
+}
+
+/// `--require-toctou-safe` arms the notice on the source even when `capture` is all-false, because
+/// it reaches the source `rcpd` as its own mirrored flag rather than through the capture struct.
+///
+/// This is the one case where an all-false `capture` does NOT mean the source touches no xattr, and
+/// it is only observable across the wire: locally the two flags are read from the same process, so
+/// a local test cannot tell "mirrored correctly" from "never needed mirroring".
+#[test]
+fn test_remote_strict_mode_arms_the_root_notice_on_an_all_false_capture() {
+    if !common::safedir::openat2_available() {
+        eprintln!("skipping: this kernel lacks openat2(2), --require-toctou-safe refuses");
+        return;
+    }
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    // canonicalize: TMPDIR may contain symlinked components, which strict resolution refuses
+    let src_base = src_dir.path().canonicalize().unwrap();
+    let dst_base = dst_dir.path().canonicalize().unwrap();
+    let src_tree = src_base.join("tree");
+    std::fs::create_dir(&src_tree).unwrap();
+    create_test_file(&src_tree.join("f.txt"), "payload", 0o644);
+    set_acl(&src_tree, ACL_ACCESS, &denying_acl());
+    let src_remote = format!("localhost:{}", src_tree.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_base.join("strict").to_str().unwrap());
+    // no --preserve-settings at all, so the master sends `capture` all-false
+    let log = run_rcp_at_default_verbosity(&["--require-toctou-safe", &src_remote, &dst_remote]);
+    assert!(
+        log.contains("carries a POSIX ACL that this copy will NOT preserve"),
+        "the strict flag did not arm the source's root notice, so a remote user who reached for \
+         --require-toctou-safe — and may well assume it carries source ACLs across — is told \
+         nothing:\n{log}"
+    );
+    assert!(
+        log.contains("does not carry the SOURCE's"),
+        "the notice reached the master with the generic wording, so the source rcpd did not know \
+         it was running strict:\n{log}"
+    );
+}
+
 /// `-L`/`--dereference` reaches a different Pass-1 walk on the source: it holds no directory fd, so
 /// its ACL read opens the directory by path instead of reading the held one. Without this the
 /// dereference walk would quietly send no directory ACLs — and "no ACL" is a request to CLEAR, so

@@ -905,6 +905,97 @@ fn warns_when_the_source_root_carries_an_acl_that_is_not_preserved() {
 }
 
 #[test]
+fn stays_silent_when_the_copy_asks_for_no_preservation() {
+    // a copy left at the shipped default already drops uid, gid, timestamps and the
+    // setuid/setgid/sticky bits without a word — it reproduces the source's `rwx` bits like `cp`
+    // and claims nothing more. Singling ACLs out there would be advice about a completeness the
+    // run never asked for, so the notice is armed by ASKING (`--preserve*`, or the strict flag),
+    // not by an ACL merely existing. `--preserve-settings=none` resolves to the same settings and
+    // must behave the same: it is the explicit spelling of "I did not ask".
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = build_aclless_source(src_dir.path());
+    set_acl(&src_tree, ACL_ACCESS, &denying_acl());
+    for (label, args) in [
+        ("default", vec![]),
+        ("none", vec!["--preserve-settings=none"]),
+        // spelled-out longhand of the default: the gate reads the RESOLVED settings, so this must
+        // not behave differently from writing nothing
+        ("longhand", vec!["--preserve-settings=f:0777 d:0777"]),
+    ] {
+        let dst = dst_dir.path().join(label);
+        let mut argv = args.clone();
+        argv.push(src_tree.to_str().unwrap());
+        argv.push(dst.to_str().unwrap());
+        let log = rcp_log(&argv);
+        assert!(
+            !log.contains(ROOT_WARNING),
+            "`{label}` asked for no preservation, so the ACL notice is noise about a fidelity the \
+             copy never claimed:\n{log}"
+        );
+    }
+    // non-vacuous: the SAME tree under settings that do ask must still warn, or this test would
+    // also pass with the notice deleted outright
+    let log = rcp_log(&[
+        "--preserve-settings=all",
+        src_tree.to_str().unwrap(),
+        dst_dir.path().join("asked").to_str().unwrap(),
+    ]);
+    assert!(
+        log.contains(ROOT_WARNING),
+        "the same root under `all` did not warn either, so the silence above proves nothing:\n{log}"
+    );
+}
+
+#[test]
+fn any_attribute_worth_preserving_arms_the_root_notice() {
+    // the gate is "did this run ask for metadata fidelity at all", not "did it ask for the mode".
+    // A run preserving only uid is making a claim about the destination's metadata just as much as
+    // `all` is, and an ACL it silently drops undermines that claim the same way.
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = build_aclless_source(src_dir.path());
+    set_acl(&src_tree, ACL_ACCESS, &denying_acl());
+    let log = rcp_log(&[
+        "--preserve-settings=d:uid",
+        src_tree.to_str().unwrap(),
+        dst_dir.path().join("uid_only").to_str().unwrap(),
+    ]);
+    assert!(
+        log.contains(ROOT_WARNING),
+        "a run preserving one attribute did not arm the notice, so the gate is keyed to a preset \
+         rather than to asking:\n{log}"
+    );
+}
+
+#[test]
+fn strict_mode_arms_the_root_notice_without_any_preserve_flag() {
+    // the two flags do not imply each other (§10.2). `--require-toctou-safe` is a request ABOUT
+    // permissions whatever the preserve settings say, so it arms the notice on its own — and it is
+    // the case where the user is most likely to assume the flag covered the source's ACLs too.
+    if strict_mode_unusable() {
+        return;
+    }
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_base = src_dir.path().canonicalize().unwrap();
+    let dst_base = dst_dir.path().canonicalize().unwrap();
+    let src_tree = build_aclless_source(&src_base);
+    set_acl(&src_tree, ACL_ACCESS, &denying_acl());
+    let log = rcp_log(&[
+        "--require-toctou-safe",
+        src_tree.to_str().unwrap(),
+        dst_base.join("strict_only").to_str().unwrap(),
+    ]);
+    assert!(
+        log.contains(ROOT_WARNING),
+        "--require-toctou-safe alone did not warn, so a user who reached for it — and may well \
+         assume it carries source ACLs across — is told nothing:\n{log}"
+    );
+    assert!(
+        log.contains("does not carry the SOURCE's"),
+        "the strict wording must survive being armed by the flag alone:\n{log}"
+    );
+}
+
+#[test]
 fn quiet_suppresses_the_root_notice() {
     // `--quiet` installs no tracing subscriber at all, so it silences the notice like everything
     // else. That is the supported way to turn it off, and it must keep working — a notice the user

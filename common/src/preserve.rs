@@ -151,6 +151,24 @@ impl Settings {
         self.dir.acl = acl;
         self
     }
+
+    /// Whether this run asks for any metadata fidelity beyond what the tools ship with.
+    ///
+    /// The shipped default reproduces the source's `rwx` bits like `cp` and nothing else — no uid,
+    /// no gid, no timestamps, no setuid/setgid/sticky. A run that stays there is not making a claim
+    /// about the destination's metadata, so advice about metadata it also does not carry (see
+    /// [`crate::safedir::RootAclNotice`]) is noise. Asking for *anything* more — `--preserve`,
+    /// `all`, a bare `f:uid`, a `7777` mode mask — is that claim, and the advice becomes worth
+    /// printing.
+    ///
+    /// Compared as a whole value rather than field by field, so a future field is covered the
+    /// moment it exists. It reads the RESOLVED settings, so `--preserve-settings=none` — and any
+    /// spelling that lands back on the default, such as `f:0777 d:0777` — counts as "did not ask",
+    /// which is what those settings mean.
+    #[must_use]
+    pub fn requests_preservation(&self) -> bool {
+        *self != Self::default()
+    }
 }
 
 /// Compute the permission bits to apply, honoring the mode mask.
@@ -335,5 +353,79 @@ mod tests {
             preserve_none().with_acl(true)
         );
         assert_eq!(preserve_all_with_acls().with_acl(false), preserve_all());
+    }
+    #[test]
+    fn the_shipped_default_requests_no_preservation() {
+        // `none` IS the shipped default, so both spellings of "I did not ask" agree
+        assert!(!Settings::default().requests_preservation());
+        assert!(!preserve_none().requests_preservation());
+    }
+    #[test]
+    fn any_attribute_beyond_the_default_requests_preservation() {
+        // one field at a time, so a predicate that happened to key off only `uid` (or only the
+        // mode mask) fails here rather than in whatever consumes it
+        for settings in [
+            preserve_all(),
+            preserve_all_with_acls(),
+            preserve_none().with_acl(true),
+            Settings {
+                file: FileSettings {
+                    user_and_time: UserAndTimeSettings {
+                        uid: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Settings {
+                dir: DirSettings {
+                    user_and_time: UserAndTimeSettings {
+                        time: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Settings {
+                symlink: SymlinkSettings {
+                    user_and_time: UserAndTimeSettings {
+                        gid: true,
+                        ..Default::default()
+                    },
+                },
+                ..Default::default()
+            },
+            Settings {
+                file: FileSettings {
+                    mode_mask: 0o7777,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                settings.requests_preservation(),
+                "{settings:?} asks for more than the shipped default but reads as 'did not ask'"
+            );
+        }
+    }
+    #[test]
+    fn settings_that_spell_out_the_default_request_no_preservation() {
+        // the predicate reads the RESOLVED value, so writing the default out longhand is the same
+        // as not writing it at all — otherwise `f:0777 d:0777` would behave unlike a bare run
+        let spelled_out = Settings {
+            file: FileSettings {
+                mode_mask: 0o0777,
+                ..Default::default()
+            },
+            dir: DirSettings {
+                mode_mask: 0o0777,
+                ..Default::default()
+            },
+            symlink: SymlinkSettings::default(),
+        };
+        assert!(!spelled_out.requests_preservation());
     }
 }

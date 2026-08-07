@@ -689,7 +689,14 @@ pub struct TracingHello {
 /// TLS certificate fingerprint (SHA-256 of DER-encoded certificate).
 pub type CertFingerprint = [u8; 32];
 
-/// What EXTENDED per-entry metadata the SOURCE must read, beyond the `stat` it already does.
+/// What EXTENDED metadata the SOURCE must read, beyond the `stat` it already does.
+///
+/// Two of the three fields are per-entry reads whose bytes are sent; the third buys one read on the
+/// ROOT whose only product is a log line. All three answer the same question — what may the source
+/// spend an xattr syscall on — so with every field false the source issues none, EXCEPT under
+/// `--require-toctou-safe`: that flag arms the root notice from the source's own mirrored copy of
+/// it rather than from here, so a strict run still pays the one root `listxattr` on an all-false
+/// capture. Nothing per-entry is reachable that way — only `file_acl`/`dir_acl` open that door.
 ///
 /// Carried in [`MasterHello::Source`] because the source otherwise has no way to know: only
 /// [`MasterHello::Destination`] carries `preserve`, so without this the source would have to probe
@@ -708,6 +715,14 @@ pub struct ExtendedMetadataCapture {
     pub file_acl: bool,
     /// Read each source DIRECTORY's access AND default ACLs.
     pub dir_acl: bool,
+    /// Probe the source ROOT once for a POSIX ACL, so the source can say that this copy will not
+    /// carry it across (see [`common::safedir::RootAclNotice`]).
+    ///
+    /// Independent of the two above: it is armed by the master's `preserve` asking for metadata
+    /// fidelity AT ALL, and disarmed by a copy that asked for none — the reads above are armed by
+    /// `preserve` asking for `acl` specifically, which is the case where there is nothing to warn
+    /// about. A run at the shipped default sets all three to false and the source touches no xattr.
+    pub root_acl_notice: bool,
 }
 
 impl ExtendedMetadataCapture {
@@ -723,6 +738,22 @@ impl ExtendedMetadataCapture {
         Self {
             file_acl: preserve.file.acl,
             dir_acl: preserve.dir.acl,
+            root_acl_notice: preserve.requests_preservation(),
+        }
+    }
+}
+
+impl From<ExtendedMetadataCapture> for common::safedir::RootAclNotice {
+    /// The source's view of the notice, reassembled from what crossed the wire.
+    ///
+    /// `--require-toctou-safe` is absent here on purpose: it reaches the source `rcpd` as its own
+    /// mirrored flag and is read from the process-global strict state, so it arms the notice on the
+    /// host that actually runs the probe rather than travelling twice.
+    fn from(capture: ExtendedMetadataCapture) -> Self {
+        Self {
+            wanted: capture.root_acl_notice,
+            file_acl_preserved: capture.file_acl,
+            dir_acl_preserved: capture.dir_acl,
         }
     }
 }
@@ -945,13 +976,22 @@ mod tests {
             ExtendedMetadataCapture::for_preserve(&common::preserve::preserve_all_with_acls()),
             ExtendedMetadataCapture {
                 file_acl: true,
-                dir_acl: true
+                dir_acl: true,
+                // armed by the run asking for preservation, but the per-kind flags above then turn
+                // the probe away: there is nothing to warn about once both kinds are carried across
+                root_acl_notice: true,
             }
         );
         assert_eq!(
             ExtendedMetadataCapture::for_preserve(&common::preserve::preserve_all()),
-            ExtendedMetadataCapture::default(),
-            "`all` deliberately excludes ACLs, so it must not make the source pay the probe"
+            ExtendedMetadataCapture {
+                file_acl: false,
+                dir_acl: false,
+                root_acl_notice: true,
+            },
+            "`all` deliberately excludes ACLs, so it must not make the source pay the per-entry \
+             read — but it DID ask for metadata fidelity, so the one root probe behind the notice \
+             is exactly the case the notice exists for"
         );
         let mut file_only = common::preserve::preserve_none();
         file_only.file.acl = true;
@@ -959,7 +999,37 @@ mod tests {
             ExtendedMetadataCapture::for_preserve(&file_only),
             ExtendedMetadataCapture {
                 file_acl: true,
-                dir_acl: false
+                dir_acl: false,
+                root_acl_notice: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_copy_asking_for_no_preservation_makes_the_source_read_nothing() {
+        // the whole point of the notice gate: a remote copy left at the shipped default must not
+        // make the source touch a single xattr, root probe included
+        assert_eq!(
+            ExtendedMetadataCapture::for_preserve(&common::preserve::preserve_none()),
+            ExtendedMetadataCapture::default(),
+        );
+    }
+
+    #[test]
+    fn the_notice_the_source_reassembles_matches_the_capture_it_came_from() {
+        // the source has no `preserve` of its own, so the notice it acts on is rebuilt from the
+        // wire; a field crossed over here would silence or misdirect the probe on the far host
+        let capture = ExtendedMetadataCapture {
+            file_acl: true,
+            dir_acl: false,
+            root_acl_notice: true,
+        };
+        assert_eq!(
+            common::safedir::RootAclNotice::from(capture),
+            common::safedir::RootAclNotice {
+                wanted: true,
+                file_acl_preserved: true,
+                dir_acl_preserved: false,
             }
         );
     }

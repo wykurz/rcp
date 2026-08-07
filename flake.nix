@@ -179,10 +179,12 @@
           # one of these, so nothing here is unverified; only this packaging check skips them.
           # (The setuid group above is also ACL-related, but is listed there because it needs
           # setuid/setgid as well and would fail in the sandbox for that reason too.)
+          "--skip=a_bare_rlink_still_reports_a_source_root_acl_it_will_not_preserve"
           "--skip=a_root_that_cannot_warn_does_not_spend_the_probe_budget"
           "--skip=acl_clears_the_destination_trees_inherited_acl"
           "--skip=all_without_acl_drops_the_source_acl"
           "--skip=an_aborted_strict_copy_does_not_destroy_the_reused_directorys_acl"
+          "--skip=any_attribute_worth_preserving_arms_the_root_notice"
           "--skip=clears_an_acl_the_destination_tree_would_have_imposed"
           "--skip=default_leaves_the_destination_trees_inherited_acl"
           "--skip=directory_acls_apply_normally_because_rlink_creates_directories_fresh"
@@ -198,8 +200,10 @@
           "--skip=safedir::tests::read_acls_fd_round_trips_an_access_acl"
           "--skip=safedir::tests::set_dir_metadata_fd_installs_access_and_default_acls"
           "--skip=safedir::tests::set_dir_metadata_fd_keeps_the_dir_owner_only_when_the_default_acl_fails"
+          "--skip=stays_silent_when_the_copy_asks_for_no_preservation"
           "--skip=stays_silent_when_the_source_root_acl_is_preserved"
           "--skip=stays_silent_when_the_source_root_has_no_acl"
+          "--skip=strict_mode_arms_the_root_notice_without_any_preserve_flag"
           "--skip=strict_mode_contains_and_restores_a_reused_directorys_acls"
           "--skip=strict_mode_prevents_inheritance_in_every_directory_it_creates"
           "--skip=strict_mode_prevents_the_destination_trees_inherited_acl"

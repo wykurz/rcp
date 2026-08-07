@@ -7,6 +7,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The source-root ACL notice now fires only when the run **asked** for the fidelity a dropped ACL
+  would undermine: `--preserve`/`--preserve-settings` requesting anything beyond the shipped
+  default, or `--require-toctou-safe`. A bare `rcp src dst` is silent, probe included — it pays not
+  even the one `listxattr`. Left at the default, `rcp` reproduces the source's `rwx` bits like `cp`
+  and drops uid, gid, timestamps and the setuid/setgid/sticky bits without a word, so warning about
+  one more attribute it also does not carry was the single loud omission among several silent ones.
+  The gate reads the resolved settings against the **shipped default**, so
+  `--preserve-settings=none` — and any spelling that lands back on that default, such as
+  `f:0777 d:0777` — counts as "did not ask" in every tool. A bare `rlink` is therefore unchanged,
+  since its CLI default is `all` rather than the shipped default; `rlink --preserve-settings=none`
+  goes quiet like everything else that asked for nothing.
+
+- `WIRE_REVISION` is now 2. Carrying the arming flag to a remote source adds a field to
+  `MasterHello::Source`'s `capture`, which reshapes the hello, and the crate version does not change
+  with it — so without the bump a stale same-version `rcpd` (on `PATH` or in the deploy cache) would
+  pass the compatibility check and then misdecode the hello mid-copy. Builds now advertise
+  `0.39.0+w2`, and a cached `rcpd-0.39.0-w1` is no longer resolved.
+
 ## [0.38.0] - 2026-08-05
 
 ### Added
