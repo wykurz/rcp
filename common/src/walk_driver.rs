@@ -544,17 +544,21 @@ where
                         )));
                     }
                 };
-                if handle.kind() != EntryKind::Dir {
-                    let leaf = AdmittedLeaf::new(handle, admission.into_permit());
-                    return AdmittedDispatch::Leaf(
-                        visitor.visit_leaf(&cx, &parent_ctx, leaf).await,
-                    );
+                match AdmittedLeaf::try_new(handle, admission.into_permit()) {
+                    Ok(leaf) => {
+                        return AdmittedDispatch::Leaf(
+                            visitor.visit_leaf(&cx, &parent_ctx, leaf).await,
+                        );
+                    }
+                    Err((handle, permit)) => {
+                        // ── the single drop-before-recurse site ──────────────────────────────
+                        // release provisional admission inside its scope, then return only the
+                        // directory handle. ending the scope restores any outer pool before
+                        // dir_pre can recurse.
+                        drop(permit);
+                        AdmittedDispatch::Directory(handle)
+                    }
                 }
-                // ── the single drop-before-recurse site ──────────────────────────────────────
-                // release provisional admission inside its scope, then return only the directory
-                // handle. ending the scope restores any outer pool before dir_pre can recurse.
-                drop(admission);
-                AdmittedDispatch::Directory(handle)
             })
             .await;
             match dispatch {
@@ -1210,6 +1214,7 @@ mod tests {
             tokio::task::JoinHandle<Result<CountSummary, OperationError<CountSummary>>>,
             std::os::fd::RawFd,
             Arc<tokio::sync::Notify>,
+            std::path::PathBuf,
         )> {
             let root = crate::testutils::create_temp_dir().await?;
             let leaf_path = root.join("leaf");
@@ -1233,17 +1238,12 @@ mod tests {
                 walk::preacquire_leaf_permit(PermitKind::PendingMeta, Some(EntryKind::File)).await;
             let task = tokio::spawn(process_entry(visitor, cx, (), permit));
             let raw_fd = started_rx.await.context("leaf visitor did not start")?;
-            Ok((admission, task, raw_fd, release))
-        }
-
-        fn fd_is_closed(raw_fd: std::os::fd::RawFd) -> bool {
-            let result = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
-            result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+            Ok((admission, task, raw_fd, release, root))
         }
 
         #[tokio::test(flavor = "current_thread")]
-        async fn successful_leaf_keeps_admission_until_its_handle_closes() -> anyhow::Result<()> {
-            let (_admission, task, raw_fd, release) =
+        async fn successful_leaf_holds_admission_through_visitor() -> anyhow::Result<()> {
+            let (_admission, task, raw_fd, release, root) =
                 start_leaf_lifetime_operation(LeafOutcome::Success).await?;
             let mut next_permit = Box::pin(throttle::pending_meta_permit());
             assert!(
@@ -1254,19 +1254,20 @@ mod tests {
             let summary = task.await?.map_err(|error| error.source)?;
             assert_eq!(summary.files, 1);
             assert!(
-                fd_is_closed(raw_fd),
+                crate::testutils::fd_is_closed(raw_fd),
                 "successful leaf returned with its classification handle open"
             );
             let permit = tokio::time::timeout(Duration::from_secs(1), next_permit)
                 .await
                 .context("successful leaf did not return admission")?;
             drop(permit);
+            tokio::fs::remove_dir_all(root).await?;
             Ok(())
         }
 
         #[tokio::test(flavor = "current_thread")]
-        async fn failed_leaf_keeps_admission_until_its_handle_closes() -> anyhow::Result<()> {
-            let (_admission, task, raw_fd, release) =
+        async fn failed_leaf_holds_admission_through_visitor() -> anyhow::Result<()> {
+            let (_admission, task, raw_fd, release, root) =
                 start_leaf_lifetime_operation(LeafOutcome::Error).await?;
             let mut next_permit = Box::pin(throttle::pending_meta_permit());
             assert!(
@@ -1277,19 +1278,20 @@ mod tests {
             let error = task.await?.expect_err("leaf operation must fail");
             assert!(format!("{:#}", error.source).contains("leaf operation failed"));
             assert!(
-                fd_is_closed(raw_fd),
+                crate::testutils::fd_is_closed(raw_fd),
                 "failed leaf returned with its classification handle open"
             );
             let permit = tokio::time::timeout(Duration::from_secs(1), next_permit)
                 .await
                 .context("failed leaf did not return admission")?;
             drop(permit);
+            tokio::fs::remove_dir_all(root).await?;
             Ok(())
         }
 
         #[tokio::test(flavor = "current_thread")]
-        async fn cancelled_leaf_keeps_admission_until_its_handle_closes() -> anyhow::Result<()> {
-            let (_admission, task, raw_fd, _release) =
+        async fn cancelled_leaf_drops_handle_and_returns_admission() -> anyhow::Result<()> {
+            let (_admission, task, raw_fd, _release, root) =
                 start_leaf_lifetime_operation(LeafOutcome::Success).await?;
             let mut next_permit = Box::pin(throttle::pending_meta_permit());
             assert!(
@@ -1300,13 +1302,14 @@ mod tests {
             let task_error = task.await.expect_err("leaf task must be cancelled");
             assert!(task_error.is_cancelled());
             assert!(
-                fd_is_closed(raw_fd),
+                crate::testutils::fd_is_closed(raw_fd),
                 "cancelled leaf retained its classification handle"
             );
             let permit = tokio::time::timeout(Duration::from_secs(1), next_permit)
                 .await
                 .context("cancelled leaf did not return admission")?;
             drop(permit);
+            tokio::fs::remove_dir_all(root).await?;
             Ok(())
         }
 
@@ -1365,6 +1368,7 @@ mod tests {
                     .await
                     .context("dir_pre blocking work did not return outer admission")?,
             );
+            tokio::fs::remove_dir_all(root).await?;
             Ok(())
         }
 

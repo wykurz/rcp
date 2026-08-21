@@ -3435,12 +3435,14 @@ mod tests {
                 throttle::open_file_permit(),
             )
             .await;
+            drop(permit);
+            let cleanup_result = tokio::fs::remove_dir_all(root).await;
             work_started_result.context("detached metadata work did not start")?;
             release_work_result.context("detached metadata work ended before its release")?;
             drop_started_result.context("the abandoned returned fd did not begin dropping")?;
             release_drop_result.context("the abandoned returned fd ended before its release")?;
             completion_result.context("the abandoned returned fd did not report completion")?;
-            drop(permit);
+            cleanup_result?;
             assert!(
                 waiter_was_cancelled,
                 "the async metadata waiter must observe cancellation"
@@ -3503,12 +3505,14 @@ mod tests {
                 throttle::open_file_permit(),
             )
             .await;
+            drop(permit);
+            let cleanup_result = tokio::fs::remove_dir_all(root).await;
             work_started_result.context("detached unprobed work did not start")?;
             release_work_result.context("detached unprobed work ended before its release")?;
             drop_started_result.context("the abandoned returned fd did not begin dropping")?;
             release_drop_result.context("the abandoned returned fd ended before its release")?;
             completion_result.context("the abandoned returned fd did not report completion")?;
-            drop(permit);
+            cleanup_result?;
             assert!(
                 waiter_was_cancelled,
                 "the async waiter must observe cancellation"

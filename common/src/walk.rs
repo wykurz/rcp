@@ -217,34 +217,80 @@ impl LeafPermit {
     }
 }
 
+/// A checked, authoritatively classified non-directory handle.
+#[derive(Debug)]
+struct NonDirectoryHandle(crate::safedir::Handle);
+
+impl TryFrom<crate::safedir::Handle> for NonDirectoryHandle {
+    type Error = crate::safedir::Handle;
+
+    fn try_from(handle: crate::safedir::Handle) -> Result<Self, Self::Error> {
+        if handle.kind() == EntryKind::Dir {
+            Err(handle)
+        } else {
+            Ok(Self(handle))
+        }
+    }
+}
+
+fn take_permit_after_closing_handle<H, P>(
+    handle: &mut Option<H>,
+    permit: &mut Option<P>,
+) -> Option<P> {
+    drop(handle.take());
+    permit.take()
+}
+
 /// An authoritatively classified non-directory and its leaf admission.
 ///
-/// Field order is the lifetime invariant: Rust drops struct fields in declaration order, so the
-/// classification handle closes before the admission permit returns on every ordinary, error,
-/// panic, and cancellation exit. Directory dispatch never constructs this type.
+/// The private handle-then-permit fields document the lifetime invariant, while the explicit drop
+/// implementation enforces it in one testable place on every ordinary, error, panic, and
+/// cancellation exit. Directory dispatch never constructs this type.
 pub struct AdmittedLeaf {
-    handle: crate::safedir::Handle,
+    handle: Option<NonDirectoryHandle>,
     permit: Option<LeafPermit>,
 }
 
 impl AdmittedLeaf {
-    /// Bundle an authoritative non-directory classification with its admission.
-    #[must_use]
-    pub(crate) fn new(handle: crate::safedir::Handle, permit: Option<LeafPermit>) -> Self {
-        debug_assert_ne!(handle.kind(), EntryKind::Dir);
-        Self { handle, permit }
+    fn new(handle: NonDirectoryHandle, permit: Option<LeafPermit>) -> Self {
+        Self {
+            handle: Some(handle),
+            permit,
+        }
+    }
+
+    /// Check and bundle an authoritative non-directory classification with its admission.
+    ///
+    /// A directory returns its original handle and permit so the caller can release admission and
+    /// dispatch recursion explicitly without a panic or an invalid leaf state.
+    // the directory outcome deliberately returns both owned values without boxing: this branch is
+    // the hot recursive path, and ownership is what lets the caller close the handle before the
+    // permit. accepting the large error variant avoids an allocation per directory.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn try_new(
+        handle: crate::safedir::Handle,
+        permit: Option<LeafPermit>,
+    ) -> Result<Self, (crate::safedir::Handle, Option<LeafPermit>)> {
+        match NonDirectoryHandle::try_from(handle) {
+            Ok(handle) => Ok(Self::new(handle, permit)),
+            Err(handle) => Err((handle, permit)),
+        }
     }
 
     /// Borrow the authoritative classification handle.
     #[must_use]
     pub fn handle(&self) -> &crate::safedir::Handle {
-        &self.handle
+        &self
+            .handle
+            .as_ref()
+            .expect("an admitted leaf always owns its handle")
+            .0
     }
 
     /// Return the authoritative entry kind.
     #[must_use]
     pub fn kind(&self) -> EntryKind {
-        self.handle.kind()
+        self.handle().kind()
     }
 
     /// Borrow this leaf's weak admission reference, when its visitor uses a pool.
@@ -255,10 +301,17 @@ impl AdmittedLeaf {
 
     /// Close the classification handle before transferring the admission permit.
     #[must_use]
-    pub(crate) fn into_permit(self) -> Option<LeafPermit> {
-        let Self { handle, permit } = self;
-        drop(handle);
-        permit
+    pub(crate) fn into_permit(mut self) -> Option<LeafPermit> {
+        take_permit_after_closing_handle(&mut self.handle, &mut self.permit)
+    }
+}
+
+impl Drop for AdmittedLeaf {
+    fn drop(&mut self) {
+        drop(take_permit_after_closing_handle(
+            &mut self.handle,
+            &mut self.permit,
+        ));
     }
 }
 
@@ -791,6 +844,46 @@ mod tests {
         drop(permit);
     }
 
+    #[test]
+    fn leaf_drop_primitive_closes_handle_before_permit() {
+        let events = testutils::DropEvents::default();
+        let mut handle = Some(events.probe("handle"));
+        let mut permit = Some(events.probe("permit"));
+
+        let permit = take_permit_after_closing_handle(&mut handle, &mut permit);
+        assert_eq!(
+            events.snapshot(),
+            ["handle"],
+            "the handle must close before the permit can be returned"
+        );
+        drop(permit);
+        assert_eq!(events.snapshot(), ["handle", "permit"]);
+    }
+
+    #[tokio::test]
+    async fn directory_handle_conversion_returns_the_original_handle() -> anyhow::Result<()> {
+        let root = testutils::create_temp_dir().await?;
+        tokio::fs::create_dir(root.join("directory")).await?;
+        let parent = Dir::open_parent_dir(&root, congestion::Side::Source)
+            .await?
+            .into_tree();
+        let handle = parent.child(OsStr::new("directory")).await?;
+        let raw_fd = handle.as_fd().as_raw_fd();
+
+        let directory = match NonDirectoryHandle::try_from(handle) {
+            Ok(_) => anyhow::bail!("a directory was accepted as a non-directory handle"),
+            Err(directory) => directory,
+        };
+        assert_eq!(directory.kind(), EntryKind::Dir);
+        assert_eq!(directory.as_fd().as_raw_fd(), raw_fd);
+        assert!(!testutils::fd_is_closed(raw_fd));
+        drop(directory);
+        assert!(testutils::fd_is_closed(raw_fd));
+        drop(parent);
+        tokio::fs::remove_dir_all(root).await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn into_permit_closes_handle_before_transfer() -> anyhow::Result<()> {
         let root = testutils::create_temp_dir().await?;
@@ -802,19 +895,18 @@ mod tests {
             .into_tree();
         let handle = parent.child(OsStr::new("leaf")).await?;
         let raw_fd = handle.as_fd().as_raw_fd();
-        let leaf = AdmittedLeaf::new(
+        let leaf = AdmittedLeaf::try_new(
             handle,
             Some(LeafPermit::OpenFile(throttle::open_file_permit().await)),
-        );
+        )
+        .map_err(|_| anyhow::anyhow!("file classification returned a directory outcome"))?;
         assert_eq!(leaf.kind(), EntryKind::File);
         assert_eq!(leaf.handle().as_fd().as_raw_fd(), raw_fd);
         assert!(leaf.admission().is_some());
         let permit = leaf.into_permit();
-        let fcntl_result = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
-        assert_eq!(fcntl_result, -1, "transfer retained the classification fd");
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
+        assert!(
+            testutils::fd_is_closed(raw_fd),
+            "transfer retained the classification fd"
         );
         let mut next_permit = Box::pin(throttle::open_file_permit());
         assert!(
@@ -823,6 +915,8 @@ mod tests {
         );
         drop(permit);
         drop(next_permit.await);
+        drop(parent);
+        tokio::fs::remove_dir_all(root).await?;
         Ok(())
     }
 

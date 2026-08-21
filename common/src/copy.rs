@@ -1675,12 +1675,37 @@ async fn copy_file_fd(
     // open-files admission retained by the canonical non-cancellable blocking boundary. the
     // destination file is returned so it remains live through metadata application, closing the
     // path-based re-open and cancellation-lifetime gaps.
-    let (copied, dst_file) = safedir::run_fd_admitted_blocking(move || {
-        copy_file_range_all(&src_file, &dst_file, len).map(|copied| (copied, dst_file))
+    #[cfg(test)]
+    let data_gate_path = dst_path.to_path_buf();
+    let data_output = safedir::run_fd_admitted_blocking(move || {
+        #[cfg(test)]
+        let gate_visit = {
+            use std::os::fd::AsRawFd as _;
+            crate::testutils::wait_on_blocking_path_gate(
+                &data_gate_path,
+                dst_file.as_fd().as_raw_fd(),
+            )
+        };
+        let copy_result = copy_file_range_all(&src_file, &dst_file, len);
+        #[cfg(test)]
+        {
+            Ok((copy_result, dst_file, gate_visit))
+        }
+        #[cfg(not(test))]
+        {
+            Ok((copy_result, dst_file))
+        }
     })
     .await
     .with_context(|| format!("failed copying data to {:?}", dst_path))
     .map_err(|err| Error::new(err, copy_summary))?;
+    #[cfg(test)]
+    let (copy_result, dst_file, _gate_visit) = data_output;
+    #[cfg(not(test))]
+    let (copy_result, dst_file) = data_output;
+    let copied = copy_result
+        .with_context(|| format!("failed copying data to {:?}", dst_path))
+        .map_err(|err| Error::new(err, copy_summary))?;
     // account for the bytes ACTUALLY copied, not `len` (the size snapshotted at open): if the source
     // is concurrently truncated, `copy_file_range_all` returns the shorter real count, so using `len`
     // would over-report. `len` still drives the copy loop and the iops-token reservation above.
@@ -5591,7 +5616,9 @@ mod copy_tests {
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::ReadLink);
             admission.set_max_ops_in_flight(readlink_resource, 1);
             let held_readlink = throttle::ops_in_flight_permit(readlink_resource).await;
-            let visit = visitor.visit_leaf(&cx, &parent_ctx, AdmittedLeaf::new(handle, permit));
+            let leaf = AdmittedLeaf::try_new(handle, permit)
+                .map_err(|_| anyhow::anyhow!("symlink classification returned a directory"))?;
+            let visit = visitor.visit_leaf(&cx, &parent_ctx, leaf);
             tokio::pin!(visit);
             let stopped_at_readlink_gate = futures::poll!(visit.as_mut()).is_pending();
             let mut second_permit = Box::pin(throttle::open_file_permit());
@@ -5668,7 +5695,9 @@ mod copy_tests {
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
-            let visit = visitor.visit_leaf(&cx, &parent_ctx, AdmittedLeaf::new(handle, permit));
+            let leaf = AdmittedLeaf::try_new(handle, permit)
+                .map_err(|_| anyhow::anyhow!("symlink classification returned a directory"))?;
+            let visit = visitor.visit_leaf(&cx, &parent_ctx, leaf);
             tokio::pin!(visit);
             let stopped_at_canonicalize_gate = futures::poll!(visit.as_mut()).is_pending();
             // Queue a test waiter immediately behind canonicalize. Once canonicalize releases its
@@ -5778,50 +5807,59 @@ mod copy_tests {
             Ok(())
         }
 
-        /// Cancelling an async waiter must not release admission while its non-cancellable blocking
-        /// work is still running with file descriptors.
+        /// Cancelling the real local data-copy boundary must retain admission until its
+        /// non-cancellable fd-owning job and abandoned output have both dropped.
         #[tokio::test]
-        async fn cancelled_blocking_copy_work_retains_open_file_capacity() -> anyhow::Result<()> {
+        async fn cancelled_copy_file_fd_retains_capacity_until_its_fds_close() -> anyhow::Result<()>
+        {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("source");
+            let dst = root.join("destination");
+            if let Err(error) = tokio::fs::write(&src, vec![b'x'; 4096]).await {
+                let _ = tokio::fs::remove_dir_all(&root).await;
+                return Err(error.into());
+            }
+            let gate = testutils::BlockingPathGate::install(dst.clone());
             let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(1);
-            let open_file_guard = throttle::open_file_permit().await;
-            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-            let (release_tx, release_rx) = std::sync::mpsc::channel();
-            let (completion, completion_rx) = testutils::CompletionSignal::new();
+            let timeout = std::time::Duration::from_secs(20);
+            let settings = settings_with_delete(None);
             let task = tokio::spawn(async move {
-                let admission = open_file_guard.admission();
-                safedir::with_fd_admission(admission, async move {
-                    let _open_file_guard = open_file_guard;
-                    safedir::run_fd_admitted_blocking(move || {
-                        let _completion = completion;
-                        let _ = started_tx.send(());
-                        release_rx.recv().map_err(std::io::Error::other)?;
-                        Ok(())
-                    })
-                    .await
-                })
+                copy(
+                    &PROGRESS,
+                    &src,
+                    &dst,
+                    &settings,
+                    &NO_PRESERVE_SETTINGS,
+                    false,
+                )
                 .await
             });
-            let started_result = started_rx.await;
-            task.abort();
-            let waiter_was_cancelled = matches!(task.await, Err(error) if error.is_cancelled());
-            let second_permit = throttle::open_file_permit();
-            tokio::pin!(second_permit);
-            let admission_was_retained =
-                started_result.is_ok() && futures::poll!(second_permit.as_mut()).is_pending();
-            let release_result = release_tx.send(());
-            let (completion_result, permit) =
-                testutils::await_completion_and_capacity(completion_rx, second_permit.as_mut())
-                    .await;
-            started_result.context("blocking copy work did not start")?;
-            release_result.context("blocking copy work ended before its release")?;
-            completion_result.context("blocking copy work did not report completion")?;
-            drop(permit);
-            assert!(waiter_was_cancelled);
+            let observations =
+                testutils::cancel_at_blocking_path(admission, gate, task, timeout, |_| ()).await;
+            let cleanup_result = tokio::fs::remove_dir_all(root).await;
+            let (observations, ()) = observations?;
+            cleanup_result?;
+
+            assert!(observations.waiter_was_cancelled);
             assert!(
-                admission_was_retained,
-                "cancelling the waiter released capacity while blocking work was live"
+                observations.admission_was_retained_while_work_gated,
+                "cancelling copy_file_fd released capacity while its fd-owning job was live"
             );
+            assert!(
+                observations.fd_was_open_while_work_gated,
+                "copy_file_fd closed its fd while the job was gated"
+            );
+            assert_eq!(observations.hit_count_before_release, 1);
+            assert!(
+                observations.fd_was_closed_at_output_drop_start,
+                "copy_file_fd reached its output-drop boundary before its destination fd closed"
+            );
+            assert!(
+                observations.admission_was_retained_at_output_drop_start,
+                "copy_file_fd released capacity before its abandoned output dropped"
+            );
+            assert_eq!(observations.final_hit_count, 1);
             Ok(())
         }
 
