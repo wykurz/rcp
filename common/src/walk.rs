@@ -4,9 +4,9 @@
 //! visitors:
 //! - `EntryKind` — classifies a directory entry by file type and exposes the per-type bits
 //!   (dry-run label, skipped-counter increment) so callers don't re-implement the dispatch.
-//! - entry-admission lifecycle (`PermitKind` / `LeafPermit` / `EntryAdmission` /
-//!   `classify_entry`) — carries enumeration hints into classification while keeping leaf
-//!   admission co-located with the driver's drop-before-recurse invariant.
+//! - entry-admission lifecycle (`PermitKind` / `LeafPermit` / `EntryAdmission` / `AdmittedLeaf` /
+//!   `classify_entry`) — carries enumeration hints into classification while keeping leaf handles
+//!   structurally inside their admission lifetime.
 //! - congestion↔throttle bridges (`throttle_side` / `throttle_op` / `meta_resource`) — map the
 //!   walk's side/op enums onto the throttle and congestion resource enums.
 //! - metadata-probe wrappers (`next_entry_probed` / `run_metadata_probed`) — wrap the path-based
@@ -217,6 +217,51 @@ impl LeafPermit {
     }
 }
 
+/// An authoritatively classified non-directory and its leaf admission.
+///
+/// Field order is the lifetime invariant: Rust drops struct fields in declaration order, so the
+/// classification handle closes before the admission permit returns on every ordinary, error,
+/// panic, and cancellation exit. Directory dispatch never constructs this type.
+pub struct AdmittedLeaf {
+    handle: crate::safedir::Handle,
+    permit: Option<LeafPermit>,
+}
+
+impl AdmittedLeaf {
+    /// Bundle an authoritative non-directory classification with its admission.
+    #[must_use]
+    pub(crate) fn new(handle: crate::safedir::Handle, permit: Option<LeafPermit>) -> Self {
+        debug_assert_ne!(handle.kind(), EntryKind::Dir);
+        Self { handle, permit }
+    }
+
+    /// Borrow the authoritative classification handle.
+    #[must_use]
+    pub fn handle(&self) -> &crate::safedir::Handle {
+        &self.handle
+    }
+
+    /// Return the authoritative entry kind.
+    #[must_use]
+    pub fn kind(&self) -> EntryKind {
+        self.handle.kind()
+    }
+
+    /// Borrow this leaf's weak admission reference, when its visitor uses a pool.
+    #[must_use]
+    pub fn admission(&self) -> Option<throttle::FdAdmission> {
+        self.permit.as_ref().map(LeafPermit::admission)
+    }
+
+    /// Close the classification handle before transferring the admission permit.
+    #[must_use]
+    pub(crate) fn into_permit(self) -> Option<LeafPermit> {
+        let Self { handle, permit } = self;
+        drop(handle);
+        permit
+    }
+}
+
 /// Pre-acquire a leaf permit for a child about to be spawned.
 ///
 /// Returns `None` when `kind == PermitKind::None` or the cheap `getdents` hint positively identifies
@@ -277,28 +322,16 @@ pub async fn ensure_entry_admission(kind: PermitKind, admission: EntryAdmission)
     }
 }
 
-/// Classify an entry according to its explicit admission state.
+/// Classify an entry within the admission scope selected by its caller.
 ///
-/// Roots and possible leaves acquire before the first `O_PATH` handle opens. A positive directory
-/// hint classifies once without leaf admission; if it resolves to a leaf, that handle is closed
-/// before admission is awaited and the name is classified again under the held permit. Returning
-/// the updated state keeps the authoritative handle and its admission together at the caller.
+/// The shared driver and rlink own the hinted-directory state machine because a stale positive
+/// hint must close its first handle, acquire admission, install a new scope, and keep that scope
+/// through final leaf work. This helper is deliberately only the authoritative fd-based open.
 pub async fn classify_entry(
     dir: &crate::safedir::Dir,
     name: &std::ffi::OsStr,
-    kind: PermitKind,
-    admission: EntryAdmission,
-) -> std::io::Result<(crate::safedir::Handle, EntryAdmission)> {
-    let mut admission = ensure_entry_admission(kind, admission).await;
-    let mut handle =
-        crate::safedir::with_optional_fd_admission(admission.admission(), dir.child(name)).await?;
-    if matches!(admission, EntryAdmission::HintedDirectory) && handle.kind() != EntryKind::Dir {
-        drop(handle);
-        admission = ensure_entry_admission(kind, EntryAdmission::RootOrDelegated).await;
-        handle = crate::safedir::with_optional_fd_admission(admission.admission(), dir.child(name))
-            .await?;
-    }
-    Ok((handle, admission))
+) -> std::io::Result<crate::safedir::Handle> {
+    dir.child(name).await
 }
 
 /// Resolve the `throttle::Side` from the matching `congestion::Side`.
@@ -636,6 +669,7 @@ mod tests {
     use crate::safedir::Dir;
     use crate::testutils;
     use std::ffi::OsStr;
+    use std::os::fd::AsRawFd;
 
     fn include_filter(pattern: &str) -> Option<FilterSettings> {
         let mut f = FilterSettings::new();
@@ -755,6 +789,41 @@ mod tests {
         let permit = preacquire_leaf_permit(PermitKind::OpenFile, None).await;
         assert!(matches!(permit, Some(LeafPermit::OpenFile(_))));
         drop(permit);
+    }
+
+    #[tokio::test]
+    async fn into_permit_closes_handle_before_transfer() -> anyhow::Result<()> {
+        let root = testutils::create_temp_dir().await?;
+        tokio::fs::write(root.join("leaf"), b"x").await?;
+        let admission = testutils::AdmissionLimit::new().await;
+        admission.set_max_open_files(1);
+        let parent = Dir::open_parent_dir(&root, congestion::Side::Source)
+            .await?
+            .into_tree();
+        let handle = parent.child(OsStr::new("leaf")).await?;
+        let raw_fd = handle.as_fd().as_raw_fd();
+        let leaf = AdmittedLeaf::new(
+            handle,
+            Some(LeafPermit::OpenFile(throttle::open_file_permit().await)),
+        );
+        assert_eq!(leaf.kind(), EntryKind::File);
+        assert_eq!(leaf.handle().as_fd().as_raw_fd(), raw_fd);
+        assert!(leaf.admission().is_some());
+        let permit = leaf.into_permit();
+        let fcntl_result = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
+        assert_eq!(fcntl_result, -1, "transfer retained the classification fd");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        let mut next_permit = Box::pin(throttle::open_file_permit());
+        assert!(
+            futures::poll!(next_permit.as_mut()).is_pending(),
+            "transfer returned admission instead of preserving it"
+        );
+        drop(permit);
+        drop(next_permit.await);
+        Ok(())
     }
 
     // split_root_operand: a normal operand splits via parent()/file_name() (single component ->
