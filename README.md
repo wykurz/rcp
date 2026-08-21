@@ -311,11 +311,13 @@ Two complementary mechanisms: **static caps** that you set once based on budget 
     maximum
   - `0` disables descriptor admission; when omitted and the current soft `RLIMIT_NOFILE` is nonzero,
     RCP tools except `filegen` derive each pool's count as
-    `min(max(1, floor((soft limit × 80%) / 4)), 4096)`; a zero soft limit leaves admission disabled
-  - the four modeled units are three simultaneous OpenFile leaf descriptors (classification, source,
-    and either overwrite planning or destination) plus one independently sized PendingMeta
-    descriptor; recursive directory, network socket, and process-support descriptors remain outside
-    this heuristic
+    `min(max(1, floor((soft limit × 80%) / 5)), 4096)`; a zero soft limit leaves admission disabled
+  - the five modeled units are the shipped copy/link overlap: four simultaneous OpenFile leaf
+    descriptors during overwrite recheck (source classification, destination planning, source data,
+    and the fresh destination identity check) plus one PendingMeta classification descriptor in
+    recursive rm/delete work. Metadata-only tools can transiently use two descriptors per
+    PendingMeta operation but do not run the four-descriptor OpenFile path concurrently. Recursive
+    directory, network socket, and process-support descriptors remain outside this heuristic
 
 ### Adaptive metadata throttling (`--auto-meta-throttle`)
 
@@ -355,7 +357,11 @@ itself), see [docs/congestion_control.md](docs/congestion_control.md).
 ## Error handling
 
 - `rcp` tools will log non-terminal errors and continue by default
-- to fail immediately on any error use the `--fail-early` flag
+- to stop on the first error use the `--fail-early` flag. In the shared hardened and rlink
+  traversals, recursively spawned async work is cancelled and dropped before the operation returns,
+  and blocking work that has not started is discarded. A blocking job that already won the
+  start/cancel race cannot be interrupted and may contain later filesystem operations, so process
+  shutdown gives blocking workers a bounded grace period instead of waiting forever on dead storage
 
 ## Remote copy configuration
 
@@ -696,7 +702,7 @@ ulimit -n 65536
 ```
 
 `rcp` queries the current session's **soft** limit without changing it. When `--max-open-files` is
-omitted, that value drives the four-unit per-pool heuristic described in
+omitted, that value drives the five-unit per-pool heuristic described in
 [Static caps](#static-caps). Raising the soft limit can therefore increase default leaf parallelism
 until the 4096-operation cap. The setting is not a literal count of every descriptor in the process.
 

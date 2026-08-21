@@ -506,14 +506,17 @@ The operand paths themselves — the one place the fd-based walk still consults 
   itself keeps the tools' existing non-`-L` semantics: classified `O_NOFOLLOW`, a symlink operand is
   operated on as the link object and never followed (`ELOOP` where the open requires a directory,
   e.g. the `--delete` prune reopen).
-- **Resolved once, up front, then threaded.** Each operand's parent is opened exactly once, at the
-  entry of the operation, **before any filter / dry-run / overwrite / `--update` branching** — the
-  same discipline the recursive walk already uses below the named root, now extended up to the
-  operands themselves. That single open IS the validation: a symlinked prefix fails closed there, so
-  no downstream branch (a filtered-out source root, a trailing-slash or `--overwrite` destination, a
-  plain `--update`, a `--dry-run` that never touches the destination) can let a symlinked prefix
-  slip past by skipping a later check. The held fd is reused by every consumer (root-filter
-  classification, the "already exists" check, the walk, the dry-run reporter, the `--update` probe).
+- **Resolved up front, then threaded.** Every operand prefix is validated at the entry of the
+  operation, **before any filter / dry-run / overwrite / `--update` branching** — the same
+  discipline the recursive walk already uses below the named root, now extended up to the operands
+  themselves. A symlinked prefix therefore fails closed before any downstream branch (a filtered-out
+  source root, a trailing-slash or `--overwrite` destination, a plain `--update`, or a `--dry-run`
+  that never touches the destination) can skip validation. The resulting parent fd is normally
+  retained for root-filter classification, existence checks, and the walk. Rlink's optional update
+  root is a documented implementation exception: it performs one up-front strict prefix/existence
+  probe and later opens the update parent again for its fd-relative walk. Both operations
+  independently use `openat2(RESOLVE_NO_SYMLINKS)`, so the second open cannot weaken containment;
+  consolidating them into one retained parent is a follow-up rather than a security dependency.
   Where a dry run holds no persistent destination fd, the existence probes re-resolve with a
   decomposed `openat2` (parent open + `O_NOFOLLOW` child), which is atomic and distinguishes an
   intermediate-prefix symlink (fail closed) from a final component that is merely a symlink or
@@ -561,22 +564,27 @@ so the security-relevant invariants each live in exactly one place:
   any outer pool before nested work. A structural lint (`scripts/check-walk-driver-usage.sh`) fails
   the build if `copy.rs`/`chmod.rs`/`rm.rs` reintroduce a hand-rolled walk (a `JoinSet` or
   `read_entries`).
-- **Admission scheduling (descriptor invariant)**: a reliable `getdents` type hint lets the driver
-  make a cheap filter decision before admission. A `DT_UNKNOWN` entry with an active filter acquires
-  first because its authoritative filter probe opens a handle; an included unknown or known
-  non-directory otherwise acquires immediately before spawn. A positive directory hint is the sole
-  classification exception and takes no leaf admission. If that hint is stale, the first handle is
-  closed, admission is acquired, and classification repeats. An authoritative directory releases any
-  provisional permit inside the inner scope before `dir_pre` or descent. This bounds fd-bearing leaf
-  fan-out without putting arbitrary recursive directory depth/breadth into a pool, which would
-  recreate the deep-directory hold-and-wait deadlock.
-- **Checked leaf ownership**: only a checked non-directory handle can construct `AdmittedLeaf`, so a
-  directory-as-leaf state is unrepresentable in release builds. Its explicit `Drop` closes the
-  classification handle before releasing the permit on every destructing exit, including success,
-  error, early return, panic unwind, and cancellation; `into_permit` closes the handle before
-  transferring admission. The canonical safedir blocking runner attempts to upgrade any live ambient
-  weak admission reference; if none is live, it adds no lease. If its async waiter is abandoned
-  after an upgrade, any descriptor-bearing output drops before that lease.
+- **Admission scheduling (descriptor invariant)**: a reliable `getdents` type hint lets an ordinary
+  source walk make a cheap filter decision before admission. A `DT_UNKNOWN` entry with an active
+  filter acquires first because its authoritative filter probe opens a handle; an included unknown
+  or known non-directory otherwise acquires immediately before spawn. A positive directory hint
+  normally takes no leaf admission. Destructive remove/delete filtering is deliberately stricter:
+  every hint is advisory, so the driver acquires, classifies once, and transfers that exact
+  `AdmittedEntry` into dispatch. Rlink's dual-tree path similarly admits before opening either
+  source or update handle when an update counterpart needs classification, because the source hint
+  says nothing about that separate entry. An authoritative directory releases any provisional permit
+  inside the inner scope before `dir_pre` or descent. This bounds fd-bearing leaf fan-out without
+  putting arbitrary recursive directory depth/breadth into a pool, which would recreate the
+  deep-directory hold-and-wait deadlock.
+- **Checked entry ownership**: `AdmittedEntry` binds an authoritative destructive-filter decision to
+  dispatch without a second name lookup; only a checked non-directory handle can then construct
+  `AdmittedLeaf`, so a directory-as-leaf state is unrepresentable in release builds. Their explicit
+  `Drop` implementations close classification handles before releasing permits on every destructing
+  exit, including success, error, early return, panic unwind, and cancellation. The directory
+  transition is centralized in the driver and releases provisional leaf admission before recursion.
+  The canonical safedir blocking runner attempts to upgrade any live ambient weak admission
+  reference; if none is live, it adds no lease. If its async waiter is abandoned after an upgrade,
+  any descriptor-bearing output drops before that lease.
 - **Root and delegation scope**: local copy/rm/chmod and rlink root setup acquire before their
   fd-bearing parent/classification work. Delegated shared-driver and rlink entries either ensure or
   transfer admission before final classification. This statement does not cover every remote rcpd
@@ -591,24 +599,28 @@ so the security-relevant invariants each live in exactly one place:
   `TrustedDir` type (`common/src/safedir.rs`); crossing below the named root yields a hardened `Dir`
   whose child opens are all `O_NOFOLLOW`. The boundary is type-enforced — a hardened child cannot be
   silently used where a trusted parent is required, and vice versa.
-- **Filter-probe errors**: the shared hardened driver, rlink's dual-tree driver, and delete
-  protection route `is_dir` decisions through `walk::filter_is_dir`. A `DT_UNKNOWN` hint therefore
-  falls back to authoritative `fstat` without following a symlink, and any probe error propagates.
-  In particular, delete aborts instead of treating an uncertain entry as a non-directory and pruning
-  it. The path-based rcmp walk remains a read-only exception: a failed `DirEntry::file_type`
-  currently falls back to non-directory for filtering. Making that path fail closed is a follow-up;
-  it does not authorize filesystem mutation today.
+- **Filter-classification errors**: ordinary hardened source walks and rlink's dual-tree driver
+  route `DT_UNKNOWN` `is_dir` decisions through `walk::filter_is_dir`; destructive remove/delete
+  filtering instead uses the authoritative kind in its transferred `AdmittedEntry`. Neither path
+  follows a symlink, and an error propagates rather than becoming a cheap non-directory result. The
+  path-based rcmp walk remains a read-only exception: a failed `DirEntry::file_type` currently falls
+  back to non-directory for filtering. Making that path fail closed is a follow-up; it does not
+  authorize filesystem mutation today.
 - **Cancellation boundary**: repository-owned blocking jobs routed through the canonical safedir
   runner attempt to upgrade a live ambient weak admission reference and retain it when present. If
-  the async waiter is cancelled after an upgrade, an abandoned descriptor-bearing output drops
-  before that strong lease. With no live ambient admission, the runner adds no lease. Local copy's
-  synchronous data move and filegen's one-buffer synchronous chunks use this boundary. A weak scope
-  alone is passive: admitted remote source/destination payload-leaf streaming still uses
-  `tokio::fs::File`, whose private blocking jobs can retain an `Arc<StdFile>` owning the same fd
-  after high-level cancellation without inheriting admission. The fd is retained, not cloned or
-  duplicated. A separate bounded remote-I/O abstraction is the documented follow-up for that
-  payload-leaf residual; it is not a claim about every Tokio filesystem operation, and the wire
-  protocol is unchanged.
+  the async waiter is cancelled after an upgrade, work that has not started is discarded; for work
+  whose blocking job already won the start/cancel race, an abandoned descriptor-bearing output drops
+  before the strong lease. Fail-early task scopes wait for every recursively spawned **async**
+  descendant to finish dropping, but do not await an already-started blocking job: the job keeps its
+  lease while the operation returns and may still contain later filesystem calls, leaving the
+  runtime's bounded shutdown able to abandon work stuck indefinitely on dead storage. With no live
+  ambient admission, the runner adds no lease. Local copy's synchronous data move and filegen's
+  one-buffer synchronous chunks use this boundary. A weak scope alone is passive: admitted remote
+  source/destination payload-leaf streaming still uses `tokio::fs::File`, whose private blocking
+  jobs can retain an `Arc<StdFile>` owning the same fd after high-level cancellation without
+  inheriting admission. The fd is retained, not cloned or duplicated. A separate bounded remote-I/O
+  abstraction is the documented follow-up for that payload-leaf residual; it is not a claim about
+  every Tokio filesystem operation, and the wire protocol is unchanged.
 
 `rlink` is the documented exception: it walks two correlated trees (source plus `--update`) and so
 keeps its own dual-tree enumeration, but it shares the same substrate — the `TrustedDir` boundary,

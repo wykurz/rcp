@@ -39,9 +39,9 @@ pub async fn prune_extraneous(
     dry_run: Option<crate::config::DryRunMode>,
 ) -> Result<crate::rm::Summary, crate::rm::Error> {
     let summary = crate::rm::Summary::default();
-    // Enumerate the destination through its pinned fd (no path re-resolution). The returned
-    // `d_type` is a best-effort hint passed to `filter_is_dir`, which resolves authoritatively via
-    // fstat on DT_UNKNOWN. `rm_child` re-classifies each entry authoritatively via `child()`.
+    // enumerate the destination through its pinned fd (no path re-resolution). `d_type` remains a
+    // scheduling hint only: exclude protection classifies under admission and transfers that exact
+    // handle into rm, while unfiltered removal lets the shared driver classify at dispatch.
     let entries = dst_dir
         .read_entries()
         .await
@@ -64,7 +64,7 @@ pub async fn prune_extraneous(
 /// Apply prune decisions to an already-enumerated destination directory.
 ///
 /// Production callers arrive through [`prune_extraneous`]. Separating enumeration lets tests
-/// inject `DT_UNKNOWN` deterministically without requiring an NFS/FUSE fixture.
+/// inject stale and `DT_UNKNOWN` hints deterministically without requiring an NFS/FUSE fixture.
 #[allow(clippy::too_many_arguments)]
 async fn prune_entries(
     prog_track: &'static progress::Progress,
@@ -86,30 +86,25 @@ async fn prune_entries(
         // the entry's path relative to the destination (mirror) root: anchors filter matching and
         // reconstructs the display path inside `rm_child`. Computed once and reused below.
         let rel = relative_dir.join(&name);
-        let mut admission = crate::walk::EntryAdmission::from_hint(hint);
         let protect_excluded = !delete_settings.delete_excluded && filter.is_some();
-        // only DT_UNKNOWN delete protection needs an fd-bearing filter probe. reliable hints keep
-        // cheap protection decisions outside pending-metadata admission.
-        if hint.is_none() && protect_excluded {
-            admission = crate::walk::ensure_entry_admission(
+        let mut admitted_entry = None;
+        // an exclude-protection decision authorizes deletion, so `d_type` is never authoritative
+        // here. Classify once under admission and transfer this exact handle into rm; otherwise a
+        // stale File hint for a real directory could bypass a dir-only exclude such as `cache/`.
+        let is_dir = if protect_excluded {
+            let admission = crate::walk::ensure_entry_admission(
                 crate::walk::PermitKind::PendingMeta,
-                admission,
+                crate::walk::EntryAdmission::RootOrDelegated,
             )
             .await;
-        }
-        // the exclude-protection decision must use the AUTHORITATIVE is_dir: on filesystems that
-        // report DT_UNKNOWN (NFS, some FUSE mounts) the hint is None, so defaulting to non-dir
-        // would fail to protect a real directory that matches a dir-only exclude pattern like
-        // `cache/`. `filter_is_dir` does one authoritative fstat only in the DT_UNKNOWN+filter
-        // case, preserving the no-cost path when the hint is reliable or no filter is active.
-        let is_dir = if protect_excluded {
-            crate::safedir::with_optional_fd_admission(
-                admission.admission(),
-                crate::walk::filter_is_dir(filter, dst_dir, &name, hint, false),
-            )
-            .await
-            .with_context(|| format!("failed reading metadata from {rel:?}"))
-            .map_err(|error| crate::rm::Error::new(error, summary))?
+            let entry =
+                crate::walk::classify_admitted_entry(dst_dir, &name, admission.into_permit())
+                    .await
+                    .with_context(|| format!("failed reading metadata from {rel:?}"))
+                    .map_err(|error| crate::rm::Error::new(error, summary))?;
+            let is_dir = entry.kind() == crate::walk::EntryKind::Dir;
+            admitted_entry = Some(entry);
+            is_dir
         } else {
             false
         };
@@ -125,9 +120,6 @@ async fn prune_entries(
             tracing::debug!("protecting excluded destination entry {:?}", rel);
             continue;
         }
-        admission =
-            crate::walk::ensure_entry_admission(crate::walk::PermitKind::PendingMeta, admission)
-                .await;
         // Protect excluded descendants when removing an extraneous directory: rm::rm_child applies
         // the filter recursively (skipping excluded entries), so an extra dir containing e.g.
         // `*.log` files keeps them and survives non-empty — upholding the documented
@@ -145,16 +137,36 @@ async fn prune_entries(
             time_filter: None,
             dry_run,
         };
-        match crate::rm::rm_child_admitted(
-            prog_track,
-            dst_dir,
-            &name,
-            &rel,
-            &rm_settings,
-            admission,
-        )
-        .await
-        {
+        let result = match admitted_entry {
+            Some(entry) => {
+                crate::rm::rm_child_admitted_entry(
+                    prog_track,
+                    dst_dir,
+                    &name,
+                    &rel,
+                    &rm_settings,
+                    entry,
+                )
+                .await
+            }
+            None => {
+                let admission = crate::walk::ensure_entry_admission(
+                    crate::walk::PermitKind::PendingMeta,
+                    crate::walk::EntryAdmission::from_hint(hint),
+                )
+                .await;
+                crate::rm::rm_child_admitted(
+                    prog_track,
+                    dst_dir,
+                    &name,
+                    &rel,
+                    &rm_settings,
+                    admission,
+                )
+                .await
+            }
+        };
+        match result {
             Ok(rm_summary) => {
                 summary = summary + rm_summary;
             }
@@ -197,9 +209,48 @@ mod tests {
     mod max_open_files_tests {
         use super::*;
 
-        /// A reliable file hint lets delete protection reject the entry without leaf admission.
+        /// Delete protection must classify the entry it will remove rather than trust `d_type`.
         #[tokio::test]
-        async fn filtered_hinted_file_does_not_wait_for_admission() -> anyhow::Result<()> {
+        async fn stale_file_hint_cannot_bypass_dir_only_exclude() -> anyhow::Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let dst = tmp.path().join("dst");
+            tokio::fs::create_dir_all(dst.join("cache")).await?;
+            tokio::fs::write(dst.join("cache").join("child"), b"protected").await?;
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let dst_dir = open_dst(&dst).await?;
+            let mut filter = crate::filter::FilterSettings::new();
+            filter.add_exclude("cache/")?;
+            let result = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(20),
+                    prune_entries(
+                        &PROGRESS,
+                        &dst_dir,
+                        std::path::Path::new(""),
+                        &HashSet::new(),
+                        Some(&filter),
+                        &delete_settings(false),
+                        false,
+                        None,
+                        vec![(
+                            std::ffi::OsString::from("cache"),
+                            Some(crate::walk::EntryKind::File),
+                        )],
+                    ),
+                )
+                .await
+                .context("stale-hint delete protection did not terminate")?
+                .map_err(|error| error.source)?;
+            assert_eq!(result.files_removed, 0);
+            assert_eq!(result.directories_removed, 0);
+            assert!(dst.join("cache").join("child").exists());
+            Ok(())
+        }
+
+        /// A destructive filter admits classification even when `d_type` reports a file.
+        #[tokio::test]
+        async fn filtered_hinted_file_waits_before_authoritative_decision() -> anyhow::Result<()> {
             let tmp = tempfile::tempdir()?;
             let dst = tmp.path().join("dst");
             tokio::fs::create_dir(&dst).await?;
@@ -228,7 +279,7 @@ mod tests {
             );
             tokio::pin!(prune);
             let first_poll = futures::poll!(prune.as_mut());
-            let completed_while_saturated = first_poll.is_ready();
+            let waited_for_admission = first_poll.is_pending();
             drop(held);
             let result = match first_poll {
                 std::task::Poll::Ready(result) => result,
@@ -239,8 +290,8 @@ mod tests {
             };
             let summary = result.map_err(|error| error.source)?;
             assert!(
-                completed_while_saturated,
-                "delete protection waited for pending-metadata admission despite a reliable hint"
+                waited_for_admission,
+                "delete protection trusted a file hint without authoritative admission"
             );
             assert_eq!(summary.files_removed, 0);
             assert!(dst.join("protected").exists());
@@ -521,24 +572,7 @@ mod tests {
         Ok(())
     }
 
-    /// Regression test for the DT_UNKNOWN + dir-only exclude protection bug (PR #247 review).
-    ///
-    /// On NFS/FUSE filesystems `read_entries` returns `None` for `d_type` (the `DT_UNKNOWN` case).
-    /// The old hint-only `is_dir` computation (`hint.is_some_and(|k| k == Dir)`) produced `false`
-    /// for `None`, so a real destination directory with a `None` hint appeared to be a non-dir.
-    /// A dir-only exclude pattern like `cache/` therefore did NOT protect it, and prune would
-    /// delete the directory when it should have kept it.
-    ///
-    /// The fix replaces the hint-only computation with
-    /// `filter_is_dir(filter, dst_dir, name, hint, force_authoritative)`, which performs an
-    /// authoritative `fstat` when the hint is `None` AND a filter is active.
-    ///
-    /// Since we cannot force `DT_UNKNOWN` on a local tmpfs, we verify the fix indirectly by driving
-    /// `filter_is_dir` with `hint = None` in isolation (exactly as the authoritative fstat path is
-    /// exercised in `walk.rs`'s unit tests), and by confirming that `prune_extraneous` with a
-    /// dir-only exclude retains the matching destination directory end-to-end. On a local fs the hint
-    /// is always `Some(Dir)`, so `filter_is_dir` uses it directly — but the test would fail with the
-    /// old code if the hint were forced to `None`, which is exactly what happens on NFS/FUSE.
+    /// A `DT_UNKNOWN` entry is authoritatively classified before delete protection.
     #[tokio::test]
     #[traced_test]
     async fn protects_dir_only_excluded_directory_dt_unknown() -> anyhow::Result<()> {
@@ -557,28 +591,8 @@ mod tests {
 
         let keep = HashSet::new(); // both `cache/` and `unrelated.txt` are extraneous
 
-        // verify the authoritative fstat path via `filter_is_dir` with hint=None (DT_UNKNOWN
-        // simulation): a real directory must classify as `is_dir = true`, so the dir-only exclude
-        // protects it. The old hint-only code returned `false` here, causing the directory to be
-        // pruned instead.
         let dst_dir = open_dst(&dst).await?;
-        let authoritative_is_dir = crate::walk::filter_is_dir(
-            Some(&filter),
-            &dst_dir,
-            std::ffi::OsStr::new("cache"),
-            None, // DT_UNKNOWN: no hint available (NFS/FUSE case)
-            false,
-        )
-        .await?;
-        assert!(
-            authoritative_is_dir,
-            "filter_is_dir with hint=None on a real directory must return true via authoritative fstat"
-        );
-
-        // end-to-end: `prune_extraneous` must retain `cache/` (protected by the dir-only exclude)
-        // and remove `unrelated.txt` (not excluded).
-        let dst_dir = open_dst(&dst).await?;
-        let summary = prune_extraneous(
+        let summary = prune_entries(
             &PROGRESS,
             &dst_dir,
             std::path::Path::new(""),
@@ -587,6 +601,13 @@ mod tests {
             &delete_settings(false),
             false,
             None,
+            vec![
+                (std::ffi::OsString::from("cache"), None),
+                (
+                    std::ffi::OsString::from("unrelated.txt"),
+                    Some(crate::walk::EntryKind::File),
+                ),
+            ],
         )
         .await
         .map_err(|e| e.source)?;

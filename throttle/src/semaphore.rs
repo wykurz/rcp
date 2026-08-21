@@ -19,9 +19,13 @@ struct Epoch {
     // Outstanding shrink shortfall. When `set_max` reduces the cap but the
     // excess permits are held by outstanding acquirers, `forget_permits`
     // only takes from the available pool; the remainder is recorded here
-    // and consumed by the next N permit drops (see [`Permit::drop`]) so
-    // the effective in-flight count eventually converges to the new cap.
+    // and consumed by returning permits or by a newly granted raw permit before it can admit work,
+    // so the effective in-flight count eventually converges to the new cap.
     forget_debt: AtomicUsize,
+    // true while a shrink has removed available permits but may not yet have
+    // published the corresponding shortfall debt.
+    shrink_in_progress: AtomicBool,
+    shrink_finished: tokio::sync::Notify,
 }
 
 impl Epoch {
@@ -30,6 +34,8 @@ impl Epoch {
             sem: std::sync::Arc::new(tokio::sync::Semaphore::new(limit)),
             limit: AtomicUsize::new(limit),
             forget_debt: AtomicUsize::new(0),
+            shrink_in_progress: AtomicBool::new(false),
+            shrink_finished: tokio::sync::Notify::new(),
         }
     }
 
@@ -37,10 +43,81 @@ impl Epoch {
     /// pool, then accrue the remainder as `forget_debt` so outstanding
     /// permits are reclaimed on drop.
     fn record_shrink(&self, delta: usize) {
+        self.record_shrink_inner(delta, || {}, || {});
+    }
+
+    fn record_shrink_inner(
+        &self,
+        delta: usize,
+        after_forget: impl FnOnce(),
+        after_clear: impl FnOnce(),
+    ) {
+        let already_shrinking = self.shrink_in_progress.swap(true, Ordering::AcqRel);
+        debug_assert!(
+            !already_shrinking,
+            "overlapping shrink operations bypassed epoch configuration serialization"
+        );
         let forgotten = self.sem.forget_permits(delta);
+        after_forget();
         let shortfall = delta.saturating_sub(forgotten);
         if shortfall > 0 {
             self.forget_debt.fetch_add(shortfall, Ordering::AcqRel);
+        }
+        self.shrink_in_progress.store(false, Ordering::Release);
+        after_clear();
+        self.shrink_finished.notify_waiters();
+    }
+
+    async fn wait_for_shrink_to_finish(&self) {
+        while self.shrink_in_progress.load(Ordering::Acquire) {
+            // construct the future before rechecking the gate so notify_waiters cannot be lost
+            // between observing an active shrink and awaiting its completion.
+            let finished = self.shrink_finished.notified();
+            if self.shrink_in_progress.load(Ordering::Acquire) {
+                finished.await;
+            }
+        }
+    }
+
+    /// Pay one unit of outstanding shrink debt, if present.
+    ///
+    /// This is shared by wrapped permit drops and newly granted raw Tokio permits. The latter is
+    /// necessary because cancelling a waiter after Tokio assigns it a permit returns that permit
+    /// directly to the inner semaphore, bypassing [`Permit::drop`]. A subsequent acquire must
+    /// retire that capacity instead of admitting work above the shrunken cap.
+    fn pay_one_forget_debt(&self) -> bool {
+        let mut debt = self.forget_debt.load(Ordering::Acquire);
+        while debt > 0 {
+            match self.forget_debt.compare_exchange_weak(
+                debt,
+                debt - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => debt = actual,
+            }
+        }
+        false
+    }
+
+    /// Apply growth first to pending shrink debt and return only the capacity still to add.
+    fn cancel_forget_debt(&self, growth: usize) -> usize {
+        let mut debt = self.forget_debt.load(Ordering::Acquire);
+        loop {
+            let cancelled = debt.min(growth);
+            if cancelled == 0 {
+                return growth;
+            }
+            match self.forget_debt.compare_exchange_weak(
+                debt,
+                debt - cancelled,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return growth - cancelled,
+                Err(actual) => debt = actual,
+            }
         }
     }
 }
@@ -57,27 +134,12 @@ impl Drop for Permit {
         let Some(permit) = self.permit.take() else {
             return;
         };
-        // Consume one unit of forget_debt if any is outstanding. We use a
-        // CAS loop so concurrent drops race cleanly — at most `debt` of
-        // them will successfully decrement and forget their permit; the
-        // rest return to the pool normally.
-        let mut debt = self.epoch.forget_debt.load(Ordering::Acquire);
-        while debt > 0 {
-            match self.epoch.forget_debt.compare_exchange_weak(
-                debt,
-                debt - 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    permit.forget();
-                    return;
-                }
-                Err(actual) => debt = actual,
-            }
+        if self.epoch.pay_one_forget_debt() {
+            permit.forget();
+        } else {
+            // no debt: return the permit to this epoch normally.
+            drop(permit);
         }
-        // debt == 0: let `permit` drop normally, returning to the pool.
-        drop(permit);
     }
 }
 
@@ -125,21 +187,23 @@ impl Semaphore {
     /// Adjusts by delta from the current limit: if `value` is larger, new
     /// permits are added; if smaller, available permits are forgotten
     /// first and any shortfall (because permits are held by outstanding
-    /// acquirers) is recorded as `forget_debt`. The next N permit drops
-    /// will consume that debt — being forgotten rather than returned to
-    /// the pool — so the effective in-flight count converges to `value`.
-    ///
-    /// **Threading:** assumes a single writer (the congestion-control
-    /// adapter task). Concurrent callers can race the `limit.swap` and
-    /// compute incorrect deltas against each other. Callers that need
-    /// multi-writer access must wrap `set_max` in an external lock.
+    /// acquirers) is recorded as `forget_debt`. Returning permits consume that debt instead of
+    /// re-entering the pool; a raw permit returned by a cancelled Tokio waiter is likewise retired
+    /// by the next acquire before it can admit work. Growth first cancels pending debt, then adds
+    /// only its remaining delta. Together these rules keep the effective in-flight count converging
+    /// to `value` without overshooting a later growth target.
     pub fn set_max(&self, value: usize) {
+        self.set_max_inner(value, || {});
+    }
+
+    fn set_max_inner(&self, value: usize, after_epoch_lock: impl FnOnce()) {
         if value == 0 {
             let next = std::sync::Arc::new(Epoch::new(0));
             let mut current = self
                 .epoch
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            after_epoch_lock();
             let retired = std::mem::replace(&mut *current, next);
             self.flag.store(false, Ordering::Release);
             retired.sem.close();
@@ -147,15 +211,19 @@ impl Semaphore {
         }
         let epoch = self
             .epoch
-            .read()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        after_epoch_lock();
         let current = epoch.limit.swap(value, Ordering::AcqRel);
         // enable or adjust: apply the permit delta before flipping the
         // flag to true, so a 0 → N transition never lets a concurrent
         // acquire see `flag == true` with zero permits.
         match value.cmp(&current) {
             std::cmp::Ordering::Greater => {
-                epoch.sem.add_permits(value - current);
+                let added = epoch.cancel_forget_debt(value - current);
+                if added > 0 {
+                    epoch.sem.add_permits(added);
+                }
             }
             std::cmp::Ordering::Less => {
                 epoch.record_shrink(current - value);
@@ -209,6 +277,11 @@ impl Semaphore {
             let epoch = self.enabled_epoch()?;
             match epoch.sem.clone().acquire_owned().await {
                 Ok(permit) => {
+                    epoch.wait_for_shrink_to_finish().await;
+                    if epoch.pay_one_forget_debt() {
+                        permit.forget();
+                        continue;
+                    }
                     return Some(Permit {
                         epoch,
                         permit: Some(permit),
@@ -299,6 +372,12 @@ mod tests {
         sem.current_epoch().forget_debt.load(Ordering::Acquire)
     }
 
+    fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        future.poll(&mut context)
+    }
+
     #[tokio::test]
     async fn set_max_delta_grows_and_shrinks_available_permits() {
         let sem = Semaphore::new();
@@ -308,6 +387,22 @@ mod tests {
         assert_eq!(available_permits(&sem), 15);
         sem.set_max(3);
         assert_eq!(available_permits(&sem), 3);
+    }
+
+    #[test]
+    fn set_max_holds_exclusive_epoch_configuration_access() {
+        let sem = Semaphore::new();
+        sem.setup(2);
+        sem.set_max_inner(1, || {
+            assert!(
+                matches!(
+                    sem.epoch.try_read(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "a concurrent set_max caller could enter the same epoch update"
+            );
+        });
+        assert_eq!(sem.current_limit(), 1);
     }
 
     #[tokio::test]
@@ -501,7 +596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_max_grow_during_pending_debt_settles_to_new_cap() {
+    async fn set_max_growth_cancels_pending_shrink_debt() {
         let sem = std::sync::Arc::new(Semaphore::new());
         sem.set_max(5);
         let g1 = sem.acquire().await.unwrap();
@@ -510,18 +605,212 @@ mod tests {
         // shrink to 1 — leaves 2 units of debt pending.
         sem.set_max(1);
         assert_eq!(forget_debt(&sem), 2);
-        // grow back to 5 while debt still pending. The pool gains
-        // (5 - 1) = 4 permits; debt stays the same and will still be
-        // consumed by drops.
+        // grow back to 5 while debt is pending. Two units of growth cancel
+        // the two units of debt; only the remaining two become immediately
+        // available, so the three held permits plus two new permits equal 5.
         sem.set_max(5);
-        assert_eq!(available_permits(&sem), 4);
-        assert_eq!(forget_debt(&sem), 2);
-        // drops: first two consume debt; third returns to pool.
+        assert_eq!(available_permits(&sem), 2);
+        assert_eq!(forget_debt(&sem), 0);
+        let g4 = sem.acquire().await.unwrap();
+        let g5 = sem.acquire().await.unwrap();
+        let mut sixth = Box::pin(sem.acquire());
+        let sixth_was_pending = poll_once(sixth.as_mut()).is_pending();
         drop(g1);
         drop(g2);
         drop(g3);
-        // steady state: pool has 4 (from regrow) + 1 (from g3) = 5 = new cap.
+        drop(g4);
+        drop(g5);
+        drop(sixth);
         assert_eq!(available_permits(&sem), 5);
+        assert!(
+            sixth_was_pending,
+            "growth exposed more operations than the new cap while old permits were held"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_woken_waiter_cannot_bypass_pending_shrink() {
+        let sem = Semaphore::new();
+        sem.set_max(2);
+        let g1 = sem.acquire().await.unwrap();
+        let g2 = sem.acquire().await.unwrap();
+        let mut assigned_waiter = Box::pin(sem.acquire());
+        assert!(poll_once(assigned_waiter.as_mut()).is_pending());
+
+        // tokio assigns g1's returned raw permit to this queued waiter. Shrinking before that
+        // waiter is polled records one unit of debt because neither permit is in the available
+        // pool. Cancelling the waiter then returns its assigned permit directly to Tokio, bypassing
+        // our Permit::drop boundary.
+        drop(g1);
+        sem.set_max(1);
+        assert_eq!(forget_debt(&sem), 1);
+        drop(assigned_waiter);
+
+        let mut fresh = Box::pin(sem.acquire());
+        let (fresh_was_pending, fresh_guard) = match poll_once(fresh.as_mut()) {
+            std::task::Poll::Pending => (true, None),
+            std::task::Poll::Ready(guard) => (false, guard),
+        };
+        drop(g2);
+        let fresh_guard = match fresh_guard {
+            Some(guard) => guard,
+            None => fresh.await.expect("nonzero cap remains enabled"),
+        };
+        drop(fresh_guard);
+        assert_eq!(available_permits(&sem), 1);
+        assert!(
+            fresh_was_pending,
+            "a cancelled Tokio waiter returned a permit that bypassed pending shrink debt"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_during_shrink_waits_for_debt_publication() {
+        let sem = std::sync::Arc::new(Semaphore::new());
+        sem.set_max(2);
+        let returned_during_shrink = sem.acquire().await.unwrap();
+        let held = sem.acquire().await.unwrap();
+        let after_forget = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let publish_debt = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let epoch = sem.current_epoch();
+        let shrink_after_forget = after_forget.clone();
+        let shrink_publish_debt = publish_debt.clone();
+        let shrink = std::thread::spawn(move || {
+            // mirror set_max's limit update before entering the shrink operation.
+            epoch.limit.store(1, Ordering::Release);
+            epoch.record_shrink_inner(
+                1,
+                || {
+                    shrink_after_forget.wait();
+                    shrink_publish_debt.wait();
+                },
+                || {},
+            );
+        });
+        after_forget.wait();
+        drop(returned_during_shrink);
+        let mut fresh = Box::pin(sem.acquire());
+        let (fresh_was_pending, fresh_guard) = match poll_once(fresh.as_mut()) {
+            std::task::Poll::Pending => (true, None),
+            std::task::Poll::Ready(guard) => (false, guard),
+        };
+        publish_debt.wait();
+        shrink.join().expect("shrink thread completes");
+        assert!(
+            fresh_was_pending,
+            "a raw permit returned during shrink admitted replacement work before debt publication"
+        );
+        drop(fresh_guard);
+        assert!(
+            poll_once(fresh.as_mut()).is_pending(),
+            "the replacement acquire did not retire shrink debt before admitting work"
+        );
+        assert_eq!(forget_debt(&sem), 0);
+        assert_eq!(available_permits(&sem), 0);
+        drop(held);
+        let fresh_guard = tokio::time::timeout(std::time::Duration::from_secs(1), fresh)
+            .await
+            .expect("the replacement acquire wakes after the allowed operation exits")
+            .expect("the nonzero cap remains enabled");
+        drop(fresh_guard);
+        assert_eq!(available_permits(&sem), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shrink_completion_wakes_acquire_after_debt_publication() {
+        let sem = std::sync::Arc::new(Semaphore::new());
+        sem.set_max(2);
+        let returned_during_shrink = sem.acquire().await.unwrap();
+        let held = sem.acquire().await.unwrap();
+        let after_forget = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let publish_debt = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let after_clear = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let allow_notify = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let waiter_polls = std::sync::Arc::new(AtomicUsize::new(0));
+        let epoch = sem.current_epoch();
+        let shrink_after_forget = after_forget.clone();
+        let shrink_publish_debt = publish_debt.clone();
+        let shrink_after_clear = after_clear.clone();
+        let shrink_allow_notify = allow_notify.clone();
+        let shrink_waiter_polls = waiter_polls.clone();
+        let shrink_gate = epoch.clone();
+        let shrink = std::thread::spawn(move || {
+            epoch.limit.store(1, Ordering::Release);
+            epoch.record_shrink_inner(
+                1,
+                || {
+                    shrink_after_forget.wait();
+                    shrink_publish_debt.wait();
+                },
+                || {
+                    // if notification is ever moved before the gate-clear store, make the woken
+                    // waiter deterministically repoll while the gate is still raised. The normal
+                    // order observes false here and never spins.
+                    while shrink_gate.shrink_in_progress.load(Ordering::Acquire)
+                        && shrink_waiter_polls.load(Ordering::Acquire) < 2
+                    {
+                        std::thread::yield_now();
+                    }
+                    shrink_after_clear.wait();
+                    shrink_allow_notify.wait();
+                },
+            );
+        });
+
+        after_forget.wait();
+        drop(returned_during_shrink);
+        let (first_poll_tx, first_poll_rx) = tokio::sync::oneshot::channel();
+        let (second_poll_tx, mut second_poll_rx) = tokio::sync::oneshot::channel();
+        let waiter_sem = sem.clone();
+        let waiter_poll_count = waiter_polls.clone();
+        let waiter = tokio::spawn(async move {
+            let mut acquire = Box::pin(waiter_sem.acquire());
+            let mut first_poll_tx = Some(first_poll_tx);
+            let mut second_poll_tx = Some(second_poll_tx);
+            std::future::poll_fn(|cx| {
+                let result = acquire.as_mut().poll(cx);
+                waiter_poll_count.fetch_add(1, Ordering::AcqRel);
+                if let Some(first_poll_tx) = first_poll_tx.take() {
+                    let _ = first_poll_tx.send(());
+                } else if let Some(second_poll_tx) = second_poll_tx.take() {
+                    let _ = second_poll_tx.send(());
+                }
+                result
+            })
+            .await
+        });
+        first_poll_rx
+            .await
+            .expect("the replacement acquire did not park behind the shrink gate");
+
+        publish_debt.wait();
+        after_clear.wait();
+        let progressed_before_announcement = second_poll_rx.try_recv().is_ok();
+        allow_notify.wait();
+        shrink.join().expect("shrink thread completes");
+        if progressed_before_announcement {
+            waiter.abort();
+            match waiter.await {
+                Err(error) if error.is_cancelled() => {}
+                _ => panic!("the replacement acquire did not stop after abort"),
+            }
+            drop(held);
+            panic!("the replacement acquire progressed before shrink completion was announced");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_poll_rx)
+            .await
+            .expect("the shrink completion notification did not wake the replacement acquire")
+            .expect("the replacement acquire ended before reporting its wake-up");
+        assert_eq!(forget_debt(&sem), 0);
+
+        drop(held);
+        let guard = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("the replacement acquire did not finish after the allowed operation exited")
+            .expect("the replacement acquire task panicked")
+            .expect("the nonzero cap remains enabled");
+        drop(guard);
+        assert_eq!(available_permits(&sem), 1);
     }
 
     #[tokio::test]

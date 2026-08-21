@@ -15,9 +15,10 @@ use crate::progress;
 use crate::rm;
 use crate::rm::{Settings as RmSettings, Summary as RmSummary};
 use crate::safedir::{self, Dir, FileMeta, Handle};
-use crate::walk::{AdmittedLeaf, EntryAdmission, EntryKind, LeafPermit, PermitKind};
+use crate::walk::{AdmittedEntry, AdmittedLeaf, EntryAdmission, EntryKind, LeafPermit, PermitKind};
 use crate::walk_driver::{
-    DirAction, DirPreResult, EntryCx, ProcessedChildren, WalkVisitor, process_entry,
+    DirAction, DirPreResult, EntryCx, ProcessedChildren, WalkVisitor, process_admitted_entry,
+    process_entry,
 };
 
 /// Error type for copy operations. See [`crate::error::OperationError`] for
@@ -340,6 +341,7 @@ pub async fn copy_with_filter_base(
         preserve,
         is_fresh,
         filter_base,
+        DeleteScanAnchor::new(dst, std::path::Path::new("")),
         None,
     )
     .await
@@ -361,6 +363,7 @@ async fn copy_with_filter_base_admitted(
     preserve: &preserve::Settings,
     is_fresh: bool,
     filter_base: &std::path::Path,
+    delete_scan_anchor: DeleteScanAnchor,
     open_file_guard: Option<throttle::OpenFileGuard>,
 ) -> Result<Summary, Error> {
     let open_file_guard = match open_file_guard {
@@ -582,9 +585,35 @@ async fn copy_with_filter_base_admitted(
         settings,
         preserve,
         is_fresh,
-        EntryAdmission::Held(LeafPermit::OpenFile(open_file_guard)),
+        delete_scan_anchor,
+        EntryAdmission::Held(LeafPermit::OpenFile(open_file_guard)).into(),
     )
     .await
+}
+
+/// Classification state accepted by rlink's fd-relative copy delegation boundary.
+///
+/// An admitted entry retains the exact handle whose type selected the copy action. The shared
+/// driver consumes that classification owner directly, so a final-component type swap cannot route
+/// an excluded replacement type through a new classification. Regular-file and directory payload
+/// opens remain fd-relative by parent and name, preserving their existing same-type replacement
+/// semantics; symlink payload stays pinned to the admitted handle. Ordinary delegated entries
+/// retain the existing classify-under-admission path.
+pub(crate) enum CopyEntryAdmission {
+    Unclassified(EntryAdmission),
+    Admitted(AdmittedEntry),
+}
+
+impl From<EntryAdmission> for CopyEntryAdmission {
+    fn from(admission: EntryAdmission) -> Self {
+        Self::Unclassified(admission)
+    }
+}
+
+impl From<AdmittedEntry> for CopyEntryAdmission {
+    fn from(entry: AdmittedEntry) -> Self {
+        Self::Admitted(entry)
+    }
 }
 
 /// Copy a single entry `name` (within `src_parent`) into `dst_parent`, using held directory
@@ -595,11 +624,11 @@ async fn copy_with_filter_base_admitted(
 /// TOCTOU safety the link walk has — no path is re-walked from a root.
 ///
 /// `src_path`/`dst_path` are the entry's reconstructed real paths; they serve as the copy walk's
-/// roots so diagnostics, `--dereference` (`canonicalize`), path-based `rm`, and `--delete` pruning
-/// reconstruct the right paths inside the delegated subtree. `filter_base` is the entry's logical
-/// path relative to the original filter root, so any `--delete` pruning inside the subtree matches
-/// include/exclude patterns at the entry's true relative path (e.g. `cache/*.log`). `dst_parent`
-/// is `None` only in dry-run (no destination mutation).
+/// roots for diagnostics and `--dereference` (`canonicalize`). `filter_base` is the entry's logical
+/// path relative to the original filter root. `delete_scan_anchor` separately retains the original
+/// destination operand plus this subtree's physical base, so dry-run pruning never derives its
+/// trust boundary from either display or filter paths. `dst_parent` is `None` only in dry-run (no
+/// destination mutation).
 #[instrument(skip(prog_track, src_parent, dst_parent, settings, preserve, admission))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn copy_child(
@@ -613,7 +642,8 @@ pub(crate) async fn copy_child(
     settings: &Settings,
     preserve: &preserve::Settings,
     is_fresh: bool,
-    admission: EntryAdmission,
+    delete_scan_anchor: DeleteScanAnchor,
+    admission: CopyEntryAdmission,
 ) -> Result<Summary, Error> {
     run_copy_root(
         prog_track,
@@ -626,9 +656,55 @@ pub(crate) async fn copy_child(
         settings,
         preserve,
         is_fresh,
+        delete_scan_anchor,
         admission,
     )
     .await
+}
+
+/// Physical authority for reopening a destination subtree during dry-run deletion preview.
+#[derive(Clone, Debug)]
+pub(crate) struct DeleteScanAnchor {
+    named_root: PathBuf,
+    base: PathBuf,
+}
+
+impl DeleteScanAnchor {
+    /// Retain the named destination root and an independently supplied relative subtree base.
+    #[must_use]
+    pub(crate) fn new(named_root: &std::path::Path, base: &std::path::Path) -> Self {
+        Self {
+            named_root: named_root.to_path_buf(),
+            base: base.to_path_buf(),
+        }
+    }
+
+    fn relative_from_root(&self, relative: &std::path::Path) -> PathBuf {
+        if self.base.as_os_str().is_empty() {
+            relative.to_path_buf()
+        } else if relative.as_os_str().is_empty() {
+            self.base.clone()
+        } else {
+            self.base.join(relative)
+        }
+    }
+
+    fn descend(&self, relative: &std::path::Path) -> Self {
+        Self {
+            named_root: self.named_root.clone(),
+            base: self.relative_from_root(relative),
+        }
+    }
+
+    async fn open(&self, relative: &std::path::Path) -> std::io::Result<Option<Dir>> {
+        let relative = self.relative_from_root(relative);
+        safedir::open_existing_dir_beneath_operand(
+            &self.named_root,
+            &relative,
+            congestion::Side::Destination,
+        )
+        .await
+    }
 }
 
 /// The copy walk's [`WalkVisitor`]: holds the run-constant state shared by every entry and maps
@@ -649,6 +725,9 @@ struct CopyVisitor {
     dst_root: PathBuf,
     /// The logical filter base: an entry's filter path is `filter_base.join(rel_path)`.
     filter_base: PathBuf,
+    /// The original destination operand plus this walk's physical subtree base. Unlike
+    /// `filter_base`, this is never derived from logical filter coordinates.
+    delete_scan_anchor: DeleteScanAnchor,
     settings: Settings,
     preserve: preserve::Settings,
     /// The opened top-level destination parent directory (`None` in dry-run). Seeds the
@@ -769,50 +848,30 @@ impl CopyVisitor {
         let keep_set: std::collections::HashSet<OsString> =
             processed.names().iter().cloned().collect();
         let relative_dir = self.filter_base.join(rel_path);
-        // obtain the destination directory as an open `Dir`. in a real copy we already hold it
-        // (`dst_dir`). in --dry-run the create-or-overwrite step was skipped, so there is no held
-        // handle and the path could still be a symlink-to-directory or a non-directory; open it
-        // O_NOFOLLOW|O_DIRECTORY (dereference=false) so a symlink or non-directory fails closed here
-        // and prune is simply skipped — never following the symlink to preview deletions OUTSIDE the
-        // destination. a missing dir likewise skips.
-        // This reopen runs only in --dry-run (a real copy holds `dst_dir`). It re-resolves the
-        // destination directory BELOW the named root, which the real copy walks fd-relative and
-        // would replace/skip as it goes. Under strict operand resolution the open is
-        // openat2(RESOLVE_NO_SYMLINKS), so a symlink anywhere in `dst_path` — an intermediate
-        // component the real copy would replace, or a final symlink — fails with ELOOP and is
-        // SKIPPED here (there is nothing to prune: the real copy creates a fresh directory). The
-        // operand prefix ABOVE the named root is validated up front (fatal on a symlinked prefix),
-        // so this below-root skip does not weaken the strict contract, and it keeps the dry-run
-        // preview consistent with the real copy (which exits 0 in these cases).
+        // in a real copy we already hold the destination directory. Dry-run instead descends from
+        // the original named operand one `O_NOFOLLOW` component at a time; the local `dst_path` is
+        // only a diagnostic string and cannot redirect the scan through a symlinked operand root.
         let prune_dir: Option<Arc<Dir>> = match dst_dir {
             Some(dir) => Some(Arc::clone(dir)),
-            None => {
-                match Dir::open_root_dir(dst_path, false, congestion::Side::Destination).await {
-                    Ok(dir) => Some(Arc::new(dir)),
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                        ) || err.raw_os_error() == Some(libc::ELOOP)
-                            || err.raw_os_error() == Some(libc::ENOTDIR) =>
-                    {
-                        tracing::debug!(
-                            "skipping --delete pruning of {:?}: not a real directory in dry-run",
-                            dst_path
-                        );
-                        None
-                    }
-                    Err(err) => {
-                        let err = anyhow::Error::new(err).context(format!(
-                            "cannot open destination {dst_path:?} for delete scan"
-                        ));
-                        // a scan-open failure is surfaced as this directory's own error (this runs only
-                        // when children all succeeded, so there is no prior error to combine with —
-                        // matching the old fail-early/collect handling).
-                        return Err(Error::new(err, *copy_summary));
-                    }
+            None => match self.delete_scan_anchor.open(rel_path).await {
+                Ok(Some(dir)) => Some(Arc::new(dir)),
+                Ok(None) => {
+                    tracing::debug!(
+                        "skipping --delete pruning of {:?}: not a real directory in dry-run",
+                        dst_path
+                    );
+                    None
                 }
-            }
+                Err(err) => {
+                    let err = anyhow::Error::new(err).context(format!(
+                        "cannot open destination {dst_path:?} for delete scan"
+                    ));
+                    // a scan-open failure is surfaced as this directory's own error (this runs only
+                    // when children all succeeded, so there is no prior error to combine with —
+                    // matching the old fail-early/collect handling).
+                    return Err(Error::new(err, *copy_summary));
+                }
+            },
         };
         let Some(prune_dir) = prune_dir else {
             return Ok(());
@@ -1005,10 +1064,10 @@ struct FinalizeDir {
 
 /// Build the [`CopyVisitor`] for one copy operation and process the root entry through the generic
 /// driver. Shared by [`copy_with_filter_base`] (which acquires root admission before parent setup)
-/// and [`copy_child`] (rlink's fd-based delegation entry point, which may pass an already-held
-/// open-files permit). The root is processed exactly like a nested child via
-/// [`crate::walk_driver::process_entry`]: it is classified authoritatively, then dispatched to
-/// `visit_leaf` (file/symlink/special) or `dir_pre`/recurse/`dir_post` (directory).
+/// and [`copy_child`] (rlink's fd-based delegation entry point, which may pass an unclassified
+/// admission state or an exact [`AdmittedEntry`]). The root is processed exactly like a nested child
+/// via [`process_entry`] or [`process_admitted_entry`], then dispatched to `visit_leaf`
+/// (file/symlink/special) or `dir_pre`/recurse/`dir_post` (directory).
 #[allow(clippy::too_many_arguments)]
 async fn run_copy_root(
     prog_track: &'static progress::Progress,
@@ -1021,12 +1080,14 @@ async fn run_copy_root(
     settings: &Settings,
     preserve: &preserve::Settings,
     is_fresh: bool,
-    admission: EntryAdmission,
+    delete_scan_anchor: DeleteScanAnchor,
+    admission: CopyEntryAdmission,
 ) -> Result<Summary, Error> {
     let visitor = Arc::new(CopyVisitor {
         prog_track,
         dst_root: dst_root.to_path_buf(),
         filter_base: filter_base.to_path_buf(),
+        delete_scan_anchor,
         settings: settings.clone(),
         preserve: *preserve,
         dst_parent,
@@ -1050,7 +1111,53 @@ async fn run_copy_root(
         prog_track,
     };
     let root_ctx = visitor.root_dir_context();
-    process_entry(visitor, root_cx, root_ctx, admission).await
+    if let Some(filter) = visitor.filter() {
+        let entry = match admission {
+            CopyEntryAdmission::Unclassified(admission) => {
+                let admission = crate::walk::ensure_entry_admission(
+                    visitor.permit_kind(),
+                    admission.require_admission(),
+                )
+                .await;
+                crate::walk::classify_admitted_entry(
+                    &root_cx.parent,
+                    &root_cx.name,
+                    admission.into_permit(),
+                )
+                .await
+                .with_context(|| format!("failed reading metadata from {:?}", &root_cx.real_path))
+                .map_err(|err| Error::new(err, Default::default()))?
+            }
+            CopyEntryAdmission::Admitted(entry) => entry,
+        };
+        let kind = entry.kind();
+        let skip_result = if filter_base.as_os_str().is_empty() {
+            filter.should_include_root_item(std::path::Path::new(name), kind == EntryKind::Dir)
+        } else {
+            filter.should_include(filter_base, kind == EntryKind::Dir)
+        };
+        if !matches!(skip_result, crate::filter::FilterResult::Included) {
+            if let Some(mode) = settings.dry_run {
+                crate::dry_run::report_skip(
+                    &root_cx.real_path,
+                    &skip_result,
+                    mode,
+                    kind.label_long(),
+                );
+            }
+            kind.inc_skipped(prog_track);
+            return Ok(skipped_summary_for(kind));
+        }
+        return process_admitted_entry(visitor, root_cx, root_ctx, entry).await;
+    }
+    match admission {
+        CopyEntryAdmission::Unclassified(admission) => {
+            process_entry(visitor, root_cx, root_ctx, admission).await
+        }
+        CopyEntryAdmission::Admitted(entry) => {
+            process_admitted_entry(visitor, root_cx, root_ctx, entry).await
+        }
+    }
 }
 
 impl WalkVisitor for CopyVisitor {
@@ -1077,6 +1184,17 @@ impl WalkVisitor for CopyVisitor {
 
     fn filter(&self) -> Option<&crate::filter::FilterSettings> {
         self.settings.filter.as_ref()
+    }
+
+    fn filter_requires_admitted_entry(&self) -> bool {
+        true
+    }
+
+    fn filter_allows_hint_only_skip(&self, _dir_ctx: &Self::DirContext) -> bool {
+        // --delete derives its keep-set from dispatched children, and dry-run exposes the exact
+        // action/counters to the user. In either mode, a hint-only skip could omit an actually
+        // included source replacement from an observable result.
+        self.settings.delete.is_none() && self.settings.dry_run.is_none()
     }
 
     fn on_skip(
@@ -1140,6 +1258,7 @@ impl WalkVisitor for CopyVisitor {
                 &self.preserve,
                 is_fresh,
                 std::path::Path::new(""),
+                self.delete_scan_anchor.descend(&cx.rel_path),
                 Some(open_file_guard),
             )
             .await;
@@ -1506,9 +1625,9 @@ async fn copy_file_fd(
     // bring `FileMeta::size()` into scope locally; importing the trait at module level would
     // collide with `std::os::unix::fs::MetadataExt` on `std::fs::Metadata` elsewhere in this file.
     use crate::preserve::Metadata as _;
-    let src_meta = src_handle.meta();
-    // --ignore-existing in DRY-RUN: skip if the destination already exists (any type, including a
-    // dangling symlink). A real copy does NOT probe here — [`resolve_dst_file`] below is the single
+    debug_assert_eq!(src_handle.kind(), EntryKind::File);
+    // --ignore-existing in dry-run: skip if the destination already exists (any type, including a
+    // dangling symlink). a real copy does NOT probe here — [`preflight_dst_file`] below is the single
     // owner of every conflict decision, `--ignore-existing` included, and it reaches that decision
     // on both of its routes, so an fd-based probe here would be a redundant `child()` whose only
     // distinct effect was to mistake a lookup *failure* (EACCES, EMFILE, ESTALE) for a vacant slot.
@@ -1533,29 +1652,69 @@ async fn copy_file_fd(
             ..Default::default()
         });
     }
-    // dry-run: report and return what would happen without touching the destination.
-    if settings.dry_run.is_some() {
-        crate::dry_run::report_action("copy", src_path, Some(dst_path), "file");
-        return Ok(Summary {
-            files_copied: 1,
-            bytes_copied: src_meta.size(),
-            ..Default::default()
-        });
+    if settings.dry_run.is_none() {
+        // dst_parent is guaranteed Some here: it is None only in dry-run.
+        let dst_parent = dst_parent.expect("destination parent must be open for a real copy");
+        let preflight = if is_fresh {
+            DestinationPreflight::Vacant
+        } else {
+            preflight_dst_file(prog_track, dst_parent, dst_name, dst_path, settings).await?
+        };
+        let preflight = match preflight {
+            DestinationPreflight::Skip(summary) => return Ok(summary),
+            preflight => preflight,
+        };
+        // `src_handle` is the pinned type authorization selected by the caller. Reopen the current
+        // final component only after destination-only outcomes are settled: same-type replacement
+        // remains by-name, while `open_file_read` rejects a directory, symlink, or special-file
+        // replacement. its metadata and bytes come from this one fd and remain paired throughout.
+        let current = CurrentRegular::open(src_parent, name, src_path).await?;
+        return copy_current_regular(
+            prog_track, src_parent, dst_parent, dst_name, dst_path, src_path, current, preflight,
+            settings, preserve,
+        )
+        .await;
     }
-    // dst_parent is guaranteed Some here: it is None only in dry-run, which returned above.
-    let dst_parent = dst_parent.expect("destination parent must be open for a real copy");
+    let CurrentRegular { meta: src_meta, .. } =
+        CurrentRegular::open(src_parent, name, src_path).await?;
+    // dry-run: report and return what would happen without touching the destination.
+    crate::dry_run::report_action("copy", src_path, Some(dst_path), "file");
+    Ok(Summary {
+        files_copied: 1,
+        bytes_copied: src_meta.size(),
+        ..Default::default()
+    })
+}
+
+/// Copies one already-open current regular source after destination-only preflight has completed.
+#[allow(clippy::too_many_arguments)]
+async fn copy_current_regular(
+    prog_track: &'static progress::Progress,
+    src_parent: &Arc<Dir>,
+    dst_parent: &Arc<Dir>,
+    dst_name: &OsStr,
+    dst_path: &std::path::Path,
+    src_path: &std::path::Path,
+    current: CurrentRegular,
+    preflight: DestinationPreflight,
+    settings: &Settings,
+    preserve: &preserve::Settings,
+) -> Result<Summary, Error> {
+    use crate::preserve::Metadata as _;
+    let CurrentRegular {
+        file: src_file,
+        meta: src_meta,
+    } = current;
     // `copy_summary` accumulates what has already happened to the destination, so every error
     // payload below reports the removals an overwrite performed.
     let mut copy_summary = Summary::default();
-    // PLAN, then acquire, then MUTATE. Deciding what to do about the destination is separated from
-    // doing it (see [`plan_dst_file`]) so the SOURCE OPEN — the step most likely to fail for an
-    // outside reason before a single byte of replacement data exists — happens while the destination
-    // is still intact. An overwrite that unlinked before it would leave the user with neither file
-    // whenever the source turned out to be unreadable or had been swapped away: a copy that could
-    // never have produced bytes must not destroy what it was going to replace. The ordering is free,
-    // which is the whole reason to have it.
+    // preflight, open, plan, reserve, then mutate. the current source was opened while the destination
+    // was still intact; metadata-dependent planning remains separate from mutation (see
+    // [`plan_dst_file`]). an overwrite that unlinked first would leave the user with neither file
+    // whenever the source turned out to be unreadable or had changed kind: a copy that could never
+    // have produced bytes must not destroy what it was going to replace.
     //
-    // This is NOT cancellation safety and does not try to be. `create_file` waits on the ops-throttle
+    // this is not cancellation safety and does not try to be. `create_file` waits on the ops-throttle
     // internally, so the removal below and the create after it are not one committed step:
     // cancellation (Ctrl-C, a `--fail-early` sibling abort) can land between them and leave the
     // destination absent, and `create_file` can itself fail with EMFILE/ENOSPC/EIO. rcp's copy
@@ -1564,31 +1723,11 @@ async fn copy_file_fd(
     // next step would leave a truncated destination anyway. Closing that gap means staging plus
     // rename, which costs performance rcp deliberately does not spend.
     //
-    // A known-fresh destination skips the probe entirely and plans lazily, only if `create_file`
-    // below actually reports a conflict.
-    let plan = if is_fresh {
-        FilePlan::Vacant
-    } else {
-        match plan_dst_file(
-            prog_track, dst_parent, dst_name, dst_path, src_meta, settings,
-        )
-        .await?
-        {
-            FilePlan::Skip(summary) => return Ok(skip_summary(summary, &copy_summary)),
-            plan => plan,
-        }
+    let plan = match plan_dst_file(prog_track, preflight, &src_meta, settings) {
+        FilePlan::Skip(summary) => return Ok(skip_summary(summary, &copy_summary)),
+        plan => plan,
     };
     get_file_iops_tokens(settings.chunk_size, src_meta.size()).await;
-    // open the source for reading (fstat confirms it is still a regular file) and create the
-    // destination fresh. the destination is created owner-only (`DST_FILE_CREATE_MODE`) and only
-    // widened to the source mode by `set_file_metadata_fd` below, after the last byte — the file
-    // counterpart of the split-chmod directories already get. our write fd is writable regardless
-    // of those bits (it was opened O_WRONLY at creation).
-    let (src_file, open_meta) = src_parent
-        .open_file_read(name)
-        .await
-        .with_context(|| format!("failed opening src file {:?} for reading", src_path))
-        .map_err(|err| Error::new(err, copy_summary))?;
     // read the source ACL from the SAME fd whose bytes are about to be copied (read-side fidelity,
     // docs/tocttou.md), and before the destination is touched — an unreadable source must not cost
     // the user the file being overwritten. Only when `acl` was requested: the probe is a syscall per
@@ -1632,13 +1771,12 @@ async fn copy_file_fd(
         // back-to-back here, unlike the route above: the source and the tokens are already held, so
         // there is nothing left that could abandon the copy after the removal.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let plan = match plan_dst_file(
-                prog_track, dst_parent, dst_name, dst_path, src_meta, settings,
-            )
-            .await
-            // rebuild from `err.source`, never from a stringified error: the chain must survive.
-            .map_err(|err| Error::new(err.source, err.summary + copy_summary))?
-            {
+            let preflight =
+                preflight_dst_file(prog_track, dst_parent, dst_name, dst_path, settings)
+                    .await
+                    // rebuild from `err.source`, never from a stringified error: the chain must survive.
+                    .map_err(|err| Error::new(err.source, err.summary + copy_summary))?;
+            let plan = match plan_dst_file(prog_track, preflight, &src_meta, settings) {
                 FilePlan::Skip(summary) => return Ok(skip_summary(summary, &copy_summary)),
                 plan => plan,
             };
@@ -1669,7 +1807,7 @@ async fn copy_file_fd(
         }
     };
     tracing::debug!("copying data");
-    let len = open_meta.size();
+    let len = src_meta.size();
     // the data copy is the data path, not a metadata syscall — it is deliberately NOT wrapped in a
     // congestion probe (matching the old `tokio::fs::copy`), so the large/variable copy latency
     // never pollutes the per-metadata-op controller baseline. backpressure comes from the
@@ -1715,7 +1853,7 @@ async fn copy_file_fd(
     tracing::debug!("setting permissions");
     safedir::set_file_metadata_fd(
         preserve,
-        &open_meta,
+        &src_meta,
         src_acls.as_ref(),
         dst_file.as_fd(),
         congestion::Side::Destination,
@@ -1915,7 +2053,40 @@ async fn copy_symlink_fd(
     }
 }
 
-/// What to do about whatever occupies a destination file's slot — decided WITHOUT touching it.
+/// The current by-name regular source whose metadata and bytes come from one open descriptor.
+struct CurrentRegular {
+    file: std::fs::File,
+    meta: FileMeta,
+}
+
+impl CurrentRegular {
+    /// Opens the current final component and rejects a replacement of any non-regular type.
+    async fn open(
+        src_parent: &Dir,
+        name: &OsStr,
+        src_path: &std::path::Path,
+    ) -> Result<Self, Error> {
+        let (file, meta) = src_parent
+            .open_file_read(name)
+            .await
+            .with_context(|| format!("failed opening src file {:?} for reading", src_path))
+            .map_err(|err| Error::new(err, Default::default()))?;
+        Ok(Self { file, meta })
+    }
+}
+
+/// Source-independent decision made before reopening the current regular source.
+#[derive(Debug)]
+enum DestinationPreflight {
+    /// Nothing occupies the destination slot.
+    Vacant,
+    /// Leave the destination alone without acquiring the current source.
+    Skip(Summary),
+    /// An existing entry may be compared with the current source and then replaced.
+    OverwriteCandidate(Handle),
+}
+
+/// What to do about whatever occupies a destination file's slot — decided without touching it.
 #[derive(Debug)]
 enum FilePlan {
     /// Nothing is in the way. Create straight away.
@@ -1952,11 +2123,11 @@ fn skip_summary(skip: Summary, copy_summary: &Summary) -> Summary {
 /// Carry out the one mutating step a [`FilePlan`] can call for, folding its accounting into the
 /// running copy summary so every later error payload reports the removal that already happened.
 ///
-/// Split from [`plan_dst_file`] deliberately, and the split is the point: it lets the caller put the
-/// throttle wait and the source open BETWEEN deciding to replace the destination and actually
-/// unlinking it. When the two were one step, a copy that then failed to open its source had already
-/// deleted a destination it could no longer replace. The split buys nothing against *cancellation* —
-/// see [`copy_file_fd`] for why rcp does not chase that.
+/// Split from [`preflight_dst_file`] and [`plan_dst_file`] deliberately: the caller settles
+/// destination-only outcomes, opens the current source, and reserves throttle capacity before
+/// actually unlinking. When those were one step, a copy that then failed to open its source had
+/// already deleted a destination it could no longer replace. The split buys nothing against
+/// *cancellation* — see [`copy_file_fd`] for why rcp does not chase that.
 async fn execute_dst_plan(
     prog_track: &'static progress::Progress,
     dst_parent: &Arc<Dir>,
@@ -1992,26 +2163,22 @@ async fn execute_dst_plan(
     }
 }
 
-/// Decide what to do about an entry already occupying `dst_name`: skip it (`--ignore-existing`, or
-/// an identical / newer file under `--overwrite`), replace it (`--overwrite`), or fail (no
-/// `--overwrite`). Mirrors [`copy_symlink_fd`]'s `AlreadyExists` branch, and is the file-slot
-/// counterpart of [`resolve_dst_dir`].
+/// Resolve every destination-only outcome before reopening the current source.
 ///
-/// **Non-mutating.** It classifies and decides; [`execute_dst_plan`] is what removes. Keep it that
-/// way — the separation is what lets the caller finish acquiring everything the copy needs before
-/// the destination stops existing.
+/// An occupied slot either skips under `--ignore-existing`, fails without `--overwrite`, or becomes
+/// an [`DestinationPreflight::OverwriteCandidate`] whose metadata-dependent comparison is deferred
+/// to [`plan_dst_file`]. A vacant slot needs no source metadata either. This function never mutates.
 ///
 /// [`copy_file_fd`] calls this from both of its routes: up front when the destination is not
 /// known-fresh, and again when the destination was believed fresh but `create_file` reported the
-/// slot occupied anyway. A slot that turns out to be vacant plans to [`FilePlan::Vacant`].
-async fn plan_dst_file(
+/// slot occupied anyway.
+async fn preflight_dst_file(
     prog_track: &'static progress::Progress,
     dst_parent: &Arc<Dir>,
     dst_name: &OsStr,
     dst_path: &std::path::Path,
-    src_meta: &FileMeta,
     settings: &Settings,
-) -> Result<FilePlan, Error> {
+) -> Result<DestinationPreflight, Error> {
     let dst_handle = match dst_parent.child(dst_name).await {
         Ok(dst_handle) => dst_handle,
         // `NotFound` is the ONE error that means "nothing occupies the slot". Every other failure
@@ -2022,7 +2189,7 @@ async fn plan_dst_file(
         // function only because the slot is KNOWN occupied, would report a second bare `EEXIST`
         // naming neither the real errno nor the fact that the lookup itself failed.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(FilePlan::Vacant);
+            return Ok(DestinationPreflight::Vacant);
         }
         Err(error) => {
             return Err(Error::new(
@@ -2035,7 +2202,7 @@ async fn plan_dst_file(
     if settings.ignore_existing {
         tracing::debug!("destination exists, skipping (--ignore-existing)");
         prog_track.files_unchanged.inc();
-        return Ok(FilePlan::Skip(Summary {
+        return Ok(DestinationPreflight::Skip(Summary {
             files_unchanged: 1,
             ..Default::default()
         }));
@@ -2049,29 +2216,44 @@ async fn plan_dst_file(
             Default::default(),
         ));
     }
+    Ok(DestinationPreflight::OverwriteCandidate(dst_handle))
+}
+
+/// Finish destination planning using metadata from the already-open current regular source.
+fn plan_dst_file(
+    prog_track: &'static progress::Progress,
+    preflight: DestinationPreflight,
+    src_meta: &FileMeta,
+    settings: &Settings,
+) -> FilePlan {
+    let dst_handle = match preflight {
+        DestinationPreflight::Vacant => return FilePlan::Vacant,
+        DestinationPreflight::Skip(summary) => return FilePlan::Skip(summary),
+        DestinationPreflight::OverwriteCandidate(dst_handle) => dst_handle,
+    };
     tracing::debug!("file exists, check if it's identical");
     if dst_handle.kind() == EntryKind::File {
         if filecmp::metadata_equal(&settings.overwrite_compare, src_meta, dst_handle.meta()) {
             tracing::debug!("file is identical, skipping");
             prog_track.files_unchanged.inc();
-            return Ok(FilePlan::Skip(Summary {
+            return FilePlan::Skip(Summary {
                 files_unchanged: 1,
                 ..Default::default()
-            }));
+            });
         }
         if let Some(OverwriteFilter::Newer) = settings.overwrite_filter
             && filecmp::dest_is_newer(src_meta, dst_handle.meta())
         {
             tracing::debug!("dest is newer than source, skipping");
             prog_track.files_unchanged.inc();
-            return Ok(FilePlan::Skip(Summary {
+            return FilePlan::Skip(Summary {
                 files_unchanged: 1,
                 ..Default::default()
-            }));
+            });
         }
     }
     tracing::info!("destination differs, will replace existing entry");
-    Ok(FilePlan::Replace(dst_handle))
+    FilePlan::Replace(dst_handle)
 }
 
 /// An opened destination directory plus the bookkeeping the caller needs.
@@ -2416,6 +2598,29 @@ mod copy_tests {
         Some(DeleteSettings {
             delete_excluded: false,
         })
+    }
+
+    /// Runs admission-sensitive work and proves its sole open-file permit is returned afterwards.
+    async fn run_with_open_file_cleanup<F>(
+        admission: &testutils::AdmissionLimit,
+        operation: F,
+    ) -> Result<F::Output, anyhow::Error>
+    where
+        F: std::future::Future,
+    {
+        let output = admission
+            .run_with_timeout(std::time::Duration::from_secs(20), operation)
+            .await
+            .context("copy operation did not finish at an open-file limit of one")?;
+        let returned = admission
+            .run_with_timeout(
+                std::time::Duration::from_secs(20),
+                throttle::open_file_permit(),
+            )
+            .await
+            .context("copy operation did not return open-file capacity")?;
+        drop(returned);
+        Ok(output)
     }
 
     // Regression: a source operand whose final component is `.`/`..` (e.g. `rcp tree/sub/.. dst`,
@@ -4689,6 +4894,331 @@ mod copy_tests {
             );
             Ok(())
         }
+
+        /// A root file admitted after the cheap filter cannot materialize an excluded replacement
+        /// directory; the exact authoritative entry must make the final filter decision.
+        #[tokio::test]
+        #[traced_test]
+        async fn root_file_swap_to_excluded_directory_is_rechecked_authoritatively()
+        -> Result<(), anyhow::Error> {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("source");
+            let dst = root.join("destination");
+            tokio::fs::write(&src, "INITIAL-FILE").await?;
+
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("source/")?;
+            assert!(matches!(
+                filter.should_include_root_item(std::path::Path::new("source"), false),
+                crate::filter::FilterResult::Included
+            ));
+            assert!(!matches!(
+                filter.should_include_root_item(std::path::Path::new("source"), true),
+                crate::filter::FilterResult::Included
+            ));
+
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let src_parent = Arc::new(
+                Dir::open_parent_dir(&root, congestion::Side::Source)
+                    .await?
+                    .into_tree(),
+            );
+            let dst_parent = Arc::new(
+                Dir::open_parent_dir(&root, congestion::Side::Destination)
+                    .await?
+                    .into_tree(),
+            );
+
+            // the cheap root check above saw a file. replace it before the admitted final check.
+            tokio::fs::remove_file(&src).await?;
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::write(src.join("replacement.txt"), "EXCLUDED").await?;
+            let permit = crate::walk::ensure_leaf_permit(PermitKind::OpenFile, None).await;
+            let entry = crate::walk::classify_admitted_entry(
+                &src_parent,
+                std::ffi::OsStr::new("source"),
+                permit,
+            )
+            .await?;
+            assert_eq!(entry.kind(), EntryKind::Dir);
+
+            let mut settings = settings_with_delete(None);
+            settings.filter = Some(filter);
+            let summary = run_with_open_file_cleanup(
+                &admission,
+                run_copy_root(
+                    &PROGRESS,
+                    &src_parent,
+                    Some(dst_parent),
+                    std::ffi::OsStr::new("source"),
+                    &src,
+                    &dst,
+                    std::path::Path::new(""),
+                    &settings,
+                    &NO_PRESERVE_SETTINGS,
+                    false,
+                    DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                    CopyEntryAdmission::Admitted(entry),
+                ),
+            )
+            .await??;
+
+            assert_eq!(summary.directories_skipped, 1);
+            assert_eq!(summary.directories_created, 0);
+            assert!(
+                !dst.exists(),
+                "an excluded replacement directory must not be materialized"
+            );
+            Ok(())
+        }
+
+        /// A nested reliable file hint may pass the cheap filter, but a replacement directory must
+        /// be rechecked under admission and excluded before the exact entry reaches dispatch.
+        #[tokio::test(flavor = "current_thread")]
+        #[traced_test]
+        async fn nested_file_swap_to_excluded_directory_is_rechecked_authoritatively()
+        -> Result<(), anyhow::Error> {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("source");
+            let dst = root.join("destination");
+            let node = src.join("node");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::write(&node, "INITIAL-FILE").await?;
+
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("node/")?;
+            assert!(matches!(
+                filter.should_include(std::path::Path::new("node"), false),
+                crate::filter::FilterResult::Included
+            ));
+            assert!(!matches!(
+                filter.should_include(std::path::Path::new("node"), true),
+                crate::filter::FilterResult::Included
+            ));
+            let mut settings = settings_with_delete(None);
+            settings.filter = Some(filter);
+
+            // inject the reliable file hint captured before this replacement, so the boundary is
+            // deterministic without depending on a scheduler race or filesystem-specific d_type.
+            tokio::fs::remove_file(&node).await?;
+            tokio::fs::create_dir(&node).await?;
+            tokio::fs::write(node.join("replacement.txt"), "EXCLUDED").await?;
+            tokio::fs::create_dir(&dst).await?;
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let src_dir =
+                Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+            let dst_dir =
+                Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
+            let visitor = Arc::new(CopyVisitor {
+                prog_track: &PROGRESS,
+                dst_root: dst.clone(),
+                filter_base: PathBuf::new(),
+                delete_scan_anchor: DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                settings,
+                preserve: *NO_PRESERVE_SETTINGS,
+                dst_parent: None,
+                root_is_fresh: false,
+            });
+            let root_cx = EntryCx {
+                parent: Arc::clone(&src_dir),
+                name: std::ffi::OsString::from("source"),
+                rel_path: PathBuf::new(),
+                filter_path: PathBuf::new(),
+                real_path: src.clone(),
+                dry_run: false,
+                prog_track: &PROGRESS,
+            };
+            let child_ctx = CopyDirContext {
+                dst_dir: Some(dst_dir),
+                is_fresh: true,
+            };
+            let (summary, processed) = run_with_open_file_cleanup(
+                &admission,
+                crate::walk_driver::scope_tasks(crate::walk_driver::walk_dir_entries(
+                    Arc::clone(&visitor),
+                    src_dir,
+                    &root_cx,
+                    &child_ctx,
+                    vec![(std::ffi::OsString::from("node"), Some(EntryKind::File))],
+                )),
+            )
+            .await?
+            .map_err(|error| error.source)?;
+
+            assert_eq!(summary.directories_skipped, 1);
+            assert!(processed.names().is_empty());
+            assert!(
+                !dst.join("node").exists(),
+                "an excluded nested replacement directory must not be materialized"
+            );
+            Ok(())
+        }
+
+        /// A stale directory hint cannot hide an included source file from `--delete`'s keep-set.
+        #[tokio::test(flavor = "current_thread")]
+        #[traced_test]
+        async fn delete_rechecks_a_directory_hint_before_pruning_an_included_file()
+        -> Result<(), anyhow::Error> {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("source");
+            let dst = root.join("destination");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&dst).await?;
+            tokio::fs::write(src.join("node"), "CURRENT-SOURCE-CONTENT").await?;
+            tokio::fs::write(dst.join("node"), "OLD").await?;
+
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("node/")?;
+            assert!(!matches!(
+                filter.should_include(std::path::Path::new("node"), true),
+                crate::filter::FilterResult::Included
+            ));
+            assert!(matches!(
+                filter.should_include(std::path::Path::new("node"), false),
+                crate::filter::FilterResult::Included
+            ));
+            let mut settings = settings_with_delete(delete_on());
+            settings.filter = Some(filter);
+
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let src_dir =
+                Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+            let dst_dir =
+                Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
+            let visitor = Arc::new(CopyVisitor {
+                prog_track: &PROGRESS,
+                dst_root: dst.clone(),
+                filter_base: PathBuf::new(),
+                delete_scan_anchor: DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                settings,
+                preserve: *NO_PRESERVE_SETTINGS,
+                dst_parent: None,
+                root_is_fresh: false,
+            });
+            let root_cx = EntryCx {
+                parent: Arc::clone(&src_dir),
+                name: std::ffi::OsString::from("source"),
+                rel_path: PathBuf::new(),
+                filter_path: PathBuf::new(),
+                real_path: src.clone(),
+                dry_run: false,
+                prog_track: &PROGRESS,
+            };
+            let child_ctx = CopyDirContext {
+                dst_dir: Some(Arc::clone(&dst_dir)),
+                is_fresh: false,
+            };
+
+            // inject a stale directory hint for the real source file, then run the same post-order
+            // prune that consumes the driver's processed-child keep-set.
+            let (summary, processed) = run_with_open_file_cleanup(&admission, async {
+                let (mut summary, processed) =
+                    crate::walk_driver::scope_tasks(crate::walk_driver::walk_dir_entries(
+                        Arc::clone(&visitor),
+                        src_dir,
+                        &root_cx,
+                        &child_ctx,
+                        vec![(std::ffi::OsString::from("node"), Some(EntryKind::Dir))],
+                    ))
+                    .await
+                    .map_err(|error| error.source)?;
+                let mut child_error = None;
+                visitor
+                    .prune_finished_dir(
+                        &mut summary,
+                        &mut child_error,
+                        &processed,
+                        &Some(dst_dir),
+                        &dst,
+                        std::path::Path::new(""),
+                    )
+                    .await
+                    .map_err(|error| error.source)?;
+                assert!(child_error.is_none());
+                Ok::<_, anyhow::Error>((summary, processed))
+            })
+            .await??;
+
+            assert_eq!(processed.names(), &[std::ffi::OsString::from("node")]);
+            assert_eq!(summary.files_copied, 1);
+            assert_eq!(summary.rm_summary.files_removed, 1);
+            assert_eq!(
+                tokio::fs::read_to_string(dst.join("node")).await?,
+                "CURRENT-SOURCE-CONTENT"
+            );
+            Ok(())
+        }
+
+        /// A dry-run preview is authoritative even without `--delete`: a stale directory hint must
+        /// not suppress the included regular file that now occupies the name.
+        #[tokio::test(flavor = "current_thread")]
+        #[traced_test]
+        async fn dry_run_rechecks_a_directory_hint_before_previewing_an_included_file()
+        -> Result<(), anyhow::Error> {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("source");
+            let dst = root.join("destination");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::write(src.join("node"), "CURRENT-SOURCE-CONTENT").await?;
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("node/")?;
+            assert!(!matches!(
+                filter.should_include(std::path::Path::new("node"), true),
+                crate::filter::FilterResult::Included
+            ));
+            assert!(matches!(
+                filter.should_include(std::path::Path::new("node"), false),
+                crate::filter::FilterResult::Included
+            ));
+            let mut settings = settings_with_delete(None);
+            settings.filter = Some(filter);
+            settings.dry_run = Some(crate::config::DryRunMode::Brief);
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let src_dir =
+                Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+            let visitor = Arc::new(CopyVisitor {
+                prog_track: &PROGRESS,
+                dst_root: dst.clone(),
+                filter_base: PathBuf::new(),
+                delete_scan_anchor: DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                settings,
+                preserve: *NO_PRESERVE_SETTINGS,
+                dst_parent: None,
+                root_is_fresh: false,
+            });
+            let root_cx = EntryCx {
+                parent: Arc::clone(&src_dir),
+                name: std::ffi::OsString::from("source"),
+                rel_path: PathBuf::new(),
+                filter_path: PathBuf::new(),
+                real_path: src.clone(),
+                dry_run: true,
+                prog_track: &PROGRESS,
+            };
+            let (summary, processed) = run_with_open_file_cleanup(
+                &admission,
+                crate::walk_driver::scope_tasks(crate::walk_driver::walk_dir_entries(
+                    visitor,
+                    src_dir,
+                    &root_cx,
+                    &CopyDirContext {
+                        dst_dir: None,
+                        is_fresh: false,
+                    },
+                    vec![(std::ffi::OsString::from("node"), Some(EntryKind::Dir))],
+                )),
+            )
+            .await??;
+            assert_eq!(processed.names(), &[std::ffi::OsString::from("node")]);
+            assert_eq!(summary.files_copied, 1);
+            assert_eq!(summary.directories_skipped, 0);
+            Ok(())
+        }
+
         /// Test that filters apply to root symlinks with simple exclude patterns.
         #[tokio::test]
         #[traced_test]
@@ -5549,6 +6079,10 @@ mod copy_tests {
                 prog_track: &PROGRESS,
                 dst_root: PathBuf::new(),
                 filter_base: PathBuf::new(),
+                delete_scan_anchor: DeleteScanAnchor::new(
+                    std::path::Path::new("dst"),
+                    std::path::Path::new(""),
+                ),
                 settings: settings_with_delete(None),
                 preserve: *NO_PRESERVE_SETTINGS,
                 dst_parent: None,
@@ -5589,10 +6123,12 @@ mod copy_tests {
             );
             let handle = src_parent.child(src_name).await?;
             assert_eq!(handle.kind(), EntryKind::Symlink);
+            let dst_root = root.join(dst_name);
             let visitor = CopyVisitor {
                 prog_track: &PROGRESS,
-                dst_root: root.join(dst_name),
+                dst_root: dst_root.clone(),
                 filter_base: PathBuf::new(),
+                delete_scan_anchor: DeleteScanAnchor::new(&dst_root, std::path::Path::new("")),
                 settings: settings_with_delete(None),
                 preserve: *NO_PRESERVE_SETTINGS,
                 dst_parent: Some(Arc::clone(&dst_parent)),
@@ -5668,10 +6204,12 @@ mod copy_tests {
             let mut settings = settings_with_delete(None);
             settings.dereference = true;
             settings.dry_run = Some(crate::config::DryRunMode::Brief);
+            let dst_root = root.join("dst");
             let visitor = CopyVisitor {
                 prog_track: &PROGRESS,
-                dst_root: root.join("dst"),
+                dst_root: dst_root.clone(),
                 filter_base: PathBuf::new(),
+                delete_scan_anchor: DeleteScanAnchor::new(&dst_root, std::path::Path::new("")),
                 settings,
                 preserve: *NO_PRESERVE_SETTINGS,
                 dst_parent: None,
@@ -6326,6 +6864,71 @@ mod copy_tests {
 
     #[tokio::test]
     #[traced_test]
+    async fn delete_dry_run_does_not_scan_through_named_destination_symlink()
+    -> Result<(), anyhow::Error> {
+        let root = testutils::create_temp_dir().await?;
+        let src = root.join("src");
+        let outside = root.join("outside");
+        let dst = root.join("dst");
+        tokio::fs::create_dir_all(src.join("sub")).await?;
+        tokio::fs::create_dir_all(outside.join("sub")).await?;
+        tokio::fs::write(outside.join("sub/stale"), "OUTSIDE").await?;
+        tokio::fs::symlink(&outside, &dst).await?;
+        let mut settings = settings_with_delete(delete_on());
+        settings.dry_run = Some(crate::config::DryRunMode::Brief);
+        let summary = copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings,
+            &NO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+        assert_eq!(summary.rm_summary.files_removed, 0);
+        assert_eq!(
+            tokio::fs::read_to_string(outside.join("sub/stale")).await?,
+            "OUTSIDE"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn dereferenced_delete_dry_run_scans_its_destination_subtree() -> Result<(), anyhow::Error>
+    {
+        let root = testutils::create_temp_dir().await?;
+        let src = root.join("src");
+        let target = root.join("target");
+        let dst = root.join("dst");
+        tokio::fs::create_dir_all(&src).await?;
+        tokio::fs::create_dir_all(&target).await?;
+        tokio::fs::write(target.join("kept"), "SOURCE").await?;
+        tokio::fs::symlink(&target, src.join("node")).await?;
+        tokio::fs::create_dir_all(dst.join("node")).await?;
+        tokio::fs::write(dst.join("node/stale"), "STALE").await?;
+        let mut settings = settings_with_delete(delete_on());
+        settings.dry_run = Some(crate::config::DryRunMode::Brief);
+        settings.dereference = true;
+
+        let summary = copy(
+            &PROGRESS,
+            &src,
+            &dst,
+            &settings,
+            &NO_PRESERVE_SETTINGS,
+            false,
+        )
+        .await?;
+
+        assert_eq!(summary.rm_summary.files_removed, 1);
+        assert_eq!(summary.rm_summary.directories_removed, 0);
+        assert!(dst.join("node/stale").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
     async fn delete_does_not_prune_when_source_unreadable() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
         let test_path = tmp_dir.as_path();
@@ -6416,7 +7019,265 @@ mod copy_tests {
         Ok(())
     }
 
+    /// An admitted regular file retains its selected handle only for type authorization. Overwrite
+    /// planning must compare the destination with the current by-name file that will supply the
+    /// bytes, not with the earlier selected inode.
+    #[tokio::test]
+    #[traced_test]
+    async fn admitted_file_replacement_overwrites_destination_matching_selected_file()
+    -> Result<(), anyhow::Error> {
+        let root = testutils::create_temp_dir().await?;
+        let src = root.join("source");
+        let dst = root.join("destination");
+        tokio::fs::write(&src, "SELECTED-A").await?;
+        tokio::fs::hard_link(&src, &dst).await?;
+
+        let admission = testutils::AdmissionLimit::new().await;
+        admission.set_max_open_files(1);
+        let src_parent = Arc::new(
+            Dir::open_parent_dir(&root, congestion::Side::Source)
+                .await?
+                .into_tree(),
+        );
+        let dst_parent = Arc::new(
+            Dir::open_parent_dir(&root, congestion::Side::Destination)
+                .await?
+                .into_tree(),
+        );
+        let selected = src_parent.child(std::ffi::OsStr::new("source")).await?;
+        assert_eq!(selected.kind(), EntryKind::File);
+        let permit = crate::walk::ensure_leaf_permit(PermitKind::OpenFile, None).await;
+        let entry = AdmittedEntry::new(selected, permit);
+
+        tokio::fs::remove_file(&src).await?;
+        tokio::fs::write(&src, "CURRENT-BY-NAME-REPLACEMENT").await?;
+        let mut settings = settings_with_delete(None);
+        settings.overwrite = true;
+        settings.overwrite_compare = filecmp::MetadataCmpSettings {
+            size: true,
+            ..Default::default()
+        };
+
+        let summary = admission
+            .run_with_timeout(
+                std::time::Duration::from_secs(20),
+                copy_child(
+                    &PROGRESS,
+                    &src_parent,
+                    Some(&dst_parent),
+                    std::ffi::OsStr::new("source"),
+                    &src,
+                    &dst,
+                    std::path::Path::new(""),
+                    &settings,
+                    &NO_PRESERVE_SETTINGS,
+                    false,
+                    DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                    CopyEntryAdmission::Admitted(entry),
+                ),
+            )
+            .await
+            .context("admitted replacement copy did not finish at a limit of one")??;
+        let returned = admission
+            .run_with_timeout(
+                std::time::Duration::from_secs(20),
+                throttle::open_file_permit(),
+            )
+            .await
+            .context("admitted replacement copy did not return open-file capacity")?;
+        drop(returned);
+
+        assert_eq!(summary.files_copied, 1);
+        assert_eq!(
+            tokio::fs::read_to_string(&dst).await?,
+            "CURRENT-BY-NAME-REPLACEMENT"
+        );
+        Ok(())
+    }
+
     // ── TOCTOU hardening: -L separability, swap-loop races, fd-budget ────────────────
+
+    /// `--ignore-existing` is a destination-only no-op: an admitted source that disappears after
+    /// selection must not turn the skip into a source-open error.
+    #[tokio::test]
+    #[traced_test]
+    async fn ignore_existing_skips_before_reopening_an_admitted_missing_source()
+    -> Result<(), anyhow::Error> {
+        let root = testutils::create_temp_dir().await?;
+        let src = root.join("source");
+        let dst = root.join("destination");
+        tokio::fs::write(&src, "SOURCE").await?;
+        tokio::fs::write(&dst, "PRECIOUS").await?;
+
+        let admission = testutils::AdmissionLimit::new().await;
+        admission.set_max_open_files(1);
+        let src_parent = Arc::new(
+            Dir::open_parent_dir(&root, congestion::Side::Source)
+                .await?
+                .into_tree(),
+        );
+        let dst_parent = Arc::new(
+            Dir::open_parent_dir(&root, congestion::Side::Destination)
+                .await?
+                .into_tree(),
+        );
+        let permit = crate::walk::ensure_leaf_permit(PermitKind::OpenFile, None).await;
+        let entry = crate::walk::classify_admitted_entry(
+            &src_parent,
+            std::ffi::OsStr::new("source"),
+            permit,
+        )
+        .await?;
+        tokio::fs::remove_file(&src).await?;
+
+        let summary = run_with_open_file_cleanup(
+            &admission,
+            copy_child(
+                &PROGRESS,
+                &src_parent,
+                Some(&dst_parent),
+                std::ffi::OsStr::new("source"),
+                &src,
+                &dst,
+                std::path::Path::new(""),
+                &Settings {
+                    ignore_existing: true,
+                    ..settings_with_delete(None)
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+                DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                CopyEntryAdmission::Admitted(entry),
+            ),
+        )
+        .await??;
+
+        assert_eq!(summary.files_unchanged, 1);
+        assert_eq!(summary.files_copied, 0);
+        assert_eq!(tokio::fs::read_to_string(&dst).await?, "PRECIOUS");
+        Ok(())
+    }
+
+    /// A destination conflict is diagnosed before reopening an admitted source that has vanished.
+    #[tokio::test]
+    #[traced_test]
+    async fn no_overwrite_reports_destination_conflict_before_an_admitted_missing_source()
+    -> Result<(), anyhow::Error> {
+        let root = testutils::create_temp_dir().await?;
+        let src = root.join("source");
+        let dst = root.join("destination");
+        tokio::fs::write(&src, "SOURCE").await?;
+        tokio::fs::write(&dst, "PRECIOUS").await?;
+
+        let admission = testutils::AdmissionLimit::new().await;
+        admission.set_max_open_files(1);
+        let src_parent = Arc::new(
+            Dir::open_parent_dir(&root, congestion::Side::Source)
+                .await?
+                .into_tree(),
+        );
+        let dst_parent = Arc::new(
+            Dir::open_parent_dir(&root, congestion::Side::Destination)
+                .await?
+                .into_tree(),
+        );
+        let permit = crate::walk::ensure_leaf_permit(PermitKind::OpenFile, None).await;
+        let entry = crate::walk::classify_admitted_entry(
+            &src_parent,
+            std::ffi::OsStr::new("source"),
+            permit,
+        )
+        .await?;
+        tokio::fs::remove_file(&src).await?;
+
+        let error = run_with_open_file_cleanup(
+            &admission,
+            copy_child(
+                &PROGRESS,
+                &src_parent,
+                Some(&dst_parent),
+                std::ffi::OsStr::new("source"),
+                &src,
+                &dst,
+                std::path::Path::new(""),
+                &settings_with_delete(None),
+                &NO_PRESERVE_SETTINGS,
+                false,
+                DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                CopyEntryAdmission::Admitted(entry),
+            ),
+        )
+        .await?
+        .expect_err("an existing destination without --overwrite must fail");
+
+        let message = format!("{:#}", &error.source);
+        assert!(
+            message.contains("did you intend to specify --overwrite?"),
+            "destination conflict lost precedence: {message}"
+        );
+        assert!(
+            !message.contains("failed opening src file"),
+            "source acquisition masked the destination conflict: {message}"
+        );
+        assert_eq!(tokio::fs::read_to_string(&dst).await?, "PRECIOUS");
+        Ok(())
+    }
+
+    /// Dry-run `--ignore-existing` also decides the no-op before reopening an admitted source.
+    #[tokio::test]
+    #[traced_test]
+    async fn dry_run_ignore_existing_skips_before_reopening_an_admitted_missing_source()
+    -> Result<(), anyhow::Error> {
+        let root = testutils::create_temp_dir().await?;
+        let src = root.join("source");
+        let dst = root.join("destination");
+        tokio::fs::write(&src, "SOURCE").await?;
+        tokio::fs::write(&dst, "PRECIOUS").await?;
+
+        let admission = testutils::AdmissionLimit::new().await;
+        admission.set_max_open_files(1);
+        let src_parent = Arc::new(
+            Dir::open_parent_dir(&root, congestion::Side::Source)
+                .await?
+                .into_tree(),
+        );
+        let permit = crate::walk::ensure_leaf_permit(PermitKind::OpenFile, None).await;
+        let entry = crate::walk::classify_admitted_entry(
+            &src_parent,
+            std::ffi::OsStr::new("source"),
+            permit,
+        )
+        .await?;
+        tokio::fs::remove_file(&src).await?;
+
+        let summary = run_with_open_file_cleanup(
+            &admission,
+            copy_child(
+                &PROGRESS,
+                &src_parent,
+                None,
+                std::ffi::OsStr::new("source"),
+                &src,
+                &dst,
+                std::path::Path::new(""),
+                &Settings {
+                    ignore_existing: true,
+                    dry_run: Some(DryRunMode::Brief),
+                    ..settings_with_delete(None)
+                },
+                &NO_PRESERVE_SETTINGS,
+                false,
+                DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                CopyEntryAdmission::Admitted(entry),
+            ),
+        )
+        .await??;
+
+        assert_eq!(summary.files_unchanged, 1);
+        assert_eq!(summary.files_copied, 0);
+        assert_eq!(tokio::fs::read_to_string(&dst).await?, "PRECIOUS");
+        Ok(())
+    }
 
     /// Default non-dereference copy settings used by the TOCTOU/fd-budget tests below.
     /// `overwrite` is on so a fresh destination per iteration is never required to be empty.

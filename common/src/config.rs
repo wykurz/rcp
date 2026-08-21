@@ -58,7 +58,7 @@ pub struct AutoMetaThrottleConfig {
 pub struct ThrottleConfig {
     /// Admission count assigned to each independent OpenFile and PendingMeta pool.
     ///
-    /// `None` derives a per-pool count from the current soft `RLIMIT_NOFILE`, four modeled
+    /// `None` derives a per-pool count from the current soft `RLIMIT_NOFILE`, five modeled
     /// descriptor units, and a 4096 cap; a zero soft limit leaves admission disabled. `Some(0)`
     /// also disables descriptor admission.
     pub max_open_files: Option<usize>,

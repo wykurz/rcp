@@ -188,8 +188,8 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
   pattern. `false` when the directory was only traversed to look for potential matches and should be
   removed if it ends up empty on disk.
 - **No `file_count`**: the source retains the child-file count it computed during the pre-read (in
-  its fd-map entry under hardened reads, or in a path→count map under `-L`), so it is not sent on
-  the wire and not echoed back. See §7.1.
+  its fd-map entry under hardened reads, or in a path-keyed Pass-1 entry under `-L`), so it is not
+  sent on the wire and not echoed back. See §7.1.
 
 **`Symlink`**
 
@@ -272,11 +272,11 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
 - **Usage**: Sent after successfully creating directory, and after any `DirectoryManifestChunk`s for
   it. This is purely the Pass-2 trigger: it tells the source the destination created the directory
   and is ready to receive its files. The source already retains the authoritative child-file count
-  it computed during the Pass-1 pre-read (hardened: in the fd-map entry; `-L`: in a path→count map),
-  so no count is echoed back. Triggers source to send files. See §7.1. On the destination it is also
-  the directory's **completion gate**: child entries processed off Pass-1 messages
-  (symlinks/subdirectories) never complete a directory before its own announce is on the wire (§5.2)
-  — a directory completes at the LATER of its last processed entry and its announce.
+  it computed during the Pass-1 pre-read (hardened: in the fd-map entry; `-L`: in a path-keyed
+  Pass-1 entry), so no count is echoed back. Triggers source to send files. See §7.1. On the
+  destination it is also the directory's **completion gate**: child entries processed off Pass-1
+  messages (symlinks/subdirectories) never complete a directory before its own announce is on the
+  wire (§5.2) — a directory completes at the LATER of its last processed entry and its announce.
 
 **`DirectorySkipped`**
 
@@ -285,11 +285,10 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
   for it.
 - **Fields**: `src`, `dst`
 - **Usage**: The destination sends **exactly one** of `DirectoryCreated` / `DirectorySkipped` per
-  `Directory` message. The source uses this to release the directory's held fd in its source-side
-  fd-map (the TOCTOU-safe-read dir-fd budget). Without this nack a skipped directory's fd permit
-  would never be released, so a no-ack subtree larger than the budget would block the source's
-  Pass-1 walk and hang the copy. Does not affect completion accounting: skipped directories were
-  never added to `pending_directories`.
+  `Directory` message. The source uses this to release the matching hardened directory-fd entry or
+  `-L` owned credit. Without this nack a skipped directory's permit would never be released, so a
+  no-ack subtree larger than the budget would block the source's Pass-1 walk and hang the copy. Does
+  not affect completion accounting: skipped directories were never added to `pending_directories`.
 - **Exception — hard abort.** Most failure paths still send `DirectorySkipped` — an ancestor failed,
   the create was converted to `Failed`, or `--ignore-existing` skipped a non-directory — even under
   `--fail-early`, and the accounting rule ("exactly one per directory") holds for them. The
@@ -299,31 +298,35 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
   transport failure on either stream, or the destination closing its control stream. So the source
   MUST NOT depend on receiving an ack/nack for every directory: it releases the **entire** dir-fd
   budget (`close_fd_budget`) — and, under `-L`, closes the outstanding-directory credit that
-  replaces it. The path-based walk retains no pinned directory fd or fd-map entry across
-  acknowledgements, although each `ReadDir` enumeration owns a transient descriptor. One credit per
-  unacknowledged `Directory`, released by that directory's `DirectoryCreated`/`DirectorySkipped`,
-  keeps a slow ack path from letting the walk flood the destination with an unbounded backlog of
-  registered directories, each holding a destination directory fd and possibly owning a queued
-  manifest. After every normal dispatch-loop result — control-stream close, transport-task error, or
-  a child-task panic surfaced as `JoinError` — the source explicitly closes the applicable gate
-  before draining tasks. Once installed at dispatch entry, an RAII closer also closes the gate if
-  cancellation drops the future or a panic unwinds before that point. Thus, after dispatch starts, a
-  Pass-1 walk parked on the budget unblocks on every path that runs destructors, and the source
-  tears down cleanly instead of hanging. On such an abort the top-level cause depends on which side
-  detected it. A **source-side** cause (e.g. a source file's `Permission denied` on read) is
-  published to a shared slot before the budget is released, and the teardown surfaces it in place of
-  the synthetic budget-closed wakeup (a typed `FdBudgetClosed` marker, detected by type) that
-  unblocks the parked walk. A **destination-side** cause (e.g. the destination cannot create a file)
-  is not visible to the source — its slot stays empty, so the source reports only a benign teardown
-  symptom (a meaningful "destination closed the control connection before the source finished
-  sending" message, or a broken-pipe Pass-2 send error — never the internal `FdBudgetClosed` marker,
-  which is substituted), while the **destination** reports the real cause, preferring its own
-  recorded operation error over the connection-teardown symptom, and the master prefixes it
-  `Destination:`. So a destination-side abort still fails the copy with the real cause named — on
-  the destination's half of the aggregated error — while the source adds only the benign teardown
-  symptom alongside it. (Fully suppressing that source-side symptom is deferred: once the peer has
-  aborted, the source's own Pass-2 sends genuinely fail, and a benign peer-abort is not reliably
-  distinguishable there from a real transport fault.)
+  replaces it. The path-based walk retains no pinned directory fd, although each `ReadDir`
+  enumeration owns a transient descriptor. Under `-L`, one credit is owned by every sent
+  `Directory`: `DirectoryCreated` transfers it into that directory's Pass-2 task and releases it
+  when the task finishes, while `DirectorySkipped` releases it immediately. This bounds directories
+  waiting on a slow acknowledgement/manifest and those with active direct-file Pass-2 work. It is
+  not a total directory-fd bound: a zero-file Pass 2 releases immediately, so destination fds
+  retained for recursive ancestors and directory-only trees can outlive the credit. After every
+  normal dispatch-loop result — control-stream close, transport-task error, or a child-task panic
+  surfaced as `JoinError` — the source explicitly closes the applicable gate before draining tasks.
+  Once installed at dispatch entry, an RAII closer also closes the gate if cancellation drops the
+  future or a panic unwinds before that point. Thus, after dispatch starts, a Pass-1 walk parked on
+  the budget unblocks on every path that runs destructors, and the source tears down cleanly instead
+  of hanging. On such an abort the top-level cause depends on which side detected it. A
+  **source-side** cause (e.g. a source file's `Permission denied` on read) is published to a shared
+  slot before the budget is released, and the teardown surfaces it in place of the synthetic
+  budget-closed wakeup (a typed `FdBudgetClosed` marker, detected by type) that unblocks the parked
+  walk. A recursive source walk treats that marker as teardown control flow in either read mode,
+  even under collect-errors: it neither sends a compensating `FileSkipped` nor continues into later
+  siblings. A **destination-side** cause (e.g. the destination cannot create a file) is not visible
+  to the source — its slot stays empty, so the source reports only a benign teardown symptom (a
+  meaningful "destination closed the control connection before the source finished sending" message,
+  or a broken-pipe Pass-2 send error — never the internal `FdBudgetClosed` marker, which is
+  substituted), while the **destination** reports the real cause, preferring its own recorded
+  operation error over the connection-teardown symptom, and the master prefixes it `Destination:`.
+  So a destination-side abort still fails the copy with the real cause named — on the destination's
+  half of the aggregated error — while the source adds only the benign teardown symptom alongside
+  it. (Fully suppressing that source-side symptom is deferred: once the peer has aborted, the
+  source's own Pass-2 sends genuinely fail, and a benign peer-abort is not reliably distinguishable
+  there from a real transport fault.)
   - **A data-path abort is signaled by closing the control stream.** A fatal error on a *data*
     connection — a `--fail-early` file/metadata failure, or a corrupted data stream — propagates out
     of the data worker; the destination records it and closes its control send stream (the
@@ -574,10 +577,11 @@ The protocol uses asymmetric error communication between source and destination:
 - **Exception — directory acks:** the destination DOES tell the source the outcome of every
   `Directory` message, sending exactly one of `DirectoryCreated` (success/reuse) or
   `DirectorySkipped` (not created). This is not failure reporting for its own sake — the source
-  needs it to release the directory's held fd from its source-side fd-map (TOCTOU-safe reads). It
-  does not change what the source sends next (a skipped directory's children still arrive and are
-  skipped via `failed_directories`). (Sole exception: a **hard abort** may close the control stream
-  in place of a final ack/nack — see `DirectorySkipped` §2.2, "Exception — hard abort".)
+  needs it to consume the matching Pass-1 entry: the hardened entry owns a directory fd, while the
+  `-L` entry owns its pacing credit. It does not change what the source sends next (a skipped
+  directory's children still arrive and are skipped via `failed_directories`). (Sole exception: a
+  **hard abort** may close the control stream in place of a final ack/nack — see `DirectorySkipped`
+  §2.2, "Exception — hard abort".)
 
 ### 3.2 Rationale
 
@@ -591,10 +595,12 @@ If destination fails to create a directory:
 
 - It tracks this locally in `failed_directories`
 - It sends `DirectorySkipped` (not `DirectoryCreated`), so source won't send files for it but does
-  release the directory's held fd (fd-map). The same `DirectorySkipped` is sent when a directory is
-  skipped because an ancestor failed, or `--ignore-existing` skips a non-directory.
+  release the matching hardened fd-map entry or `-L` owned credit. The same `DirectorySkipped` is
+  sent when a directory is skipped because an ancestor failed, or `--ignore-existing` skips a
+  non-directory.
 - It skips any descendant directories/symlinks that arrive (checking `failed_directories`)
-- Source continues sending the full structure (it only releases the skipped dir's fd)
+- Source continues sending the full structure (it releases only the skipped directory's hardened
+  fd-map entry or `-L` owned credit)
 
 ### 3.3 Root Item Failure Invariant
 
@@ -997,8 +1003,8 @@ sent on the wire and not echoed back. The destination only signals readiness:
 
 - **Hardened reads (default):** the count is stored in the directory's source-side fd-map entry
   (alongside the held `O_NOFOLLOW` directory fd) keyed by source path.
-- **`-L`/`--dereference`:** the source holds no fd-map, so the count is stored in a separate
-  `path → file_count` map.
+- **`-L`/`--dereference`:** the source holds no directory fd-map, so a separate path-keyed entry
+  stores the Pass-1 contents and one owned pacing credit.
 
 `DirectoryCreated { src, dst }` is purely the **Pass-2 trigger**: when it arrives the source looks
 up the directory's retained count and begins sending its files. This still decouples traversal
@@ -1006,8 +1012,8 @@ up the directory's retained count and begins sending its files. This still decou
 files after the `DirectoryCreated` confirmation — but without a file-count round-trip. Under
 hardened reads a `DirectoryCreated` whose directory has no retained entry is a TOCTOU-safety /
 protocol-invariant violation and **fails closed** (the source refuses to re-resolve the directory by
-path); under `-L` a missing count defaults to 0 with a debug log (that path is not hardened, so a
-miss is not a fail-closed condition).
+path); under `-L` a missing entry defaults to 0 with a debug log and carries no credit (that path is
+not hardened, so a miss is not a fail-closed condition and cannot inflate admission).
 
 **Committed-but-unreadable directory (tombstone):** When the source commits a directory to the wire
 (the `is_dir` pre-check passed) but then cannot open or enumerate it, it sends a 0-entry `Directory`
@@ -1015,15 +1021,18 @@ so the destination creates an empty directory and completes its tracking. To kee
 rule from mis-firing on this legitimate case, the source registers a matching retained entry before
 sending:
 
-- If the directory fd is held (only enumeration failed): a real 0-file fd-map entry.
-- If the directory could not be opened at all: a **tombstone** (no held fd, no fd-budget permit,
-  file_count 0).
+- Hardened mode records either a real 0-file fd-map entry (if the directory fd was opened) or a
+  **tombstone** (no held fd, no fd-budget permit, file count 0).
+- `-L` records empty contents with a real owned credit, exactly like a readable path-based
+  directory. `DirectoryCreated` transfers it into the zero-file Pass-2 task, which returns
+  immediately and releases the credit.
 
 Either way the destination's `DirectoryCreated` ack consumes a real entry instead of hitting the
-fail-closed miss path, and Pass 2 sends zero files. This preserves the "unreadable directory →
-continue as an empty directory unless `--fail-early`" behavior for both root and non-root
-directories. (A *true* miss — a directory that was never committed, or whose entry was already
-consumed — still fails closed.)
+mode-specific missing-entry path, and Pass 2 sends zero files. This preserves the "unreadable
+directory → continue as an empty directory unless `--fail-early`" behavior for both root and
+non-root directories. In hardened mode, a *true* miss — a directory that was never committed, or
+whose entry was already consumed — still fails closed. Under `-L`, the same miss deliberately
+becomes an empty zero-file Pass 2 with no credit because that path is not fd-hardened.
 
 **Counted-but-unsendable child (Pass 1):** A directory's `entry_count` is fixed when its `Directory`
 message goes out, but the walk descends into its children only afterwards. A child that vanished,
@@ -1089,15 +1098,19 @@ Failed directories are tracked in a simple set:
 
 The protocol uses two sending primitives:
 
-**`send_batch_message()`:** Serializes without flushing.
+**`send_batch_message()`:** Serializes one framed message and flushes it before returning.
 
 - Used for: Directories, symlinks during traversal
-- Benefit: Multiple messages batched in single network packet
+- Despite the historical name, its `SinkExt::send` call includes `poll_flush`; this flush is
+  load-bearing when a budget-one source must receive a directory acknowledgement before it can send
+  the next directory
 
-**`send_control_message()`:** Serializes and flushes.
+**`send_control_message()`:** Sends through `send_batch_message()` and then explicitly flushes
+again.
 
 - Used for: `DirStructureComplete`, `DestinationDone`, `DirectoryCreated`, `DirectorySkipped`
-- Critical for correctness at synchronization points
+- The second flush is normally redundant today, but keeps the synchronization intent explicit at
+  control boundaries
 
 ### 7.5 Data Connection Pooling
 
@@ -1219,7 +1232,7 @@ remove/create/write as required. The two rcpd processes do not share a pool.
 - `--pending-writes-multiplier=N`: Multiplier for pending tasks (default: 4)
 - `--max-open-files=N`: Assign `N` to each rcpd's independent OpenFile and PendingMeta admission
   pools (`0` disables admission). An explicit value is propagated to both rcpds. When absent, each
-  rcpd derives its own per-pool count from its unchanged current soft `RLIMIT_NOFILE` using four
+  rcpd derives its own per-pool count from its unchanged current soft `RLIMIT_NOFILE` using five
   modeled descriptor units, capped at 4096; a zero soft limit leaves admission disabled.
 
 The multiplier ensures work is always queued when connections become available, avoiding idle time

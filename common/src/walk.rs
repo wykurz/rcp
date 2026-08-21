@@ -4,9 +4,9 @@
 //! visitors:
 //! - `EntryKind` — classifies a directory entry by file type and exposes the per-type bits
 //!   (dry-run label, skipped-counter increment) so callers don't re-implement the dispatch.
-//! - entry-admission lifecycle (`PermitKind` / `LeafPermit` / `EntryAdmission` / `AdmittedLeaf` /
-//!   `classify_entry`) — carries enumeration hints into classification while keeping leaf handles
-//!   structurally inside their admission lifetime.
+//! - entry-admission lifecycle (`PermitKind` / `LeafPermit` / `EntryAdmission` / `AdmittedEntry` /
+//!   `AdmittedLeaf` / `classify_entry`) — carries enumeration hints into classification while
+//!   keeping classification handles structurally inside their admission lifetime.
 //! - congestion↔throttle bridges (`throttle_side` / `throttle_op` / `meta_resource`) — map the
 //!   walk's side/op enums onto the throttle and congestion resource enums.
 //! - metadata-probe wrappers (`next_entry_probed` / `run_metadata_probed`) — wrap the path-based
@@ -163,6 +163,19 @@ impl EntryAdmission {
         }
     }
 
+    /// Require ordinary admission when a decision cannot rely on the directory-hint exception.
+    ///
+    /// A dual-tree operation cannot use one entry's hint to exempt classification of its separate
+    /// counterpart. A destructive filter cannot trust the hinted type before authorizing an
+    /// action. Both discard the exception before classification; already-held admission remains.
+    #[must_use]
+    pub(crate) fn require_admission(self) -> Self {
+        match self {
+            Self::HintedDirectory => Self::RootOrDelegated,
+            Self::Held(_) | Self::RootOrDelegated => self,
+        }
+    }
+
     /// Borrow the held admission lease, when this entry has acquired one.
     #[must_use]
     pub(crate) fn admission(&self) -> Option<throttle::FdAdmission> {
@@ -241,6 +254,77 @@ fn take_permit_after_closing_handle<H, P>(
     permit.take()
 }
 
+/// One authoritatively classified entry and the admission held while deciding its action.
+///
+/// Destructive filters use this type to transfer the exact classification handle that informed
+/// the filter decision into the shared walk driver. Private handle-then-permit ownership plus the
+/// explicit [`Drop`] implementation close the handle before returning admission on every skipped,
+/// failed, or cancelled path. Only the driver's directory dispatch can deliberately release the
+/// provisional leaf permit while retaining a directory handle for unbudgeted recursion.
+pub(crate) struct AdmittedEntry {
+    handle: Option<crate::safedir::Handle>,
+    permit: Option<LeafPermit>,
+}
+
+impl AdmittedEntry {
+    pub(crate) fn new(handle: crate::safedir::Handle, permit: Option<LeafPermit>) -> Self {
+        Self {
+            handle: Some(handle),
+            permit,
+        }
+    }
+
+    /// Borrow the authoritative classification handle.
+    #[must_use]
+    pub(crate) fn handle(&self) -> &crate::safedir::Handle {
+        self.handle
+            .as_ref()
+            .expect("an admitted entry always owns its handle")
+    }
+
+    /// Return the authoritative entry kind.
+    #[must_use]
+    pub(crate) fn kind(&self) -> EntryKind {
+        self.handle().kind()
+    }
+
+    /// Borrow this entry's weak admission reference, when its visitor uses a pool.
+    #[must_use]
+    pub(crate) fn admission(&self) -> Option<throttle::FdAdmission> {
+        self.permit.as_ref().map(LeafPermit::admission)
+    }
+
+    /// Convert the classified entry into the driver's leaf-or-directory dispatch.
+    ///
+    /// The directory outcome is the sole explicit drop-before-recursion transition: it returns the
+    /// authoritative handle after releasing provisional leaf admission. The leaf outcome preserves
+    /// handle-before-permit ownership in [`AdmittedLeaf`].
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn into_leaf(self) -> Result<AdmittedLeaf, crate::safedir::Handle> {
+        let mut this = self;
+        let handle = this
+            .handle
+            .take()
+            .expect("an admitted entry always owns its handle");
+        match NonDirectoryHandle::try_from(handle) {
+            Ok(handle) => Ok(AdmittedLeaf::new(handle, this.permit.take())),
+            Err(handle) => {
+                drop(this.permit.take());
+                Err(handle)
+            }
+        }
+    }
+}
+
+impl Drop for AdmittedEntry {
+    fn drop(&mut self) {
+        drop(take_permit_after_closing_handle(
+            &mut self.handle,
+            &mut self.permit,
+        ));
+    }
+}
+
 /// An authoritatively classified non-directory and its leaf admission.
 ///
 /// The private handle-then-permit fields document the lifetime invariant, while the explicit drop
@@ -261,11 +345,9 @@ impl AdmittedLeaf {
 
     /// Check and bundle an authoritative non-directory classification with its admission.
     ///
-    /// A directory returns its original handle and permit so the caller can release admission and
-    /// dispatch recursion explicitly without a panic or an invalid leaf state.
-    // the directory outcome deliberately returns both owned values without boxing: this branch is
-    // the hot recursive path, and ownership is what lets the caller close the handle before the
-    // permit. accepting the large error variant avoids an allocation per directory.
+    /// A directory returns its original handle and permit so callers with a multi-entry decision
+    /// can close every related handle before releasing admission. The shared single-entry driver
+    /// instead consumes [`AdmittedEntry`], which centralizes its drop-before-recursion transition.
     #[allow(clippy::result_large_err)]
     pub(crate) fn try_new(
         handle: crate::safedir::Handle,
@@ -385,6 +467,24 @@ pub async fn classify_entry(
     name: &std::ffi::OsStr,
 ) -> std::io::Result<crate::safedir::Handle> {
     dir.child(name).await
+}
+
+/// Classify an entry while transferring its already-acquired admission into one owner.
+///
+/// Callers acquire according to their visitor's pool policy before entering here. The weak
+/// task-local scope lets every fd-bearing await in the classification use the same admission, and
+/// [`AdmittedEntry`] then keeps the handle inside that permit's lifetime until dispatch.
+pub(crate) async fn classify_admitted_entry(
+    dir: &crate::safedir::Dir,
+    name: &std::ffi::OsStr,
+    permit: Option<LeafPermit>,
+) -> std::io::Result<AdmittedEntry> {
+    let admission = permit.as_ref().map(LeafPermit::admission);
+    crate::safedir::with_optional_fd_admission(admission, async move {
+        let handle = classify_entry(dir, name).await?;
+        Ok(AdmittedEntry::new(handle, permit))
+    })
+    .await
 }
 
 /// Resolve the `throttle::Side` from the matching `congestion::Side`.

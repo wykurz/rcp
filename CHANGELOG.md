@@ -13,29 +13,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hardened copy/remove/chmod walk, rlink's dual-tree walk, and delete protection. This fixes
   `EMFILE` failures seen on slow sources with wide trees, especially filesystems such as NFS that
   frequently report `DT_UNKNOWN`: unknown entries that need a filter probe acquire admission before
-  the authoritative stat, while reliable filter skips avoid the pool. Reliable directory hints still
-  classify without leaf admission to preserve deep-tree liveness; if one is stale, its first handle
-  is closed before admission and reclassification. Authoritative filter-probe errors now propagate
-  on these paths, so delete no longer prunes after an authoritative filter probe fails.
+  the authoritative stat, while reliable skips remain cheap in non-destructive source walks.
+  Destructive remove/delete filtering treats every `d_type` as advisory: it classifies under
+  admission and transfers that exact handle into dispatch, so a stale hint cannot bypass a dir-only
+  exclude. Rlink's dual-tree path likewise admits a hinted source directory before touching either
+  side when an update counterpart also needs classification. If a source-only hint is stale, its
+  first handle is closed before admission and reclassification. Authoritative classification errors
+  now propagate on these paths, so delete no longer prunes after an uncertain filter decision.
 
   Leaf ownership and cancellation boundaries are structural rather than call-site convention:
-  admitted leaves can contain only checked non-directory handles and explicitly close the handle
-  before their permit on every destructing exit. Local copy's synchronous data move and filegen's
-  bounded synchronous chunks use one runner that retains admission through cancellation and drops
-  abandoned fd-bearing outputs before releasing it. Recursive overwrite removal uses a separate
-  metadata pool, so recursive-descent directory descriptors remain outside leaf admission without
-  creating a cross-pool wait cycle. Startup/test setup and process reset now replace and close the
-  prior semaphore epoch; `set_max(0)` does the same for dynamically capped pools. Parked waiters
-  wake and either retry on a nonzero replacement or return when the pool is disabled, while old
-  permits can return only to the retired epoch and cannot shrink the new pool. Nonzero dynamic
-  `set_max` updates the current epoch in place. Admitted remote source/destination payload streaming
-  retains a documented cancellation-lifetime follow-up; its wire behavior is unchanged.
+  admitted entries transfer filter decisions without reopening and admitted leaves can contain only
+  checked non-directory handles; both explicitly close the handle before their permit on every
+  destructing exit. Remove verifies a directory after opening it for descent and rechecks that name
+  again before the final `rmdir`; nondirectory actions retain their classified handle for exact
+  metadata/accounting, and their fd-relative unlink cannot remove a swapped-in directory. Local
+  copy's synchronous data move and filegen's bounded synchronous chunks use one runner that retains
+  admission through cancellation and drops abandoned fd-bearing outputs before releasing it.
+  Recursive overwrite removal uses a separate metadata pool, so recursive-descent directory
+  descriptors remain outside leaf admission without creating a cross-pool wait cycle. Startup/test
+  setup and process reset now replace and close the prior semaphore epoch; `set_max(0)` does the
+  same for dynamically capped pools. Parked waiters wake and either retry on a nonzero replacement
+  or return when the pool is disabled, while old permits can return only to the retired epoch and
+  cannot shrink the new pool. Nonzero dynamic `set_max` updates the current epoch in place; growth
+  now cancels pending shrink debt before adding capacity, shrink publication gates replacement
+  admission, and a raw permit returned by a cancelled Tokio waiter pays that debt before admitting
+  work. Admitted remote source/destination payload streaming retains a documented
+  cancellation-lifetime follow-up; its wire behavior is unchanged.
+
+  Fail-early traversal now quiesces every recursively spawned async descendant before returning,
+  including tasks that had not yet received their first poll. Cancelling an async waiter discards
+  blocking work that has not started; a blocking job that won the start/cancel race is deliberately
+  not part of that wait and keeps its descriptor-admission lease until its work and abandoned output
+  finish. The existing bounded runtime shutdown therefore remains able to abandon a job stuck
+  indefinitely on dead storage.
 
   When `--max-open-files` is omitted and the current soft `RLIMIT_NOFILE` is nonzero, each
   independent OpenFile and PendingMeta pool now receives
-  `min(max(1, floor((soft limit × 80%) / 4)), 4096)`; a zero soft limit leaves admission disabled.
+  `min(max(1, floor((soft limit × 80%) / 5)), 4096)`; a zero soft limit leaves admission disabled.
   The process soft limit is no longer silently raised to its hard limit. Compared with the previous
-  released default, this is approximately one quarter as many admitted operations only for uncapped
+  released default, this is approximately one fifth as many admitted operations only for uncapped
   runs whose soft and hard limits were equal; a lower soft limit can reduce the count further, while
   systems where both old and new calculations hit 4096 may see no change. An explicit
   `--max-open-files=N` and filegen's available-CPU-parallelism default are unchanged.
@@ -575,11 +591,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   complete directory to fail its announce against the closed peer, which under `-L` (where the
   source's dir-fd budget does not bound them) could stall failure shutdown without bound. The `-L`
   walk itself now carries an outstanding-directory **credit** mirroring the hardened walk's dir-fd
-  budget — one credit per unacknowledged `Directory`, returned by its
-  `DirectoryCreated`/`DirectorySkipped`, closed on dispatch exit with the same typed marker — so a
-  slow ack path (one large reused-directory manifest) can no longer let the path-based walk register
-  an entire tree at the destination (an open fd, stored metadata, and possibly a queued manifest per
-  directory, bounded by nothing but tree size).
+  budget. Every sent `Directory` owns one credit; `DirectoryCreated` transfers it into that
+  directory's Pass-2 task and releases it when the task finishes, while `DirectorySkipped` releases
+  it immediately. The gate closes on dispatch exit with the same typed marker, so a slow ack,
+  manifest, or direct-file Pass-2 path cannot create an unbounded backlog at that stage. Zero-file
+  Pass 2 releases immediately, so destination fds retained for recursive ancestors can outlive the
+  credit; holding it through destination directory completion would deadlock a directory-only chain.
+  The credit is stored in the same map entry as the directory's Pass-1 contents, so an
+  unreadable-directory arm or absent/duplicate acknowledgement cannot omit or invent one.
 - Four corrections to the (unreleased) strict-mode ACL containment and its rollback, each closing a
   way the destination could end with ACL state that came from neither the source nor its own past: a
   **direct file operand** copied into a parent carrying a default ACL kept the inherited entries
