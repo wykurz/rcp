@@ -5,10 +5,11 @@
 //! drives the traversal:
 //!
 //! 1. gated `read_entries` on the open hardened directory,
-//! 2. per child: [`walk::preacquire_leaf_permit`] for every possible leaf,
-//! 3. authoritative-or-hinted [`walk::filter_is_dir`] + [`walk::should_skip_entry`]
-//!    filter decision (against the child's [`EntryCx::filter_path`]),
-//! 4. acquire-then-spawn one task per non-skipped child, joining/folding via
+//! 2. per child: derive an explicit [`walk::EntryAdmission`] from its type hint,
+//! 3. fallible authoritative-or-hinted [`walk::filter_is_dir`] +
+//!    [`walk::should_skip_entry`] filter decision (against the child's
+//!    [`EntryCx::filter_path`]); only a `DT_UNKNOWN` filter probe admits first,
+//! 4. admit each remaining possible leaf immediately before spawn, joining/folding via
 //!    [`join_and_fold`] (NOT batched: see [`walk_dir_contents`] for why the permit
 //!    is acquired and the task spawned in the same loop step),
 //! 5. in each task: authoritative [`Dir::child`] classification, then either
@@ -74,9 +75,11 @@
 //! - **`on_skip`** mirrors copy's inline filter-skip: `report_skip` in dry-run +
 //!   `skipped_summary_for(kind)`.
 //! - **`permit_kind`** = `OpenFile`; every entry not positively hinted as a
-//!   directory is admitted before spawn. Root/delegated entries and known
-//!   directories acquire before authoritative classification. An entry proven
-//!   to be a directory releases that provisional permit before descent.
+//!   directory is admitted before spawn. Roots and delegated entries acquire
+//!   before authoritative classification. A positive directory hint may classify
+//!   without admission; if stale, that first handle is closed before admission is
+//!   awaited and classification is repeated. An authoritative directory releases
+//!   any provisional permit before descent.
 //!
 //! The delegated-subtree case (rlink handing copy an update-only/type-changed
 //! subtree rooted below the original filter root) is carried by seeding the root
@@ -196,7 +199,7 @@ pub(crate) fn blocking_task_guard() -> Option<impl Drop + Send + 'static> {
 }
 use crate::progress::Progress;
 use crate::safedir::{Dir, Handle};
-use crate::walk::{self, EntryKind, LeafPermit, PermitKind};
+use crate::walk::{self, EntryAdmission, EntryKind, LeafPermit, PermitKind};
 
 /// A per-run summary accumulated by the walk.
 ///
@@ -455,8 +458,8 @@ pub trait WalkVisitor: Send + Sync + 'static {
 /// Process one already-located entry: classify it authoritatively via
 /// [`Dir::child`], then dispatch.
 ///
-/// - **Non-directory:** call [`WalkVisitor::visit_leaf`] holding `permit`.
-/// - **Directory:** `drop(permit)` — **the one and only drop-before-recurse
+/// - **Non-directory:** call [`WalkVisitor::visit_leaf`] holding admission.
+/// - **Directory:** drop admission — **the one and only drop-before-recurse
 ///   site** — then [`WalkVisitor::dir_pre`]; on [`DirAction::Descend`], walk the
 ///   contents via [`walk_dir_contents`] (threading the child context) and finish
 ///   with [`WalkVisitor::dir_post`].
@@ -469,12 +472,18 @@ pub async fn process_entry<V>(
     visitor: Arc<V>,
     cx: EntryCx,
     parent_ctx: V::DirContext,
-    permit: Option<LeafPermit>,
+    admission: impl Into<EntryAdmission> + Send,
 ) -> Result<V::Summary, OperationError<V::Summary>>
 where
     V: WalkVisitor,
 {
-    scope_tasks(process_entry_tracked(visitor, cx, parent_ctx, permit)).await
+    scope_tasks(process_entry_tracked(
+        visitor,
+        cx,
+        parent_ctx,
+        admission.into(),
+    ))
+    .await
 }
 
 #[async_recursion]
@@ -482,37 +491,28 @@ async fn process_entry_tracked<V>(
     visitor: Arc<V>,
     cx: EntryCx,
     parent_ctx: V::DirContext,
-    permit: Option<LeafPermit>,
+    admission: EntryAdmission,
 ) -> Result<V::Summary, OperationError<V::Summary>>
 where
     V: WalkVisitor,
 {
     let _ops_guard = cx.prog_track.ops.guard();
-    // root and delegated callers do not necessarily pass through the directory spawn loop. repair
-    // a missing admission here, before authoritative classification opens the entry's O_PATH fd.
-    // if the entry is a directory, the single drop-before-recurse branch below releases this
-    // provisional permit before any descent.
-    let permit = walk::ensure_leaf_permit(visitor.permit_kind(), permit).await;
     // authoritative classification: one fstat, in one place. a symlink swap between
     // the getdents hint and here is caught (O_NOFOLLOW) and classified as Symlink.
-    let classification_admission = permit.as_ref().map(LeafPermit::admission);
-    let handle = match crate::safedir::with_optional_fd_admission(
-        classification_admission,
-        cx.parent.child(&cx.name),
-    )
-    .await
-    {
-        Ok(handle) => handle,
-        Err(err) => {
-            let err = anyhow::Error::new(err)
-                .context(format!("failed reading metadata from {:?}", &cx.real_path));
-            return Err(OperationError::new(err, Default::default()));
-        }
-    };
+    let (handle, admission) =
+        match walk::classify_entry(&cx.parent, &cx.name, visitor.permit_kind(), admission).await {
+            Ok(classified) => classified,
+            Err(err) => {
+                let err = anyhow::Error::new(err)
+                    .context(format!("failed reading metadata from {:?}", &cx.real_path));
+                return Err(OperationError::new(err, Default::default()));
+            }
+        };
     let kind = handle.kind();
     if kind != EntryKind::Dir {
         // leaf: the permit is held across the (non-recursive) leaf work and dropped
         // when `visit_leaf` returns. nothing below this can recurse.
+        let permit = admission.into_permit();
         let leaf_admission = permit.as_ref().map(LeafPermit::admission);
         let visit = visitor.visit_leaf(&cx, &parent_ctx, handle, kind, permit);
         return crate::safedir::with_optional_fd_admission(leaf_admission, visit).await;
@@ -521,7 +521,7 @@ where
     // an authoritative directory recurses; its children acquire their own permits.
     // releasing the provisional entry permit now is what makes the hold-and-wait deadlock
     // structurally impossible.
-    drop(permit);
+    drop(admission);
     let action = visitor.dir_pre(&cx, &parent_ctx, &handle).await?;
     // dir_pre has copied everything its state needs and opened the directory used for descent.
     // the classification handle is redundant from here on and must not inflate the per-depth fd
@@ -564,10 +564,11 @@ where
 
 /// Walk the contents of an open hardened directory.
 ///
-/// Enumerates `dir` (gated `read_entries`), pre-acquires a leaf permit for each
-/// possible leaf before any authoritative filter probe, applies the visitor's
-/// filter, and spawns one [`process_entry`] task per non-skipped child. Joins
-/// them with a fold + fail-early via [`join_and_fold`].
+/// Enumerates `dir` (gated `read_entries`), admits only `DT_UNKNOWN` entries that need an
+/// authoritative filter probe, applies the visitor's filter, and then admits each remaining
+/// possible leaf immediately before spawning one [`process_entry`] task per non-skipped child.
+/// Positive directory hints carry their explicit unadmitted state into classification. Tasks are
+/// joined with a fold + fail-early via [`join_and_fold`].
 ///
 /// Returns the folded child summary (filter-skip contributions included) and the
 /// [`ProcessedChildren`] list of the names that were spawned. `parent_cx`
@@ -638,11 +639,15 @@ where
     let mut processed = ProcessedChildren::default();
     let mut join_set = tokio::task::JoinSet::new();
     for (entry_name, hint) in entries {
-        // admit every possible leaf before any fd-bearing work. a positively-known directory takes
-        // no spawn-time permit; `process_entry` obtains a short provisional permit before its own
-        // authoritative classification and releases it before recursion. DT_UNKNOWN must acquire
-        // here because the active-filter probe below itself opens an O_PATH handle.
-        let permit = walk::preacquire_leaf_permit(visitor.permit_kind(), hint).await;
+        let mut admission = EntryAdmission::from_hint(hint);
+        // build the child's owned context once; reused whether it is skipped or spawned, and gives
+        // an authoritative probe failure its operation-path context.
+        let child_cx = parent_cx.child(Arc::clone(&dir), &entry_name);
+        // a DT_UNKNOWN filter decision opens an O_PATH handle, so it is the only filter path that
+        // acquires before filtering. reliable hints keep cheap skips outside leaf admission.
+        if hint.is_none() && visitor.filter().is_some() {
+            admission = walk::ensure_entry_admission(visitor.permit_kind(), admission).await;
+        }
         // the FILTER `is_dir` decision uses the AUTHORITATIVE type when the getdents
         // hint is DT_UNKNOWN and a filter is active (one extra fstat only then, never
         // follows a symlink) — the single classification path that closes the
@@ -650,14 +655,22 @@ where
         // used only for the FILTER decision; the recurse-vs-leaf choice is made later from the
         // AUTHORITATIVE `child()` handle in `process_entry`, so there is no control-flow
         // dependence here that would need `force_authoritative`.
-        let filter_admission = permit.as_ref().map(LeafPermit::admission);
-        let entry_is_dir = crate::safedir::with_optional_fd_admission(
-            filter_admission,
+        let entry_is_dir = match crate::safedir::with_optional_fd_admission(
+            admission.admission(),
             walk::filter_is_dir(visitor.filter(), &dir, &entry_name, hint, false),
         )
-        .await;
-        // build the child's owned context once; reused whether it is skipped or spawned.
-        let child_cx = parent_cx.child(Arc::clone(&dir), &entry_name);
+        .await
+        {
+            Ok(entry_is_dir) => entry_is_dir,
+            Err(error) => {
+                abort_and_join(&mut join_set).await;
+                let error = anyhow::Error::new(error).context(format!(
+                    "failed reading metadata from {:?}",
+                    &child_cx.real_path
+                ));
+                return Err(OperationError::new(error, skipped_summary));
+            }
+        };
         if let Some(skip_result) =
             walk::should_skip_entry_ref(visitor.filter(), &child_cx.filter_path, entry_is_dir)
         {
@@ -682,6 +695,9 @@ where
                 skipped_summary + visitor.on_skip(&child_cx, entry_kind, &skip_result);
             continue;
         }
+        // every included possible leaf acquires immediately before spawn. a positive directory
+        // hint retains its explicit exception state into the worker.
+        admission = walk::ensure_entry_admission(visitor.permit_kind(), admission).await;
         // own everything moved into the task (cancellation safety): the child context
         // (source parent Arc + owned name/paths), the visitor handle, and a clone of
         // the inherited context (copy's destination parent dir).
@@ -690,7 +706,7 @@ where
         processed.names.push(entry_name);
         spawn_tracked(
             &mut join_set,
-            process_entry(task_visitor, child_cx, task_ctx, permit),
+            process_entry(task_visitor, child_cx, task_ctx, admission),
         );
     }
     let folded =
@@ -986,6 +1002,22 @@ mod tests {
     /// process-wide throttle mutation (see `.config/nextest.toml`).
     mod max_open_files_tests {
         use super::*;
+        use anyhow::Context;
+        use std::os::unix::fs::MetadataExt;
+
+        fn inode_is_open(path: &std::path::Path) -> anyhow::Result<bool> {
+            let metadata = std::fs::symlink_metadata(path)?;
+            for entry in std::fs::read_dir("/proc/self/fd")? {
+                let entry = entry?;
+                let Ok(open_metadata) = std::fs::metadata(entry.path()) else {
+                    continue;
+                };
+                if open_metadata.dev() == metadata.dev() && open_metadata.ino() == metadata.ino() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
 
         /// A caller that did not pre-acquire must reserve capacity before the driver's fd-based
         /// authoritative classification, rather than opening a `Handle` first.
@@ -1100,6 +1132,195 @@ mod tests {
                 processed.names().is_empty(),
                 "filtered entry must not spawn"
             );
+            Ok(())
+        }
+
+        /// A reliable file hint lets filtering reject the entry without consuming leaf capacity.
+        #[tokio::test]
+        async fn filtered_hinted_file_does_not_wait_for_admission() -> anyhow::Result<()> {
+            let root = crate::testutils::create_temp_dir().await?;
+            tokio::fs::write(root.join("leaf"), b"x").await?;
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let held = throttle::pending_meta_permit().await;
+            let dir = Arc::new(
+                Dir::open_parent_dir(&root, congestion::Side::Source)
+                    .await?
+                    .into_tree(),
+            );
+            let mut filter = FilterSettings::default();
+            filter.add_exclude("leaf")?;
+            let visitor = Arc::new(CountingVisitor {
+                leaves_seen: Arc::new(AtomicUsize::new(0)),
+                filter: Some(filter),
+            });
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+            let walk = scope_tasks(walk_dir_entries(
+                visitor,
+                dir,
+                &parent_cx,
+                &(),
+                vec![(OsString::from("leaf"), Some(EntryKind::File))],
+            ));
+            tokio::pin!(walk);
+            let first_poll = futures::poll!(walk.as_mut());
+            let completed_while_saturated = first_poll.is_ready();
+            drop(held);
+            let result = match first_poll {
+                std::task::Poll::Ready(result) => result,
+                std::task::Poll::Pending => admission
+                    .run_with_timeout(Duration::from_secs(20), walk.as_mut())
+                    .await
+                    .context("filtered hinted file did not resume after capacity was released")?,
+            };
+            let (summary, processed) = result.map_err(|error| error.source)?;
+            assert!(
+                completed_while_saturated,
+                "a cheap filter skip waited for pending-metadata admission"
+            );
+            assert_eq!(summary.files, 0);
+            assert!(processed.names().is_empty());
+            Ok(())
+        }
+
+        /// A positive directory hint is the one classification allowed outside leaf admission.
+        #[tokio::test]
+        async fn hinted_directory_classifies_while_pool_is_saturated() -> anyhow::Result<()> {
+            let root = crate::testutils::create_temp_dir().await?;
+            tokio::fs::create_dir(root.join("dir")).await?;
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let held = throttle::pending_meta_permit().await;
+            let parent = Arc::new(
+                Dir::open_parent_dir(&root, congestion::Side::Source)
+                    .await?
+                    .into_tree(),
+            );
+            let visitor = Arc::new(CountingVisitor {
+                leaves_seen: Arc::new(AtomicUsize::new(0)),
+                filter: None,
+            });
+            let parent_cx = root_cx(Arc::clone(&parent), OsStr::new("root"), root);
+            let result = admission
+                .run_with_timeout(
+                    Duration::from_secs(1),
+                    scope_tasks(walk_dir_entries(
+                        visitor,
+                        parent,
+                        &parent_cx,
+                        &(),
+                        vec![(OsString::from("dir"), Some(EntryKind::Dir))],
+                    )),
+                )
+                .await;
+            drop(held);
+            let (summary, processed) = result
+                .context("hinted directory waited for pending-metadata admission")?
+                .map_err(|error| error.source)?;
+            assert_eq!(summary.dirs, 1);
+            assert_eq!(processed.names(), &[OsString::from("dir")]);
+            Ok(())
+        }
+
+        /// A stale directory hint must close its first handle, admit, and classify the name again.
+        #[tokio::test(flavor = "current_thread")]
+        async fn stale_directory_hint_closes_admits_and_reclassifies() -> anyhow::Result<()> {
+            let root = crate::testutils::create_temp_dir().await?;
+            let entry = root.join("entry");
+            tokio::fs::write(&entry, b"old").await?;
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let held_leaf = throttle::pending_meta_permit().await;
+            let parent = Arc::new(
+                Dir::open_parent_dir(&root, congestion::Side::Source)
+                    .await?
+                    .into_tree(),
+            );
+            let stat_resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
+            admission.set_max_ops_in_flight(stat_resource, 1);
+            let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
+            let visitor = Arc::new(CountingVisitor {
+                leaves_seen: Arc::new(AtomicUsize::new(0)),
+                filter: None,
+            });
+            let cx = root_cx(parent, OsStr::new("entry"), entry.clone());
+            let mut task = tokio::spawn(process_entry(
+                visitor,
+                cx,
+                (),
+                walk::EntryAdmission::HintedDirectory,
+            ));
+            tokio::task::yield_now().await;
+            drop(held_stat);
+            let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
+            let mut first_handle_closed = false;
+            for _ in 0..100 {
+                if !inode_is_open(&entry)? {
+                    first_handle_closed = true;
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            tokio::fs::remove_file(&entry).await?;
+            tokio::fs::create_dir(&entry).await?;
+            drop(held_leaf);
+            tokio::task::yield_now().await;
+            drop(held_stat);
+            let task_result = admission
+                .run_with_timeout(Duration::from_secs(20), &mut task)
+                .await
+                .context("stale hinted entry did not resume after admission was released")?;
+            let summary = task_result?.map_err(|error| error.source)?;
+            assert!(
+                first_handle_closed,
+                "stale hinted-directory classification retained its first leaf handle while waiting"
+            );
+            assert_eq!(
+                summary,
+                CountSummary {
+                    dirs: 1,
+                    ..Default::default()
+                },
+                "the admitted reclassification must observe the replacement directory"
+            );
+            Ok(())
+        }
+
+        /// A failed authoritative filter probe is an operation error, not a cheap non-directory.
+        #[tokio::test]
+        async fn failed_authoritative_filter_probe_propagates() -> anyhow::Result<()> {
+            let root = crate::testutils::create_temp_dir().await?;
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            let dir = Arc::new(
+                Dir::open_parent_dir(&root, congestion::Side::Source)
+                    .await?
+                    .into_tree(),
+            );
+            let mut filter = FilterSettings::default();
+            filter.add_exclude("vanished")?;
+            let visitor = Arc::new(CountingVisitor {
+                leaves_seen: Arc::new(AtomicUsize::new(0)),
+                filter: Some(filter),
+            });
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root.clone());
+            let result = admission
+                .run_with_timeout(
+                    Duration::from_secs(20),
+                    scope_tasks(walk_dir_entries(
+                        visitor,
+                        dir,
+                        &parent_cx,
+                        &(),
+                        vec![(OsString::from("vanished"), None)],
+                    )),
+                )
+                .await
+                .context("failed filter probe did not terminate")?;
+            let error = result.expect_err("a missing authoritative probe target must fail");
+            let rendered = format!("{:#}", error.source);
+            assert!(rendered.contains("failed reading metadata from"));
+            assert!(rendered.contains("vanished"));
             Ok(())
         }
 

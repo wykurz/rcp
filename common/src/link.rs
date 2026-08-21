@@ -11,7 +11,7 @@ use crate::filecmp;
 use crate::preserve;
 use crate::progress;
 use crate::safedir::{self, Dir};
-use crate::walk::{self, EntryKind, LeafPermit, PermitKind};
+use crate::walk::{self, EntryAdmission, EntryKind, LeafPermit, PermitKind};
 
 /// Error type for link operations. See [`crate::error::OperationError`] for
 /// logging conventions and rationale.
@@ -587,7 +587,7 @@ async fn link_inner(
         std::path::Path::new(""),
         settings,
         is_fresh,
-        permit,
+        permit.into(),
     )
     .await
 }
@@ -656,12 +656,11 @@ impl DeleteKeepSet {
 /// the dual tree. With no update tree, a source file is hard-linked, a source symlink is copied,
 /// and a directory recurses.
 ///
-/// `permit` is provisional entry admission, normally acquired by a directory spawn loop via
-/// [`walk::preacquire_leaf_permit`]. Root/delegated calls repair a missing permit before
-/// classification. Every non-recursive branch retains it through its final fd-bearing operation;
-/// direct directory recursion releases it before descent, while delegated copy owns that decision
-/// for the update entry it classifies.
-#[instrument(skip(prog_track, src_parent, update, dst_parent, settings, permit))]
+/// `admission` is the explicit scheduling state supplied by the directory loop. Every
+/// non-recursive branch retains a held permit through its final fd-bearing operation; direct
+/// directory recursion releases it before descent, while delegated copy owns that decision for the
+/// update entry it classifies.
+#[instrument(skip(prog_track, src_parent, update, dst_parent, settings, admission))]
 #[async_recursion]
 #[allow(clippy::too_many_arguments)]
 async fn link_internal(
@@ -676,14 +675,9 @@ async fn link_internal(
     rel_path: &std::path::Path,
     settings: &Settings,
     is_fresh: bool,
-    permit: Option<LeafPermit>,
+    admission: EntryAdmission,
 ) -> Result<Summary, Error> {
     let _prog_guard = prog_track.ops.guard();
-    // `link_internal` is also the root/delegated entry point, so it cannot assume a directory spawn
-    // loop supplied admission. repair a missing permit before either source/update classification
-    // opens an O_PATH handle. direct directory recursion releases it below; delegated copy receives
-    // the guard and uses the shared driver's authoritative drop-before-recurse branch.
-    let permit = walk::ensure_leaf_permit(PermitKind::OpenFile, permit).await;
     // real filesystem paths reconstructed from the roots + accumulated relative path. used for
     // diagnostics, the path-based `--delete` prune scan / `rm`, the `--dereference` canonicalize
     // fallback inside copy, and to derive `dst_name`. joining an empty `rel_path` (the root entry)
@@ -713,13 +707,20 @@ async fn link_internal(
         })?
         .to_owned();
     tracing::debug!("classifying source entry");
-    let src_handle = safedir::with_optional_fd_admission(
-        permit.as_ref().map(LeafPermit::admission),
-        src_parent.child(name),
-    )
-    .await
-    .with_context(|| format!("failed reading metadata from {:?}", &src_path))
-    .map_err(|err| Error::new(err, Default::default()))?;
+    let (src_handle, mut admission) =
+        walk::classify_entry(src_parent, name, PermitKind::OpenFile, admission)
+            .await
+            .with_context(|| format!("failed reading metadata from {:?}", &src_path))
+            .map_err(|err| Error::new(err, Default::default()))?;
+    if update.is_some() {
+        // the source hint says nothing about the update counterpart. ensure it is admitted before
+        // opening a possible update leaf; a directory result releases this provisional permit at
+        // the common recursion boundary below.
+        if matches!(admission, EntryAdmission::HintedDirectory) {
+            admission = EntryAdmission::RootOrDelegated;
+        }
+        admission = walk::ensure_entry_admission(PermitKind::OpenFile, admission).await;
+    }
     // classify the update entry at this name (if an update tree is present at this level). a
     // NotFound is the "this path is missing from update" case; under --update-exclusive it means
     // we're done (nothing materializes), otherwise we fall back to no-update mode for this entry.
@@ -727,7 +728,7 @@ async fn link_internal(
         Some((update_dir, update_name)) => {
             tracing::debug!("classifying 'update' entry");
             match safedir::with_optional_fd_admission(
-                permit.as_ref().map(LeafPermit::admission),
+                admission.admission(),
                 update_dir.child(update_name),
             )
             .await
@@ -813,7 +814,7 @@ async fn link_internal(
     // final fd-bearing operation. a delegated copy owns the same guard and drops it itself if the
     // authoritative update entry is a directory. only the direct dual-tree directory recursion at
     // the bottom releases it locally.
-    let open_file_guard = permit.map(LeafPermit::into_open_file);
+    let open_file_guard = admission.into_permit().map(LeafPermit::into_open_file);
     if let Some(update_entry) = update_handle.as_ref() {
         let (update_dir, update_name) = update.unwrap();
         let update_path = update_path.as_deref().unwrap();
@@ -844,7 +845,7 @@ async fn link_internal(
                 rel_path,
                 settings,
                 is_fresh,
-                open_file_guard,
+                EntryAdmission::from(open_file_guard.map(LeafPermit::OpenFile)),
             )
             .await;
         }
@@ -904,7 +905,7 @@ async fn link_internal(
                 rel_path,
                 settings,
                 is_fresh,
-                open_file_guard,
+                EntryAdmission::from(open_file_guard.map(LeafPermit::OpenFile)),
             )
             .await;
         }
@@ -923,7 +924,7 @@ async fn link_internal(
                 rel_path,
                 settings,
                 is_fresh,
-                open_file_guard,
+                EntryAdmission::from(open_file_guard.map(LeafPermit::OpenFile)),
             )
             .await;
         }
@@ -972,7 +973,7 @@ async fn link_internal(
                 rel_path,
                 settings,
                 is_fresh,
-                open_file_guard,
+                EntryAdmission::from(open_file_guard.map(LeafPermit::OpenFile)),
             )
             .await;
         }
@@ -1074,7 +1075,7 @@ async fn delegate_copy(
     filter_base: &std::path::Path,
     settings: &Settings,
     is_fresh: bool,
-    open_file_guard: Option<throttle::OpenFileGuard>,
+    admission: EntryAdmission,
 ) -> Result<Summary, Error> {
     let copy_summary = copy::copy_child(
         prog_track,
@@ -1087,7 +1088,7 @@ async fn delegate_copy(
         &settings.copy_settings,
         &settings.preserve,
         is_fresh,
-        open_file_guard,
+        admission,
     )
     .await
     .map_err(|err| {
@@ -1285,18 +1286,21 @@ async fn link_dir_contents(
     );
     // iterate through src entries and recursively call "link" on each one
     for (entry_name, hint) in src_entries {
-        // classification for the special-skip, symlink-dispatch, and permit pre-acquire decisions
-        // uses the cheap getdents hint; `link_internal` re-classifies authoritatively via fstat
+        // classification for the special-skip, symlink-dispatch, and admission decisions uses the
+        // cheap getdents hint; `link_internal` re-classifies authoritatively via fstat
         // before acting. an unknown hint (DT_UNKNOWN) is treated as a regular file for those, the
         // same default the old path-based walk used when `file_type()` was unavailable.
         let entry_kind = hint.unwrap_or(EntryKind::File);
         let entry_is_symlink = entry_kind == EntryKind::Symlink;
         let entry_rel = rel_path.join(&entry_name);
         let entry_path = src_path.join(&entry_name);
-        // admit every possible leaf before a DT_UNKNOWN filter/dry-run probe can open an O_PATH
-        // handle. a known directory takes no spawn-time permit; `link_internal` obtains only a
-        // short provisional one for authoritative classification and drops it before recursion.
-        let permit = walk::preacquire_leaf_permit(PermitKind::OpenFile, hint).await;
+        let mut admission = EntryAdmission::from_hint(hint);
+        // a DT_UNKNOWN filter or dry-run type decision opens an O_PATH handle, so it is the only
+        // decision path that acquires before filtering. reliable hints keep cheap exits outside
+        // open-file admission.
+        if hint.is_none() && (settings.filter.is_some() || settings.dry_run.is_some()) {
+            admission = walk::ensure_entry_admission(PermitKind::OpenFile, admission).await;
+        }
         // the dir-ness that drives the FILTER decision AND the dry-run recurse-vs-leaf branch
         // below must be AUTHORITATIVE: on a DT_UNKNOWN entry, defaulting to non-dir would wrongly
         // omit a real directory's whole subtree under an is_dir-dependent filter, or (in dry-run,
@@ -1304,8 +1308,8 @@ async fn link_dir_contents(
         // fstats when a filter is active OR — via force_authoritative — when dry-run needs the
         // type for control flow. One extra fstat only in those DT_UNKNOWN cases (never follows
         // symlinks).
-        let entry_is_dir = safedir::with_optional_fd_admission(
-            permit.as_ref().map(LeafPermit::admission),
+        let entry_is_dir = match safedir::with_optional_fd_admission(
+            admission.admission(),
             walk::filter_is_dir(
                 settings.filter.as_ref(),
                 src_dir,
@@ -1314,7 +1318,18 @@ async fn link_dir_contents(
                 settings.dry_run.is_some(),
             ),
         )
-        .await;
+        .await
+        {
+            Ok(entry_is_dir) => entry_is_dir,
+            Err(error) => {
+                crate::walk_driver::abort_and_join(&mut join_set).await;
+                return Err(Error::new(
+                    anyhow::Error::new(error)
+                        .context(format!("failed reading metadata from {entry_path:?}")),
+                    link_summary,
+                ));
+            }
+        };
         // apply filter if configured (logical path == entry_rel, since link's filter_base is empty)
         if let Some(skip_result) =
             walk::should_skip_entry(&settings.filter, &entry_rel, entry_is_dir)
@@ -1373,6 +1388,7 @@ async fn link_dir_contents(
             }
             continue;
         }
+        admission = walk::ensure_entry_admission(PermitKind::OpenFile, admission).await;
         // Acquire-then-IMMEDIATELY-spawn (the permit is moved into `do_link` and spawned on the next
         // line, in the same loop step) is load-bearing: collecting a Vec of pre-acquired permits and
         // spawning later would hold N permits before any task runs and self-deadlock a saturated pool.
@@ -1401,7 +1417,7 @@ async fn link_dir_contents(
                 &entry_rel,
                 &settings,
                 is_fresh,
-                permit,
+                admission,
             )
             .await
         };
@@ -1421,20 +1437,23 @@ async fn link_dir_contents(
                 )
             })
             .map_err(|err| Error::new(err, link_summary))?;
-        // iterate through update entries and copy names absent from src. open-file admission is
-        // acquired incrementally before any DT_UNKNOWN filter probe and transferred into
-        // `copy_child`; copy therefore never re-acquires while the outer task holds it. the pending-
-        // metadata pool remains separate for any overwrite-triggered rm work.
+        // iterate through update entries and copy names absent from src. only a DT_UNKNOWN filter
+        // probe acquires before cheap decisions; included possible leaves acquire immediately
+        // before spawn and transfer the explicit state into `copy_child`.
         for (entry_name, hint) in update_entries {
             let entry_kind = hint.unwrap_or(EntryKind::File);
             let entry_rel = rel_path.join(&entry_name);
-            let permit = walk::preacquire_leaf_permit(PermitKind::OpenFile, hint).await;
+            let update_entry_path = update_root.join(&entry_rel);
+            let mut admission = EntryAdmission::from_hint(hint);
+            if hint.is_none() && settings.filter.is_some() {
+                admission = walk::ensure_entry_admission(PermitKind::OpenFile, admission).await;
+            }
             // the FILTER `is_dir` decision must use the AUTHORITATIVE type: on a DT_UNKNOWN update
             // entry with an is_dir-dependent include filter, defaulting to non-dir would wrongly
             // omit a real directory's whole subtree. one extra fstat only in that DT_UNKNOWN+filter
             // case (never follows symlinks).
-            let entry_is_dir = safedir::with_optional_fd_admission(
-                permit.as_ref().map(LeafPermit::admission),
+            let entry_is_dir = match safedir::with_optional_fd_admission(
+                admission.admission(),
                 walk::filter_is_dir(
                     settings.filter.as_ref(),
                     update_dir,
@@ -1445,7 +1464,19 @@ async fn link_dir_contents(
                     false,
                 ),
             )
-            .await;
+            .await
+            {
+                Ok(entry_is_dir) => entry_is_dir,
+                Err(error) => {
+                    crate::walk_driver::abort_and_join(&mut join_set).await;
+                    return Err(Error::new(
+                        anyhow::Error::new(error).context(format!(
+                            "failed reading metadata from {update_entry_path:?}"
+                        )),
+                        link_summary,
+                    ));
+                }
+            };
             // evaluate the filter for this update entry at its logical path. This MUST run
             // regardless of `--delete`: `copy_child` wraps `copy_internal`, which (unlike the old
             // path-based `copy_with_filter_base`) does NOT re-apply a top-level filter to the entry
@@ -1475,7 +1506,6 @@ async fn link_dir_contents(
             // `copy_with_filter_base`'s top-level filter), and record the skip in the summary /
             // counters exactly as the source loop does for a filtered src entry.
             if let Some(skip_result) = skip_result {
-                let update_entry_path = update_root.join(&entry_rel);
                 if let Some(mode) = settings.dry_run {
                     crate::dry_run::report_skip(
                         &update_entry_path,
@@ -1492,13 +1522,32 @@ async fn link_dir_contents(
                 entry_kind.inc_skipped(prog_track);
                 continue;
             }
+            if settings.copy_settings.skip_specials && entry_kind == EntryKind::Special {
+                tracing::debug!("skipping special file {:?}", &update_entry_path);
+                if let Some(mode) = settings.dry_run {
+                    match mode {
+                        crate::config::DryRunMode::Brief => {}
+                        crate::config::DryRunMode::All => {
+                            println!("skip special {:?}", &update_entry_path)
+                        }
+                        crate::config::DryRunMode::Explain => {
+                            println!(
+                                "skip special {:?} (unsupported file type: {:?})",
+                                &update_entry_path, entry_kind
+                            );
+                        }
+                    }
+                }
+                link_summary.copy_summary.specials_skipped += 1;
+                prog_track.specials_skipped.inc();
+                continue;
+            }
+            admission = walk::ensure_entry_admission(PermitKind::OpenFile, admission).await;
             tracing::debug!("found a new entry in the 'update' directory");
-            let update_entry_path = update_root.join(&entry_rel);
             let dst_entry_path = dst_path.join(&entry_name);
             let update_parent = Arc::clone(update_dir);
             let dst_parent = dst_dir.map(Arc::clone);
             let settings = settings.clone();
-            let open_file_guard = permit.map(LeafPermit::into_open_file);
             let do_copy = move || async move {
                 // filter-base for the delegated copy: this update entry's path relative to the
                 // source root, so any --delete pruning inside it matches the include/exclude filter
@@ -1513,7 +1562,7 @@ async fn link_dir_contents(
                     &entry_rel,
                     &settings,
                     is_fresh,
-                    open_file_guard,
+                    admission,
                 )
                 .await
             };
@@ -4103,6 +4152,285 @@ mod link_tests {
     mod max_open_files_tests {
         use super::*;
 
+        /// A reliable file hint lets the rlink filter skip before open-file admission.
+        #[tokio::test]
+        async fn filtered_hinted_file_does_not_wait_for_admission() -> Result<(), anyhow::Error> {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("src");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::write(src.join("leaf"), b"x").await?;
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let held = throttle::open_file_permit().await;
+            let src_dir =
+                Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+            let hints = src_dir.read_entries().await?;
+            assert_eq!(
+                hints,
+                vec![(std::ffi::OsString::from("leaf"), Some(EntryKind::File))],
+                "the fixture filesystem must provide the reliable hint this test exercises"
+            );
+            let mut filter = crate::filter::FilterSettings::new();
+            filter.add_exclude("leaf")?;
+            let mut settings = common_settings(false, false);
+            settings.filter = Some(filter.clone());
+            settings.copy_settings.filter = Some(filter);
+            let dst = root.join("dst");
+            let operation = link_dir_contents(
+                &PROGRESS,
+                &src_dir,
+                None,
+                None,
+                None,
+                std::ffi::OsStr::new("dst"),
+                &src,
+                &dst,
+                None,
+                std::path::Path::new(""),
+                &src,
+                &dst,
+                false,
+                false,
+                None,
+                &settings,
+                Summary::default(),
+            );
+            let result = admission
+                .run_with_timeout(std::time::Duration::from_secs(1), operation)
+                .await;
+            drop(held);
+            let summary = result.context("rlink filter skip waited for open-file admission")??;
+            assert_eq!(summary.copy_summary.files_skipped, 1);
+            assert_eq!(summary.hard_links_created, 0);
+            Ok(())
+        }
+
+        /// A reliable update-only file hint lets the filter skip before copy admission.
+        #[tokio::test]
+        async fn filtered_hinted_update_file_does_not_wait_for_admission()
+        -> Result<(), anyhow::Error> {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("src");
+            let update = root.join("update");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&update).await?;
+            tokio::fs::write(update.join("leaf"), b"x").await?;
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let held = throttle::open_file_permit().await;
+            let src_dir =
+                Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+            let update_dir =
+                Arc::new(Dir::open_root_dir(&update, false, congestion::Side::Source).await?);
+            let hints = update_dir.read_entries().await?;
+            assert_eq!(
+                hints,
+                vec![(std::ffi::OsString::from("leaf"), Some(EntryKind::File))],
+                "the fixture filesystem must provide the reliable hint this test exercises"
+            );
+            let mut filter = crate::filter::FilterSettings::new();
+            filter.add_exclude("leaf")?;
+            let mut settings = common_settings(false, false);
+            settings.filter = Some(filter.clone());
+            settings.copy_settings.filter = Some(filter);
+            let dst = root.join("dst");
+            let operation = crate::walk_driver::scope_tasks(link_dir_contents(
+                &PROGRESS,
+                &src_dir,
+                Some(&update_dir),
+                None,
+                None,
+                std::ffi::OsStr::new("dst"),
+                &src,
+                &dst,
+                Some(&update),
+                std::path::Path::new(""),
+                &src,
+                &dst,
+                false,
+                false,
+                None,
+                &settings,
+                Summary::default(),
+            ));
+            let result = admission
+                .run_with_timeout(std::time::Duration::from_secs(1), operation)
+                .await;
+            drop(held);
+            let summary =
+                result.context("rlink update filter skip waited for open-file admission")??;
+            assert_eq!(summary.copy_summary.files_skipped, 1);
+            assert_eq!(summary.copy_summary.files_copied, 0);
+            Ok(())
+        }
+
+        /// Rlink preserves a positive directory hint through its worker dispatch.
+        #[tokio::test]
+        async fn hinted_directory_classifies_while_pool_is_saturated() -> Result<(), anyhow::Error>
+        {
+            let root = testutils::create_temp_dir().await?;
+            let src_path = root.join("src");
+            let dst_path = root.join("dst");
+            tokio::fs::create_dir(&src_path).await?;
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let held = throttle::open_file_permit().await;
+            let src_parent = Arc::new(
+                Dir::open_parent_dir(&root, congestion::Side::Source)
+                    .await?
+                    .into_tree(),
+            );
+            let mut settings = common_settings(false, false);
+            settings.dry_run = Some(crate::config::DryRunMode::Brief);
+            settings.copy_settings.dry_run = settings.dry_run;
+            let result = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(1),
+                    link_internal(
+                        &PROGRESS,
+                        &src_parent,
+                        None,
+                        None,
+                        std::ffi::OsStr::new("src"),
+                        &src_path,
+                        &dst_path,
+                        None,
+                        std::path::Path::new(""),
+                        &settings,
+                        false,
+                        walk::EntryAdmission::HintedDirectory,
+                    ),
+                )
+                .await;
+            drop(held);
+            let summary = result.context("hinted rlink directory waited for admission")??;
+            assert_eq!(summary.copy_summary.directories_created, 1);
+            Ok(())
+        }
+
+        /// A source directory hint does not authorize probing its separate update counterpart.
+        #[tokio::test]
+        async fn hinted_source_directory_admits_before_update_probe() -> Result<(), anyhow::Error> {
+            let root = testutils::create_temp_dir().await?;
+            let src_root = root.join("src");
+            let update_root = root.join("update");
+            let dst_root = root.join("dst");
+            tokio::fs::create_dir(&src_root).await?;
+            tokio::fs::create_dir(&update_root).await?;
+            tokio::fs::create_dir(src_root.join("entry")).await?;
+            tokio::fs::write(update_root.join("entry"), b"x").await?;
+            let src_parent =
+                Arc::new(Dir::open_root_dir(&src_root, false, congestion::Side::Source).await?);
+            let update_parent =
+                Arc::new(Dir::open_root_dir(&update_root, false, congestion::Side::Source).await?);
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let held_open = throttle::open_file_permit().await;
+            let stat_resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
+            admission.set_max_ops_in_flight(stat_resource, 1);
+            let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
+            let mut settings = common_settings(false, false);
+            settings.dry_run = Some(crate::config::DryRunMode::Brief);
+            settings.copy_settings.dry_run = settings.dry_run;
+            let task_src_root = src_root.clone();
+            let task_update_root = update_root.clone();
+            let task_dst_root = dst_root.clone();
+            let mut task = tokio::spawn(async move {
+                link_internal(
+                    &PROGRESS,
+                    &src_parent,
+                    Some((&update_parent, std::ffi::OsStr::new("entry"))),
+                    None,
+                    std::ffi::OsStr::new("entry"),
+                    &task_src_root,
+                    &task_dst_root,
+                    Some(&task_update_root),
+                    std::path::Path::new("entry"),
+                    &settings,
+                    false,
+                    EntryAdmission::HintedDirectory,
+                )
+                .await
+            });
+            tokio::task::yield_now().await;
+            drop(held_stat);
+            // fair ordering lets the source classification run first, then gives this test the stat
+            // slot. while it is held, an incorrect update probe queues ahead of `probe` below.
+            let held_after_source = throttle::ops_in_flight_permit(stat_resource).await;
+            tokio::task::yield_now().await;
+            let mut probe = Box::pin(throttle::ops_in_flight_permit(stat_resource));
+            assert!(
+                futures::poll!(probe.as_mut()).is_pending(),
+                "the test's stat slot must be saturated"
+            );
+            drop(held_after_source);
+            let update_waited_for_admission = futures::poll!(probe.as_mut()).is_ready();
+            drop(probe);
+            drop(held_open);
+            let task_result = admission
+                .run_with_timeout(std::time::Duration::from_secs(20), &mut task)
+                .await
+                .context("rlink did not resume after update admission was released")?;
+            let summary = task_result?.map_err(|error| error.source)?;
+            assert!(
+                update_waited_for_admission,
+                "the update counterpart reached fd-based classification under the source hint"
+            );
+            assert_eq!(summary.copy_summary.files_copied, 1);
+            Ok(())
+        }
+
+        /// An update-only directory preserves its hint through delegation into copy.
+        #[tokio::test]
+        async fn hinted_update_directory_classifies_while_pool_is_saturated()
+        -> Result<(), anyhow::Error> {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("src");
+            let update = root.join("update");
+            let dst = root.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&update).await?;
+            tokio::fs::create_dir(update.join("dir")).await?;
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let held = throttle::open_file_permit().await;
+            let src_dir =
+                Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+            let update_dir =
+                Arc::new(Dir::open_root_dir(&update, false, congestion::Side::Source).await?);
+            let mut settings = common_settings(false, false);
+            settings.dry_run = Some(crate::config::DryRunMode::Brief);
+            settings.copy_settings.dry_run = settings.dry_run;
+            let operation = crate::walk_driver::scope_tasks(link_dir_contents(
+                &PROGRESS,
+                &src_dir,
+                Some(&update_dir),
+                None,
+                None,
+                std::ffi::OsStr::new("dst"),
+                &src,
+                &dst,
+                Some(&update),
+                std::path::Path::new(""),
+                &src,
+                &dst,
+                false,
+                false,
+                None,
+                &settings,
+                Summary::default(),
+            ));
+            let result = admission
+                .run_with_timeout(std::time::Duration::from_secs(1), operation)
+                .await;
+            drop(held);
+            let summary =
+                result.context("hinted update directory waited for delegated copy admission")??;
+            assert_eq!(summary.copy_summary.directories_created, 1);
+            Ok(())
+        }
+
         /// Public root setup must reserve open-file capacity before strict probes or operand-parent
         /// opens. A filtered root otherwise returns before `link_internal` reaches its admission
         /// point, and concurrent callers can bypass the budget entirely.
@@ -4182,7 +4510,7 @@ mod link_tests {
                 std::path::Path::new(""),
                 &settings,
                 false,
-                None,
+                EntryAdmission::RootOrDelegated,
             );
             tokio::pin!(operation);
             let stopped_at_stat_gate = futures::poll!(operation.as_mut()).is_pending();
@@ -4249,7 +4577,7 @@ mod link_tests {
                     std::path::Path::new(""),
                     &common_settings(false, false),
                     true,
-                    permit,
+                    EntryAdmission::from(permit),
                 )
                 .await
             });

@@ -4,9 +4,9 @@
 //! visitors:
 //! - `EntryKind` — classifies a directory entry by file type and exposes the per-type bits
 //!   (dry-run label, skipped-counter increment) so callers don't re-implement the dispatch.
-//! - leaf-permit lifecycle (`PermitKind` / `LeafPermit` / `preacquire_leaf_permit`) — acquires a
-//!   leaf's open-files permit before spawning, co-located with the driver's drop-before-recurse
-//!   invariant.
+//! - entry-admission lifecycle (`PermitKind` / `LeafPermit` / `EntryAdmission` /
+//!   `classify_entry`) — carries enumeration hints into classification while keeping leaf
+//!   admission co-located with the driver's drop-before-recurse invariant.
 //! - congestion↔throttle bridges (`throttle_side` / `throttle_op` / `meta_resource`) — map the
 //!   walk's side/op enums onto the throttle and congestion resource enums.
 //! - metadata-probe wrappers (`next_entry_probed` / `run_metadata_probed`) — wrap the path-based
@@ -136,6 +136,61 @@ pub enum LeafPermit {
     PendingMeta(throttle::PendingMetaGuard),
 }
 
+/// Admission state carried from directory scheduling into entry classification.
+///
+/// A possible leaf either arrives with a held permit or acquires before its first authoritative
+/// classification. A positive `getdents` directory hint is the sole exception: it may classify
+/// without leaf admission, but a stale hint that resolves to a leaf must close that first handle,
+/// acquire, and classify again. Roots and delegated entries have no enumeration hint and acquire
+/// before classification.
+pub enum EntryAdmission {
+    /// The possible leaf already owns admission from its scheduling loop.
+    Held(LeafPermit),
+    /// A positive `getdents` directory hint permits one unadmitted classification.
+    HintedDirectory,
+    /// A root or delegated entry must acquire before classification.
+    RootOrDelegated,
+}
+
+impl EntryAdmission {
+    /// Construct the unacquired state described by a directory-entry type hint.
+    #[must_use]
+    pub fn from_hint(hint: Option<EntryKind>) -> Self {
+        if hint == Some(EntryKind::Dir) {
+            Self::HintedDirectory
+        } else {
+            Self::RootOrDelegated
+        }
+    }
+
+    /// Borrow the held admission lease, when this entry has acquired one.
+    #[must_use]
+    pub(crate) fn admission(&self) -> Option<throttle::FdAdmission> {
+        match self {
+            Self::Held(permit) => Some(permit.admission()),
+            Self::HintedDirectory | Self::RootOrDelegated => None,
+        }
+    }
+
+    /// Consume the state after classification and recover its leaf permit.
+    #[must_use]
+    pub(crate) fn into_permit(self) -> Option<LeafPermit> {
+        match self {
+            Self::Held(permit) => Some(permit),
+            Self::HintedDirectory | Self::RootOrDelegated => None,
+        }
+    }
+}
+
+impl From<Option<LeafPermit>> for EntryAdmission {
+    fn from(permit: Option<LeafPermit>) -> Self {
+        match permit {
+            Some(permit) => Self::Held(permit),
+            None => Self::RootOrDelegated,
+        }
+    }
+}
+
 impl LeafPermit {
     /// Obtain a non-owning reference to this entry's admission for blocking work.
     #[must_use]
@@ -205,6 +260,45 @@ pub async fn ensure_leaf_permit(
         )),
         PermitKind::None => None,
     }
+}
+
+/// Ensure a root, delegated entry, or possible leaf holds the visitor's selected admission.
+///
+/// `HintedDirectory` deliberately remains unadmitted until classification proves the hint stale.
+/// `PermitKind::None` also remains `RootOrDelegated`, expressing that the visitor opted out of a
+/// leaf pool rather than pretending it holds a permit.
+pub async fn ensure_entry_admission(kind: PermitKind, admission: EntryAdmission) -> EntryAdmission {
+    match admission {
+        EntryAdmission::Held(_) | EntryAdmission::HintedDirectory => admission,
+        EntryAdmission::RootOrDelegated => match ensure_leaf_permit(kind, None).await {
+            Some(permit) => EntryAdmission::Held(permit),
+            None => EntryAdmission::RootOrDelegated,
+        },
+    }
+}
+
+/// Classify an entry according to its explicit admission state.
+///
+/// Roots and possible leaves acquire before the first `O_PATH` handle opens. A positive directory
+/// hint classifies once without leaf admission; if it resolves to a leaf, that handle is closed
+/// before admission is awaited and the name is classified again under the held permit. Returning
+/// the updated state keeps the authoritative handle and its admission together at the caller.
+pub async fn classify_entry(
+    dir: &crate::safedir::Dir,
+    name: &std::ffi::OsStr,
+    kind: PermitKind,
+    admission: EntryAdmission,
+) -> std::io::Result<(crate::safedir::Handle, EntryAdmission)> {
+    let mut admission = ensure_entry_admission(kind, admission).await;
+    let mut handle =
+        crate::safedir::with_optional_fd_admission(admission.admission(), dir.child(name)).await?;
+    if matches!(admission, EntryAdmission::HintedDirectory) && handle.kind() != EntryKind::Dir {
+        drop(handle);
+        admission = ensure_entry_admission(kind, EntryAdmission::RootOrDelegated).await;
+        handle = crate::safedir::with_optional_fd_admission(admission.admission(), dir.child(name))
+            .await?;
+    }
+    Ok((handle, admission))
 }
 
 /// Resolve the `throttle::Side` from the matching `congestion::Side`.
@@ -366,29 +460,26 @@ where
 /// symlink entry classifies as `Symlink`, not `Dir`) or blocks opening a FIFO or
 /// device payload; the metadata lookup itself can still wait on slow storage.
 /// The hardening of the walk below the named root is unaffected. On a `child`
-/// error (e.g. the entry vanished mid-walk) the hint-derived value is used as a
-/// fallback — the entry's own per-entry worker will then surface the error
-/// authoritatively.
+/// error (e.g. the entry vanished mid-walk), the error is returned. A failed authoritative probe
+/// cannot safely be interpreted as a non-directory because that could defeat directory-only
+/// filtering or delete protection.
 pub async fn filter_is_dir(
     filter: Option<&FilterSettings>,
     dir: &crate::safedir::Dir,
     name: &std::ffi::OsStr,
     hint: Option<EntryKind>,
     force_authoritative: bool,
-) -> bool {
+) -> std::io::Result<bool> {
     match hint {
-        Some(kind) => kind == EntryKind::Dir,
+        Some(kind) => Ok(kind == EntryKind::Dir),
         // DT_UNKNOWN: only pay for the authoritative fstat when the type is actually
         // needed — a filter needs it, or the caller's control flow depends on it
         // (`force_authoritative`, e.g. a dry-run recurse-vs-leaf decision). Otherwise
         // the value is unused, so default cheaply.
-        None if filter.is_some() || force_authoritative => match dir.child(name).await {
-            Ok(handle) => handle.kind() == EntryKind::Dir,
-            // entry changed/vanished: fall back to the historical non-dir default;
-            // the per-entry worker re-classifies and reports any real error.
-            Err(_) => false,
-        },
-        None => false,
+        None if filter.is_some() || force_authoritative => {
+            Ok(dir.child(name).await?.kind() == EntryKind::Dir)
+        }
+        None => Ok(false),
     }
 }
 
@@ -567,12 +658,12 @@ mod tests {
         // DT_UNKNOWN + active filter on a real DIRECTORY -> must resolve to `true` via fstat, so an
         // include filter does NOT omit its subtree (the regression this fix closes).
         assert!(
-            filter_is_dir(filter.as_ref(), &dir, OsStr::new("bar"), None, false).await,
+            filter_is_dir(filter.as_ref(), &dir, OsStr::new("bar"), None, false).await?,
             "a real directory reported as DT_UNKNOWN must classify as a directory for the filter"
         );
         // DT_UNKNOWN + active filter on a real FILE -> resolves to `false` authoritatively.
         assert!(
-            !filter_is_dir(filter.as_ref(), &dir, OsStr::new("0.txt"), None, false).await,
+            !filter_is_dir(filter.as_ref(), &dir, OsStr::new("0.txt"), None, false).await?,
             "a real file reported as DT_UNKNOWN must classify as a non-directory"
         );
         Ok(())
@@ -595,7 +686,7 @@ mod tests {
                 Some(EntryKind::Dir),
                 false
             )
-            .await
+            .await?
         );
         // reliable File hint -> false.
         assert!(
@@ -606,11 +697,11 @@ mod tests {
                 Some(EntryKind::File),
                 false
             )
-            .await
+            .await?
         );
         // DT_UNKNOWN, NO filter, and not forced -> cheap non-dir default (no authoritative fstat
         // needed); the `name` is never resolved, so it need not even exist.
-        assert!(!filter_is_dir(None, &dir, OsStr::new("does_not_exist"), None, false).await);
+        assert!(!filter_is_dir(None, &dir, OsStr::new("does_not_exist"), None, false).await?);
         Ok(())
     }
 
@@ -625,12 +716,12 @@ mod tests {
         let dir = Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Source).await?;
         // DT_UNKNOWN + NO filter, but force_authoritative -> a real directory must classify as dir.
         assert!(
-            filter_is_dir(None, &dir, OsStr::new("bar"), None, true).await,
+            filter_is_dir(None, &dir, OsStr::new("bar"), None, true).await?,
             "force_authoritative must fstat a DT_UNKNOWN directory even with no filter"
         );
         // ...and a real file as non-dir.
         assert!(
-            !filter_is_dir(None, &dir, OsStr::new("0.txt"), None, true).await,
+            !filter_is_dir(None, &dir, OsStr::new("0.txt"), None, true).await?,
             "force_authoritative must fstat a DT_UNKNOWN file even with no filter"
         );
         Ok(())

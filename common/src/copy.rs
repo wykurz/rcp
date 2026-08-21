@@ -15,7 +15,7 @@ use crate::progress;
 use crate::rm;
 use crate::rm::{Settings as RmSettings, Summary as RmSummary};
 use crate::safedir::{self, Dir, FileMeta, Handle};
-use crate::walk::{EntryKind, LeafPermit, PermitKind};
+use crate::walk::{EntryAdmission, EntryKind, LeafPermit, PermitKind};
 use crate::walk_driver::{
     DirAction, DirPreResult, EntryCx, ProcessedChildren, WalkVisitor, process_entry,
 };
@@ -568,7 +568,7 @@ async fn copy_with_filter_base_admitted(
         settings,
         preserve,
         is_fresh,
-        Some(LeafPermit::OpenFile(open_file_guard)),
+        EntryAdmission::Held(LeafPermit::OpenFile(open_file_guard)),
     )
     .await
 }
@@ -586,14 +586,7 @@ async fn copy_with_filter_base_admitted(
 /// path relative to the original filter root, so any `--delete` pruning inside the subtree matches
 /// include/exclude patterns at the entry's true relative path (e.g. `cache/*.log`). `dst_parent`
 /// is `None` only in dry-run (no destination mutation).
-#[instrument(skip(
-    prog_track,
-    src_parent,
-    dst_parent,
-    settings,
-    preserve,
-    open_file_guard
-))]
+#[instrument(skip(prog_track, src_parent, dst_parent, settings, preserve, admission))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn copy_child(
     prog_track: &'static progress::Progress,
@@ -606,7 +599,7 @@ pub(crate) async fn copy_child(
     settings: &Settings,
     preserve: &preserve::Settings,
     is_fresh: bool,
-    open_file_guard: Option<throttle::OpenFileGuard>,
+    admission: EntryAdmission,
 ) -> Result<Summary, Error> {
     run_copy_root(
         prog_track,
@@ -619,7 +612,7 @@ pub(crate) async fn copy_child(
         settings,
         preserve,
         is_fresh,
-        open_file_guard.map(LeafPermit::OpenFile),
+        admission,
     )
     .await
 }
@@ -1014,7 +1007,7 @@ async fn run_copy_root(
     settings: &Settings,
     preserve: &preserve::Settings,
     is_fresh: bool,
-    permit: Option<LeafPermit>,
+    admission: EntryAdmission,
 ) -> Result<Summary, Error> {
     let visitor = Arc::new(CopyVisitor {
         prog_track,
@@ -1043,7 +1036,7 @@ async fn run_copy_root(
         prog_track,
     };
     let root_ctx = visitor.root_dir_context();
-    process_entry(visitor, root_cx, root_ctx, permit).await
+    process_entry(visitor, root_cx, root_ctx, admission).await
 }
 
 impl WalkVisitor for CopyVisitor {
