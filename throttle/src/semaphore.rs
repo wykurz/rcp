@@ -1,12 +1,16 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub struct Semaphore {
-    flag: std::sync::Arc<AtomicBool>,
-    sem: tokio::sync::Semaphore,
+    flag: AtomicBool,
+    epoch: std::sync::RwLock<std::sync::Arc<Epoch>>,
     // per-interval replenish count, read by `run_replenish_thread` on every
     // iteration. Making this dynamic lets the congestion-control layer
     // adjust the token rate while the replenish loop is running.
     replenish: AtomicUsize,
+}
+
+struct Epoch {
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
     // current intended concurrency cap — tracked separately from the inner
     // tokio semaphore so `set_max` can perform delta-based adjustments
     // (add or forget permits) rather than a reset-and-add that would drift
@@ -18,112 +22,102 @@ pub struct Semaphore {
     // and consumed by the next N permit drops (see [`Permit::drop`]) so
     // the effective in-flight count eventually converges to the new cap.
     forget_debt: AtomicUsize,
-    // `setup` establishes a fresh configuration. A permit acquired before that boundary must be
-    // forgotten on return rather than credited into the new pool.
-    generation: AtomicU64,
-    // serialize a fresh setup against permit return. without this lock an old permit can validate
-    // its generation, race setup, and then return into the newly configured Tokio semaphore.
-    setup_or_return: std::sync::Mutex<()>,
 }
 
-/// RAII guard wrapping a tokio semaphore permit. On drop, if the semaphore
-/// has outstanding `forget_debt` from a prior shrink, this permit is
-/// forgotten (removed from the pool) rather than released; otherwise it
-/// returns to the pool normally.
-pub struct Permit<'a> {
-    inner: Option<PermitInner<'a>>,
+impl Epoch {
+    fn new(limit: usize) -> Self {
+        Self {
+            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(limit)),
+            limit: AtomicUsize::new(limit),
+            forget_debt: AtomicUsize::new(0),
+        }
+    }
+
+    /// Apply a `delta`-permit shrink: forget what we can from the available
+    /// pool, then accrue the remainder as `forget_debt` so outstanding
+    /// permits are reclaimed on drop.
+    fn record_shrink(&self, delta: usize) {
+        let forgotten = self.sem.forget_permits(delta);
+        let shortfall = delta.saturating_sub(forgotten);
+        if shortfall > 0 {
+            self.forget_debt.fetch_add(shortfall, Ordering::AcqRel);
+        }
+    }
 }
 
-struct PermitInner<'a> {
-    sem: &'a Semaphore,
-    permit: tokio::sync::SemaphorePermit<'a>,
-    generation: u64,
+/// RAII guard wrapping a tokio semaphore permit. On drop, if its epoch has outstanding shrink
+/// debt, the permit is forgotten rather than released into that epoch's pool.
+pub struct Permit {
+    epoch: std::sync::Arc<Epoch>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
-impl Drop for Permit<'_> {
+impl Drop for Permit {
     fn drop(&mut self) {
-        let Some(inner) = self.inner.take() else {
+        let Some(permit) = self.permit.take() else {
             return;
         };
-        let _setup_or_return = inner
-            .sem
-            .setup_or_return
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if inner.generation != inner.sem.generation.load(Ordering::Acquire) {
-            inner.permit.forget();
-            return;
-        }
         // Consume one unit of forget_debt if any is outstanding. We use a
         // CAS loop so concurrent drops race cleanly — at most `debt` of
         // them will successfully decrement and forget their permit; the
         // rest return to the pool normally.
-        let mut debt = inner.sem.forget_debt.load(Ordering::Acquire);
+        let mut debt = self.epoch.forget_debt.load(Ordering::Acquire);
         while debt > 0 {
-            match inner.sem.forget_debt.compare_exchange_weak(
+            match self.epoch.forget_debt.compare_exchange_weak(
                 debt,
                 debt - 1,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    inner.permit.forget();
+                    permit.forget();
                     return;
                 }
                 Err(actual) => debt = actual,
             }
         }
         // debt == 0: let `permit` drop normally, returning to the pool.
-        drop(inner.permit);
+        drop(permit);
     }
 }
 
 impl Semaphore {
     pub fn new() -> Self {
-        let flag = std::sync::Arc::new(AtomicBool::new(false));
-        // initialize with zero permits so `set_max` can cleanly add the
-        // first batch without having to first forget an arbitrary baseline.
-        // Callers that go through the `flag`-guarded API never observe the
-        // zero state: acquire returns None while flag is false, so nothing
-        // blocks on the semaphore before setup.
-        let sem = tokio::sync::Semaphore::const_new(0);
         Self {
-            flag,
-            sem,
+            flag: AtomicBool::new(false),
+            epoch: std::sync::RwLock::new(std::sync::Arc::new(Epoch::new(0))),
             replenish: AtomicUsize::new(0),
-            limit: AtomicUsize::new(0),
-            forget_debt: AtomicUsize::new(0),
-            generation: AtomicU64::new(0),
-            setup_or_return: std::sync::Mutex::new(()),
         }
+    }
+
+    fn current_epoch(&self) -> std::sync::Arc<Epoch> {
+        self.epoch
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn enabled_epoch(&self) -> Option<std::sync::Arc<Epoch>> {
+        let epoch = self
+            .epoch
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.flag.load(Ordering::Acquire).then(|| epoch.clone())
     }
 
     /// Establish a fresh startup/test configuration.
     ///
-    /// Outstanding acquired permits may safely cross this boundary: their generation tag prevents
-    /// them from crediting the new pool when they return. Callers must not race `setup` with tasks
-    /// already queued inside [`Self::acquire`]; an old waiter could otherwise consume a newly-added
-    /// permit before observing the generation change. Production calls this only during quiescent
-    /// runtime setup, and tests reset it only after their workers have finished.
+    /// Outstanding permits and queued waiters remain attached to the retired epoch. Closing it
+    /// wakes queued waiters so they can observe the fresh configuration.
     pub fn setup(&self, value: usize) {
-        let _setup_or_return = self
-            .setup_or_return
-            .lock()
+        let next = std::sync::Arc::new(Epoch::new(value));
+        let mut current = self
+            .epoch
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // temporarily disable while reconfiguring so a new acquire cannot observe `flag == true`
-        // with an empty semaphore (the permit-free window between `forget_permits` and
-        // `add_permits`).
-        self.flag.store(false, Ordering::Release);
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        self.sem.forget_permits(self.sem.available_permits());
-        self.forget_debt.store(0, Ordering::Release);
-        self.limit.store(value, Ordering::Release);
-        if value == 0 {
-            return;
-        }
-        self.sem.add_permits(value);
-        // flip to enabled only after permits are in place.
-        self.flag.store(true, Ordering::Release);
+        let retired = std::mem::replace(&mut *current, next);
+        self.flag.store(value > 0, Ordering::Release);
+        retired.sem.close();
     }
 
     /// Update the concurrency cap dynamically.
@@ -139,50 +133,36 @@ impl Semaphore {
     /// adapter task). Concurrent callers can race the `limit.swap` and
     /// compute incorrect deltas against each other. Callers that need
     /// multi-writer access must wrap `set_max` in an external lock.
-    ///
-    /// **Limitation:** `set_max(0)` flips the cap off for *new* `acquire`
-    /// calls but does not wake tasks already suspended inside
-    /// `acquire().await`. They remain parked until a permit becomes
-    /// available. Callers that require a cancellable disable should use a
-    /// higher-level shutdown signal; the adaptive controller does not rely
-    /// on zero transitions in practice (its minimum cwnd is configured
-    /// `>= 1`).
     pub fn set_max(&self, value: usize) {
-        let current = self.limit.swap(value, Ordering::AcqRel);
         if value == 0 {
-            // disable: flip the flag before forgetting permits so new
-            // acquires observe the disabled state and return None instead
-            // of blocking on a now-empty semaphore.
+            let next = std::sync::Arc::new(Epoch::new(0));
+            let mut current = self
+                .epoch
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let retired = std::mem::replace(&mut *current, next);
             self.flag.store(false, Ordering::Release);
-            if current > 0 {
-                self.record_shrink(current);
-            }
+            retired.sem.close();
             return;
         }
+        let epoch = self
+            .epoch
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = epoch.limit.swap(value, Ordering::AcqRel);
         // enable or adjust: apply the permit delta before flipping the
         // flag to true, so a 0 → N transition never lets a concurrent
         // acquire see `flag == true` with zero permits.
         match value.cmp(&current) {
             std::cmp::Ordering::Greater => {
-                self.sem.add_permits(value - current);
+                epoch.sem.add_permits(value - current);
             }
             std::cmp::Ordering::Less => {
-                self.record_shrink(current - value);
+                epoch.record_shrink(current - value);
             }
             std::cmp::Ordering::Equal => {}
         }
         self.flag.store(true, Ordering::Release);
-    }
-
-    /// Apply a `delta`-permit shrink: forget what we can from the available
-    /// pool, then accrue the remainder as `forget_debt` so outstanding
-    /// permits are reclaimed on drop.
-    fn record_shrink(&self, delta: usize) {
-        let forgotten = self.sem.forget_permits(delta);
-        let shortfall = delta.saturating_sub(forgotten);
-        if shortfall > 0 {
-            self.forget_debt.fetch_add(shortfall, Ordering::AcqRel);
-        }
     }
 
     /// Disable this semaphore without adjusting the cap. Intended for
@@ -199,7 +179,11 @@ impl Semaphore {
     /// flipping the flag would strand them. Returns `true` if the flag was
     /// flipped on, `false` if there is no prior configuration to enable.
     pub fn enable(&self) -> bool {
-        if self.limit.load(Ordering::Acquire) == 0 {
+        let epoch = self
+            .epoch
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if epoch.limit.load(Ordering::Acquire) == 0 {
             return false;
         }
         self.flag.store(true, Ordering::Release);
@@ -210,7 +194,7 @@ impl Semaphore {
     /// that want to observe the most recent `set_max` / `setup` value
     /// without having to probe the inner semaphore.
     pub fn current_limit(&self) -> usize {
-        self.limit.load(Ordering::Acquire)
+        self.current_epoch().limit.load(Ordering::Acquire)
     }
 
     /// Update the per-interval replenish count. Takes effect on the next
@@ -219,31 +203,48 @@ impl Semaphore {
         self.replenish.store(value, Ordering::Release);
     }
 
-    pub async fn acquire(&self) -> Option<Permit<'_>> {
-        if self.flag.load(Ordering::Acquire) {
-            let generation = self.generation.load(Ordering::Acquire);
-            let permit = self.sem.acquire().await.unwrap();
-            Some(Permit {
-                inner: Some(PermitInner {
-                    sem: self,
-                    permit,
-                    generation,
-                }),
-            })
-        } else {
-            None
+    pub async fn acquire(&self) -> Option<Permit> {
+        loop {
+            let epoch = self.enabled_epoch()?;
+            match epoch.sem.clone().acquire_owned().await {
+                Ok(permit) => {
+                    return Some(Permit {
+                        epoch,
+                        permit: Some(permit),
+                    });
+                }
+                Err(_) => continue,
+            }
         }
     }
 
     pub async fn consume(&self) {
-        if self.flag.load(Ordering::Acquire) {
-            self.sem.acquire().await.unwrap().forget();
+        loop {
+            let Some(epoch) = self.enabled_epoch() else {
+                return;
+            };
+            match epoch.sem.clone().acquire_owned().await {
+                Ok(permit) => {
+                    permit.forget();
+                    return;
+                }
+                Err(_) => continue,
+            }
         }
     }
 
     pub async fn consume_many(&self, value: u32) {
-        if self.flag.load(Ordering::Acquire) {
-            self.sem.acquire_many(value).await.unwrap().forget();
+        loop {
+            let Some(epoch) = self.enabled_epoch() else {
+                return;
+            };
+            match epoch.sem.clone().acquire_many_owned(value).await {
+                Ok(permit) => {
+                    permit.forget();
+                    return;
+                }
+                Err(_) => continue,
+            }
         }
     }
 
@@ -262,11 +263,12 @@ impl Semaphore {
             if replenish == 0 {
                 continue;
             }
-            let curr_permits = self.sem.available_permits();
+            let epoch = self.current_epoch();
+            let curr_permits = epoch.sem.available_permits();
             if curr_permits >= replenish {
                 continue;
             }
-            self.sem.add_permits(replenish - curr_permits);
+            epoch.sem.add_permits(replenish - curr_permits);
         }
     }
 }
@@ -274,6 +276,7 @@ impl Semaphore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
 
     /// Yield repeatedly so a just-woken task has a chance to actually run its
     /// loop body before the next assertion. A single `yield_now` is often
@@ -285,15 +288,23 @@ mod tests {
         }
     }
 
+    fn available_permits(sem: &Semaphore) -> usize {
+        sem.current_epoch().sem.available_permits()
+    }
+
+    fn forget_debt(sem: &Semaphore) -> usize {
+        sem.current_epoch().forget_debt.load(Ordering::Acquire)
+    }
+
     #[tokio::test]
     async fn set_max_delta_grows_and_shrinks_available_permits() {
         let sem = Semaphore::new();
         sem.set_max(10);
-        assert_eq!(sem.sem.available_permits(), 10);
+        assert_eq!(available_permits(&sem), 10);
         sem.set_max(15);
-        assert_eq!(sem.sem.available_permits(), 15);
+        assert_eq!(available_permits(&sem), 15);
         sem.set_max(3);
-        assert_eq!(sem.sem.available_permits(), 3);
+        assert_eq!(available_permits(&sem), 3);
     }
 
     #[tokio::test]
@@ -305,7 +316,7 @@ mod tests {
         let current = sem.acquire().await.unwrap();
         drop(old);
         assert_eq!(
-            sem.sem.available_permits(),
+            available_permits(&sem),
             0,
             "an old permit inflated the newly configured capacity"
         );
@@ -314,39 +325,98 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(1), sem.acquire())
                 .await
                 .is_ok(),
-            "the current generation's permit did not return normally"
+            "the current epoch's permit did not return normally"
         );
     }
 
     #[tokio::test]
-    async fn stale_permit_does_not_consume_current_generation_shrink_debt() {
+    async fn retired_permit_does_not_consume_current_epoch_shrink_debt() {
         let sem = Semaphore::new();
         sem.setup(2);
         let old = sem.acquire().await.unwrap();
-
         sem.setup(2);
         let current_one = sem.acquire().await.unwrap();
         let current_two = sem.acquire().await.unwrap();
         sem.set_max(1);
-        assert_eq!(sem.forget_debt.load(Ordering::Acquire), 1);
-
+        assert_eq!(forget_debt(&sem), 1);
         drop(old);
         assert_eq!(
-            sem.forget_debt.load(Ordering::Acquire),
+            forget_debt(&sem),
             1,
-            "a stale permit consumed shrink debt from the current generation"
+            "a retired permit consumed shrink debt from the current epoch"
         );
         drop(current_one);
-        assert_eq!(sem.forget_debt.load(Ordering::Acquire), 0);
+        assert_eq!(forget_debt(&sem), 0);
         drop(current_two);
-
         let only = sem.acquire().await.unwrap();
         assert_eq!(
-            sem.sem.available_permits(),
+            available_permits(&sem),
             0,
-            "the shrunk current generation admitted more than one permit"
+            "the shrunk current epoch admitted more than one permit"
         );
         drop(only);
+    }
+
+    #[tokio::test]
+    async fn waiter_crossing_setup_does_not_shrink_fresh_pool() {
+        let sem = Semaphore::new();
+        sem.setup(1);
+        let held = sem.acquire().await.unwrap();
+        let mut waiter = std::pin::pin!(sem.acquire());
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(waiter.as_mut().poll(&mut context).is_pending());
+        sem.setup(1);
+        drop(held);
+        let crossing = tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
+            .await
+            .expect("registered waiter wakes after setup")
+            .expect("fresh setup remains enabled");
+        drop(crossing);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), sem.acquire())
+                .await
+                .expect("crossing waiter returns its fresh permit")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_zero_wakes_parked_waiter_to_none() {
+        let sem = Semaphore::new();
+        sem.setup(1);
+        let held = sem.acquire().await.unwrap();
+        let mut waiter = std::pin::pin!(sem.acquire());
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(waiter.as_mut().poll(&mut context).is_pending());
+        sem.setup(0);
+        drop(held);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
+                .await
+                .expect("setup wakes registered waiter")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn set_max_zero_wakes_parked_waiter_to_none() {
+        let sem = Semaphore::new();
+        sem.set_max(1);
+        let held = sem.acquire().await.unwrap();
+        let mut waiter = std::pin::pin!(sem.acquire());
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(waiter.as_mut().poll(&mut context).is_pending());
+        sem.set_max(0);
+        drop(held);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
+                .await
+                .expect("zero cap wakes registered waiter")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -354,9 +424,9 @@ mod tests {
         let sem = Semaphore::new();
         sem.set_max(10);
         sem.consume_many(3).await;
-        assert_eq!(sem.sem.available_permits(), 7);
+        assert_eq!(available_permits(&sem), 7);
         sem.consume_many(0).await;
-        assert_eq!(sem.sem.available_permits(), 7, "consuming zero is a no-op");
+        assert_eq!(available_permits(&sem), 7, "consuming zero is a no-op");
     }
 
     #[tokio::test]
@@ -366,7 +436,7 @@ mod tests {
         sem.disable();
         sem.consume_many(5).await;
         assert_eq!(
-            sem.sem.available_permits(),
+            available_permits(&sem),
             10,
             "a disabled semaphore must not drain permits"
         );
@@ -391,41 +461,40 @@ mod tests {
         let g1 = sem.acquire().await.unwrap();
         let g2 = sem.acquire().await.unwrap();
         let g3 = sem.acquire().await.unwrap();
-        assert_eq!(sem.sem.available_permits(), 2);
+        assert_eq!(available_permits(&sem), 2);
         // shrink from 5 to 1: we need to remove 4 permits, but only 2 are
         // available. The other 2 are recorded as forget_debt and consumed
         // by the next two drops.
         sem.set_max(1);
-        assert_eq!(sem.sem.available_permits(), 0);
-        assert_eq!(sem.forget_debt.load(Ordering::Acquire), 2);
+        assert_eq!(available_permits(&sem), 0);
+        assert_eq!(forget_debt(&sem), 2);
         drop(g1);
-        assert_eq!(sem.forget_debt.load(Ordering::Acquire), 1);
-        assert_eq!(sem.sem.available_permits(), 0);
+        assert_eq!(forget_debt(&sem), 1);
+        assert_eq!(available_permits(&sem), 0);
         drop(g2);
-        assert_eq!(sem.forget_debt.load(Ordering::Acquire), 0);
-        assert_eq!(sem.sem.available_permits(), 0);
+        assert_eq!(forget_debt(&sem), 0);
+        assert_eq!(available_permits(&sem), 0);
         // debt is now 0; the third drop returns its permit to the pool,
         // giving us steady-state of exactly 1 — the new cap.
         drop(g3);
-        assert_eq!(sem.sem.available_permits(), 1);
+        assert_eq!(available_permits(&sem), 1);
     }
 
     #[tokio::test]
     async fn set_max_zero_while_held_revokes_permits_on_drop() {
         let sem = std::sync::Arc::new(Semaphore::new());
         sem.set_max(3);
+        let retired = sem.current_epoch();
         let g1 = sem.acquire().await.unwrap();
         let g2 = sem.acquire().await.unwrap();
         let g3 = sem.acquire().await.unwrap();
-        // no available permits; set_max(0) records full debt.
         sem.set_max(0);
-        assert_eq!(sem.forget_debt.load(Ordering::Acquire), 3);
+        assert!(retired.sem.is_closed());
         drop(g1);
         drop(g2);
         drop(g3);
-        // all three permits consumed by debt — none back in the pool.
-        assert_eq!(sem.sem.available_permits(), 0);
-        assert_eq!(sem.forget_debt.load(Ordering::Acquire), 0);
+        assert_eq!(available_permits(&sem), 0);
+        assert_eq!(forget_debt(&sem), 0);
     }
 
     #[tokio::test]
@@ -437,30 +506,30 @@ mod tests {
         let g3 = sem.acquire().await.unwrap();
         // shrink to 1 — leaves 2 units of debt pending.
         sem.set_max(1);
-        assert_eq!(sem.forget_debt.load(Ordering::Acquire), 2);
+        assert_eq!(forget_debt(&sem), 2);
         // grow back to 5 while debt still pending. The pool gains
         // (5 - 1) = 4 permits; debt stays the same and will still be
         // consumed by drops.
         sem.set_max(5);
-        assert_eq!(sem.sem.available_permits(), 4);
-        assert_eq!(sem.forget_debt.load(Ordering::Acquire), 2);
+        assert_eq!(available_permits(&sem), 4);
+        assert_eq!(forget_debt(&sem), 2);
         // drops: first two consume debt; third returns to pool.
         drop(g1);
         drop(g2);
         drop(g3);
         // steady state: pool has 4 (from regrow) + 1 (from g3) = 5 = new cap.
-        assert_eq!(sem.sem.available_permits(), 5);
+        assert_eq!(available_permits(&sem), 5);
     }
 
     #[tokio::test]
     async fn disable_flips_flag_without_clearing_pool() {
         let sem = Semaphore::new();
         sem.setup(3);
-        assert_eq!(sem.sem.available_permits(), 3);
+        assert_eq!(available_permits(&sem), 3);
         sem.disable();
         // consume is now a no-op; pool is untouched.
         sem.consume().await;
-        assert_eq!(sem.sem.available_permits(), 3);
+        assert_eq!(available_permits(&sem), 3);
     }
 
     #[tokio::test]
@@ -471,12 +540,12 @@ mod tests {
         // gate is open — consume drains nothing.
         sem.consume().await;
         sem.consume().await;
-        assert_eq!(sem.sem.available_permits(), 2);
+        assert_eq!(available_permits(&sem), 2);
         // flip the flag back on: consume now actually drains tokens.
         assert!(sem.enable());
         sem.consume().await;
         sem.consume().await;
-        assert_eq!(sem.sem.available_permits(), 0);
+        assert_eq!(available_permits(&sem), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -520,13 +589,13 @@ mod tests {
         // returned to the pool or was consumed by forget_debt on drop.
         // No drift, no leak.
         assert_eq!(
-            sem.sem.available_permits(),
+            available_permits(&sem),
             15,
             "expected final cap (15), got {} — forget_debt accounting drifted",
-            sem.sem.available_permits(),
+            available_permits(&sem),
         );
         assert_eq!(
-            sem.forget_debt.load(Ordering::Acquire),
+            forget_debt(&sem),
             0,
             "debt must be fully consumed once all permits have returned",
         );
@@ -555,13 +624,13 @@ mod tests {
         assert!(sem.enable());
         sem.set_replenish(5);
         // drain anything that was in the pool to force a refill
-        while sem.sem.available_permits() > 0 {
+        while available_permits(&sem) > 0 {
             sem.consume().await;
         }
         tokio::time::advance(std::time::Duration::from_millis(150)).await;
         let_spawned_task_run().await;
         assert_eq!(
-            sem.sem.available_permits(),
+            available_permits(&sem),
             5,
             "thread did not refill after the disable-then-enable cycle",
         );
@@ -598,7 +667,7 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_millis(150)).await;
         // and yield back so the wake-up runs the body that adds permits
         let_spawned_task_run().await;
-        assert_eq!(sem.sem.available_permits(), 3);
+        assert_eq!(available_permits(&sem), 3);
         handle.abort();
     }
 
@@ -615,21 +684,21 @@ mod tests {
         // atomic before we touch it from the test thread.
         let_spawned_task_run().await;
         // drain now — after spawn, so the upcoming refill has work to do.
-        while sem.sem.available_permits() > 0 {
+        while available_permits(&sem) > 0 {
             sem.consume().await;
         }
         // first refill at the initial rate
         tokio::time::advance(std::time::Duration::from_millis(150)).await;
         let_spawned_task_run().await;
-        assert_eq!(sem.sem.available_permits(), 5);
+        assert_eq!(available_permits(&sem), 5);
         // bump the rate; drain; next refill uses the new value
         sem.set_replenish(10);
-        while sem.sem.available_permits() > 0 {
+        while available_permits(&sem) > 0 {
             sem.consume().await;
         }
         tokio::time::advance(std::time::Duration::from_millis(100)).await;
         let_spawned_task_run().await;
-        assert_eq!(sem.sem.available_permits(), 10);
+        assert_eq!(available_permits(&sem), 10);
         handle.abort();
     }
 
@@ -643,26 +712,26 @@ mod tests {
                 .await;
         });
         let_spawned_task_run().await;
-        while sem.sem.available_permits() > 0 {
+        while available_permits(&sem) > 0 {
             sem.consume().await;
         }
         // first refill happens at the initial rate
         tokio::time::advance(std::time::Duration::from_millis(150)).await;
         let_spawned_task_run().await;
-        assert_eq!(sem.sem.available_permits(), 4);
+        assert_eq!(available_permits(&sem), 4);
         // setting rate to zero keeps the loop alive but stops adding permits
         sem.set_replenish(0);
-        while sem.sem.available_permits() > 0 {
+        while available_permits(&sem) > 0 {
             sem.consume().await;
         }
         tokio::time::advance(std::time::Duration::from_millis(300)).await;
         let_spawned_task_run().await;
-        assert_eq!(sem.sem.available_permits(), 0);
+        assert_eq!(available_permits(&sem), 0);
         // restoring the rate resumes refills
         sem.set_replenish(4);
         tokio::time::advance(std::time::Duration::from_millis(150)).await;
         let_spawned_task_run().await;
-        assert_eq!(sem.sem.available_permits(), 4);
+        assert_eq!(available_permits(&sem), 4);
         handle.abort();
     }
 }

@@ -294,7 +294,7 @@ pub fn set_max_open_files(max_open_files: usize) {
 /// blocking work starts, [`Self::blocking_lease`] upgrades it to a strong lease for that syscall.
 #[derive(Clone)]
 pub struct FdAdmission {
-    permit: Option<std::sync::Weak<semaphore::Permit<'static>>>,
+    permit: Option<std::sync::Weak<semaphore::Permit>>,
 }
 
 impl FdAdmission {
@@ -310,11 +310,11 @@ impl FdAdmission {
 
 /// Strong admission ownership held by one non-cancellable blocking operation.
 pub struct BlockingFdAdmissionLease {
-    _permit: Option<std::sync::Arc<semaphore::Permit<'static>>>,
+    _permit: Option<std::sync::Arc<semaphore::Permit>>,
 }
 
 pub struct OpenFileGuard {
-    permit: Option<std::sync::Arc<semaphore::Permit<'static>>>,
+    permit: Option<std::sync::Arc<semaphore::Permit>>,
 }
 
 impl OpenFileGuard {
@@ -343,7 +343,7 @@ pub async fn open_file_permit() -> OpenFileGuard {
 /// directory destination) don't deadlock against a saturated
 /// `OPEN_FILES_LIMIT`.
 pub struct PendingMetaGuard {
-    permit: Option<std::sync::Arc<semaphore::Permit<'static>>>,
+    permit: Option<std::sync::Arc<semaphore::Permit>>,
 }
 
 impl PendingMetaGuard {
@@ -369,17 +369,14 @@ pub async fn pending_meta_permit() -> PendingMetaGuard {
 /// if permits are already held — they return naturally on drop. This is
 /// the enforcement knob the adaptive controller drives.
 ///
-/// Setting to 0 disables the cap for *subsequent* acquires (they return
-/// immediately without a permit), but does not wake acquirers already
-/// blocked inside the semaphore's wait queue — they remain parked until
-/// permits become available. Callers that need a cancellable disable
-/// should use a higher-level shutdown signal.
+/// Setting to 0 disables the cap and wakes already-blocked acquirers, which return without a
+/// permit.
 pub fn set_max_ops_in_flight(resource: Resource, max_in_flight: usize) {
     ops_in_flight_limit(resource).set_max(max_in_flight);
 }
 
 pub struct OpsInFlightGuard {
-    _permit: Option<semaphore::Permit<'static>>,
+    _permit: Option<semaphore::Permit>,
 }
 
 /// Acquire a permit from the ops-in-flight cap for the given [`Resource`].
