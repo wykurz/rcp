@@ -199,7 +199,7 @@ pub(crate) fn blocking_task_guard() -> Option<impl Drop + Send + 'static> {
 }
 use crate::progress::Progress;
 use crate::safedir::{Dir, Handle};
-use crate::walk::{self, EntryAdmission, EntryKind, LeafPermit, PermitKind};
+use crate::walk::{self, AdmittedLeaf, EntryAdmission, EntryKind, PermitKind};
 
 /// A per-run summary accumulated by the walk.
 ///
@@ -395,17 +395,15 @@ pub trait WalkVisitor: Send + Sync + 'static {
         Self::Summary::default()
     }
 
-    /// Process a non-directory entry (file / symlink / special). `parent_ctx` is
-    /// the inherited context of the directory containing this entry (copy's
-    /// destination parent + freshness). The admission `permit` is held for the
-    /// duration and dropped on return.
+    /// Process a non-directory entry (file / symlink / special). `parent_ctx` is the inherited
+    /// context of the directory containing this entry (copy's destination parent + freshness).
+    /// `leaf` keeps its classification handle structurally ahead of its admission permit for the
+    /// full visit.
     fn visit_leaf(
         &self,
         cx: &EntryCx,
         parent_ctx: &Self::DirContext,
-        handle: Handle,
-        kind: EntryKind,
-        permit: Option<LeafPermit>,
+        leaf: AdmittedLeaf,
     ) -> impl std::future::Future<Output = Result<Self::Summary, OperationError<Self::Summary>>> + Send;
 
     /// Pre-order step for a directory entry, run *after* the leaf permit has been
@@ -497,31 +495,74 @@ where
     V: WalkVisitor,
 {
     let _ops_guard = cx.prog_track.ops.guard();
-    // authoritative classification: one fstat, in one place. a symlink swap between
-    // the getdents hint and here is caught (O_NOFOLLOW) and classified as Symlink.
-    let (handle, admission) =
-        match walk::classify_entry(&cx.parent, &cx.name, visitor.permit_kind(), admission).await {
-            Ok(classified) => classified,
+    let mut admission = admission;
+    // a positive directory hint gets one unadmitted classification. if stale, close that first
+    // leaf handle before waiting for admission; final classification and leaf work then run inside
+    // the newly admitted region below.
+    let hinted_directory = if matches!(admission, EntryAdmission::HintedDirectory) {
+        match walk::classify_entry(&cx.parent, &cx.name).await {
+            Ok(handle) if handle.kind() == EntryKind::Dir => Some(handle),
+            Ok(handle) => {
+                drop(handle);
+                admission = EntryAdmission::RootOrDelegated;
+                None
+            }
             Err(err) => {
                 let err = anyhow::Error::new(err)
                     .context(format!("failed reading metadata from {:?}", &cx.real_path));
                 return Err(OperationError::new(err, Default::default()));
             }
-        };
-    let kind = handle.kind();
-    if kind != EntryKind::Dir {
-        // leaf: the permit is held across the (non-recursive) leaf work and dropped
-        // when `visit_leaf` returns. nothing below this can recurse.
-        let permit = admission.into_permit();
-        let leaf_admission = permit.as_ref().map(LeafPermit::admission);
-        let visit = visitor.visit_leaf(&cx, &parent_ctx, handle, kind, permit);
-        return crate::safedir::with_optional_fd_admission(leaf_admission, visit).await;
+        }
+    } else {
+        None
+    };
+
+    enum AdmittedDispatch<S> {
+        Leaf(Result<S, OperationError<S>>),
+        Directory(Handle),
     }
-    // ── the single drop-before-recurse site ──────────────────────────────────
-    // an authoritative directory recurses; its children acquire their own permits.
-    // releasing the provisional entry permit now is what makes the hold-and-wait deadlock
-    // structurally impossible.
-    drop(admission);
+
+    let handle = match hinted_directory {
+        Some(handle) => {
+            drop(admission);
+            handle
+        }
+        None => {
+            admission = walk::ensure_entry_admission(visitor.permit_kind(), admission).await;
+            let weak_admission = admission.admission();
+            let dispatch = crate::safedir::with_optional_fd_admission(weak_admission, async {
+                // authoritative classification: one fstat, in one place. a symlink swap between
+                // the getdents hint and here is caught (O_NOFOLLOW) and classified as Symlink.
+                let handle = match walk::classify_entry(&cx.parent, &cx.name).await {
+                    Ok(handle) => handle,
+                    Err(err) => {
+                        let err = anyhow::Error::new(err)
+                            .context(format!("failed reading metadata from {:?}", &cx.real_path));
+                        return AdmittedDispatch::Leaf(Err(OperationError::new(
+                            err,
+                            Default::default(),
+                        )));
+                    }
+                };
+                if handle.kind() != EntryKind::Dir {
+                    let leaf = AdmittedLeaf::new(handle, admission.into_permit());
+                    return AdmittedDispatch::Leaf(
+                        visitor.visit_leaf(&cx, &parent_ctx, leaf).await,
+                    );
+                }
+                // ── the single drop-before-recurse site ──────────────────────────────────────
+                // release provisional admission inside its scope, then return only the directory
+                // handle. ending the scope restores any outer pool before dir_pre can recurse.
+                drop(admission);
+                AdmittedDispatch::Directory(handle)
+            })
+            .await;
+            match dispatch {
+                AdmittedDispatch::Leaf(result) => return result,
+                AdmittedDispatch::Directory(handle) => handle,
+            }
+        }
+    };
     let action = visitor.dir_pre(&cx, &parent_ctx, &handle).await?;
     // dir_pre has copied everything its state needs and opened the directory used for descent.
     // the classification handle is redundant from here on and must not inflate the per-depth fd
@@ -830,14 +871,10 @@ mod tests {
             &self,
             _cx: &EntryCx,
             _parent_ctx: &(),
-            _handle: Handle,
-            kind: EntryKind,
-            permit: Option<LeafPermit>,
+            leaf: AdmittedLeaf,
         ) -> Result<CountSummary, OperationError<CountSummary>> {
             self.leaves_seen.fetch_add(1, Ordering::SeqCst);
-            // hold the permit across the leaf work, then drop it (mirrors real tools).
-            drop(permit);
-            Ok(match kind {
+            Ok(match leaf.kind() {
                 EntryKind::Symlink => CountSummary {
                     symlinks: 1,
                     ..Default::default()
@@ -1003,7 +1040,333 @@ mod tests {
     mod max_open_files_tests {
         use super::*;
         use anyhow::Context;
+        use std::os::fd::AsRawFd;
         use std::os::unix::fs::MetadataExt;
+
+        #[derive(Clone, Copy)]
+        enum LeafOutcome {
+            Success,
+            Error,
+        }
+
+        struct LeafLifetimeVisitor {
+            started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<std::os::fd::RawFd>>>,
+            release: Arc<tokio::sync::Notify>,
+            outcome: LeafOutcome,
+        }
+
+        struct DirPreLifetimeVisitor {
+            file_path: std::path::PathBuf,
+            started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+            completed: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        }
+
+        impl WalkVisitor for DirPreLifetimeVisitor {
+            type Summary = CountSummary;
+            type DirContext = ();
+            type DirState = ();
+
+            fn root_dir_context(&self) {}
+
+            fn permit_kind(&self) -> PermitKind {
+                PermitKind::PendingMeta
+            }
+
+            fn fail_early(&self) -> bool {
+                false
+            }
+
+            fn filter(&self) -> Option<&FilterSettings> {
+                None
+            }
+
+            async fn visit_leaf(
+                &self,
+                _cx: &EntryCx,
+                _parent_ctx: &(),
+                _leaf: AdmittedLeaf,
+            ) -> Result<CountSummary, OperationError<CountSummary>> {
+                unreachable!("dir-pre lifetime visitor must not see a leaf")
+            }
+
+            async fn dir_pre(
+                &self,
+                _cx: &EntryCx,
+                _parent_ctx: &(),
+                _handle: &Handle,
+            ) -> DirPreResult<Self> {
+                let file_path = self.file_path.clone();
+                let started = self
+                    .started
+                    .lock()
+                    .expect("started lock poisoned")
+                    .take()
+                    .expect("dir_pre runs once");
+                let release = self
+                    .release
+                    .lock()
+                    .expect("release lock poisoned")
+                    .take()
+                    .expect("dir_pre runs once");
+                let completed = self
+                    .completed
+                    .lock()
+                    .expect("completed lock poisoned")
+                    .take()
+                    .expect("dir_pre runs once");
+                crate::safedir::run_fd_admitted_blocking(move || {
+                    let file = std::fs::File::open(file_path)?;
+                    let _ = started.send(());
+                    release.recv().map_err(std::io::Error::other)?;
+                    drop(file);
+                    let _ = completed.send(());
+                    Ok(())
+                })
+                .await
+                .map_err(|err| {
+                    OperationError::new(anyhow::Error::new(err), CountSummary::default())
+                })?;
+                Ok(DirAction::Skip(CountSummary::default()))
+            }
+
+            async fn dir_post(
+                &self,
+                _cx: &EntryCx,
+                _state: (),
+                _processed: &ProcessedChildren,
+                _child_result: Result<CountSummary, OperationError<CountSummary>>,
+            ) -> Result<CountSummary, OperationError<CountSummary>> {
+                unreachable!("dir-pre lifetime visitor does not descend")
+            }
+        }
+
+        impl WalkVisitor for LeafLifetimeVisitor {
+            type Summary = CountSummary;
+            type DirContext = ();
+            type DirState = ();
+
+            fn root_dir_context(&self) {}
+
+            fn permit_kind(&self) -> PermitKind {
+                PermitKind::PendingMeta
+            }
+
+            fn fail_early(&self) -> bool {
+                false
+            }
+
+            fn filter(&self) -> Option<&FilterSettings> {
+                None
+            }
+
+            async fn visit_leaf(
+                &self,
+                _cx: &EntryCx,
+                _parent_ctx: &(),
+                leaf: AdmittedLeaf,
+            ) -> Result<CountSummary, OperationError<CountSummary>> {
+                let raw_fd = leaf.handle().as_fd().as_raw_fd();
+                if let Some(started) = self.started.lock().expect("started lock poisoned").take() {
+                    let _ = started.send(raw_fd);
+                }
+                self.release.notified().await;
+                match self.outcome {
+                    LeafOutcome::Success => Ok(CountSummary {
+                        files: 1,
+                        ..Default::default()
+                    }),
+                    LeafOutcome::Error => Err(OperationError::new(
+                        anyhow::anyhow!("leaf operation failed"),
+                        CountSummary::default(),
+                    )),
+                }
+            }
+
+            async fn dir_pre(
+                &self,
+                _cx: &EntryCx,
+                _parent_ctx: &(),
+                _handle: &Handle,
+            ) -> DirPreResult<Self> {
+                unreachable!("leaf lifetime visitor must not see a directory")
+            }
+
+            async fn dir_post(
+                &self,
+                _cx: &EntryCx,
+                _state: (),
+                _processed: &ProcessedChildren,
+                _child_result: Result<CountSummary, OperationError<CountSummary>>,
+            ) -> Result<CountSummary, OperationError<CountSummary>> {
+                unreachable!("leaf lifetime visitor must not recurse")
+            }
+        }
+
+        async fn start_leaf_lifetime_operation(
+            outcome: LeafOutcome,
+        ) -> anyhow::Result<(
+            crate::testutils::AdmissionLimit,
+            tokio::task::JoinHandle<Result<CountSummary, OperationError<CountSummary>>>,
+            std::os::fd::RawFd,
+            Arc<tokio::sync::Notify>,
+        )> {
+            let root = crate::testutils::create_temp_dir().await?;
+            let leaf_path = root.join("leaf");
+            tokio::fs::write(&leaf_path, b"x").await?;
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let parent = Arc::new(
+                Dir::open_parent_dir(&root, congestion::Side::Source)
+                    .await?
+                    .into_tree(),
+            );
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let release = Arc::new(tokio::sync::Notify::new());
+            let visitor = Arc::new(LeafLifetimeVisitor {
+                started: std::sync::Mutex::new(Some(started_tx)),
+                release: Arc::clone(&release),
+                outcome,
+            });
+            let cx = root_cx(parent, OsStr::new("leaf"), leaf_path);
+            let permit =
+                walk::preacquire_leaf_permit(PermitKind::PendingMeta, Some(EntryKind::File)).await;
+            let task = tokio::spawn(process_entry(visitor, cx, (), permit));
+            let raw_fd = started_rx.await.context("leaf visitor did not start")?;
+            Ok((admission, task, raw_fd, release))
+        }
+
+        fn fd_is_closed(raw_fd: std::os::fd::RawFd) -> bool {
+            let result = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
+            result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn successful_leaf_keeps_admission_until_its_handle_closes() -> anyhow::Result<()> {
+            let (_admission, task, raw_fd, release) =
+                start_leaf_lifetime_operation(LeafOutcome::Success).await?;
+            let mut next_permit = Box::pin(throttle::pending_meta_permit());
+            assert!(
+                futures::poll!(next_permit.as_mut()).is_pending(),
+                "leaf admission returned while its classification handle was live"
+            );
+            release.notify_one();
+            let summary = task.await?.map_err(|error| error.source)?;
+            assert_eq!(summary.files, 1);
+            assert!(
+                fd_is_closed(raw_fd),
+                "successful leaf returned with its classification handle open"
+            );
+            let permit = tokio::time::timeout(Duration::from_secs(1), next_permit)
+                .await
+                .context("successful leaf did not return admission")?;
+            drop(permit);
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn failed_leaf_keeps_admission_until_its_handle_closes() -> anyhow::Result<()> {
+            let (_admission, task, raw_fd, release) =
+                start_leaf_lifetime_operation(LeafOutcome::Error).await?;
+            let mut next_permit = Box::pin(throttle::pending_meta_permit());
+            assert!(
+                futures::poll!(next_permit.as_mut()).is_pending(),
+                "leaf admission returned while its classification handle was live"
+            );
+            release.notify_one();
+            let error = task.await?.expect_err("leaf operation must fail");
+            assert!(format!("{:#}", error.source).contains("leaf operation failed"));
+            assert!(
+                fd_is_closed(raw_fd),
+                "failed leaf returned with its classification handle open"
+            );
+            let permit = tokio::time::timeout(Duration::from_secs(1), next_permit)
+                .await
+                .context("failed leaf did not return admission")?;
+            drop(permit);
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn cancelled_leaf_keeps_admission_until_its_handle_closes() -> anyhow::Result<()> {
+            let (_admission, task, raw_fd, _release) =
+                start_leaf_lifetime_operation(LeafOutcome::Success).await?;
+            let mut next_permit = Box::pin(throttle::pending_meta_permit());
+            assert!(
+                futures::poll!(next_permit.as_mut()).is_pending(),
+                "leaf admission returned while its classification handle was live"
+            );
+            task.abort();
+            let task_error = task.await.expect_err("leaf task must be cancelled");
+            assert!(task_error.is_cancelled());
+            assert!(
+                fd_is_closed(raw_fd),
+                "cancelled leaf retained its classification handle"
+            );
+            let permit = tokio::time::timeout(Duration::from_secs(1), next_permit)
+                .await
+                .context("cancelled leaf did not return admission")?;
+            drop(permit);
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn directory_ends_inner_scope_before_dir_pre_blocking_work() -> anyhow::Result<()> {
+            let root = crate::testutils::create_temp_dir().await?;
+            let directory_path = root.join("directory");
+            let file_path = root.join("owned-by-dir-pre");
+            tokio::fs::create_dir(&directory_path).await?;
+            tokio::fs::write(&file_path, b"x").await?;
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let parent = Arc::new(
+                Dir::open_parent_dir(&root, congestion::Side::Source)
+                    .await?
+                    .into_tree(),
+            );
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+            let visitor = Arc::new(DirPreLifetimeVisitor {
+                file_path,
+                started: std::sync::Mutex::new(Some(started_tx)),
+                release: std::sync::Mutex::new(Some(release_rx)),
+                completed: std::sync::Mutex::new(Some(completed_tx)),
+            });
+            let cx = root_cx(parent, OsStr::new("directory"), directory_path);
+            let outer_guard = throttle::open_file_permit().await;
+            let outer_admission = outer_guard.admission();
+            let task = tokio::spawn(crate::safedir::with_fd_admission(
+                outer_admission,
+                async move {
+                    let _outer_guard = outer_guard;
+                    process_entry(visitor, cx, (), EntryAdmission::RootOrDelegated).await
+                },
+            ));
+            started_rx
+                .await
+                .context("dir_pre blocking work did not start")?;
+            task.abort();
+            let task_error = task.await.expect_err("directory task must be cancelled");
+            assert!(task_error.is_cancelled());
+            let mut next_permit = Box::pin(throttle::open_file_permit());
+            let admission_was_retained = futures::poll!(next_permit.as_mut()).is_pending();
+            let release_result = release_tx.send(());
+            completed_rx
+                .await
+                .context("dir_pre blocking work did not complete")?;
+            release_result.context("dir_pre blocking work ended before release")?;
+            assert!(
+                admission_was_retained,
+                "the expired inner directory admission masked the live outer leaf admission"
+            );
+            drop(
+                tokio::time::timeout(Duration::from_secs(1), next_permit)
+                    .await
+                    .context("dir_pre blocking work did not return outer admission")?,
+            );
+            Ok(())
+        }
 
         fn inode_is_open(path: &std::path::Path) -> anyhow::Result<bool> {
             let metadata = std::fs::symlink_metadata(path)?;

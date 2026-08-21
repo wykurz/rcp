@@ -15,7 +15,7 @@ use crate::progress;
 use crate::rm;
 use crate::rm::{Settings as RmSettings, Summary as RmSummary};
 use crate::safedir::{self, Dir, FileMeta, Handle};
-use crate::walk::{EntryAdmission, EntryKind, LeafPermit, PermitKind};
+use crate::walk::{AdmittedLeaf, EntryAdmission, EntryKind, LeafPermit, PermitKind};
 use crate::walk_driver::{
     DirAction, DirPreResult, EntryCx, ProcessedChildren, WalkVisitor, process_entry,
 };
@@ -367,202 +367,216 @@ async fn copy_with_filter_base_admitted(
         Some(guard) => guard,
         None => throttle::open_file_permit().await,
     };
-    // Source: decompose via the shared helper so `.`/`..` operands (e.g. `rcp . dst`, `rcp src/..
-    // dst`) are canonicalized to a real directory + basename instead of being rejected; `/` is still
-    // rejected. (The helper also maps a single-component relative path's empty parent to ".".)
-    let src_operand = crate::walk::split_root_operand(src)
-        .await
-        .map_err(|err| Error::new(err, Default::default()))?;
-    let src_parent_path = src_operand.parent.as_path();
-    let src_name = src_operand.name.as_os_str();
-    let src = src_operand.display.as_path();
-    // The destination's parent path, split leniently for the up-front strict validation below (a
-    // `.`/`..`/`/` destination has no distinct parent+name; the authoritative split — which rejects
-    // such a destination — runs AFTER the filter, preserving default-mode ordering so a filtered-out
-    // source still skips cleanly).
-    let dst_parent_path_opt: Option<&std::path::Path> = match (dst.parent(), dst.file_name()) {
-        (Some(parent), Some(_)) if parent.as_os_str().is_empty() => Some(std::path::Path::new(".")),
-        (Some(parent), Some(_)) => Some(parent),
-        _ => None,
-    };
-    // Under strict operand resolution (--require-toctou-safe), resolve BOTH operand parents UP
-    // FRONT — before the source root-filter early-return, unconditionally, in every mode (real and
-    // dry-run) — via `open_parent_dir` (openat2 RESOLVE_NO_SYMLINKS). This single open per operand
-    // IS the strict validation: a symlink in any directory component of the source OR destination
-    // path fails closed with ELOOP here, so no filter/dry-run/overwrite branch downstream can let a
-    // symlinked prefix through. The held fds are reused below (source classify + walk; destination
-    // walk). On the DEFAULT path this is skipped: the filter check runs first over a path stat, so
-    // an excluded root under an execute-only (0111, searchable-not-readable) parent skips cleanly
-    // without requiring parent read.
-    let strict = crate::safedir::strict_operand_resolution();
-    let strict_src_parent: Option<Arc<Dir>> = if strict {
-        let parent = safedir::with_fd_admission(
-            open_file_guard.admission(),
-            Dir::open_parent_dir(src_parent_path, congestion::Side::Source),
-        )
-        .await
-        .with_context(|| format!("cannot open source parent directory {:?}", src_parent_path))
-        .map_err(|err| Error::new(err, Default::default()))?;
-        // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
-        Some(Arc::new(parent.into_tree()))
-    } else {
-        None
-    };
-    let strict_dst_parent: Option<Arc<Dir>> = match (strict, dst_parent_path_opt) {
-        (true, Some(dst_parent_path)) => {
-            match safedir::with_fd_admission(
-                open_file_guard.admission(),
-                Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination),
-            )
+    enum CopyRootSetup {
+        Complete(Summary),
+        Ready {
+            src_operand: crate::walk::RootOperand,
+            src_parent: Arc<Dir>,
+            dst_parent: Option<Arc<Dir>>,
+        },
+    }
+    let setup_admission = open_file_guard.admission();
+    let setup = safedir::with_fd_admission(setup_admission, async {
+        // Source: decompose via the shared helper so `.`/`..` operands (e.g. `rcp . dst`, `rcp src/..
+        // dst`) are canonicalized to a real directory + basename instead of being rejected; `/` is still
+        // rejected. (The helper also maps a single-component relative path's empty parent to ".".)
+        let src_operand = crate::walk::split_root_operand(src)
             .await
-            {
-                Ok(parent) => Some(Arc::new(parent.into_tree())),
-                // an absent destination parent (dry-run previewing into a not-yet-created tree, or
-                // a filtered-out root) is not a symlink violation — leave it to the walk's
-                // functional handling below. Only a symlinked prefix component (ELOOP) fails here.
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::NotFound
-                        || err.raw_os_error() == Some(libc::ENOTDIR) =>
-                {
-                    None
-                }
-                Err(err) => {
-                    return Err(Error::new(
-                        anyhow::Error::new(err).context(format!(
-                            "cannot open destination parent directory {dst_parent_path:?}"
-                        )),
-                        Default::default(),
-                    ));
+            .map_err(|err| Error::new(err, Default::default()))?;
+        let src_parent_path = src_operand.parent.as_path();
+        let src_name = src_operand.name.as_os_str();
+        let src = src_operand.display.as_path();
+        // The destination's parent path, split leniently for the up-front strict validation below (a
+        // `.`/`..`/`/` destination has no distinct parent+name; the authoritative split — which rejects
+        // such a destination — runs AFTER the filter, preserving default-mode ordering so a filtered-out
+        // source still skips cleanly).
+        let dst_parent_path_opt: Option<&std::path::Path> = match (dst.parent(), dst.file_name()) {
+            (Some(parent), Some(_)) if parent.as_os_str().is_empty() => {
+                Some(std::path::Path::new("."))
+            }
+            (Some(parent), Some(_)) => Some(parent),
+            _ => None,
+        };
+        // Under strict operand resolution (--require-toctou-safe), resolve BOTH operand parents UP
+        // FRONT — before the source root-filter early-return, unconditionally, in every mode (real and
+        // dry-run) — via `open_parent_dir` (openat2 RESOLVE_NO_SYMLINKS). This single open per operand
+        // IS the strict validation: a symlink in any directory component of the source OR destination
+        // path fails closed with ELOOP here, so no filter/dry-run/overwrite branch downstream can let a
+        // symlinked prefix through. The held fds are reused below (source classify + walk; destination
+        // walk). On the DEFAULT path this is skipped: the filter check runs first over a path stat, so
+        // an excluded root under an execute-only (0111, searchable-not-readable) parent skips cleanly
+        // without requiring parent read.
+        let strict = crate::safedir::strict_operand_resolution();
+        let strict_src_parent: Option<Arc<Dir>> = if strict {
+            let parent = Dir::open_parent_dir(src_parent_path, congestion::Side::Source)
+                .await
+                .with_context(|| {
+                    format!("cannot open source parent directory {:?}", src_parent_path)
+                })
+                .map_err(|err| Error::new(err, Default::default()))?;
+            // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
+            Some(Arc::new(parent.into_tree()))
+        } else {
+            None
+        };
+        let strict_dst_parent: Option<Arc<Dir>> = match (strict, dst_parent_path_opt) {
+            (true, Some(dst_parent_path)) => {
+                match Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination).await {
+                    Ok(parent) => Some(Arc::new(parent.into_tree())),
+                    // an absent destination parent (dry-run previewing into a not-yet-created tree, or
+                    // a filtered-out root) is not a symlink violation — leave it to the walk's
+                    // functional handling below. Only a symlinked prefix component (ELOOP) fails here.
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::NotFound
+                            || err.raw_os_error() == Some(libc::ENOTDIR) =>
+                    {
+                        None
+                    }
+                    Err(err) => {
+                        return Err(Error::new(
+                            anyhow::Error::new(err).context(format!(
+                                "cannot open destination parent directory {dst_parent_path:?}"
+                            )),
+                            Default::default(),
+                        ));
+                    }
                 }
             }
-        }
-        // default mode, or a degenerate destination (rejected by the authoritative split below)
-        _ => None,
-    };
-    // check filter for top-level source (files, directories, and symlinks)
-    if let Some(ref filter) = settings.filter {
-        let (kind, is_dir) = match &strict_src_parent {
-            // strict: classify via the held parent fd (O_NOFOLLOW), never by path
-            Some(parent) => {
-                let root_handle =
-                    safedir::with_fd_admission(open_file_guard.admission(), parent.child(src_name))
+            // default mode, or a degenerate destination (rejected by the authoritative split below)
+            _ => None,
+        };
+        // check filter for top-level source (files, directories, and symlinks)
+        if let Some(ref filter) = settings.filter {
+            let (kind, is_dir) = match &strict_src_parent {
+                // strict: classify via the held parent fd (O_NOFOLLOW), never by path
+                Some(parent) => {
+                    let root_handle = parent
+                        .child(src_name)
                         .await
                         .with_context(|| format!("failed reading metadata from src: {:?}", &src))
                         .map_err(|err| Error::new(err, Default::default()))?;
-                (root_handle.kind(), root_handle.kind() == EntryKind::Dir)
-            }
-            None => {
-                let src_metadata = crate::walk::run_metadata_probed(
-                    congestion::Side::Source,
-                    congestion::MetadataOp::Stat,
-                    tokio::fs::symlink_metadata(src),
-                )
-                .await
-                .with_context(|| format!("failed reading metadata from src: {:?}", &src))
-                .map_err(|err| Error::new(err, Default::default()))?;
-                (
-                    EntryKind::from_metadata(&src_metadata),
-                    src_metadata.is_dir(),
-                )
-            }
-        };
-        // for a delegated subtree (non-empty filter_base) the source is not the true filter
-        // root, so match it at its logical path with nested semantics; for a normal copy use
-        // root-item semantics (anchored patterns don't apply to the root itself).
-        let result = if filter_base.as_os_str().is_empty() {
-            filter.should_include_root_item(std::path::Path::new(src_name), is_dir)
-        } else {
-            filter.should_include(filter_base, is_dir)
-        };
-        match result {
-            crate::filter::FilterResult::Included => {}
-            result => {
-                if let Some(mode) = settings.dry_run {
-                    crate::dry_run::report_skip(src, &result, mode, kind.label_long());
+                    (root_handle.kind(), root_handle.kind() == EntryKind::Dir)
                 }
-                kind.inc_skipped(prog_track);
-                return Ok(skipped_summary_for(kind));
+                None => {
+                    let src_metadata = crate::walk::run_metadata_probed(
+                        congestion::Side::Source,
+                        congestion::MetadataOp::Stat,
+                        tokio::fs::symlink_metadata(src),
+                    )
+                    .await
+                    .with_context(|| format!("failed reading metadata from src: {:?}", &src))
+                    .map_err(|err| Error::new(err, Default::default()))?;
+                    (
+                        EntryKind::from_metadata(&src_metadata),
+                        src_metadata.is_dir(),
+                    )
+                }
+            };
+            // for a delegated subtree (non-empty filter_base) the source is not the true filter
+            // root, so match it at its logical path with nested semantics; for a normal copy use
+            // root-item semantics (anchored patterns don't apply to the root itself).
+            let result = if filter_base.as_os_str().is_empty() {
+                filter.should_include_root_item(std::path::Path::new(src_name), is_dir)
+            } else {
+                filter.should_include(filter_base, is_dir)
+            };
+            match result {
+                crate::filter::FilterResult::Included => {}
+                result => {
+                    if let Some(mode) = settings.dry_run {
+                        crate::dry_run::report_skip(src, &result, mode, kind.label_long());
+                    }
+                    kind.inc_skipped(prog_track);
+                    return Ok(CopyRootSetup::Complete(skipped_summary_for(kind)));
+                }
             }
         }
-    }
-    // Source parent for the walk: reuse the strict-validated fd, or open it following symlinks
-    // (default mode; the trusted prefix up to and including the operand's container).
-    let src_parent = match strict_src_parent {
-        Some(parent) => parent,
-        None => {
-            let parent = safedir::with_fd_admission(
-                open_file_guard.admission(),
-                Dir::open_parent_dir(src_parent_path, congestion::Side::Source),
-            )
-            .await
-            .with_context(|| format!("cannot open source parent directory {:?}", src_parent_path))
-            .map_err(|err| Error::new(err, Default::default()))?;
-            Arc::new(parent.into_tree())
-        }
-    };
-    // One `listxattr` on the source ROOT per run — a constant, not a per-entry probe — warning that
-    // a source root carrying an ACL is about to be copied by settings that drop it. Skipped
-    // entirely by a copy that asked for no preservation at all, once ACLs are preserved for both
-    // kinds, and after the first root of the run.
-    safedir::with_fd_admission(
-        open_file_guard.admission(),
+        // Source parent for the walk: reuse the strict-validated fd, or open it following symlinks
+        // (default mode; the trusted prefix up to and including the operand's container).
+        let src_parent = match strict_src_parent {
+            Some(parent) => parent,
+            None => {
+                let parent = Dir::open_parent_dir(src_parent_path, congestion::Side::Source)
+                    .await
+                    .with_context(|| {
+                        format!("cannot open source parent directory {:?}", src_parent_path)
+                    })
+                    .map_err(|err| Error::new(err, Default::default()))?;
+                Arc::new(parent.into_tree())
+            }
+        };
+        // One `listxattr` on the source ROOT per run — a constant, not a per-entry probe — warning that
+        // a source root carrying an ACL is about to be copied by settings that drop it. Skipped
+        // entirely by a copy that asked for no preservation at all, once ACLs are preserved for both
+        // kinds, and after the first root of the run.
         crate::safedir::warn_if_root_acl_unpreserved_at(
             &src_parent,
             src_name,
             src,
             crate::safedir::RootAclNotice::for_preserve(preserve),
-        ),
-    )
-    .await;
-    // Authoritative destination split (runs AFTER the filter, preserving default-mode ordering): a
-    // `.`/`..`/`/` destination is not a meaningful copy target, and rejecting it avoids clobbering
-    // the cwd. empty parent (a single-component relative path) means the current directory.
-    let (Some(dst_parent_path), Some(_dst_name)) = (dst.parent(), dst.file_name()) else {
-        return Err(Error::new(
-            anyhow!(
-                "copy destination {:?} has no parent directory or file name",
-                dst
-            ),
-            Default::default(),
-        ));
-    };
-    let dst_parent_path = if dst_parent_path.as_os_str().is_empty() {
-        std::path::Path::new(".")
-    } else {
-        dst_parent_path
-    };
-    // In dry-run we never touch the destination, so we don't open its parent at all (the parent
-    // may not even exist). `dst_parent == None` is the signal throughout the walk that destination
-    // operations must be skipped. In a real copy, reuse the strict-validated parent, or open it
-    // following symlinks (default mode; `rcp file symlink_to_dir/out` copies into the real dir).
-    let dst_parent = if settings.dry_run.is_some() {
-        None
-    } else {
-        match strict_dst_parent {
-            Some(parent) => Some(parent),
-            None => {
-                let dir = safedir::with_fd_admission(
-                    open_file_guard.admission(),
-                    Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination),
-                )
-                .await
-                .with_context(|| {
-                    format!(
-                        "cannot open destination parent directory {:?}",
-                        dst_parent_path
-                    )
-                })
-                .map_err(|err| Error::new(err, Default::default()))?;
-                Some(Arc::new(dir.into_tree()))
+        )
+        .await;
+        // Authoritative destination split (runs AFTER the filter, preserving default-mode ordering): a
+        // `.`/`..`/`/` destination is not a meaningful copy target, and rejecting it avoids clobbering
+        // the cwd. empty parent (a single-component relative path) means the current directory.
+        let (Some(dst_parent_path), Some(_dst_name)) = (dst.parent(), dst.file_name()) else {
+            return Err(Error::new(
+                anyhow!(
+                    "copy destination {:?} has no parent directory or file name",
+                    dst
+                ),
+                Default::default(),
+            ));
+        };
+        let dst_parent_path = if dst_parent_path.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            dst_parent_path
+        };
+        // In dry-run we never touch the destination, so we don't open its parent at all (the parent
+        // may not even exist). `dst_parent == None` is the signal throughout the walk that destination
+        // operations must be skipped. In a real copy, reuse the strict-validated parent, or open it
+        // following symlinks (default mode; `rcp file symlink_to_dir/out` copies into the real dir).
+        let dst_parent = if settings.dry_run.is_some() {
+            None
+        } else {
+            match strict_dst_parent {
+                Some(parent) => Some(parent),
+                None => {
+                    let dir = Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "cannot open destination parent directory {:?}",
+                                dst_parent_path
+                            )
+                        })
+                        .map_err(|err| Error::new(err, Default::default()))?;
+                    Some(Arc::new(dir.into_tree()))
+                }
             }
-        }
+        };
+        Ok(CopyRootSetup::Ready {
+            src_operand,
+            src_parent,
+            dst_parent,
+        })
+    })
+    .await?;
+    let (src_operand, src_parent, dst_parent) = match setup {
+        CopyRootSetup::Complete(summary) => return Ok(summary),
+        CopyRootSetup::Ready {
+            src_operand,
+            src_parent,
+            dst_parent,
+        } => (src_operand, src_parent, dst_parent),
     };
     run_copy_root(
         prog_track,
         &src_parent,
         dst_parent,
-        src_name,
-        src,
+        &src_operand.name,
+        &src_operand.display,
         dst,
         filter_base,
         settings,
@@ -1082,9 +1096,7 @@ impl WalkVisitor for CopyVisitor {
         &self,
         cx: &EntryCx,
         parent_ctx: &CopyDirContext,
-        handle: Handle,
-        kind: EntryKind,
-        permit: Option<LeafPermit>,
+        leaf: AdmittedLeaf,
     ) -> Result<Summary, Error> {
         let src_parent = &cx.parent;
         let dst_parent = parent_ctx.dst_dir.as_ref();
@@ -1097,14 +1109,11 @@ impl WalkVisitor for CopyVisitor {
         // one path-based branch we intentionally keep (hardening -L is out of scope). transfer the
         // provisional admission into the target's root walk; that walk releases it if authoritative
         // classification proves the target is a directory.
-        if self.settings.dereference && kind == EntryKind::Symlink {
-            let open_file_guard = match permit {
+        if self.settings.dereference && leaf.kind() == EntryKind::Symlink {
+            let open_file_guard = match leaf.into_permit() {
                 Some(permit) => permit.into_open_file(),
                 None => throttle::open_file_permit().await,
             };
-            // canonicalize/recurse no longer uses the pinned symlink; release that fd before the
-            // potentially deep path-based traversal too.
-            drop(handle);
             // invariant: only the explicit `--dereference` path may re-resolve an entry by path
             // (`canonicalize`). the non-dereference walk is fully fd-based and must never reach
             // here. a future refactor that wires `dereference == false` into this branch trips in
@@ -1134,12 +1143,8 @@ impl WalkVisitor for CopyVisitor {
             )
             .await;
         }
-        match kind {
+        match leaf.kind() {
             EntryKind::File => {
-                let open_file_guard = match permit {
-                    Some(permit) => permit.into_open_file(),
-                    None => throttle::open_file_permit().await,
-                };
                 copy_file_fd(
                     self.prog_track,
                     src_parent,
@@ -1148,20 +1153,14 @@ impl WalkVisitor for CopyVisitor {
                     &dst_name,
                     &dst_path,
                     src_path,
-                    &handle,
+                    leaf.handle(),
                     &self.settings,
                     &self.preserve,
                     is_fresh,
-                    open_file_guard,
                 )
                 .await
             }
             EntryKind::Symlink => {
-                // retain admission through the complete fd-bearing symlink operation.
-                let _guard = match permit {
-                    Some(permit) => permit,
-                    None => LeafPermit::OpenFile(throttle::open_file_permit().await),
-                };
                 copy_symlink_fd(
                     self.prog_track,
                     src_parent,
@@ -1169,7 +1168,7 @@ impl WalkVisitor for CopyVisitor {
                     &dst_name,
                     src_path,
                     &dst_path,
-                    &handle,
+                    leaf.handle(),
                     &self.settings,
                     &self.preserve,
                     is_fresh,
@@ -1177,11 +1176,6 @@ impl WalkVisitor for CopyVisitor {
                 .await
             }
             EntryKind::Special => {
-                // retain admission through this non-recursive classification decision.
-                let _guard = match permit {
-                    Some(permit) => permit,
-                    None => LeafPermit::OpenFile(throttle::open_file_permit().await),
-                };
                 if self.settings.skip_specials {
                     tracing::debug!("skipping special file {:?}", src_path);
                     if let Some(mode) = self.settings.dry_run {
@@ -1489,26 +1483,6 @@ async fn dry_run_dst_exists(dst_path: &std::path::Path) -> Result<bool, Error> {
     }
 }
 
-/// Run non-cancellable blocking work while keeping its open-file admission alive.
-///
-/// Tokio cannot abort a `spawn_blocking` closure once it starts. Moving the guard into the closure
-/// prevents cancellation of the awaiting async task from releasing capacity while detached work
-/// still owns file descriptors. On normal completion the guard returns to the async caller so it
-/// can remain live across any subsequent fd-bearing work.
-async fn spawn_blocking_with_open_file_guard<T, F>(
-    open_file_guard: throttle::OpenFileGuard,
-    work: F,
-) -> Result<(T, throttle::OpenFileGuard), tokio::task::JoinError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    let task_guard = crate::walk_driver::blocking_task_guard();
-    let (result, open_file_guard, _task_guard) =
-        tokio::task::spawn_blocking(move || (work(), open_file_guard, task_guard)).await?;
-    Ok((result, open_file_guard))
-}
-
 /// Copy a regular file fd-relative: create (or overwrite) the destination via `dst_parent`,
 /// copy the bytes with `copy_file_range_all`, then apply metadata through the destination's own
 /// fd — the open is held from creation through metadata, closing the path-based re-open TOCTOU
@@ -1527,7 +1501,6 @@ async fn copy_file_fd(
     settings: &Settings,
     preserve: &preserve::Settings,
     is_fresh: bool,
-    open_file_guard: throttle::OpenFileGuard,
 ) -> Result<Summary, Error> {
     // bring `FileMeta::size()` into scope locally; importing the trait at module level would
     // collide with `std::os::unix::fs::MetadataExt` on `std::fs::Metadata` elsewhere in this file.
@@ -1699,23 +1672,15 @@ async fn copy_file_fd(
     // the data copy is the data path, not a metadata syscall — it is deliberately NOT wrapped in a
     // congestion probe (matching the old `tokio::fs::copy`), so the large/variable copy latency
     // never pollutes the per-metadata-op controller baseline. backpressure comes from the
-    // open-files admission moved into the non-cancellable blocking closure. the dst file and guard
-    // are returned so both remain live through the metadata application that follows, closing the
+    // open-files admission retained by the canonical non-cancellable blocking boundary. the
+    // destination file is returned so it remains live through metadata application, closing the
     // path-based re-open and cancellation-lifetime gaps.
-    let (copy_result, open_file_guard) =
-        spawn_blocking_with_open_file_guard(open_file_guard, move || {
-            copy_file_range_all(&src_file, &dst_file, len).map(|copied| (copied, dst_file))
-        })
-        .await
-        .map_err(std::io::Error::other)
-        .with_context(|| format!("failed copying data to {:?}", dst_path))
-        .map_err(|err| Error::new(err, copy_summary))?;
-    // bind the guard before the returned destination file so reverse local-drop order closes the
-    // fd before releasing admission on every success/error exit below.
-    let _open_file_guard = open_file_guard;
-    let (copied, dst_file) = copy_result
-        .with_context(|| format!("failed copying data to {:?}", dst_path))
-        .map_err(|err| Error::new(err, copy_summary))?;
+    let (copied, dst_file) = safedir::run_fd_admitted_blocking(move || {
+        copy_file_range_all(&src_file, &dst_file, len).map(|copied| (copied, dst_file))
+    })
+    .await
+    .with_context(|| format!("failed copying data to {:?}", dst_path))
+    .map_err(|err| Error::new(err, copy_summary))?;
     // account for the bytes ACTUALLY copied, not `len` (the size snapshotted at open): if the source
     // is concurrently truncated, `copy_file_range_all` returns the shorter real count, so using `len`
     // would over-report. `len` still drives the copy loop and the iops-token reservation above.
@@ -5626,7 +5591,7 @@ mod copy_tests {
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::ReadLink);
             admission.set_max_ops_in_flight(readlink_resource, 1);
             let held_readlink = throttle::ops_in_flight_permit(readlink_resource).await;
-            let visit = visitor.visit_leaf(&cx, &parent_ctx, handle, EntryKind::Symlink, permit);
+            let visit = visitor.visit_leaf(&cx, &parent_ctx, AdmittedLeaf::new(handle, permit));
             tokio::pin!(visit);
             let stopped_at_readlink_gate = futures::poll!(visit.as_mut()).is_pending();
             let mut second_permit = Box::pin(throttle::open_file_permit());
@@ -5703,7 +5668,7 @@ mod copy_tests {
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
-            let visit = visitor.visit_leaf(&cx, &parent_ctx, handle, EntryKind::Symlink, permit);
+            let visit = visitor.visit_leaf(&cx, &parent_ctx, AdmittedLeaf::new(handle, permit));
             tokio::pin!(visit);
             let stopped_at_canonicalize_gate = futures::poll!(visit.as_mut()).is_pending();
             // Queue a test waiter immediately behind canonicalize. Once canonicalize releases its
@@ -5823,14 +5788,20 @@ mod copy_tests {
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let (completion, completion_rx) = testutils::CompletionSignal::new();
-            let task = tokio::spawn(spawn_blocking_with_open_file_guard(
-                open_file_guard,
-                move || {
-                    let _completion = completion;
-                    let _ = started_tx.send(());
-                    release_rx.recv().expect("release sender must stay alive");
-                },
-            ));
+            let task = tokio::spawn(async move {
+                let admission = open_file_guard.admission();
+                safedir::with_fd_admission(admission, async move {
+                    let _open_file_guard = open_file_guard;
+                    safedir::run_fd_admitted_blocking(move || {
+                        let _completion = completion;
+                        let _ = started_tx.send(());
+                        release_rx.recv().map_err(std::io::Error::other)?;
+                        Ok(())
+                    })
+                    .await
+                })
+                .await
+            });
             let started_result = started_rx.await;
             task.abort();
             let waiter_was_cancelled = matches!(task.await, Err(error) if error.is_cancelled());

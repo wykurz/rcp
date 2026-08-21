@@ -9,7 +9,7 @@ use tracing::instrument;
 use crate::filter::TimeFilter;
 use crate::progress;
 use crate::safedir::{self, Dir, Handle};
-use crate::walk::{EntryAdmission, EntryKind, LeafPermit, PermitKind};
+use crate::walk::{AdmittedLeaf, EntryAdmission, EntryKind, LeafPermit, PermitKind};
 use crate::walk_driver::{
     DirAction, DirPreResult, EntryCx, ProcessedChildren, WalkVisitor, process_entry,
 };
@@ -210,58 +210,71 @@ pub async fn rm(
     // its parent or performing the optional fd-based filter probe, then transfer that same permit
     // into the shared driver. an authoritative directory releases it before descent.
     let permit = crate::walk::ensure_leaf_permit(PermitKind::PendingMeta, None).await;
-    // decompose the operand into (parent dir, final component) so the root entry is opened and
-    // classified relative to a directory fd — the same fd-relative shape every nested entry takes.
-    // `.`/`..` operands (e.g. `rrm .`) are canonicalized so they still name a directory; `/` is
-    // rejected. rm reads and removes "the" tree; we gate it on the Source side (matching the
-    // existing rm code, which probes its stat/readdir on Source and only the destructive
-    // unlink/rmdir on Destination).
-    let operand = crate::walk::split_root_operand(path)
-        .await
-        .map_err(|err| Error::new(err, Default::default()))?;
-    let parent_path = operand.parent.as_path();
+    enum RmRootSetup {
+        Complete(Summary),
+        Ready {
+            operand: crate::walk::RootOperand,
+            parent: Arc<Dir>,
+        },
+    }
+    let setup =
+        safedir::with_optional_fd_admission(permit.as_ref().map(LeafPermit::admission), async {
+            // decompose the operand into (parent dir, final component) so the root entry is opened and
+            // classified relative to a directory fd — the same fd-relative shape every nested entry takes.
+            // `.`/`..` operands (e.g. `rrm .`) are canonicalized so they still name a directory; `/` is
+            // rejected. rm reads and removes "the" tree; we gate it on the Source side (matching the
+            // existing rm code, which probes its stat/readdir on Source and only the destructive
+            // unlink/rmdir on Destination).
+            let operand = crate::walk::split_root_operand(path)
+                .await
+                .map_err(|err| Error::new(err, Default::default()))?;
+            let parent_path = operand.parent.as_path();
+            let name = operand.name.as_os_str();
+            let path = operand.display.as_path();
+            // the operand's TRUSTED parent prefix is resolved following symlinks normally (the prefix is
+            // trusted up to and including the operand's container — only entries strictly below the named
+            // root are O_NOFOLLOW-hardened). a symlinked parent (e.g. `rrm symlinkdir/foo`) is followed; the
+            // operand itself is still classified via `child(name)` with O_NOFOLLOW (a symlink root is
+            // removed as the link itself).
+            let parent = Dir::open_parent_dir(parent_path, congestion::Side::Source)
+                .await
+                .with_context(|| format!("cannot open parent directory {parent_path:?}"))
+                .map_err(|err| Error::new(err, Default::default()))?;
+            // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
+            let parent = Arc::new(parent.into_tree());
+            if let Some(ref filter) = settings.filter {
+                // the top-level include/exclude filter is checked against `path` itself (its file name);
+                // classify the root via its parent fd purely to evaluate the root filter. the driver
+                // re-classifies the root authoritatively in `process_entry`, so this handle is just a probe.
+                let root_handle = parent
+                    .child(name)
+                    .await
+                    .with_context(|| format!("failed reading metadata from {path:?}"))
+                    .map_err(|err| Error::new(err, Default::default()))?;
+                let name_path = std::path::Path::new(name);
+                let result = filter
+                    .should_include_root_item(name_path, root_handle.kind() == EntryKind::Dir);
+                match result {
+                    crate::filter::FilterResult::Included => {}
+                    result => {
+                        let kind = root_handle.kind();
+                        if let Some(mode) = settings.dry_run {
+                            crate::dry_run::report_skip(path, &result, mode, kind.label_long());
+                        }
+                        kind.inc_skipped(prog_track);
+                        return Ok(RmRootSetup::Complete(skipped_summary_for(kind)));
+                    }
+                }
+            }
+            Ok(RmRootSetup::Ready { operand, parent })
+        })
+        .await?;
+    let (operand, parent) = match setup {
+        RmRootSetup::Complete(summary) => return Ok(summary),
+        RmRootSetup::Ready { operand, parent } => (operand, parent),
+    };
     let name = operand.name.as_os_str();
     let path = operand.display.as_path();
-    // the operand's TRUSTED parent prefix is resolved following symlinks normally (the prefix is
-    // trusted up to and including the operand's container — only entries strictly below the named
-    // root are O_NOFOLLOW-hardened). a symlinked parent (e.g. `rrm symlinkdir/foo`) is followed; the
-    // operand itself is still classified via `child(name)` with O_NOFOLLOW (a symlink root is
-    // removed as the link itself).
-    let parent = safedir::with_optional_fd_admission(
-        permit.as_ref().map(LeafPermit::admission),
-        Dir::open_parent_dir(parent_path, congestion::Side::Source),
-    )
-    .await
-    .with_context(|| format!("cannot open parent directory {parent_path:?}"))
-    .map_err(|err| Error::new(err, Default::default()))?;
-    // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
-    let parent = Arc::new(parent.into_tree());
-    if let Some(ref filter) = settings.filter {
-        // the top-level include/exclude filter is checked against `path` itself (its file name);
-        // classify the root via its parent fd purely to evaluate the root filter. the driver
-        // re-classifies the root authoritatively in `process_entry`, so this handle is just a probe.
-        let root_handle = safedir::with_optional_fd_admission(
-            permit.as_ref().map(LeafPermit::admission),
-            parent.child(name),
-        )
-        .await
-        .with_context(|| format!("failed reading metadata from {path:?}"))
-        .map_err(|err| Error::new(err, Default::default()))?;
-        let name_path = std::path::Path::new(name);
-        let result =
-            filter.should_include_root_item(name_path, root_handle.kind() == EntryKind::Dir);
-        match result {
-            crate::filter::FilterResult::Included => {}
-            result => {
-                let kind = root_handle.kind();
-                if let Some(mode) = settings.dry_run {
-                    crate::dry_run::report_skip(path, &result, mode, kind.label_long());
-                }
-                kind.inc_skipped(prog_track);
-                return Ok(skipped_summary_for(kind));
-            }
-        }
-    }
     // the root entry's owned context: rel_path/filter_path empty (the root), real_path = the
     // operand. rm has no delegated subtree, so `filter_path == rel_path`. The root is processed
     // exactly like a nested child via `process_entry`, transferring the root admission acquired
@@ -432,13 +445,9 @@ impl WalkVisitor for RmVisitor {
         &self,
         cx: &EntryCx,
         _parent_ctx: &(),
-        handle: Handle,
-        kind: EntryKind,
-        permit: Option<LeafPermit>,
+        leaf: AdmittedLeaf,
     ) -> Result<Summary, Error> {
-        // leaf: hold the permit through the (non-recursive) removal, then drop on return (the
-        // driver drops it for directories, never here).
-        let _permit = permit;
+        let kind = leaf.kind();
         let prog_track = self.prog_track;
         let settings = &self.settings;
         let parent = &cx.parent;
@@ -449,7 +458,7 @@ impl WalkVisitor for RmVisitor {
         let file_size = if is_symlink {
             0
         } else {
-            crate::preserve::Metadata::size(handle.meta())
+            crate::preserve::Metadata::size(leaf.handle().meta())
         };
         // apply time filter before removing (files/symlinks only)
         if let Some(ref time_filter) = settings.time_filter {
@@ -474,7 +483,8 @@ impl WalkVisitor for RmVisitor {
             // fd snapshot does not carry; read it inode-exact through the pinned handle so a
             // concurrent swap of `name` cannot redirect the stat to a different inode.
             let metadata =
-                match safedir::stat_meta_via_proc_fd(&handle, congestion::Side::Source).await {
+                match safedir::stat_meta_via_proc_fd(leaf.handle(), congestion::Side::Source).await
+                {
                     Ok(md) => md,
                     Err(err) => {
                         let err = anyhow::Error::new(err).context(format!(

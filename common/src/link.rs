@@ -10,8 +10,8 @@ use crate::copy::{
 use crate::filecmp;
 use crate::preserve;
 use crate::progress;
-use crate::safedir::{self, Dir};
-use crate::walk::{self, EntryAdmission, EntryKind, LeafPermit, PermitKind};
+use crate::safedir::{self, Dir, Handle};
+use crate::walk::{self, AdmittedLeaf, EntryAdmission, EntryKind, LeafPermit, PermitKind};
 
 /// Error type for link operations. See [`crate::error::OperationError`] for
 /// logging conventions and rationale.
@@ -222,6 +222,18 @@ async fn link_inner(
     // reserve root admission before any strict probe or operand-parent open, then transfer it into
     // link_internal. an authoritative directory releases it before dual-tree descent.
     let permit = walk::ensure_leaf_permit(PermitKind::OpenFile, None).await;
+    enum LinkRootSetup {
+        Complete(Summary),
+        Ready {
+            src_operand: crate::walk::RootOperand,
+            src_parent: Arc<Dir>,
+            dst_parent: Option<Arc<Dir>>,
+            update_parent: Option<(Arc<Dir>, std::ffi::OsString)>,
+        },
+    }
+    let setup = safedir::with_optional_fd_admission(
+        permit.as_ref().map(LeafPermit::admission),
+        async {
     // A missing --update root is destructive under both --update-exclusive (materialized set =
     // update set, so nothing materializes) AND --delete (the source-only keep_set makes any dst
     // entry the missing update tree WOULD have protected look extraneous, and prune wipes it).
@@ -242,10 +254,8 @@ async fn link_inner(
             // otherwise be opened) cannot slip a symlinked update prefix through. A symlink in a
             // directory component fails closed (ELOOP); this also serves the destructive-mode
             // existence check below.
-            let kind = safedir::with_optional_fd_admission(
-                permit.as_ref().map(LeafPermit::admission),
-                crate::safedir::strict_probe_dst_kind(update_path, congestion::Side::Source),
-            )
+            let kind =
+                crate::safedir::strict_probe_dst_kind(update_path, congestion::Side::Source)
             .await
             .map_err(|err| {
                 Error::new(
@@ -309,10 +319,7 @@ async fn link_inner(
     // excluded root under an execute-only (0111, searchable-not-readable) parent must skip cleanly,
     // and the O_RDONLY parent open would fail EACCES there.
     let strict_src_parent: Option<Arc<Dir>> = if crate::safedir::strict_operand_resolution() {
-        let parent = safedir::with_optional_fd_admission(
-            permit.as_ref().map(LeafPermit::admission),
-            Dir::open_parent_dir(&src_operand.parent, congestion::Side::Source),
-        )
+        let parent = Dir::open_parent_dir(&src_operand.parent, congestion::Side::Source)
         .await
         .with_context(|| {
             format!(
@@ -345,12 +352,7 @@ async fn link_inner(
         dst_parent_path_opt,
     ) {
         (true, Some(dst_parent_path)) => {
-            match safedir::with_optional_fd_admission(
-                permit.as_ref().map(LeafPermit::admission),
-                Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination),
-            )
-            .await
-            {
+            match Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination).await {
                 Ok(parent) => Some(Arc::new(parent.into_tree())),
                 Err(err)
                     if err.kind() == std::io::ErrorKind::NotFound
@@ -376,10 +378,8 @@ async fn link_inner(
         let (kind, is_dir) = match &strict_src_parent {
             // strict: classify via the held parent fd (O_NOFOLLOW), never by path
             Some(parent) => {
-                let root_handle = safedir::with_optional_fd_admission(
-                    permit.as_ref().map(LeafPermit::admission),
-                    parent.child(src_name),
-                )
+                let root_handle = parent
+                    .child(src_name)
                 .await
                 .with_context(|| format!("failed reading metadata from {:?}", &src))
                 .map_err(|err| Error::new(err, Default::default()))?;
@@ -408,7 +408,7 @@ async fn link_inner(
                     crate::dry_run::report_skip(src, &result, mode, kind.label_long());
                 }
                 kind.inc_skipped(prog_track);
-                return Ok(skipped_summary_for(kind));
+                return Ok(LinkRootSetup::Complete(skipped_summary_for(kind)));
             }
         }
     }
@@ -437,10 +437,7 @@ async fn link_inner(
     let src_parent = match strict_src_parent {
         Some(parent) => parent,
         None => {
-            let parent = safedir::with_optional_fd_admission(
-                permit.as_ref().map(LeafPermit::admission),
-                Dir::open_parent_dir(&src_operand.parent, congestion::Side::Source),
-            )
+            let parent = Dir::open_parent_dir(&src_operand.parent, congestion::Side::Source)
             .await
             .with_context(|| {
                 format!(
@@ -465,9 +462,7 @@ async fn link_inner(
     // root-only-heuristic character.) Whether the notice is wanted AT ALL still comes from the
     // preserve settings, which for rlink default to `all` — metadata fidelity is what the tool is
     // for — so a bare `rlink` asks for it where a bare `rcp` does not.
-    safedir::with_optional_fd_admission(
-        permit.as_ref().map(LeafPermit::admission),
-        crate::safedir::warn_if_root_acl_unpreserved_at(
+    crate::safedir::warn_if_root_acl_unpreserved_at(
             &src_parent,
             src_name,
             src,
@@ -475,7 +470,6 @@ async fn link_inner(
                 file_acl_preserved: update.is_none() || settings.preserve.file.acl,
                 ..crate::safedir::RootAclNotice::for_preserve(&settings.preserve)
             },
-        ),
     )
     .await;
     // In dry-run we never touch the destination, so we don't open its parent at all (it may not
@@ -489,10 +483,7 @@ async fn link_inner(
         match strict_dst_parent {
             Some(parent) => Some(parent),
             None => {
-                let dir = safedir::with_optional_fd_admission(
-                    permit.as_ref().map(LeafPermit::admission),
-                    Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination),
-                )
+                let dir = Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination)
                 .await
                 .with_context(|| {
                     format!(
@@ -534,12 +525,7 @@ async fn link_inner(
             // source parent above): a symlinked update container must be followed into the real dir.
             let fallback_eligible =
                 !settings.update_exclusive && settings.copy_settings.delete.is_none();
-            match safedir::with_optional_fd_admission(
-                permit.as_ref().map(LeafPermit::admission),
-                Dir::open_parent_dir(&update_parent_path, congestion::Side::Source),
-            )
-            .await
-            {
+            match Dir::open_parent_dir(&update_parent_path, congestion::Side::Source).await {
                 // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below).
                 Ok(dir) => Some((Arc::new(dir.into_tree()), update_name)),
                 Err(err)
@@ -572,6 +558,26 @@ async fn link_inner(
         }
         None => None,
     };
+    Ok(LinkRootSetup::Ready {
+        src_operand,
+        src_parent,
+        dst_parent,
+        update_parent,
+    })
+        },
+    )
+    .await?;
+    let (src_operand, src_parent, dst_parent, update_parent) = match setup {
+        LinkRootSetup::Complete(summary) => return Ok(summary),
+        LinkRootSetup::Ready {
+            src_operand,
+            src_parent,
+            dst_parent,
+            update_parent,
+        } => (src_operand, src_parent, dst_parent, update_parent),
+    };
+    let src = src_operand.display.as_path();
+    let src_name = src_operand.name.as_os_str();
     let update_ref = update_parent
         .as_ref()
         .map(|(dir, name)| (dir, name.as_os_str()));
@@ -638,23 +644,74 @@ impl DeleteKeepSet {
     }
 }
 
-/// Per-entry worker of the fd-based dual-tree link walk.
+/// Keeps both comparison handles structurally ahead of their shared admission permit.
+struct AdmittedLinkEntry {
+    src_handle: Handle,
+    update_handle: Option<Handle>,
+    permit: Option<LeafPermit>,
+}
+
+impl AdmittedLinkEntry {
+    fn new(src_handle: Handle, permit: Option<LeafPermit>) -> Self {
+        Self {
+            src_handle,
+            update_handle: None,
+            permit,
+        }
+    }
+
+    fn into_source_leaf(self) -> AdmittedLeaf {
+        let Self {
+            src_handle,
+            update_handle,
+            permit,
+        } = self;
+        drop(update_handle);
+        AdmittedLeaf::new(src_handle, permit)
+    }
+
+    fn into_update_permit(self) -> Option<LeafPermit> {
+        let Self {
+            src_handle,
+            update_handle,
+            permit,
+        } = self;
+        drop(src_handle);
+        let update_handle =
+            update_handle.expect("update action requires a classified update entry");
+        if update_handle.kind() == EntryKind::Dir {
+            // delegated copy reclassifies directories and releases this provisional permit before
+            // descent; close the comparison handle without constructing a leaf bundle for it.
+            drop(update_handle);
+            permit
+        } else {
+            AdmittedLeaf::new(update_handle, permit).into_permit()
+        }
+    }
+
+    fn close_for_directory(self) -> bool {
+        let Self {
+            src_handle,
+            update_handle,
+            permit,
+        } = self;
+        let has_update_dir = update_handle.is_some();
+        drop(permit);
+        drop(src_handle);
+        drop(update_handle);
+        has_update_dir
+    }
+}
+
+/// Process one entry in the dual source/update tree.
 ///
-/// `src_parent` is the open source directory holding `name`; `update` is `Some((dir, name))` when
-/// an update tree is present at this level (its directory handle plus the update root's basename
-/// for the root entry); `dst_parent` is the open destination directory (`None` in dry-run).
-/// `src_root`/`dst_root`/`update_root` are the user-specified roots and `rel_path` is this entry's
-/// path relative to those roots (empty for the root entry) — joined onto a root they reconstruct
-/// the real path used for diagnostics, `rm`, and `--dereference`. `rel_path` is also this entry's
-/// logical filter path.
-///
-/// The src entry is classified via `src_parent.child(name)` (fstat-authoritative; the getdents
+/// The source entry is classified via `src_parent.child(name)` (fstat-authoritative; the getdents
 /// hint is only a spawn-loop heuristic). When an update entry exists at this name it is classified
 /// too, and the hard-link-vs-copy decision mirrors the old `--update` overlay logic exactly:
-/// a type-mismatch / changed file / symlink in the update tree is COPIED from the update version
-/// via [`copy::copy_child`]; an unchanged file is HARD-LINKED from the source; a directory recurses
-/// the dual tree. With no update tree, a source file is hard-linked, a source symlink is copied,
-/// and a directory recurses.
+/// a type mismatch, changed file, or symlink in the update tree is copied from the update version
+/// via [`copy::copy_child`]; an unchanged file is hard-linked from the source; a directory recurses
+/// through the dual tree. With no update tree, a source file is hard-linked, a source symlink is
+/// copied, and a directory recurses.
 ///
 /// `admission` is the explicit scheduling state supplied by the directory loop. Every
 /// non-recursive branch retains a held permit through its final fd-bearing operation; direct
@@ -706,52 +763,79 @@ async fn link_internal(
             )
         })?
         .to_owned();
-    tracing::debug!("classifying source entry");
-    let (src_handle, mut admission) =
-        walk::classify_entry(src_parent, name, PermitKind::OpenFile, admission)
+    let mut admission = admission;
+    // A positive source-directory hint gets one unadmitted classification. If stale, close the
+    // first handle before acquiring and reclassify inside the admitted worker region below.
+    let hinted_src_handle = if matches!(admission, EntryAdmission::HintedDirectory) {
+        tracing::debug!("classifying hinted source entry");
+        let handle = walk::classify_entry(src_parent, name)
             .await
             .with_context(|| format!("failed reading metadata from {:?}", &src_path))
             .map_err(|err| Error::new(err, Default::default()))?;
-    if update.is_some() {
-        // the source hint says nothing about the update counterpart. ensure it is admitted before
-        // opening a possible update leaf; a directory result releases this provisional permit at
-        // the common recursion boundary below.
-        if matches!(admission, EntryAdmission::HintedDirectory) {
+        if handle.kind() == EntryKind::Dir {
+            Some(handle)
+        } else {
+            drop(handle);
             admission = EntryAdmission::RootOrDelegated;
+            None
         }
+    } else {
+        None
+    };
+    // A source directory hint says nothing about a separate update counterpart. Any update
+    // classification therefore needs admission even when the source handle above did not.
+    if update.is_some() && matches!(admission, EntryAdmission::HintedDirectory) {
+        admission = EntryAdmission::RootOrDelegated;
+    }
+    if hinted_src_handle.is_none() || update.is_some() {
         admission = walk::ensure_entry_admission(PermitKind::OpenFile, admission).await;
     }
-    // classify the update entry at this name (if an update tree is present at this level). a
-    // NotFound is the "this path is missing from update" case; under --update-exclusive it means
-    // we're done (nothing materializes), otherwise we fall back to no-update mode for this entry.
-    let mut update_handle = match update {
-        Some((update_dir, update_name)) => {
-            tracing::debug!("classifying 'update' entry");
-            match safedir::with_optional_fd_admission(
-                admission.admission(),
-                update_dir.child(update_name),
-            )
-            .await
-            {
-                Ok(handle) => Some(handle),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if settings.update_exclusive {
-                        // the path is missing from update, we're done
-                        return Ok(Default::default());
+    let weak_admission = admission.admission();
+
+    enum LinkDispatch {
+        Complete(Summary),
+        Directory { has_update_dir: bool },
+    }
+
+    let dispatch = safedir::with_optional_fd_admission(weak_admission, async {
+        let src_handle = match hinted_src_handle {
+            Some(handle) => handle,
+            None => {
+                tracing::debug!("classifying source entry");
+                walk::classify_entry(src_parent, name)
+                    .await
+                    .with_context(|| format!("failed reading metadata from {:?}", &src_path))
+                    .map_err(|err| Error::new(err, Default::default()))?
+            }
+        };
+        let mut entry = AdmittedLinkEntry::new(src_handle, admission.into_permit());
+        // classify the update entry at this name (if an update tree is present at this level). a
+        // NotFound is the "this path is missing from update" case; under --update-exclusive it
+        // means we're done, otherwise we fall back to no-update mode for this entry.
+        entry.update_handle = match update {
+            Some((update_dir, update_name)) => {
+                tracing::debug!("classifying 'update' entry");
+                match update_dir.child(update_name).await {
+                    Ok(handle) => Some(handle),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if settings.update_exclusive {
+                            return Ok(LinkDispatch::Complete(Default::default()));
+                        }
+                        None
                     }
-                    None
-                }
-                Err(error) => {
-                    return Err(Error::new(
-                        anyhow::Error::new(error)
-                            .context(format!("failed reading metadata from {:?}", &update_path)),
-                        Default::default(),
-                    ));
+                    Err(error) => {
+                        return Err(Error::new(
+                            anyhow::Error::new(error).context(format!(
+                                "failed reading metadata from {:?}",
+                                &update_path
+                            )),
+                            Default::default(),
+                        ));
+                    }
                 }
             }
-        }
-        None => None,
-    };
+            None => None,
+        };
     // Re-evaluate the filter using the UPDATE entry's authoritative type before letting it drive
     // the materialization decision below. The spawn loop in `link_dir_contents` evaluated the
     // filter against the SOURCE entry's type; when the same name is a TYPE MISMATCH (e.g. src
@@ -762,7 +846,7 @@ async fn link_internal(
     // excluded subtree. Note a filtered-out update reaching here is necessarily a type mismatch: if
     // the pattern were type-independent it would have excluded the src too, so the src loop would
     // not have spawned this worker.
-    if let Some(handle) = update_handle.as_ref() {
+    if let Some(handle) = entry.update_handle.as_ref() {
         let update_is_dir = handle.kind() == EntryKind::Dir;
         // For the ROOT entry (`rel_path` empty) judge the update side with root-item semantics —
         // symmetric with how the source root was filtered (`should_include_root_item` at the top of
@@ -796,7 +880,7 @@ async fn link_internal(
                     "update entry {:?} is filtered out under --update-exclusive; materializing nothing",
                     update_path
                 );
-                return Ok(Default::default());
+                return Ok(LinkDispatch::Complete(Default::default()));
             }
             // Normal --update (union): the update's version of this name is excluded, so the src's
             // version stands. Treat the update entry as absent and fall through to the no-update
@@ -807,23 +891,22 @@ async fn link_internal(
                 "update entry {:?} is filtered out; falling back to source-only handling",
                 update_path
             );
-            update_handle = None;
+            entry.update_handle = None;
         }
     }
-    // from this point every non-recursive action retains the concrete open-file guard through its
-    // final fd-bearing operation. a delegated copy owns the same guard and drops it itself if the
-    // authoritative update entry is a directory. only the direct dual-tree directory recursion at
-    // the bottom releases it locally.
-    let open_file_guard = admission.into_permit().map(LeafPermit::into_open_file);
-    if let Some(update_entry) = update_handle.as_ref() {
+    // From this point every non-recursive action retains an `AdmittedLeaf` through its final
+    // fd-bearing operation. A delegated copy closes its action handle before taking the permit;
+    // comparison handles close before that transfer. Direct directory recursion closes admission
+    // and both classification handles inside this scope.
+    if let Some(update_entry) = entry.update_handle.as_ref() {
         let (update_dir, update_name) = update.unwrap();
         let update_path = update_path.as_deref().unwrap();
-        if update_entry.kind() != src_handle.kind() {
+        if update_entry.kind() != entry.src_handle.kind() {
             // file type changed, just copy the updated one
             tracing::debug!(
                 "link: file type of {:?} ({:?}) and {:?} ({:?}) differs - copying from update",
                 src_path,
-                src_handle.kind(),
+                entry.src_handle.kind(),
                 update_path,
                 update_entry.kind()
             );
@@ -833,8 +916,7 @@ async fn link_internal(
             // the update side is a directory, copy's driver releases it before descent.
             // copy_child classifies the update entry again and does not consume either outer
             // classification handle. release both before transferring admission to that walk.
-            drop(src_handle);
-            drop(update_handle);
+            let permit = entry.into_update_permit();
             return delegate_copy(
                 prog_track,
                 update_dir,
@@ -845,47 +927,40 @@ async fn link_internal(
                 rel_path,
                 settings,
                 is_fresh,
-                EntryAdmission::from(open_file_guard.map(LeafPermit::OpenFile)),
+                EntryAdmission::from(permit),
             )
-            .await;
+            .await
+            .map(LinkDispatch::Complete);
         }
         if update_entry.kind() == EntryKind::File {
             // check if the file is unchanged and if so hard-link, otherwise copy from the updated one
             if filecmp::metadata_equal(
                 &settings.update_compare,
-                src_handle.meta(),
+                entry.src_handle.meta(),
                 update_entry.meta(),
             ) {
                 // unchanged file: hard-link from src while retaining admission across `linkat`.
                 tracing::debug!("no change, hard link 'src'");
-                // the update classification established the decision but hard-linking consumes
-                // only the pinned source handle.
-                drop(update_handle);
-                let hard_link_lease = open_file_guard
-                    .as_ref()
-                    .map(throttle::OpenFileGuard::admission);
-                let _guard = open_file_guard;
+                let leaf = entry.into_source_leaf();
                 if settings.dry_run.is_some() {
                     crate::dry_run::report_action("link", &src_path, Some(&dst_path), "file");
-                    return Ok(Summary {
+                    return Ok(LinkDispatch::Complete(Summary {
                         hard_links_created: 1,
                         ..Default::default()
-                    });
+                    }));
                 }
                 let dst_dir =
                     dst_parent.expect("destination parent must be open for a real hard link");
-                return safedir::with_optional_fd_admission(
-                    hard_link_lease,
-                    hard_link_entry_fd(
+                return hard_link_entry_fd(
                         prog_track,
-                        &src_handle,
+                        leaf.handle(),
                         dst_dir,
                         &dst_name,
                         &dst_path,
                         settings,
-                    ),
                 )
-                .await;
+                .await
+                .map(LinkDispatch::Complete);
             }
             tracing::debug!(
                 "link: {:?} metadata has changed, copying from {:?}",
@@ -893,8 +968,7 @@ async fn link_internal(
                 update_path
             );
             // changed file: delegate to copy, transferring the same admission guard.
-            drop(src_handle);
-            drop(update_handle);
+            let permit = entry.into_update_permit();
             return delegate_copy(
                 prog_track,
                 update_dir,
@@ -905,15 +979,15 @@ async fn link_internal(
                 rel_path,
                 settings,
                 is_fresh,
-                EntryAdmission::from(open_file_guard.map(LeafPermit::OpenFile)),
+                EntryAdmission::from(permit),
             )
-            .await;
+            .await
+            .map(LinkDispatch::Complete);
         }
         if update_entry.kind() == EntryKind::Symlink {
             // update symlink: copy it under the same non-recursive admission guard.
             tracing::debug!("'update' is a symlink so just symlink that");
-            drop(src_handle);
-            drop(update_handle);
+            let permit = entry.into_update_permit();
             return delegate_copy(
                 prog_track,
                 update_dir,
@@ -924,45 +998,39 @@ async fn link_internal(
                 rel_path,
                 settings,
                 is_fresh,
-                EntryAdmission::from(open_file_guard.map(LeafPermit::OpenFile)),
+                EntryAdmission::from(permit),
             )
-            .await;
+            .await
+            .map(LinkDispatch::Complete);
         }
     } else {
         // update hasn't been specified (or is absent at this name): hard-link a source file or copy
         // a source symlink, retaining admission across the non-recursive work.
         tracing::debug!("no 'update' entry");
-        if src_handle.kind() == EntryKind::File {
-            let hard_link_lease = open_file_guard
-                .as_ref()
-                .map(throttle::OpenFileGuard::admission);
-            let _guard = open_file_guard;
+        if entry.src_handle.kind() == EntryKind::File {
+            let leaf = entry.into_source_leaf();
             if settings.dry_run.is_some() {
                 crate::dry_run::report_action("link", &src_path, Some(&dst_path), "file");
-                return Ok(Summary {
+                return Ok(LinkDispatch::Complete(Summary {
                     hard_links_created: 1,
                     ..Default::default()
-                });
+                }));
             }
             let dst_dir = dst_parent.expect("destination parent must be open for a real hard link");
-            return safedir::with_optional_fd_admission(
-                hard_link_lease,
-                hard_link_entry_fd(
+            return hard_link_entry_fd(
                     prog_track,
-                    &src_handle,
+                    leaf.handle(),
                     dst_dir,
                     &dst_name,
                     &dst_path,
                     settings,
-                ),
             )
-            .await;
+            .await
+            .map(LinkDispatch::Complete);
         }
-        if src_handle.kind() == EntryKind::Symlink {
+        if entry.src_handle.kind() == EntryKind::Symlink {
             tracing::debug!("'src' is a symlink so just symlink that");
-            // copy_child reclassifies the source entry, so the outer classification is redundant
-            // once dispatch has been decided.
-            drop(src_handle);
+            let permit = entry.into_source_leaf().into_permit();
             return delegate_copy(
                 prog_track,
                 src_parent,
@@ -973,20 +1041,20 @@ async fn link_internal(
                 rel_path,
                 settings,
                 is_fresh,
-                EntryAdmission::from(open_file_guard.map(LeafPermit::OpenFile)),
+                EntryAdmission::from(permit),
             )
-            .await;
+            .await
+            .map(LinkDispatch::Complete);
         }
     }
-    if src_handle.kind() != EntryKind::Dir {
+    if entry.src_handle.kind() != EntryKind::Dir {
         // special file (or unsupported type): retain admission until this non-recursive decision
         // returns and drops the source/update handles.
-        let _guard = open_file_guard;
         if settings.copy_settings.skip_specials {
             tracing::debug!(
                 "skipping special file {:?} (kind: {:?})",
                 src_path,
-                src_handle.kind()
+                entry.src_handle.kind()
             );
             if let Some(mode) = settings.dry_run {
                 match mode {
@@ -996,49 +1064,52 @@ async fn link_internal(
                         println!(
                             "skip special {:?} (unsupported file type: {:?})",
                             src_path,
-                            src_handle.kind()
+                            entry.src_handle.kind()
                         );
                     }
                 }
             }
             prog_track.specials_skipped.inc();
-            return Ok(Summary {
+            return Ok(LinkDispatch::Complete(Summary {
                 copy_summary: CopySummary {
                     specials_skipped: 1,
                     ..Default::default()
                 },
                 ..Default::default()
-            });
+            }));
         }
         return Err(Error::new(
             anyhow!(
                 "copy: {:?} -> {:?} failed, unsupported src file type: {:?}",
                 src_path,
                 dst_path,
-                src_handle.kind()
+                entry.src_handle.kind()
             ),
             Default::default(),
         ));
     }
     // directory: release before recursing the dual tree. this is rlink's direct counterpart to the
     // shared driver's drop-before-recurse boundary.
-    drop(open_file_guard);
     debug_assert!(
-        update_handle.is_none() || update_handle.as_ref().unwrap().kind() == EntryKind::Dir
+        entry.update_handle.is_none()
+            || entry.update_handle.as_ref().unwrap().kind() == EntryKind::Dir
     );
     // Only drive the dual-tree update walk when an update directory entry actually exists at this
     // name. If `update_handle` is None (the update tree has no counterpart for this src dir, the
     // recursive "update missing" case), process this subtree in no-update mode: hard-link the whole
     // source subtree. Passing the parent update tuple here would make `link_dir_entry` try to
     // `open_dir` a non-existent update child.
-    let has_update_dir = update_handle.is_some();
+    let has_update_dir = entry.close_for_directory();
+    Ok(LinkDispatch::Directory { has_update_dir })
+    })
+    .await?;
+    let has_update_dir = match dispatch {
+        LinkDispatch::Complete(summary) => return Ok(summary),
+        LinkDispatch::Directory { has_update_dir } => has_update_dir,
+    };
     let update_for_dir = update.filter(|_| has_update_dir);
     let update_root_for_dir = update_root.filter(|_| has_update_dir);
     let update_path_for_dir = update_path.as_deref().filter(|_| has_update_dir);
-    // link_dir_entry opens the source/update directories used for descent. retaining these O_PATH
-    // classification handles as well would add one or two needless fds at every recursive level.
-    drop(src_handle);
-    drop(update_handle);
     link_dir_entry(
         prog_track,
         src_parent,

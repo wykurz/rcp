@@ -3131,7 +3131,7 @@ pub async fn set_symlink_metadata_fd<Meta: crate::preserve::Metadata>(
 /// boundary intentionally adds no rate or congestion gating; directory enumeration uses it after
 /// consuming its static rate token, while metadata syscalls layer their congestion lifecycle on
 /// top in [`run_metadata_probed_blocking_no_rate`].
-async fn run_fd_admitted_blocking<F, T>(f: F) -> std::io::Result<T>
+pub(crate) async fn run_fd_admitted_blocking<F, T>(f: F) -> std::io::Result<T>
 where
     F: FnOnce() -> std::io::Result<T> + Send + 'static,
     T: Send + 'static,
@@ -3424,14 +3424,15 @@ mod tests {
 
             let release_work_result = release_work_tx.send(());
             let drop_started_result = drop_started_rx.await;
-            let second_permit = throttle::open_file_permit();
-            tokio::pin!(second_permit);
-            let admission_was_retained =
-                drop_started_result.is_ok() && futures::poll!(second_permit.as_mut()).is_pending();
+            let admission_was_retained = {
+                let second_permit = throttle::open_file_permit();
+                tokio::pin!(second_permit);
+                drop_started_result.is_ok() && futures::poll!(second_permit.as_mut()).is_pending()
+            };
             let release_drop_result = release_drop_tx.send(());
             let (completion_result, permit) = crate::testutils::await_completion_and_capacity(
                 completion_rx,
-                second_permit.as_mut(),
+                throttle::open_file_permit(),
             )
             .await;
             work_started_result.context("detached metadata work did not start")?;
@@ -3443,6 +3444,74 @@ mod tests {
             assert!(
                 waiter_was_cancelled,
                 "the async metadata waiter must observe cancellation"
+            );
+            assert!(
+                admission_was_retained,
+                "admission was released before the abandoned returned fd was dropped"
+            );
+            Ok(())
+        }
+
+        /// An abandoned unprobed blocking result must drop its fd owner before returning the
+        /// strong admission lease. The data-copy path uses this lower-level runner directly.
+        #[tokio::test]
+        async fn abandoned_unprobed_output_keeps_admission_until_returned_fd_drops()
+        -> anyhow::Result<()> {
+            let root = crate::testutils::create_temp_dir().await?;
+            let file_path = root.join("returned-unprobed");
+            tokio::fs::write(&file_path, b"x").await?;
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let open_file_guard = throttle::open_file_permit().await;
+            let (work_started_tx, work_started_rx) = tokio::sync::oneshot::channel();
+            let (release_work_tx, release_work_rx) = std::sync::mpsc::channel();
+            let (drop_started_tx, drop_started_rx) = tokio::sync::oneshot::channel();
+            let (release_drop_tx, release_drop_rx) = std::sync::mpsc::channel();
+            let (completion, completion_rx) = crate::testutils::CompletionSignal::new();
+            let task = tokio::spawn(async move {
+                let admission = open_file_guard.admission();
+                with_fd_admission(admission, async move {
+                    let _open_file_guard = open_file_guard;
+                    run_fd_admitted_blocking(move || {
+                        let file = std::fs::File::open(file_path)?;
+                        let _ = work_started_tx.send(());
+                        release_work_rx.recv().map_err(std::io::Error::other)?;
+                        Ok(BlockingDropFd {
+                            _file: file,
+                            drop_started: Some(drop_started_tx),
+                            release_drop: release_drop_rx,
+                            _completion: completion,
+                        })
+                    })
+                    .await
+                })
+                .await
+            });
+            let work_started_result = work_started_rx.await;
+            task.abort();
+            let waiter_was_cancelled = matches!(task.await, Err(error) if error.is_cancelled());
+            let release_work_result = release_work_tx.send(());
+            let drop_started_result = drop_started_rx.await;
+            let admission_was_retained = {
+                let second_permit = throttle::open_file_permit();
+                tokio::pin!(second_permit);
+                drop_started_result.is_ok() && futures::poll!(second_permit.as_mut()).is_pending()
+            };
+            let release_drop_result = release_drop_tx.send(());
+            let (completion_result, permit) = crate::testutils::await_completion_and_capacity(
+                completion_rx,
+                throttle::open_file_permit(),
+            )
+            .await;
+            work_started_result.context("detached unprobed work did not start")?;
+            release_work_result.context("detached unprobed work ended before its release")?;
+            drop_started_result.context("the abandoned returned fd did not begin dropping")?;
+            release_drop_result.context("the abandoned returned fd ended before its release")?;
+            completion_result.context("the abandoned returned fd did not report completion")?;
+            drop(permit);
+            assert!(
+                waiter_was_cancelled,
+                "the async waiter must observe cancellation"
             );
             assert!(
                 admission_was_retained,

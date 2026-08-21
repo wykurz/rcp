@@ -87,22 +87,21 @@ pub async fn write_file(
     bufsize: usize,
     chunk_size: u64,
 ) -> Result<Summary, Error> {
-    use tokio::io::AsyncWriteExt;
     let open_file_guard = throttle::open_file_permit().await;
-    throttle::get_file_iops_tokens(chunk_size, filesize as u64).await;
-    let _ops_guard = prog_track.ops.guard();
-    let original_filesize = filesize;
-    let mut bytes = vec![0u8; bufsize];
-    // The file open is the single metadata syscall in this path; wrap it
-    // with the cwnd permit + probe so filegen participates in the same
-    // adaptive control loop as copy/rm/link. Use the `_no_rate` variant
-    // because filegen gates the ops-throttle at task-spawn time (see
-    // `filegen` below) — going through the rate-gating helper here
-    // would consume two tokens per file and halve the effective rate.
-    let open_path = path.clone();
-    let file = crate::safedir::with_fd_admission(
-        open_file_guard.admission(),
-        crate::safedir::run_metadata_probed_blocking_no_rate(
+    let admission = open_file_guard.admission();
+    crate::safedir::with_fd_admission(admission, async move {
+        let _open_file_guard = open_file_guard;
+        throttle::get_file_iops_tokens(chunk_size, filesize as u64).await;
+        let _ops_guard = prog_track.ops.guard();
+        let original_filesize = filesize;
+        // The file open is the single metadata syscall in this path; wrap it
+        // with the cwnd permit + probe so filegen participates in the same
+        // adaptive control loop as copy/rm/link. Use the `_no_rate` variant
+        // because filegen gates the ops-throttle at task-spawn time (see
+        // `filegen` below) — going through the rate-gating helper here
+        // would consume two tokens per file and halve the effective rate.
+        let open_path = path.clone();
+        let file = crate::safedir::run_metadata_probed_blocking_no_rate(
             congestion::Side::Destination,
             congestion::MetadataOp::OpenCreate,
             move || {
@@ -112,39 +111,44 @@ pub async fn write_file(
                     .truncate(false)
                     .open(open_path)
             },
-        ),
-    )
-    .await
-    .with_context(|| format!("Error opening {:?}", &path))
-    .map_err(|err| Error::new(err, Default::default()))?;
-    let mut file = tokio::fs::File::from_std(file);
-    while filesize > 0 {
-        {
-            // make sure rng falls out of scope before await
-            rand::fill(&mut bytes[..]);
-        }
-        let writesize = std::cmp::min(filesize, bufsize);
-        file.write_all(&bytes[..writesize])
-            .await
-            .with_context(|| format!("Error writing to {:?}", &path))
-            .map_err(|err| Error::new(err, Default::default()))?;
-        filesize -= writesize;
-        prog_track.bytes_copied.add(writesize as u64);
-    }
-    // tokio accepts the final chunk into its internal buffer before the mandatory blocking write
-    // necessarily finishes. wait for that background write while the admission guard is still
-    // live; otherwise a successful fast producer can release capacity while slow storage still
-    // owns the file descriptor.
-    file.flush()
+        )
         .await
-        .with_context(|| format!("Error flushing {:?}", &path))
+        .with_context(|| format!("Error opening {:?}", &path))
         .map_err(|err| Error::new(err, Default::default()))?;
-    prog_track.files_copied.inc();
-    Ok(Summary {
-        files_created: 1,
-        bytes_written: original_filesize as u64,
-        ..Default::default()
+        let write_path = path.clone();
+        let write_result = crate::safedir::run_fd_admitted_blocking(move || {
+            use std::io::Write as _;
+
+            let mut file = file;
+            let mut bytes = vec![0u8; bufsize];
+            let result = (|| -> anyhow::Result<()> {
+                while filesize > 0 {
+                    // rng state is thread-local and never crosses a blocking boundary.
+                    rand::fill(&mut bytes[..]);
+                    let writesize = std::cmp::min(filesize, bufsize);
+                    file.write_all(&bytes[..writesize])
+                        .with_context(|| format!("Error writing to {:?}", &write_path))?;
+                    filesize -= writesize;
+                    prog_track.bytes_copied.add(writesize as u64);
+                }
+                file.flush()
+                    .with_context(|| format!("Error flushing {:?}", &write_path))?;
+                Ok(())
+            })();
+            Ok(result)
+        })
+        .await
+        .with_context(|| format!("Error running file writer for {:?}", &path))
+        .map_err(|err| Error::new(err, Default::default()))?;
+        write_result.map_err(|err| Error::new(err, Default::default()))?;
+        prog_track.files_copied.inc();
+        Ok(Summary {
+            files_created: 1,
+            bytes_written: original_filesize as u64,
+            ..Default::default()
+        })
     })
+    .await
 }
 
 #[async_recursion]
