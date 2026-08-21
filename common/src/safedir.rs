@@ -3142,8 +3142,9 @@ where
     let blocking_admission = FD_ADMISSION
         .try_with(throttle::FdAdmission::blocking_lease)
         .ok();
-    let (result, _blocking_admission) =
-        tokio::task::spawn_blocking(move || (f(), blocking_admission))
+    let task_guard = crate::walk_driver::blocking_task_guard();
+    let (result, _blocking_admission, _task_guard) =
+        tokio::task::spawn_blocking(move || (f(), blocking_admission, task_guard))
             .await
             .map_err(std::io::Error::other)?;
     result
@@ -3236,6 +3237,7 @@ mod tests {
             _file: std::fs::File,
             drop_started: Option<tokio::sync::oneshot::Sender<()>>,
             release_drop: std::sync::mpsc::Receiver<()>,
+            _completion: crate::testutils::CompletionSignal,
         }
 
         impl Drop for BlockingDropFd {
@@ -3264,11 +3266,13 @@ mod tests {
             let open_file_guard = throttle::open_file_permit().await;
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (completion, completion_rx) = crate::testutils::CompletionSignal::new();
             let task = tokio::spawn(async move {
                 let admission = open_file_guard.admission();
                 with_fd_admission(admission, async move {
                     let _open_file_guard = open_file_guard;
                     run_fd_admitted_blocking(move || {
+                        let _completion = completion;
                         let _file = std::fs::File::open(file_path)?;
                         let _ = started_tx.send(());
                         release_rx.recv().map_err(std::io::Error::other)?;
@@ -3278,17 +3282,23 @@ mod tests {
                 })
                 .await
             });
-            started_rx.await?;
+            let started_result = started_rx.await;
             task.abort();
             let waiter_was_cancelled = matches!(task.await, Err(error) if error.is_cancelled());
 
             let mut second_permit = Box::pin(throttle::open_file_permit());
-            let admission_was_retained = futures::poll!(second_permit.as_mut()).is_pending();
-            release_tx.send(())?;
-            let permit =
+            let admission_was_retained =
+                started_result.is_ok() && futures::poll!(second_permit.as_mut()).is_pending();
+            let release_result = release_tx.send(());
+            let completion_result = completion_rx.await;
+            let permit_result =
                 tokio::time::timeout(std::time::Duration::from_secs(20), second_permit.as_mut())
-                    .await
-                    .context("admission was not released after detached unprobed work finished")?;
+                    .await;
+            started_result.context("detached unprobed work did not start")?;
+            release_result.context("detached unprobed work ended before its release")?;
+            completion_result.context("detached unprobed work did not report completion")?;
+            let permit = permit_result
+                .context("admission was not released after detached unprobed work finished")?;
             drop(permit);
             assert!(waiter_was_cancelled);
             assert!(
@@ -3314,6 +3324,7 @@ mod tests {
             let open_file_guard = throttle::open_file_permit().await;
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (completion, completion_rx) = crate::testutils::CompletionSignal::new();
             let task = tokio::spawn(async move {
                 let admission = open_file_guard.admission();
                 with_fd_admission(admission, async move {
@@ -3322,6 +3333,7 @@ mod tests {
                         congestion::Side::Source,
                         congestion::MetadataOp::Stat,
                         move || {
+                            let _completion = completion;
                             let _file = std::fs::File::open(file_path)?;
                             let _ = started_tx.send(());
                             release_rx.recv().map_err(std::io::Error::other)?;
@@ -3332,28 +3344,36 @@ mod tests {
                 })
                 .await
             });
-            started_rx.await?;
+            let started_result = started_rx.await;
             task.abort();
             let waiter_was_cancelled = matches!(task.await, Err(error) if error.is_cancelled());
 
             let second_permit = throttle::open_file_permit();
             tokio::pin!(second_permit);
-            let admission_was_retained = futures::poll!(second_permit.as_mut()).is_pending();
+            let admission_was_retained =
+                started_result.is_ok() && futures::poll!(second_permit.as_mut()).is_pending();
             let second_stat_permit = throttle::ops_in_flight_permit(stat_resource);
             tokio::pin!(second_stat_permit);
-            let metadata_was_retained = futures::poll!(second_stat_permit.as_mut()).is_pending();
-            release_tx.send(())?;
-            let permit =
+            let metadata_was_retained =
+                started_result.is_ok() && futures::poll!(second_stat_permit.as_mut()).is_pending();
+            let release_result = release_tx.send(());
+            let completion_result = completion_rx.await;
+            let permit_result =
                 tokio::time::timeout(std::time::Duration::from_secs(20), second_permit.as_mut())
-                    .await
-                    .context("admission was not released after detached metadata work finished")?;
-            drop(permit);
-            let stat_permit = tokio::time::timeout(
+                    .await;
+            let stat_permit_result = tokio::time::timeout(
                 std::time::Duration::from_secs(20),
                 second_stat_permit.as_mut(),
             )
-            .await
-            .context("metadata capacity was not released after detached work finished")?;
+            .await;
+            started_result.context("detached metadata work did not start")?;
+            release_result.context("detached metadata work ended before its release")?;
+            completion_result.context("detached metadata work did not report completion")?;
+            let permit = permit_result
+                .context("admission was not released after detached metadata work finished")?;
+            drop(permit);
+            let stat_permit = stat_permit_result
+                .context("metadata capacity was not released after detached work finished")?;
             drop(stat_permit);
             assert!(waiter_was_cancelled);
             assert!(
@@ -3382,6 +3402,7 @@ mod tests {
             let (release_work_tx, release_work_rx) = std::sync::mpsc::channel();
             let (drop_started_tx, drop_started_rx) = tokio::sync::oneshot::channel();
             let (release_drop_tx, release_drop_rx) = std::sync::mpsc::channel();
+            let (completion, completion_rx) = crate::testutils::CompletionSignal::new();
             let task = tokio::spawn(async move {
                 let admission = open_file_guard.admission();
                 with_fd_admission(admission, async move {
@@ -3397,6 +3418,7 @@ mod tests {
                                 _file: file,
                                 drop_started: Some(drop_started_tx),
                                 release_drop: release_drop_rx,
+                                _completion: completion,
                             })
                         },
                     )
@@ -3404,20 +3426,28 @@ mod tests {
                 })
                 .await
             });
-            work_started_rx.await?;
+            let work_started_result = work_started_rx.await;
             task.abort();
             let waiter_was_cancelled = matches!(task.await, Err(error) if error.is_cancelled());
 
-            release_work_tx.send(())?;
-            drop_started_rx.await?;
+            let release_work_result = release_work_tx.send(());
+            let drop_started_result = drop_started_rx.await;
             let second_permit = throttle::open_file_permit();
             tokio::pin!(second_permit);
-            let admission_was_retained = futures::poll!(second_permit.as_mut()).is_pending();
-            release_drop_tx.send(())?;
-            let permit =
+            let admission_was_retained =
+                drop_started_result.is_ok() && futures::poll!(second_permit.as_mut()).is_pending();
+            let release_drop_result = release_drop_tx.send(());
+            let completion_result = completion_rx.await;
+            let permit_result =
                 tokio::time::timeout(std::time::Duration::from_secs(20), second_permit.as_mut())
-                    .await
-                    .context("admission was not released after the returned fd was dropped")?;
+                    .await;
+            work_started_result.context("detached metadata work did not start")?;
+            release_work_result.context("detached metadata work ended before its release")?;
+            drop_started_result.context("the abandoned returned fd did not begin dropping")?;
+            release_drop_result.context("the abandoned returned fd ended before its release")?;
+            completion_result.context("the abandoned returned fd did not report completion")?;
+            let permit = permit_result
+                .context("admission was not released after the returned fd was dropped")?;
             drop(permit);
             assert!(
                 waiter_was_cancelled,

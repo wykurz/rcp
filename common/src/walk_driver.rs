@@ -29,8 +29,9 @@
 //! Spawned tasks must be `'static`, and `spawn_blocking` work is not cancellable,
 //! so every per-entry context is **owned**: [`EntryCx`] clones `Arc<Dir>` plus
 //! owned `OsString`/`PathBuf` rather than borrowing, exactly as the existing
-//! per-tool walks do. A dropped surrounding future (timeout, `fail_early` abort,
-//! Ctrl-C) therefore can never leave a spawned task holding a dangling borrow.
+//! per-tool walks do. A dropped surrounding future (timeout or Ctrl-C) therefore
+//! can never leave a spawned task holding a dangling borrow. Fail-early traversal
+//! aborts spawned siblings and its task scope waits for recursively owned work.
 //!
 //! ## How copy maps onto this trait
 //!
@@ -97,6 +98,102 @@ use std::sync::Arc;
 use async_recursion::async_recursion;
 
 use crate::error::OperationError;
+
+#[derive(Clone)]
+pub(crate) struct TaskTracker {
+    state: Arc<TaskTrackerState>,
+}
+
+struct TaskTrackerState {
+    active: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+struct TrackedTask(TaskTracker);
+
+impl TaskTracker {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(TaskTrackerState {
+                active: std::sync::atomic::AtomicUsize::new(0),
+                idle: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+
+    fn enter(&self) -> TrackedTask {
+        self.state
+            .active
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        TrackedTask(self.clone())
+    }
+
+    async fn wait_idle(&self) {
+        loop {
+            let idle = self.state.idle.notified();
+            if self.state.active.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+impl Drop for TrackedTask {
+    fn drop(&mut self) {
+        if self
+            .0
+            .state
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.0.state.idle.notify_one();
+        }
+    }
+}
+
+tokio::task_local! {
+    static TASK_TRACKER: TaskTracker;
+}
+
+/// Runs an operation in a task scope and waits for cancelled descendants to finish dropping.
+pub(crate) async fn scope_tasks<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    if TASK_TRACKER.try_with(Clone::clone).is_ok() {
+        return future.await;
+    }
+    let tracker = TaskTracker::new();
+    let output = TASK_TRACKER.scope(tracker.clone(), future).await;
+    tracker.wait_idle().await;
+    output
+}
+
+/// Spawns work tracked by the current task scope.
+pub(crate) fn spawn_tracked<T, F>(join_set: &mut tokio::task::JoinSet<T>, future: F)
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    let tracker = TASK_TRACKER
+        .try_with(Clone::clone)
+        .expect("tracked work must run inside a task scope");
+    let task_tracker = tracker.clone();
+    join_set.spawn(TASK_TRACKER.scope(tracker, async move {
+        let _tracked = task_tracker.enter();
+        future.await
+    }));
+}
+
+/// Tracks non-cancellable blocking work in the current task scope, when present.
+pub(crate) fn blocking_task_guard() -> Option<impl Drop + Send + 'static> {
+    TASK_TRACKER
+        .try_with(Clone::clone)
+        .ok()
+        .map(|tracker| tracker.enter())
+}
 use crate::progress::Progress;
 use crate::safedir::{Dir, Handle};
 use crate::walk::{self, EntryKind, LeafPermit, PermitKind};
@@ -334,10 +431,10 @@ pub trait WalkVisitor: Send + Sync + 'static {
     /// — the visitor carries that in `state` and folds it here.)
     ///
     /// `dir_post` is **not** called when `fail_early` is set and a child failed: that
-    /// case aborts the subtree immediately (the surrounding `JoinSet` drops, aborting
-    /// siblings) and the error is returned without any post-order work — so a
-    /// fail-early abort never applies post-order finalization (copy's directory
-    /// metadata / `--delete` prune). When `fail_early` is unset, `dir_post` IS called
+    /// case aborts the subtree's already-spawned siblings and returns the error after
+    /// the enclosing task scope has quiesced, without any post-order work — so a
+    /// fail-early return never applies post-order finalization (copy's directory metadata /
+    /// `--delete` prune). When `fail_early` is unset, `dir_post` IS called
     /// with `Err(..)` so the visitor can still apply safe post-order finalization
     /// (copy applies directory metadata even after a partial failure, but skips the
     /// destructive `--delete` prune) and then return the combined error.
@@ -368,8 +465,20 @@ pub trait WalkVisitor: Send + Sync + 'static {
 /// entry. `cx.parent` must be that (hardened) directory. On a classification
 /// error the entry's own error is surfaced — the same fail-closed behavior the
 /// per-tool walks have.
-#[async_recursion]
 pub async fn process_entry<V>(
+    visitor: Arc<V>,
+    cx: EntryCx,
+    parent_ctx: V::DirContext,
+    permit: Option<LeafPermit>,
+) -> Result<V::Summary, OperationError<V::Summary>>
+where
+    V: WalkVisitor,
+{
+    scope_tasks(process_entry_tracked(visitor, cx, parent_ctx, permit)).await
+}
+
+#[async_recursion]
+async fn process_entry_tracked<V>(
     visitor: Arc<V>,
     cx: EntryCx,
     parent_ctx: V::DirContext,
@@ -431,14 +540,14 @@ where
                         .dir_post(&cx, state, &processed, Ok(child_summary))
                         .await
                 }
-                // a child failed. with `fail_early` the subtree is aborted immediately and NO
-                // post-order work runs (siblings were aborted when the `JoinSet` dropped) — the
-                // error propagates as-is. without `fail_early`, `dir_post` IS still invoked, with
-                // the combined error, so the visitor can apply safe post-order finalization (copy's
-                // directory metadata) while skipping destructive work (copy's `--delete` prune) and
-                // then return the combined error. `processed` is not recoverable on the error path,
-                // so an empty list is passed — the only consumer (a `--delete` keep-set) is skipped
-                // on error anyway.
+                // a child failed. with `fail_early` the subtree's already-spawned siblings have
+                // been aborted and NO post-order work runs — the error propagates as-is after the
+                // enclosing task scope quiesces. without `fail_early`, `dir_post` IS still invoked,
+                // with the combined error, so the visitor can apply safe post-order finalization
+                // (copy's directory metadata) while skipping destructive work (copy's `--delete`
+                // prune) and then return the combined error. `processed` is not recoverable on the
+                // error path, so an empty list is passed — the only consumer (a `--delete` keep-set)
+                // is skipped on error anyway.
                 Err(walk_err) => {
                     if visitor.fail_early() {
                         Err(walk_err)
@@ -477,8 +586,20 @@ where
 /// block on permit `N+1` while the first `N` permits are held by not-yet-running
 /// tasks — a self-deadlock against a saturated pool. Spawning each task as soon as
 /// its permit is taken lets running tasks release permits the loop is waiting on.
-#[async_recursion]
 pub async fn walk_dir_contents<V>(
+    visitor: Arc<V>,
+    dir: Arc<Dir>,
+    parent_cx: &EntryCx,
+    dir_ctx: &V::DirContext,
+) -> Result<(V::Summary, ProcessedChildren), OperationError<V::Summary>>
+where
+    V: WalkVisitor,
+{
+    scope_tasks(walk_dir_contents_tracked(visitor, dir, parent_cx, dir_ctx)).await
+}
+
+#[async_recursion]
+async fn walk_dir_contents_tracked<V>(
     visitor: Arc<V>,
     dir: Arc<Dir>,
     parent_cx: &EntryCx,
@@ -567,12 +688,20 @@ where
         let task_visitor = Arc::clone(&visitor);
         let task_ctx = dir_ctx.clone();
         processed.names.push(entry_name);
-        join_set
-            .spawn(async move { process_entry(task_visitor, child_cx, task_ctx, permit).await });
+        spawn_tracked(
+            &mut join_set,
+            process_entry(task_visitor, child_cx, task_ctx, permit),
+        );
     }
     let folded =
         join_and_fold::<V::Summary>(join_set, visitor.fail_early(), skipped_summary).await?;
     Ok((folded, processed))
+}
+
+/// Cancels every remaining task and waits for their direct futures to finish dropping.
+pub(crate) async fn abort_and_join<T: 'static>(join_set: &mut tokio::task::JoinSet<T>) {
+    join_set.abort_all();
+    while join_set.join_next().await.is_some() {}
 }
 
 /// Join an already-populated `JoinSet` of per-child tasks and fold their summaries
@@ -583,9 +712,10 @@ where
 /// see [`walk_dir_contents`]) and hands it here so the held leaf permits are
 /// released by running tasks rather than all held before the first task runs.
 /// `base` seeds the fold (the walk passes the filter-skip contributions). On
-/// `fail_early`, the first task error returns immediately, carrying the summary
-/// accumulated so far; the remaining tasks are aborted when the `JoinSet` is
-/// dropped. Otherwise all errors are collected and deduplicated, and the single
+/// `fail_early`, the first task error aborts the remaining tasks. The enclosing
+/// task scope waits for recursively owned tasks and blocking work to finish
+/// dropping before the operation returns.
+/// Otherwise all errors are collected and deduplicated, and the single
 /// combined error (if any) is returned with the full folded summary.
 pub async fn join_and_fold<S>(
     mut join_set: tokio::task::JoinSet<Result<S, OperationError<S>>>,
@@ -604,13 +734,14 @@ where
                 tracing::error!("walk child failed with: {:#}", &error);
                 summary = summary + error.summary;
                 if fail_early {
-                    // dropping `join_set` here aborts the still-running children.
+                    abort_and_join(&mut join_set).await;
                     return Err(OperationError::new(error.source, summary));
                 }
                 errors.push(error.source);
             }
             Err(join_error) => {
                 if fail_early {
+                    abort_and_join(&mut join_set).await;
                     return Err(OperationError::new(join_error.into(), summary));
                 }
                 errors.push(join_error.into());
@@ -754,6 +885,66 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn fail_early_cancels_and_quiesces_nested_sibling_work() {
+        struct DropNotice(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropNotice {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, mut dropped_rx) = tokio::sync::oneshot::channel();
+        let nested_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_completed = Arc::clone(&nested_completed);
+        let blocking_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let blocking_task_completed = Arc::clone(&blocking_completed);
+        let result = scope_tasks(async move {
+            let mut join_set = tokio::task::JoinSet::new();
+            spawn_tracked(&mut join_set, async move {
+                let mut nested = tokio::task::JoinSet::new();
+                spawn_tracked(&mut nested, async move {
+                    let _drop_notice = DropNotice(Some(dropped_tx));
+                    let task_guard = blocking_task_guard().expect("nested task must be tracked");
+                    let _blocking_task = tokio::task::spawn_blocking(move || {
+                        std::thread::sleep(Duration::from_millis(50));
+                        blocking_task_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+                        drop(task_guard);
+                    });
+                    let _ = started_tx.send(());
+                    std::future::pending::<()>().await;
+                    task_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+                while nested.join_next().await.is_some() {}
+                Ok(CountSummary::default())
+            });
+            started_rx.await.expect("sibling task did not start");
+            spawn_tracked(&mut join_set, async {
+                Err(OperationError::new(
+                    anyhow::anyhow!("stop the walk"),
+                    CountSummary::default(),
+                ))
+            });
+            join_and_fold(join_set, true, CountSummary::default()).await
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            dropped_rx.try_recv().is_ok(),
+            "fail-early returned before nested sibling work was dropped"
+        );
+        assert!(!nested_completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            blocking_completed.load(std::sync::atomic::Ordering::SeqCst),
+            "fail-early returned before non-cancellable nested work finished"
+        );
+    }
+
     // The driver compiles and runs end-to-end (RPITIT + Send + recursion) and counts
     // a real tree correctly. `setup_test_dir` builds foo/{0.txt, bar/{1,2,3.txt},
     // baz/{4.txt, 5.txt->sym, 6.txt->sym}}: under `foo` there are 5 files, 2
@@ -828,7 +1019,9 @@ mod tests {
                 futures::poll!(second_permit.as_mut()).is_ready();
             drop(second_permit);
             drop(held_stat);
-            let result = tokio::time::timeout(Duration::from_secs(20), operation.as_mut()).await;
+            let result = admission
+                .run_with_timeout(Duration::from_secs(20), operation.as_mut())
+                .await;
             assert!(
                 stopped_at_stat_gate,
                 "entry did not reach the held stat gate"
@@ -852,6 +1045,7 @@ mod tests {
         -> anyhow::Result<()> {
             let root = crate::testutils::create_temp_dir().await?;
             tokio::fs::write(root.join("leaf"), b"x").await?;
+            let admission = crate::testutils::AdmissionLimit::new().await;
             let dir = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -864,19 +1058,18 @@ mod tests {
                 filter: Some(filter),
             });
             let parent_cx = root_cx(Arc::clone(&dir), std::ffi::OsStr::new("root"), root.clone());
-            let admission = crate::testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
-            let walk = walk_dir_entries(
+            let walk = scope_tasks(walk_dir_entries(
                 visitor,
                 dir,
                 &parent_cx,
                 &(),
                 vec![(std::ffi::OsString::from("leaf"), None)],
-            );
+            ));
             tokio::pin!(walk);
             let stopped_at_stat_gate = futures::poll!(walk.as_mut()).is_pending();
             let mut second_permit = Box::pin(throttle::pending_meta_permit());
@@ -884,7 +1077,9 @@ mod tests {
                 futures::poll!(second_permit.as_mut()).is_ready();
             drop(second_permit);
             drop(held_stat);
-            let result = tokio::time::timeout(Duration::from_secs(20), walk.as_mut()).await;
+            let result = admission
+                .run_with_timeout(Duration::from_secs(20), walk.as_mut())
+                .await;
             assert!(
                 stopped_at_stat_gate,
                 "DT_UNKNOWN filter probe did not reach the held stat gate"
@@ -959,11 +1154,12 @@ mod tests {
             let permit =
                 walk::preacquire_leaf_permit(PermitKind::PendingMeta, Some(EntryKind::File)).await;
             assert!(permit.is_some(), "the pre-acquire must take the one permit");
-            let result = tokio::time::timeout(
-                Duration::from_secs(20),
-                process_entry(visitor, cx, (), permit),
-            )
-            .await;
+            let result = admission
+                .run_with_timeout(
+                    Duration::from_secs(20),
+                    process_entry(visitor, cx, (), permit),
+                )
+                .await;
             let summary = result
                 .map_err(|_| {
                     anyhow::anyhow!(

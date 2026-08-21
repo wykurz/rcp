@@ -1980,8 +1980,9 @@ mod tests {
             let setup_bypassed_admission = futures::poll!(second_permit.as_mut()).is_ready();
             drop(second_permit);
             drop(held_stat);
-            let result =
-                tokio::time::timeout(std::time::Duration::from_secs(20), operation.as_mut()).await;
+            let result = admission
+                .run_with_timeout(std::time::Duration::from_secs(20), operation.as_mut())
+                .await;
             assert!(
                 stopped_at_stat_gate,
                 "chmod root did not reach the held stat gate"
@@ -2055,11 +2056,12 @@ mod tests {
                 crate::walk::preacquire_leaf_permit(PermitKind::PendingMeta, Some(EntryKind::File))
                     .await;
             assert!(permit.is_some(), "the pre-acquire must take the one permit");
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                process_entry(visitor, cx, (), permit),
-            )
-            .await;
+            let result = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(20),
+                    process_entry(visitor, cx, (), permit),
+                )
+                .await;
             let summary = result
                 .context(
                     "process_entry hung — leaf permit held across directory recursion (deadlock)",

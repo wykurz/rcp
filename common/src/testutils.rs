@@ -28,6 +28,34 @@ impl AdmissionLimit {
     pub fn set_max_ops_in_flight(&self, resource: throttle::Resource, max_in_flight: usize) {
         throttle::set_max_ops_in_flight(resource, max_in_flight);
     }
+
+    /// Runs admission-sensitive work with a timeout and quiesces it before reporting expiry.
+    pub async fn run_with_timeout<F>(
+        &self,
+        duration: std::time::Duration,
+        future: F,
+    ) -> Result<F::Output, tokio::time::error::Elapsed>
+    where
+        F: std::future::Future,
+    {
+        tokio::pin!(future);
+        match tokio::time::timeout(duration, future.as_mut()).await {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                self.quiesce(future).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Removes configured limits and waits for admission-sensitive work to finish.
+    pub async fn quiesce<F>(&self, future: F)
+    where
+        F: std::future::Future,
+    {
+        reset_admission_limits();
+        let _ = future.await;
+    }
 }
 
 impl Drop for AdmissionLimit {
@@ -45,6 +73,25 @@ fn reset_admission_limits() {
     }
     throttle::disable_ops_throttle();
     congestion::clear_sample_sink();
+}
+
+/// Signals when a blocking test owner has been dropped.
+pub struct CompletionSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl CompletionSignal {
+    /// Creates a completion signal and its receiver.
+    pub fn new() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        (Self(Some(sender)), receiver)
+    }
+}
+
+impl Drop for CompletionSignal {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
 }
 
 pub async fn create_temp_dir() -> Result<std::path::PathBuf> {
@@ -191,5 +238,32 @@ mod tests {
         .expect("PendingMeta admission was not reset after panic");
         assert_eq!(throttle::current_ops_in_flight_limit(resource), 0);
         drop((first_open, second_open, first_pending, second_pending));
+    }
+
+    #[tokio::test]
+    async fn timed_out_admission_work_finishes_after_limits_are_removed() {
+        let limit = AdmissionLimit::new().await;
+        limit.set_max_open_files(1);
+        let held_open = throttle::open_file_permit().await;
+        let held_pending = throttle::pending_meta_permit().await;
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_completed = std::sync::Arc::clone(&completed);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            limit.run_with_timeout(Duration::from_millis(10), async move {
+                let (_open, _pending) = tokio::join!(
+                    throttle::open_file_permit(),
+                    throttle::pending_meta_permit(),
+                );
+                task_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+        )
+        .await
+        .expect("timed-out work did not quiesce after admission was removed");
+
+        assert!(result.is_err(), "the inner timeout must still be reported");
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        drop((held_open, held_pending));
     }
 }
