@@ -94,6 +94,22 @@ impl Drop for CompletionSignal {
     }
 }
 
+/// Waits for blocking work and then for its abandoned output to release capacity.
+pub async fn await_completion_and_capacity<F>(
+    completion: tokio::sync::oneshot::Receiver<()>,
+    capacity: F,
+) -> (
+    Result<(), tokio::sync::oneshot::error::RecvError>,
+    F::Output,
+)
+where
+    F: std::future::Future,
+{
+    let completion_result = completion.await;
+    let capacity = capacity.await;
+    (completion_result, capacity)
+}
+
 pub async fn create_temp_dir() -> Result<std::path::PathBuf> {
     let mut idx = 0;
     loop {
@@ -265,5 +281,33 @@ mod tests {
         assert!(result.is_err(), "the inner timeout must still be reported");
         assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
         drop((held_open, held_pending));
+    }
+
+    #[tokio::test]
+    async fn completion_witness_also_waits_for_capacity() {
+        let limit = AdmissionLimit::new().await;
+        limit.set_max_open_files(1);
+        let held = throttle::open_file_permit().await;
+        let (completion, completion_rx) = CompletionSignal::new();
+        let owner_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_owner_dropped = std::sync::Arc::clone(&owner_dropped);
+        let owner = tokio::spawn(async move {
+            drop(completion);
+            tokio::task::yield_now().await;
+            drop(held);
+            task_owner_dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let (completion_result, permit) = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_completion_and_capacity(completion_rx, throttle::open_file_permit()),
+        )
+        .await
+        .expect("capacity cleanup did not finish");
+
+        completion_result.expect("completion sender was dropped");
+        assert!(owner_dropped.load(std::sync::atomic::Ordering::SeqCst));
+        drop(permit);
+        owner.await.expect("capacity owner failed");
     }
 }

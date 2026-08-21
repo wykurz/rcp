@@ -3290,15 +3290,14 @@ mod tests {
             let admission_was_retained =
                 started_result.is_ok() && futures::poll!(second_permit.as_mut()).is_pending();
             let release_result = release_tx.send(());
-            let completion_result = completion_rx.await;
-            let permit_result =
-                tokio::time::timeout(std::time::Duration::from_secs(20), second_permit.as_mut())
-                    .await;
+            let (completion_result, permit) = crate::testutils::await_completion_and_capacity(
+                completion_rx,
+                second_permit.as_mut(),
+            )
+            .await;
             started_result.context("detached unprobed work did not start")?;
             release_result.context("detached unprobed work ended before its release")?;
             completion_result.context("detached unprobed work did not report completion")?;
-            let permit = permit_result
-                .context("admission was not released after detached unprobed work finished")?;
             drop(permit);
             assert!(waiter_was_cancelled);
             assert!(
@@ -3357,23 +3356,16 @@ mod tests {
             let metadata_was_retained =
                 started_result.is_ok() && futures::poll!(second_stat_permit.as_mut()).is_pending();
             let release_result = release_tx.send(());
-            let completion_result = completion_rx.await;
-            let permit_result =
-                tokio::time::timeout(std::time::Duration::from_secs(20), second_permit.as_mut())
-                    .await;
-            let stat_permit_result = tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                second_stat_permit.as_mut(),
-            )
-            .await;
+            let (completion_result, (permit, stat_permit)) =
+                crate::testutils::await_completion_and_capacity(
+                    completion_rx,
+                    futures::future::join(second_permit.as_mut(), second_stat_permit.as_mut()),
+                )
+                .await;
             started_result.context("detached metadata work did not start")?;
             release_result.context("detached metadata work ended before its release")?;
             completion_result.context("detached metadata work did not report completion")?;
-            let permit = permit_result
-                .context("admission was not released after detached metadata work finished")?;
             drop(permit);
-            let stat_permit = stat_permit_result
-                .context("metadata capacity was not released after detached work finished")?;
             drop(stat_permit);
             assert!(waiter_was_cancelled);
             assert!(
@@ -3437,17 +3429,16 @@ mod tests {
             let admission_was_retained =
                 drop_started_result.is_ok() && futures::poll!(second_permit.as_mut()).is_pending();
             let release_drop_result = release_drop_tx.send(());
-            let completion_result = completion_rx.await;
-            let permit_result =
-                tokio::time::timeout(std::time::Duration::from_secs(20), second_permit.as_mut())
-                    .await;
+            let (completion_result, permit) = crate::testutils::await_completion_and_capacity(
+                completion_rx,
+                second_permit.as_mut(),
+            )
+            .await;
             work_started_result.context("detached metadata work did not start")?;
             release_work_result.context("detached metadata work ended before its release")?;
             drop_started_result.context("the abandoned returned fd did not begin dropping")?;
             release_drop_result.context("the abandoned returned fd ended before its release")?;
             completion_result.context("the abandoned returned fd did not report completion")?;
-            let permit = permit_result
-                .context("admission was not released after the returned fd was dropped")?;
             drop(permit);
             assert!(
                 waiter_was_cancelled,
