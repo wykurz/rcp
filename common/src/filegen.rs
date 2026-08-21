@@ -88,7 +88,7 @@ pub async fn write_file(
     chunk_size: u64,
 ) -> Result<Summary, Error> {
     use tokio::io::AsyncWriteExt;
-    let _permit = throttle::open_file_permit().await;
+    let open_file_guard = throttle::open_file_permit().await;
     throttle::get_file_iops_tokens(chunk_size, filesize as u64).await;
     let _ops_guard = prog_track.ops.guard();
     let original_filesize = filesize;
@@ -99,18 +99,25 @@ pub async fn write_file(
     // because filegen gates the ops-throttle at task-spawn time (see
     // `filegen` below) — going through the rate-gating helper here
     // would consume two tokens per file and halve the effective rate.
-    let mut file = crate::walk::run_metadata_probed_no_rate(
-        congestion::Side::Destination,
-        congestion::MetadataOp::OpenCreate,
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path),
+    let open_path = path.clone();
+    let file = crate::safedir::with_fd_admission(
+        open_file_guard.admission(),
+        crate::safedir::run_metadata_probed_blocking_no_rate(
+            congestion::Side::Destination,
+            congestion::MetadataOp::OpenCreate,
+            move || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(open_path)
+            },
+        ),
     )
     .await
     .with_context(|| format!("Error opening {:?}", &path))
     .map_err(|err| Error::new(err, Default::default()))?;
+    let mut file = tokio::fs::File::from_std(file);
     while filesize > 0 {
         {
             // make sure rng falls out of scope before await
@@ -124,6 +131,14 @@ pub async fn write_file(
         filesize -= writesize;
         prog_track.bytes_copied.add(writesize as u64);
     }
+    // tokio accepts the final chunk into its internal buffer before the mandatory blocking write
+    // necessarily finishes. wait for that background write while the admission guard is still
+    // live; otherwise a successful fast producer can release capacity while slow storage still
+    // owns the file descriptor.
+    file.flush()
+        .await
+        .with_context(|| format!("Error flushing {:?}", &path))
+        .map_err(|err| Error::new(err, Default::default()))?;
     prog_track.files_copied.inc();
     Ok(Summary {
         files_created: 1,

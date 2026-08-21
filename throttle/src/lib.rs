@@ -7,7 +7,7 @@
 //!
 //! The throttle system provides three types of rate limiting:
 //!
-//! 1. **Open Files Limit** - Controls the maximum number of simultaneously open files
+//! 1. **Open Files Limit** - Bounds concurrent fd-bearing leaf operations
 //! 2. **Operations Throttle** - Limits the number of operations per second
 //! 3. **I/O Operations Throttle** - Limits the number of I/O operations per second based on chunk size
 //!
@@ -17,13 +17,15 @@
 //!
 //! ## Open Files Limit
 //!
-//! Prevents exceeding system file descriptor limits by controlling concurrent file operations:
+//! Applies descriptor backpressure by controlling concurrent file operations. This is not a hard
+//! process-wide descriptor ceiling: one operation may own multiple fds, and recursive directory
+//! handles are deliberately outside this pool so traversal cannot hold-and-wait deadlock.
 //!
 //! ```rust,no_run
 //! use throttle::{set_max_open_files, open_file_permit};
 //!
 //! # async fn example() {
-//! // Configure max open files (typically 80% of system limit)
+//! // Configure leaf-operation descriptor backpressure
 //! set_max_open_files(8000);
 //!
 //! // Acquire permit before opening file
@@ -123,7 +125,7 @@
 //! use std::time::Duration;
 //!
 //! async fn setup_throttling() {
-//!     // Limit to 80% of 10000 max files
+//!     // Limit concurrent fd-bearing leaf operations
 //!     set_max_open_files(8000);
 //!
 //!     // 500 operations per second
@@ -238,9 +240,8 @@ impl Resource {
 
 static OPEN_FILES_LIMIT: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
-// Spawn-time backpressure for operations that don't actually hold open
-// file descriptors but still benefit from a bound on in-flight tasks
-// (rm, cmp). Kept separate from OPEN_FILES_LIMIT so that an inner rm
+// spawn-time backpressure for metadata traversal tasks (rm, chmod, cmp). Hardened rm/chmod entries
+// carry a short-lived O_PATH handle, but this stays separate from OPEN_FILES_LIMIT so an inner rm
 // triggered by a copy/link path that already holds an OPEN_FILES_LIMIT
 // permit cannot deadlock against itself when the outer permit pool is
 // saturated. Both semaphores are sized to the same configured limit by
@@ -270,11 +271,11 @@ fn ops_in_flight_limit(resource: Resource) -> &'static semaphore::Semaphore {
 ///
 /// Despite the name, this sizes **two** independent semaphores:
 ///
-/// * [`open_file_permit`] — actual file-descriptor backpressure for
-///   paths that hold open fds (copy/link).
+/// * [`open_file_permit`] — leaf-operation backpressure for paths that hold
+///   open fds (copy/link). One operation can hold multiple descriptors.
 /// * [`pending_meta_permit`] — task-spawn backpressure for recursive
-///   metadata-only walks (rm/cmp) that don't hold fds. Sized
-///   separately so paths that compose these operations
+///   metadata walks (rm/chmod/cmp). Hardened entry classification can carry
+///   an `O_PATH` fd; the pool remains separate so paths that compose operations
 ///   (e.g. `copy_file → rm` for an overwrite of a directory
 ///   destination) cannot deadlock against the open-files pool.
 ///
@@ -285,31 +286,79 @@ pub fn set_max_open_files(max_open_files: usize) {
     PENDING_META_LIMIT.setup(max_open_files);
 }
 
+/// A cloneable, non-owning reference to one already-acquired fd-admission permit.
+///
+/// The operation guards themselves deliberately remain non-`Clone`: ordinary async ownership has
+/// one obvious release point. This weak reference can be threaded through async code without
+/// extending that lifetime across recursive directory descent. Immediately before non-cancellable
+/// blocking work starts, [`Self::blocking_lease`] upgrades it to a strong lease for that syscall.
+#[derive(Clone)]
+pub struct FdAdmission {
+    permit: Option<std::sync::Weak<semaphore::Permit<'static>>>,
+}
+
+impl FdAdmission {
+    /// Keep the underlying permit live for one non-cancellable blocking operation, if its guard
+    /// still exists.
+    #[must_use]
+    pub fn blocking_lease(&self) -> BlockingFdAdmissionLease {
+        BlockingFdAdmissionLease {
+            _permit: self.permit.as_ref().and_then(std::sync::Weak::upgrade),
+        }
+    }
+}
+
+/// Strong admission ownership held by one non-cancellable blocking operation.
+pub struct BlockingFdAdmissionLease {
+    _permit: Option<std::sync::Arc<semaphore::Permit<'static>>>,
+}
+
 pub struct OpenFileGuard {
-    _permit: Option<semaphore::Permit<'static>>,
+    permit: Option<std::sync::Arc<semaphore::Permit<'static>>>,
+}
+
+impl OpenFileGuard {
+    /// Obtain a non-owning admission reference for blocking work launched by this operation.
+    #[must_use]
+    pub fn admission(&self) -> FdAdmission {
+        FdAdmission {
+            permit: self.permit.as_ref().map(std::sync::Arc::downgrade),
+        }
+    }
 }
 
 pub async fn open_file_permit() -> OpenFileGuard {
     OpenFileGuard {
-        _permit: OPEN_FILES_LIMIT.acquire().await,
+        permit: OPEN_FILES_LIMIT.acquire().await.map(std::sync::Arc::new),
     }
 }
 
-/// Backpressure guard for in-flight metadata-only operations (rm, cmp).
+/// Backpressure guard for in-flight metadata traversal operations (rm, chmod, cmp).
 ///
 /// Held across a spawned task to bound the live task count under
-/// recursive walk operations that don't hold open file descriptors.
+/// recursive walk operations. Hardened rm/chmod workers can retain an `O_PATH`
+/// classification handle while this guard is live.
 /// Kept distinct from [`OpenFileGuard`] so that paths which compose
 /// these operations (e.g. `copy_file → rm` for an overwrite of a
 /// directory destination) don't deadlock against a saturated
 /// `OPEN_FILES_LIMIT`.
 pub struct PendingMetaGuard {
-    _permit: Option<semaphore::Permit<'static>>,
+    permit: Option<std::sync::Arc<semaphore::Permit<'static>>>,
+}
+
+impl PendingMetaGuard {
+    /// Obtain a non-owning admission reference for blocking work launched by this operation.
+    #[must_use]
+    pub fn admission(&self) -> FdAdmission {
+        FdAdmission {
+            permit: self.permit.as_ref().map(std::sync::Arc::downgrade),
+        }
+    }
 }
 
 pub async fn pending_meta_permit() -> PendingMetaGuard {
     PendingMetaGuard {
-        _permit: PENDING_META_LIMIT.acquire().await,
+        permit: PENDING_META_LIMIT.acquire().await.map(std::sync::Arc::new),
     }
 }
 

@@ -90,8 +90,8 @@ impl EntryKind {
 /// Which backpressure pool a leaf's pre-acquired permit comes from.
 ///
 /// The two pools are deliberately distinct (see [`LeafPermit`]) — this enum
-/// selects between them per tool, plus a `None` variant for metadata-only
-/// walks (e.g. rcmp-style traversals) that take no leaf permit at all.
+/// selects between them per tool, plus a `None` variant for walks that take no
+/// leaf permit at all.
 ///
 /// Unifying the *choice* of pool here — alongside [`LeafPermit`] and
 /// [`preacquire_leaf_permit`] — is what lets the traversal driver own the
@@ -101,10 +101,11 @@ impl EntryKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermitKind {
     /// File-descriptor backpressure ([`throttle::open_file_permit`]) — for
-    /// tools that hold an open fd across leaf work (copy, link).
+    /// copy/link leaf operations.
     OpenFile,
-    /// Task-spawn backpressure ([`throttle::pending_meta_permit`]) — for
-    /// recursive metadata-only walks that don't hold an fd (chmod, rm).
+    /// Separate metadata-task backpressure ([`throttle::pending_meta_permit`]) —
+    /// for recursive chmod/rm walks. Keeping this pool distinct lets rm run
+    /// inside a copy overwrite while copy retains its open-file admission.
     PendingMeta,
     /// The tool takes no leaf permit (it doesn't gate at the leaf).
     None,
@@ -114,19 +115,20 @@ pub enum PermitKind {
 /// pools so a single caller (the traversal driver) can hold either uniformly
 /// and drop it in exactly one place before recursing into a directory.
 ///
-/// The two pools must stay distinct: [`throttle::OpenFileGuard`] gates open
-/// file descriptors while [`throttle::PendingMetaGuard`] gates in-flight
-/// metadata-only tasks. They are sized independently so a path that composes
-/// the two operations (e.g. `copy_file → rm` when overwriting a directory
-/// destination) cannot self-deadlock against a saturated open-files pool.
+/// The two pools must stay distinct: [`throttle::OpenFileGuard`] gates fd-bearing
+/// copy/link leaf operations while [`throttle::PendingMetaGuard`] gates in-flight
+/// metadata traversal tasks, some of which retain an `O_PATH` classification
+/// handle. They are sized independently so a path that composes the two operations
+/// (e.g. `copy_file → rm` when overwriting a directory destination) cannot
+/// self-deadlock against a saturated open-files pool.
 /// This enum unifies only the *lifecycle*, never the pools themselves.
 ///
-/// Neither guard is `Clone`; dropping a `LeafPermit` releases exactly the
-/// underlying permit it wraps. The driver drops it before descending so a
-/// directory entry never holds a leaf permit across its recursive walk —
-/// the single home for the invariant that previously lived at 4/7/1/1
-/// per-tool branch sites and shipped as a deadlock when a single-site tool
-/// forgot it.
+/// Neither guard is `Clone`; the only shared ownership they expose is an explicit
+/// [`throttle::FdAdmission`] weak reference for non-cancellable blocking work. In the ordinary
+/// path, dropping a `LeafPermit` releases exactly the underlying permit it wraps. The driver drops
+/// it before descending so a directory entry never holds a leaf permit across its recursive walk
+/// — the single home for the invariant that previously lived at 4/7/1/1 per-tool branch sites and
+/// shipped as a deadlock when a single-site tool forgot it.
 pub enum LeafPermit {
     /// A permit from the open-files pool.
     OpenFile(throttle::OpenFileGuard),
@@ -134,28 +136,43 @@ pub enum LeafPermit {
     PendingMeta(throttle::PendingMetaGuard),
 }
 
-/// Pre-acquire a leaf permit for a child about to be spawned, per the tool's
-/// policy.
+impl LeafPermit {
+    /// Obtain a non-owning reference to this entry's admission for blocking work.
+    #[must_use]
+    pub(crate) fn admission(&self) -> throttle::FdAdmission {
+        match self {
+            Self::OpenFile(guard) => guard.admission(),
+            Self::PendingMeta(guard) => guard.admission(),
+        }
+    }
+
+    /// Consume an open-file admission wrapper and return its concrete guard.
+    ///
+    /// `rlink` schedules with the generic wrapper, then transfers the concrete guard into
+    /// `copy_child`; copy's `--dereference` path similarly transfers it into the target root walk.
+    /// A pending-metadata variant here is an internal policy error because neither path draws from
+    /// that pool.
+    pub(crate) fn into_open_file(self) -> throttle::OpenFileGuard {
+        match self {
+            Self::OpenFile(guard) => guard,
+            Self::PendingMeta(_) => {
+                unreachable!("pending-metadata permit used for open-file work")
+            }
+        }
+    }
+}
+
+/// Pre-acquire a leaf permit for a child about to be spawned.
 ///
-/// Returns `None` when `kind == PermitKind::None` or when `!want(hint)` — the
-/// latter lets a tool opt out based on the cheap `getdents` `d_type` hint. The
-/// key case: when the hint says "directory", the tool passes a `want` that
-/// returns `false`, so no leaf permit is taken. That matters because a hinted
-/// directory must NOT hold a leaf permit across recursion (the hold-and-wait
-/// deadlock). Otherwise this acquires from the pool selected by `kind` and
-/// wraps it in [`LeafPermit`].
-///
-/// `want` receives the raw hint (`None` for `DT_UNKNOWN`); the authoritative
-/// type is only resolved later by the per-entry worker. A hint of `None`
-/// therefore takes a permit when the tool's `want` admits it (matching the
-/// historical "treat unknown as a leaf" behavior), and the worker re-classifies
-/// and drops it if the entry turns out to be a directory.
+/// Returns `None` when `kind == PermitKind::None` or the cheap `getdents` hint positively identifies
+/// a directory. Every known non-directory and `DT_UNKNOWN` entry is admitted provisionally before
+/// spawn. The worker then classifies it authoritatively and drops the permit before recursion if it
+/// proves to be a directory.
 pub async fn preacquire_leaf_permit(
     kind: PermitKind,
     hint: Option<EntryKind>,
-    want: impl Fn(Option<EntryKind>) -> bool,
 ) -> Option<LeafPermit> {
-    if kind == PermitKind::None || !want(hint) {
+    if kind == PermitKind::None || hint == Some(EntryKind::Dir) {
         return None;
     }
     match kind {
@@ -164,6 +181,28 @@ pub async fn preacquire_leaf_permit(
             throttle::pending_meta_permit().await,
         )),
         // unreachable: the early return above already handled `None`.
+        PermitKind::None => None,
+    }
+}
+
+/// Ensure an entry has admission before its fd-bearing authoritative classification.
+///
+/// Spawn loops pass their already-acquired permit here. Root and delegated callers that did not
+/// come through such a loop acquire from the visitor's pool now, before `Dir::child` opens the
+/// entry's `O_PATH` handle. A directory classification releases the provisional permit in the
+/// shared driver's drop-before-recursion branch.
+pub async fn ensure_leaf_permit(
+    kind: PermitKind,
+    permit: Option<LeafPermit>,
+) -> Option<LeafPermit> {
+    if permit.is_some() {
+        return permit;
+    }
+    match kind {
+        PermitKind::OpenFile => Some(LeafPermit::OpenFile(throttle::open_file_permit().await)),
+        PermitKind::PendingMeta => Some(LeafPermit::PendingMeta(
+            throttle::pending_meta_permit().await,
+        )),
         PermitKind::None => None,
     }
 }
@@ -324,9 +363,10 @@ where
 /// syscall), preserving the optimization.
 ///
 /// `child(name)` uses `O_PATH|O_NOFOLLOW`, so this never follows a symlink (a
-/// symlink entry classifies as `Symlink`, not `Dir`) and never blocks: the
-/// hardening of the walk below the named root is unaffected. On a `child` error
-/// (e.g. the entry vanished mid-walk) the hint-derived value is used as a
+/// symlink entry classifies as `Symlink`, not `Dir`) or blocks opening a FIFO or
+/// device payload; the metadata lookup itself can still wait on slow storage.
+/// The hardening of the walk below the named root is unaffected. On a `child`
+/// error (e.g. the entry vanished mid-walk) the hint-derived value is used as a
 /// fallback — the entry's own per-entry worker will then surface the error
 /// authoritatively.
 pub async fn filter_is_dir(
@@ -596,34 +636,34 @@ mod tests {
         Ok(())
     }
 
-    // The leaf-permit lifecycle: `PermitKind::None` and a rejecting `want` both opt
-    // out (the basis for "a hinted directory takes no permit, so it can't deadlock
-    // by holding one across recursion"); a matching `want` acquires from the
-    // requested pool. The pools are process-global; configure a small cap so the
-    // OpenFile case exercises a real acquire rather than the disabled-pool no-op.
+    // the leaf-permit lifecycle: `PermitKind::None` and a known directory opt out;
+    // every possible leaf acquires from the requested pool. The pools are
+    // process-global; configure a small cap so the OpenFile case exercises a real
+    // acquire rather than the disabled-pool no-op.
     #[tokio::test]
-    async fn preacquire_leaf_permit_respects_kind_and_want() {
+    async fn preacquire_leaf_permit_respects_max_open_files_kind_and_hint() {
         throttle::set_max_open_files(4);
-        // `None` kind never takes a permit, regardless of hint/want.
+        // `None` kind never takes a permit, regardless of hint.
         assert!(
-            preacquire_leaf_permit(PermitKind::None, Some(EntryKind::File), |_| true)
+            preacquire_leaf_permit(PermitKind::None, Some(EntryKind::File))
                 .await
                 .is_none()
         );
-        // matching want on the OpenFile pool yields an OpenFile permit.
-        let permit = preacquire_leaf_permit(PermitKind::OpenFile, Some(EntryKind::File), |h| {
-            h == Some(EntryKind::File)
-        })
-        .await;
+        // a possible leaf on the OpenFile pool yields an OpenFile permit.
+        let permit = preacquire_leaf_permit(PermitKind::OpenFile, Some(EntryKind::File)).await;
         assert!(matches!(permit, Some(LeafPermit::OpenFile(_))));
         drop(permit);
-        // a rejecting want (e.g. the hint says "directory") opts out even though the
-        // pool is configured — the hinted-dir-takes-no-permit case.
+        // a known directory opts out even though the pool is configured.
         assert!(
-            preacquire_leaf_permit(PermitKind::OpenFile, Some(EntryKind::Dir), |_| false)
+            preacquire_leaf_permit(PermitKind::OpenFile, Some(EntryKind::Dir))
                 .await
                 .is_none()
         );
+        // treat DT_UNKNOWN as a provisional leaf until authoritative classification.
+        let permit = preacquire_leaf_permit(PermitKind::OpenFile, None).await;
+        assert!(matches!(permit, Some(LeafPermit::OpenFile(_))));
+        drop(permit);
+        throttle::set_max_open_files(0);
     }
 
     // split_root_operand: a normal operand splits via parent()/file_name() (single component ->

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub struct Semaphore {
     flag: std::sync::Arc<AtomicBool>,
@@ -18,6 +18,12 @@ pub struct Semaphore {
     // and consumed by the next N permit drops (see [`Permit::drop`]) so
     // the effective in-flight count eventually converges to the new cap.
     forget_debt: AtomicUsize,
+    // `setup` establishes a fresh configuration. A permit acquired before that boundary must be
+    // forgotten on return rather than credited into the new pool.
+    generation: AtomicU64,
+    // serialize a fresh setup against permit return. without this lock an old permit can validate
+    // its generation, race setup, and then return into the newly configured Tokio semaphore.
+    setup_or_return: std::sync::Mutex<()>,
 }
 
 /// RAII guard wrapping a tokio semaphore permit. On drop, if the semaphore
@@ -31,6 +37,7 @@ pub struct Permit<'a> {
 struct PermitInner<'a> {
     sem: &'a Semaphore,
     permit: tokio::sync::SemaphorePermit<'a>,
+    generation: u64,
 }
 
 impl Drop for Permit<'_> {
@@ -38,6 +45,15 @@ impl Drop for Permit<'_> {
         let Some(inner) = self.inner.take() else {
             return;
         };
+        let _setup_or_return = inner
+            .sem
+            .setup_or_return
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.generation != inner.sem.generation.load(Ordering::Acquire) {
+            inner.permit.forget();
+            return;
+        }
         // Consume one unit of forget_debt if any is outstanding. We use a
         // CAS loop so concurrent drops race cleanly — at most `debt` of
         // them will successfully decrement and forget their permit; the
@@ -77,17 +93,28 @@ impl Semaphore {
             replenish: AtomicUsize::new(0),
             limit: AtomicUsize::new(0),
             forget_debt: AtomicUsize::new(0),
+            generation: AtomicU64::new(0),
+            setup_or_return: std::sync::Mutex::new(()),
         }
     }
 
+    /// Establish a fresh startup/test configuration.
+    ///
+    /// Outstanding acquired permits may safely cross this boundary: their generation tag prevents
+    /// them from crediting the new pool when they return. Callers must not race `setup` with tasks
+    /// already queued inside [`Self::acquire`]; an old waiter could otherwise consume a newly-added
+    /// permit before observing the generation change. Production calls this only during quiescent
+    /// runtime setup, and tests reset it only after their workers have finished.
     pub fn setup(&self, value: usize) {
-        // temporarily disable while reconfiguring so a concurrent acquire
-        // cannot observe `flag == true` with an empty semaphore (the
-        // permit-free window between `forget_permits` and `add_permits`).
-        // A caller racing this reconfiguration will see the semaphore as
-        // disabled and acquire a no-op permit — acceptable since setup is
-        // normally a startup operation.
+        let _setup_or_return = self
+            .setup_or_return
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // temporarily disable while reconfiguring so a new acquire cannot observe `flag == true`
+        // with an empty semaphore (the permit-free window between `forget_permits` and
+        // `add_permits`).
         self.flag.store(false, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.sem.forget_permits(self.sem.available_permits());
         self.forget_debt.store(0, Ordering::Release);
         self.limit.store(value, Ordering::Release);
@@ -194,9 +221,14 @@ impl Semaphore {
 
     pub async fn acquire(&self) -> Option<Permit<'_>> {
         if self.flag.load(Ordering::Acquire) {
+            let generation = self.generation.load(Ordering::Acquire);
             let permit = self.sem.acquire().await.unwrap();
             Some(Permit {
-                inner: Some(PermitInner { sem: self, permit }),
+                inner: Some(PermitInner {
+                    sem: self,
+                    permit,
+                    generation,
+                }),
             })
         } else {
             None
@@ -262,6 +294,59 @@ mod tests {
         assert_eq!(sem.sem.available_permits(), 15);
         sem.set_max(3);
         assert_eq!(sem.sem.available_permits(), 3);
+    }
+
+    #[tokio::test]
+    async fn setup_does_not_accept_a_permit_from_an_older_configuration() {
+        let sem = Semaphore::new();
+        sem.setup(1);
+        let old = sem.acquire().await.unwrap();
+        sem.setup(1);
+        let current = sem.acquire().await.unwrap();
+        drop(old);
+        assert_eq!(
+            sem.sem.available_permits(),
+            0,
+            "an old permit inflated the newly configured capacity"
+        );
+        drop(current);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), sem.acquire())
+                .await
+                .is_ok(),
+            "the current generation's permit did not return normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_permit_does_not_consume_current_generation_shrink_debt() {
+        let sem = Semaphore::new();
+        sem.setup(2);
+        let old = sem.acquire().await.unwrap();
+
+        sem.setup(2);
+        let current_one = sem.acquire().await.unwrap();
+        let current_two = sem.acquire().await.unwrap();
+        sem.set_max(1);
+        assert_eq!(sem.forget_debt.load(Ordering::Acquire), 1);
+
+        drop(old);
+        assert_eq!(
+            sem.forget_debt.load(Ordering::Acquire),
+            1,
+            "a stale permit consumed shrink debt from the current generation"
+        );
+        drop(current_one);
+        assert_eq!(sem.forget_debt.load(Ordering::Acquire), 0);
+        drop(current_two);
+
+        let only = sem.acquire().await.unwrap();
+        assert_eq!(
+            sem.sem.available_permits(),
+            0,
+            "the shrunk current generation admitted more than one permit"
+        );
+        drop(only);
     }
 
     #[tokio::test]

@@ -1852,7 +1852,7 @@ async fn send_file_tcp(
         .instrument(tracing::trace_span!("borrow_stream"))
         .await?;
     // now that we have a stream, acquire file-related resources
-    let _open_file_guard = throttle::open_file_permit()
+    let open_file_guard = throttle::open_file_permit()
         .instrument(tracing::trace_span!("open_file_permit"))
         .await;
     throttle::get_file_iops_tokens(settings.chunk_size, size)
@@ -1863,18 +1863,27 @@ async fn send_file_tcp(
     // symlink swap can't redirect the read; the path-based open is only for the
     // `-L`/`--dereference` walk (which follows symlinks by design).
     let open_result = match &file_read {
-        FileRead::Hardened(dir, name) => dir
-            .open_file_read(name)
-            .instrument(tracing::trace_span!("file_open"))
-            .await
-            .map(|(file, meta)| (tokio::fs::File::from_std(file), Some(meta))),
-        FileRead::Path => common::walk::run_metadata_probed(
-            common::Side::Source,
-            common::MetadataOp::Stat,
-            tokio::fs::File::open(src).instrument(tracing::trace_span!("file_open")), // rcp-toctou-allow: -L path (dereference, documented not hardened)
+        FileRead::Hardened(dir, name) => common::safedir::with_fd_admission(
+            open_file_guard.admission(),
+            dir.open_file_read(name)
+                .instrument(tracing::trace_span!("file_open")),
         )
         .await
-        .map(|file| (file, None)),
+        .map(|(file, meta)| (tokio::fs::File::from_std(file), Some(meta))),
+        FileRead::Path => {
+            let src = src.to_owned();
+            common::safedir::with_fd_admission(
+                open_file_guard.admission(),
+                common::safedir::run_metadata_probed_blocking(
+                    common::Side::Source,
+                    common::MetadataOp::Stat,
+                    move || std::fs::File::open(src), // rcp-toctou-allow: -L path (dereference, documented not hardened)
+                ),
+            )
+            .instrument(tracing::trace_span!("file_open"))
+            .await
+            .map(|file| (tokio::fs::File::from_std(file), None))
+        }
     };
     // read the source ACL from the SAME fd whose bytes are about to be sent (read-side fidelity,
     // docs/tocttou.md): a probe by path could be answered by a different inode than the one being
@@ -1884,11 +1893,12 @@ async fn send_file_tcp(
     // Folded into `open_result` so a failure takes the same accounted path as a failed open: the
     // header has not been sent, so the destination is still owed exactly one entry for this file.
     let open_result = match open_result {
-        Ok((file, meta)) if capture.file_acl => {
-            common::safedir::read_acls_fd(file.as_fd(), common::Side::Source, false)
-                .await
-                .map(|acls| (file, meta, Some(acls)))
-        }
+        Ok((file, meta)) if capture.file_acl => common::safedir::with_fd_admission(
+            open_file_guard.admission(),
+            common::safedir::read_acls_fd(file.as_fd(), common::Side::Source, false),
+        )
+        .await
+        .map(|acls| (file, meta, Some(acls))),
         Ok((file, meta)) => Ok((file, meta, None)),
         Err(e) => Err(e),
     };

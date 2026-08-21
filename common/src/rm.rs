@@ -206,6 +206,10 @@ pub async fn rm(
     path: &std::path::Path,
     settings: &Settings,
 ) -> Result<Summary, Error> {
+    // command-line callers may run many root operands concurrently. admit each one before opening
+    // its parent or performing the optional fd-based filter probe, then transfer that same permit
+    // into the shared driver. an authoritative directory releases it before descent.
+    let permit = crate::walk::ensure_leaf_permit(PermitKind::PendingMeta, None).await;
     // decompose the operand into (parent dir, final component) so the root entry is opened and
     // classified relative to a directory fd — the same fd-relative shape every nested entry takes.
     // `.`/`..` operands (e.g. `rrm .`) are canonicalized so they still name a directory; `/` is
@@ -223,21 +227,26 @@ pub async fn rm(
     // root are O_NOFOLLOW-hardened). a symlinked parent (e.g. `rrm symlinkdir/foo`) is followed; the
     // operand itself is still classified via `child(name)` with O_NOFOLLOW (a symlink root is
     // removed as the link itself).
-    let parent = Dir::open_parent_dir(parent_path, congestion::Side::Source)
-        .await
-        .with_context(|| format!("cannot open parent directory {parent_path:?}"))
-        .map_err(|err| Error::new(err, Default::default()))?;
+    let parent = safedir::with_optional_fd_admission(
+        permit.as_ref().map(LeafPermit::admission),
+        Dir::open_parent_dir(parent_path, congestion::Side::Source),
+    )
+    .await
+    .with_context(|| format!("cannot open parent directory {parent_path:?}"))
+    .map_err(|err| Error::new(err, Default::default()))?;
     // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
     let parent = Arc::new(parent.into_tree());
     if let Some(ref filter) = settings.filter {
         // the top-level include/exclude filter is checked against `path` itself (its file name);
         // classify the root via its parent fd purely to evaluate the root filter. the driver
         // re-classifies the root authoritatively in `process_entry`, so this handle is just a probe.
-        let root_handle = parent
-            .child(name)
-            .await
-            .with_context(|| format!("failed reading metadata from {path:?}"))
-            .map_err(|err| Error::new(err, Default::default()))?;
+        let root_handle = safedir::with_optional_fd_admission(
+            permit.as_ref().map(LeafPermit::admission),
+            parent.child(name),
+        )
+        .await
+        .with_context(|| format!("failed reading metadata from {path:?}"))
+        .map_err(|err| Error::new(err, Default::default()))?;
         let name_path = std::path::Path::new(name);
         let result =
             filter.should_include_root_item(name_path, root_handle.kind() == EntryKind::Dir);
@@ -255,8 +264,8 @@ pub async fn rm(
     }
     // the root entry's owned context: rel_path/filter_path empty (the root), real_path = the
     // operand. rm has no delegated subtree, so `filter_path == rel_path`. The root is processed
-    // exactly like a nested child via `process_entry`, with no pre-acquired permit (it is not
-    // spawned from the backpressure-limited walk loop).
+    // exactly like a nested child via `process_entry`, transferring the root admission acquired
+    // before parent setup.
     let visitor = Arc::new(RmVisitor {
         prog_track,
         settings: settings.clone(),
@@ -270,7 +279,7 @@ pub async fn rm(
         dry_run: settings.dry_run.is_some(),
         prog_track,
     };
-    process_entry(visitor, root_cx, (), None).await // rm has no second tree → root context `()`
+    process_entry(visitor, root_cx, (), permit).await // rm has no second tree → root context `()`
 }
 
 /// Remove a single child entry of an already-open directory, fd-relative.
@@ -303,6 +312,21 @@ pub async fn rm_child(
     rel_path: &std::path::Path,
     settings: &Settings,
 ) -> Result<Summary, Error> {
+    rm_child_admitted(prog_track, parent, name, rel_path, settings, None).await
+}
+
+/// Remove an already-located child while transferring admission acquired by an outer probe.
+///
+/// `--delete` uses this when `DT_UNKNOWN` requires fd-based filter classification before removal.
+/// Other callers use [`rm_child`], and the shared driver acquires before its own classification.
+pub(crate) async fn rm_child_admitted(
+    prog_track: &'static progress::Progress,
+    parent: &Arc<Dir>,
+    name: &OsStr,
+    rel_path: &std::path::Path,
+    settings: &Settings,
+    permit: Option<LeafPermit>,
+) -> Result<Summary, Error> {
     // build the child's owned context rooted at `rel_path`: the display path and the filter path
     // then each equal `rel_path` (the destination-root-relative path), anchoring include/exclude
     // matching against the entry's full root-relative path, and each descendant extends it by one
@@ -322,11 +346,9 @@ pub async fn rm_child(
         dry_run: settings.dry_run.is_some(),
         prog_track,
     };
-    // a `rm_child` entry point is not spawned from the backpressure-limited walk loop, so it never
-    // pre-acquires a pending-meta permit. `process_entry` classifies `name` authoritatively via
-    // `child()` (a swap of `name` to a symlink is caught there — classified as a symlink leaf,
-    // never descended) and dispatches to the visitor.
-    process_entry(visitor, root_cx, (), None).await
+    // process_entry repairs a missing permit before classification. when --delete already needed an
+    // fd-based filter probe, it transfers that admission here instead of dropping and reacquiring.
+    process_entry(visitor, root_cx, (), permit).await
 }
 /// The remove walk's [`WalkVisitor`]. The driver owns enumeration, the leaf-permit lifecycle,
 /// spawning, the single drop-before-recurse site, and the error fold; this visitor supplies rm's
@@ -370,19 +392,10 @@ impl WalkVisitor for RmVisitor {
     fn root_dir_context(&self) {}
 
     fn permit_kind(&self) -> PermitKind {
-        // we use the pending-meta semaphore (not open-files) because rm is reachable from
+        // use the pending-meta semaphore (not open-files) because rm is reachable from
         // copy_file's overwrite path, which already holds an open-files permit; using a distinct
-        // semaphore avoids that cross-pool deadlock. rm holds no open fd across leaf work.
+        // semaphore avoids that cross-pool deadlock while still bounding fd-backed entry handles.
         PermitKind::PendingMeta
-    }
-
-    fn want_permit(&self, hint: Option<EntryKind>) -> bool {
-        // pre-acquire only for a positively-known leaf hint. We deliberately skip pre-acquire when
-        // the getdents hint is unknown (DT_UNKNOWN -> None): the entry could actually be a
-        // directory, and a chain of such unknown-typed directories holding permits while recursing
-        // would deadlock the pending-meta pool. Directories also skip pre-acquire for the same
-        // reason. The authoritative type is still the child's fstat; this is only the hint.
-        hint.is_some_and(|ft| ft != EntryKind::Dir)
     }
 
     fn fail_early(&self) -> bool {
@@ -1945,6 +1958,52 @@ mod tests {
     mod max_open_files_tests {
         use super::*;
 
+        /// Public root setup must reserve metadata capacity before opening the operand parent or
+        /// performing the fd-based root filter probe. Otherwise many CLI operands can bypass the
+        /// shared driver's later admission point concurrently.
+        #[tokio::test]
+        async fn filtered_root_waits_for_admission_before_setup() -> Result<(), anyhow::Error> {
+            let root = testutils::create_temp_dir().await?;
+            let path = root.join("victim");
+            tokio::fs::write(&path, b"x").await?;
+            let mut filter = crate::filter::FilterSettings::new();
+            filter.add_exclude("victim")?;
+            let settings = Settings {
+                fail_early: true,
+                filter: Some(filter),
+                dry_run: None,
+                time_filter: None,
+            };
+            throttle::set_max_open_files(1);
+            let stat_resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
+            throttle::set_max_ops_in_flight(stat_resource, 1);
+            let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
+            let operation = rm(&PROGRESS, &path, &settings);
+            tokio::pin!(operation);
+            let stopped_at_stat_gate = futures::poll!(operation.as_mut()).is_pending();
+            let mut second_permit = Box::pin(throttle::pending_meta_permit());
+            let setup_bypassed_admission = futures::poll!(second_permit.as_mut()).is_ready();
+            drop(second_permit);
+            drop(held_stat);
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(20), operation.as_mut()).await;
+            throttle::set_max_ops_in_flight(stat_resource, 0);
+            throttle::set_max_open_files(0);
+            assert!(
+                stopped_at_stat_gate,
+                "rm root did not reach the held stat gate"
+            );
+            let summary =
+                result.context("rm root did not resume after stat capacity was released")??;
+            assert!(
+                !setup_bypassed_admission,
+                "rm performed root setup before pending-metadata admission"
+            );
+            assert_eq!(summary.files_skipped, 1);
+            Ok(())
+        }
+
         /// wide rm: many files with a very low open-files limit.
         /// verifies all files are removed correctly under permit saturation.
         #[tokio::test]
@@ -1978,15 +2037,15 @@ mod tests {
             Ok(())
         }
 
-        /// deep + wide rm: directory tree deeper than the open-files limit, with files
-        /// at every level. verifies no deadlock occurs (directories don't consume permits).
+        /// Deep + wide rm: a directory tree deeper than the open-files limit, with files at every
+        /// level. Verifies directories do not retain leaf admission across recursion.
         #[tokio::test]
         #[traced_test]
         async fn deep_tree_no_deadlock_under_open_files_saturation() -> Result<(), anyhow::Error> {
             let test_path = testutils::create_temp_dir().await?;
             let depth = 20;
             let files_per_level = 5;
-            let limit = 4;
+            let limit = 1;
             // create a directory chain deeper than the permit limit, with files at each level
             let mut dir = test_path.clone();
             for level in 0..depth {
@@ -2023,41 +2082,9 @@ mod tests {
             Ok(())
         }
 
-        /// Locks down the boolean used at the rm spawn site to decide whether
-        /// to pre-acquire a pending-meta permit. A naive `entry_is_dir = false
-        /// ⇒ pre-acquire` policy treats unknown-typed entries (when
-        /// `DirEntry::file_type()` fails) as leaves, so the spawned task
-        /// holds the permit even if the entry is actually a directory and
-        /// recurses. A chain of such entries can deadlock the pool. The
-        /// safer pattern — `pre-acquire iff positively-known-not-directory`
-        /// — keeps the predicate `false` for unknown types.
-        #[test]
-        fn pre_acquire_skips_unknown_filetype() -> Result<(), anyhow::Error> {
-            let tmp = std::env::temp_dir().join(format!(
-                "rcp_pre_acquire_test_{}_{}",
-                std::process::id(),
-                rand::random::<u64>()
-            ));
-            std::fs::create_dir(&tmp)?;
-            let dir_path = tmp.join("d");
-            std::fs::create_dir(&dir_path)?;
-            let file_path = tmp.join("f");
-            std::fs::write(&file_path, "x")?;
-            let dir_ft = std::fs::metadata(&dir_path)?.file_type();
-            let file_ft = std::fs::metadata(&file_path)?.file_type();
-            // The exact predicate used in the rm spawn site:
-            let known_leaf =
-                |ft: Option<std::fs::FileType>| ft.as_ref().is_some_and(|t| !t.is_dir());
-            assert!(!known_leaf(None), "unknown filetype must skip pre-acquire");
-            assert!(!known_leaf(Some(dir_ft)), "directory must skip pre-acquire");
-            assert!(known_leaf(Some(file_ft)), "regular file must pre-acquire");
-            std::fs::remove_dir_all(&tmp).ok();
-            Ok(())
-        }
-
         /// Regression for the hold-and-wait deadlock when a getdents leaf-hint entry is actually a
         /// directory (the DT_UNKNOWN edge, or a swap between `getdents` and the authoritative
-        /// `child()`). The walk pre-acquires a `pending_meta` permit for hinted leaves only; if such
+        /// `child()`). The walk pre-acquires a `pending_meta` permit for every possible leaf; if such
         /// an entry turns out to be a directory, the spawned task must DROP that permit before
         /// recursing — otherwise it holds the permit AND its children block trying to acquire one,
         /// and with a saturated pool the whole walk hangs.
@@ -2115,12 +2142,9 @@ mod tests {
             };
             // pre-acquire the single permit exactly as the spawn loop does for a hinted leaf, and
             // hand it to `process_entry`. The fix drops it before recursing into the directory.
-            let permit = crate::walk::preacquire_leaf_permit(
-                PermitKind::PendingMeta,
-                Some(EntryKind::File),
-                |_| true,
-            )
-            .await;
+            let permit =
+                crate::walk::preacquire_leaf_permit(PermitKind::PendingMeta, Some(EntryKind::File))
+                    .await;
             assert!(permit.is_some(), "the pre-acquire must take the one permit");
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(20),

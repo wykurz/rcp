@@ -108,7 +108,8 @@ struct Args {
     )]
     output_format: common::cmp::OutputFormat,
 
-    /// Maximum number of open files (0 = no limit, unspecified = 80% of system limit)
+    /// Metadata-task backpressure limit; recursive directory fds are outside this pool
+    /// (0 = no limit, unspecified = derived from 80% of the system fd budget)
     #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
     max_open_files: Option<usize>,
 

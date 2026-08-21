@@ -141,7 +141,8 @@ struct Args {
     #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
     quiet: bool,
 
-    /// Maximum number of open files (0 = no limit, unspecified = 80% of system limit)
+    /// Descriptor-backpressure limit per leaf-operation pool; not a hard process-wide fd count
+    /// (0 = no limit, unspecified = derived from 80% of the system fd budget)
     #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
     max_open_files: Option<usize>,
 

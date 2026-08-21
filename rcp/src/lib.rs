@@ -98,7 +98,7 @@
 //!
 //! - `--ops-throttle`: Limit operations per second
 //! - `--iops-throttle`: Limit I/O operations per second
-//! - `--max-open-files`: Control maximum open file descriptors
+//! - `--max-open-files`: Control descriptor backpressure for leaf operations
 //! - `--max-workers`: Control number of worker threads
 //!
 //! ## Remote Copy Configuration
