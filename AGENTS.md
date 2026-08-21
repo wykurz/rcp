@@ -186,6 +186,11 @@ fail fast if unavailable — they are never skipped based on environment.
 
 ## Pull Requests
 
+Dedicated feature worktrees are always integrated through a pull request. Never merge a worktree
+branch into `main` locally. Finish the change on the worktree's branch, run the required
+verification, commit and push that branch, create a PR, and keep the worktree available for review
+follow-ups.
+
 After creating a PR, check all review comments (including automated ones from Copilot). Evaluate
 each on its merit — address valid suggestions and respond to ones that aren't applicable.
 
