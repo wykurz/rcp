@@ -410,9 +410,9 @@ pub enum DestinationMessage {
     /// Confirm directory created, request file transfers. This is purely the
     /// Pass-2 trigger: it tells the source the destination created the directory
     /// and is ready to receive its files. The source already retains the
-    /// authoritative Pass-1 file count for the directory (in its fd-map entry under
-    /// hardened reads, or in a path→count map under `-L`), so no count is echoed
-    /// back here. Any `DirectoryManifestChunk`s for this directory precede this message.
+    /// authoritative Pass-1 file count for the directory (in its fd-map entry under hardened
+    /// reads, or in a path-keyed Pass-1 entry under `-L`), so no count is echoed back here. Any
+    /// `DirectoryManifestChunk`s for this directory precede this message.
     DirectoryCreated {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
@@ -421,11 +421,10 @@ pub enum DestinationMessage {
     /// failed, ancestor failed, or `--ignore-existing` skipped a non-directory).
     /// No files will be requested for it. The destination sends exactly one of
     /// `DirectoryCreated` / `DirectorySkipped` per `Directory` message so the
-    /// source can release the matching held directory fd (see the source-side
-    /// fd-map / dir-fd budget in `rcp::source`): without this nack a skipped
-    /// directory's Pass-1 permit would never be released, hanging large no-ack
-    /// subtrees. `src` keys the source-side fd-map entry to release (the map is
-    /// inserted under `src`; see `take_for_skipped`); `dst` is carried for
+    /// source can release the matching Pass-1 entry (a held directory fd under hardened reads, or
+    /// an owned pacing credit under `-L`): without this nack a skipped directory's permit would
+    /// never be released, hanging large no-ack subtrees. `src` keys the source-side entry to
+    /// release (the map is inserted under `src`; see `take_for_skipped`); `dst` is carried for
     /// symmetry/logging.
     DirectorySkipped {
         src: std::path::PathBuf,

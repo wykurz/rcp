@@ -404,21 +404,23 @@ pub(crate) fn install_tracing_subscriber(
 
 /// Derive a conservative leaf-operation count from the process descriptor limit.
 ///
-/// The OpenFile pool can model three simultaneous leaf-owned descriptors: classification, source,
-/// and either overwrite planning or destination. The independently sized PendingMeta pool can
-/// model one transient descriptor for each of its operations. Dividing an
-/// 80%-of-soft-`RLIMIT_NOFILE` budget by those four units gives the same admission count to each
-/// pool. This is a heuristic, not a hard process-wide ceiling: recursive directories and process
-/// support descriptors are outside leaf admission. A nonzero soft limit gets at least one operation
-/// so very small test/container limits do not silently disable backpressure.
+/// Local copy/link can overlap four OpenFile descriptors during overwrite recheck (source
+/// classification, destination planning, source data, and the fresh destination identity check)
+/// with one PendingMeta classification descriptor in recursive rm/delete work. Dividing an
+/// 80%-of-soft-`RLIMIT_NOFILE` budget by those five units gives the same admission count to each
+/// pool. Metadata-only tools can transiently hold two descriptors per PendingMeta operation, but do
+/// not use the four-descriptor OpenFile path concurrently. This is a heuristic for shipped tool
+/// workflows, not a hard process-wide ceiling: recursive directories and process support
+/// descriptors are outside leaf admission. A nonzero soft limit gets at least one operation so very
+/// small test/container limits do not silently disable backpressure.
 fn default_leaf_operation_limit(soft_limit: u64) -> usize {
     if soft_limit == 0 {
         return 0;
     }
-    const OPEN_FILE_DESCRIPTOR_UNITS: u64 = 3;
-    const PENDING_META_DESCRIPTOR_UNITS: u64 = 1;
+    const OPEN_FILE_DESCRIPTOR_UNITS: u64 = 4;
+    const OVERLAPPING_PENDING_META_DESCRIPTOR_UNITS: u64 = 1;
     const DESCRIPTOR_UNITS_PER_OPERATION: u64 =
-        OPEN_FILE_DESCRIPTOR_UNITS + PENDING_META_DESCRIPTOR_UNITS;
+        OPEN_FILE_DESCRIPTOR_UNITS + OVERLAPPING_PENDING_META_DESCRIPTOR_UNITS;
     const MAX_LEAF_OPERATIONS_PER_POOL: u64 = 4096;
     let descriptor_budget = soft_limit.saturating_mul(8) / 10;
     let leaf_operation_limit = std::cmp::min(
@@ -430,7 +432,7 @@ fn default_leaf_operation_limit(soft_limit: u64) -> usize {
 
 /// Build a multi-threaded tokio runtime configured per `runtime`, and apply the
 /// `max_open_files` leaf-operation admission limit from `throttle`. Falls back
-/// to a per-pool admission count derived from an 80%-of-soft-rlimit descriptor budget (four modeled
+/// to a per-pool admission count derived from an 80%-of-soft-rlimit descriptor budget (five modeled
 /// descriptor units across the two independent pools, capped at 4096 operations per pool) when
 /// `max_open_files` is unset.
 pub(crate) fn build_tokio_runtime(
@@ -456,10 +458,10 @@ pub(crate) fn build_tokio_runtime(
             "Setting max concurrent leaf operations per admission pool to: {}",
             leaf_operation_limit
         );
-        throttle::set_max_open_files(leaf_operation_limit);
     } else {
-        tracing::info!("Not applying any leaf-operation admission limit");
+        tracing::info!("Disabling leaf-operation admission limits");
     }
+    throttle::set_max_open_files(leaf_operation_limit);
     builder.build().expect("Failed to create runtime")
 }
 
@@ -475,6 +477,12 @@ mod default_leaf_operation_limit_tests {
     const RLIMIT_CHILD_SUCCESS: &str = "RCP_TEST_RUNTIME_SETUP_RLIMIT_CHILD:success";
     #[cfg(target_os = "linux")]
     const RLIMIT_CHILD_SKIP: &str = "RCP_TEST_RUNTIME_SETUP_RLIMIT_CHILD:skip";
+    #[cfg(target_os = "linux")]
+    const ZERO_LIMIT_CHILD_MARKER: &str = "RCP_TEST_RUNTIME_SETUP_ZERO_LIMIT_CHILD";
+    #[cfg(target_os = "linux")]
+    const ZERO_LIMIT_CHILD_MARKER_VALUE: &str = "replaces-stale-admission-epoch-v1";
+    #[cfg(target_os = "linux")]
+    const ZERO_LIMIT_CHILD_SUCCESS: &str = "RCP_TEST_RUNTIME_SETUP_ZERO_LIMIT_CHILD:success";
 
     #[cfg(target_os = "linux")]
     fn nofile_limit() -> libc::rlimit {
@@ -495,8 +503,8 @@ mod default_leaf_operation_limit_tests {
 
     #[test]
     fn reserves_descriptor_headroom_for_each_leaf_operation() {
-        assert_eq!(default_leaf_operation_limit(100), 20);
-        assert_eq!(default_leaf_operation_limit(4096), 819);
+        assert_eq!(default_leaf_operation_limit(100), 16);
+        assert_eq!(default_leaf_operation_limit(4096), 655);
         assert_eq!(default_leaf_operation_limit(1_000_000), 4096);
         assert_eq!(default_leaf_operation_limit(u64::MAX), 4096);
     }
@@ -506,6 +514,79 @@ mod default_leaf_operation_limit_tests {
         assert_eq!(default_leaf_operation_limit(1), 1);
         assert_eq!(default_leaf_operation_limit(4), 1);
         assert_eq!(default_leaf_operation_limit(0), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_tokio_runtime_zero_limit_replaces_stale_admission_epochs() {
+        let is_child = std::env::var_os(ZERO_LIMIT_CHILD_MARKER)
+            .is_some_and(|value| value == std::ffi::OsStr::new(ZERO_LIMIT_CHILD_MARKER_VALUE));
+        if !is_child {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime_setup::default_leaf_operation_limit_tests::build_tokio_runtime_zero_limit_replaces_stale_admission_epochs",
+                    "--nocapture",
+                ])
+                .env(ZERO_LIMIT_CHILD_MARKER, ZERO_LIMIT_CHILD_MARKER_VALUE)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "child test failed:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains(ZERO_LIMIT_CHILD_SUCCESS)
+                    || stderr.contains(ZERO_LIMIT_CHILD_SUCCESS),
+                "child branch did not emit its sentinel:\n{stdout}\n{stderr}"
+            );
+            return;
+        }
+        let runtime = RuntimeConfig {
+            max_workers: 1,
+            max_blocking_threads: 1,
+        };
+        let old_limit = ThrottleConfig {
+            max_open_files: Some(1),
+            ..ThrottleConfig::default()
+        };
+        let admission_runtime = build_tokio_runtime(&runtime, &old_limit);
+        let (old_open_file, old_pending_meta) = admission_runtime.block_on(async {
+            tokio::join!(
+                throttle::open_file_permit(),
+                throttle::pending_meta_permit()
+            )
+        });
+        let disabled_limit = ThrottleConfig {
+            max_open_files: Some(0),
+            ..ThrottleConfig::default()
+        };
+        drop(build_tokio_runtime(&runtime, &disabled_limit));
+        let (new_open_file, new_pending_meta) = admission_runtime.block_on(async {
+            let open_file = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                throttle::open_file_permit(),
+            )
+            .await
+            .expect("zero OpenFile cap must not wait behind the stale epoch");
+            let pending_meta = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                throttle::pending_meta_permit(),
+            )
+            .await
+            .expect("zero PendingMeta cap must not wait behind the stale epoch");
+            (open_file, pending_meta)
+        });
+        drop((
+            new_open_file,
+            new_pending_meta,
+            old_open_file,
+            old_pending_meta,
+        ));
+        throttle::set_max_open_files(0);
+        println!("{ZERO_LIMIT_CHILD_SUCCESS}");
     }
 
     #[cfg(target_os = "linux")]
@@ -540,7 +621,7 @@ mod default_leaf_operation_limit_tests {
         }
         let original = nofile_limit();
         const TARGET_SOFT_LIMIT: libc::rlim_t = 256;
-        if original.rlim_cur <= TARGET_SOFT_LIMIT || original.rlim_max <= TARGET_SOFT_LIMIT {
+        if original.rlim_max < TARGET_SOFT_LIMIT {
             eprintln!(
                 "{RLIMIT_CHILD_SKIP}: current={} hard={}",
                 original.rlim_cur, original.rlim_max
@@ -567,10 +648,10 @@ mod default_leaf_operation_limit_tests {
             max_blocking_threads: 1,
         };
         let throttle = ThrottleConfig {
-            max_open_files: Some(1),
+            max_open_files: None,
             ..ThrottleConfig::default()
         };
-        drop(build_tokio_runtime(&runtime, &throttle));
+        let runtime = build_tokio_runtime(&runtime, &throttle);
         let after = nofile_limit();
         assert_eq!(
             after.rlim_cur, TARGET_SOFT_LIMIT,
@@ -580,6 +661,42 @@ mod default_leaf_operation_limit_tests {
             after.rlim_max, original.rlim_max,
             "runtime setup changed the hard limit"
         );
+        let (open_files, pending_meta) = runtime
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    let mut open_files = Vec::with_capacity(40);
+                    let mut pending_meta = Vec::with_capacity(40);
+                    for _ in 0..40 {
+                        open_files.push(throttle::open_file_permit().await);
+                    }
+                    for _ in 0..40 {
+                        pending_meta.push(throttle::pending_meta_permit().await);
+                    }
+                    assert!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            throttle::open_file_permit(),
+                        )
+                        .await
+                        .is_err(),
+                        "the 41st OpenFile acquisition must wait at the derived limit"
+                    );
+                    assert!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            throttle::pending_meta_permit(),
+                        )
+                        .await
+                        .is_err(),
+                        "the 41st PendingMeta acquisition must wait at the derived limit"
+                    );
+                    (open_files, pending_meta)
+                })
+                .await
+            })
+            .expect("derived admission boundary must complete within its watchdog");
+        drop((open_files, pending_meta));
+        throttle::set_max_open_files(0);
         println!("{RLIMIT_CHILD_SUCCESS}");
     }
 }

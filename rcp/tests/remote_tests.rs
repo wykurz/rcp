@@ -1651,11 +1651,10 @@ fn test_remote_copy_file_skipped_under_failed_parent_does_not_abort() {
     );
 }
 
-/// Dereference (`-L`) copy of a directory tree, exercising the source-side `-L`
-/// `path → file_count` map introduced in Change B (the destination no longer echoes
-/// the count, so `-L` must retain its own Pass-1 count for each directory). The
-/// directory is reached through a symlink and must be copied as a real directory
-/// with all files present.
+/// Dereference (`-L`) copy of a directory tree, exercising the source-side path-keyed Pass-1
+/// entries (the destination no longer echoes the count, so `-L` retains each directory's contents
+/// and pacing credit). The directory is reached through a symlink and must be copied as a real
+/// directory with all files present.
 #[test]
 fn test_remote_copy_dereference_directory_tree() {
     require_local_ssh();
@@ -2052,35 +2051,119 @@ fn find_rcpd_processes() -> Vec<u32> {
         .collect()
 }
 
-/// Read a process's argv from `/proc`, space-joined. `None` if it has already exited.
-fn read_proc_cmdline(pid: u32) -> Option<String> {
+/// Read a process's raw argv from `/proc`. `None` if it has already exited.
+fn read_proc_argv(pid: u32) -> Option<Vec<Vec<u8>>> {
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     Some(
         raw.split(|byte| *byte == 0)
             .filter(|arg| !arg.is_empty())
-            .map(|arg| String::from_utf8_lossy(arg).into_owned())
-            .collect::<Vec<_>>()
-            .join(" "),
+            .map(<[u8]>::to_vec)
+            .collect(),
     )
 }
 
-/// wait for rcpd processes to exit (with timeout)
-fn wait_for_rcpd_exit(initial_pids: &[u32], timeout_secs: u64) -> bool {
-    let start = std::time::Instant::now();
-    loop {
-        let current_pids = find_rcpd_processes();
-        let remaining: Vec<_> = initial_pids
-            .iter()
-            .filter(|pid| current_pids.contains(pid))
-            .collect();
-        if remaining.is_empty() {
-            return true;
+/// Find only rcpd processes carrying one test run's unique debug-log marker, optionally restricted
+/// to a role.
+fn find_marked_rcpd_processes(marker: &str, role: Option<&str>) -> Vec<u32> {
+    let marker_arg = format!("--debug-log-prefix={marker}").into_bytes();
+    find_rcpd_processes()
+        .into_iter()
+        .filter(|pid| {
+            read_proc_argv(*pid).is_some_and(|argv| {
+                argv.iter().any(|arg| arg == &marker_arg)
+                    && role.is_none_or(|role| {
+                        argv.windows(2).any(|pair| {
+                            pair[0].as_slice() == b"--role" && pair[1].as_slice() == role.as_bytes()
+                        })
+                    })
+            })
+        })
+        .collect()
+}
+
+/// Return whether any rcpd debug log in `dir` contains `needle`.
+fn rcpd_logs_contain(dir: &std::path::Path, needle: &str) -> bool {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            std::fs::read_to_string(entry.path()).is_ok_and(|content| content.contains(needle))
+        })
+}
+
+/// Return whether both marked rcpd roles have consumed their master hello.
+fn rcpd_role_hellos_received(log_dir: &std::path::Path) -> bool {
+    rcpd_logs_contain(log_dir, "Received side: Source")
+        && rcpd_logs_contain(log_dir, "Received side: Destination")
+}
+
+#[test]
+fn rcpd_role_hello_readiness_requires_both_roles() {
+    let log_dir = tempfile::TempDir::new().expect("Failed to create rcpd debug log dir");
+    std::fs::write(
+        log_dir.path().join("source.log"),
+        "Received side: Source { ... }",
+    )
+    .expect("Failed to write source rcpd log");
+    assert!(!rcpd_role_hellos_received(log_dir.path()));
+
+    std::fs::write(
+        log_dir.path().join("destination.log"),
+        "Received side: Destination { ... }",
+    )
+    .expect("Failed to write destination rcpd log");
+    assert!(rcpd_role_hellos_received(log_dir.path()));
+}
+
+/// Own the actual rcp master and clean up every marked daemon on any test exit, including panic.
+struct MarkedRemoteRun {
+    master: Option<std::process::Child>,
+    marker: String,
+}
+
+impl MarkedRemoteRun {
+    fn new(master: std::process::Child, marker: String) -> Self {
+        Self {
+            master: Some(master),
+            marker,
         }
-        if start.elapsed().as_secs() >= timeout_secs {
-            eprintln!("Timeout waiting for rcpd processes to exit. Remaining PIDs: {remaining:?}");
-            return false;
+    }
+    fn master_pid(&self) -> u32 {
+        self.master
+            .as_ref()
+            .expect("rcp master already reaped")
+            .id()
+    }
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.master
+            .as_mut()
+            .expect("rcp master already reaped")
+            .try_wait()
+    }
+    fn kill_master(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let mut master = self.master.take().expect("rcp master already reaped");
+        if let Err(error) = master.kill() {
+            let _ = master.wait();
+            return Err(error);
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        master.wait()
+    }
+}
+
+impl Drop for MarkedRemoteRun {
+    fn drop(&mut self) {
+        if let Some(mut master) = self.master.take()
+            && !matches!(master.try_wait(), Ok(Some(_)))
+        {
+            let _ = master.kill();
+            let _ = master.wait();
+        }
+        for pid in find_marked_rcpd_processes(&self.marker, None) {
+            // SAFETY: `kill` has no memory-safety preconditions; an already-exited pid returns
+            // ESRCH, which is harmless during best-effort panic cleanup.
+            let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
     }
 }
 
@@ -2097,120 +2180,118 @@ fn create_large_test_file(path: &std::path::Path, size_mb: usize) {
 
 #[test]
 fn test_remote_rcpd_exits_when_master_killed() {
-    // verify that rcpd processes exit when the master (rcp) is killed
-    // the stdin watchdog should detect master death immediately
     require_local_ssh();
+    // each rcpd reserves 50 one-MiB DATA tokens at five tokens/sec, keeping the copy alive long
+    // enough to observe both marked roles without relying on loopback throughput or metadata ops.
+    const IOPS_THROTTLE: usize = 5;
+    const FILE_SIZE_MIB: usize = 50;
     let (src_dir, dst_dir) = setup_test_env();
-    // create a very large file (200MB) to ensure copy takes ~10 seconds over localhost
-    let src_file = src_dir.path().join("large_file.dat");
-    eprintln!("Creating 200MB test file...");
-    create_large_test_file(&src_file, 200);
+    let src_file = src_dir.path().join("throttled_file.dat");
+    create_large_test_file(&src_file, FILE_SIZE_MIB);
     let dst_file = dst_dir.path().join("large_file.dat");
     let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
-    // get initial rcpd processes
-    let initial_pids = find_rcpd_processes();
-    eprintln!("Initial rcpd processes: {initial_pids:?}");
-    // spawn rcp as subprocess
     let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
-    eprintln!("Spawning rcp subprocess...");
-    let mut child = std::process::Command::new(rcp_path)
-        .args(["-vv", &src_remote, &dst_remote])
-        .spawn()
-        .expect("Failed to spawn rcp");
-    // wait 1 second to ensure copy starts and rcpd processes are spawned
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    // check that rcpd processes were spawned
-    let running_pids = find_rcpd_processes();
-    eprintln!("Running rcpd processes after 1.5s: {running_pids:?}");
-    let new_pids: Vec<_> = running_pids
-        .iter()
-        .filter(|pid| !initial_pids.contains(pid))
-        .copied()
-        .collect();
-    if new_pids.is_empty() {
-        // copy might have completed already - this is okay, skip the test
-        eprintln!("⚠ Copy completed too quickly to test master kill scenario - skipping");
-        child.wait().ok();
-        return;
-    }
-    eprintln!("New rcpd PIDs spawned by this test: {new_pids:?}");
-    // kill the master with SIGKILL (simulates crash)
-    eprintln!("Killing master process (PID: {}) with SIGKILL", child.id());
-    child.kill().expect("Failed to kill master");
-    child.wait().expect("Failed to wait for master");
-    // stdin watchdog should detect master death immediately
-    // wait up to 5 seconds for rcpd to exit (should be much faster with stdin watchdog)
-    let exited = wait_for_rcpd_exit(&new_pids, 5);
-    assert!(
-        exited,
-        "rcpd processes should exit within 5 seconds after master is killed"
+    let rcpd_log_dir = tempfile::TempDir::new().expect("Failed to create rcpd debug log dir");
+    let rcpd_marker = rcpd_log_dir.path().join("rcpd-debug").display().to_string();
+    let rcpd_log_arg = format!("--rcpd-debug-log-prefix={rcpd_marker}");
+    let stdout_file = tempfile::NamedTempFile::new().expect("Failed to create stdout capture file");
+    let stderr_file = tempfile::NamedTempFile::new().expect("Failed to create stderr capture file");
+    let iops_arg = format!("--iops-throttle={IOPS_THROTTLE}");
+    let mut command = std::process::Command::new(rcp_path);
+    command.args([
+        "-vv",
+        "--force-remote",
+        "--chunk-size=1MiB",
+        &iops_arg,
+        &rcpd_log_arg,
+        &src_remote,
+        &dst_remote,
+    ]);
+    command.stdout(
+        stdout_file
+            .reopen()
+            .expect("Failed to reopen stdout capture file"),
     );
-    eprintln!("✓ All rcpd processes exited successfully");
-}
-
-#[test]
-fn test_remote_rcpd_exits_when_master_killed_with_throttle() {
-    // alternative test that uses throttling to ensure copy is in progress when killed
-    // verifies the stdin watchdog works correctly
-    require_local_ssh();
-    let (src_dir, dst_dir) = setup_test_env();
-    // create a moderate file (50MB)
-    let src_file = src_dir.path().join("throttled_file.dat");
-    eprintln!("Creating 50MB test file...");
-    create_large_test_file(&src_file, 50);
-    let dst_file = dst_dir.path().join("throttled_file.dat");
-    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
-    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
-    // get initial rcpd processes
-    let initial_pids = find_rcpd_processes();
-    eprintln!("Initial rcpd processes: {initial_pids:?}");
-    // spawn rcp with throttling to slow down the copy
-    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
-    eprintln!("Spawning rcp subprocess with throttling...");
-    let mut child = std::process::Command::new(rcp_path)
-        .args([
-            "-vv",
-            "--ops-throttle=100", // limit to 100 operations per second
-            &src_remote,
-            &dst_remote,
-        ])
-        .spawn()
-        .expect("Failed to spawn rcp");
-    // wait 2 seconds to ensure copy is in progress with throttling
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    // check that rcpd processes were spawned
-    let running_pids = find_rcpd_processes();
-    eprintln!("Running rcpd processes after 2s: {running_pids:?}");
-    let new_pids: Vec<_> = running_pids
-        .iter()
-        .filter(|pid| !initial_pids.contains(pid))
-        .copied()
-        .collect();
-    if new_pids.is_empty() {
-        eprintln!("⚠ No rcpd processes found - copy may have completed too quickly - skipping");
-        child.wait().ok();
-        return;
-    }
-    eprintln!("New rcpd PIDs spawned by this test: {new_pids:?}");
-    // kill the master with SIGKILL (simulates crash)
-    eprintln!("Killing master process (PID: {}) with SIGKILL", child.id());
-    child.kill().expect("Failed to kill master");
-    child.wait().expect("Failed to wait for master");
-    // stdin watchdog should detect master death immediately
-    // wait up to 3 seconds for rcpd to exit (stdin watchdog should be instant)
-    let start = std::time::Instant::now();
-    let exited = wait_for_rcpd_exit(&new_pids, 3);
-    let elapsed = start.elapsed();
-    assert!(
-        exited,
-        "rcpd processes should exit within 3 seconds after master is killed (stdin watchdog)"
+    command.stderr(
+        stderr_file
+            .reopen()
+            .expect("Failed to reopen stderr capture file"),
     );
-    eprintln!("✓ All rcpd processes exited in {elapsed:?} (stdin watchdog worked!)");
-    // verify it was fast (stdin watchdog should be nearly instant)
-    assert!(
-        elapsed.as_secs() < 5,
-        "rcpd should exit quickly via stdin watchdog"
+    let read_captured_output = |status: std::process::ExitStatus| -> std::process::Output {
+        std::process::Output {
+            status,
+            stdout: std::fs::read(stdout_file.path()).unwrap_or_default(),
+            stderr: std::fs::read(stderr_file.path()).unwrap_or_default(),
+        }
+    };
+    let scenario_start = std::time::Instant::now();
+    let master = command.spawn().expect("Failed to spawn rcp master");
+    let mut run = MarkedRemoteRun::new(master, rcpd_marker.clone());
+    let marked_pids = loop {
+        let source_pids = find_marked_rcpd_processes(&rcpd_marker, Some("source"));
+        let destination_pids = find_marked_rcpd_processes(&rcpd_marker, Some("destination"));
+        let role_hellos_received = rcpd_role_hellos_received(rcpd_log_dir.path());
+        if !source_pids.is_empty() && !destination_pids.is_empty() && role_hellos_received {
+            break source_pids
+                .into_iter()
+                .chain(destination_pids)
+                .collect::<Vec<_>>();
+        }
+        if let Some(status) = run.try_wait().expect("Failed to poll rcp master") {
+            print_command_output(&read_captured_output(status));
+            panic!(
+                "the master-kill scenario was never reached: rcp exited before both marked rcpd \
+                 roles were running and had consumed their master hellos"
+            );
+        }
+        if scenario_start.elapsed() >= std::time::Duration::from_secs(20) {
+            let status = run
+                .kill_master()
+                .expect("Failed to stop rcp master after scenario timeout");
+            print_command_output(&read_captured_output(status));
+            panic!(
+                "the master-kill scenario was never reached within {:?}: found source {:?}, \
+                 destination {:?}, both master hellos received: {role_hellos_received}",
+                scenario_start.elapsed(),
+                source_pids,
+                destination_pids
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    if let Some(status) = run.try_wait().expect("Failed to poll rcp master") {
+        print_command_output(&read_captured_output(status));
+        panic!("rcp master exited before it could be killed");
+    }
+    let master_pid = run.master_pid();
+    eprintln!("Killing rcp master {master_pid}; marked rcpd processes: {marked_pids:?}");
+    let status = run.kill_master().expect("Failed to SIGKILL rcp master");
+    let output = read_captured_output(status);
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&output.status),
+        Some(libc::SIGKILL),
+        "the direct rcp child was not terminated by SIGKILL"
+    );
+    let exit_start = std::time::Instant::now();
+    loop {
+        let remaining = find_marked_rcpd_processes(&rcpd_marker, None);
+        if remaining.is_empty() {
+            break;
+        }
+        if exit_start.elapsed() >= std::time::Duration::from_secs(5) {
+            print_command_output(&output);
+            panic!(
+                "marked rcpd processes did not exit within {:?} after master {master_pid} was \
+                 killed: {remaining:?}",
+                exit_start.elapsed()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    eprintln!(
+        "All marked rcpd processes exited in {:?} after master {master_pid} was killed",
+        exit_start.elapsed()
     );
 }
 
@@ -2311,18 +2392,9 @@ fn test_remote_destination_rcpd_killed_reports_error_not_abort() {
     // line IS the acknowledgement. `--role source` produces "Received side: Source", so matching on
     // the variant name picks out the destination without needing to know the log file naming.
     let dest_ready_marker = "Received side: Destination";
-    let rcpd_logs_contain = |needle: &str| -> bool {
-        std::fs::read_dir(rcpd_log_dir.path())
-            .into_iter()
-            .flatten()
-            .flatten()
-            .any(|entry| {
-                std::fs::read_to_string(entry.path()).is_ok_and(|content| content.contains(needle))
-            })
-    };
     let mut ready = false;
     while spawn_start.elapsed().as_secs() < 20 {
-        if rcpd_logs_contain(dest_ready_marker) {
+        if rcpd_logs_contain(rcpd_log_dir.path(), dest_ready_marker) {
             ready = true;
             break;
         }
@@ -2371,7 +2443,7 @@ fn test_remote_destination_rcpd_killed_reports_error_not_abort() {
     let structure_wait_start = std::time::Instant::now();
     let mut structure_seen = false;
     while structure_wait_start.elapsed().as_secs() < 20 {
-        if rcpd_logs_contain(structure_marker) {
+        if rcpd_logs_contain(rcpd_log_dir.path(), structure_marker) {
             structure_seen = true;
             break;
         }
@@ -2392,14 +2464,7 @@ fn test_remote_destination_rcpd_killed_reports_error_not_abort() {
     // matching process on the host - a developer's live remote copy, or another test's daemon on a
     // shared CI runner. nextest's serial group orders tests within one run; it says nothing about
     // what else is running on the machine.
-    let destination_pids: Vec<u32> = find_rcpd_processes()
-        .into_iter()
-        .filter(|pid| {
-            read_proc_cmdline(*pid).is_some_and(|cmdline| {
-                cmdline.contains(&rcpd_marker) && cmdline.contains("--role destination")
-            })
-        })
-        .collect();
+    let destination_pids = find_marked_rcpd_processes(&rcpd_marker, Some("destination"));
     eprintln!(
         "Destination rcpd consumed the master's hello after {:?} (control queue drained), killing \
          it {destination_pids:?}",
@@ -2476,7 +2541,10 @@ fn test_remote_destination_rcpd_killed_reports_error_not_abort() {
     // this, and the log file is written before the master is anywhere near exiting - the master
     // reads the SOURCE's result first (rcp/src/bin/rcp.rs), which the source only sends after this.
     assert!(
-        rcpd_logs_contain("closed its control stream without sending DestinationDone"),
+        rcpd_logs_contain(
+            rcpd_log_dir.path(),
+            "closed its control stream without sending DestinationDone"
+        ),
         "expected the source rcpd to warn that the destination went away without DestinationDone; \
          without it a log read after the fact reports the abort-or-death as a clean finish"
     );
@@ -2549,21 +2617,12 @@ fn test_remote_overwrite_recovers_when_destination_appears_after_classification(
     );
     let spawn_start = std::time::Instant::now();
     let mut child = cmd.spawn().expect("Failed to spawn rcp");
-    let rcpd_logs_contain = |needle: &str| -> bool {
-        std::fs::read_dir(rcpd_log_dir.path())
-            .into_iter()
-            .flatten()
-            .flatten()
-            .any(|entry| {
-                std::fs::read_to_string(entry.path()).is_ok_and(|content| content.contains(needle))
-            })
-    };
     // logged by rcp::destination::process_single_file between classifying the slot and reserving its
     // I/O budget, so seeing it means classification is done and the destination is now parked.
     let classified_marker = "destination slot classified, reserving iops budget";
     let mut classified = false;
     while spawn_start.elapsed().as_secs() < 40 {
-        if rcpd_logs_contain(classified_marker) {
+        if rcpd_logs_contain(rcpd_log_dir.path(), classified_marker) {
             classified = true;
             break;
         }
@@ -2607,7 +2666,10 @@ fn test_remote_overwrite_recovers_when_destination_appears_after_classification(
     // would take the ordinary overwrite path and this test would pass without exercising the recovery
     // it exists for.
     assert!(
-        rcpd_logs_contain("destination appeared after classification"),
+        rcpd_logs_contain(
+            rcpd_log_dir.path(),
+            "destination appeared after classification"
+        ),
         "expected the destination to report recovering from a post-classification EEXIST; without it \
          the plant raced classification and the ordinary overwrite path ran instead"
     );

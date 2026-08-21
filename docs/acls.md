@@ -458,11 +458,12 @@ copy destination. rcp does write there — exactly one entry — so containment 
 
 **Freshly created directories.** The `mkdirat`, the re-open, and the removal of both
 `system.posix_acl_access` and `system.posix_acl_default` all run inside **one blocking closure**,
-which runs to completion once submitted: no cancellation (a `--fail-early` sibling abort dropping
-the future) can abandon a created-but-unsanitized directory, and a directory whose open or strip
-fails is removed (best-effort, it is empty) rather than left carrying inherited ACLs an
-indistinguishable rerun would then faithfully "restore". Two syscalls per directory and **none per
-file** beneath one: stripping the default ACL stops the inheritance chain for the whole subtree.
+which either is reclaimed before it starts or runs to completion after it wins the start/cancel
+race. No cancellation (a `--fail-early` sibling abort dropping the future) can therefore abandon a
+created-but-unsanitized directory, and a directory whose open or strip fails is removed
+(best-effort, it is empty) rather than left carrying inherited ACLs an indistinguishable rerun would
+then faithfully "restore". Two syscalls per directory and **none per file** beneath one: stripping
+the default ACL stops the inheritance chain for the whole subtree.
 
 **Reused directories.** The lockdown that restricts a reused destination directory to `0o700` for
 the copy's duration already neuters its *access* ACL (the `chmod` rewrites `MASK`), but a `chmod`
@@ -487,10 +488,10 @@ every remaining fallible step — including the final re-stat verification and e
 point up to the successful return, so a cancelled or verify-rejected finalize rolls back rather than
 keeping the source's ACL — and armed even when the directory originally had no default ACL, because
 the rollback then means *removing* whatever a partial finalize installed, not leaving it. Every
-finalize write to the guarded attribute is **serialized against the guard's rollback**: finalize
-runs on a blocking pool that cannot be cancelled, so a dropped future detaches its write, and an
-unserialized write could land *after* the `Drop` rollback and silently undo it. A write that finds
-the guard already disarmed is skipped instead.
+finalize write to the guarded attribute is **serialized against the guard's rollback**. A write
+still queued when its waiter is dropped is reclaimed before it starts, but one already taken by a
+blocking worker cannot be cancelled; without serialization, that write could land *after* the `Drop`
+rollback and silently undo it. A write that finds the guard already disarmed is skipped instead.
 
 Restoring a snapshot runs **first**, unwinding the lockdown in the reverse of the order it was
 applied — ACL removed last, so restored first; then the owner; then the mode. Two reasons, neither

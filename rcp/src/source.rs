@@ -32,14 +32,14 @@ fn progress() -> &'static common::progress::Progress {
 ///   where nested symlink following is intentional and the data open is the
 ///   ordinary `File::open(src)`. It retains no pinned Pass-1 directory fd across
 ///   phases, although each `ReadDir` enumeration owns a transient descriptor. It
-///   DOES retain the Pass-1 file count per directory in a `path → file_count` map:
-///   with no count echoed back over the wire, Pass 2 (`-L`) reads its expected
-///   count from here. A `-L` miss is NOT a TOCTOU violation (this path is not
-///   hardened), so it is treated as count 0 + a debug log rather than failing closed.
+///   DOES retain a path-keyed Pass-1 entry per directory: with no count echoed back over the wire,
+///   Pass 2 (`-L`) reads its expected count from here, while an owned credit paces the entry through
+///   its direct-file work. A `-L` miss is NOT a TOCTOU violation (this path is not hardened), so it
+///   is treated as count 0 + a debug log rather than failing closed.
 #[derive(Clone)]
 enum SourceRead {
     Hardened(Arc<SourceDirMap>),
-    DereferencePath(DereferenceContentsMap),
+    DereferencePath(DereferencePass1Map),
 }
 
 impl SourceRead {
@@ -95,9 +95,9 @@ impl Pass1Contents {
     }
 }
 
-/// Source-side `path → `[`Pass1Contents`] map for the `-L`/`--dereference` walk, the
-/// dereference analogue of the hardened [`SourceDirMap`] minus the held fd and the
-/// fd-budget permit.
+/// Source-side path-keyed Pass-1 map for the `-L`/`--dereference` walk, the dereference analogue of
+/// the hardened [`SourceDirMap`]. Its entries own a pacing credit instead of a pinned directory fd
+/// and fd-budget permit.
 ///
 /// With the destination no longer echoing `file_count` in `DirectoryCreated`, the
 /// `-L` path (which holds no fd-map) must retain its own Pass-1 bookkeeping: Pass 1
@@ -105,43 +105,69 @@ impl Pass1Contents {
 /// [`resolve_pass2_source`] takes it back when the matching `DirectoryCreated`
 /// triggers Pass 2. A missing entry is treated as empty contents with a debug log — `-L`
 /// is intentionally not hardened, so a miss is not a TOCTOU/fail-closed condition.
-type DereferenceContentsMap = Arc<DereferenceWalkState>;
+type DereferencePass1Map = Arc<DereferenceWalkState>;
 
-/// The `-L` walk's shared Pass-1 state: the `path → Pass1Contents` bookkeeping map, plus the
-/// outstanding-directory CREDIT — the pacing the hardened walk gets for free from its dir-fd
-/// budget. Without it the path-based walk recursively sends `Directory` for the entire tree with
-/// no acknowledgement budget, while the destination retains an open fd, stored metadata, and (for
-/// reused directories) a queued manifest task per registered directory — so one slow root
-/// manifest lets an arbitrarily large tree exhaust destination fds or memory, bounded by nothing.
-/// One credit is taken per `Directory` sent and returned by that directory's
-/// `DirectoryCreated`/`DirectorySkipped`; the budget size mirrors the hardened walk's
-/// (`max_pending_files`). `close_credit` releases a parked walk on teardown with the same typed
-/// [`FdBudgetClosed`] marker the hardened budget uses, so teardown attribution is unchanged.
+/// The `-L` walk's shared Pass-1 state: path-keyed contents bundled with the owned credit that paces
+/// the entry until its direct-file Pass-2 work finishes. Without it the path-based walk recursively
+/// sends `Directory` for the entire tree with no acknowledgement budget, while the destination
+/// retains an open fd, stored metadata, and (for reused directories) a queued manifest task per
+/// registered directory — so one slow root manifest lets an arbitrarily large tree exhaust
+/// destination fds or memory, bounded by nothing.
+/// One credit is taken per `Directory` sent. `DirectoryCreated` transfers it into that directory's
+/// Pass-2 task and returns it when the task finishes; `DirectorySkipped` returns it immediately.
+/// The budget size mirrors the hardened walk's (`max_pending_files`). `close_credit` releases a
+/// parked walk on teardown with the same typed [`FdBudgetClosed`] marker the hardened budget uses,
+/// so teardown attribution is unchanged.
 struct DereferenceWalkState {
-    contents: std::sync::Mutex<HashMap<std::path::PathBuf, Pass1Contents>>,
-    credit: tokio::sync::Semaphore,
+    contents: std::sync::Mutex<HashMap<std::path::PathBuf, DereferencePass1Entry>>,
+    credit: Arc<tokio::sync::Semaphore>,
+}
+
+/// One `-L` directory committed by Pass 1 and not yet acknowledged by the destination.
+///
+/// The owned credit lives in the same map entry as the directory bookkeeping, so an
+/// acknowledgement can only act on a credit that a matching `Directory` consumed.
+/// `DirectoryCreated` transfers the entry into Pass 2 and releases it when that work finishes;
+/// `DirectorySkipped` drops it immediately. A missing or duplicate acknowledgement has no permit
+/// to invent.
+struct DereferencePass1Entry {
+    contents: Pass1Contents,
+    _credit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl DereferenceWalkState {
     fn new(credit: usize) -> Self {
         Self {
             contents: std::sync::Mutex::new(HashMap::new()),
-            credit: tokio::sync::Semaphore::new(credit),
+            credit: Arc::new(tokio::sync::Semaphore::new(credit)),
         }
     }
-    /// Take one outstanding-directory credit (parking the walk at the budget), or fail with the
-    /// typed [`FdBudgetClosed`] marker once [`Self::close_credit`] ran.
-    async fn acquire_credit(&self) -> anyhow::Result<()> {
-        self.credit
-            .acquire()
+    /// Record one directory and retain its credit through its matching acknowledgement and Pass 2.
+    async fn insert(&self, src: std::path::PathBuf, contents: Pass1Contents) -> anyhow::Result<()> {
+        let credit = self
+            .credit
+            .clone()
+            .acquire_owned()
             .await
-            .map_err(|_| anyhow::Error::new(FdBudgetClosed))?
-            .forget();
+            .map_err(|_| anyhow::Error::new(FdBudgetClosed))?;
+        self.contents.lock().unwrap().insert(
+            src,
+            DereferencePass1Entry {
+                contents,
+                _credit: credit,
+            },
+        );
         Ok(())
     }
-    /// Return one credit — called on this directory's `DirectoryCreated` or `DirectorySkipped`.
-    fn release_credit(&self) {
-        self.credit.add_permits(1);
+
+    /// Transfer one created directory's bookkeeping and credit into its Pass-2 work.
+    fn take_for_created(&self, src: &std::path::Path) -> Option<DereferencePass1Entry> {
+        self.contents.lock().unwrap().remove(src)
+    }
+
+    /// Consume a skipped directory and release its outstanding credit.
+    fn take_for_skipped(&self, src: &std::path::Path) -> bool {
+        self.contents.lock().unwrap().remove(src).is_some()
     }
     /// Close the credit gate so a parked walk fails with [`FdBudgetClosed`] instead of hanging.
     fn close_credit(&self) {
@@ -156,16 +182,6 @@ impl SourceRead {
         match self {
             SourceRead::Hardened(map) => Some(map),
             SourceRead::DereferencePath(_) => None,
-        }
-    }
-
-    /// The `-L`/--dereference `path → file_count` map, or `None` in hardened mode.
-    /// Used by Pass 1's path-based body to record each directory's count and by
-    /// [`resolve_pass2_source`] to recover it (no count is echoed over the wire).
-    fn deref_counts(&self) -> Option<&DereferenceContentsMap> {
-        match self {
-            SourceRead::Hardened(_) => None,
-            SourceRead::DereferencePath(counts) => Some(counts),
         }
     }
 }
@@ -260,14 +276,18 @@ enum MapEntry {
 
 /// Marker error raised when the dir-fd budget semaphore is closed (by `close_fd_budget`). It is a
 /// SYNTHETIC wakeup used to unblock a Pass-1 walk parked on the budget during teardown, NOT a root
-/// cause — the caller detects it BY TYPE (`e.chain().any(|c| c.is::<FdBudgetClosed>())`) to prefer
-/// the dispatch task's real error (the transport/task failure that triggered the close) when
-/// reporting. A typed marker (rather than a matched-on string) keeps that detection robust against
-/// message rewording and context-wrapping. Its Display text is kept stable because it can still
-/// surface on abnormal teardown paths.
+/// cause — the caller detects it BY TYPE through [`is_fd_budget_closed`] to prefer the dispatch
+/// task's real error (the transport/task failure that triggered the close) when reporting. A typed
+/// marker (rather than a matched-on string) keeps that detection robust against message rewording
+/// and context-wrapping. Its Display text is kept stable because it can still surface on abnormal
+/// teardown paths.
 #[derive(Debug, thiserror::Error)]
 #[error("source dir-fd budget semaphore closed")]
 struct FdBudgetClosed;
+
+fn is_fd_budget_closed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<FdBudgetClosed>())
+}
 
 impl SourceDirMap {
     /// Create a map bounded to at most `fd_budget` directory fds held in flight
@@ -461,6 +481,61 @@ enum Pass1Commit {
     Nothing,
 }
 
+/// A complete `-L` directory commit waiting to be registered and sent.
+///
+/// Keeping the bookkeeping and wire fields together lets one funnel enforce the protocol order:
+/// acquire an outstanding-directory credit, register the Pass-1 contents, then send exactly one
+/// `Directory`. No path-based directory arm can register or send only part of that transaction.
+struct DereferenceDirectoryCommit {
+    src: std::path::PathBuf,
+    dst: std::path::PathBuf,
+    metadata: remote::protocol::Metadata,
+    is_root: bool,
+    entry_count: usize,
+    keep_if_empty: bool,
+    contents: Pass1Contents,
+}
+
+impl DereferenceDirectoryCommit {
+    async fn send(
+        self,
+        state: &DereferenceWalkState,
+        control_send_stream: &remote::streams::BoxedSharedSendStream,
+    ) -> anyhow::Result<()> {
+        let Self {
+            src,
+            dst,
+            metadata,
+            is_root,
+            entry_count,
+            keep_if_empty,
+            contents,
+        } = self;
+        let file_count = contents.file_count;
+        state.insert(src.clone(), contents).await?;
+        tracing::debug!(
+            "Sending directory: {:?} -> {:?} (entries={}, files={})",
+            src,
+            dst,
+            entry_count,
+            file_count
+        );
+        let message = remote::protocol::SourceMessage::Directory {
+            src,
+            dst,
+            metadata,
+            is_root,
+            entry_count,
+            keep_if_empty,
+        };
+        control_send_stream
+            .lock()
+            .await
+            .send_batch_message(&message)
+            .await
+    }
+}
+
 /// The `-L`/`--dereference` path-based Pass-1 walk (directories + symlinks). The hardened
 /// (non-`-L`) walk lives in [`send_directory_fd_walk`] (nested) and [`send_root_hardened`] (root);
 /// this function is reached only in dereference mode, so every read here is path-based by design
@@ -488,10 +563,9 @@ async fn send_directories_and_symlinks(
     root_metadata: Option<&std::fs::Metadata>,
     control_send_stream: &remote::streams::BoxedSharedSendStream,
     error_collector: &std::sync::Arc<common::error_collector::ErrorCollector>,
-    // the `-L`/--dereference `path → file_count` map: Pass 1 records each directory's Pass-1 file
-    // count here so [`resolve_pass2_source`] can recover it without a wire echo (no count is echoed
-    // over the wire).
-    deref_counts: Option<&DereferenceContentsMap>,
+    // mandatory `-L` Pass-1 state: every directory commit records its contents and owns one
+    // outstanding credit here until a skip or the matching created-directory Pass 2 finishes.
+    deref_state: &DereferenceWalkState,
 ) -> anyhow::Result<()> {
     let commit = send_pass1_entry(
         settings,
@@ -502,7 +576,7 @@ async fn send_directories_and_symlinks(
         root_metadata,
         control_send_stream,
         error_collector,
-        deref_counts,
+        deref_state,
     )
     .await?;
     match commit {
@@ -538,7 +612,7 @@ async fn send_directories_and_symlinks(
 /// classification. They are left in place rather than deleted so the arm set still mirrors the
 /// hardened walk's, but nothing in `-L` exercises them.
 #[instrument(
-    skip(error_collector, control_send_stream, deref_counts),
+    skip(error_collector, control_send_stream, deref_state),
     fields(is_root = root_metadata.is_some())
 )]
 #[allow(clippy::too_many_arguments)]
@@ -551,7 +625,7 @@ async fn send_pass1_entry(
     root_metadata: Option<&std::fs::Metadata>,
     control_send_stream: &remote::streams::BoxedSharedSendStream,
     error_collector: &std::sync::Arc<common::error_collector::ErrorCollector>,
-    deref_counts: Option<&DereferenceContentsMap>,
+    deref_state: &DereferenceWalkState,
 ) -> anyhow::Result<Pass1Commit> {
     tracing::debug!("Sending data from {:?} to {:?}", &src, dst);
     let is_root = root_metadata.is_some();
@@ -717,37 +791,28 @@ async fn send_pass1_entry(
                 return Err(e.into());
             }
             error_collector.push(e.into());
-            // directory unreadable but we already committed to sending it -
-            // send with 0 entries so destination can still complete. This is also where a
-            // ROOT that changed type under us lands (`ENOTDIR`), and it is the same answer
-            // `send_root_hardened` gives when its `open_dir` fails. Record empty contents for
-            // this `-L` directory so Pass 2's lookup resolves (no wire echo carries them).
-            if let Some(deref_counts) = deref_counts {
-                deref_counts
-                    .contents
-                    .lock()
-                    .unwrap()
-                    .insert(src.to_path_buf(), Pass1Contents::empty());
-            }
+            // directory unreadable but we already committed to sending it - send with 0 entries
+            // so destination can still complete. This is also where a ROOT that changed type under
+            // us lands (`ENOTDIR`), and it is the same answer `send_root_hardened` gives when its
+            // `open_dir` fails. The shared commit funnel records empty contents and owns the same
+            // acknowledgement credit as every other `-L` directory.
             // ACLs stay UNKNOWN on this one: the directory could not be opened, so there is no fd
             // to read them from and no honest answer to give. `WireAcls::Unknown` tells the
             // destination to leave the destination directory's ACLs ALONE (a locked reused
             // directory gets its original default ACL back from the lockdown guard) — an absence
             // we never observed must not arrive as an authoritative CLEAR of a reused
             // destination's ACLs. The entry's copy is already recorded as failed above.
-            let dir = remote::protocol::SourceMessage::Directory {
+            DereferenceDirectoryCommit {
                 src: src.to_path_buf(),
                 dst: dst.to_path_buf(),
                 metadata: remote::protocol::Metadata::from(&src_metadata),
                 is_root,
                 entry_count: 0,
                 keep_if_empty: true,
-            };
-            control_send_stream
-                .lock()
-                .await
-                .send_batch_message(&dir)
-                .await?;
+                contents: Pass1Contents::empty(),
+            }
+            .send(deref_state, control_send_stream)
+            .await?;
             return Ok(Pass1Commit::Sent);
         }
     };
@@ -898,65 +963,45 @@ async fn send_pass1_entry(
     } else {
         metadata
     };
-    // record this `-L` directory's Pass-1 bookkeeping so Pass 2 can recover it
-    // without a wire echo (it lives only on the source now): the file count, plus the names Pass 1
-    // accounts for itself so Pass 2 cannot account for them a second time (see `Pass1Contents`).
-    // Inserted before the `Directory` send so it is present before the destination can ack
-    // `DirectoryCreated` and trigger the Pass-2 lookup — and after the fallible work above, so a
-    // directory that is never sent leaves nothing behind for a `DirectoryCreated` that can never
-    // arrive.
-    if let Some(deref_counts) = deref_counts {
-        deref_counts.contents.lock().unwrap().insert(
-            src.to_path_buf(),
-            Pass1Contents {
-                file_count,
-                non_files: dir_children
-                    .iter()
-                    .chain(symlink_children.iter())
-                    .filter_map(|child| child.src_path.file_name().map(|n| n.to_owned()))
-                    .collect(),
-            },
-        );
-    }
-    // send Directory message with pre-computed entry count
-    let dir = remote::protocol::SourceMessage::Directory {
+    // register this `-L` directory's Pass-1 bookkeeping, acquire its outstanding credit, and send
+    // the pre-computed entry count through the same commit funnel as unreadable directories.
+    DereferenceDirectoryCommit {
         src: src.to_path_buf(),
         dst: dst.to_path_buf(),
         metadata,
         is_root,
         entry_count,
         keep_if_empty,
-    };
-    tracing::debug!(
-        "Sending directory: {:?} -> {:?} (entries={}, files={})",
-        &src,
-        dst,
-        entry_count,
-        file_count
-    );
-    // outstanding-directory credit, taken BEFORE the send: caps how many unacknowledged
-    // `Directory` messages this walk may have in flight (see `DereferenceWalkState`) — a closed
-    // gate (teardown) surfaces the typed marker instead of parking forever
-    if let Some(deref_counts) = deref_counts {
-        deref_counts.acquire_credit().await?;
+        contents: Pass1Contents {
+            file_count,
+            non_files: dir_children
+                .iter()
+                .chain(symlink_children.iter())
+                .filter_map(|child| child.src_path.file_name().map(|n| n.to_owned()))
+                .collect(),
+        },
     }
-    control_send_stream
-        .lock()
-        .await
-        .send_batch_message(&dir)
-        .await?;
+    .send(deref_state, control_send_stream)
+    .await?;
     // recurse into non-file children (symlinks first, then directories) through the funnel, which
     // accounts for any child it sends nothing for. this path-based body only runs when the fd-map
-    // is inactive (`-L` mode), so the recursive calls carry `None` for the hardened fd-map, `None`
-    // for the root classification (they are not the root), and forward the dereference count map.
+    // is inactive (`-L` mode), so the recursive calls carry `None` for the root classification
+    // (they are not the root) and forward the dereference Pass-1 state.
     //
-    // Both loops additionally account for a child whose recursion returned `Err` with
-    // `send_child_failed_skip`, exactly as the hardened walk does: the child was already counted in
-    // this directory's `entry_count`, so without it the destination's parent never reaches
-    // `entries_expected`, `DestinationDone` is never sent, and the copy HANGS with both peers alive
-    // (no timeout saves it). See `send_child_failed_skip` for why liveness is favored over precision
-    // when the child had already self-accounted.
-    for child in symlink_children {
+    // ordinary child errors are accounted with `send_child_failed_skip`, exactly as the hardened
+    // walk does: the child was already counted in this directory's `entry_count`, so without it the
+    // destination's parent never reaches `entries_expected`, `DestinationDone` is never sent, and
+    // the copy HANGS with both peers alive (no timeout saves it). See `send_child_failed_skip` for
+    // why liveness is favored over precision when the child had already self-accounted.
+    //
+    // `FdBudgetClosed` is different: dispatch closed the `-L` pacing gate to tear the copy down.
+    // it is unconditional control flow, not a child failure to compensate or collect; return it
+    // immediately so the caller can replace this synthetic marker with dispatch's published cause.
+    for (kind, child) in symlink_children
+        .into_iter()
+        .map(|child| ("symlink", child))
+        .chain(dir_children.into_iter().map(|child| ("directory", child)))
+    {
         if let Err(e) = send_directories_and_symlinks(
             settings,
             capture,
@@ -966,38 +1011,20 @@ async fn send_pass1_entry(
             None,
             control_send_stream,
             error_collector,
-            deref_counts,
+            deref_state,
         )
         .await
         {
-            tracing::error!("Failed to send symlink {:?}: {e:#}", child.src_path);
-            send_child_failed_skip(&child.src_path, &child.dst_path, control_send_stream).await?;
-            if settings.fail_early {
-                return Err(e);
-            }
-            error_collector.push(e);
-        }
-    }
-    for child in dir_children {
-        if let Err(e) = send_directories_and_symlinks(
-            settings,
-            capture,
-            &child.src_path,
-            &child.dst_path,
-            source_root,
-            None,
-            control_send_stream,
-            error_collector,
-            deref_counts,
-        )
-        .await
-        {
-            tracing::error!("Failed to send directory {:?}: {e:#}", child.src_path);
-            send_child_failed_skip(&child.src_path, &child.dst_path, control_send_stream).await?;
-            if settings.fail_early {
-                return Err(e);
-            }
-            error_collector.push(e);
+            handle_child_walk_error(
+                kind,
+                &child.src_path,
+                &child.dst_path,
+                e,
+                settings.fail_early,
+                control_send_stream,
+                error_collector,
+            )
+            .await?;
         }
     }
     Ok(Pass1Commit::Sent)
@@ -1089,11 +1116,11 @@ async fn send_unreadable_directory(
 /// source-side "counted but not sent" signal already used for vanished/unreadable
 /// children, and after a failed open the source has no trustworthy type to assert.
 ///
-/// Liveness over precision (the `fail_early` edge): this is sent whenever the child
-/// recursion returns `Err`, even in the case where the child had already sent its
-/// own `Directory` *and* self-accounted before erroring (e.g. a deeper `fail_early`
-/// abort after a grandchild failed). There the extra `FileSkipped` over-counts the
-/// parent by one, which can complete it before the (incomplete, never-completing)
+/// Liveness over precision (the `fail_early` edge): except for the synthetic [`FdBudgetClosed`]
+/// teardown marker, this is sent whenever the child recursion returns `Err`, even in the case where
+/// the child had already sent its own `Directory` *and* self-accounted before erroring (e.g. a
+/// deeper `fail_early` abort after a grandchild failed). There the extra `FileSkipped` over-counts
+/// the parent by one, which can complete it before the (incomplete, never-completing)
 /// child subtree does. That is deliberately accepted: the alternative — withholding
 /// the skip whenever the child sent its `Directory` — would hang the far more common
 /// case where the child sent its `Directory` but errored *before* completing (its
@@ -1121,6 +1148,33 @@ async fn send_child_failed_skip(
         src,
         dst
     );
+    Ok(())
+}
+
+/// Funnel a recursive Pass-1 child failure through teardown-marker classification and ordinary
+/// child compensation.
+///
+/// [`FdBudgetClosed`] is synthetic teardown control flow: propagate it immediately so the caller
+/// can surface the dispatch task's published cause. Every other error belongs to the counted child
+/// and therefore takes the normal `FileSkipped` / fail-early / collection path.
+async fn handle_child_walk_error(
+    kind: &str,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    error: anyhow::Error,
+    fail_early: bool,
+    control_send_stream: &remote::streams::BoxedSharedSendStream,
+    error_collector: &std::sync::Arc<common::error_collector::ErrorCollector>,
+) -> anyhow::Result<()> {
+    if is_fd_budget_closed(&error) {
+        return Err(error);
+    }
+    tracing::error!("Failed to send {kind} {src:?}: {error:#}");
+    send_child_failed_skip(src, dst, control_send_stream).await?;
+    if fail_early {
+        return Err(error);
+    }
+    error_collector.push(error);
     Ok(())
 }
 
@@ -1429,20 +1483,19 @@ async fn send_directory_fd_walk(
         )
         .await
         {
-            tracing::error!("Failed to send directory {:?}: {e:#}", child.src_path);
-            // the recursive descent returned an error. the child is counted in this
-            // directory's `entry_count`, so account for it with a `FileSkipped` to keep the
-            // destination's parent count balanced and avoid a hang when the child's subtree
-            // never completes. This is sent even if the child had already sent its own
-            // `Directory` (a deeper `fail_early` abort) — a deliberate, benign over-count;
-            // see `send_child_failed_skip` for why liveness is favored over precision here.
-            // (If the error was a transport failure, this send also fails and propagates — the
-            // copy is already tearing down.)
-            send_child_failed_skip(&child.src_path, &child.dst_path, control_send_stream).await?;
-            if settings.fail_early {
-                return Err(e);
-            }
-            error_collector.push(e);
+            // the shared funnel propagates the typed teardown marker immediately. ordinary child
+            // errors are compensated with `FileSkipped`, then returned or collected according to
+            // fail-early mode; see `send_child_failed_skip` for the accounting rationale.
+            handle_child_walk_error(
+                "directory",
+                &child.src_path,
+                &child.dst_path,
+                e,
+                settings.fail_early,
+                control_send_stream,
+                error_collector,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -1484,6 +1537,9 @@ async fn send_fs_objects_tcp(
         )
         .await;
     }
+    let SourceRead::DereferencePath(deref_state) = &source_read else {
+        anyhow::bail!("dereference walk started without dereference Pass-1 state");
+    };
     let src_metadata = match common::walk::run_metadata_probed(
         common::Side::Source,
         common::MetadataOp::Stat,
@@ -1550,7 +1606,7 @@ async fn send_fs_objects_tcp(
             Some(&src_metadata),
             &control_send_stream,
             &error_collector,
-            source_read.deref_counts(),
+            deref_state,
         )
         .await
     {
@@ -2032,22 +2088,28 @@ struct FileToSend {
 ///   lifetime). For a *tombstone* (committed-but-unreadable directory) the entry is a
 ///   [`MapEntry::Tombstone`] (no fd, file count 0), so Pass 2 returns immediately,
 ///   sending no files and needing no fd.
-/// - [`Pass2Source::DereferencePath`] carries only the `file_count` recovered from the source-side
-///   `-L` count map: the `-L` walk retains no pinned Pass-1 directory fd and re-enumerates by path,
-///   with a transient `ReadDir` descriptor (unchanged).
+/// - [`Pass2Source::DereferencePath`] carries the source-side `-L` map entry, including its
+///   outstanding-directory credit. The `-L` walk retains no pinned Pass-1 directory fd and
+///   re-enumerates by path, with a transient `ReadDir` descriptor, but the credit stays owned until
+///   this Pass-2 task finishes so it has the same pacing lifetime as the hardened map permit.
+/// - [`Pass2Source::DereferencePathMissing`] represents an absent or duplicate trusted-peer
+///   acknowledgement. Dereference mode remains fail-open with empty contents, but this variant has
+///   no credit and therefore cannot inflate the configured budget.
 enum Pass2Source {
     Hardened(MapEntry),
-    DereferencePath(Pass1Contents),
+    DereferencePath(DereferencePass1Entry),
+    DereferencePathMissing,
 }
 
 impl Pass2Source {
     /// The authoritative expected file count for this directory: the Pass-1 count
-    /// stored in the map entry (hardened) or recovered from the `-L` contents map.
+    /// stored in the map entry for either source mode.
     fn file_count(&self) -> usize {
         match self {
             Pass2Source::Hardened(MapEntry::Readable { contents, .. }) => contents.file_count,
             Pass2Source::Hardened(MapEntry::Tombstone) => 0,
-            Pass2Source::DereferencePath(contents) => contents.file_count,
+            Pass2Source::DereferencePath(entry) => entry.contents.file_count,
+            Pass2Source::DereferencePathMissing => 0,
         }
     }
 
@@ -2058,7 +2120,8 @@ impl Pass2Source {
         match self {
             Pass2Source::Hardened(MapEntry::Readable { contents, .. }) => Some(&contents.non_files),
             Pass2Source::Hardened(MapEntry::Tombstone) => None,
-            Pass2Source::DereferencePath(contents) => Some(&contents.non_files),
+            Pass2Source::DereferencePath(entry) => Some(&entry.contents.non_files),
+            Pass2Source::DereferencePathMissing => None,
         }
     }
 
@@ -2068,15 +2131,15 @@ impl Pass2Source {
         match self {
             Pass2Source::Hardened(MapEntry::Readable { dir, .. }) => Some(dir),
             Pass2Source::Hardened(MapEntry::Tombstone) => None,
-            Pass2Source::DereferencePath { .. } => None,
+            Pass2Source::DereferencePath(_) | Pass2Source::DereferencePathMissing => None,
         }
     }
 }
 
 /// Resolve the owned Pass-2 input for a `DirectoryCreated { src, dst }`, applying
 /// the hardened fail-closed rule. This is the TOCTOU-safety seam. The destination
-/// no longer echoes a file count, so the count is recovered source-side: from the
-/// consumed map entry (hardened) or the `-L` count map (dereference).
+/// no longer echoes a file count, so the count is recovered from the consumed source-side map entry
+/// in either mode.
 ///
 /// - `SourceRead::Hardened`: CONSUME the directory's held fd-map entry (one-shot
 ///   ownership) and use its stored Pass-1 `file_count`. The entry may be a real
@@ -2088,13 +2151,13 @@ impl Pass2Source {
 ///   dispatch loop then breaks and releases the fd-budget ONCE post-loop, unblocking
 ///   any parked Pass-1 walk and tearing the copy down cleanly). NEVER fall back to a
 ///   path-based read.
-/// - `SourceRead::DereferencePath`: the `-L` walk retains no pinned fd-map entry across phases.
-///   Recover the Pass-1 count from the `path → file_count` map. A missing entry is treated as count
-///   0 with a debug log — `-L` is intentionally NOT hardened, so a miss is not a
+/// - `SourceRead::DereferencePath`: the `-L` walk retains no pinned directory fd across phases.
+///   Recover the Pass-1 count and owned credit from the path-keyed map. A missing entry is treated
+///   as count 0 with a debug log — `-L` is intentionally NOT hardened, so a miss is not a
 ///   TOCTOU/fail-closed condition (the destination's `entries_expected` is the Pass-1 count, and
-///   Pass 2 does not re-count). The entry is CONSUMED (removed), mirroring the hardened one-shot
-///   lifecycle — a directory's files are requested exactly once, so this bounds the map's memory
-///   during large dereference copies.
+///   Pass 2 does not re-count). The entry is CONSUMED (removed) and transferred into Pass 2,
+///   mirroring the hardened one-shot lifecycle: a directory's files are requested exactly once,
+///   map memory stays bounded, and its credit remains held until that task finishes.
 fn resolve_pass2_source(
     source_read: &SourceRead,
     src: &std::path::Path,
@@ -2111,19 +2174,17 @@ fn resolve_pass2_source(
                 Err(err)
             }
         },
-        SourceRead::DereferencePath(counts) => {
-            // the created ack returns this directory's outstanding-directory credit
-            counts.release_credit();
-            let contents = counts.contents.lock().unwrap().remove(src).unwrap_or_else(|| {
+        SourceRead::DereferencePath(counts) => Ok(match counts.take_for_created(src) {
+            Some(entry) => Pass2Source::DereferencePath(entry),
+            None => {
                 tracing::debug!(
-                    "no recorded -L Pass-1 contents for {src:?} on DirectoryCreated; defaulting to \
-                     empty (dereference path is not hardened, so this is not a fail-closed \
-                     condition)"
+                    "no recorded -L Pass-1 contents for {src:?} on DirectoryCreated; defaulting \
+                         to empty (dereference path is not hardened, so this is not a fail-closed \
+                         condition)"
                 );
-                Pass1Contents::empty()
-            });
-            Ok(Pass2Source::DereferencePath(contents))
-        }
+                Pass2Source::DereferencePathMissing
+            }
+        }),
     }
 }
 
@@ -2180,11 +2241,10 @@ async fn send_files_in_directory_tcp(
     src: std::path::PathBuf,
     dst: std::path::PathBuf,
     source_root: std::path::PathBuf,
-    // owned Pass-2 input: the held map entry (hardened) or the `-L` file count
-    // recovered from the source-side count map. Carries the authoritative
-    // `file_count` and, in hardened mode, the held `Dir` fd used to open file DATA
-    // fd-relative (None for a tombstone, which has 0 files). The owned entry's
-    // fd-budget permit is released when this function returns (entry dropped here).
+    // owned Pass-2 input: the held map entry from either source mode. Carries the authoritative
+    // `file_count`; hardened entries also carry the `Dir` fd used to open file DATA fd-relative
+    // (None for a tombstone), while `-L` entries carry the outstanding-directory credit. The owned
+    // permit/credit is released when this function returns (entry dropped here).
     pass2_source: Pass2Source,
     stream_pool: std::sync::Arc<AcceptingSendStreamPool>,
     pending_limit: std::sync::Arc<tokio::sync::Semaphore>,
@@ -2194,9 +2254,9 @@ async fn send_files_in_directory_tcp(
         std::collections::HashMap<std::path::PathBuf, remote::protocol::ExistingEntry>,
     >,
 ) -> anyhow::Result<()> {
-    // the Pass-1 count is authoritative for this directory's send logic (truncation
-    // and synthetic `FileSkipped`). It comes entirely from the source side now (the
-    // consumed map entry or the `-L` contents map); the destination echoes nothing.
+    // the Pass-1 count is authoritative for this directory's send logic (truncation and synthetic
+    // `FileSkipped`). It comes entirely from the consumed source-mode map entry; the destination
+    // echoes nothing.
     let file_count = pass2_source.file_count();
     // names Pass 1 counted as directories or symlinks and therefore accounts for itself. This
     // enumeration re-reads the directory, so any of them that has since become a regular file
@@ -2211,8 +2271,8 @@ async fn send_files_in_directory_tcp(
         "Sending files from {src:?} (expected file_count={})",
         file_count
     );
-    // if no files expected, nothing to do (the owned entry, if any, drops here,
-    // releasing its dir-fd-in-flight permit back to Pass 1)
+    // if no files are expected, nothing to do. the owned entry, if any, drops here and releases its
+    // hardened dir-fd permit or `-L` credit back to Pass 1.
     if file_count == 0 {
         return Ok(());
     }
@@ -2777,11 +2837,11 @@ async fn dispatch_control_messages_tcp(
                                 .map(|e| (e.name.clone(), e))
                                 .collect(),
                         );
-                        // build the owned Pass-2 input. In hardened mode this CONSUMES the
-                        // directory's held fd-map entry (one-shot ownership) and fails closed
-                        // on a miss (see `resolve_pass2_source`); the owned `Dir` + permit
-                        // then move into the spawned task. The file count is recovered
-                        // source-side (map entry or `-L` count map) — no wire echo.
+                        // build the owned Pass-2 input. This consumes the source-mode-specific map
+                        // entry and moves its permit/credit into the spawned task. Hardened mode
+                        // fails closed on a miss; `-L` uses an empty no-credit variant (see
+                        // `resolve_pass2_source`). The file count is recovered source-side — no
+                        // wire echo.
                         let pass2_source = match resolve_pass2_source(&source_read, src) {
                             Ok(source) => source,
                             // fail closed: break the loop; the post-loop teardown publishes this
@@ -2832,13 +2892,17 @@ async fn dispatch_control_messages_tcp(
                                     );
                                 }
                             }
-                            // -L: no fd is held, but Pass 1 recorded a count entry; remove it
-                            // here so a skipped subtree's counts don't grow until the connection
-                            // ends (mirrors the DirectoryCreated consume + the hardened nack).
+                            // -L: no fd is held, but Pass 1 recorded a contents+credit entry. Remove
+                            // it here so a skipped subtree cannot retain either until connection
+                            // end. A missing or duplicate nack has no credit to invent.
                             SourceRead::DereferencePath(counts) => {
-                                counts.contents.lock().unwrap().remove(src);
-                                // the nack returns the credit exactly as a created ack does
-                                counts.release_credit();
+                                if !counts.take_for_skipped(src) {
+                                    tracing::warn!(
+                                        "DirectorySkipped for {src:?} but no -L Pass-1 entry present \
+                                         (absent or duplicate nack — protocol-invariant violation \
+                                         under trusted rcpd)"
+                                    );
+                                }
                             }
                         }
                     }
@@ -3153,9 +3217,9 @@ async fn handle_connection(
     // dispatch from each `DirectoryCreated`). Its dir-fd-in-flight budget bounds how far Pass 1 can
     // race ahead of the network-paced Pass 2 (prevents EMFILE); sized like the file pending-writes
     // pool. The `-L` variant instead carries a shared
-    // `path → file_count` map and an outstanding-directory credit with the same pacing role, so
-    // Pass 2 can recover each directory's Pass-1 count without unbounded acknowledgement backlog
-    // (the destination no longer echoes the count over the wire).
+    // path-keyed Pass-1 contents and an owned outstanding-directory credit with the same pacing
+    // lifetime, so Pass 2 can recover each directory's count without an unbounded destination or
+    // task backlog (the destination no longer echoes the count over the wire).
     let source_read = if settings.dereference {
         SourceRead::DereferencePath(Arc::new(DereferenceWalkState::new(max_pending_files)))
     } else {
@@ -3213,10 +3277,7 @@ async fn handle_connection(
         // would re-mask the cause). Then abort the now-doomed dispatch task — dropping its join set
         // aborts the in-flight Pass-2 tasks. For any OTHER walk failure, that IS the real cause, so
         // abort and report it as before.
-        let is_budget_wakeup = send_result
-            .as_ref()
-            .err()
-            .is_some_and(|e| e.chain().any(|c| c.is::<FdBudgetClosed>()));
+        let is_budget_wakeup = send_result.as_ref().err().is_some_and(is_fd_budget_closed);
         // take the real cause out of the slot up front (dropping the guard before any await); None
         // for a non-budget-wakeup failure or if nothing was published.
         let published_cause = if is_budget_wakeup {
@@ -4157,5 +4218,281 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
         }
         .into()),
         None => Ok(("source OK".to_string(), summary)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dereference_settings() -> common::copy::Settings {
+        common::copy::Settings {
+            dereference: true,
+            fail_early: false,
+            overwrite: false,
+            overwrite_compare: Default::default(),
+            overwrite_filter: None,
+            ignore_existing: false,
+            chunk_size: 0,
+            skip_specials: false,
+            remote_copy_buffer_size: 0,
+            filter: None,
+            dry_run: None,
+            delete: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_dereference_credit_propagates_from_child_in_collect_errors_mode()
+    -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let src = temp.path().join("source");
+        let dst = temp.path().join("destination");
+        std::fs::create_dir_all(src.join("first"))?;
+        std::fs::create_dir(src.join("second"))?;
+        let root_metadata = std::fs::metadata(&src)?;
+        let state = Arc::new(DereferenceWalkState::new(1));
+        let errors = Arc::new(common::error_collector::ErrorCollector::default());
+        let (wire_send, wire_recv) = tokio::io::duplex(64 * 1024);
+        let writer: remote::streams::BoxedWrite = Box::new(wire_send);
+        let control = Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+            writer,
+        )));
+        let mut recv = remote::streams::RecvStream::new(wire_recv);
+        let settings = dereference_settings();
+
+        let walk = send_directories_and_symlinks(
+            &settings,
+            ExtendedMetadataCapture::default(),
+            &src,
+            &dst,
+            &src,
+            Some(&root_metadata),
+            &control,
+            &errors,
+            &state,
+        );
+        let close_after_root = async {
+            let message = recv
+                .recv_object::<remote::protocol::SourceMessage>()
+                .await?
+                .context("dereference walk did not send its root Directory message")?;
+            assert!(matches!(
+                message,
+                remote::protocol::SourceMessage::Directory { entry_count: 2, .. }
+            ));
+            state.close_credit();
+            anyhow::Ok(())
+        };
+        let (walk_result, close_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(walk, close_after_root)
+            })
+            .await
+            .context("dereference walk did not stop after its credit gate closed")?;
+        close_result?;
+
+        let error = walk_result.expect_err(
+            "a closed dereference credit must abort child recursion even in collect-errors mode",
+        );
+        assert!(
+            is_fd_budget_closed(&error),
+            "walk returned the wrong error: {error:#}"
+        );
+        assert!(
+            errors.take_error().is_none(),
+            "the teardown marker must not be added to collected user errors"
+        );
+        drop(control);
+        assert!(
+            recv.recv_object::<remote::protocol::SourceMessage>()
+                .await?
+                .is_none(),
+            "gate closure must not send a compensating skip or continue to a sibling"
+        );
+        // production mutation caught: removing the `FdBudgetClosed` early return from the unified
+        // child-error funnel makes collect-errors mode compensate, collect, and continue here.
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn closed_hardened_fd_budget_propagates_from_child_in_collect_errors_mode()
+    -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let src = temp.path().join("source");
+        let dst = temp.path().join("destination");
+        std::fs::create_dir_all(src.join("first"))?;
+        std::fs::create_dir(src.join("second"))?;
+        let root = Arc::new(Dir::open_root_dir(&src, false, common::Side::Source).await?);
+        let dir_map = Arc::new(SourceDirMap::new(1));
+        let errors = Arc::new(common::error_collector::ErrorCollector::default());
+        let (wire_send, wire_recv) = tokio::io::duplex(64 * 1024);
+        let writer: remote::streams::BoxedWrite = Box::new(wire_send);
+        let control = Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+            writer,
+        )));
+        let mut recv = remote::streams::RecvStream::new(wire_recv);
+        let mut settings = dereference_settings();
+        settings.dereference = false;
+
+        let walk = send_directory_fd_walk(
+            &settings,
+            ExtendedMetadataCapture::default(),
+            &src,
+            &dst,
+            &src,
+            true,
+            root,
+            &control,
+            &errors,
+            &dir_map,
+        );
+        let close_after_root = async {
+            let message = recv
+                .recv_object::<remote::protocol::SourceMessage>()
+                .await?
+                .context("hardened walk did not send its root Directory message")?;
+            assert!(matches!(
+                message,
+                remote::protocol::SourceMessage::Directory { entry_count: 2, .. }
+            ));
+            assert_eq!(
+                dir_map.fd_budget.available_permits(),
+                0,
+                "the retained root entry must saturate this one-permit fd budget"
+            );
+            dir_map.close_fd_budget();
+            anyhow::Ok(())
+        };
+        let (walk_result, close_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(walk, close_after_root)
+            })
+            .await
+            .context("hardened walk did not stop after its fd budget closed")?;
+        close_result?;
+
+        let error = walk_result.expect_err(
+            "a closed hardened fd budget must abort child recursion even in collect-errors mode",
+        );
+        assert!(
+            is_fd_budget_closed(&error),
+            "walk returned the wrong error: {error:#}"
+        );
+        assert!(
+            errors.take_error().is_none(),
+            "the teardown marker must not be added to collected user errors"
+        );
+        drop(control);
+        assert!(
+            recv.recv_object::<remote::protocol::SourceMessage>()
+                .await?
+                .is_none(),
+            "gate closure must not send a compensating skip or continue to a sibling"
+        );
+        // production mutation caught: routing `FdBudgetClosed` through the ordinary child-error
+        // path makes collect-errors mode compensate, collect, and continue here.
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unreadable_dereference_directory_balances_outstanding_credit() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let src = temp.path().join("source");
+        let dst = temp.path().join("destination");
+        std::fs::create_dir(&src)?;
+        let directory_metadata = std::fs::metadata(&src)?;
+        std::fs::remove_dir(&src)?;
+        std::fs::write(&src, b"changed type")?;
+        let state = Arc::new(DereferenceWalkState::new(1));
+        let errors = Arc::new(common::error_collector::ErrorCollector::default());
+        let (wire_send, wire_recv) = tokio::io::duplex(64 * 1024);
+        let writer: remote::streams::BoxedWrite = Box::new(wire_send);
+        let control = Arc::new(tokio::sync::Mutex::new(remote::streams::SendStream::new(
+            writer,
+        )));
+        let mut recv = remote::streams::RecvStream::new(wire_recv);
+
+        let commit = send_pass1_entry(
+            &dereference_settings(),
+            ExtendedMetadataCapture::default(),
+            &src,
+            &dst,
+            &src,
+            Some(&directory_metadata),
+            &control,
+            &errors,
+            &state,
+        )
+        .await?;
+
+        assert!(matches!(commit, Pass1Commit::Sent));
+        let message = recv
+            .recv_object::<remote::protocol::SourceMessage>()
+            .await?
+            .context("unreadable directory did not send its Directory message")?;
+        assert!(matches!(
+            message,
+            remote::protocol::SourceMessage::Directory {
+                entry_count: 0,
+                keep_if_empty: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            state.credit.available_permits(),
+            0,
+            "every sent dereference Directory must consume one outstanding credit"
+        );
+        let pass2 = resolve_pass2_source(&SourceRead::DereferencePath(state.clone()), &src)?;
+        assert_eq!(pass2.file_count(), 0);
+        assert_eq!(
+            state.credit.available_permits(),
+            0,
+            "DirectoryCreated must transfer the credit into its Pass-2 work"
+        );
+        drop(pass2);
+        assert_eq!(
+            state.credit.available_permits(),
+            1,
+            "finishing Pass 2 must return exactly the credit consumed by the Directory"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_dereference_ack_does_not_create_credit() -> anyhow::Result<()> {
+        let state = Arc::new(DereferenceWalkState::new(1));
+
+        let pass2 = resolve_pass2_source(
+            &SourceRead::DereferencePath(state.clone()),
+            std::path::Path::new("missing"),
+        )?;
+
+        assert_eq!(pass2.file_count(), 0);
+        assert_eq!(
+            state.credit.available_permits(),
+            1,
+            "an absent or duplicate acknowledgement cannot increase the configured credit"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skipped_dereference_directory_returns_only_its_owned_credit() -> anyhow::Result<()> {
+        let state = Arc::new(DereferenceWalkState::new(1));
+        let src = std::path::PathBuf::from("skipped");
+        state.insert(src.clone(), Pass1Contents::empty()).await?;
+        assert_eq!(state.credit.available_permits(), 0);
+
+        assert!(state.take_for_skipped(&src));
+        assert_eq!(state.credit.available_permits(), 1);
+        assert!(!state.take_for_skipped(&src));
+        assert_eq!(
+            state.credit.available_permits(),
+            1,
+            "a duplicate DirectorySkipped cannot increase the configured credit"
+        );
+        Ok(())
     }
 }

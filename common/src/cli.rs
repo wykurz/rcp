@@ -14,7 +14,7 @@
 //!   error output), so its help text differs from the other tools.
 
 /// Shared help for the leaf-operation descriptor-admission setting.
-pub const LEAF_ADMISSION_HELP: &str = "Leaf-operation descriptor admission count. N is assigned to each of the independent OpenFile and PendingMeta pools; it is not a literal fd maximum or a combined pool total. 0 disables admission. With a nonzero soft RLIMIT_NOFILE, the default per pool is min(max(1, floor((soft limit * 80%) / 4)), 4096); a zero soft limit leaves admission disabled.";
+pub const LEAF_ADMISSION_HELP: &str = "Leaf-operation descriptor admission count. N is assigned to each of the independent OpenFile and PendingMeta pools; it is not a literal fd maximum or a combined pool total. 0 disables admission. With a nonzero soft RLIMIT_NOFILE, the default per pool is min(max(1, floor((soft limit * 80%) / 5)), 4096); a zero soft limit leaves admission disabled.";
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct CommonArgs {

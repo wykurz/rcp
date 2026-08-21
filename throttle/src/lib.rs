@@ -368,9 +368,9 @@ pub async fn pending_meta_permit() -> PendingMetaGuard {
 /// Dynamically set the maximum number of concurrent operations in flight
 /// for the given [`Resource`].
 ///
-/// Increasing the cap is instant; decreasing it can temporarily overshoot
-/// if permits are already held — they return naturally on drop. This is
-/// the enforcement knob the adaptive controller drives.
+/// Increasing the cap is immediate; decreasing it stops replacement admission across the shrink
+/// transition but can leave already-held operations temporarily above the new value. Their permits
+/// pay the shrink debt as they return. This is the enforcement knob the adaptive controller drives.
 ///
 /// Setting to 0 disables the cap and wakes already-blocked acquirers, which return without a
 /// permit.

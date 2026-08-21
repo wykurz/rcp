@@ -1705,6 +1705,7 @@ dependencies = [
  "indicatif",
  "libc",
  "nix",
+ "pin-project-lite",
  "procfs",
  "proptest",
  "rand 0.10.2",

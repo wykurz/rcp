@@ -359,14 +359,17 @@ impl Handle {
 /// that path-based lookups are vulnerable to.
 ///
 /// The fd is held behind an `Arc` so per-entry operations can move an owned
-/// reference into their `spawn_blocking` closure. `spawn_blocking` tasks are
-/// not cancellable: if the surrounding future is dropped (timeout, `fail_early`
-/// abort, Ctrl-C) the closure keeps running detached. Cloning the `Arc` (a
-/// refcount bump, no syscall) keeps the open file description alive for the
-/// closure's full duration even if the originating `Dir` is dropped mid-flight,
-/// preserving the `openat` TOCTOU guarantee. Later fd-relative methods
-/// (`open_file_read`, `create_file`, `make_dir`, `read_entries`, …) must follow
-/// this same clone-Arc-into-closure shape.
+/// reference into their `spawn_blocking` closure. Once a closure starts it is
+/// not cancellable: if the surrounding future is then dropped (timeout,
+/// `fail_early` abort, Ctrl-C) the closure keeps running detached. User work
+/// still queued at `run_fd_admitted_blocking`'s handoff is instead reclaimed
+/// synchronously with its captures; the Tokio wrapper does nothing if scheduled
+/// later. Cloning the `Arc` (a refcount bump, no syscall) keeps the open file
+/// description alive for a started closure's full duration even if the
+/// originating `Dir` is dropped mid-flight, preserving the `openat` TOCTOU
+/// guarantee. Later fd-relative methods (`open_file_read`, `create_file`,
+/// `make_dir`, `read_entries`, …) must follow this same clone-Arc-into-closure
+/// shape.
 #[derive(Debug)]
 pub struct Dir {
     fd: Arc<OwnedFd>,
@@ -492,10 +495,10 @@ impl Dir {
     /// `openat` during the walk still uses `O_NOFOLLOW`, so the hardening below
     /// the named root is unaffected.
     ///
-    /// Returns a [`TrustedDir`]: this is the ONLY constructor of that type, so a
-    /// symlink-following open can be obtained nowhere else. Crossing into the
-    /// hardened tree below the named root is the explicit [`TrustedDir::into_tree`]
-    /// step.
+    /// Returns a [`TrustedDir`], the only retained/exposed symlink-following transition used by
+    /// ordinary callers. The private dry-run preview parent opener follows the trusted prefix
+    /// internally before beginning its nofollow descent. Crossing into the hardened tree below the
+    /// named root is the explicit [`TrustedDir::into_tree`] step.
     ///
     /// Under strict operand resolution (`--require-toctou-safe`) the prefix must
     /// already be symlink-free: it is resolved `RESOLVE_NO_SYMLINKS`, and a
@@ -539,8 +542,8 @@ impl Dir {
         }
         // clone the Arc (refcount bump, no syscall) and move it into the blocking
         // closure so the open file description stays alive for the closure's full
-        // duration even if this Dir is dropped mid-flight (spawn_blocking is not
-        // cancellable). see the Dir doc comment.
+        // duration even if this Dir is dropped after the closure starts (started
+        // spawn_blocking work is not cancellable). see the Dir doc comment.
         let dir = self.fd.clone();
         let side = self.side;
         let name = name.to_owned();
@@ -614,6 +617,23 @@ impl Dir {
         .await
     }
 
+    /// Returns whether this pinned directory inode has no remaining filesystem link.
+    ///
+    /// A successful `rmdir` sets the removed directory's link count to zero even while this fd
+    /// keeps its inode alive. Conversely, a by-name `rmdir` that raced with a rename and removed a
+    /// replacement leaves this walked inode linked elsewhere. This fd-exact check lets callers
+    /// distinguish those outcomes without another name lookup. Gated as `Stat` on this directory's
+    /// congestion side.
+    pub async fn pinned_inode_is_unlinked(&self) -> std::io::Result<bool> {
+        let dir = self.fd.clone();
+        let side = self.side;
+        run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
+            let st = fstat(dir.as_fd()).map_err(nix_to_io)?;
+            Ok(st.st_nlink == 0)
+        })
+        .await
+    }
+
     /// Read this directory's own access and default POSIX ACLs from its held fd.
     ///
     /// The directory counterpart of [`Self::meta`], and paired with it for the same reason: the
@@ -638,8 +658,8 @@ impl Dir {
         }
         // clone the Arc (refcount bump, no syscall) and move it into the blocking
         // closure so the open file description stays alive for the closure's full
-        // duration even if this Dir is dropped mid-flight (spawn_blocking is not
-        // cancellable). see the Dir doc comment.
+        // duration even if this Dir is dropped after the closure starts (started
+        // spawn_blocking work is not cancellable). see the Dir doc comment.
         let dir = self.fd.clone();
         let side = self.side;
         let name = name.to_owned();
@@ -718,9 +738,9 @@ impl Dir {
     /// [`strict_operand_resolution`]: taking ownership first means the directory's PRIOR
     /// owner can no longer `chmod` it back open while children are written.
     ///
-    /// The sequence — inside ONE `spawn_blocking` closure (NOT cancelled once started, so it
-    /// runs to completion) — is ordered so that **every failure exit leaves the directory no
-    /// wider than a successful copy would**:
+    /// The sequence — inside ONE `spawn_blocking` closure (which runs to completion once it
+    /// starts) — is ordered so that **every failure exit leaves the directory no wider than a
+    /// successful copy would**:
     ///
     /// 1. `fchown` the owner to the effective uid (lock the prior owner out). Failing here
     ///    leaves the directory untouched — transparent, fail-safe.
@@ -874,15 +894,16 @@ impl Dir {
     ///
     /// The `mkdirat`, the re-open, and (under strict operand resolution) the inherited-ACL strip
     /// all run inside ONE blocking closure, gated once as `MkDir`. That is a cancellation-safety
-    /// requirement, not packaging: a `spawn_blocking` closure runs to completion once submitted, so
-    /// there is NO await point at which the directory exists but its sanitization has not happened.
-    /// Splitting the steps across separate gated calls (as an earlier version did) leaves windows a
-    /// `--fail-early` sibling abort can land in, abandoning an rcp-created directory that still
-    /// carries the destination's inherited default ACL — inert at that moment (created owner-only,
-    /// `ACL_MASK` empty), but poisoning the containment invariant for anything created under it
-    /// later, including a rerun that cannot tell such an orphan from a user's own directory. For
-    /// the same reason, a directory whose open or strip FAILS is removed (best-effort; it is empty
-    /// and just created) inside the same closure rather than left behind unsanitized.
+    /// requirement, not packaging: a queued job can be reclaimed before doing anything, while a
+    /// closure that takes it runs every step to completion, so there is NO await point at which the
+    /// directory exists but its sanitization has not happened. Splitting the steps across separate
+    /// gated calls (as an earlier version did) leaves windows a `--fail-early` sibling abort can
+    /// land in, abandoning an rcp-created directory that still carries the destination's inherited
+    /// default ACL — inert at that moment (created owner-only, `ACL_MASK` empty), but poisoning the
+    /// containment invariant for anything created under it later, including a rerun that cannot
+    /// tell such an orphan from a user's own directory. For the same reason, a directory whose open
+    /// or strip FAILS is removed (best-effort; it is empty and just created) inside the same closure
+    /// rather than left behind unsanitized.
     ///
     /// # Inherited ACLs, and why the strip lives here
     ///
@@ -1303,7 +1324,8 @@ impl Dir {
         }
         // clone the source O_PATH fd into an owned fd the blocking closure can hold,
         // keeping the pinned inode alive for the syscall's full duration even if the
-        // originating Handle is dropped (spawn_blocking is not cancellable).
+        // originating Handle is dropped after the closure starts. started spawn_blocking work is
+        // not cancellable.
         let src_owned = src_handle.as_fd().try_clone_to_owned()?;
         let dst_dir = self.fd.clone();
         let side = self.side;
@@ -1380,11 +1402,12 @@ impl Dir {
                 .map(std::fs::File::from)
                 .map_err(nix_to_io)?;
             if strict && may_inherit.load(std::sync::atomic::Ordering::SeqCst) {
-                // same-closure for the same reason as `make_dir`: once submitted this runs to
-                // completion, so no cancellation can abandon a created-but-unsanitized file.
-                // The failure-path removal is recheck-guarded — this closure runs in the AMBIENT
-                // operand parent, the one directory rcp neither creates nor locks down, so the
-                // name must be removed only while it still refers to the file just created
+                // same-closure for the same reason as `make_dir`: queued work creates nothing,
+                // while work that starts runs to completion, so cancellation cannot abandon a
+                // created-but-unsanitized file. the failure-path removal is recheck-guarded — this
+                // closure runs in the AMBIENT operand parent, the one directory rcp neither creates
+                // nor locks down, so the name must be removed only while it still refers to the
+                // file just created
                 if let Err(err) = apply_one_acl(file.as_raw_fd(), ACL_ACCESS_XATTR, None) {
                     remove_created_if_same_inode(
                         dir.as_fd(),
@@ -1409,9 +1432,9 @@ impl Dir {
 /// The trusted-boundary model (docs/tocttou.md, "Trusted boundary") trusts the path named on the
 /// command line up to and including its container directory; only entries
 /// strictly BELOW the named root are hardened with `O_NOFOLLOW`. A `TrustedDir`
-/// is that trusted container, and it is the ONLY way in this crate to obtain a
-/// directory fd that was opened following symlinks — its sole constructor is
-/// [`Dir::open_parent_dir`]. Every other directory open ([`Dir::open_dir`],
+/// is that trusted container, and it is the only retained/exposed follow-open transition used by
+/// ordinary callers. The private dry-run preview parent opener follows the trusted prefix
+/// internally before its nofollow descent. Every other ordinary directory open ([`Dir::open_dir`],
 /// [`Dir::child`], [`Dir::open_file_read`], [`Dir::create_file`],
 /// [`Dir::make_dir`], …) is `O_NOFOLLOW`.
 ///
@@ -1439,20 +1462,14 @@ impl TrustedDir {
     }
 }
 
-// ── Strict operand probes ────────────────────────────────────────────────────
+// ── Operand probes and contained preview opens ───────────────────────────────
 //
-// Existence/kind and directory-open probes on an operand path that stay faithful
-// to strict operand resolution (`--require-toctou-safe`): they resolve the
-// operand's parent prefix with `open_parent_dir` (which is
-// `openat2(RESOLVE_NO_SYMLINKS)` while armed) and touch the final component only
-// fd-relative, so a symlink in a directory component of the operand path fails
-// closed with `ELOOP` instead of being followed by a path-based probe
-// (`Path::exists`, `symlink_metadata`, `open_root_dir` on the full path). These
-// decompose the path into parent + final component so an INTERMEDIATE-prefix
-// symlink (a strict violation → `Err(ELOOP)`) is never conflated with a final
-// component that is merely a symlink / non-directory (→ `Ok(None)`). Callers use
-// these under `strict_operand_resolution()`; the default path keeps its
-// path-based probes unchanged.
+// dry-run preview scans resolve the trusted operand parent with the active default/strict policy,
+// then open the named operand and every scan-relative component fd-relative without following
+// symlinks. The strict existence/kind probes below similarly decompose an operand into parent +
+// final component: strict mode resolves the parent through `openat2(RESOLVE_NO_SYMLINKS)` and
+// touches only the final component fd-relative, while default-mode callers retain their existing
+// path-based probes.
 
 /// Split a lexically-normal absolute operand into `(parent, final_component)` for
 /// an fd-relative probe. Strict operands are already absolute + normal (the linter
@@ -1467,6 +1484,94 @@ fn split_parent_and_name(path: &Path) -> Option<(&Path, &OsStr)> {
         _ => Path::new("."),
     };
     Some((parent, name))
+}
+
+/// Open the trusted parent of a destination operand for a contained preview scan.
+///
+/// `O_PATH` is load-bearing in default mode: a searchable-but-unreadable parent may contain an
+/// operand that is itself readable, and preview containment must not add a parent read-permission
+/// requirement. Strict mode applies the same flag through `openat2(RESOLVE_NO_SYMLINKS)`.
+async fn open_preview_operand_parent(path: &Path, side: congestion::Side) -> std::io::Result<Dir> {
+    let path = path.to_owned();
+    run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
+        let flags = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+        #[cfg(target_os = "linux")]
+        if strict_operand_resolution() {
+            return openat2_no_symlinks(&path, flags)
+                .map(|fd| Dir::opened(fd, side))
+                .map_err(nix_to_io);
+        }
+        openat(AT_FDCWD, &path, flags, Mode::empty())
+            .map(|fd| Dir::opened(fd, side))
+            .map_err(nix_to_io)
+    })
+    .await
+}
+
+fn preview_scan_absence(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || error.kind() == std::io::ErrorKind::NotADirectory
+        || matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTDIR) | Some(libc::ELOOP)
+        )
+}
+
+fn preview_relative_components(relative: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+    if relative.as_os_str().is_empty() {
+        return Ok(Vec::new());
+    }
+    relative
+        .as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .map(|component| {
+            let component = OsStr::from_bytes(component);
+            is_single_component(component)
+                .then(|| component.to_owned())
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))
+        })
+        .collect()
+}
+
+/// Open an existing directory below the exact destination operand named by the user.
+///
+/// The operand's trusted parent is resolved with the normal strict/default policy, but the named
+/// root itself and every `relative` component are opened one at a time with `O_NOFOLLOW`. This keeps
+/// dry-run delete scans beneath the operand even when that final operand component is a symlink.
+/// Missing, non-directory, and symlink components mean there is no real directory to preview and
+/// return `None`; every other error remains observable to the caller.
+pub(crate) async fn open_existing_dir_beneath_operand(
+    named_root: &Path,
+    relative: &Path,
+    side: congestion::Side,
+) -> std::io::Result<Option<Dir>> {
+    let relative = preview_relative_components(relative)?;
+    let Some((parent_path, root_name)) = split_parent_and_name(named_root) else {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    };
+    if !is_single_component(root_name) {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let parent = match open_preview_operand_parent(parent_path, side).await {
+        Ok(parent) => parent,
+        Err(error) if preview_scan_absence(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut current = match parent.open_dir(root_name).await {
+        Ok(dir) => dir,
+        Err(error) if preview_scan_absence(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    drop(parent);
+    for component in relative {
+        current = match current.open_dir(&component).await {
+            Ok(dir) => dir,
+            Err(error) if preview_scan_absence(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+    }
+    Ok(Some(current))
 }
 
 /// Probe an operand's existence and kind fd-relative under strict operand
@@ -1571,9 +1676,9 @@ pub async fn strict_probe_dst_kind(
 ///   none must then get that installation REMOVED on rollback, or a failed copy leaves it carrying
 ///   an ACL the destination never had. A bare `Option<Vec<u8>>` (the previous shape) could not
 ///   express that arm: its `None` doubled as "disarmed", so the partial application survived.
-/// - **A detached write must not undo the restore.** Finalize ACL writes run on the blocking pool,
-///   which cannot be cancelled — a dropped future detaches the closure, which lands whenever the
-///   pool schedules it, possibly AFTER the guard's `Drop` has already put the original back.
+/// - **A detached write must not undo the restore.** A finalize ACL write still queued when its
+///   waiter is dropped is reclaimed before it starts, but one already taken by a blocking worker
+///   cannot be cancelled and may land AFTER the guard's `Drop` has put the original back.
 ///   Serializing every guarded write and the restore through this one mutex, with a write that
 ///   observes [`Self::Disarmed`] SKIPPING, closes the race in both directions: a write mid-syscall
 ///   holds the mutex, so the restore waits and then lands over it (correct — the copy is
@@ -1859,11 +1964,12 @@ pub async fn lockdown_reused_dir(
     if needs_strip {
         let raw = dir.fd.as_raw_fd();
         // The removal is issued SYNCHRONOUSLY, inside the gate rather than on the blocking pool,
-        // and this is load-bearing rather than an optimization. `spawn_blocking` cannot be
-        // cancelled once submitted and a dropped `JoinHandle` detaches rather than cancels, so an
-        // `.await` on it is a cancellation point at which the `fremovexattr` still runs — the exact
-        // hazard the arming above closes. Running it in-line means there is no cancellation point
-        // between arming and destroying at all: polling this future runs the syscall to completion.
+        // and this is load-bearing rather than an optimization. the shared blocking boundary can
+        // reclaim user work before a worker takes it, but a closure cannot be stopped after that
+        // handoff, so an `.await` on it is a cancellation point at which the `fremovexattr` may
+        // still run — the exact hazard the arming above closes. Running it in-line means there is
+        // no cancellation point between arming and destroying at all: polling this future runs the
+        // syscall to completion.
         //
         // Arming first while KEEPING `spawn_blocking` would be strictly worse than either: a pool
         // thread's `fremovexattr` could land after this task's `Drop` restore and silently undo it.
@@ -2589,7 +2695,8 @@ pub(crate) async fn chmod_via_proc_fd(
 ) -> std::io::Result<()> {
     // clone the O_PATH fd into an owned fd the blocking closure can hold, keeping
     // the pinned inode alive for the syscall's full duration even if the
-    // originating Handle is dropped (spawn_blocking is not cancellable).
+    // originating Handle is dropped after the closure starts. started spawn_blocking work is not
+    // cancellable.
     let owned = handle.as_fd().try_clone_to_owned()?;
     run_metadata_probed_blocking(side, congestion::MetadataOp::Chmod, move || {
         let proc_path = format!("/proc/self/fd/{}", owned.as_raw_fd());
@@ -3124,6 +3231,65 @@ pub async fn set_symlink_metadata_fd<Meta: crate::preserve::Metadata>(
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+/// One blocking job whose queued resources have a defined destruction order.
+///
+/// Field order is load-bearing: queued user work may own fds, so it must be dropped before the
+/// strong admission lease that accounts for them.
+struct BlockingJob<F> {
+    work: F,
+    admission: Option<throttle::BlockingFdAdmissionLease>,
+}
+
+type BlockingJobOutput<T> = (
+    std::io::Result<T>,
+    Option<throttle::BlockingFdAdmissionLease>,
+);
+
+impl<F> BlockingJob<F> {
+    fn run<T>(self) -> BlockingJobOutput<T>
+    where
+        F: FnOnce() -> std::io::Result<T>,
+    {
+        let Self { work, admission } = self;
+        (work(), admission)
+    }
+}
+
+fn take_blocking_job<F>(
+    shared_job: &std::sync::Mutex<Option<BlockingJob<F>>>,
+) -> Option<BlockingJob<F>> {
+    shared_job
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+/// Wait for a blocking job while retaining control of work that has not started.
+struct BlockingJobWaiter<F, T> {
+    shared_job: Arc<std::sync::Mutex<Option<BlockingJob<F>>>>,
+    handle: tokio::task::JoinHandle<Option<BlockingJobOutput<T>>>,
+}
+
+impl<F, T> std::future::Future for BlockingJobWaiter<F, T> {
+    type Output = Result<Option<BlockingJobOutput<T>>, tokio::task::JoinError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        std::future::Future::poll(std::pin::Pin::new(&mut this.handle), cx)
+    }
+}
+
+impl<F, T> Drop for BlockingJobWaiter<F, T> {
+    fn drop(&mut self) {
+        let queued_job = take_blocking_job(&self.shared_job);
+        drop(queued_job);
+        self.handle.abort();
+    }
+}
+
 /// Run fd-owning blocking work while retaining any task-scoped admission through cancellation.
 ///
 /// The strong lease lives in the blocking task's output, after `result`, so an abandoned returned
@@ -3131,6 +3297,10 @@ pub async fn set_symlink_metadata_fd<Meta: crate::preserve::Metadata>(
 /// boundary intentionally adds no rate or congestion gating; directory enumeration uses it after
 /// consuming its static rate token, while metadata syscalls layer their congestion lifecycle on
 /// top in [`run_metadata_probed_blocking_no_rate`].
+///
+/// Until the worker takes the shared job, dropping the waiter synchronously destroys its user work
+/// before its lease. Once the worker takes it, the job is considered started and runs detached if
+/// the waiter is cancelled.
 pub(crate) async fn run_fd_admitted_blocking<F, T>(f: F) -> std::io::Result<T>
 where
     F: FnOnce() -> std::io::Result<T> + Send + 'static,
@@ -3142,11 +3312,17 @@ where
     let blocking_admission = FD_ADMISSION
         .try_with(throttle::FdAdmission::blocking_lease)
         .ok();
-    let task_guard = crate::walk_driver::blocking_task_guard();
-    let (result, _blocking_admission, _task_guard) =
-        tokio::task::spawn_blocking(move || (f(), blocking_admission, task_guard))
-            .await
-            .map_err(std::io::Error::other)?;
+    let shared_job = Arc::new(std::sync::Mutex::new(Some(BlockingJob {
+        work: f,
+        admission: blocking_admission,
+    })));
+    let worker_job = Arc::clone(&shared_job);
+    let handle =
+        tokio::task::spawn_blocking(move || take_blocking_job(&worker_job).map(BlockingJob::run));
+    let (result, _blocking_admission) = BlockingJobWaiter { shared_job, handle }
+        .await
+        .map_err(std::io::Error::other)?
+        .expect("blocking job disappeared while its waiter was alive");
     result
 }
 
@@ -3229,9 +3405,61 @@ mod tests {
         EntryKind::Special,
     ];
 
+    #[tokio::test]
+    async fn preview_operand_descent_rejects_a_symlink_in_the_relative_prefix() -> anyhow::Result<()>
+    {
+        let fixture = testutils::create_temp_dir().await?;
+        let named_root = fixture.join("named-root");
+        let outside = fixture.join("outside");
+        tokio::fs::create_dir_all(&named_root).await?;
+        tokio::fs::create_dir_all(outside.join("level-two")).await?;
+        tokio::fs::symlink(&outside, named_root.join("level-one")).await?;
+
+        let opened = open_existing_dir_beneath_operand(
+            &named_root,
+            Path::new("level-one/level-two"),
+            congestion::Side::Destination,
+        )
+        .await?;
+
+        assert!(opened.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preview_operand_relative_path_accepts_empty_and_rejects_non_normal_components()
+    -> anyhow::Result<()> {
+        let fixture = testutils::create_temp_dir().await?;
+        let named_root = fixture.join("named-root");
+        tokio::fs::create_dir(&named_root).await?;
+
+        assert!(
+            open_existing_dir_beneath_operand(
+                &named_root,
+                Path::new(""),
+                congestion::Side::Destination,
+            )
+            .await?
+            .is_some(),
+            "an empty relative path must open the named root"
+        );
+        for invalid in ["/absolute", ".", "..", "one/./two", "one/../two"] {
+            let error = open_existing_dir_beneath_operand(
+                &named_root,
+                Path::new(invalid),
+                congestion::Side::Destination,
+            )
+            .await
+            .expect_err("a non-normal relative path must be rejected");
+            assert_eq!(error.raw_os_error(), Some(libc::EINVAL), "{invalid:?}");
+        }
+        Ok(())
+    }
+
     mod max_open_files_tests {
         use super::*;
         use anyhow::Context as _;
+        use futures::FutureExt as _;
 
         struct BlockingDropFd {
             _file: std::fs::File,
@@ -3249,6 +3477,148 @@ mod tests {
                     .recv()
                     .expect("drop release sender must stay alive");
             }
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct QueuedFdDropObservation {
+            fd_was_closed: bool,
+            admission_was_retained: bool,
+        }
+
+        struct QueuedFdCapture {
+            file: Option<std::fs::File>,
+            raw_fd: RawFd,
+            observation: Arc<std::sync::Mutex<Option<QueuedFdDropObservation>>>,
+        }
+
+        impl Drop for QueuedFdCapture {
+            fn drop(&mut self) {
+                drop(self.file.take());
+                let fd_was_closed = crate::testutils::fd_is_closed(self.raw_fd);
+                let admission_was_retained = throttle::open_file_permit().now_or_never().is_none();
+                *self
+                    .observation
+                    .lock()
+                    .expect("queued fd drop observation lock poisoned") =
+                    Some(QueuedFdDropObservation {
+                        fd_was_closed,
+                        admission_was_retained,
+                    });
+            }
+        }
+
+        /// Dropping a queued blocking waiter must synchronously close its captured fd and return
+        /// admission before the occupied worker is released, without ever running user work.
+        #[test]
+        fn dropping_queued_blocking_work_closes_fd_before_returning_admission() -> anyhow::Result<()>
+        {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let root = crate::testutils::create_temp_dir().await?;
+                let file_path = root.join("queued-capture");
+                tokio::fs::write(&file_path, b"x").await?;
+                let admission = crate::testutils::AdmissionLimit::new().await;
+                admission.set_max_open_files(1);
+                let open_file_guard = throttle::open_file_permit().await;
+                let file = std::fs::File::open(file_path)?;
+                let raw_fd = file.as_raw_fd();
+                let drop_observation = Arc::new(std::sync::Mutex::new(None));
+
+                let (blocker_started_tx, blocker_started_rx) = tokio::sync::oneshot::channel();
+                let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    let _ = blocker_started_tx.send(());
+                    release_blocker_rx
+                        .recv()
+                        .expect("blocking worker release sender must stay alive");
+                });
+                blocker_started_rx
+                    .await
+                    .context("the sole blocking worker did not start")?;
+
+                let (queued_started_tx, queued_started_rx) = tokio::sync::oneshot::channel();
+                {
+                    let admission = open_file_guard.admission();
+                    let queued_capture = QueuedFdCapture {
+                        file: Some(file),
+                        raw_fd,
+                        observation: Arc::clone(&drop_observation),
+                    };
+                    let mut waiter = Box::pin(with_fd_admission(admission, async move {
+                        run_fd_admitted_blocking(move || {
+                            let _queued_capture = queued_capture;
+                            let _ = queued_started_tx.send(());
+                            Ok(())
+                        })
+                        .await
+                    }));
+                    assert!(
+                        futures::poll!(waiter.as_mut()).is_pending(),
+                        "the admitted blocking closure must queue behind the occupied worker"
+                    );
+                    // leave the blocking lease as the sole strong admission owner before
+                    // exercising the queued-job drop order
+                    drop(open_file_guard);
+                }
+
+                let fd_was_closed_before_release = crate::testutils::fd_is_closed(raw_fd);
+                let drop_observation_before_release = *drop_observation
+                    .lock()
+                    .expect("queued fd drop observation lock poisoned");
+                let mut next_permit = Box::pin(throttle::open_file_permit());
+                let (admission_returned_before_release, returned_admission) =
+                    match futures::poll!(next_permit.as_mut()) {
+                        std::task::Poll::Ready(permit) => (true, Some(permit)),
+                        std::task::Poll::Pending => (false, None),
+                    };
+
+                let release_result = release_blocker_tx.send(());
+                let blocker_result = blocker.await;
+                let queued_start_result =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), queued_started_rx)
+                        .await;
+                let returned_admission = match returned_admission {
+                    Some(permit) => permit,
+                    None => tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        next_permit.as_mut(),
+                    )
+                    .await
+                    .context("queued blocking work did not eventually return admission")?,
+                };
+                drop(returned_admission);
+                let cleanup_result = tokio::fs::remove_dir_all(root).await;
+
+                release_result.context("the blocking worker ended before its release")?;
+                blocker_result.context("the blocking worker panicked")?;
+                cleanup_result?;
+
+                assert!(
+                    fd_was_closed_before_release,
+                    "dropping the queued waiter left its captured fd open"
+                );
+                assert!(
+                    admission_returned_before_release,
+                    "dropping the queued waiter retained fd admission"
+                );
+                assert_eq!(
+                    drop_observation_before_release,
+                    Some(QueuedFdDropObservation {
+                        fd_was_closed: true,
+                        admission_was_retained: true,
+                    }),
+                    "the queued work must close its fd before its admission lease drops"
+                );
+                assert!(
+                    matches!(queued_start_result, Ok(Err(_))),
+                    "the dropped queued blocking work started"
+                );
+                Ok(())
+            })
         }
 
         /// Cancelling an unprobed blocking waiter must retain any ambient fd admission until its
@@ -4056,6 +4426,25 @@ mod tests {
             err.raw_os_error(),
             Some(libc::ENOTDIR),
             "expected ENOTDIR for regular file, got {err:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pinned_directory_reports_when_its_inode_is_unlinked() -> anyhow::Result<()> {
+        let tmp = testutils::setup_test_dir().await?;
+        let root =
+            Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
+        tokio::fs::create_dir(tmp.join("foo/empty_sub")).await?;
+        let pinned = root.open_dir(OsStr::new("empty_sub")).await?;
+        assert!(
+            !pinned.pinned_inode_is_unlinked().await?,
+            "a linked directory was reported unlinked"
+        );
+        root.rmdir_at(OsStr::new("empty_sub")).await?;
+        assert!(
+            pinned.pinned_inode_is_unlinked().await?,
+            "the pinned directory retained a link after successful rmdir"
         );
         Ok(())
     }
@@ -5562,8 +5951,8 @@ mod tests {
             Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
         let dir = root.make_dir(OsStr::new("locked"), 0o700).await?;
         // a guard whose restore has already run (the owning future was cancelled and the guard
-        // dropped): a finalize write detached on the blocking pool must observe that and SKIP —
-        // landing it would silently overwrite the restore
+        // dropped): a finalize write that already started on the blocking pool must observe that
+        // and SKIP — landing it would silently overwrite the restore
         let lock = ReusedDirLock {
             restore_owner: (0, 0),
             state: Arc::new(std::sync::Mutex::new(DefaultAclGuard::Disarmed)),

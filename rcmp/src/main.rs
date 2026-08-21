@@ -112,7 +112,7 @@ struct Args {
     /// literal fd maximum or combined total; rcmp uses PendingMeta for metadata tasks, while
     /// recursive ReadDir descriptors remain outside admission. 0 disables admission. For a nonzero
     /// soft RLIMIT_NOFILE, the default per pool is
-    /// min(max(1, floor((soft limit * 80%) / 4)), 4096); zero leaves admission disabled.
+    /// min(max(1, floor((soft limit * 80%) / 5)), 4096); zero leaves admission disabled.
     #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
     max_open_files: Option<usize>,
 

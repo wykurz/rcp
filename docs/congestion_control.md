@@ -138,9 +138,10 @@ So:
   variations swing it across the knee unpredictably. Latency moves continuously and is cheaper to
   read: every op produces one sample.
 
-The single control knob throughout this document — **`cwnd`** (the TCP "congestion window") — is
-exactly the maximum number of in-flight operations the controller will permit at any instant. We use
-`cwnd`, "concurrency cap", and "max in-flight" interchangeably; they are the same number, just
+The single control knob throughout this document — **`cwnd`** (the TCP "congestion window") — is the
+target maximum used for replacement admission. Growth takes effect immediately; after a reduction,
+already-held operations may temporarily exceed the new value and the pool converges as they finish.
+We use `cwnd`, "concurrency cap", and "max in-flight" interchangeably; they are the same target,
 expressed in TCP terminology vs. systems terminology.
 
 ## The Control Signal
@@ -345,11 +346,14 @@ off some throughput for less jitter. The defaults are deliberately on the conser
 ## Enforcement Model
 
 The controller's output is a fresh value for `cwnd`. The enforcement layer maps that onto a
-semaphore and updates it whenever the controller changes its mind. Growth adds permits immediately.
-On a reduction, available permits are forgotten immediately; if operations still hold the remaining
-excess, the semaphore records forget debt and consumes it as those permits are dropped. In-flight
-work can therefore remain above the latest `cwnd` until existing operations finish, then converges
-to the new limit.
+semaphore and updates it whenever the controller changes its mind. On a reduction, available permits
+are forgotten immediately; if operations still hold the remaining excess, the semaphore records
+forget debt and consumes it as those permits return. Replacement acquisition pauses across the
+forget/debt publication boundary, and a raw permit returned by a cancelled waiter is retired at the
+next acquisition boundary. Growth applies immediately by cancelling pending debt before exposing
+only the remaining capacity. In-flight work can therefore remain above the latest `cwnd` until
+existing operations finish, then converges to the new limit without admitting replacement work
+through the shrink transition or overshooting a subsequent growth target.
 
 ## What Counts as a Metadata Op
 
