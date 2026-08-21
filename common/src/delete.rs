@@ -189,10 +189,11 @@ mod tests {
             filter.add_exclude("protected")?;
             let keep = HashSet::new();
             let settings = delete_settings(false);
-            throttle::set_max_open_files(1);
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Stat);
-            throttle::set_max_ops_in_flight(stat_resource, 1);
+            admission.set_max_ops_in_flight(stat_resource, 1);
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
             let prune = prune_entries(
                 &PROGRESS,
@@ -213,8 +214,6 @@ mod tests {
             drop(held_stat);
             let result =
                 tokio::time::timeout(std::time::Duration::from_secs(20), prune.as_mut()).await;
-            throttle::set_max_ops_in_flight(stat_resource, 0);
-            throttle::set_max_open_files(0);
             assert!(
                 stopped_at_stat_gate,
                 "DT_UNKNOWN prune filter did not reach the held stat gate"

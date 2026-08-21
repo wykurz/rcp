@@ -491,31 +491,13 @@ mod tests {
 
     /// End-to-end tests that wire the real ControlUnit + run_adapter and
     /// verify decisions propagate all the way to the global ops-in-flight
-    /// semaphore. These touch the process-wide `OPS_IN_FLIGHT_LIMIT` and
-    /// the installed `SampleSink`, so they must serialize via `FEEDBACK_GUARD`.
+    /// semaphore. These touch the process-wide admission limits and installed `SampleSink`, so
+    /// they use the shared admission fixture.
     mod feedback {
         use super::*;
         use congestion::{
             ControlUnit, Controller, Decision, FixedController, RoutingSinkBuilder, Sample, Side,
         };
-
-        /// Serialize these tests against each other. The only other consumer of
-        /// the per-side `OPS_IN_FLIGHT_LIMIT_*` globals is the cwnd-deadlock
-        /// integration test in `common/tests/probe_metadata.rs`, which lives
-        /// in a separate test binary and does not share this process.
-        static FEEDBACK_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-        /// Reset the global throttle + sample-sink state after a test so
-        /// a subsequent test sees a clean slate regardless of ordering.
-        async fn reset_globals() {
-            for &side in &throttle::Side::ALL {
-                for &op in &throttle::MetadataOp::ALL {
-                    throttle::set_max_ops_in_flight(throttle::Resource::meta(side, op), 0);
-                }
-            }
-            throttle::disable_ops_throttle();
-            congestion::clear_sample_sink();
-        }
 
         /// Build the wiring used by every feedback test and return the
         /// adapter / unit join handles. Tests run a single resource at a
@@ -541,8 +523,7 @@ mod tests {
 
         #[tokio::test]
         async fn fixed_controller_initial_decision_reaches_throttle() {
-            let _g = FEEDBACK_GUARD.lock().await;
-            reset_globals().await;
+            let _admission = crate::testutils::AdmissionLimit::new().await;
             // FixedController(42) emits `with_concurrency(42)` forever. The
             // first decision after startup must land on the source-side
             // OPS_IN_FLIGHT_LIMIT — proving unit -> adapter -> throttle
@@ -562,22 +543,23 @@ mod tests {
             // poll for up to 500ms; adapter runs on another task and the
             // watch's initial value must be consumed before we can observe.
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-            loop {
+            let reached = loop {
                 if throttle::current_ops_in_flight_limit(resource) == 42 {
-                    break;
+                    break true;
                 }
                 if std::time::Instant::now() >= deadline {
-                    panic!(
-                        "adapter did not apply initial cwnd=42 within 500ms; \
-                         current limit = {}",
-                        throttle::current_ops_in_flight_limit(resource),
-                    );
+                    break false;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
+            };
             unit.abort();
             adapter.abort();
-            reset_globals().await;
+            let _ = tokio::join!(unit, adapter);
+            assert!(
+                reached,
+                "adapter did not apply initial cwnd=42 within 500ms; current limit = {}",
+                throttle::current_ops_in_flight_limit(resource),
+            );
         }
 
         /// Controller that emits a scripted sequence of decisions on
@@ -606,8 +588,7 @@ mod tests {
 
         #[tokio::test]
         async fn scripted_decisions_propagate_in_order_to_throttle() {
-            let _g = FEEDBACK_GUARD.lock().await;
-            reset_globals().await;
+            let _admission = crate::testutils::AdmissionLimit::new().await;
             // Feed a deterministic sequence of concurrency decisions: grow,
             // grow more, shrink. Each tick the scripted controller returns
             // the next entry; the adapter must route each to the throttle
@@ -631,29 +612,35 @@ mod tests {
             // Observe each target cwnd in sequence. The controller's
             // on_tick produces one per tick, so after ~N ticks each value
             // in the script should land. Allow slack for interleaving.
+            let mut missed_target = None;
             for target in [5_usize, 25, 3] {
                 let deadline = std::time::Instant::now() + tick * 20;
                 while throttle::current_ops_in_flight_limit(resource) != target {
                     if std::time::Instant::now() >= deadline {
-                        panic!(
-                            "cwnd did not reach scripted value {target} within {:?}; \
-                             observed = {}",
-                            tick * 20,
-                            throttle::current_ops_in_flight_limit(resource),
-                        );
+                        missed_target = Some(target);
+                        break;
                     }
                     tokio::time::sleep(tick / 4).await;
+                }
+                if missed_target.is_some() {
+                    break;
                 }
             }
             unit.abort();
             adapter.abort();
-            reset_globals().await;
+            let _ = tokio::join!(unit, adapter);
+            assert!(
+                missed_target.is_none(),
+                "cwnd did not reach scripted value {} within {:?}; observed = {}",
+                missed_target.unwrap_or_default(),
+                tick * 20,
+                throttle::current_ops_in_flight_limit(resource),
+            );
         }
 
         #[tokio::test]
         async fn decision_with_none_clears_cap_at_throttle() {
-            let _g = FEEDBACK_GUARD.lock().await;
-            reset_globals().await;
+            let _admission = crate::testutils::AdmissionLimit::new().await;
             // Script that grows to a cap, then drops to None. The None
             // transition must land as SetMaxInFlight(0) at the throttle
             // so the semaphore disables its cap, matching the Decision
@@ -670,32 +657,40 @@ mod tests {
             let (unit, adapter) = wire_adapter(side, op, resource, controller, tick).await;
             // First, observe 15 land.
             let deadline = std::time::Instant::now() + tick * 10;
-            while throttle::current_ops_in_flight_limit(resource) != 15 {
+            let reached_cap = loop {
+                if throttle::current_ops_in_flight_limit(resource) == 15 {
+                    break true;
+                }
                 if std::time::Instant::now() >= deadline {
-                    panic!("cwnd=15 never landed");
+                    break false;
                 }
                 tokio::time::sleep(tick / 4).await;
-            }
+            };
             // Then observe the UNLIMITED → SetMaxInFlight(0) land.
             let deadline = std::time::Instant::now() + tick * 20;
-            while throttle::current_ops_in_flight_limit(resource) != 0 {
+            let cleared = loop {
+                if throttle::current_ops_in_flight_limit(resource) == 0 {
+                    break true;
+                }
                 if std::time::Instant::now() >= deadline {
-                    panic!(
-                        "cwnd did not clear to 0 after None decision; observed {}",
-                        throttle::current_ops_in_flight_limit(resource),
-                    );
+                    break false;
                 }
                 tokio::time::sleep(tick / 4).await;
-            }
+            };
             unit.abort();
             adapter.abort();
-            reset_globals().await;
+            let _ = tokio::join!(unit, adapter);
+            assert!(reached_cap, "cwnd=15 never landed");
+            assert!(
+                cleared,
+                "cwnd did not clear to 0 after None decision; observed {}",
+                throttle::current_ops_in_flight_limit(resource),
+            );
         }
 
         #[tokio::test]
         async fn adapter_exits_when_decision_channel_closes() {
-            let _g = FEEDBACK_GUARD.lock().await;
-            reset_globals().await;
+            let _admission = crate::testutils::AdmissionLimit::new().await;
             // Dropping the ControlUnit (via the join handle completing after
             // its sample channel closes) must cause the adapter task to
             // exit. We set this up with a tight tick + short-lived unit.
@@ -714,7 +709,7 @@ mod tests {
                 std::time::Duration::from_millis(5),
             );
             let unit_handle = unit.spawn();
-            let adapter_handle = tokio::spawn(run_adapter(resource, true, decision_rx, sink));
+            let mut adapter_handle = tokio::spawn(run_adapter(resource, true, decision_rx, sink));
             // Let the initial decision land, then tear down the sink so
             // ControlUnit's sample channel closes and it exits. Its watch
             // sender drops, which closes the adapter's decision channel.
@@ -729,12 +724,18 @@ mod tests {
             // the channel close and should exit cleanly within a short
             // window.
             let adapter_result =
-                tokio::time::timeout(std::time::Duration::from_secs(1), adapter_handle).await;
+                tokio::time::timeout(std::time::Duration::from_secs(1), &mut adapter_handle).await;
+            if adapter_result.is_err() {
+                adapter_handle.abort();
+            }
+            let _ = unit_handle.await;
+            if adapter_result.is_err() {
+                let _ = adapter_handle.await;
+            }
             assert!(
                 adapter_result.is_ok(),
                 "adapter did not exit within 1s of decision channel close"
             );
-            reset_globals().await;
         }
     }
 }

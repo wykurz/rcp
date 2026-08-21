@@ -230,7 +230,7 @@
           cargoTestFlags = [ "-p" packageName ];
 
           # Run the package's tests, skipping the ones the sandbox can't support.
-          checkFlags = sandboxSkippedTests;
+          checkFlags = sandboxSkippedTests ++ [ "--test-threads=1" ];
 
           meta = with pkgs.lib; {
             description = description;
@@ -291,7 +291,7 @@
 
             # Build and test the whole workspace, skipping the sandbox-incompatible
             # tests (mirrors the nixpkgs package, which also builds the full workspace).
-            checkFlags = sandboxSkippedTests;
+            checkFlags = sandboxSkippedTests ++ [ "--test-threads=1" ];
 
             meta = with pkgs.lib; {
               description = "Fast file operations tools suite";
