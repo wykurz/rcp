@@ -83,24 +83,36 @@ async fn prune_entries(
         if keep.contains(&name) {
             continue;
         }
-        // a DT_UNKNOWN filter classification opens an O_PATH handle before rm_child is reached.
-        // admit every possible leaf first and transfer the permit into rm_child; an actual
-        // directory releases it at the shared driver's drop-before-recurse boundary.
-        let permit =
-            crate::walk::preacquire_leaf_permit(crate::walk::PermitKind::PendingMeta, hint).await;
+        // the entry's path relative to the destination (mirror) root: anchors filter matching and
+        // reconstructs the display path inside `rm_child`. Computed once and reused below.
+        let rel = relative_dir.join(&name);
+        let mut admission = crate::walk::EntryAdmission::from_hint(hint);
+        let protect_excluded = !delete_settings.delete_excluded && filter.is_some();
+        // only DT_UNKNOWN delete protection needs an fd-bearing filter probe. reliable hints keep
+        // cheap protection decisions outside pending-metadata admission.
+        if hint.is_none() && protect_excluded {
+            admission = crate::walk::ensure_entry_admission(
+                crate::walk::PermitKind::PendingMeta,
+                admission,
+            )
+            .await;
+        }
         // the exclude-protection decision must use the AUTHORITATIVE is_dir: on filesystems that
         // report DT_UNKNOWN (NFS, some FUSE mounts) the hint is None, so defaulting to non-dir
         // would fail to protect a real directory that matches a dir-only exclude pattern like
         // `cache/`. `filter_is_dir` does one authoritative fstat only in the DT_UNKNOWN+filter
         // case, preserving the no-cost path when the hint is reliable or no filter is active.
-        let is_dir = crate::safedir::with_optional_fd_admission(
-            permit.as_ref().map(crate::walk::LeafPermit::admission),
-            crate::walk::filter_is_dir(filter, dst_dir, &name, hint, false),
-        )
-        .await;
-        // the entry's path relative to the destination (mirror) root: anchors filter matching and
-        // reconstructs the display path inside `rm_child`. Computed once and reused below.
-        let rel = relative_dir.join(&name);
+        let is_dir = if protect_excluded {
+            crate::safedir::with_optional_fd_admission(
+                admission.admission(),
+                crate::walk::filter_is_dir(filter, dst_dir, &name, hint, false),
+            )
+            .await
+            .with_context(|| format!("failed reading metadata from {rel:?}"))
+            .map_err(|error| crate::rm::Error::new(error, summary))?
+        } else {
+            false
+        };
         // exclude-protection: keep destination entries the filter would exclude,
         // unless --delete-excluded was requested.
         if !delete_settings.delete_excluded
@@ -113,6 +125,9 @@ async fn prune_entries(
             tracing::debug!("protecting excluded destination entry {:?}", rel);
             continue;
         }
+        admission =
+            crate::walk::ensure_entry_admission(crate::walk::PermitKind::PendingMeta, admission)
+                .await;
         // Protect excluded descendants when removing an extraneous directory: rm::rm_child applies
         // the filter recursively (skipping excluded entries), so an extra dir containing e.g.
         // `*.log` files keeps them and survives non-empty — upholding the documented
@@ -130,8 +145,15 @@ async fn prune_entries(
             time_filter: None,
             dry_run,
         };
-        match crate::rm::rm_child_admitted(prog_track, dst_dir, &name, &rel, &rm_settings, permit)
-            .await
+        match crate::rm::rm_child_admitted(
+            prog_track,
+            dst_dir,
+            &name,
+            &rel,
+            &rm_settings,
+            admission,
+        )
+        .await
         {
             Ok(rm_summary) => {
                 summary = summary + rm_summary;
@@ -174,6 +196,56 @@ mod tests {
 
     mod max_open_files_tests {
         use super::*;
+
+        /// A reliable file hint lets delete protection reject the entry without leaf admission.
+        #[tokio::test]
+        async fn filtered_hinted_file_does_not_wait_for_admission() -> anyhow::Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let dst = tmp.path().join("dst");
+            tokio::fs::create_dir(&dst).await?;
+            tokio::fs::write(dst.join("protected"), b"x").await?;
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let held = throttle::pending_meta_permit().await;
+            let dst_dir = open_dst(&dst).await?;
+            let mut filter = crate::filter::FilterSettings::new();
+            filter.add_exclude("protected")?;
+            let keep = HashSet::new();
+            let settings = delete_settings(false);
+            let prune = prune_entries(
+                &PROGRESS,
+                &dst_dir,
+                std::path::Path::new(""),
+                &keep,
+                Some(&filter),
+                &settings,
+                false,
+                None,
+                vec![(
+                    std::ffi::OsString::from("protected"),
+                    Some(crate::walk::EntryKind::File),
+                )],
+            );
+            tokio::pin!(prune);
+            let first_poll = futures::poll!(prune.as_mut());
+            let completed_while_saturated = first_poll.is_ready();
+            drop(held);
+            let result = match first_poll {
+                std::task::Poll::Ready(result) => result,
+                std::task::Poll::Pending => admission
+                    .run_with_timeout(std::time::Duration::from_secs(20), prune.as_mut())
+                    .await
+                    .context("filtered hinted delete did not resume after admission release")?,
+            };
+            let summary = result.map_err(|error| error.source)?;
+            assert!(
+                completed_while_saturated,
+                "delete protection waited for pending-metadata admission despite a reliable hint"
+            );
+            assert_eq!(summary.files_removed, 0);
+            assert!(dst.join("protected").exists());
+            Ok(())
+        }
 
         /// A `DT_UNKNOWN` prune entry must reserve metadata capacity before the fd-based filter
         /// classification. If the filter protects it, `rm_child` is never reached and cannot repair
@@ -229,6 +301,40 @@ mod tests {
             assert_eq!(summary.files_removed, 0);
             assert_eq!(summary.directories_removed, 0);
             assert!(dst.join("protected").exists());
+            Ok(())
+        }
+
+        /// A failed authoritative delete-protection probe must abort pruning.
+        #[tokio::test]
+        async fn failed_authoritative_probe_aborts_delete_protection() -> anyhow::Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let dst = tmp.path().join("dst");
+            tokio::fs::create_dir(&dst).await?;
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            let dst_dir = open_dst(&dst).await?;
+            let mut filter = crate::filter::FilterSettings::new();
+            filter.add_exclude("vanished")?;
+            let result = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(20),
+                    prune_entries(
+                        &PROGRESS,
+                        &dst_dir,
+                        std::path::Path::new(""),
+                        &HashSet::new(),
+                        Some(&filter),
+                        &delete_settings(false),
+                        false,
+                        None,
+                        vec![(std::ffi::OsString::from("vanished"), None)],
+                    ),
+                )
+                .await
+                .context("failed delete-protection probe did not terminate")?;
+            let error = result.expect_err("a missing authoritative probe target must fail");
+            let rendered = format!("{:#}", error.source);
+            assert!(rendered.contains("failed reading metadata from"));
+            assert!(rendered.contains("vanished"));
             Ok(())
         }
     }
@@ -462,7 +568,7 @@ mod tests {
             None, // DT_UNKNOWN: no hint available (NFS/FUSE case)
             false,
         )
-        .await;
+        .await?;
         assert!(
             authoritative_is_dir,
             "filter_is_dir with hint=None on a real directory must return true via authoritative fstat"

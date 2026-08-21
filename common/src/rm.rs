@@ -9,7 +9,7 @@ use tracing::instrument;
 use crate::filter::TimeFilter;
 use crate::progress;
 use crate::safedir::{self, Dir, Handle};
-use crate::walk::{EntryKind, LeafPermit, PermitKind};
+use crate::walk::{EntryAdmission, EntryKind, LeafPermit, PermitKind};
 use crate::walk_driver::{
     DirAction, DirPreResult, EntryCx, ProcessedChildren, WalkVisitor, process_entry,
 };
@@ -312,10 +312,18 @@ pub async fn rm_child(
     rel_path: &std::path::Path,
     settings: &Settings,
 ) -> Result<Summary, Error> {
-    rm_child_admitted(prog_track, parent, name, rel_path, settings, None).await
+    rm_child_admitted(
+        prog_track,
+        parent,
+        name,
+        rel_path,
+        settings,
+        EntryAdmission::RootOrDelegated,
+    )
+    .await
 }
 
-/// Remove an already-located child while transferring admission acquired by an outer probe.
+/// Remove an already-located child while transferring its explicit admission state.
 ///
 /// `--delete` uses this when `DT_UNKNOWN` requires fd-based filter classification before removal.
 /// Other callers use [`rm_child`], and the shared driver acquires before its own classification.
@@ -325,7 +333,7 @@ pub(crate) async fn rm_child_admitted(
     name: &OsStr,
     rel_path: &std::path::Path,
     settings: &Settings,
-    permit: Option<LeafPermit>,
+    admission: EntryAdmission,
 ) -> Result<Summary, Error> {
     // build the child's owned context rooted at `rel_path`: the display path and the filter path
     // then each equal `rel_path` (the destination-root-relative path), anchoring include/exclude
@@ -346,9 +354,9 @@ pub(crate) async fn rm_child_admitted(
         dry_run: settings.dry_run.is_some(),
         prog_track,
     };
-    // process_entry repairs a missing permit before classification. when --delete already needed an
-    // fd-based filter probe, it transfers that admission here instead of dropping and reacquiring.
-    process_entry(visitor, root_cx, (), permit).await
+    // a DT_UNKNOWN delete-protection probe transfers held admission, while a positive directory
+    // hint preserves the one unadmitted-classification exception into the shared worker.
+    process_entry(visitor, root_cx, (), admission).await
 }
 /// The remove walk's [`WalkVisitor`]. The driver owns enumeration, the leaf-permit lifecycle,
 /// spawning, the single drop-before-recurse site, and the error fold; this visitor supplies rm's
