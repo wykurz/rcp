@@ -298,16 +298,22 @@ mod tests {
             task_owner_dropped.store(true, std::sync::atomic::Ordering::SeqCst);
         });
 
-        let (completion_result, permit) = tokio::time::timeout(
+        let helper_result = tokio::time::timeout(
             Duration::from_secs(1),
             await_completion_and_capacity(completion_rx, throttle::open_file_permit()),
         )
-        .await
-        .expect("capacity cleanup did not finish");
+        .await;
+        let returned_before_owner_dropped =
+            helper_result.is_ok() && !owner_dropped.load(std::sync::atomic::Ordering::SeqCst);
+        let owner_result = owner.await;
 
+        owner_result.expect("capacity owner failed");
+        let (completion_result, permit) = helper_result.expect("capacity cleanup did not finish");
         completion_result.expect("completion sender was dropped");
-        assert!(owner_dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !returned_before_owner_dropped,
+            "completion witness returned before the capacity owner dropped"
+        );
         drop(permit);
-        owner.await.expect("capacity owner failed");
     }
 }
