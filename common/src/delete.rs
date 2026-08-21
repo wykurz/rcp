@@ -529,8 +529,9 @@ mod tests {
     /// A dir-only exclude pattern like `cache/` therefore did NOT protect it, and prune would
     /// delete the directory when it should have kept it.
     ///
-    /// The fix replaces the hint-only computation with `filter_is_dir(filter, dst_dir, name, hint)`,
-    /// which performs an authoritative `fstat` when the hint is `None` AND a filter is active.
+    /// The fix replaces the hint-only computation with
+    /// `filter_is_dir(filter, dst_dir, name, hint, force_authoritative)`, which performs an
+    /// authoritative `fstat` when the hint is `None` AND a filter is active.
     ///
     /// Since we cannot force `DT_UNKNOWN` on a local tmpfs, we verify the fix indirectly by driving
     /// `filter_is_dir` with `hint = None` in isolation (exactly as the authoritative fstat path is

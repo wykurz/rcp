@@ -166,12 +166,12 @@ pub(crate) fn print_runtime_stats() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn get_max_open_files() -> Result<u64, std::io::Error> {
+fn get_soft_open_file_limit() -> Result<u64, std::io::Error> {
     let mut rlim = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    // Safety: we pass a valid "rlim" pointer and the result is checked
+    // safety: we pass a valid "rlim" pointer and the result is checked
     let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rlim) };
     if result == 0 {
         Ok(rlim.rlim_cur)
@@ -404,30 +404,35 @@ pub(crate) fn install_tracing_subscriber(
 
 /// Derive a conservative leaf-operation count from the process descriptor limit.
 ///
-/// A hardened local copy can simultaneously own a classification handle, source file, destination
-/// file, and overwrite-planning handle. Its separately-sized pending-metadata pool can add one
-/// classification handle per operation. Dividing an 80%-of-`RLIMIT_NOFILE` budget by those five
-/// modeled descriptor units leaves the remaining 20% for recursive directory handles and process
-/// support fds. This is deliberately a conservative heuristic, not a hard process-wide ceiling:
-/// arbitrary directory depth is outside leaf admission. A nonzero system limit gets at least one
-/// operation so very small test/container limits do not silently disable backpressure.
-fn default_leaf_operation_limit(fd_limit: usize) -> usize {
-    if fd_limit == 0 {
+/// The OpenFile pool can model three simultaneous leaf-owned descriptors: classification, source,
+/// and either overwrite planning or destination. The independently sized PendingMeta pool can
+/// model one transient descriptor for each of its operations. Dividing an
+/// 80%-of-soft-`RLIMIT_NOFILE` budget by those four units gives the same admission count to each
+/// pool. This is a heuristic, not a hard process-wide ceiling: recursive directories and process
+/// support descriptors are outside leaf admission. A nonzero soft limit gets at least one operation
+/// so very small test/container limits do not silently disable backpressure.
+fn default_leaf_operation_limit(soft_limit: u64) -> usize {
+    if soft_limit == 0 {
         return 0;
     }
-    const DESCRIPTOR_UNITS_PER_OPERATION_PAIR: usize = 5;
-    const MAX_LEAF_OPERATIONS: usize = 4096;
-    let descriptor_budget = fd_limit.saturating_mul(8) / 10;
-    std::cmp::min(
-        (descriptor_budget / DESCRIPTOR_UNITS_PER_OPERATION_PAIR).max(1),
-        MAX_LEAF_OPERATIONS,
-    )
+    const OPEN_FILE_DESCRIPTOR_UNITS: u64 = 3;
+    const PENDING_META_DESCRIPTOR_UNITS: u64 = 1;
+    const DESCRIPTOR_UNITS_PER_OPERATION: u64 =
+        OPEN_FILE_DESCRIPTOR_UNITS + PENDING_META_DESCRIPTOR_UNITS;
+    const MAX_LEAF_OPERATIONS_PER_POOL: u64 = 4096;
+    let descriptor_budget = soft_limit.saturating_mul(8) / 10;
+    let leaf_operation_limit = std::cmp::min(
+        (descriptor_budget / DESCRIPTOR_UNITS_PER_OPERATION).max(1),
+        MAX_LEAF_OPERATIONS_PER_POOL,
+    );
+    usize::try_from(leaf_operation_limit).expect("the leaf-operation cap fits in usize")
 }
 
 /// Build a multi-threaded tokio runtime configured per `runtime`, and apply the
 /// `max_open_files` leaf-operation admission limit from `throttle`. Falls back
-/// to an admission count derived from an 80%-of-rlimit descriptor budget (five modeled descriptor
-/// units across the two pools, capped at 4096 operations) when `max_open_files` is unset.
+/// to a per-pool admission count derived from an 80%-of-soft-rlimit descriptor budget (four modeled
+/// descriptor units across the two independent pools, capped at 4096 operations per pool) when
+/// `max_open_files` is unset.
 pub(crate) fn build_tokio_runtime(
     runtime: &RuntimeConfig,
     throttle: &ThrottleConfig,
@@ -440,21 +445,18 @@ pub(crate) fn build_tokio_runtime(
     if runtime.max_blocking_threads > 0 {
         builder.max_blocking_threads(runtime.max_blocking_threads);
     }
-    if !sysinfo::set_open_files_limit(usize::MAX) {
-        tracing::info!("Failed to update the open files limit (expected on non-linux targets)");
-    }
-    let set_max_open_files = throttle.max_open_files.unwrap_or_else(|| {
-        let limit = get_max_open_files().expect(
+    let leaf_operation_limit = throttle.max_open_files.unwrap_or_else(|| {
+        let soft_limit = get_soft_open_file_limit().expect(
             "We failed to query rlimit, if this is expected try specifying --max-open-files",
-        ) as usize;
-        default_leaf_operation_limit(limit)
+        );
+        default_leaf_operation_limit(soft_limit)
     });
-    if set_max_open_files > 0 {
+    if leaf_operation_limit > 0 {
         tracing::info!(
             "Setting max concurrent leaf operations per admission pool to: {}",
-            set_max_open_files
+            leaf_operation_limit
         );
-        throttle::set_max_open_files(set_max_open_files);
+        throttle::set_max_open_files(leaf_operation_limit);
     } else {
         tracing::info!("Not applying any leaf-operation admission limit");
     }
@@ -465,11 +467,38 @@ pub(crate) fn build_tokio_runtime(
 mod default_leaf_operation_limit_tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    const RLIMIT_CHILD_MARKER: &str = "RCP_TEST_RUNTIME_SETUP_RLIMIT_CHILD";
+    #[cfg(target_os = "linux")]
+    const RLIMIT_CHILD_MARKER_VALUE: &str = "preserve-session-soft-limit-v1";
+    #[cfg(target_os = "linux")]
+    const RLIMIT_CHILD_SUCCESS: &str = "RCP_TEST_RUNTIME_SETUP_RLIMIT_CHILD:success";
+    #[cfg(target_os = "linux")]
+    const RLIMIT_CHILD_SKIP: &str = "RCP_TEST_RUNTIME_SETUP_RLIMIT_CHILD:skip";
+
+    #[cfg(target_os = "linux")]
+    fn nofile_limit() -> libc::rlimit {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // safety: `limit` is valid for writes and the return value is checked
+        let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) };
+        assert_eq!(
+            result,
+            0,
+            "getrlimit failed: {:#}",
+            std::io::Error::last_os_error()
+        );
+        limit
+    }
+
     #[test]
     fn reserves_descriptor_headroom_for_each_leaf_operation() {
-        assert_eq!(default_leaf_operation_limit(100), 16);
-        assert_eq!(default_leaf_operation_limit(4096), 655);
+        assert_eq!(default_leaf_operation_limit(100), 20);
+        assert_eq!(default_leaf_operation_limit(4096), 819);
         assert_eq!(default_leaf_operation_limit(1_000_000), 4096);
+        assert_eq!(default_leaf_operation_limit(u64::MAX), 4096);
     }
 
     #[test]
@@ -477,6 +506,81 @@ mod default_leaf_operation_limit_tests {
         assert_eq!(default_leaf_operation_limit(1), 1);
         assert_eq!(default_leaf_operation_limit(4), 1);
         assert_eq!(default_leaf_operation_limit(0), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_tokio_runtime_preserves_session_soft_limit() {
+        let is_child = std::env::var_os(RLIMIT_CHILD_MARKER)
+            .is_some_and(|value| value == std::ffi::OsStr::new(RLIMIT_CHILD_MARKER_VALUE));
+        if !is_child {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime_setup::default_leaf_operation_limit_tests::build_tokio_runtime_preserves_session_soft_limit",
+                    "--nocapture",
+                ])
+                .env(RLIMIT_CHILD_MARKER, RLIMIT_CHILD_MARKER_VALUE)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "child test failed:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains(RLIMIT_CHILD_SUCCESS)
+                    || stderr.contains(RLIMIT_CHILD_SUCCESS)
+                    || stdout.contains(RLIMIT_CHILD_SKIP)
+                    || stderr.contains(RLIMIT_CHILD_SKIP),
+                "child branch did not emit its sentinel:\n{stdout}\n{stderr}"
+            );
+            return;
+        }
+        let original = nofile_limit();
+        const TARGET_SOFT_LIMIT: libc::rlim_t = 256;
+        if original.rlim_cur <= TARGET_SOFT_LIMIT || original.rlim_max <= TARGET_SOFT_LIMIT {
+            eprintln!(
+                "{RLIMIT_CHILD_SKIP}: current={} hard={}",
+                original.rlim_cur, original.rlim_max
+            );
+            return;
+        }
+        let lowered = libc::rlimit {
+            rlim_cur: TARGET_SOFT_LIMIT,
+            rlim_max: original.rlim_max,
+        };
+        // safety: `lowered` is a valid read-only limit and affects only this child process
+        let result = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lowered) };
+        assert_eq!(
+            result,
+            0,
+            "setrlimit failed: {:#}",
+            std::io::Error::last_os_error()
+        );
+        let before = nofile_limit();
+        assert_eq!(before.rlim_cur, TARGET_SOFT_LIMIT);
+        assert_eq!(before.rlim_max, original.rlim_max);
+        let runtime = RuntimeConfig {
+            max_workers: 1,
+            max_blocking_threads: 1,
+        };
+        let throttle = ThrottleConfig {
+            max_open_files: Some(1),
+            ..ThrottleConfig::default()
+        };
+        drop(build_tokio_runtime(&runtime, &throttle));
+        let after = nofile_limit();
+        assert_eq!(
+            after.rlim_cur, TARGET_SOFT_LIMIT,
+            "runtime setup changed the session soft limit"
+        );
+        assert_eq!(
+            after.rlim_max, original.rlim_max,
+            "runtime setup changed the hard limit"
+        );
+        println!("{RLIMIT_CHILD_SUCCESS}");
     }
 }
 

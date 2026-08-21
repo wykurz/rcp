@@ -8,10 +8,13 @@
 //! - `chunk_size` — rcp/rcpd parse as `bytesize::ByteSize` (e.g. "16MiB"),
 //!   others as bare `u64`.
 //! - `summary` — rcpd streams results to the master and never prints a summary.
-//! - `max_open_files` — filegen falls back to physical CPU cores instead of
-//!   80% of the system rlimit, because random-data generation is CPU-bound.
+//! - `max_open_files` — filegen falls back to available CPU parallelism instead of the
+//!   soft-rlimit-based leaf-admission heuristic, because random-data generation is CPU-bound.
 //! - `quiet` — rcmp's `--quiet` also suppresses stdout differences (not just
 //!   error output), so its help text differs from the other tools.
+
+/// Shared help for the leaf-operation descriptor-admission setting.
+pub const LEAF_ADMISSION_HELP: &str = "Leaf-operation descriptor admission count. N is assigned to each of the independent OpenFile and PendingMeta pools; it is not a literal fd maximum or a combined pool total. 0 disables admission. With a nonzero soft RLIMIT_NOFILE, the default per pool is min(max(1, floor((soft limit * 80%) / 4)), 4096); a zero soft limit leaves admission disabled.";
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct CommonArgs {

@@ -344,9 +344,12 @@ off some throughput for less jitter. The defaults are deliberately on the conser
 
 ## Enforcement Model
 
-The controller's output is a fresh value for `cwnd`. The enforcement layer maps that directly onto a
-semaphore whose capacity is set to the current `cwnd` and updated every time the controller changes
-its mind — so "in-flight at the syscall layer" never exceeds whatever the algorithm last decided.
+The controller's output is a fresh value for `cwnd`. The enforcement layer maps that onto a
+semaphore and updates it whenever the controller changes its mind. Growth adds permits immediately.
+On a reduction, available permits are forgotten immediately; if operations still hold the remaining
+excess, the semaphore records forget debt and consumes it as those permits are dropped. In-flight
+work can therefore remain above the latest `cwnd` until existing operations finish, then converges
+to the new limit.
 
 ## What Counts as a Metadata Op
 
@@ -371,13 +374,15 @@ What "wide coverage" means concretely:
   per-file metadata syscalls that *follow* the walk still carry a clean signal, so we let those
   drive the controllers and skip the walk path entirely. One side-effect worth flagging: a workload
   that walks a wide tree but filters most entries away (large `--include`/`--exclude` exclusions)
-  will still spawn concurrent directory scans without any auto-meta backpressure, since the filter
-  short-circuit happens before any metadata syscall fires. Walks self-pace through the OS getdents
-  cache and the global `--ops-throttle` rate gate still applies; if you need a hard cap on walk-side
-  load on a fragile NAS, reach for `--ops-throttle`.
-- **Not probed by design — data path.** The read-loop and write-loop inside the copy pipeline, and
-  `tokio::fs::copy` itself. Bandwidth- bound, not service-time-bound; a latency-ratio controller
-  doesn't fit. See [Pluggability](#pluggability) for the BBR direction.
+  can still run concurrent directory scans without auto-meta backpressure. A reliable `getdents`
+  type hint lets a filter reject an entry without another metadata syscall. A `DT_UNKNOWN` entry
+  with an active filter is different: it first takes leaf descriptor admission and performs the
+  authoritative probed stat needed for the filter decision. Walks otherwise self-pace through the OS
+  `getdents` cache and the global `--ops-throttle` rate gate still applies; if you need a hard cap
+  on walk-side load on a fragile NAS, reach for `--ops-throttle`.
+- **Not probed by design — data path.** The local `copy_file_range_all` data move and the remote
+  payload-stream read/write loops. They are bandwidth-bound, not service-time-bound; a latency-ratio
+  controller doesn't fit. See [Pluggability](#pluggability) for the BBR direction.
 
 ## One Controller per (Side, Syscall)
 
@@ -484,7 +489,8 @@ caller ───> [  ] ────────> [    ] ────> syscall
 
 Either can be enabled independently:
 
-- **Neither**: default — no rate or concurrency cap beyond file-descriptor limits. Legacy behavior.
+- **Neither**: default — no metadata rate or adaptive-concurrency cap beyond the separate
+  leaf-operation descriptor-admission caps.
 - **Static rate only**: a hard ceiling on operations per second, useful for budget-bound deployments
   where the limit is known in advance.
 - **Adaptive concurrency only**: `cwnd` alone adapts to the filesystem's response; this is the

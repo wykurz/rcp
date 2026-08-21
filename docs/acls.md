@@ -430,12 +430,13 @@ a `Captured` `None` means CLEAR while `Unknown` means the destination's ACLs are
 how a failed read is accounted. Do not duplicate it here.
 
 One case is worth naming because getting it wrong would have been actively destructive. The remote
-`--dereference` (`-L`) directory walk holds **no directory fd**, so it cannot read a directory's ACL
-from the fd whose contents it enumerated. Reporting "no ACL" would not merely have failed to carry
-the source's ACLs — an authoritative absence is an instruction to CLEAR, so it would have **stripped
-the destination's**. So that walk opens the directory by path instead, after enumeration succeeds.
-That is the same concession `-L` already makes everywhere else (it is documented as not
-TOCTOU-hardened), and it is the honest answer rather than a silently destructive one.
+`--dereference` (`-L`) directory walk does not retain its transient enumeration descriptor for the
+later ACL capture, so it cannot read the ACL from the fd whose contents it enumerated. Reporting "no
+ACL" would not merely have failed to carry the source's ACLs — an authoritative absence is an
+instruction to CLEAR, so it would have **stripped the destination's**. So that walk opens the
+directory by path instead, after enumeration succeeds. That is the same concession `-L` already
+makes everywhere else (it is documented as not TOCTOU-hardened), and it is the honest answer rather
+than a silently destructive one.
 
 ## `--require-toctou-safe` containment
 

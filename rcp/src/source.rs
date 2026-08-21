@@ -30,11 +30,12 @@ fn progress() -> &'static common::progress::Progress {
 ///   miss is fatal (the whole copy aborts).
 /// - [`SourceRead::DereferencePath`]: the `-L`/`--dereference` path-based walk,
 ///   where nested symlink following is intentional and the data open is the
-///   ordinary `File::open(src)`. It holds no directory fd, but it DOES retain the
-///   Pass-1 file count per directory in a `path → file_count` map: with no count
-///   echoed back over the wire, Pass 2 (`-L`) reads its expected count from here.
-///   A `-L` miss is NOT a TOCTOU violation (this path is not hardened), so it is
-///   treated as count 0 + a debug log rather than failing closed.
+///   ordinary `File::open(src)`. It retains no pinned Pass-1 directory fd across
+///   phases, although each `ReadDir` enumeration owns a transient descriptor. It
+///   DOES retain the Pass-1 file count per directory in a `path → file_count` map:
+///   with no count echoed back over the wire, Pass 2 (`-L`) reads its expected
+///   count from here. A `-L` miss is NOT a TOCTOU violation (this path is not
+///   hardened), so it is treated as count 0 + a debug log rather than failing closed.
 #[derive(Clone)]
 enum SourceRead {
     Hardened(Arc<SourceDirMap>),
@@ -187,8 +188,9 @@ impl SourceRead {
 /// - [`Self::take_for_created`] (on `DirectoryCreated`): the owned [`MapEntry`]
 ///   (its `Arc<Dir>` plus the held fd-budget permit) moves INTO the spawned Pass 2
 ///   task, which releases the permit when it drops the entry after all files are
-///   sent. Pass 2 is network-bound and independent of the dir-fd permit, so it
-///   always makes progress.
+///   sent. Pass 2 never reacquires the dir-fd budget whose permit it holds, so this
+///   handoff introduces no self-cycle; progress can still depend on network,
+///   filesystem, rate, and leaf-admission gates.
 /// - [`Self::take_for_skipped`] (on `DirectorySkipped`): the entry is dropped
 ///   immediately (releasing the permit) since no files are ever requested for a
 ///   skipped directory.
@@ -199,21 +201,22 @@ impl SourceRead {
 ///
 /// # Bounding semaphore (prevents EMFILE)
 ///
-/// Pass 1 is an *unthrottled* full-tree DFS while Pass 2 is network-paced, so
-/// without a bound the peak number of held directory fds would approach the whole
-/// tree's directory count → `EMFILE` on large trees. The map is gated by a
+/// Pass 1 is an independently running full-tree DFS while Pass 2 is network-paced,
+/// so without a bound the peak number of held directory fds would approach the
+/// whole tree's directory count → `EMFILE` on large trees. The map is gated by a
 /// dir-fd-in-flight semaphore: Pass 1 acquires one permit per [`Self::insert`]
 /// (awaiting if the bound is reached), and the permit is released when the
 /// directory's [`MapEntry`] is dropped (after a take).
 ///
 /// # Release invariant (deadlock-free)
 ///
-/// Pass 1 only ever *acquires*; it must never release. **Every Pass-1 insert is
-/// matched by exactly one release**, driven by the destination's exactly-one
-/// response per `Directory` message (the two `take_*` methods above). This keeps
-/// the budget both *effective* (a large no-ack subtree releases its fds promptly
-/// via `DirectorySkipped` nacks instead of accumulating to connection-end) and
-/// *deadlock-free*. Pass 2 must never acquire a dir-fd permit.
+/// Pass 1 only ever *acquires*; it must never release. During normal protocol flow,
+/// **every Pass-1 insert is matched by exactly one response-driven release** through
+/// the two `take_*` methods above. This keeps the budget both *effective* (a large
+/// no-ack subtree releases its fds promptly via `DirectorySkipped` nacks instead of
+/// accumulating to connection-end) and *deadlock-free*. On hard teardown the gate
+/// closes to wake any blocked insert, then dropping the map releases residual held
+/// entries. Pass 2 must never acquire a dir-fd permit.
 ///
 /// # Fail-closed teardown
 ///
@@ -340,17 +343,17 @@ impl SourceDirMap {
     }
 }
 
-/// RAII backstop that closes the dir-fd budget on drop.
+/// RAII backstop that closes the applicable Pass-1 pacing gate on drop.
 ///
-/// The dispatch loop closes the budget explicitly (once, before draining its Pass-2 tasks) on every
-/// NORMAL exit. This guard covers the one path an explicit close cannot: a panic unwinding out of
-/// the dispatch loop would skip that call, leaving a Pass-1 walk parked on the budget forever — and
-/// because the caller awaits that walk INLINE (before it ever awaits the dispatch task), it would
-/// never reach the point where it observes the panicked task, deadlocking the whole source. Holding
-/// this guard from the top of the dispatch function means the unwind runs it and releases the walk,
-/// which then returns the synthetic `FdBudgetClosed` and lets the source tear down instead of
-/// hanging. `close_fd_budget` is idempotent, so on the normal path (explicit close already done)
-/// this drop is a no-op.
+/// The dispatch loop closes the active gate explicitly (once, before draining its Pass-2 tasks) on
+/// every normal exit: the hardened walk uses its dir-fd budget, while `-L` uses an
+/// outstanding-directory credit. Once installed at function entry, this guard covers destruction
+/// before that point: cancellation can drop the dispatch future, and a panic can unwind out of the
+/// loop. Without the close, a Pass-1 walk parked on either gate would keep the caller from reaching
+/// the point where it awaits the dispatch task. The guard releases that walk whenever destructors
+/// run; the walk then returns the synthetic `FdBudgetClosed` and teardown can continue.
+/// `close_pass1_gate` is idempotent, so on the normal path (explicit close already done) this drop is
+/// a no-op.
 struct FdBudgetCloser(SourceRead);
 
 impl Drop for FdBudgetCloser {
@@ -412,15 +415,16 @@ async fn send_symlink_skipped(
         .await
 }
 
-/// Read a directory's access + default ACLs on the `-L`/`--dereference` walk, which holds no
-/// directory fd.
+/// Read a directory's access + default ACLs on the `-L`/`--dereference` walk, which retains no
+/// pinned enumeration fd for the later ACL capture.
 ///
 /// The hardened walk reads a directory's ACLs from the very fd whose contents it enumerates
-/// ([`Dir::read_acls`]); `-L` has no such fd, so the directory is opened by path here. That is the
-/// same choice the rest of this walk already makes — following symlinks is the point of `-L`, and
-/// the path is documented as not hardened — and it is strictly better than the alternative of
-/// reporting "no ACL", which would silently WIDEN the destination (a source with no ACL is copied
-/// by CLEARING the destination's, so an unread ACL is indistinguishable from an absent one).
+/// ([`Dir::read_acls`]); `-L` has already closed its transient `ReadDir` descriptor, so the
+/// directory is opened by path here. That is the same choice the rest of this walk already makes —
+/// following symlinks is the point of `-L`, and the path is documented as not hardened — and it is
+/// strictly better than the alternative of reporting "no ACL", which would silently WIDEN the
+/// destination (a source with no ACL is copied by CLEARING the destination's, so an unread ACL is
+/// indistinguishable from an absent one).
 /// Called only when the master asked for directory ACLs, so a copy without `d:acl` pays nothing.
 ///
 /// The open in front of the probe is rate-gated like every other path-based metadata read in this
@@ -869,11 +873,12 @@ async fn send_pass1_entry(
     } else {
         true
     };
-    // this directory's ACLs, when the master asked for them (`d:acl`). `-L` holds no directory fd,
-    // so the read opens the directory by path — the same choice the rest of this walk already makes
-    // (following symlinks is what `-L` is for; documented not hardened). Read only AFTER the
-    // enumeration above succeeded, so an unreadable directory still degrades to the 0-entry
-    // `Directory` above rather than becoming a hard failure it is not today.
+    // this directory's ACLs, when the master asked for them (`d:acl`). `-L` retains no pinned
+    // enumeration fd for this later capture, so the read opens the directory by path — the same
+    // choice the rest of this walk already makes (following symlinks is what `-L` is for; documented
+    // not hardened). Read only AFTER the enumeration above succeeded, so an unreadable directory
+    // still degrades to the 0-entry `Directory` above rather than becoming a hard failure it is not
+    // today.
     //
     // A failure here FAILS the directory rather than degrading to "no ACL": an all-`None` `Acls` is
     // a request to CLEAR, so sending one would make an unreadable ACL STRIP the destination's —
@@ -2027,9 +2032,9 @@ struct FileToSend {
 ///   lifetime). For a *tombstone* (committed-but-unreadable directory) the entry is a
 ///   [`MapEntry::Tombstone`] (no fd, file count 0), so Pass 2 returns immediately,
 ///   sending no files and needing no fd.
-/// - [`Pass2Source::DereferencePath`] carries only the `file_count` recovered from
-///   the source-side `-L` count map: the `-L` walk holds no directory fd and
-///   re-enumerates by path (unchanged).
+/// - [`Pass2Source::DereferencePath`] carries only the `file_count` recovered from the source-side
+///   `-L` count map: the `-L` walk retains no pinned Pass-1 directory fd and re-enumerates by path,
+///   with a transient `ReadDir` descriptor (unchanged).
 enum Pass2Source {
     Hardened(MapEntry),
     DereferencePath(Pass1Contents),
@@ -2083,13 +2088,13 @@ impl Pass2Source {
 ///   dispatch loop then breaks and releases the fd-budget ONCE post-loop, unblocking
 ///   any parked Pass-1 walk and tearing the copy down cleanly). NEVER fall back to a
 ///   path-based read.
-/// - `SourceRead::DereferencePath`: the `-L` walk holds no fd. Recover the Pass-1
-///   count from the `path → file_count` map. A missing entry is treated as count 0
-///   with a debug log — `-L` is intentionally NOT hardened, so a miss is not a
-///   TOCTOU/fail-closed condition (the destination's `entries_expected` is the
-///   Pass-1 count, and Pass 2 does not re-count). The entry is CONSUMED (removed),
-///   mirroring the hardened one-shot lifecycle — a directory's files are requested
-///   exactly once, so this bounds the map's memory during large dereference copies.
+/// - `SourceRead::DereferencePath`: the `-L` walk retains no pinned fd-map entry across phases.
+///   Recover the Pass-1 count from the `path → file_count` map. A missing entry is treated as count
+///   0 with a debug log — `-L` is intentionally NOT hardened, so a miss is not a
+///   TOCTOU/fail-closed condition (the destination's `entries_expected` is the Pass-1 count, and
+///   Pass 2 does not re-count). The entry is CONSUMED (removed), mirroring the hardened one-shot
+///   lifecycle — a directory's files are requested exactly once, so this bounds the map's memory
+///   during large dereference copies.
 fn resolve_pass2_source(
     source_read: &SourceRead,
     src: &std::path::Path,
@@ -2610,16 +2615,18 @@ async fn dispatch_control_messages_tcp(
     error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
     pool_shutdown: PoolShutdownToken,
     // shared slot into which this task publishes its fatal loop error (if any) BEFORE releasing the
-    // fd-budget, so the caller can report the real cause even when the budget wakeup would mask it.
+    // applicable Pass-1 pacing gate, so the caller can report the real cause even when the gate
+    // wakeup would mask it
     fatal_error: std::sync::Arc<std::sync::Mutex<Option<anyhow::Error>>>,
     // explicit source read mode. In hardened mode each directory's `DirectoryCreated`
     // consumes the held fd-map entry (the owned `Dir` + permit) for Pass 2 and a miss
     // fails closed; under `-L` there is no fd-map and Pass 2 re-enumerates by path.
     source_read: SourceRead,
 ) -> anyhow::Result<()> {
-    // panic-safety backstop: if the dispatch loop below unwinds, close the fd-budget on drop so a
-    // Pass-1 walk parked on it is released (every NORMAL exit still closes it explicitly, before the
-    // task drain). Held from here so it covers the whole body.
+    // destruction backstop: cancellation or panic unwind closes the applicable Pass-1 pacing gate
+    // (the hardened dir-fd budget or `-L` credit) so a parked walk is released. every normal exit
+    // still closes it explicitly before the task drain; hold the guard from here so it covers the
+    // whole body
     let _fd_budget_closer = FdBudgetCloser(source_read.clone());
     // create semaphore to limit pending file tasks for backpressure
     let pending_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(max_pending_files));
@@ -2846,23 +2853,24 @@ async fn dispatch_control_messages_tcp(
             }
         }
     };
-    // Publish a fatal loop error to the shared slot BEFORE releasing the fd-budget below. Closing
-    // the budget wakes the Pass-1 walk (awaited inline in the caller, parked on
-    // `SourceDirMap::insert`'s `acquire_owned()`), which then returns the synthetic
-    // `FdBudgetClosed`; the caller reads THIS slot to report the real cause instead — and
-    // reads it WITHOUT awaiting this task, which still has to drain its Pass-2 tasks below (a slow
-    // drain must not re-mask the cause). Publishing before the close guarantees the slot is
-    // populated by the time the walk wakes.
+    // publish a fatal loop error to the shared slot BEFORE releasing the applicable Pass-1 pacing
+    // gate below. closing the hardened dir-fd budget or `-L` outstanding-directory credit wakes the
+    // Pass-1 walk (awaited inline in the caller), which then returns the synthetic `FdBudgetClosed`;
+    // the caller reads THIS slot to report the real cause instead — and reads it WITHOUT awaiting
+    // this task, which still has to drain its Pass-2 tasks below (a slow drain must not re-mask the
+    // cause). publishing before the close guarantees the slot is populated by the time the walk
+    // wakes
     let had_fatal_error = result.is_err();
     if let Err(e) = result {
         *fatal_error.lock().unwrap() = Some(e);
     }
-    // Release the hardened dir-fd budget on EVERY dispatch-loop exit — a control-stream close, a
-    // transport-task error, or a panic in the biased task arm above — BEFORE draining tasks. The
-    // Pass-1 walk may be parked on `acquire_owned()`, and only a permit release or this close
-    // unblocks it; closing here, once post-loop rather than per-arm, is what stops a Pass-2 task
-    // error under `--fail-early` from deadlocking the walk. Idempotent, and a no-op on a clean close
-    // (the walk has already finished by then).
+    // release the applicable Pass-1 pacing gate after every normal dispatch-loop result — a
+    // control-stream close, transport-task error, or child-task panic surfaced as JoinError — before
+    // draining tasks. the RAII closer above covers cancellation or panic unwind before this point.
+    // the walk may be parked on the hardened dir-fd budget or `-L` credit, and only a permit/credit
+    // release or this close unblocks it; closing here once post-loop is what stops a Pass-2 task
+    // error under `--fail-early` from deadlocking the walk. idempotent, and a no-op on a clean close
+    // (the walk has already finished by then)
     source_read.close_pass1_gate();
     // if we're exiting with an error, abort the recv task immediately
     // (otherwise it would block waiting for more messages from destination)
@@ -3142,11 +3150,12 @@ async fn handle_connection(
     // O_NOFOLLOW fd primitives intentionally don't (that path stays as-is, matching
     // local copy). The hardened fd-map is shared (via the `Arc` inside `SourceRead`)
     // between Pass 1 (`send_fs_objects_tcp`, below) and Pass 2 (spawned inside
-    // dispatch from each `DirectoryCreated`). Its dir-fd-in-flight budget bounds how
-    // far the unthrottled Pass-1 walk can race ahead of the network-paced Pass 2
-    // (prevents EMFILE); sized like the file pending-writes pool. The `-L` variant
-    // instead carries a shared `path → file_count` map so Pass 2 can recover each
-    // directory's Pass-1 count (the destination no longer echoes it over the wire).
+    // dispatch from each `DirectoryCreated`). Its dir-fd-in-flight budget bounds how far Pass 1 can
+    // race ahead of the network-paced Pass 2 (prevents EMFILE); sized like the file pending-writes
+    // pool. The `-L` variant instead carries a shared
+    // `path → file_count` map and an outstanding-directory credit with the same pacing role, so
+    // Pass 2 can recover each directory's Pass-1 count without unbounded acknowledgement backlog
+    // (the destination no longer echoes the count over the wire).
     let source_read = if settings.dereference {
         SourceRead::DereferencePath(Arc::new(DereferenceWalkState::new(max_pending_files)))
     } else {
@@ -3155,10 +3164,10 @@ async fn handle_connection(
     // pass a clone of the shutdown token to dispatch - it will signal shutdown before
     // draining its tasks to prevent deadlock when destination closes unexpectedly.
     // see dispatch_control_messages_tcp doc comment for detailed shutdown flow.
-    // Shared slot for the dispatch task's fatal loop error. It publishes here BEFORE it releases the
-    // fd-budget that wakes the (parked) Pass-1 walk, so on a `--fail-early` budget-saturation failure
-    // we report the REAL cause instead of the synthetic budget wakeup — without awaiting the dispatch
-    // task's (possibly slow) Pass-2 drain.
+    // shared slot for the dispatch task's fatal loop error. it publishes here BEFORE releasing the
+    // applicable Pass-1 pacing gate that wakes the parked walk, so on a `--fail-early` saturation
+    // failure we report the REAL cause instead of the synthetic gate wakeup — without awaiting the
+    // dispatch task's possibly slow Pass-2 drain
     let dispatch_fatal_error: std::sync::Arc<std::sync::Mutex<Option<anyhow::Error>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let dispatch_task = tokio::spawn(dispatch_control_messages_tcp(

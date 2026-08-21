@@ -305,10 +305,17 @@ Two complementary mechanisms: **static caps** that you set once based on budget 
 - set `--iops-throttle` to limit the maximum number of I/O operations per second
   - MUST be used with `--chunk-size`, which is used to calculate I/O operations per file
 
-- set `--max-open-files` to limit concurrent leaf operations that contribute to descriptor pressure
-  - RCP tools automatically derive the admission count from the system limit; this is backpressure,
-    not a hard process-wide descriptor ceiling, because one operation can hold multiple descriptors
-    and recursive directory handles are deliberately excluded to avoid traversal deadlocks
+- set `--max-open-files=N` to apply descriptor backpressure to leaf operations
+  - the same `N` is assigned to two independent pools: OpenFile for fd-bearing leaf work and
+    PendingMeta for spawned metadata work; it is not a combined pool total or a literal descriptor
+    maximum
+  - `0` disables descriptor admission; when omitted and the current soft `RLIMIT_NOFILE` is nonzero,
+    RCP tools except `filegen` derive each pool's count as
+    `min(max(1, floor((soft limit × 80%) / 4)), 4096)`; a zero soft limit leaves admission disabled
+  - the four modeled units are three simultaneous OpenFile leaf descriptors (classification, source,
+    and either overwrite planning or destination) plus one independently sized PendingMeta
+    descriptor; recursive directory, network socket, and process-support descriptors remain outside
+    this heuristic
 
 ### Adaptive metadata throttling (`--auto-meta-throttle`)
 
@@ -688,9 +695,10 @@ ulimit -n 65536
 * hard nofile 65536
 ```
 
-`rcp` automatically queries the system limit and uses `--max-open-files` for descriptor
-backpressure, but higher limits allow more parallelism. The setting is not a literal count of every
-descriptor in the process; see [Static caps](#static-caps).
+`rcp` queries the current session's **soft** limit without changing it. When `--max-open-files` is
+omitted, that value drives the four-unit per-pool heuristic described in
+[Static caps](#static-caps). Raising the soft limit can therefore increase default leaf parallelism
+until the 4096-operation cap. The setting is not a literal count of every descriptor in the process.
 
 ### Network Backlog (10+ Gbps)
 
@@ -784,21 +792,21 @@ For optimal performance on high-speed networks:
 The `filegen` tool generates random test data, which is CPU-intensive. Unlike other rcp tools that
 are typically I/O-bound, filegen's bottleneck is often the CPU generating random bytes.
 
-**Default behavior**: `filegen` defaults `--max-open-files` to the number of physical CPU cores,
-rather than deriving an operation count from the system's descriptor budget like the other tools.
-This matches concurrency to compute capacity, avoiding excessive parallelism that would cause CPU
-contention.
+**Default behavior**: `filegen` defaults `--max-open-files` to
+`std::thread::available_parallelism()` rather than using the soft-rlimit heuristic used by the other
+tools. This respects the CPU parallelism available to the process (including affinity/resource
+constraints) and avoids excessive random-data-generation contention.
 
 **Tuning for your workload**:
 
 ```bash
-# Use default (physical cores) - optimal for fast storage
+# Use default (available CPU parallelism) - optimal for fast storage
 filegen /tmp 3,2 10 1M --progress
 
 # Increase for slow storage where I/O latency dominates
 filegen /tmp 3,2 10 1M --max-open-files=64 --progress
 
-# No limit (unlimited concurrency)
+# Disable file-write admission (other runtime and congestion gates still apply)
 filegen /tmp 3,2 10 1M --max-open-files=0 --progress
 ```
 

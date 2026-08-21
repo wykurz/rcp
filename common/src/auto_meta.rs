@@ -20,7 +20,7 @@ pub(crate) enum AdapterAction {
     /// Flip the ops-throttle flag back on after a prior disable so
     /// `consume` / `get_ops_token` once again waits for tokens.
     EnableOpsThrottle,
-    /// Disable the ops-throttle flag so `get_ops_token` becomes a no-op.
+    /// Disable the ops-throttle flag so future `get_ops_token` calls become no-ops.
     /// Matches the "no limit on this dimension" reading of
     /// `rate_per_sec: None`.
     DisableOpsThrottle,
@@ -148,16 +148,15 @@ pub(crate) fn apply_decision(
     if new.rate_per_sec != prev.rate_per_sec {
         match new.rate_per_sec {
             Some(rate) => {
-                // Preserve rate<=0 (and NaN) as a genuine "halt" signal —
-                // matches the simulator's `can_submit` contract. For any
-                // strictly-positive rate, enforce a floor of 1 token per
-                // interval so rates below 10 ops/sec (which would truncate
-                // to 0 at the 100ms interval) don't silently pause the
-                // gate after the initial drain. The tradeoff: a
-                // rate-aware controller that asks for less than 10 ops/sec
-                // gets the 10-ops/sec floor instead of a pause. Static
-                // `--ops-throttle` values below the floor are rejected at
-                // config-validation time.
+                // preserve nonpositive rates as a request to halt new replenishment. any tokens
+                // already in the runtime bucket can drain first, while the simulator's
+                // `can_submit` contract models that nonpositive steady-state halt immediately.
+                // treat NaN defensively as zero replenishment here as well. for any
+                // strictly-positive rate, enforce a floor of 1 token per interval so rates below 10
+                // ops/sec (which would truncate to 0 at the 100ms interval) don't silently pause the
+                // gate after the initial drain. the tradeoff: a rate-aware controller that asks for
+                // less than 10 ops/sec gets the 10-ops/sec floor instead of a pause. static
+                // `--ops-throttle` values below the floor are rejected at config-validation time
                 let replenish = if rate > 0.0 {
                     ((rate * REPLENISH_INTERVAL_SECS) as usize).max(1)
                 } else {
@@ -206,18 +205,17 @@ mod tests {
 
     #[test]
     fn max_in_flight_some_to_none_disables_via_zero_sentinel() {
-        // Per the Decision contract, None clears the cap. The semaphore's
-        // set_max(0) achieves this by flipping the gate off so new
-        // acquires succeed without a permit — not by stalling at 0.
+        // per the Decision contract, None clears the cap. set_max(0) swaps in a disabled zero-cap
+        // epoch and closes the old one, so new acquires succeed without a permit rather than
+        // stalling at 0
         let actions = apply_decision(Decision::with_concurrency(10), Decision::UNLIMITED);
         assert_eq!(actions, vec![AdapterAction::SetMaxInFlight(0)]);
     }
 
     #[test]
     fn rate_none_to_some_enables_after_setting_replenish() {
-        // The enable action must come AFTER the replenish update so the
-        // first token drop after re-enablement uses the new rate, not a
-        // stale one from a prior configuration.
+        // the enable action must come AFTER the replenish update so the first replenishment tick
+        // after re-enablement uses the new count, not a stale one from a prior configuration
         let actions = apply_decision(Decision::UNLIMITED, Decision::with_rate(1_000.0));
         assert_eq!(
             actions,

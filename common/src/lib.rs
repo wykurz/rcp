@@ -41,7 +41,7 @@
 //! The [`run`] function provides a unified entry point for all RCP tools with support for:
 //! - Progress tracking and reporting
 //! - Logging configuration (quiet/verbose modes)
-//! - Resource limits (max workers, open files, throttling)
+//! - Resource limits (max workers, leaf-operation descriptor admission, throttling)
 //! - Tokio runtime setup
 //! - Remote tracing integration
 //!

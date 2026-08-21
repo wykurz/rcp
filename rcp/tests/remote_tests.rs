@@ -7986,10 +7986,10 @@ fn test_remote_strict_mode_arms_the_root_notice_on_an_all_false_capture() {
     );
 }
 
-/// `-L`/`--dereference` reaches a different Pass-1 walk on the source: it holds no directory fd, so
-/// its ACL read opens the directory by path instead of reading the held one. Without this the
-/// dereference walk would quietly send no directory ACLs — and "no ACL" is a request to CLEAR, so
-/// the destination would end up stripping them rather than merely failing to copy them.
+/// `-L`/`--dereference` reaches a different Pass-1 walk on the source: it does not retain the
+/// transient enumeration descriptor for the later ACL capture, so that read opens the directory by
+/// path. Without this the dereference walk would quietly send no directory ACLs — and "no ACL" is a
+/// request to CLEAR, so the destination would strip them rather than merely fail to copy them.
 #[test]
 fn test_remote_acl_round_trip_with_dereference() {
     require_local_ssh();

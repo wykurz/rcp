@@ -176,9 +176,12 @@ struct Args {
     #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
     quiet: bool,
 
-    /// Descriptor-backpressure limit per leaf-operation pool; not a hard process-wide fd count
-    /// (0 = no limit, unspecified = derived from 80% of the system fd budget)
-    #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
+    #[arg(
+        long,
+        value_name = "N",
+        help = common::cli::LEAF_ADMISSION_HELP,
+        help_heading = "Performance & throttling"
+    )]
     max_open_files: Option<usize>,
 
     /// Chunk size for calculating I/O operations per file

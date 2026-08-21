@@ -1746,12 +1746,13 @@ async fn process_control_stream(
     // copy is failing, and the outstanding tasks are pure liability — each queued one would
     // acquire the single build slot and scan its complete directory (up to
     // --overwrite-manifest-max-entries = 5M entries) only to fail its announce against the closed
-    // peer. Those scans are NOT bounded by the source's dir-fd budget under -L (the path→count
-    // walk holds no fds), so draining them could stall failure shutdown arbitrarily long. Abort
-    // instead: shutdown() cancels queued tasks at their slot acquire and active ones at their
-    // next await (the manifest's per-child stat loop awaits between children; at most one
-    // already-submitted read_entries enumeration keeps running detached on the blocking pool —
-    // bounded by a single directory). The cancelled tasks' JoinErrors are deliberately discarded,
+    // peer. The `-L` outstanding-directory credit bounds how many manifest builds can be queued, but
+    // one build can still scan up to 5M entries or stall indefinitely in filesystem I/O. Draining
+    // could therefore stall failure shutdown arbitrarily long. Abort instead: shutdown() cancels
+    // queued tasks at their slot acquire and active ones at their next await (the manifest's
+    // per-child stat loop awaits between children; at most one already-submitted read_entries
+    // enumeration keeps running detached on the blocking pool — bounded by a single directory).
+    // the cancelled tasks' JoinErrors are deliberately discarded,
     // not reaped: cancellation here is not a failure — the incomplete transfer is reported by
     // choose_final_result, and an announce that genuinely failed before this point already
     // recorded its own error. The `?` error exits above skip both paths deliberately: dropping

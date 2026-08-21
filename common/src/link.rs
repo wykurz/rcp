@@ -752,9 +752,9 @@ impl AdmittedLinkEntry {
 /// copied, and a directory recurses.
 ///
 /// `admission` is the explicit scheduling state supplied by the directory loop. Every
-/// non-recursive branch retains a held permit through its final fd-bearing operation; direct
-/// directory recursion releases it before descent, while delegated copy owns that decision for the
-/// update entry it classifies.
+/// leaf-dispatch branch retains a held permit through its final fd-bearing work, including nested
+/// overwrite removal; direct directory recursion releases it before descent, while delegated copy
+/// owns that decision for the update entry it classifies.
 #[instrument(skip(prog_track, src_parent, update, dst_parent, settings, admission))]
 #[async_recursion]
 #[allow(clippy::too_many_arguments)]
@@ -932,11 +932,12 @@ async fn link_internal(
             entry.update_handle = None;
         }
     }
-    // From this point every non-recursive action retains the private entry bundle or an
-    // `AdmittedLeaf` through its final fd-bearing operation. A delegated non-directory closes its
-    // action handle before taking the permit; comparison handles close before that transfer. An
-    // authoritative delegated directory closes both handles before transferring its permit for
-    // admitted reclassification. Direct directory recursion closes admission and both handles here.
+    // from this point every leaf-dispatch action retains the private entry bundle or an
+    // `AdmittedLeaf` through its final fd-bearing work, including nested overwrite removal. A
+    // delegated non-directory closes its action handle before taking the permit; comparison handles
+    // close before that transfer. An authoritative delegated directory closes both handles before
+    // transferring its permit for admitted reclassification. Direct directory recursion closes
+    // admission and both handles here
     if let Some(update_entry) = entry.update_handle.as_ref() {
         let (update_dir, update_name) = update.unwrap();
         let update_path = update_path.as_deref().unwrap();
@@ -1033,7 +1034,8 @@ async fn link_internal(
             .map(LinkDispatch::Complete);
         }
         if update_entry.kind() == EntryKind::Symlink {
-            // update symlink: copy it under the same non-recursive admission guard.
+            // update symlink: copy it under the same leaf admission guard, including any overwrite
+            // removal it triggers
             tracing::debug!("'update' is a symlink so just symlink that");
             let admission = entry.into_update_admission().into_entry_admission();
             return delegate_copy(
@@ -1053,7 +1055,7 @@ async fn link_internal(
         }
     } else {
         // update hasn't been specified (or is absent at this name): hard-link a source file or copy
-        // a source symlink, retaining admission across the non-recursive work.
+        // a source symlink, retaining admission across all leaf work and nested overwrite removal
         tracing::debug!("no 'update' entry");
         if entry.src_handle.kind() == EntryKind::File {
             let leaf = match entry.into_source_leaf() {
@@ -1110,8 +1112,8 @@ async fn link_internal(
         }
     }
     if entry.src_handle.kind() != EntryKind::Dir {
-        // special file (or unsupported type): retain admission until this non-recursive decision
-        // returns and drops the source/update handles.
+        // special file (or unsupported type): retain admission until this branch returns and drops
+        // the source/update classification handles.
         if settings.copy_settings.skip_specials {
             tracing::debug!(
                 "skipping special file {:?} (kind: {:?})",
@@ -5053,15 +5055,14 @@ mod link_tests {
             Ok(())
         }
 
-        /// Regression for the link site-3 ↔ rm pending-meta self-deadlock.
+        /// Regression for update-only copy ↔ rm cross-pool self-deadlock.
         ///
         /// Scenario: update has many entries not in src; dst already has
         /// directories at those same names; the user passes --overwrite. Each
-        /// site-3 task runs copy::copy → copy_file → rm::rm to remove the
-        /// preexisting dst directory before placing the regular-file copy.
-        /// rm::rm draws from the pending-meta pool. If site 3 also held
-        /// pending-meta across copy::copy, every running task would hold a
-        /// permit while waiting on inner rm to acquire one — classic
+        /// update-only task delegates through `copy_child` / `copy_file_fd`, whose
+        /// `remove_existing` invokes `rm_child` to remove the preexisting destination directory.
+        /// rm draws from PendingMeta. If the outer task also held PendingMeta across delegated copy,
+        /// every running task would hold a permit while waiting on inner rm to acquire one — a
         /// self-deadlock once the pool is saturated.
         #[tokio::test]
         #[traced_test]
@@ -5078,8 +5079,8 @@ mod link_tests {
                 // update/uN is a regular file (site 3 will copy it).
                 tokio::fs::write(update.join(format!("u{}", i)), format!("upd-{}", i)).await?;
                 // dst/uN is a preexisting directory with inner files. With
-                // --overwrite, copy_file calls rm::rm to wipe it, which
-                // recurses into pending-meta.
+                // --overwrite, `remove_existing` invokes `rm_child` to wipe it, which recurses under
+                // PendingMeta admission
                 let dst_subdir = dst.join(format!("u{}", i));
                 tokio::fs::create_dir(&dst_subdir).await?;
                 for j in 0..3 {

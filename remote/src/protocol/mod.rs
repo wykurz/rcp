@@ -442,6 +442,10 @@ pub struct RcpdConfig {
     pub fail_early: bool,
     pub max_workers: usize,
     pub max_blocking_threads: usize,
+    /// Explicit `Some(N)` is propagated from the master to both rcpds and assigns `N` to each local
+    /// descriptor-admission pool (`0` disables them). With `None`, each process derives its own
+    /// default from its unchanged current soft `RLIMIT_NOFILE` (zero leaves admission disabled); no
+    /// derived count crosses the wire.
     pub max_open_files: Option<usize>,
     pub ops_throttle: usize,
     pub iops_throttle: usize,
