@@ -413,9 +413,9 @@ impl WalkVisitor for RmVisitor {
     fn root_dir_context(&self) {}
 
     fn permit_kind(&self) -> PermitKind {
-        // use the pending-meta semaphore (not open-files) because rm is reachable from
-        // copy_file's overwrite path, which already holds an open-files permit; using a distinct
-        // semaphore avoids that cross-pool deadlock while still bounding fd-backed entry handles.
+        // use PendingMeta because copy/link overwrite leaf work can invoke rm while retaining
+        // OpenFile admission. A distinct semaphore keeps that one-way composition from becoming a
+        // hold-and-wait cycle while still bounding fd-backed entry handles
         PermitKind::PendingMeta
     }
 

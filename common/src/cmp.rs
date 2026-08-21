@@ -480,8 +480,9 @@ async fn expand_missing_tree(
         // and chained unknown-typed directories holding permits while
         // recursing would deadlock the pending-meta pool. Known directories
         // also skip pre-acquire. We use the pending-meta semaphore (not
-        // open-files) because cmp doesn't hold fds; decoupling avoids
-        // contention with concurrent copy paths that hold open-files permits.
+        // OpenFile) because cmp retains no per-leaf data/classification fd; recursive `ReadDir`
+        // descriptors remain outside leaf admission. Decoupling avoids contention with concurrent
+        // copy paths that hold OpenFile permits
         let known_leaf = entry_file_type.is_some_and(|ft| !ft.is_dir());
         let pending_guard = if known_leaf {
             Some(throttle::pending_meta_permit().await)
@@ -694,8 +695,9 @@ async fn cmp_internal(
         // and chained unknown-typed directories holding permits while
         // recursing would deadlock the pending-meta pool. Known directories
         // also skip pre-acquire. We use the pending-meta semaphore (not
-        // open-files) because cmp doesn't hold fds; decoupling avoids
-        // contention with concurrent copy paths that hold open-files permits.
+        // OpenFile) because cmp retains no per-leaf data/classification fd; recursive `ReadDir`
+        // descriptors remain outside leaf admission. Decoupling avoids contention with concurrent
+        // copy paths that hold OpenFile permits
         let known_leaf = entry_file_type.is_some_and(|ft| !ft.is_dir());
         let pending_guard = if known_leaf {
             Some(throttle::pending_meta_permit().await)

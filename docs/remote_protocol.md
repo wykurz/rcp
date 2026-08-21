@@ -261,9 +261,9 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
   stays meaningful without any single control frame exceeding the frame limit. See §7.9. On a
   source-initiated teardown (control EOF before `DestinationDone`), outstanding manifest builds are
   **aborted**, not drained: their directories can never receive files, and a queued build would only
-  scan a complete directory to fail its announce against the closed peer — under `-L` the number of
-  queued builds is not bounded by the source's dir-fd budget, so draining them could stall failure
-  shutdown arbitrarily long.
+  scan a complete directory to fail its announce against the closed peer. The `-L` replacement
+  credit bounds how many builds can be outstanding, but one build may still enumerate up to five
+  million entries or stall indefinitely in filesystem I/O, so draining can stall failure shutdown.
 
 **`DirectoryCreated`**
 
@@ -299,16 +299,20 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
   transport failure on either stream, or the destination closing its control stream. So the source
   MUST NOT depend on receiving an ack/nack for every directory: it releases the **entire** dir-fd
   budget (`close_fd_budget`) — and, under `-L`, closes the outstanding-directory credit that
-  replaces it (the path-based walk holds no fds, so one credit per unacknowledged `Directory`,
-  released by that directory's `DirectoryCreated`/`DirectorySkipped`, is what keeps a slow ack path
-  from letting the walk flood the destination with an unbounded backlog of registered directories,
-  each holding an open fd and possibly a queued manifest) — whenever its control-message dispatch
-  loop exits for ANY reason (control-stream close, a transport-task error, or a panic), once after
-  the loop and before draining tasks, so a Pass-1 walk parked on the budget always unblocks and the
-  source tears down cleanly instead of hanging. On such an abort the top-level cause depends on
-  which side detected it. A **source-side** cause (e.g. a source file's `Permission denied` on read)
-  is published to a shared slot before the budget is released, and the teardown surfaces it in place
-  of the synthetic budget-closed wakeup (a typed `FdBudgetClosed` marker, detected by type) that
+  replaces it. The path-based walk retains no pinned directory fd or fd-map entry across
+  acknowledgements, although each `ReadDir` enumeration owns a transient descriptor. One credit per
+  unacknowledged `Directory`, released by that directory's `DirectoryCreated`/`DirectorySkipped`,
+  keeps a slow ack path from letting the walk flood the destination with an unbounded backlog of
+  registered directories, each holding a destination directory fd and possibly owning a queued
+  manifest. After every normal dispatch-loop result — control-stream close, transport-task error, or
+  a child-task panic surfaced as `JoinError` — the source explicitly closes the applicable gate
+  before draining tasks. Once installed at dispatch entry, an RAII closer also closes the gate if
+  cancellation drops the future or a panic unwinds before that point. Thus, after dispatch starts, a
+  Pass-1 walk parked on the budget unblocks on every path that runs destructors, and the source
+  tears down cleanly instead of hanging. On such an abort the top-level cause depends on which side
+  detected it. A **source-side** cause (e.g. a source file's `Permission denied` on read) is
+  published to a shared slot before the budget is released, and the teardown surfaces it in place of
+  the synthetic budget-closed wakeup (a typed `FdBudgetClosed` marker, detected by type) that
   unblocks the parked walk. A **destination-side** cause (e.g. the destination cannot create a file)
   is not visible to the source — its slot stays empty, so the source reports only a benign teardown
   symptom (a meaningful "destination closed the control connection before the source finished
@@ -324,10 +328,11 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
     connection — a `--fail-early` file/metadata failure, or a corrupted data stream — propagates out
     of the data worker; the destination records it and closes its control send stream (the
     `destination closing its control stream` trigger above) so the source observes the close,
-    releases its dir-fd budget, and tears down. This close is required because the source may have
-    no failing operation of its own to notice: an all-empty-file transfer carries no data body (its
-    sends never break with a broken pipe), and a source that has finished its walk or is parked on
-    the dir-fd budget is otherwise idle — it would wait forever for a `DestinationDone` an aborting
+    releases its applicable Pass-1 pacing gate (the hardened dir-fd budget or `-L`
+    outstanding-directory credit), and tears down. This close is required because the source may
+    have no failing operation of its own to notice: an all-empty-file transfer carries no data body
+    (its sends never break with a broken pipe), and a source that has finished its walk or is parked
+    on that gate is otherwise idle — it would wait forever for a `DestinationDone` an aborting
     destination can never send. The close is issued PROMPTLY — the moment the abort is observed, not
     after the worker pool finishes draining: the pool only drains once the source has closed the
     data connections, which happens only after the source has torn down, so deferring the close
@@ -465,9 +470,10 @@ that restores the directory's ORIGINAL default ACL (the lockdown snapshot) — t
 Reading a source entry's ACL from the same fd as its payload is the same read-side fidelity rule the
 rest of the source walk follows (Guarantee 2 in [tocttou.md](tocttou.md)): a probe by path could be
 answered by a different inode than the one whose bytes and metadata are on the wire, pairing one
-entry's permissions with another's contents. The `-L`/`--dereference` walk holds no directory fd, so
-there the directory ACL read opens by path — the same intentionally-unhardened choice that walk
-already makes everywhere else.
+entry's permissions with another's contents. The `-L`/`--dereference` walk does not retain its
+transient enumeration descriptor for the later directory ACL capture, so that read opens by path —
+the same intentionally-unhardened choice that walk already makes everywhere else. That path ACL open
+is also outside remote leaf OpenFile admission and its cancellation-lifetime guarantee.
 
 **A failed ACL read FAILS the entry; it never degrades to "no ACL".** Because `None` means CLEAR,
 sending it for an ACL the source could not read would make an `EMFILE`, `EACCES` or `ENOENT` STRIP
@@ -1164,39 +1170,71 @@ slower than the source (slow disk, congested network, etc.).
 
 **Solution:**
 
-Two mechanisms work together:
+Three source-side mechanisms work together:
 
 1. **Pending task limit**: A semaphore limits the total number of file-sending tasks that can be
    active at once. Default is `max_connections × 4` (configurable via
    `--pending-writes-multiplier`). Tasks wait on this semaphore before being spawned.
 
-2. **Deferred resource acquisition**: Files are opened and buffers allocated only *after* borrowing
-   a connection from the pool. This ensures resources are only held when data can actually flow.
+2. **Connection backpressure**: A file task borrows a pooled data connection before taking
+   file-specific resources, so queued tasks do not open files or allocate data buffers while the
+   destination is slower.
+
+3. **Leaf descriptor admission**: After borrowing the connection, a source task acquires OpenFile
+   admission before its IOPS reservation, source open, buffer allocation, and send. The destination
+   has an independent OpenFile pool: after reading a file header, it acquires admission before
+   resolving the destination parent, creating/opening the file, and writing its data.
 
 **Resource acquisition order:**
 
 ```
-1. Acquire pending task permit     ← Blocks if too many tasks queued
-2. Borrow connection from pool     ← Blocks if all connections busy
-3. Open file                       ← Only after connection available
-4. Allocate buffer                 ← Only after file opened
-5. Send data
-6. Release connection + permit
+1. Acquire pending task permit       ← Blocks if too many source tasks are queued
+2. Borrow connection from pool       ← Blocks if all connections are busy
+3. Acquire source OpenFile admission ← Blocks before opening the source leaf
+4. Acquire source IOPS reservation
+5. Open file and allocate buffer     ← Only after connection and admission are available
+6. Send data
+7. Release connection + admissions
 ```
+
+On the destination the corresponding order begins after the header is consumed: acquire destination
+OpenFile admission, take the operations gate, resolve/plan the parent and entry, acquire IOPS, then
+remove/create/write as required. The two rcpd processes do not share a pool.
 
 **Effect with defaults (100 connections, 4× multiplier):**
 
 - Maximum 400 pending tasks at any time
-- Maximum 100 open files (only tasks with connections)
-- Maximum ~1.6 GiB buffer memory (100 × 16 MiB)
+- Up to 100 simultaneous source file-data transfers/handles at the connection default, possibly
+  fewer under source OpenFile admission. Destination leaf work is admitted independently; directory,
+  socket, and process-support descriptors are additional.
+- Each destination directory registered for completion retains its directory fd until completion;
+  these recursive-descent descriptors are outside leaf admission.
+- Up to approximately 1.6 GiB of payload buffers per source or destination `rcpd` (100 × 16 MiB
+  each), or approximately 3.2 GiB aggregate for one source and one destination, plus protocol and
+  runtime overhead.
 
 **Configuration:**
 
 - `--max-connections=N`: Maximum concurrent data connections (default: 100)
 - `--pending-writes-multiplier=N`: Multiplier for pending tasks (default: 4)
+- `--max-open-files=N`: Assign `N` to each rcpd's independent OpenFile and PendingMeta admission
+  pools (`0` disables admission). An explicit value is propagated to both rcpds. When absent, each
+  rcpd derives its own per-pool count from its unchanged current soft `RLIMIT_NOFILE` using four
+  modeled descriptor units, capped at 4096; a zero soft limit leaves admission disabled.
 
 The multiplier ensures work is always queued when connections become available, avoiding idle time
 between file transfers.
+
+**Cancellation-lifetime residual:** admitted remote source and destination payload-leaf streaming
+currently uses `tokio::fs::File`. A private Tokio blocking read or write job can retain an
+`Arc<StdFile>` that owns the same regular-file fd; it does not clone or duplicate the fd. Cancelling
+the high-level future can therefore drop its OpenFile guard while that job still retains the fd.
+Such jobs do not inherit the repository's weak admission scope. This residual is limited to admitted
+remote payload-leaf streaming: local copy's synchronous data move and filegen's bounded synchronous
+chunks use the admitted blocking runner, which retains a strong lease through cancellation and drops
+abandoned outputs before releasing it. Closing the remote residual requires a separate fd-owning
+bounded-I/O abstraction; it does not change the wire protocol described here or describe every Tokio
+filesystem operation.
 
 ### 7.9 Skipping identical files (destination manifest + source decision)
 

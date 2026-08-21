@@ -9,12 +9,12 @@
 //! 3. fallible authoritative-or-hinted [`walk::filter_is_dir`] +
 //!    [`walk::should_skip_entry`] filter decision (against the child's
 //!    [`EntryCx::filter_path`]); only a `DT_UNKNOWN` filter probe admits first,
-//! 4. admit each remaining possible leaf immediately before spawn, joining/folding via
-//!    [`join_and_fold`] (NOT batched: see [`walk_dir_contents`] for why the permit
-//!    is acquired and the task spawned in the same loop step),
-//! 5. in each task: authoritative [`Dir::child`] classification, then either
-//!    [`WalkVisitor::visit_leaf`] (holding the permit) or — for a directory —
-//!    **drop the permit**, [`WalkVisitor::dir_pre`], recurse, [`WalkVisitor::dir_post`].
+//! 4. admit each included possible leaf immediately before spawn; a positive directory hint carries
+//!    its explicit unadmitted exception into the task. Join/fold via [`join_and_fold`] (NOT batched:
+//!    see [`walk_dir_contents`] for why admission and spawn share one loop step),
+//! 5. in each task: authoritative [`Dir::child`] classification, then either checked
+//!    [`WalkVisitor::visit_leaf`] (holding the permit) or — for a directory — **drop the permit and
+//!    end its inner scope**, [`WalkVisitor::dir_pre`], recurse, [`WalkVisitor::dir_post`].
 //!
 //! ## The single invariant home
 //!
@@ -52,12 +52,12 @@
 //!   destination (`Some(dst)`/`None`) with the initial `is_fresh`.
 //! - **`type DirState`** = `{ dst_dir, dst_parent, dst_name, we_created, src_meta,
 //!   is_root, base }` — what `dir_post` needs to apply directory metadata
-//!   (`src_meta` is taken from `dir_pre`'s classification `Handle`, no extra stat),
+//!   (`src_meta` is read from the opened enumeration `Dir`, pairing it with the copied contents),
 //!   run empty-dir cleanup (`dst_parent.rmdir_at(dst_name)`), and `--delete`-prune,
 //!   plus the `base` create/unchanged contribution it folds with the children.
 //! - **`visit_leaf`** dispatches on `kind`: `File` → `copy_file_fd`, `Symlink` →
-//!   `copy_symlink_fd`, `Special` → skip-or-error. The admitted `permit` remains
-//!   held across every non-recursive fd-bearing leaf operation.
+//!   `copy_symlink_fd`, `Special` → skip-or-error. The admitted `permit` remains held across every
+//!   fd-bearing leaf-dispatch path, including recursive destination removal under overwrite.
 //!   `--dereference` of a symlink-to-dir stays inside `visit_leaf`: it transfers
 //!   the permit into the path-based target root walk (the one deliberately
 //!   non-fd-relative path). That walk releases the permit after authoritative

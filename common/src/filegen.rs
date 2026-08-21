@@ -252,9 +252,8 @@ pub async fn filegen(
     let should_generate_files = !leaf_files || is_leaf;
     if should_generate_files {
         for i in 0..*numfiles {
-            // it's better to await the token here so that we throttle how many tasks we spawn. the
-            // ops-throttle will never cause a deadlock (unlike max-open-files limit) so it's safe to
-            // do here.
+            // await the replenished rate token before spawn so an enabled ops throttle paces task
+            // creation at the configured operation rate
             throttle::get_ops_token().await;
             let path = root.join(format!("file{i}"));
             join_set.spawn(write_file(

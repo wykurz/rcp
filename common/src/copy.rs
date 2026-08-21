@@ -1066,7 +1066,8 @@ impl WalkVisitor for CopyVisitor {
     }
 
     fn permit_kind(&self) -> PermitKind {
-        // copy retains fd-backed handles across every non-recursive leaf operation.
+        // copy retains fd-backed handles across each leaf-dispatch path, including nested
+        // destination removal under overwrite
         PermitKind::OpenFile
     }
 
@@ -5982,15 +5983,13 @@ mod copy_tests {
             Ok(())
         }
 
-        /// Regression: copy_file → rm cross-pool deadlock.
+        /// Regression: copy-file overwrite removal must use the separate rm pool.
         ///
-        /// Scenario: many parallel copies overwrite destinations that are
-        /// directories (so each copy_file path takes the
-        /// "remove existing then copy" branch, and rm recurses). Each copy
-        /// task holds an open-files permit during copy_file; if rm also
-        /// drew permits from the open-files pool, a saturated pool would
-        /// deadlock — every permit held by a copy task waiting for rm to
-        /// release one. Decoupling rm onto pending-meta avoids that.
+        /// Scenario: many parallel copies overwrite destinations that are directories. Each
+        /// `copy_child` / `copy_file_fd` path retains OpenFile admission while `remove_existing`
+        /// invokes recursive `rm_child`. If rm also drew from OpenFile, a saturated pool would
+        /// deadlock — every permit would be held by a copy task waiting for rm to release one. The
+        /// separate PendingMeta pool avoids that cycle.
         #[tokio::test]
         #[traced_test]
         async fn parallel_overwrite_dir_with_file_no_deadlock() -> Result<(), anyhow::Error> {
@@ -6001,7 +6000,7 @@ mod copy_tests {
             tokio::fs::create_dir(&dst).await?;
             // 8 sources are regular files; the 8 corresponding destinations
             // are directories with nested files — copy with --overwrite
-            // forces rm of each dst directory tree from inside copy_file.
+            // forces rm of each dst directory tree from inside copy_file_fd.
             let n = 8;
             for i in 0..n {
                 tokio::fs::write(src.join(format!("e{}", i)), format!("file-{}", i)).await?;
@@ -6047,7 +6046,7 @@ mod copy_tests {
                 )
                 .await
                 .context(
-                    "copy timed out — deadlock between copy_file's open-files permit and inner rm",
+                    "copy timed out — deadlock between copy_file_fd's open-files permit and inner rm",
                 )?
                 .context("copy failed")?;
             assert_eq!(summary.files_copied, n);

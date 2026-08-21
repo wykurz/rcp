@@ -118,9 +118,9 @@ pub enum PermitKind {
 /// The two pools must stay distinct: [`throttle::OpenFileGuard`] gates fd-bearing
 /// copy/link leaf operations while [`throttle::PendingMetaGuard`] gates in-flight
 /// metadata traversal tasks, some of which retain an `O_PATH` classification
-/// handle. They are sized independently so a path that composes the two operations
-/// (e.g. `copy_file → rm` when overwriting a directory destination) cannot
-/// self-deadlock against a saturated open-files pool.
+/// handle. They are separate semaphores, each configured to the same `N`, so a path that composes
+/// the two operations (for example, `copy_file_fd → remove_existing → rm_child` when overwriting a
+/// directory destination) cannot self-deadlock against a saturated OpenFile pool.
 /// This enum unifies only the *lifecycle*, never the pools themselves.
 ///
 /// Neither guard is `Clone`; the only shared ownership they expose is an explicit
@@ -244,8 +244,8 @@ fn take_permit_after_closing_handle<H, P>(
 /// An authoritatively classified non-directory and its leaf admission.
 ///
 /// The private handle-then-permit fields document the lifetime invariant, while the explicit drop
-/// implementation enforces it in one testable place on every ordinary, error, panic, and
-/// cancellation exit. Directory dispatch never constructs this type.
+/// implementation enforces it in one testable place on every destructing exit: ordinary return,
+/// error, panic unwind, and cancellation. Directory dispatch never constructs this type.
 pub struct AdmittedLeaf {
     handle: Option<NonDirectoryHandle>,
     permit: Option<LeafPermit>,
@@ -501,10 +501,11 @@ where
 /// gate — for callers that already rate-limit at a coarser granularity
 /// upstream and would otherwise consume two tokens per metadata op.
 ///
-/// Concretely: `filegen` gates the rate at task-spawn time so the
-/// number of in-flight `write_file` futures stays bounded by the rate.
-/// The `OpenOptions::open(O_CREAT)` inside the spawned task is the only
-/// metadata syscall in that path; rate-gating it again would halve the
+/// Concretely: `filegen` gates the rate at task-spawn time so an enabled
+/// ops throttle paces creation of `write_file` futures. Their concurrent
+/// backlog is controlled separately by descriptor admission when that is
+/// enabled. The `OpenOptions::open(O_CREAT)` inside the spawned task is the
+/// only metadata syscall in that path; rate-gating it again would halve the
 /// effective rate.
 pub async fn run_metadata_probed_no_rate<F, T, E>(
     side: congestion::Side,

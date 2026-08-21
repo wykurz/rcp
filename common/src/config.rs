@@ -56,8 +56,11 @@ pub struct AutoMetaThrottleConfig {
 /// Throttling configuration for resource control
 #[derive(Debug, Clone)]
 pub struct ThrottleConfig {
-    /// Descriptor-backpressure limit per leaf-operation pool (`None` derives an operation count
-    /// from 80% of the system fd budget).
+    /// Admission count assigned to each independent OpenFile and PendingMeta pool.
+    ///
+    /// `None` derives a per-pool count from the current soft `RLIMIT_NOFILE`, four modeled
+    /// descriptor units, and a 4096 cap; a zero soft limit leaves admission disabled. `Some(0)`
+    /// also disables descriptor admission.
     pub max_open_files: Option<usize>,
     /// Operations per second throttle (0 = no throttle)
     pub ops_throttle: usize,

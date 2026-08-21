@@ -555,28 +555,65 @@ The recursive safe-walk is not re-implemented per tool. `rcp` (copy), `rchm`, an
 `common/src/walk_driver.rs` owns the recursive spawn/classify/permit/drop-before-recurse skeleton,
 so the security-relevant invariants each live in exactly one place:
 
-- **Drop-before-recurse (deadlock invariant)**: the leaf-permit "drop the permit before recursing
-  into a directory" rule lives in the driver's directory branch alone, not hand-maintained at every
-  recursion site. A structural lint (`scripts/check-walk-driver-usage.sh`) fails the build if
-  `copy.rs`/`chmod.rs`/`rm.rs` reintroduce a hand-rolled walk (a `JoinSet` or `read_entries`).
-- **Admit-before-classify (descriptor invariant)**: every entry that may be a leaf, including a
-  `DT_UNKNOWN` entry, reserves leaf-operation capacity before a filter probe, task spawn, or
-  authoritative `O_PATH` classification. Root and delegated walks repair missing admission before
-  opening operand parents. If classification proves the entry is a directory, the driver releases
-  the provisional admission and redundant classification handle before descent. This bounds
-  fd-bearing leaf fan-out without reintroducing the deep-directory hold-and-wait deadlock.
+- **Drop-before-recurse (deadlock invariant)**: the "release provisional leaf admission before
+  recursing into a directory" rule lives in the driver's directory branch alone, not hand-maintained
+  at every recursion site. The inner admission scope ends before `dir_pre` and descent, restoring
+  any outer pool before nested work. A structural lint (`scripts/check-walk-driver-usage.sh`) fails
+  the build if `copy.rs`/`chmod.rs`/`rm.rs` reintroduce a hand-rolled walk (a `JoinSet` or
+  `read_entries`).
+- **Admission scheduling (descriptor invariant)**: a reliable `getdents` type hint lets the driver
+  make a cheap filter decision before admission. A `DT_UNKNOWN` entry with an active filter acquires
+  first because its authoritative filter probe opens a handle; an included unknown or known
+  non-directory otherwise acquires immediately before spawn. A positive directory hint is the sole
+  classification exception and takes no leaf admission. If that hint is stale, the first handle is
+  closed, admission is acquired, and classification repeats. An authoritative directory releases any
+  provisional permit inside the inner scope before `dir_pre` or descent. This bounds fd-bearing leaf
+  fan-out without putting arbitrary recursive directory depth/breadth into a pool, which would
+  recreate the deep-directory hold-and-wait deadlock.
+- **Checked leaf ownership**: only a checked non-directory handle can construct `AdmittedLeaf`, so a
+  directory-as-leaf state is unrepresentable in release builds. Its explicit `Drop` closes the
+  classification handle before releasing the permit on every destructing exit, including success,
+  error, early return, panic unwind, and cancellation; `into_permit` closes the handle before
+  transferring admission. The canonical safedir blocking runner attempts to upgrade any live ambient
+  weak admission reference; if none is live, it adds no lease. If its async waiter is abandoned
+  after an upgrade, any descriptor-bearing output drops before that lease.
+- **Root and delegation scope**: local copy/rm/chmod and rlink root setup acquire before their
+  fd-bearing parent/classification work. Delegated shared-driver and rlink entries either ensure or
+  transfer admission before final classification. This statement does not cover every remote rcpd
+  parent/root open; remote source and destination have separate protocol-specific setup.
+- **Independent pools and recursive overwrite**: the same configured `N` is assigned to separate
+  OpenFile and PendingMeta semaphores, not one combined pool. Copy/link overwrite leaf work can
+  retain OpenFile admission while recursively invoking rm, which draws from PendingMeta. That
+  OpenFile → PendingMeta call is the only direction between those two descriptor-admission pools;
+  recursive directory handles and process-support descriptors remain outside both `--max-open-files`
+  pools and their default soft-limit heuristic.
 - **Trusted vs hardened boundary**: the symlink-following parent-prefix open returns a distinct
   `TrustedDir` type (`common/src/safedir.rs`); crossing below the named root yields a hardened `Dir`
   whose child opens are all `O_NOFOLLOW`. The boundary is type-enforced — a hardened child cannot be
   silently used where a trusted parent is required, and vice versa.
-- **DT_UNKNOWN classification**: every filter `is_dir` decision routes through the single
-  `walk::filter_is_dir` path, which falls back to an authoritative `fstat` when the `getdents` hint
-  is `DT_UNKNOWN` (never following a symlink), so a real directory's subtree can never be silently
-  omitted by a hint-only check.
+- **Filter-probe errors**: the shared hardened driver, rlink's dual-tree driver, and delete
+  protection route `is_dir` decisions through `walk::filter_is_dir`. A `DT_UNKNOWN` hint therefore
+  falls back to authoritative `fstat` without following a symlink, and any probe error propagates.
+  In particular, delete aborts instead of treating an uncertain entry as a non-directory and pruning
+  it. The path-based rcmp walk remains a read-only exception: a failed `DirEntry::file_type`
+  currently falls back to non-directory for filtering. Making that path fail closed is a follow-up;
+  it does not authorize filesystem mutation today.
+- **Cancellation boundary**: repository-owned blocking jobs routed through the canonical safedir
+  runner attempt to upgrade a live ambient weak admission reference and retain it when present. If
+  the async waiter is cancelled after an upgrade, an abandoned descriptor-bearing output drops
+  before that strong lease. With no live ambient admission, the runner adds no lease. Local copy's
+  synchronous data move and filegen's one-buffer synchronous chunks use this boundary. A weak scope
+  alone is passive: admitted remote source/destination payload-leaf streaming still uses
+  `tokio::fs::File`, whose private blocking jobs can retain an `Arc<StdFile>` owning the same fd
+  after high-level cancellation without inheriting admission. The fd is retained, not cloned or
+  duplicated. A separate bounded remote-I/O abstraction is the documented follow-up for that
+  payload-leaf residual; it is not a claim about every Tokio filesystem operation, and the wire
+  protocol is unchanged.
 
 `rlink` is the documented exception: it walks two correlated trees (source plus `--update`) and so
 keeps its own dual-tree enumeration, but it shares the same substrate — the `TrustedDir` boundary,
-the `LeafPermit` lifecycle, and `filter_is_dir` — rather than duplicating the hardening.
+explicit entry admission, checked leaf ownership, and fallible `filter_is_dir` — rather than
+duplicating the hardening.
 
 ### Scope
 

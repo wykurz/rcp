@@ -166,18 +166,19 @@ impl Semaphore {
     }
 
     /// Disable this semaphore without adjusting the cap. Intended for
-    /// rate-throttle semantics where "no limit" means `consume()` becomes
-    /// a no-op rather than pausing token replenishment.
+    /// rate-throttle semantics where "no limit" means future `consume()`
+    /// calls become no-ops rather than pausing token replenishment. A caller
+    /// already parked in the current epoch can still receive a replenished
+    /// token.
     pub fn disable(&self) {
         self.flag.store(false, Ordering::Release);
     }
 
     /// Re-enable this semaphore after [`disable`], so `consume` / `acquire`
-    /// once again wait on the inner pool. Requires that the semaphore was
-    /// previously configured (via [`setup`] or [`set_max`]) with a non-zero
-    /// value — otherwise there are no permits for callers to wait on, and
-    /// flipping the flag would strand them. Returns `true` if the flag was
-    /// flipped on, `false` if there is no prior configuration to enable.
+    /// once again wait on the inner pool. Requires that the current epoch has
+    /// a nonzero configured limit — otherwise there are no permits for callers
+    /// to wait on, and flipping the flag would strand them. Returns `true` if
+    /// the flag was flipped on, `false` if the current limit is zero.
     pub fn enable(&self) -> bool {
         let epoch = self
             .epoch
@@ -255,7 +256,9 @@ impl Semaphore {
         // [`crate::enable_ops_throttle`]. If the thread exited on `!flag`
         // here it would race that sequence and die before it ever looped.
         // With `replenish == 0`, each iteration is a no-op, so running
-        // the loop while disabled is cheap.
+        // the loop while disabled is cheap. A nonzero replenish can still
+        // wake callers that parked before disable; otherwise it leaves
+        // permits available for a later enable.
         self.replenish.store(replenish, Ordering::Release);
         loop {
             tokio::time::sleep(interval).await;

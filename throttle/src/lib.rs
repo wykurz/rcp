@@ -5,30 +5,32 @@
 //!
 //! # Overview
 //!
-//! The throttle system provides three types of rate limiting:
+//! The throttle system provides descriptor admission and two types of rate limiting:
 //!
-//! 1. **Open Files Limit** - Bounds concurrent fd-bearing leaf operations
-//! 2. **Operations Throttle** - Limits the number of operations per second
-//! 3. **I/O Operations Throttle** - Limits the number of I/O operations per second based on chunk size
-//!
-//! All throttling is implemented using token-bucket semaphores that are automatically replenished at configured intervals.
+//! 1. **Descriptor Admission** - Bounds concurrent fd-bearing leaf and metadata operations with
+//!    held/released semaphores
+//! 2. **Operations Throttle** - Limits the number of operations per second with replenished tokens
+//! 3. **I/O Operations Throttle** - Limits I/O operations per second based on chunk size with
+//!    replenished tokens
 //!
 //! # Usage Patterns
 //!
-//! ## Open Files Limit
+//! ## Descriptor Admission
 //!
-//! Applies descriptor backpressure by controlling concurrent file operations. This is not a hard
-//! process-wide descriptor ceiling: one operation may own multiple fds, and recursive directory
-//! handles are deliberately outside this pool so traversal cannot hold-and-wait deadlock.
+//! Applies descriptor backpressure through two independent semaphores. The same configured `N` is
+//! assigned to the OpenFile pool for fd-bearing leaf work and the PendingMeta pool for spawned
+//! metadata work. It is not a hard process-wide descriptor ceiling or a combined total: one
+//! operation may own multiple fds, and recursive directory handles are deliberately outside these
+//! pools so traversal cannot hold-and-wait deadlock.
 //!
 //! ```rust,no_run
 //! use throttle::{set_max_open_files, open_file_permit};
 //!
 //! # async fn example() {
-//! // Configure leaf-operation descriptor backpressure
+//! // configure both descriptor-admission pools to 8000 operations each
 //! set_max_open_files(8000);
 //!
-//! // Acquire permit before opening file
+//! // acquire from the OpenFile pool before opening a leaf
 //! let _guard = open_file_permit().await;
 //! // Open file here - permit is automatically released when guard is dropped
 //! # }
@@ -108,11 +110,13 @@
 //!
 //! # Thread Safety
 //!
-//! All throttling mechanisms are thread-safe and can be used across multiple async tasks and threads. The semaphores use efficient `parking_lot` mutexes internally.
+//! All throttling mechanisms are thread-safe and can be used across multiple async tasks and
+//! threads. Descriptor admission uses Tokio semaphores whose replaceable epochs are selected under
+//! a standard read/write lock.
 //!
 //! # Performance Considerations
 //!
-//! - **Open Files Limit**: No replenishment needed, permits released automatically
+//! - **Descriptor Admission**: No replenishment needed, permits released automatically
 //! - **Ops/IOPS Throttle**: Background task overhead is minimal (~1 task per throttle type)
 //! - **Token Acquisition**: Async operation that parks task when no tokens available
 //!
@@ -125,7 +129,7 @@
 //! use std::time::Duration;
 //!
 //! async fn setup_throttling() {
-//!     // Limit concurrent fd-bearing leaf operations
+//!     // limit each descriptor-admission pool to 8000 operations
 //!     set_max_open_files(8000);
 //!
 //!     // 500 operations per second
@@ -242,9 +246,8 @@ static OPEN_FILES_LIMIT: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
 // spawn-time backpressure for metadata traversal tasks (rm, chmod, cmp). Hardened rm/chmod entries
 // carry a short-lived O_PATH handle, but this stays separate from OPEN_FILES_LIMIT so an inner rm
-// triggered by a copy/link path that already holds an OPEN_FILES_LIMIT
-// permit cannot deadlock against itself when the outer permit pool is
-// saturated. Both semaphores are sized to the same configured limit by
+// triggered by copy/link overwrite leaf work that already holds an OPEN_FILES_LIMIT permit cannot
+// deadlock against itself when the outer pool is saturated. Both semaphores receive the same N from
 // `set_max_open_files`.
 static PENDING_META_LIMIT: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
@@ -273,14 +276,15 @@ fn ops_in_flight_limit(resource: Resource) -> &'static semaphore::Semaphore {
 ///
 /// * [`open_file_permit`] — leaf-operation backpressure for paths that hold
 ///   open fds (copy/link). One operation can hold multiple descriptors.
-/// * [`pending_meta_permit`] — task-spawn backpressure for recursive
-///   metadata walks (rm/chmod/cmp). Hardened entry classification can carry
-///   an `O_PATH` fd; the pool remains separate so paths that compose operations
-///   (e.g. `copy_file → rm` for an overwrite of a directory
-///   destination) cannot deadlock against the open-files pool.
+/// * [`pending_meta_permit`] — task-spawn backpressure for recursive metadata walks
+///   (rm/chmod/cmp). Hardened entry classification can carry an `O_PATH` fd; the pool remains
+///   separate so copy/link overwrite leaf work can retain OpenFile admission while recursively
+///   invoking rm, which draws only from PendingMeta.
 ///
-/// Pass `0` to disable both caps; `setup` is idempotent and intended
-/// for startup or test reset.
+/// The same `max_open_files` value is assigned independently to each semaphore; it is not a
+/// combined total. Pass `0` to disable both caps. Every call replaces and closes both semaphore
+/// epochs, so this is intended for startup, process reset, and test reset rather than live
+/// same-limit refresh.
 pub fn set_max_open_files(max_open_files: usize) {
     OPEN_FILES_LIMIT.setup(max_open_files);
     PENDING_META_LIMIT.setup(max_open_files);
@@ -290,8 +294,9 @@ pub fn set_max_open_files(max_open_files: usize) {
 ///
 /// The operation guards themselves deliberately remain non-`Clone`: ordinary async ownership has
 /// one obvious release point. This weak reference can be threaded through async code without
-/// extending that lifetime across recursive directory descent. Immediately before non-cancellable
-/// blocking work starts, [`Self::blocking_lease`] upgrades it to a strong lease for that syscall.
+/// extending that lifetime across recursive directory descent, but it is passive: a repository
+/// runner must explicitly call [`Self::blocking_lease`] immediately before non-cancellable work.
+/// Blocking jobs started privately by unrelated async APIs neither inherit nor upgrade it.
 #[derive(Clone)]
 pub struct FdAdmission {
     permit: Option<std::sync::Weak<semaphore::Permit>>,
@@ -338,10 +343,8 @@ pub async fn open_file_permit() -> OpenFileGuard {
 /// Held across a spawned task to bound the live task count under
 /// recursive walk operations. Hardened rm/chmod workers can retain an `O_PATH`
 /// classification handle while this guard is live.
-/// Kept distinct from [`OpenFileGuard`] so that paths which compose
-/// these operations (e.g. `copy_file → rm` for an overwrite of a
-/// directory destination) don't deadlock against a saturated
-/// `OPEN_FILES_LIMIT`.
+/// Kept distinct from [`OpenFileGuard`] so copy/link overwrite leaf work can retain OpenFile
+/// admission while recursively invoking rm without deadlocking against a saturated OpenFile pool.
 pub struct PendingMetaGuard {
     permit: Option<std::sync::Arc<semaphore::Permit>>,
 }
@@ -454,8 +457,8 @@ pub async fn run_iops_replenish_thread(replenish: usize, interval: std::time::Du
 ///    but no token refills happen.
 /// 2. The ops-throttle must be enabled (via [`init_ops_tokens`] with a
 ///    non-zero value, or [`enable_ops_throttle`] after a prior
-///    [`disable_ops_throttle`]); otherwise [`get_ops_token`] is a no-op
-///    regardless of the replenish count.
+///    [`disable_ops_throttle`]); otherwise a new [`get_ops_token`] call is
+///    a no-op regardless of the replenish count.
 pub fn set_ops_replenish(value: usize) {
     OPS_THROTTLE.set_replenish(value);
 }
@@ -466,14 +469,15 @@ pub fn set_iops_replenish(value: usize) {
     IOPS_THROTTLE.set_replenish(value);
 }
 
-/// Disable the ops-throttle, making [`get_ops_token`] a no-op. Mirrors
-/// the "unlimited on this dimension" semantics of `Decision` so an
+/// Disable the ops-throttle, making future [`get_ops_token`] calls a no-op.
+/// Mirrors the "unlimited on this dimension" semantics of `Decision` so an
 /// adaptive controller can transition a previously-set rate back to "no
 /// limit" by sending `rate_per_sec: None`.
 ///
-/// The replenish loop keeps running (it has no mid-loop flag check) but
-/// its token additions become inert until the flag is flipped back on
-/// via [`enable_ops_throttle`].
+/// The replenish loop keeps running. A caller already parked in the current
+/// semaphore epoch can still be woken by a replenished token; otherwise the
+/// token remains available if the flag is flipped back on via
+/// [`enable_ops_throttle`].
 pub fn disable_ops_throttle() {
     OPS_THROTTLE.disable();
 }
@@ -481,9 +485,9 @@ pub fn disable_ops_throttle() {
 /// Re-enable the ops-throttle after [`disable_ops_throttle`] — the
 /// counterpart that allows a controller to toggle rate capping on and
 /// off via `Decision::rate_per_sec`. Returns `true` if enablement took
-/// effect, `false` if the throttle was never initialized (i.e.
-/// `--ops-throttle` was not set at startup) so there is nothing to
-/// enable.
+/// effect, `false` if the current configured limit is zero so there is
+/// nothing to enable. Auto-meta startup can initialize this semaphore
+/// even when `--ops-throttle` was omitted.
 pub fn enable_ops_throttle() -> bool {
     OPS_THROTTLE.enable()
 }

@@ -91,13 +91,14 @@ struct Args {
     #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
     quiet: bool,
 
-    /// Maximum number of open files (concurrent file writes)
+    /// Concurrent file-write admission limit
     ///
-    /// Since filegen's random data generation is CPU-intensive, the default is set to the number
-    /// of physical CPU cores. This optimizes performance by matching concurrency to compute
-    /// capacity rather than allowing excessive parallelism that would cause CPU contention.
+    /// Since filegen's random data generation is CPU-intensive, the default uses available CPU
+    /// parallelism. This optimizes performance by matching concurrency to compute capacity rather
+    /// than allowing excessive parallelism that would cause CPU contention.
     ///
-    /// Set to 0 for no limit. Increase if using slow storage where I/O latency dominates.
+    /// Set to 0 to disable file-write admission. Increase if using slow storage where I/O latency
+    /// dominates.
     #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
     max_open_files: Option<usize>,
 
@@ -159,7 +160,8 @@ fn main() -> Result<(), anyhow::Error> {
     let output = args.common.output_config(args.quiet, args.summary);
     let runtime = args.common.runtime_config();
     // filegen's random data generation is CPU-intensive, so we default to
-    // available parallelism rather than 80% of RLIMIT_NOFILE used by other tools.
+    // available parallelism rather than the soft-rlimit leaf-admission heuristic used by other
+    // tools
     // use 1 as absolute minimum to avoid accidentally disabling limits.
     let max_open_files = args.max_open_files.unwrap_or_else(|| {
         std::thread::available_parallelism()

@@ -9,6 +9,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Leaf descriptor admission now covers fd-bearing classification and work throughout the shared
+  hardened copy/remove/chmod walk, rlink's dual-tree walk, and delete protection. This fixes
+  `EMFILE` failures seen on slow sources with wide trees, especially filesystems such as NFS that
+  frequently report `DT_UNKNOWN`: unknown entries that need a filter probe acquire admission before
+  the authoritative stat, while reliable filter skips avoid the pool. Reliable directory hints still
+  classify without leaf admission to preserve deep-tree liveness; if one is stale, its first handle
+  is closed before admission and reclassification. Authoritative filter-probe errors now propagate
+  on these paths, so delete no longer prunes after an authoritative filter probe fails.
+
+  Leaf ownership and cancellation boundaries are structural rather than call-site convention:
+  admitted leaves can contain only checked non-directory handles and explicitly close the handle
+  before their permit on every destructing exit. Local copy's synchronous data move and filegen's
+  bounded synchronous chunks use one runner that retains admission through cancellation and drops
+  abandoned fd-bearing outputs before releasing it. Recursive overwrite removal uses a separate
+  metadata pool, so recursive-descent directory descriptors remain outside leaf admission without
+  creating a cross-pool wait cycle. Startup/test setup and process reset now replace and close the
+  prior semaphore epoch; `set_max(0)` does the same for dynamically capped pools. Parked waiters
+  wake and either retry on a nonzero replacement or return when the pool is disabled, while old
+  permits can return only to the retired epoch and cannot shrink the new pool. Nonzero dynamic
+  `set_max` updates the current epoch in place. Admitted remote source/destination payload streaming
+  retains a documented cancellation-lifetime follow-up; its wire behavior is unchanged.
+
+  When `--max-open-files` is omitted and the current soft `RLIMIT_NOFILE` is nonzero, each
+  independent OpenFile and PendingMeta pool now receives
+  `min(max(1, floor((soft limit × 80%) / 4)), 4096)`; a zero soft limit leaves admission disabled.
+  The process soft limit is no longer silently raised to its hard limit. Compared with the previous
+  released default, this is approximately one quarter as many admitted operations only for uncapped
+  runs whose soft and hard limits were equal; a lower soft limit can reduce the count further, while
+  systems where both old and new calculations hit 4096 may see no change. An explicit
+  `--max-open-files=N` and filegen's available-CPU-parallelism default are unchanged.
+
 - The source-root ACL notice now fires only when the run **asked** for the fidelity a dropped ACL
   would undermine: `--preserve`/`--preserve-settings` requesting anything beyond the shipped
   default, or `--require-toctou-safe`. A bare `rcp src dst` is silent, probe included — it pays not
@@ -271,11 +302,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   directory failed to be created — out of space, or a `--require-toctou-safe` lockdown that could
   not secure a reused directory — or a transfer task failed, the source's directory walk could stay
   parked on its file-descriptor budget forever, because the budget was not released on the
-  destination's abort. The source now releases that budget whenever its control-message dispatch
-  loop exits for any reason (a control-stream close, a transport-task error, or a panic), so the
-  copy tears down cleanly instead of hanging. The failure is now also reported with its real cause
-  (for example a file's `Permission denied`) rather than the internal budget-release wakeup that
-  unblocks the parked walk.
+  destination's abort. The source now explicitly releases that budget after every normal
+  control-message dispatch result, before draining tasks. Once dispatch starts, an RAII closer
+  covers cancellation and panic unwind before that point, so teardown does not hang on a parked walk
+  along paths that run destructors. The failure is now also reported with its real cause (for
+  example a file's `Permission denied`) rather than the internal budget-release wakeup that unblocks
+  the parked walk.
 - Fix two indefinite hangs in remote `rcp -L`/`--dereference` copies, on source entries that change
   while the copy walks them. Both need `-L` and nothing else — no ACLs, no `--fail-early`.
 

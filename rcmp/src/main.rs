@@ -108,8 +108,11 @@ struct Args {
     )]
     output_format: common::cmp::OutputFormat,
 
-    /// Metadata-task backpressure limit; recursive directory fds are outside this pool
-    /// (0 = no limit, unspecified = derived from 80% of the system fd budget)
+    /// Descriptor admission count assigned to the independent OpenFile and PendingMeta pools, not a
+    /// literal fd maximum or combined total; rcmp uses PendingMeta for metadata tasks, while
+    /// recursive ReadDir descriptors remain outside admission. 0 disables admission. For a nonzero
+    /// soft RLIMIT_NOFILE, the default per pool is
+    /// min(max(1, floor((soft limit * 80%) / 4)), 4096); zero leaves admission disabled.
     #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
     max_open_files: Option<usize>,
 
