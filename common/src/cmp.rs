@@ -1808,19 +1808,20 @@ mod cmp_tests {
                 },
                 filter: None,
             };
-            let summary = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                cmp(
-                    &PROGRESS,
-                    &src,
-                    &dst,
-                    &LogWriter::silent().await?,
-                    &compare_settings,
-                ),
-            )
-            .await
-            .context("cmp timed out — possible deadlock")?
-            .context("cmp failed")?;
+            let summary = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(30),
+                    cmp(
+                        &PROGRESS,
+                        &src,
+                        &dst,
+                        &LogWriter::silent().await?,
+                        &compare_settings,
+                    ),
+                )
+                .await
+                .context("cmp timed out — possible deadlock")?
+                .context("cmp failed")?;
             assert_eq!(
                 summary.mismatch[ObjType::File][CompareResult::Same],
                 depth * files_per_level
@@ -1863,19 +1864,20 @@ mod cmp_tests {
                 },
                 filter: None,
             };
-            let summary = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                cmp(
-                    &PROGRESS,
-                    &src,
-                    &dst,
-                    &LogWriter::silent().await?,
-                    &compare_settings,
-                ),
-            )
-            .await
-            .context("cmp timed out — possible deadlock")?
-            .context("cmp failed")?;
+            let summary = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(30),
+                    cmp(
+                        &PROGRESS,
+                        &src,
+                        &dst,
+                        &LogWriter::silent().await?,
+                        &compare_settings,
+                    ),
+                )
+                .await
+                .context("cmp timed out — possible deadlock")?
+                .context("cmp failed")?;
             // every file under src is missing on dst
             assert_eq!(
                 summary.mismatch[ObjType::File][CompareResult::DstMissing],

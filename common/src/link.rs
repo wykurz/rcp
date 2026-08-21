@@ -201,6 +201,21 @@ pub async fn link(
     settings: &Settings,
     is_fresh: bool,
 ) -> Result<Summary, Error> {
+    crate::walk_driver::scope_tasks(link_inner(
+        prog_track, cwd, src, dst, update, settings, is_fresh,
+    ))
+    .await
+}
+
+async fn link_inner(
+    prog_track: &'static progress::Progress,
+    cwd: &std::path::Path,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    update: &Option<std::path::PathBuf>,
+    settings: &Settings,
+    is_fresh: bool,
+) -> Result<Summary, Error> {
     // `cwd` is retained for API/signature parity (callers still pass it) but the fd-based walk
     // reconstructs every path from the explicit roots, so it is no longer threaded into the walk.
     let _ = cwd;
@@ -1390,7 +1405,7 @@ async fn link_dir_contents(
             )
             .await
         };
-        join_set.spawn(do_link());
+        crate::walk_driver::spawn_tracked(&mut join_set, do_link());
     }
     // only process update if the path was provided and the directory is present
     if let Some(update_dir) = update_dir {
@@ -1502,7 +1517,7 @@ async fn link_dir_contents(
                 )
                 .await
             };
-            join_set.spawn(do_copy());
+            crate::walk_driver::spawn_tracked(&mut join_set, do_copy());
         }
     }
     while let Some(res) = join_set.join_next().await {
@@ -1518,6 +1533,7 @@ async fn link_dir_contents(
                     );
                     link_summary = link_summary + error.summary;
                     if settings.copy_settings.fail_early {
+                        crate::walk_driver::abort_and_join(&mut join_set).await;
                         return Err(Error::new(error.source, link_summary));
                     }
                     errors.push(error.source);
@@ -1525,6 +1541,7 @@ async fn link_dir_contents(
             },
             Err(error) => {
                 if settings.copy_settings.fail_early {
+                    crate::walk_driver::abort_and_join(&mut join_set).await;
                     return Err(Error::new(error.into(), link_summary));
                 }
                 errors.push(error.into());
@@ -4114,8 +4131,9 @@ mod link_tests {
             let setup_bypassed_admission = futures::poll!(second_permit.as_mut()).is_ready();
             drop(second_permit);
             drop(held_stat);
-            let result =
-                tokio::time::timeout(std::time::Duration::from_secs(20), operation.as_mut()).await;
+            let result = admission
+                .run_with_timeout(std::time::Duration::from_secs(20), operation.as_mut())
+                .await;
             assert!(
                 stopped_at_stat_gate,
                 "rlink root did not reach the held stat gate"
@@ -4138,6 +4156,7 @@ mod link_tests {
             let src_path = root.join("src");
             let dst_path = root.join("dst");
             tokio::fs::write(&src_path, b"x").await?;
+            let admission = testutils::AdmissionLimit::new().await;
             let src_parent = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -4146,7 +4165,6 @@ mod link_tests {
             let mut settings = common_settings(false, false);
             settings.dry_run = Some(crate::config::DryRunMode::Brief);
             settings.copy_settings.dry_run = settings.dry_run;
-            let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
@@ -4173,8 +4191,9 @@ mod link_tests {
                 futures::poll!(second_permit.as_mut()).is_ready();
             drop(second_permit);
             drop(held_stat);
-            let result =
-                tokio::time::timeout(std::time::Duration::from_secs(20), operation.as_mut()).await;
+            let result = admission
+                .run_with_timeout(std::time::Duration::from_secs(20), operation.as_mut())
+                .await;
             assert!(
                 stopped_at_stat_gate,
                 "rlink root did not reach the held stat gate"
@@ -4243,17 +4262,10 @@ mod link_tests {
             let released_before_link_finished = second_permit.is_ok();
             drop(second_permit);
             drop(held_hard_link);
-            let task_result =
-                tokio::time::timeout(std::time::Duration::from_secs(20), &mut task).await;
-            let task_result = match task_result {
-                Ok(result) => result,
-                Err(error) => {
-                    task.abort();
-                    let _ = task.await;
-                    return Err(error)
-                        .context("hard link did not resume after metadata capacity was released");
-                }
-            };
+            let task_result = admission
+                .run_with_timeout(std::time::Duration::from_secs(20), &mut task)
+                .await
+                .context("hard link did not resume after metadata capacity was released")?;
             let summary = task_result?.map_err(|error| error.source)?;
             assert!(
                 !released_before_link_finished,
@@ -4290,21 +4302,22 @@ mod link_tests {
             }
             let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(limit);
-            let summary = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                link(
-                    &PROGRESS,
-                    tmp_dir.as_path(),
-                    &src,
-                    &dst,
-                    &None,
-                    &common_settings(false, false),
-                    false,
-                ),
-            )
-            .await
-            .context("link timed out — possible deadlock")?
-            .context("link failed")?;
+            let summary = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(30),
+                    link(
+                        &PROGRESS,
+                        tmp_dir.as_path(),
+                        &src,
+                        &dst,
+                        &None,
+                        &common_settings(false, false),
+                        false,
+                    ),
+                )
+                .await
+                .context("link timed out — possible deadlock")?
+                .context("link failed")?;
             assert_eq!(summary.hard_links_created, depth * files_per_level);
             assert_eq!(summary.copy_summary.directories_created, depth);
             // spot-check that hard links work by reading content at a few levels
@@ -4355,21 +4368,24 @@ mod link_tests {
             // saturate the pool so retaining delegated admission during descent blocks child work.
             let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(2);
-            let summary = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                link(
-                    &PROGRESS,
-                    tmp_dir.as_path(),
-                    &src,
-                    &dst,
-                    &Some(update.clone()),
-                    &common_settings(false, false),
-                    false,
-                ),
-            )
-            .await
-            .context("link timed out — delegated admission was retained during directory descent")?
-            .context("link failed")?;
+            let summary = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(30),
+                    link(
+                        &PROGRESS,
+                        tmp_dir.as_path(),
+                        &src,
+                        &dst,
+                        &Some(update.clone()),
+                        &common_settings(false, false),
+                        false,
+                    ),
+                )
+                .await
+                .context(
+                    "link timed out — delegated admission was retained during directory descent",
+                )?
+                .context("link failed")?;
             // every entry was a type-mismatch -> copied from update.
             // copy::copy on a directory creates the dir and copies inner files.
             assert_eq!(summary.copy_summary.directories_created, n + 1); // +1 for dst itself
@@ -4432,24 +4448,16 @@ mod link_tests {
             .await;
             if let Err(error) = first_worker {
                 drop(held_readlink);
-                task.abort();
-                let _ = task.await;
+                admission.quiesce(&mut task).await;
                 return Err(error).context("the first update-only worker did not start");
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let started_while_blocked = progress.ops.get().started;
             drop(held_readlink);
-            let task_result =
-                tokio::time::timeout(std::time::Duration::from_secs(20), &mut task).await;
-            let task_result = match task_result {
-                Ok(result) => result,
-                Err(error) => {
-                    task.abort();
-                    let _ = task.await;
-                    return Err(error)
-                        .context("update-only copies did not resume after ReadLink was released");
-                }
-            };
+            let task_result = admission
+                .run_with_timeout(std::time::Duration::from_secs(20), &mut task)
+                .await
+                .context("update-only copies did not resume after ReadLink was released")?;
             let summary = task_result?.map_err(|error| error.source)?;
             assert_eq!(
                 started_while_blocked, 2,
@@ -4483,21 +4491,22 @@ mod link_tests {
             }
             let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(2);
-            let summary = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                link(
-                    &PROGRESS,
-                    tmp_dir.as_path(),
-                    &src,
-                    &dst,
-                    &Some(update.clone()),
-                    &common_settings(false, false),
-                    false,
-                ),
-            )
-            .await
-            .context("link timed out — site-3 spawn loop deadlock")?
-            .context("link failed")?;
+            let summary = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(30),
+                    link(
+                        &PROGRESS,
+                        tmp_dir.as_path(),
+                        &src,
+                        &dst,
+                        &Some(update.clone()),
+                        &common_settings(false, false),
+                        false,
+                    ),
+                )
+                .await
+                .context("link timed out — site-3 spawn loop deadlock")?
+                .context("link failed")?;
             // dst gets the src directory plus a copy of every update file
             assert_eq!(summary.copy_summary.directories_created, 1);
             assert_eq!(summary.copy_summary.files_copied, n);
@@ -4548,21 +4557,22 @@ mod link_tests {
             // saturate both pools to force the deadlock if the cycle existed.
             let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(2);
-            let summary = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                link(
-                    &PROGRESS,
-                    tmp_dir.as_path(),
-                    &src,
-                    &dst,
-                    &Some(update.clone()),
-                    &common_settings(false, true), // overwrite=true
-                    false,
-                ),
-            )
-            .await
-            .context("link timed out — pending-meta self-deadlock between site 3 and inner rm")?
-            .context("link failed")?;
+            let summary = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(30),
+                    link(
+                        &PROGRESS,
+                        tmp_dir.as_path(),
+                        &src,
+                        &dst,
+                        &Some(update.clone()),
+                        &common_settings(false, true), // overwrite=true
+                        false,
+                    ),
+                )
+                .await
+                .context("link timed out — pending-meta self-deadlock between site 3 and inner rm")?
+                .context("link failed")?;
             // each preexisting dst/uN directory gets removed and replaced
             // with a regular-file copy from update/uN.
             assert_eq!(summary.copy_summary.files_copied, n);

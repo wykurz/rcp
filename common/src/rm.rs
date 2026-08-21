@@ -1987,8 +1987,9 @@ mod tests {
             let setup_bypassed_admission = futures::poll!(second_permit.as_mut()).is_ready();
             drop(second_permit);
             drop(held_stat);
-            let result =
-                tokio::time::timeout(std::time::Duration::from_secs(20), operation.as_mut()).await;
+            let result = admission
+                .run_with_timeout(std::time::Duration::from_secs(20), operation.as_mut())
+                .await;
             assert!(
                 stopped_at_stat_gate,
                 "rm root did not reach the held stat gate"
@@ -2020,21 +2021,22 @@ mod tests {
             // set a very low limit to force permit contention
             let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(4);
-            let summary = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                rm(
-                    &PROGRESS,
-                    &test_path,
-                    &Settings {
-                        fail_early: true,
-                        filter: None,
-                        dry_run: None,
-                        time_filter: None,
-                    },
-                ),
-            )
-            .await
-            .context("rm timed out — possible deadlock")??;
+            let summary = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(30),
+                    rm(
+                        &PROGRESS,
+                        &test_path,
+                        &Settings {
+                            fail_early: true,
+                            filter: None,
+                            dry_run: None,
+                            time_filter: None,
+                        },
+                    ),
+                )
+                .await
+                .context("rm timed out — possible deadlock")??;
             assert_eq!(summary.files_removed, file_count);
             assert_eq!(summary.directories_removed, 1);
             assert!(!test_path.exists());
@@ -2065,22 +2067,23 @@ mod tests {
             }
             let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(limit);
-            let summary = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                rm(
-                    &PROGRESS,
-                    &test_path,
-                    &Settings {
-                        fail_early: true,
-                        filter: None,
-                        dry_run: None,
-                        time_filter: None,
-                    },
-                ),
-            )
-            .await
-            .context("rm timed out — possible deadlock")?
-            .context("rm failed")?;
+            let summary = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(30),
+                    rm(
+                        &PROGRESS,
+                        &test_path,
+                        &Settings {
+                            fail_early: true,
+                            filter: None,
+                            dry_run: None,
+                            time_filter: None,
+                        },
+                    ),
+                )
+                .await
+                .context("rm timed out — possible deadlock")?
+                .context("rm failed")?;
             assert_eq!(summary.files_removed, depth * files_per_level);
             assert_eq!(summary.directories_removed, depth);
             assert!(!test_path.exists());
@@ -2152,11 +2155,12 @@ mod tests {
                 crate::walk::preacquire_leaf_permit(PermitKind::PendingMeta, Some(EntryKind::File))
                     .await;
             assert!(permit.is_some(), "the pre-acquire must take the one permit");
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                process_entry(visitor, cx, (), permit),
-            )
-            .await;
+            let result = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(20),
+                    process_entry(visitor, cx, (), permit),
+                )
+                .await;
             let summary = result
                 .context(
                     "process_entry hung — leaf permit held across directory recursion (deadlock)",

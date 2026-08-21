@@ -184,12 +184,12 @@ mod tests {
             let dst = tmp.path().join("dst");
             tokio::fs::create_dir(&dst).await?;
             tokio::fs::write(dst.join("protected"), b"x").await?;
+            let admission = crate::testutils::AdmissionLimit::new().await;
             let dst_dir = open_dst(&dst).await?;
             let mut filter = crate::filter::FilterSettings::new();
             filter.add_exclude("protected")?;
             let keep = HashSet::new();
             let settings = delete_settings(false);
-            let admission = crate::testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Stat);
@@ -212,8 +212,9 @@ mod tests {
             let probe_bypassed_admission = futures::poll!(second_permit.as_mut()).is_ready();
             drop(second_permit);
             drop(held_stat);
-            let result =
-                tokio::time::timeout(std::time::Duration::from_secs(20), prune.as_mut()).await;
+            let result = admission
+                .run_with_timeout(std::time::Duration::from_secs(20), prune.as_mut())
+                .await;
             assert!(
                 stopped_at_stat_gate,
                 "DT_UNKNOWN prune filter did not reach the held stat gate"

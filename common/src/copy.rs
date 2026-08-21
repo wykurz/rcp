@@ -1510,7 +1510,10 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || (work(), open_file_guard)).await
+    let task_guard = crate::walk_driver::blocking_task_guard();
+    let (result, open_file_guard, _task_guard) =
+        tokio::task::spawn_blocking(move || (work(), open_file_guard, task_guard)).await?;
+    Ok((result, open_file_guard))
 }
 
 /// Copy a regular file fd-relative: create (or overwrite) the destination via `dst_parent`,
@@ -5534,8 +5537,9 @@ mod copy_tests {
             let setup_bypassed_admission = futures::poll!(second_permit.as_mut()).is_ready();
             drop(second_permit);
             drop(held_stat);
-            let result =
-                tokio::time::timeout(std::time::Duration::from_secs(20), operation.as_mut()).await;
+            let result = admission
+                .run_with_timeout(std::time::Duration::from_secs(20), operation.as_mut())
+                .await;
             assert!(
                 stopped_at_stat_gate,
                 "copy root did not reach the held stat gate"
@@ -5588,6 +5592,7 @@ mod copy_tests {
             let src_name = std::ffi::OsStr::new("src-link");
             let dst_name = std::ffi::OsStr::new("dst-link");
             tokio::fs::symlink("target", root.join(src_name)).await?;
+            let admission = testutils::AdmissionLimit::new().await;
             let src_parent = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -5622,7 +5627,6 @@ mod copy_tests {
                 dst_dir: Some(dst_parent),
                 is_fresh: true,
             };
-            let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(1);
             let permit = Some(LeafPermit::OpenFile(throttle::open_file_permit().await));
             let readlink_resource =
@@ -5636,8 +5640,9 @@ mod copy_tests {
             let released_before_copy_finished = futures::poll!(second_permit.as_mut()).is_ready();
             drop(second_permit);
             drop(held_readlink);
-            let result =
-                tokio::time::timeout(std::time::Duration::from_secs(20), visit.as_mut()).await;
+            let result = admission
+                .run_with_timeout(std::time::Duration::from_secs(20), visit.as_mut())
+                .await;
             assert!(
                 stopped_at_readlink_gate,
                 "symlink copy did not reach the held readlink gate"
@@ -5667,6 +5672,7 @@ mod copy_tests {
             let src_name = std::ffi::OsStr::new("src-link");
             tokio::fs::write(root.join("target"), b"payload").await?;
             tokio::fs::symlink("target", root.join(src_name)).await?;
+            let admission = testutils::AdmissionLimit::new().await;
             let src_parent = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -5698,7 +5704,6 @@ mod copy_tests {
                 dst_dir: None,
                 is_fresh: false,
             };
-            let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(1);
             let permit = Some(LeafPermit::OpenFile(throttle::open_file_permit().await));
             let stat_resource =
@@ -5745,7 +5750,9 @@ mod copy_tests {
             let result = match early_visit_result {
                 Some(result) => Ok(result),
                 None => {
-                    tokio::time::timeout(std::time::Duration::from_secs(20), visit.as_mut()).await
+                    admission
+                        .run_with_timeout(std::time::Duration::from_secs(20), visit.as_mut())
+                        .await
                 }
             };
             assert!(
@@ -5792,18 +5799,19 @@ mod copy_tests {
             settings.dereference = true;
             let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(1);
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                copy(
-                    &PROGRESS,
-                    &src,
-                    &dst,
-                    &settings,
-                    &NO_PRESERVE_SETTINGS,
-                    false,
-                ),
-            )
-            .await;
+            let result = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(20),
+                    copy(
+                        &PROGRESS,
+                        &src,
+                        &dst,
+                        &settings,
+                        &NO_PRESERVE_SETTINGS,
+                        false,
+                    ),
+                )
+                .await;
             let summary = result.context(
                 "dereferenced directory copy retained admission across recursive descent",
             )??;
@@ -5821,24 +5829,32 @@ mod copy_tests {
             let open_file_guard = throttle::open_file_permit().await;
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (completion, completion_rx) = testutils::CompletionSignal::new();
             let task = tokio::spawn(spawn_blocking_with_open_file_guard(
                 open_file_guard,
                 move || {
+                    let _completion = completion;
                     let _ = started_tx.send(());
                     release_rx.recv().expect("release sender must stay alive");
                 },
             ));
-            started_rx.await?;
+            let started_result = started_rx.await;
             task.abort();
             let waiter_was_cancelled = matches!(task.await, Err(error) if error.is_cancelled());
             let second_permit = throttle::open_file_permit();
             tokio::pin!(second_permit);
-            let admission_was_retained = futures::poll!(second_permit.as_mut()).is_pending();
-            release_tx.send(())?;
-            let permit =
+            let admission_was_retained =
+                started_result.is_ok() && futures::poll!(second_permit.as_mut()).is_pending();
+            let release_result = release_tx.send(());
+            let completion_result = completion_rx.await;
+            let permit_result =
                 tokio::time::timeout(std::time::Duration::from_secs(20), second_permit.as_mut())
-                    .await
-                    .context("capacity was not released after blocking work finished")?;
+                    .await;
+            started_result.context("blocking copy work did not start")?;
+            release_result.context("blocking copy work ended before its release")?;
+            completion_result.context("blocking copy work did not report completion")?;
+            let permit =
+                permit_result.context("capacity was not released after blocking work finished")?;
             drop(permit);
             assert!(waiter_was_cancelled);
             assert!(
@@ -5864,32 +5880,33 @@ mod copy_tests {
             // set a very low limit to force permit contention
             let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(4);
-            let summary = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                copy(
-                    &PROGRESS,
-                    &src,
-                    &dst,
-                    &Settings {
-                        dereference: false,
-                        fail_early: true,
-                        overwrite: false,
-                        overwrite_compare: Default::default(),
-                        overwrite_filter: None,
-                        ignore_existing: false,
-                        chunk_size: 0,
-                        skip_specials: false,
-                        remote_copy_buffer_size: 0,
-                        filter: None,
-                        dry_run: None,
-                        delete: None,
-                    },
-                    &NO_PRESERVE_SETTINGS,
-                    false,
-                ),
-            )
-            .await
-            .context("copy timed out — possible deadlock")??;
+            let summary = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(30),
+                    copy(
+                        &PROGRESS,
+                        &src,
+                        &dst,
+                        &Settings {
+                            dereference: false,
+                            fail_early: true,
+                            overwrite: false,
+                            overwrite_compare: Default::default(),
+                            overwrite_filter: None,
+                            ignore_existing: false,
+                            chunk_size: 0,
+                            skip_specials: false,
+                            remote_copy_buffer_size: 0,
+                            filter: None,
+                            dry_run: None,
+                            delete: None,
+                        },
+                        &NO_PRESERVE_SETTINGS,
+                        false,
+                    ),
+                )
+                .await
+                .context("copy timed out — possible deadlock")??;
             assert_eq!(summary.files_copied, file_count);
             assert_eq!(summary.directories_created, 1);
             for i in 0..file_count {
@@ -5925,33 +5942,34 @@ mod copy_tests {
             }
             let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(limit);
-            let summary = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                copy(
-                    &PROGRESS,
-                    &src,
-                    &dst,
-                    &Settings {
-                        dereference: false,
-                        fail_early: true,
-                        overwrite: false,
-                        overwrite_compare: Default::default(),
-                        overwrite_filter: None,
-                        ignore_existing: false,
-                        chunk_size: 0,
-                        skip_specials: false,
-                        remote_copy_buffer_size: 0,
-                        filter: None,
-                        dry_run: None,
-                        delete: None,
-                    },
-                    &NO_PRESERVE_SETTINGS,
-                    false,
-                ),
-            )
-            .await
-            .context("copy timed out — possible deadlock")?
-            .context("copy failed")?;
+            let summary = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(30),
+                    copy(
+                        &PROGRESS,
+                        &src,
+                        &dst,
+                        &Settings {
+                            dereference: false,
+                            fail_early: true,
+                            overwrite: false,
+                            overwrite_compare: Default::default(),
+                            overwrite_filter: None,
+                            ignore_existing: false,
+                            chunk_size: 0,
+                            skip_specials: false,
+                            remote_copy_buffer_size: 0,
+                            filter: None,
+                            dry_run: None,
+                            delete: None,
+                        },
+                        &NO_PRESERVE_SETTINGS,
+                        false,
+                    ),
+                )
+                .await
+                .context("copy timed out — possible deadlock")?
+                .context("copy failed")?;
             assert_eq!(summary.files_copied, depth * files_per_level);
             assert_eq!(summary.directories_created, depth);
             // spot-check content at a few levels
@@ -6003,35 +6021,36 @@ mod copy_tests {
             // recursion would block forever.
             let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(2);
-            let summary = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                copy(
-                    &PROGRESS,
-                    &src,
-                    &dst,
-                    &Settings {
-                        dereference: false,
-                        fail_early: true,
-                        overwrite: true,
-                        overwrite_compare: Default::default(),
-                        overwrite_filter: None,
-                        ignore_existing: false,
-                        chunk_size: 0,
-                        skip_specials: false,
-                        remote_copy_buffer_size: 0,
-                        filter: None,
-                        dry_run: None,
-                        delete: None,
-                    },
-                    &NO_PRESERVE_SETTINGS,
-                    false,
-                ),
-            )
-            .await
-            .context(
-                "copy timed out — deadlock between copy_file's open-files permit and inner rm",
-            )?
-            .context("copy failed")?;
+            let summary = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(30),
+                    copy(
+                        &PROGRESS,
+                        &src,
+                        &dst,
+                        &Settings {
+                            dereference: false,
+                            fail_early: true,
+                            overwrite: true,
+                            overwrite_compare: Default::default(),
+                            overwrite_filter: None,
+                            ignore_existing: false,
+                            chunk_size: 0,
+                            skip_specials: false,
+                            remote_copy_buffer_size: 0,
+                            filter: None,
+                            dry_run: None,
+                            delete: None,
+                        },
+                        &NO_PRESERVE_SETTINGS,
+                        false,
+                    ),
+                )
+                .await
+                .context(
+                    "copy timed out — deadlock between copy_file's open-files permit and inner rm",
+                )?
+                .context("copy failed")?;
             assert_eq!(summary.files_copied, n);
             assert_eq!(summary.rm_summary.files_removed, n * 3);
             assert_eq!(summary.rm_summary.directories_removed, n);
