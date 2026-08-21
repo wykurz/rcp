@@ -56,7 +56,8 @@ pub struct AutoMetaThrottleConfig {
 /// Throttling configuration for resource control
 #[derive(Debug, Clone)]
 pub struct ThrottleConfig {
-    /// Maximum number of open files (None = 80% of system limit)
+    /// Descriptor-backpressure limit per leaf-operation pool (`None` derives an operation count
+    /// from 80% of the system fd budget).
     pub max_open_files: Option<usize>,
     /// Operations per second throttle (0 = no throttle)
     pub ops_throttle: usize,

@@ -1768,8 +1768,8 @@ mod cmp_tests {
         use super::*;
         use anyhow::Context;
 
-        /// deep + wide cmp: directory tree deeper than the open-files limit, with files
-        /// at every level. verifies no deadlock occurs (directories don't consume permits).
+        /// Deep + wide cmp: a directory tree deeper than the open-files limit, with files at every
+        /// level. Verifies directories do not retain pending-metadata permits across recursion.
         #[tokio::test]
         #[traced_test]
         async fn deep_tree_no_deadlock_under_open_files_saturation() -> Result<()> {

@@ -941,6 +941,10 @@ pub async fn chmod(
     path: &std::path::Path,
     settings: &Settings,
 ) -> Result<Summary, Error> {
+    // command-line callers may run many root operands concurrently. admit each one before opening
+    // its parent or performing the optional fd-based filter probe, then transfer that same permit
+    // into the shared driver. an authoritative directory releases it before descent.
+    let permit = crate::walk::ensure_leaf_permit(PermitKind::PendingMeta, None).await;
     // decompose the operand into (parent dir, final component) so the root entry is opened and
     // classified relative to a directory fd — the same fd-relative shape every nested entry takes.
     // rchm mutates "the" tree in place, so the parent is opened on the Destination side. `.`/`..`
@@ -957,20 +961,25 @@ pub async fn chmod(
     // root are O_NOFOLLOW-hardened). a symlinked parent (e.g. `rchm symlinkdir/foo`) is followed; the
     // operand itself is still classified via `child(name)` with O_NOFOLLOW (a symlink root is
     // operated on as the link itself).
-    let parent = Dir::open_parent_dir(parent_path, congestion::Side::Destination)
-        .await
-        .with_context(|| format!("cannot open parent directory {parent_path:?}"))
-        .map_err(|err| Error::new(err, Default::default()))?;
+    let parent = safedir::with_optional_fd_admission(
+        permit.as_ref().map(LeafPermit::admission),
+        Dir::open_parent_dir(parent_path, congestion::Side::Destination),
+    )
+    .await
+    .with_context(|| format!("cannot open parent directory {parent_path:?}"))
+    .map_err(|err| Error::new(err, Default::default()))?;
     // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
     let parent = Arc::new(parent.into_tree());
     if let Some(ref filter) = settings.filter {
         // classify the root via its parent fd purely to evaluate the root filter; the driver
         // re-classifies the root authoritatively in `process_entry`, so this handle is just a probe.
-        let root_handle = parent
-            .child(name)
-            .await
-            .with_context(|| format!("failed reading metadata from {path:?}"))
-            .map_err(|err| Error::new(err, Default::default()))?;
+        let root_handle = safedir::with_optional_fd_admission(
+            permit.as_ref().map(LeafPermit::admission),
+            parent.child(name),
+        )
+        .await
+        .with_context(|| format!("failed reading metadata from {path:?}"))
+        .map_err(|err| Error::new(err, Default::default()))?;
         let name_path = std::path::Path::new(name);
         match filter.should_include_root_item(name_path, root_handle.kind() == EntryKind::Dir) {
             crate::filter::FilterResult::Included => {}
@@ -984,7 +993,7 @@ pub async fn chmod(
             }
         }
     }
-    run_chmod_root(prog_track, &parent, name, path, settings).await
+    run_chmod_root(prog_track, &parent, name, path, settings, permit).await
 }
 
 /// Build the [`ChmodVisitor`] and process the root entry through the generic
@@ -996,6 +1005,7 @@ async fn run_chmod_root(
     name: &OsStr,
     root: &std::path::Path,
     settings: &Settings,
+    permit: Option<LeafPermit>,
 ) -> Result<Summary, Error> {
     let visitor = Arc::new(ChmodVisitor {
         prog_track,
@@ -1012,7 +1022,7 @@ async fn run_chmod_root(
         dry_run: settings.dry_run.is_some(),
         prog_track,
     };
-    process_entry(visitor, root_cx, (), None).await // chmod has no second tree → root context `()`
+    process_entry(visitor, root_cx, (), permit).await // chmod has no second tree → root context `()`
 }
 
 /// The chmod walk's [`WalkVisitor`]. The driver owns enumeration, the leaf-permit lifecycle,
@@ -1050,14 +1060,9 @@ impl WalkVisitor for ChmodVisitor {
     fn root_dir_context(&self) {}
 
     fn permit_kind(&self) -> PermitKind {
-        // metadata-only walk: no open fd held across leaf work, so gate on the pending-meta pool.
+        // use the separate pending-meta pool to bound fd-backed entry work without coupling chmod
+        // to copy's open-file pool.
         PermitKind::PendingMeta
-    }
-
-    fn want_permit(&self, hint: Option<EntryKind>) -> bool {
-        // known non-directory hint only (a hinted dir recurses; DT_UNKNOWN might be a dir) —
-        // matches the old spawn loop's `known_leaf` pre-acquire policy.
-        hint.is_some_and(|k| k != EntryKind::Dir)
     }
 
     fn fail_early(&self) -> bool {
@@ -1950,9 +1955,51 @@ mod tests {
 
         static PROGRESS: std::sync::LazyLock<Progress> = std::sync::LazyLock::new(Progress::new);
 
+        /// Public root setup must reserve metadata capacity before opening the operand parent or
+        /// performing the fd-based root filter probe. Otherwise many CLI operands can bypass the
+        /// shared driver's later admission point concurrently.
+        #[tokio::test]
+        async fn filtered_root_waits_for_admission_before_setup() -> anyhow::Result<()> {
+            let root = crate::testutils::create_temp_dir().await?;
+            let path = root.join("victim");
+            tokio::fs::write(&path, b"x").await?;
+            let mut settings = settings_with("f:600", None, None);
+            let mut filter = crate::filter::FilterSettings::new();
+            filter.add_exclude("victim")?;
+            settings.filter = Some(filter);
+            throttle::set_max_open_files(1);
+            let stat_resource =
+                throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Stat);
+            throttle::set_max_ops_in_flight(stat_resource, 1);
+            let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
+            let operation = chmod(&PROGRESS, &path, &settings);
+            tokio::pin!(operation);
+            let stopped_at_stat_gate = futures::poll!(operation.as_mut()).is_pending();
+            let mut second_permit = Box::pin(throttle::pending_meta_permit());
+            let setup_bypassed_admission = futures::poll!(second_permit.as_mut()).is_ready();
+            drop(second_permit);
+            drop(held_stat);
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(20), operation.as_mut()).await;
+            throttle::set_max_ops_in_flight(stat_resource, 0);
+            throttle::set_max_open_files(0);
+            assert!(
+                stopped_at_stat_gate,
+                "chmod root did not reach the held stat gate"
+            );
+            let summary =
+                result.context("chmod root did not resume after stat capacity was released")??;
+            assert!(
+                !setup_bypassed_admission,
+                "chmod performed root setup before pending-metadata admission"
+            );
+            assert_eq!(summary.files_skipped, 1);
+            Ok(())
+        }
+
         /// Regression for the hold-and-wait deadlock when a getdents leaf-hint entry is actually a
         /// directory (the DT_UNKNOWN edge, or a getdents-vs-`child()` swap). A `pending_meta` permit
-        /// is pre-acquired for hinted leaves only; if such an entry is really a directory, the
+        /// is pre-acquired for every possible leaf; if such an entry is really a directory, the
         /// permit must be DROPPED before recursing, or it is held while its children block acquiring
         /// one and a saturated pool hangs the walk.
         ///
@@ -2004,12 +2051,9 @@ mod tests {
                 dry_run: false,
                 prog_track: &PROGRESS,
             };
-            let permit = crate::walk::preacquire_leaf_permit(
-                PermitKind::PendingMeta,
-                Some(EntryKind::File),
-                |_| true,
-            )
-            .await;
+            let permit =
+                crate::walk::preacquire_leaf_permit(PermitKind::PendingMeta, Some(EntryKind::File))
+                    .await;
             assert!(permit.is_some(), "the pre-acquire must take the one permit");
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(20),

@@ -305,9 +305,10 @@ Two complementary mechanisms: **static caps** that you set once based on budget 
 - set `--iops-throttle` to limit the maximum number of I/O operations per second
   - MUST be used with `--chunk-size`, which is used to calculate I/O operations per file
 
-- set `--max-open-files` to limit the maximum number of open files
-  - RCP tools will automatically adjust the maximum based on the system limits however, this setting
-    can be used if there are additional constraints
+- set `--max-open-files` to limit concurrent leaf operations that contribute to descriptor pressure
+  - RCP tools automatically derive the admission count from the system limit; this is backpressure,
+    not a hard process-wide descriptor ceiling, because one operation can hold multiple descriptors
+    and recursive directory handles are deliberately excluded to avoid traversal deadlocks
 
 ### Adaptive metadata throttling (`--auto-meta-throttle`)
 
@@ -687,8 +688,9 @@ ulimit -n 65536
 * hard nofile 65536
 ```
 
-`rcp` automatically queries the system limit and uses `--max-open-files` to self-throttle, but
-higher limits allow more parallelism.
+`rcp` automatically queries the system limit and uses `--max-open-files` for descriptor
+backpressure, but higher limits allow more parallelism. The setting is not a literal count of every
+descriptor in the process; see [Static caps](#static-caps).
 
 ### Network Backlog (10+ Gbps)
 
@@ -783,8 +785,9 @@ The `filegen` tool generates random test data, which is CPU-intensive. Unlike ot
 are typically I/O-bound, filegen's bottleneck is often the CPU generating random bytes.
 
 **Default behavior**: `filegen` defaults `--max-open-files` to the number of physical CPU cores,
-rather than 80% of the system's open file limit used by other tools. This matches concurrency to
-compute capacity, avoiding excessive parallelism that would cause CPU contention.
+rather than deriving an operation count from the system's descriptor budget like the other tools.
+This matches concurrency to compute capacity, avoiding excessive parallelism that would cause CPU
+contention.
 
 **Tuning for your workload**:
 

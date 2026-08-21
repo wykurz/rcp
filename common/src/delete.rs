@@ -38,7 +38,7 @@ pub async fn prune_extraneous(
     fail_early: bool,
     dry_run: Option<crate::config::DryRunMode>,
 ) -> Result<crate::rm::Summary, crate::rm::Error> {
-    let mut summary = crate::rm::Summary::default();
+    let summary = crate::rm::Summary::default();
     // Enumerate the destination through its pinned fd (no path re-resolution). The returned
     // `d_type` is a best-effort hint passed to `filter_is_dir`, which resolves authoritatively via
     // fstat on DT_UNKNOWN. `rm_child` re-classifies each entry authoritatively via `child()`.
@@ -47,17 +47,57 @@ pub async fn prune_extraneous(
         .await
         .with_context(|| "failed scanning destination directory for deletion".to_string())
         .map_err(|err| crate::rm::Error::new(err, summary))?;
+    prune_entries(
+        prog_track,
+        dst_dir,
+        relative_dir,
+        keep,
+        filter,
+        delete_settings,
+        fail_early,
+        dry_run,
+        entries,
+    )
+    .await
+}
+
+/// Apply prune decisions to an already-enumerated destination directory.
+///
+/// Production callers arrive through [`prune_extraneous`]. Separating enumeration lets tests
+/// inject `DT_UNKNOWN` deterministically without requiring an NFS/FUSE fixture.
+#[allow(clippy::too_many_arguments)]
+async fn prune_entries(
+    prog_track: &'static progress::Progress,
+    dst_dir: &Arc<Dir>,
+    relative_dir: &std::path::Path,
+    keep: &std::collections::HashSet<OsString>,
+    filter: Option<&crate::filter::FilterSettings>,
+    delete_settings: &DeleteSettings,
+    fail_early: bool,
+    dry_run: Option<crate::config::DryRunMode>,
+    entries: Vec<(OsString, Option<crate::walk::EntryKind>)>,
+) -> Result<crate::rm::Summary, crate::rm::Error> {
+    let mut summary = crate::rm::Summary::default();
     let errors = crate::error_collector::ErrorCollector::default();
     for (name, hint) in entries {
         if keep.contains(&name) {
             continue;
         }
+        // a DT_UNKNOWN filter classification opens an O_PATH handle before rm_child is reached.
+        // admit every possible leaf first and transfer the permit into rm_child; an actual
+        // directory releases it at the shared driver's drop-before-recurse boundary.
+        let permit =
+            crate::walk::preacquire_leaf_permit(crate::walk::PermitKind::PendingMeta, hint).await;
         // the exclude-protection decision must use the AUTHORITATIVE is_dir: on filesystems that
         // report DT_UNKNOWN (NFS, some FUSE mounts) the hint is None, so defaulting to non-dir
         // would fail to protect a real directory that matches a dir-only exclude pattern like
         // `cache/`. `filter_is_dir` does one authoritative fstat only in the DT_UNKNOWN+filter
         // case, preserving the no-cost path when the hint is reliable or no filter is active.
-        let is_dir = crate::walk::filter_is_dir(filter, dst_dir, &name, hint, false).await;
+        let is_dir = crate::safedir::with_optional_fd_admission(
+            permit.as_ref().map(crate::walk::LeafPermit::admission),
+            crate::walk::filter_is_dir(filter, dst_dir, &name, hint, false),
+        )
+        .await;
         // the entry's path relative to the destination (mirror) root: anchors filter matching and
         // reconstructs the display path inside `rm_child`. Computed once and reused below.
         let rel = relative_dir.join(&name);
@@ -90,7 +130,9 @@ pub async fn prune_extraneous(
             time_filter: None,
             dry_run,
         };
-        match crate::rm::rm_child(prog_track, dst_dir, &name, &rel, &rm_settings).await {
+        match crate::rm::rm_child_admitted(prog_track, dst_dir, &name, &rel, &rm_settings, permit)
+            .await
+        {
             Ok(rm_summary) => {
                 summary = summary + rm_summary;
             }
@@ -128,6 +170,67 @@ mod tests {
         Ok(Arc::new(
             Dir::open_root_dir(dst, false, congestion::Side::Destination).await?,
         ))
+    }
+
+    mod max_open_files_tests {
+        use super::*;
+
+        /// A `DT_UNKNOWN` prune entry must reserve metadata capacity before the fd-based filter
+        /// classification. If the filter protects it, `rm_child` is never reached and cannot repair
+        /// admission after the fact.
+        #[tokio::test]
+        async fn filtered_unknown_entry_waits_before_probe() -> anyhow::Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let dst = tmp.path().join("dst");
+            tokio::fs::create_dir(&dst).await?;
+            tokio::fs::write(dst.join("protected"), b"x").await?;
+            let dst_dir = open_dst(&dst).await?;
+            let mut filter = crate::filter::FilterSettings::new();
+            filter.add_exclude("protected")?;
+            let keep = HashSet::new();
+            let settings = delete_settings(false);
+            throttle::set_max_open_files(1);
+            let stat_resource =
+                throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Stat);
+            throttle::set_max_ops_in_flight(stat_resource, 1);
+            let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
+            let prune = prune_entries(
+                &PROGRESS,
+                &dst_dir,
+                std::path::Path::new(""),
+                &keep,
+                Some(&filter),
+                &settings,
+                false,
+                None,
+                vec![(std::ffi::OsString::from("protected"), None)],
+            );
+            tokio::pin!(prune);
+            let stopped_at_stat_gate = futures::poll!(prune.as_mut()).is_pending();
+            let mut second_permit = Box::pin(throttle::pending_meta_permit());
+            let probe_bypassed_admission = futures::poll!(second_permit.as_mut()).is_ready();
+            drop(second_permit);
+            drop(held_stat);
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(20), prune.as_mut()).await;
+            throttle::set_max_ops_in_flight(stat_resource, 0);
+            throttle::set_max_open_files(0);
+            assert!(
+                stopped_at_stat_gate,
+                "DT_UNKNOWN prune filter did not reach the held stat gate"
+            );
+            let summary = result
+                .context("prune did not resume after stat capacity was released")?
+                .map_err(|error| error.source)?;
+            assert!(
+                !probe_bypassed_admission,
+                "DT_UNKNOWN prune filter probe bypassed pending-metadata admission"
+            );
+            assert_eq!(summary.files_removed, 0);
+            assert_eq!(summary.directories_removed, 0);
+            assert!(dst.join("protected").exists());
+            Ok(())
+        }
     }
 
     #[tokio::test]

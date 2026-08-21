@@ -775,7 +775,7 @@ async fn handle_file_stream(
         // root file, open the trusted parent via open_parent_dir). all writes for this
         // file are then fd-relative on that pinned parent. a resolution failure is a
         // pre-data error: the stream can be recovered by draining this file's bytes.
-        let file_result =
+        let file_result = common::safedir::with_fd_admission(_open_file_guard.admission(), async {
             match resolve_parent_dir(&directory_tracker, &file_header.dst, file_header.is_root)
                 .await
             {
@@ -794,7 +794,9 @@ async fn handle_file_stream(
                     source: e.context("failed resolving destination parent directory"),
                     stream_state: StreamState::NeedsDrain,
                 }),
-            };
+            }
+        })
+        .await;
         // track whether we need to close the stream and exit early
         let mut stream_corrupted = false;
         let mut fail_early_error: Option<anyhow::Error> = None;

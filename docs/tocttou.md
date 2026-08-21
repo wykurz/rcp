@@ -559,6 +559,12 @@ so the security-relevant invariants each live in exactly one place:
   into a directory" rule lives in the driver's directory branch alone, not hand-maintained at every
   recursion site. A structural lint (`scripts/check-walk-driver-usage.sh`) fails the build if
   `copy.rs`/`chmod.rs`/`rm.rs` reintroduce a hand-rolled walk (a `JoinSet` or `read_entries`).
+- **Admit-before-classify (descriptor invariant)**: every entry that may be a leaf, including a
+  `DT_UNKNOWN` entry, reserves leaf-operation capacity before a filter probe, task spawn, or
+  authoritative `O_PATH` classification. Root and delegated walks repair missing admission before
+  opening operand parents. If classification proves the entry is a directory, the driver releases
+  the provisional admission and redundant classification handle before descent. This bounds
+  fd-bearing leaf fan-out without reintroducing the deep-directory hold-and-wait deadlock.
 - **Trusted vs hardened boundary**: the symlink-following parent-prefix open returns a distinct
   `TrustedDir` type (`common/src/safedir.rs`); crossing below the named root yields a hardened `Dir`
   whose child opens are all `O_NOFOLLOW`. The boundary is type-enforced — a hardened child cannot be

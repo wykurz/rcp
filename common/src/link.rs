@@ -10,7 +10,7 @@ use crate::copy::{
 use crate::filecmp;
 use crate::preserve;
 use crate::progress;
-use crate::safedir::Dir;
+use crate::safedir::{self, Dir};
 use crate::walk::{self, EntryKind, LeafPermit, PermitKind};
 
 /// Error type for link operations. See [`crate::error::OperationError`] for
@@ -204,6 +204,9 @@ pub async fn link(
     // `cwd` is retained for API/signature parity (callers still pass it) but the fd-based walk
     // reconstructs every path from the explicit roots, so it is no longer threaded into the walk.
     let _ = cwd;
+    // reserve root admission before any strict probe or operand-parent open, then transfer it into
+    // link_internal. an authoritative directory releases it before dual-tree descent.
+    let permit = walk::ensure_leaf_permit(PermitKind::OpenFile, None).await;
     // A missing --update root is destructive under both --update-exclusive (materialized set =
     // update set, so nothing materializes) AND --delete (the source-only keep_set makes any dst
     // entry the missing update tree WOULD have protected look extraneous, and prune wipes it).
@@ -224,16 +227,19 @@ pub async fn link(
             // otherwise be opened) cannot slip a symlinked update prefix through. A symlink in a
             // directory component fails closed (ELOOP); this also serves the destructive-mode
             // existence check below.
-            let kind = crate::safedir::strict_probe_dst_kind(update_path, congestion::Side::Source)
-                .await
-                .map_err(|err| {
-                    Error::new(
-                        anyhow::Error::new(err).context(format!(
-                            "failed reading metadata from update {update_path:?}"
-                        )),
-                        Default::default(),
-                    )
-                })?;
+            let kind = safedir::with_optional_fd_admission(
+                permit.as_ref().map(LeafPermit::admission),
+                crate::safedir::strict_probe_dst_kind(update_path, congestion::Side::Source),
+            )
+            .await
+            .map_err(|err| {
+                Error::new(
+                    anyhow::Error::new(err).context(format!(
+                        "failed reading metadata from update {update_path:?}"
+                    )),
+                    Default::default(),
+                )
+            })?;
             if destructive && kind.is_none() {
                 return Err(Error::new(
                     anyhow!(
@@ -288,15 +294,18 @@ pub async fn link(
     // excluded root under an execute-only (0111, searchable-not-readable) parent must skip cleanly,
     // and the O_RDONLY parent open would fail EACCES there.
     let strict_src_parent: Option<Arc<Dir>> = if crate::safedir::strict_operand_resolution() {
-        let parent = Dir::open_parent_dir(&src_operand.parent, congestion::Side::Source)
-            .await
-            .with_context(|| {
-                format!(
-                    "cannot open source parent directory {:?}",
-                    src_operand.parent
-                )
-            })
-            .map_err(|err| Error::new(err, Default::default()))?;
+        let parent = safedir::with_optional_fd_admission(
+            permit.as_ref().map(LeafPermit::admission),
+            Dir::open_parent_dir(&src_operand.parent, congestion::Side::Source),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "cannot open source parent directory {:?}",
+                src_operand.parent
+            )
+        })
+        .map_err(|err| Error::new(err, Default::default()))?;
         // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
         Some(Arc::new(parent.into_tree()))
     } else {
@@ -321,7 +330,12 @@ pub async fn link(
         dst_parent_path_opt,
     ) {
         (true, Some(dst_parent_path)) => {
-            match Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination).await {
+            match safedir::with_optional_fd_admission(
+                permit.as_ref().map(LeafPermit::admission),
+                Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination),
+            )
+            .await
+            {
                 Ok(parent) => Some(Arc::new(parent.into_tree())),
                 Err(err)
                     if err.kind() == std::io::ErrorKind::NotFound
@@ -347,11 +361,13 @@ pub async fn link(
         let (kind, is_dir) = match &strict_src_parent {
             // strict: classify via the held parent fd (O_NOFOLLOW), never by path
             Some(parent) => {
-                let root_handle = parent
-                    .child(src_name)
-                    .await
-                    .with_context(|| format!("failed reading metadata from {:?}", &src))
-                    .map_err(|err| Error::new(err, Default::default()))?;
+                let root_handle = safedir::with_optional_fd_admission(
+                    permit.as_ref().map(LeafPermit::admission),
+                    parent.child(src_name),
+                )
+                .await
+                .with_context(|| format!("failed reading metadata from {:?}", &src))
+                .map_err(|err| Error::new(err, Default::default()))?;
                 (root_handle.kind(), root_handle.kind() == EntryKind::Dir)
             }
             None => {
@@ -406,15 +422,18 @@ pub async fn link(
     let src_parent = match strict_src_parent {
         Some(parent) => parent,
         None => {
-            let parent = Dir::open_parent_dir(&src_operand.parent, congestion::Side::Source)
-                .await
-                .with_context(|| {
-                    format!(
-                        "cannot open source parent directory {:?}",
-                        src_operand.parent
-                    )
-                })
-                .map_err(|err| Error::new(err, Default::default()))?;
+            let parent = safedir::with_optional_fd_admission(
+                permit.as_ref().map(LeafPermit::admission),
+                Dir::open_parent_dir(&src_operand.parent, congestion::Side::Source),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "cannot open source parent directory {:?}",
+                    src_operand.parent
+                )
+            })
+            .map_err(|err| Error::new(err, Default::default()))?;
             // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
             Arc::new(parent.into_tree())
         }
@@ -431,14 +450,17 @@ pub async fn link(
     // root-only-heuristic character.) Whether the notice is wanted AT ALL still comes from the
     // preserve settings, which for rlink default to `all` — metadata fidelity is what the tool is
     // for — so a bare `rlink` asks for it where a bare `rcp` does not.
-    crate::safedir::warn_if_root_acl_unpreserved_at(
-        &src_parent,
-        src_name,
-        src,
-        crate::safedir::RootAclNotice {
-            file_acl_preserved: update.is_none() || settings.preserve.file.acl,
-            ..crate::safedir::RootAclNotice::for_preserve(&settings.preserve)
-        },
+    safedir::with_optional_fd_admission(
+        permit.as_ref().map(LeafPermit::admission),
+        crate::safedir::warn_if_root_acl_unpreserved_at(
+            &src_parent,
+            src_name,
+            src,
+            crate::safedir::RootAclNotice {
+                file_acl_preserved: update.is_none() || settings.preserve.file.acl,
+                ..crate::safedir::RootAclNotice::for_preserve(&settings.preserve)
+            },
+        ),
     )
     .await;
     // In dry-run we never touch the destination, so we don't open its parent at all (it may not
@@ -452,15 +474,18 @@ pub async fn link(
         match strict_dst_parent {
             Some(parent) => Some(parent),
             None => {
-                let dir = Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "cannot open destination parent directory {:?}",
-                            dst_parent_path
-                        )
-                    })
-                    .map_err(|err| Error::new(err, Default::default()))?;
+                let dir = safedir::with_optional_fd_admission(
+                    permit.as_ref().map(LeafPermit::admission),
+                    Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "cannot open destination parent directory {:?}",
+                        dst_parent_path
+                    )
+                })
+                .map_err(|err| Error::new(err, Default::default()))?;
                 // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below).
                 Some(Arc::new(dir.into_tree()))
             }
@@ -494,7 +519,12 @@ pub async fn link(
             // source parent above): a symlinked update container must be followed into the real dir.
             let fallback_eligible =
                 !settings.update_exclusive && settings.copy_settings.delete.is_none();
-            match Dir::open_parent_dir(&update_parent_path, congestion::Side::Source).await {
+            match safedir::with_optional_fd_admission(
+                permit.as_ref().map(LeafPermit::admission),
+                Dir::open_parent_dir(&update_parent_path, congestion::Side::Source),
+            )
+            .await
+            {
                 // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below).
                 Ok(dir) => Some((Arc::new(dir.into_tree()), update_name)),
                 Err(err)
@@ -542,7 +572,7 @@ pub async fn link(
         std::path::Path::new(""),
         settings,
         is_fresh,
-        None,
+        permit,
     )
     .await
 }
@@ -611,11 +641,11 @@ impl DeleteKeepSet {
 /// the dual tree. With no update tree, a source file is hard-linked, a source symlink is copied,
 /// and a directory recurses.
 ///
-/// `permit` is the leaf permit the spawn loop pre-acquired for a regular-file src hint (via
-/// [`walk::preacquire_leaf_permit`]). It is USED only on the one path that copies a *changed*
-/// same-type regular file from the update tree (the data copy reuses it); on every other path it is
-/// dropped at the single consolidated drop site below — see that comment for why this is rlink's
-/// acknowledged dual-tree special case.
+/// `permit` is provisional entry admission, normally acquired by a directory spawn loop via
+/// [`walk::preacquire_leaf_permit`]. Root/delegated calls repair a missing permit before
+/// classification. Every non-recursive branch retains it through its final fd-bearing operation;
+/// direct directory recursion releases it before descent, while delegated copy owns that decision
+/// for the update entry it classifies.
 #[instrument(skip(prog_track, src_parent, update, dst_parent, settings, permit))]
 #[async_recursion]
 #[allow(clippy::too_many_arguments)]
@@ -634,6 +664,11 @@ async fn link_internal(
     permit: Option<LeafPermit>,
 ) -> Result<Summary, Error> {
     let _prog_guard = prog_track.ops.guard();
+    // `link_internal` is also the root/delegated entry point, so it cannot assume a directory spawn
+    // loop supplied admission. repair a missing permit before either source/update classification
+    // opens an O_PATH handle. direct directory recursion releases it below; delegated copy receives
+    // the guard and uses the shared driver's authoritative drop-before-recurse branch.
+    let permit = walk::ensure_leaf_permit(PermitKind::OpenFile, permit).await;
     // real filesystem paths reconstructed from the roots + accumulated relative path. used for
     // diagnostics, the path-based `--delete` prune scan / `rm`, the `--dereference` canonicalize
     // fallback inside copy, and to derive `dst_name`. joining an empty `rel_path` (the root entry)
@@ -663,18 +698,25 @@ async fn link_internal(
         })?
         .to_owned();
     tracing::debug!("classifying source entry");
-    let src_handle = src_parent
-        .child(name)
-        .await
-        .with_context(|| format!("failed reading metadata from {:?}", &src_path))
-        .map_err(|err| Error::new(err, Default::default()))?;
+    let src_handle = safedir::with_optional_fd_admission(
+        permit.as_ref().map(LeafPermit::admission),
+        src_parent.child(name),
+    )
+    .await
+    .with_context(|| format!("failed reading metadata from {:?}", &src_path))
+    .map_err(|err| Error::new(err, Default::default()))?;
     // classify the update entry at this name (if an update tree is present at this level). a
     // NotFound is the "this path is missing from update" case; under --update-exclusive it means
     // we're done (nothing materializes), otherwise we fall back to no-update mode for this entry.
     let mut update_handle = match update {
         Some((update_dir, update_name)) => {
             tracing::debug!("classifying 'update' entry");
-            match update_dir.child(update_name).await {
+            match safedir::with_optional_fd_admission(
+                permit.as_ref().map(LeafPermit::admission),
+                update_dir.child(update_name),
+            )
+            .await
+            {
                 Ok(handle) => Some(handle),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     if settings.update_exclusive {
@@ -752,66 +794,31 @@ async fn link_internal(
             update_handle = None;
         }
     }
-    // ── rlink's acknowledged dual-tree special case (docs/tocttou.md, "One shared traversal driver"): the single permit-drop site ──
-    //
-    // The spawn loop in `link_dir_contents` pre-acquired this leaf permit (open-files pool) for a
-    // regular-file src `hint`, but the authoritative dual-tree decision below may instead COPY
-    // (possibly recursing, when the update entry is a directory), HARD-LINK, SKIP, or recurse a
-    // directory. The permit is USED on exactly ONE path: copying a *changed* same-type regular file
-    // from the update tree (`copy_child` reuses it for the data copy). On every other path — both
-    // the recursing ones (a type-mismatch where the update side may be a directory, and a same-type
-    // directory) and the non-recursive leaf ones (hard-link, symlink copy, special, no-update) — the
-    // permit must NOT be held: a recursing path holding it across `copy_child`/`link_dir_entry` is
-    // the hold-and-wait deadlock the leaf-permit lifecycle eliminates, and a leaf path holding the
-    // mismatched permit across its own `.await` is pointless.
-    //
-    // So decide once, here, before any `.await` that isn't the intended copy: extract the open-files
-    // guard for the file-changed-copy path and drop the permit for everything else. Replacing the
-    // seven hand-maintained `drop(open_file_guard)` sites with this one is the Class-1 cleanup; this
-    // is the one site exempted from the Phase H no-manual-drop lint, because rlink's dual-tree walk
-    // is not a `WalkVisitor` and cannot use the driver's single drop-before-recurse home.
-    let is_file_changed_copy = match update_handle.as_ref() {
-        Some(update_handle) => {
-            update_handle.kind() == src_handle.kind()
-                && update_handle.kind() == EntryKind::File
-                && !filecmp::metadata_equal(
-                    &settings.update_compare,
-                    src_handle.meta(),
-                    update_handle.meta(),
-                )
-        }
-        None => false,
-    };
-    let copy_guard: Option<throttle::OpenFileGuard> = if is_file_changed_copy {
-        // keep the permit for the data copy: hand the inner open-files guard to `copy_child`.
-        match permit {
-            Some(LeafPermit::OpenFile(guard)) => Some(guard),
-            // a non-OpenFile permit can never reach rlink (its `want` only takes from the OpenFile
-            // pool), and `None` means the pool was disabled — either way there is nothing to pass.
-            _ => None,
-        }
-    } else {
-        // every non-copy / recursing branch: release the leaf permit now (the consolidated drop).
-        drop(permit);
-        None
-    };
-    if let Some(update_handle) = update_handle.as_ref() {
+    // from this point every non-recursive action retains the concrete open-file guard through its
+    // final fd-bearing operation. a delegated copy owns the same guard and drops it itself if the
+    // authoritative update entry is a directory. only the direct dual-tree directory recursion at
+    // the bottom releases it locally.
+    let open_file_guard = permit.map(LeafPermit::into_open_file);
+    if let Some(update_entry) = update_handle.as_ref() {
         let (update_dir, update_name) = update.unwrap();
         let update_path = update_path.as_deref().unwrap();
-        if update_handle.kind() != src_handle.kind() {
+        if update_entry.kind() != src_handle.kind() {
             // file type changed, just copy the updated one
             tracing::debug!(
                 "link: file type of {:?} ({:?}) and {:?} ({:?}) differs - copying from update",
                 src_path,
                 src_handle.kind(),
                 update_path,
-                update_handle.kind()
+                update_entry.kind()
             );
-            // the leaf permit was already released at the consolidated drop site above (this is the
-            // type-mismatch path, where the update side may be a directory and we recurse via copy).
             // delegate at this entry's logical path so that, under --delete, pruning inside the
             // delegated subtree matches include/exclude descendants at the correct filter root
-            // (e.g. `node/*.log`). pass the HELD update parent + name, never a re-resolved path.
+            // (e.g. `node/*.log`). Pass the held update parent + name and transfer admission; if
+            // the update side is a directory, copy's driver releases it before descent.
+            // copy_child classifies the update entry again and does not consume either outer
+            // classification handle. release both before transferring admission to that walk.
+            drop(src_handle);
+            drop(update_handle);
             return delegate_copy(
                 prog_track,
                 update_dir,
@@ -822,20 +829,26 @@ async fn link_internal(
                 rel_path,
                 settings,
                 is_fresh,
-                None,
+                open_file_guard,
             )
             .await;
         }
-        if update_handle.kind() == EntryKind::File {
+        if update_entry.kind() == EntryKind::File {
             // check if the file is unchanged and if so hard-link, otherwise copy from the updated one
             if filecmp::metadata_equal(
                 &settings.update_compare,
                 src_handle.meta(),
-                update_handle.meta(),
+                update_entry.meta(),
             ) {
-                // unchanged file: hard-link from src. the permit was already dropped above (this is
-                // not the file-changed-copy path), so `copy_guard` is None and there is nothing held.
+                // unchanged file: hard-link from src while retaining admission across `linkat`.
                 tracing::debug!("no change, hard link 'src'");
+                // the update classification established the decision but hard-linking consumes
+                // only the pinned source handle.
+                drop(update_handle);
+                let hard_link_lease = open_file_guard
+                    .as_ref()
+                    .map(throttle::OpenFileGuard::admission);
+                let _guard = open_file_guard;
                 if settings.dry_run.is_some() {
                     crate::dry_run::report_action("link", &src_path, Some(&dst_path), "file");
                     return Ok(Summary {
@@ -845,13 +858,16 @@ async fn link_internal(
                 }
                 let dst_dir =
                     dst_parent.expect("destination parent must be open for a real hard link");
-                return hard_link_entry_fd(
-                    prog_track,
-                    &src_handle,
-                    dst_dir,
-                    &dst_name,
-                    &dst_path,
-                    settings,
+                return safedir::with_optional_fd_admission(
+                    hard_link_lease,
+                    hard_link_entry_fd(
+                        prog_track,
+                        &src_handle,
+                        dst_dir,
+                        &dst_name,
+                        &dst_path,
+                        settings,
+                    ),
                 )
                 .await;
             }
@@ -860,10 +876,9 @@ async fn link_internal(
                 src_path,
                 update_path
             );
-            // changed file: delegate to copy, reusing the pre-acquired permit (the common path: the
-            // spawn loop pre-acquires for regular-file hints). `copy_guard` is the open-files guard
-            // the consolidated decision above extracted for exactly this path. copy_child
-            // re-classifies and applies its own --overwrite/dry-run logic for a file.
+            // changed file: delegate to copy, transferring the same admission guard.
+            drop(src_handle);
+            drop(update_handle);
             return delegate_copy(
                 prog_track,
                 update_dir,
@@ -874,13 +889,15 @@ async fn link_internal(
                 rel_path,
                 settings,
                 is_fresh,
-                copy_guard,
+                open_file_guard,
             )
             .await;
         }
-        if update_handle.kind() == EntryKind::Symlink {
-            // update symlink: copy it. the permit was already dropped at the consolidated site.
+        if update_entry.kind() == EntryKind::Symlink {
+            // update symlink: copy it under the same non-recursive admission guard.
             tracing::debug!("'update' is a symlink so just symlink that");
+            drop(src_handle);
+            drop(update_handle);
             return delegate_copy(
                 prog_track,
                 update_dir,
@@ -891,17 +908,19 @@ async fn link_internal(
                 rel_path,
                 settings,
                 is_fresh,
-                None,
+                open_file_guard,
             )
             .await;
         }
     } else {
-        // update hasn't been specified (or is absent at this name): hard-link a source file,
-        // copy a source symlink.
-        // the permit (if any) was already released at the consolidated drop site above, so the
-        // no-update hard-link / symlink-copy paths here hold nothing.
+        // update hasn't been specified (or is absent at this name): hard-link a source file or copy
+        // a source symlink, retaining admission across the non-recursive work.
         tracing::debug!("no 'update' entry");
         if src_handle.kind() == EntryKind::File {
+            let hard_link_lease = open_file_guard
+                .as_ref()
+                .map(throttle::OpenFileGuard::admission);
+            let _guard = open_file_guard;
             if settings.dry_run.is_some() {
                 crate::dry_run::report_action("link", &src_path, Some(&dst_path), "file");
                 return Ok(Summary {
@@ -910,27 +929,43 @@ async fn link_internal(
                 });
             }
             let dst_dir = dst_parent.expect("destination parent must be open for a real hard link");
-            return hard_link_entry_fd(
-                prog_track,
-                &src_handle,
-                dst_dir,
-                &dst_name,
-                &dst_path,
-                settings,
+            return safedir::with_optional_fd_admission(
+                hard_link_lease,
+                hard_link_entry_fd(
+                    prog_track,
+                    &src_handle,
+                    dst_dir,
+                    &dst_name,
+                    &dst_path,
+                    settings,
+                ),
             )
             .await;
         }
         if src_handle.kind() == EntryKind::Symlink {
             tracing::debug!("'src' is a symlink so just symlink that");
+            // copy_child reclassifies the source entry, so the outer classification is redundant
+            // once dispatch has been decided.
+            drop(src_handle);
             return delegate_copy(
-                prog_track, src_parent, dst_parent, name, &src_path, &dst_path, rel_path, settings,
-                is_fresh, None,
+                prog_track,
+                src_parent,
+                dst_parent,
+                name,
+                &src_path,
+                &dst_path,
+                rel_path,
+                settings,
+                is_fresh,
+                open_file_guard,
             )
             .await;
         }
     }
     if src_handle.kind() != EntryKind::Dir {
-        // special file (or unsupported type): non-recursive; the permit is already released above.
+        // special file (or unsupported type): retain admission until this non-recursive decision
+        // returns and drops the source/update handles.
+        let _guard = open_file_guard;
         if settings.copy_settings.skip_specials {
             tracing::debug!(
                 "skipping special file {:?} (kind: {:?})",
@@ -969,8 +1004,9 @@ async fn link_internal(
             Default::default(),
         ));
     }
-    // directory: recurse the dual tree. the leaf permit was released at the consolidated drop site
-    // above — this recursing path never holds it (the hold-and-wait deadlock invariant).
+    // directory: release before recursing the dual tree. this is rlink's direct counterpart to the
+    // shared driver's drop-before-recurse boundary.
+    drop(open_file_guard);
     debug_assert!(
         update_handle.is_none() || update_handle.as_ref().unwrap().kind() == EntryKind::Dir
     );
@@ -979,8 +1015,14 @@ async fn link_internal(
     // recursive "update missing" case), process this subtree in no-update mode: hard-link the whole
     // source subtree. Passing the parent update tuple here would make `link_dir_entry` try to
     // `open_dir` a non-existent update child.
-    let update_for_dir = update.filter(|_| update_handle.is_some());
-    let update_root_for_dir = update_root.filter(|_| update_handle.is_some());
+    let has_update_dir = update_handle.is_some();
+    let update_for_dir = update.filter(|_| has_update_dir);
+    let update_root_for_dir = update_root.filter(|_| has_update_dir);
+    let update_path_for_dir = update_path.as_deref().filter(|_| has_update_dir);
+    // link_dir_entry opens the source/update directories used for descent. retaining these O_PATH
+    // classification handles as well would add one or two needless fds at every recursive level.
+    drop(src_handle);
+    drop(update_handle);
     link_dir_entry(
         prog_track,
         src_parent,
@@ -994,7 +1036,7 @@ async fn link_internal(
         rel_path,
         &src_path,
         &dst_path,
-        update_path.as_deref().filter(|_| update_handle.is_some()),
+        update_path_for_dir,
         settings,
         is_fresh,
     )
@@ -1236,6 +1278,10 @@ async fn link_dir_contents(
         let entry_is_symlink = entry_kind == EntryKind::Symlink;
         let entry_rel = rel_path.join(&entry_name);
         let entry_path = src_path.join(&entry_name);
+        // admit every possible leaf before a DT_UNKNOWN filter/dry-run probe can open an O_PATH
+        // handle. a known directory takes no spawn-time permit; `link_internal` obtains only a
+        // short provisional one for authoritative classification and drops it before recursion.
+        let permit = walk::preacquire_leaf_permit(PermitKind::OpenFile, hint).await;
         // the dir-ness that drives the FILTER decision AND the dry-run recurse-vs-leaf branch
         // below must be AUTHORITATIVE: on a DT_UNKNOWN entry, defaulting to non-dir would wrongly
         // omit a real directory's whole subtree under an is_dir-dependent filter, or (in dry-run,
@@ -1243,12 +1289,15 @@ async fn link_dir_contents(
         // fstats when a filter is active OR — via force_authoritative — when dry-run needs the
         // type for control flow. One extra fstat only in those DT_UNKNOWN cases (never follows
         // symlinks).
-        let entry_is_dir = walk::filter_is_dir(
-            settings.filter.as_ref(),
-            src_dir,
-            &entry_name,
-            hint,
-            settings.dry_run.is_some(),
+        let entry_is_dir = safedir::with_optional_fd_admission(
+            permit.as_ref().map(LeafPermit::admission),
+            walk::filter_is_dir(
+                settings.filter.as_ref(),
+                src_dir,
+                &entry_name,
+                hint,
+                settings.dry_run.is_some(),
+            ),
         )
         .await;
         // apply filter if configured (logical path == entry_rel, since link's filter_base is empty)
@@ -1309,23 +1358,11 @@ async fn link_dir_contents(
             }
             continue;
         }
-        // for regular-file entries, pre-acquire a leaf permit (open-files pool) BEFORE spawning so we
-        // don't create unbounded tasks. `preacquire_leaf_permit` is the shared lifecycle primitive:
-        // its `want` opts in only for a regular-file hint, so directories take none (they recurse and
-        // would deadlock against a saturated pool), symlinks take none (they pass through to copy,
-        // which handles permits internally), and a DT_UNKNOWN hint takes none for the same reason —
-        // exactly the original `hint == Some(File)` policy. `link_internal` re-classifies
-        // authoritatively and either uses the permit (changed-file copy) or drops it.
-        //
         // Acquire-then-IMMEDIATELY-spawn (the permit is moved into `do_link` and spawned on the next
         // line, in the same loop step) is load-bearing: collecting a Vec of pre-acquired permits and
         // spawning later would hold N permits before any task runs and self-deadlock a saturated pool.
         // This mirrors the single-tree driver's incremental acquire-then-spawn loop
         // (`walk_driver::walk_dir_contents`, joined via `walk_driver::join_and_fold`).
-        let permit = walk::preacquire_leaf_permit(PermitKind::OpenFile, hint, |h| {
-            h == Some(EntryKind::File)
-        })
-        .await;
         let src_parent = Arc::clone(src_dir);
         let dst_parent = dst_dir.map(Arc::clone);
         let update_parent = update_dir.map(Arc::clone);
@@ -1369,34 +1406,29 @@ async fn link_dir_contents(
                 )
             })
             .map_err(|err| Error::new(err, link_summary))?;
-        // Iterate through update entries and for each one that's not present in src, copy it.
-        //
-        // We deliberately do NOT pre-acquire any permit here. Two cycles rule out the
-        // straightforward options:
-        //   * `open_file_permit`: copy_child → copy_internal re-acquires open-files for each file;
-        //     a saturated pool would deadlock the inner acquire if we held one across the call.
-        //   * `pending_meta_permit`: with --overwrite, copy_child → copy_file_fd → rm::rm drains
-        //     pending_meta for child entries (rm.rs spawn loop). N tasks here each holding a
-        //     pending_meta permit would deadlock waiting on each other's inner rm.
-        //
-        // The spawn count at this site is naturally bounded by the number of update-only entries
-        // (user input — typically modest). Each spawned task's work is throttled by copy's own
-        // internal open-files backpressure inside copy_internal's spawn loop.
+        // iterate through update entries and copy names absent from src. open-file admission is
+        // acquired incrementally before any DT_UNKNOWN filter probe and transferred into
+        // `copy_child`; copy therefore never re-acquires while the outer task holds it. the pending-
+        // metadata pool remains separate for any overwrite-triggered rm work.
         for (entry_name, hint) in update_entries {
             let entry_kind = hint.unwrap_or(EntryKind::File);
             let entry_rel = rel_path.join(&entry_name);
+            let permit = walk::preacquire_leaf_permit(PermitKind::OpenFile, hint).await;
             // the FILTER `is_dir` decision must use the AUTHORITATIVE type: on a DT_UNKNOWN update
             // entry with an is_dir-dependent include filter, defaulting to non-dir would wrongly
             // omit a real directory's whole subtree. one extra fstat only in that DT_UNKNOWN+filter
             // case (never follows symlinks).
-            let entry_is_dir = walk::filter_is_dir(
-                settings.filter.as_ref(),
-                update_dir,
-                &entry_name,
-                hint,
-                // used only for the filter decision here — no dry-run recurse-vs-leaf shortcut
-                // (delegate_copy reclassifies authoritatively) — so no need to force an fstat.
-                false,
+            let entry_is_dir = safedir::with_optional_fd_admission(
+                permit.as_ref().map(LeafPermit::admission),
+                walk::filter_is_dir(
+                    settings.filter.as_ref(),
+                    update_dir,
+                    &entry_name,
+                    hint,
+                    // used only for the filter decision here — no dry-run recurse-vs-leaf shortcut
+                    // (delegate_copy reclassifies authoritatively) — so no need to force an fstat.
+                    false,
+                ),
             )
             .await;
             // evaluate the filter for this update entry at its logical path. This MUST run
@@ -1451,6 +1483,7 @@ async fn link_dir_contents(
             let update_parent = Arc::clone(update_dir);
             let dst_parent = dst_dir.map(Arc::clone);
             let settings = settings.clone();
+            let open_file_guard = permit.map(LeafPermit::into_open_file);
             let do_copy = move || async move {
                 // filter-base for the delegated copy: this update entry's path relative to the
                 // source root, so any --delete pruning inside it matches the include/exclude filter
@@ -1465,7 +1498,7 @@ async fn link_dir_contents(
                     &entry_rel,
                     &settings,
                     is_fresh,
-                    None,
+                    open_file_guard,
                 )
                 .await
             };
@@ -4053,8 +4086,181 @@ mod link_tests {
     mod max_open_files_tests {
         use super::*;
 
-        /// deep + wide link: directory tree deeper than the open-files limit, with files
-        /// at every level. verifies no deadlock occurs (directories don't consume permits).
+        /// Public root setup must reserve open-file capacity before strict probes or operand-parent
+        /// opens. A filtered root otherwise returns before `link_internal` reaches its admission
+        /// point, and concurrent callers can bypass the budget entirely.
+        #[tokio::test]
+        async fn filtered_public_root_waits_for_admission_before_setup() -> Result<(), anyhow::Error>
+        {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("src");
+            let dst = root.join("dst");
+            tokio::fs::write(&src, b"x").await?;
+            let mut filter = crate::filter::FilterSettings::new();
+            filter.add_exclude("src")?;
+            let mut settings = common_settings(false, false);
+            settings.filter = Some(filter.clone());
+            settings.copy_settings.filter = Some(filter);
+            throttle::set_max_open_files(1);
+            let stat_resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
+            throttle::set_max_ops_in_flight(stat_resource, 1);
+            let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
+            let operation = link(&PROGRESS, &root, &src, &dst, &None, &settings, false);
+            tokio::pin!(operation);
+            let stopped_at_stat_gate = futures::poll!(operation.as_mut()).is_pending();
+            let mut second_permit = Box::pin(throttle::open_file_permit());
+            let setup_bypassed_admission = futures::poll!(second_permit.as_mut()).is_ready();
+            drop(second_permit);
+            drop(held_stat);
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(20), operation.as_mut()).await;
+            throttle::set_max_ops_in_flight(stat_resource, 0);
+            throttle::set_max_open_files(0);
+            assert!(
+                stopped_at_stat_gate,
+                "rlink root did not reach the held stat gate"
+            );
+            let summary =
+                result.context("rlink root did not resume after stat capacity was released")??;
+            assert!(
+                !setup_bypassed_admission,
+                "rlink performed root setup before open-file admission"
+            );
+            assert_eq!(summary.copy_summary.files_skipped, 1);
+            Ok(())
+        }
+
+        /// A root or delegated rlink worker without a caller-supplied guard must reserve capacity
+        /// before opening its source classification handle.
+        #[tokio::test]
+        async fn root_acquires_capacity_before_classification() -> Result<(), anyhow::Error> {
+            let root = testutils::create_temp_dir().await?;
+            let src_path = root.join("src");
+            let dst_path = root.join("dst");
+            tokio::fs::write(&src_path, b"x").await?;
+            let src_parent = Arc::new(
+                Dir::open_parent_dir(&root, congestion::Side::Source)
+                    .await?
+                    .into_tree(),
+            );
+            let mut settings = common_settings(false, false);
+            settings.dry_run = Some(crate::config::DryRunMode::Brief);
+            settings.copy_settings.dry_run = settings.dry_run;
+            throttle::set_max_open_files(1);
+            let stat_resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
+            throttle::set_max_ops_in_flight(stat_resource, 1);
+            let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
+            let operation = link_internal(
+                &PROGRESS,
+                &src_parent,
+                None,
+                None,
+                std::ffi::OsStr::new("src"),
+                &src_path,
+                &dst_path,
+                None,
+                std::path::Path::new(""),
+                &settings,
+                false,
+                None,
+            );
+            tokio::pin!(operation);
+            let stopped_at_stat_gate = futures::poll!(operation.as_mut()).is_pending();
+            let mut second_permit = Box::pin(throttle::open_file_permit());
+            let classification_bypassed_admission =
+                futures::poll!(second_permit.as_mut()).is_ready();
+            drop(second_permit);
+            drop(held_stat);
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(20), operation.as_mut()).await;
+            throttle::set_max_ops_in_flight(stat_resource, 0);
+            throttle::set_max_open_files(0);
+            assert!(
+                stopped_at_stat_gate,
+                "rlink root did not reach the held stat gate"
+            );
+            assert!(
+                !classification_bypassed_admission,
+                "rlink reached fd-based classification before open-file admission"
+            );
+            let summary = result.context(
+                "rlink root did not resume after classification capacity was released",
+            )??;
+            assert_eq!(summary.hard_links_created, 1);
+            Ok(())
+        }
+
+        /// A hard-link leaf must retain its admission guard through the actual
+        /// fd-bearing `linkat`, not release it after source/update classification.
+        #[tokio::test]
+        async fn hard_link_holds_open_file_capacity_until_link_finishes()
+        -> Result<(), anyhow::Error> {
+            let root = testutils::create_temp_dir().await?;
+            let src_root = root.join("src");
+            let dst_root = root.join("dst");
+            tokio::fs::create_dir(&src_root).await?;
+            tokio::fs::create_dir(&dst_root).await?;
+            tokio::fs::write(src_root.join("entry"), b"x").await?;
+            let src_parent =
+                Arc::new(Dir::open_root_dir(&src_root, false, congestion::Side::Source).await?);
+            let dst_parent = Arc::new(
+                Dir::open_root_dir(&dst_root, false, congestion::Side::Destination).await?,
+            );
+            throttle::set_max_open_files(1);
+            let permit = Some(LeafPermit::OpenFile(throttle::open_file_permit().await));
+            let hard_link_resource = throttle::Resource::meta(
+                throttle::Side::Destination,
+                throttle::MetadataOp::HardLink,
+            );
+            throttle::set_max_ops_in_flight(hard_link_resource, 1);
+            let held_hard_link = throttle::ops_in_flight_permit(hard_link_resource).await;
+            let dst_entry = dst_root.join("entry");
+            let task_dst_entry = dst_entry.clone();
+            let task = tokio::spawn(async move {
+                link_internal(
+                    &PROGRESS,
+                    &src_parent,
+                    None,
+                    Some(&dst_parent),
+                    std::ffi::OsStr::new("entry"),
+                    &src_root.join("entry"),
+                    &task_dst_entry,
+                    None,
+                    std::path::Path::new(""),
+                    &common_settings(false, false),
+                    true,
+                    permit,
+                )
+                .await
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let second_permit = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                throttle::open_file_permit(),
+            )
+            .await;
+            let released_before_link_finished = second_permit.is_ok();
+            drop(second_permit);
+            drop(held_hard_link);
+            let summary = tokio::time::timeout(std::time::Duration::from_secs(20), task)
+                .await
+                .context("hard link did not resume after metadata capacity was released")??
+                .map_err(|error| error.source)?;
+            throttle::set_max_ops_in_flight(hard_link_resource, 0);
+            throttle::set_max_open_files(0);
+            assert!(
+                !released_before_link_finished,
+                "hard-link work released its open-file permit before linkat completed"
+            );
+            assert_eq!(summary.hard_links_created, 1);
+            assert!(dst_entry.exists());
+            Ok(())
+        }
+
+        /// Deep + wide link: a directory tree deeper than the open-files limit, with files at every
+        /// level. Verifies directories do not retain leaf admission across recursion.
         #[tokio::test]
         #[traced_test]
         async fn deep_tree_no_deadlock_under_open_files_saturation() -> Result<(), anyhow::Error> {
@@ -4063,7 +4269,7 @@ mod link_tests {
             let dst = tmp_dir.join("dst");
             let depth = 20;
             let files_per_level = 5;
-            let limit = 4;
+            let limit = 1;
             // create a directory chain deeper than the permit limit, with files at each level
             let mut dir = src.clone();
             for level in 0..depth {
@@ -4106,19 +4312,18 @@ mod link_tests {
             Ok(())
         }
 
-        /// Regression: link_internal's spawn-time guard must be released before
-        /// delegating to copy::copy on the file-type-changed path.
+        /// A file-type-changed directory must release transferred admission before recursion.
         ///
         /// Scenario: many src entries are regular files (so the spawn loop
         /// pre-acquires open-files permits for them), but the corresponding
         /// `update` entries are directories (file types differ). link_internal
-        /// then calls copy::copy on the update directory, which enters
-        /// copy_internal. If the spawn-time permit were still held while
-        /// copy::copy ran, copy_internal's own open-files acquire for any
-        /// inner file would deadlock against a saturated pool.
+        /// then transfers its admission into `copy_child` for the update directory. The copy driver
+        /// must release that guard after authoritative directory classification and before descent;
+        /// retaining it while children acquire would deadlock against a saturated pool.
         #[tokio::test]
         #[traced_test]
-        async fn parallel_update_filetype_change_no_deadlock() -> Result<(), anyhow::Error> {
+        async fn type_changed_directory_releases_admission_before_recursion()
+        -> Result<(), anyhow::Error> {
             let tmp_dir = testutils::create_temp_dir().await?;
             let src = tmp_dir.join("src");
             let update = tmp_dir.join("update");
@@ -4141,8 +4346,7 @@ mod link_tests {
                     .await?;
                 }
             }
-            // saturate the open-files pool: spawn-time permits held by every
-            // outer link task would block copy::copy's inner permit acquires.
+            // saturate the pool so retaining delegated admission during descent blocks child work.
             throttle::set_max_open_files(2);
             let summary = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
@@ -4157,9 +4361,7 @@ mod link_tests {
                 ),
             )
             .await
-            .context(
-                "link timed out — caller-supplied open-files guard not released before copy::copy",
-            )?
+            .context("link timed out — delegated admission was retained during directory descent")?
             .context("link failed")?;
             // every entry was a type-mismatch -> copied from update.
             // copy::copy on a directory creates the dir and copies inner files.
@@ -4177,13 +4379,74 @@ mod link_tests {
             Ok(())
         }
 
-        /// Regression: the "update-only entries" spawn loop must not deadlock
-        /// against copy::copy's open-files OR against rm::rm's pending-meta.
+        /// Update-only scheduling must stop before spawning a second fd-bearing copy when the
+        /// first owns all open-file capacity. The ReadLink gate keeps that first worker live long
+        /// enough to observe the number of started entry tasks deterministically.
+        #[tokio::test]
+        async fn update_only_spawning_stops_at_open_file_capacity() -> Result<(), anyhow::Error> {
+            let tmp_dir = testutils::create_temp_dir().await?;
+            let src = tmp_dir.join("src");
+            let update = tmp_dir.join("update");
+            let dst = tmp_dir.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&update).await?;
+            let n = 8;
+            for i in 0..n {
+                tokio::fs::symlink(format!("target-{i}"), update.join(format!("u{i}"))).await?;
+            }
+            let progress: &'static progress::Progress =
+                Box::leak(Box::new(progress::Progress::new()));
+            throttle::set_max_open_files(1);
+            let readlink_resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::ReadLink);
+            throttle::set_max_ops_in_flight(readlink_resource, 1);
+            let held_readlink = throttle::ops_in_flight_permit(readlink_resource).await;
+            let task = tokio::spawn(async move {
+                link(
+                    progress,
+                    &tmp_dir,
+                    &src,
+                    &dst,
+                    &Some(update),
+                    &common_settings(false, false),
+                    false,
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                loop {
+                    if progress.ops.get().started >= 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .context("the first update-only worker did not start")?;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let started_while_blocked = progress.ops.get().started;
+            drop(held_readlink);
+            let summary = tokio::time::timeout(std::time::Duration::from_secs(20), task)
+                .await
+                .context("update-only copies did not resume after ReadLink was released")??
+                .map_err(|error| error.source)?;
+            throttle::set_max_ops_in_flight(readlink_resource, 0);
+            throttle::set_max_open_files(0);
+            assert_eq!(
+                started_while_blocked, 2,
+                "root plus exactly one admitted update-only worker should be live"
+            );
+            assert_eq!(summary.copy_summary.symlinks_created, n);
+            Ok(())
+        }
+
+        /// Regression: the update-only entries loop must transfer open-file admission into
+        /// copy_child without deadlocking against copy's own classification or rm's pending-meta.
         ///
         /// Scenario: update has many regular files that don't exist in src.
         /// The loop at site 3 spawns a copy::copy task per entry under a
-        /// saturated open-files pool. copy::copy's internal acquires must
-        /// proceed normally — site 3 must not be holding open-files.
+        /// saturated open-files pool. Each outer iteration transfers its guard into copy_child, so
+        /// delegated classification does not reacquire while the caller retains capacity.
         #[tokio::test]
         #[traced_test]
         async fn update_only_entries_bounded_no_deadlock() -> Result<(), anyhow::Error> {

@@ -70,6 +70,42 @@ pub const DST_DIR_CREATE_MODE: u32 = 0o700;
 static STRICT_OPERAND_RESOLUTION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+tokio::task_local! {
+    /// The weak admission reference inherited by fd-owning blocking metadata work in this task.
+    static FD_ADMISSION: throttle::FdAdmission;
+}
+
+/// Run `future` with a weak admission reference available to safedir blocking work.
+///
+/// Tokio cannot cancel a `spawn_blocking` closure after it starts. Without this scope, cancelling
+/// the async waiter drops its operation guard even though the detached closure may still own a
+/// duplicated directory or entry fd. [`run_metadata_probed_blocking`] upgrades the reference for
+/// each such closure, keeping the original admission slot occupied until that fd-owning owner
+/// finishes. The ambient reference is deliberately weak: dropping the concrete guard before
+/// directory recursion still releases capacity even while this scope remains on the stack.
+/// Tokio task locals are not inherited by `tokio::spawn`; every spawned entry worker must install
+/// its own scope after it receives admission.
+pub async fn with_fd_admission<F>(admission: throttle::FdAdmission, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    FD_ADMISSION.scope(admission, future).await
+}
+
+/// Run `future` under `admission` when this traversal uses an fd-admission pool.
+pub(crate) async fn with_optional_fd_admission<F>(
+    admission: Option<throttle::FdAdmission>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    match admission {
+        Some(admission) => with_fd_admission(admission, future).await,
+        None => future.await,
+    }
+}
+
 /// Arm strict operand resolution for the rest of this process (one-way).
 ///
 /// Called by the TOCTOU linter when `--require-toctou-safe` proceeds; not
@@ -967,7 +1003,7 @@ impl Dir {
     ) -> std::io::Result<Vec<(std::ffi::OsString, Option<EntryKind>)>> {
         throttle::get_ops_token().await;
         let dir = self.fd.clone();
-        tokio::task::spawn_blocking(move || {
+        run_fd_admitted_blocking(move || {
             // Dup the fd with FD_CLOEXEC so nix::dir::Dir can consume (and close)
             // it on drop without touching self's Arc<OwnedFd>. A bare dup(2)
             // would clear FD_CLOEXEC; F_DUPFD_CLOEXEC atomically sets it.
@@ -1016,7 +1052,6 @@ impl Dir {
             Ok(entries)
         })
         .await
-        .map_err(std::io::Error::other)?
     }
 
     /// Enumerate at most `cap` entries (excluding `.` and `..`), or report the directory as
@@ -1033,7 +1068,7 @@ impl Dir {
     ) -> std::io::Result<Option<Vec<(std::ffi::OsString, Option<EntryKind>)>>> {
         throttle::get_ops_token().await;
         let dir = self.fd.clone();
-        tokio::task::spawn_blocking(move || {
+        run_fd_admitted_blocking(move || {
             // dup + rewind contract: see read_entries
             let dup_raw: RawFd =
                 nix::fcntl::fcntl(dir.as_fd(), nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0))
@@ -1064,7 +1099,6 @@ impl Dir {
             Ok(Some(entries))
         })
         .await
-        .map_err(std::io::Error::other)?
     }
 
     /// Remove a child non-directory entry by name, gated on this directory's own congestion side.
@@ -3090,14 +3124,40 @@ pub async fn set_symlink_metadata_fd<Meta: crate::preserve::Metadata>(
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+/// Run fd-owning blocking work while retaining any task-scoped admission through cancellation.
+///
+/// The strong lease lives in the blocking task's output, after `result`, so an abandoned returned
+/// [`Dir`], [`Handle`], or file is dropped before the admission slot is released. This lower-level
+/// boundary intentionally adds no rate or congestion gating; directory enumeration uses it after
+/// consuming its static rate token, while metadata syscalls layer their congestion lifecycle on
+/// top in [`run_metadata_probed_blocking_no_rate`].
+async fn run_fd_admitted_blocking<F, T>(f: F) -> std::io::Result<T>
+where
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    // upgrade immediately before submission. if the ambient weak reference has expired (ordinary
+    // directory recursion dropped its provisional guard), this remains an unadmitted directory
+    // operation; an admitted outer leaf such as copy -> recursive rm stays represented.
+    let blocking_admission = FD_ADMISSION
+        .try_with(throttle::FdAdmission::blocking_lease)
+        .ok();
+    let (result, _blocking_admission) =
+        tokio::task::spawn_blocking(move || (f(), blocking_admission))
+            .await
+            .map_err(std::io::Error::other)?;
+    result
+}
+
 /// Run a blocking metadata syscall closure on the blocking pool, gated by the
 /// congestion controller for the given side and operation kind.
 ///
-/// Wraps `spawn_blocking` inside [`crate::walk::run_metadata_probed`] so each
-/// per-entry `openat`/`fstatat` is rate-gated, counted against the cwnd permit,
-/// and feeds the latency probe — the same per-metadata-syscall gating shape used
-/// throughout this crate.
-async fn run_metadata_probed_blocking<F, T>(
+/// Each per-entry `openat`/`fstatat` is rate-gated, counted against the cwnd permit, and feeds the
+/// latency probe — the same per-metadata-syscall gating shape used throughout this crate. The cwnd
+/// guard and probe move into the blocking closure because cancelling the async waiter cannot stop
+/// a syscall that has started; releasing either in the waiter would undercount the actual in-flight
+/// work and its latency.
+pub async fn run_metadata_probed_blocking<F, T>(
     side: congestion::Side,
     op: congestion::MetadataOp,
     f: F,
@@ -3106,10 +3166,34 @@ where
     F: FnOnce() -> std::io::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    crate::walk::run_metadata_probed(side, op, async {
-        tokio::task::spawn_blocking(f)
-            .await
-            .map_err(std::io::Error::other)?
+    throttle::get_ops_token().await;
+    run_metadata_probed_blocking_no_rate(side, op, f).await
+}
+
+/// Variant of [`run_metadata_probed_blocking`] for a caller that already consumed the static
+/// operations-rate token before spawning its task.
+pub async fn run_metadata_probed_blocking_no_rate<F, T>(
+    side: congestion::Side,
+    op: congestion::MetadataOp,
+    f: F,
+) -> std::io::Result<T>
+where
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let ops_permit = throttle::ops_in_flight_permit(crate::walk::meta_resource(side, op)).await;
+    let probe = congestion::Probe::start_metadata(side, op);
+    run_fd_admitted_blocking(move || {
+        let result = f();
+        match &result {
+            Ok(_) => probe.complete_ok(0),
+            Err(_) => probe.discard(),
+        }
+        // the cwnd models syscall concurrency, so release it when `f` finishes. The shared blocking
+        // boundary keeps admission in the task output because `f` can return an fd that an
+        // abandoned waiter never receives.
+        drop(ops_permit);
+        result
     })
     .await
 }
@@ -3143,6 +3227,209 @@ mod tests {
         EntryKind::Symlink,
         EntryKind::Special,
     ];
+
+    mod max_open_files_tests {
+        use super::*;
+        use anyhow::Context as _;
+
+        struct BlockingDropFd {
+            _file: std::fs::File,
+            drop_started: Option<tokio::sync::oneshot::Sender<()>>,
+            release_drop: std::sync::mpsc::Receiver<()>,
+        }
+
+        impl Drop for BlockingDropFd {
+            fn drop(&mut self) {
+                if let Some(drop_started) = self.drop_started.take() {
+                    let _ = drop_started.send(());
+                }
+                self.release_drop
+                    .recv()
+                    .expect("drop release sender must stay alive");
+            }
+        }
+
+        /// Cancelling an unprobed blocking waiter must retain any ambient fd admission until its
+        /// detached closure releases the descriptor it owns. Directory enumeration uses this
+        /// lower-level boundary because `getdents` is deliberately excluded from congestion
+        /// probing.
+        #[tokio::test]
+        async fn cancelled_unprobed_waiter_keeps_admission_until_fd_owner_finishes()
+        -> anyhow::Result<()> {
+            let root = crate::testutils::create_temp_dir().await?;
+            let file_path = root.join("held-unprobed");
+            tokio::fs::write(&file_path, b"x").await?;
+            throttle::set_max_open_files(1);
+            let open_file_guard = throttle::open_file_permit().await;
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let task = tokio::spawn(async move {
+                let admission = open_file_guard.admission();
+                with_fd_admission(admission, async move {
+                    let _open_file_guard = open_file_guard;
+                    run_fd_admitted_blocking(move || {
+                        let _file = std::fs::File::open(file_path)?;
+                        let _ = started_tx.send(());
+                        release_rx.recv().map_err(std::io::Error::other)?;
+                        Ok(())
+                    })
+                    .await
+                })
+                .await
+            });
+            started_rx.await?;
+            task.abort();
+            let join_error = task
+                .await
+                .expect_err("the async unprobed waiter must observe cancellation");
+            assert!(join_error.is_cancelled());
+
+            let mut second_permit = Box::pin(throttle::open_file_permit());
+            assert!(
+                futures::poll!(second_permit.as_mut()).is_pending(),
+                "cancelling the waiter released admission while detached work held an fd"
+            );
+            release_tx.send(())?;
+            let permit =
+                tokio::time::timeout(std::time::Duration::from_secs(20), second_permit.as_mut())
+                    .await
+                    .context("admission was not released after detached unprobed work finished")?;
+            drop(permit);
+            throttle::set_max_open_files(0);
+            Ok(())
+        }
+
+        /// Cancelling a metadata waiter must not release admission while its detached blocking
+        /// closure still owns a file descriptor.
+        #[tokio::test]
+        async fn cancelled_metadata_waiter_keeps_admission_until_fd_owner_finishes()
+        -> anyhow::Result<()> {
+            let root = crate::testutils::create_temp_dir().await?;
+            let file_path = root.join("held");
+            tokio::fs::write(&file_path, b"x").await?;
+            throttle::set_max_open_files(1);
+            let stat_resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
+            throttle::set_max_ops_in_flight(stat_resource, 1);
+            let open_file_guard = throttle::open_file_permit().await;
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let task = tokio::spawn(async move {
+                let admission = open_file_guard.admission();
+                with_fd_admission(admission, async move {
+                    let _open_file_guard = open_file_guard;
+                    run_metadata_probed_blocking(
+                        congestion::Side::Source,
+                        congestion::MetadataOp::Stat,
+                        move || {
+                            let _file = std::fs::File::open(file_path)?;
+                            let _ = started_tx.send(());
+                            release_rx.recv().map_err(std::io::Error::other)?;
+                            Ok(())
+                        },
+                    )
+                    .await
+                })
+                .await
+            });
+            started_rx.await?;
+            task.abort();
+            let join_error = task
+                .await
+                .expect_err("the async metadata waiter must observe cancellation");
+            assert!(join_error.is_cancelled());
+
+            let second_permit = throttle::open_file_permit();
+            tokio::pin!(second_permit);
+            assert!(
+                futures::poll!(second_permit.as_mut()).is_pending(),
+                "cancelling the waiter released admission while detached work held an fd"
+            );
+            let second_stat_permit = throttle::ops_in_flight_permit(stat_resource);
+            tokio::pin!(second_stat_permit);
+            assert!(
+                futures::poll!(second_stat_permit.as_mut()).is_pending(),
+                "cancelling the waiter released metadata capacity while its syscall was live"
+            );
+            release_tx.send(())?;
+            let permit =
+                tokio::time::timeout(std::time::Duration::from_secs(20), second_permit.as_mut())
+                    .await
+                    .context("admission was not released after detached metadata work finished")?;
+            drop(permit);
+            let stat_permit = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                second_stat_permit.as_mut(),
+            )
+            .await
+            .context("metadata capacity was not released after detached work finished")?;
+            drop(stat_permit);
+            throttle::set_max_ops_in_flight(stat_resource, 0);
+            throttle::set_max_open_files(0);
+            Ok(())
+        }
+
+        /// A detached blocking task's returned fd must be dropped before its admission lease. The
+        /// fd lives in the abandoned task output rather than inside the syscall closure itself.
+        #[tokio::test]
+        async fn abandoned_metadata_output_keeps_admission_until_returned_fd_drops()
+        -> anyhow::Result<()> {
+            let root = crate::testutils::create_temp_dir().await?;
+            let file_path = root.join("returned");
+            tokio::fs::write(&file_path, b"x").await?;
+            throttle::set_max_open_files(1);
+            let open_file_guard = throttle::open_file_permit().await;
+            let (work_started_tx, work_started_rx) = tokio::sync::oneshot::channel();
+            let (release_work_tx, release_work_rx) = std::sync::mpsc::channel();
+            let (drop_started_tx, drop_started_rx) = tokio::sync::oneshot::channel();
+            let (release_drop_tx, release_drop_rx) = std::sync::mpsc::channel();
+            let task = tokio::spawn(async move {
+                let admission = open_file_guard.admission();
+                with_fd_admission(admission, async move {
+                    let _open_file_guard = open_file_guard;
+                    run_metadata_probed_blocking(
+                        congestion::Side::Source,
+                        congestion::MetadataOp::Stat,
+                        move || {
+                            let file = std::fs::File::open(file_path)?;
+                            let _ = work_started_tx.send(());
+                            release_work_rx.recv().map_err(std::io::Error::other)?;
+                            Ok(BlockingDropFd {
+                                _file: file,
+                                drop_started: Some(drop_started_tx),
+                                release_drop: release_drop_rx,
+                            })
+                        },
+                    )
+                    .await
+                })
+                .await
+            });
+            work_started_rx.await?;
+            task.abort();
+            assert!(
+                matches!(task.await, Err(error) if error.is_cancelled()),
+                "the async metadata waiter must observe cancellation"
+            );
+
+            release_work_tx.send(())?;
+            drop_started_rx.await?;
+            let second_permit = throttle::open_file_permit();
+            tokio::pin!(second_permit);
+            assert!(
+                futures::poll!(second_permit.as_mut()).is_pending(),
+                "admission was released before the abandoned returned fd was dropped"
+            );
+            release_drop_tx.send(())?;
+            let permit =
+                tokio::time::timeout(std::time::Duration::from_secs(20), second_permit.as_mut())
+                    .await
+                    .context("admission was not released after the returned fd was dropped")?;
+            drop(permit);
+            throttle::set_max_open_files(0);
+            Ok(())
+        }
+    }
 
     #[test]
     fn a_run_that_asked_for_nothing_wants_no_root_acl_notice() {

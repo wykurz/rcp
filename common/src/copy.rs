@@ -332,6 +332,41 @@ pub async fn copy_with_filter_base(
     is_fresh: bool,
     filter_base: &std::path::Path,
 ) -> Result<Summary, Error> {
+    copy_with_filter_base_admitted(
+        prog_track,
+        src,
+        dst,
+        settings,
+        preserve,
+        is_fresh,
+        filter_base,
+        None,
+    )
+    .await
+}
+
+/// Path-based root setup with transferable leaf admission.
+///
+/// Normal public calls arrive without a guard and acquire before opening either operand parent or
+/// performing a strict fd-based root filter probe. `--dereference` transfers its spawn-loop guard
+/// here, so a wide set of symlinks cannot fan out into unadmitted target walks. The shared driver
+/// releases the guard if authoritative target classification proves it is a directory.
+#[instrument(skip(prog_track, settings, preserve, open_file_guard))]
+#[allow(clippy::too_many_arguments)]
+async fn copy_with_filter_base_admitted(
+    prog_track: &'static progress::Progress,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    settings: &Settings,
+    preserve: &preserve::Settings,
+    is_fresh: bool,
+    filter_base: &std::path::Path,
+    open_file_guard: Option<throttle::OpenFileGuard>,
+) -> Result<Summary, Error> {
+    let open_file_guard = match open_file_guard {
+        Some(guard) => guard,
+        None => throttle::open_file_permit().await,
+    };
     // Source: decompose via the shared helper so `.`/`..` operands (e.g. `rcp . dst`, `rcp src/..
     // dst`) are canonicalized to a real directory + basename instead of being rejected; `/` is still
     // rejected. (The helper also maps a single-component relative path's empty parent to ".".)
@@ -361,10 +396,13 @@ pub async fn copy_with_filter_base(
     // without requiring parent read.
     let strict = crate::safedir::strict_operand_resolution();
     let strict_src_parent: Option<Arc<Dir>> = if strict {
-        let parent = Dir::open_parent_dir(src_parent_path, congestion::Side::Source)
-            .await
-            .with_context(|| format!("cannot open source parent directory {:?}", src_parent_path))
-            .map_err(|err| Error::new(err, Default::default()))?;
+        let parent = safedir::with_fd_admission(
+            open_file_guard.admission(),
+            Dir::open_parent_dir(src_parent_path, congestion::Side::Source),
+        )
+        .await
+        .with_context(|| format!("cannot open source parent directory {:?}", src_parent_path))
+        .map_err(|err| Error::new(err, Default::default()))?;
         // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
         Some(Arc::new(parent.into_tree()))
     } else {
@@ -372,7 +410,12 @@ pub async fn copy_with_filter_base(
     };
     let strict_dst_parent: Option<Arc<Dir>> = match (strict, dst_parent_path_opt) {
         (true, Some(dst_parent_path)) => {
-            match Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination).await {
+            match safedir::with_fd_admission(
+                open_file_guard.admission(),
+                Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination),
+            )
+            .await
+            {
                 Ok(parent) => Some(Arc::new(parent.into_tree())),
                 // an absent destination parent (dry-run previewing into a not-yet-created tree, or
                 // a filtered-out root) is not a symlink violation — leave it to the walk's
@@ -401,11 +444,11 @@ pub async fn copy_with_filter_base(
         let (kind, is_dir) = match &strict_src_parent {
             // strict: classify via the held parent fd (O_NOFOLLOW), never by path
             Some(parent) => {
-                let root_handle = parent
-                    .child(src_name)
-                    .await
-                    .with_context(|| format!("failed reading metadata from src: {:?}", &src))
-                    .map_err(|err| Error::new(err, Default::default()))?;
+                let root_handle =
+                    safedir::with_fd_admission(open_file_guard.admission(), parent.child(src_name))
+                        .await
+                        .with_context(|| format!("failed reading metadata from src: {:?}", &src))
+                        .map_err(|err| Error::new(err, Default::default()))?;
                 (root_handle.kind(), root_handle.kind() == EntryKind::Dir)
             }
             None => {
@@ -447,12 +490,13 @@ pub async fn copy_with_filter_base(
     let src_parent = match strict_src_parent {
         Some(parent) => parent,
         None => {
-            let parent = Dir::open_parent_dir(src_parent_path, congestion::Side::Source)
-                .await
-                .with_context(|| {
-                    format!("cannot open source parent directory {:?}", src_parent_path)
-                })
-                .map_err(|err| Error::new(err, Default::default()))?;
+            let parent = safedir::with_fd_admission(
+                open_file_guard.admission(),
+                Dir::open_parent_dir(src_parent_path, congestion::Side::Source),
+            )
+            .await
+            .with_context(|| format!("cannot open source parent directory {:?}", src_parent_path))
+            .map_err(|err| Error::new(err, Default::default()))?;
             Arc::new(parent.into_tree())
         }
     };
@@ -460,11 +504,14 @@ pub async fn copy_with_filter_base(
     // a source root carrying an ACL is about to be copied by settings that drop it. Skipped
     // entirely by a copy that asked for no preservation at all, once ACLs are preserved for both
     // kinds, and after the first root of the run.
-    crate::safedir::warn_if_root_acl_unpreserved_at(
-        &src_parent,
-        src_name,
-        src,
-        crate::safedir::RootAclNotice::for_preserve(preserve),
+    safedir::with_fd_admission(
+        open_file_guard.admission(),
+        crate::safedir::warn_if_root_acl_unpreserved_at(
+            &src_parent,
+            src_name,
+            src,
+            crate::safedir::RootAclNotice::for_preserve(preserve),
+        ),
     )
     .await;
     // Authoritative destination split (runs AFTER the filter, preserving default-mode ordering): a
@@ -494,15 +541,18 @@ pub async fn copy_with_filter_base(
         match strict_dst_parent {
             Some(parent) => Some(parent),
             None => {
-                let dir = Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "cannot open destination parent directory {:?}",
-                            dst_parent_path
-                        )
-                    })
-                    .map_err(|err| Error::new(err, Default::default()))?;
+                let dir = safedir::with_fd_admission(
+                    open_file_guard.admission(),
+                    Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "cannot open destination parent directory {:?}",
+                        dst_parent_path
+                    )
+                })
+                .map_err(|err| Error::new(err, Default::default()))?;
                 Some(Arc::new(dir.into_tree()))
             }
         }
@@ -518,7 +568,7 @@ pub async fn copy_with_filter_base(
         settings,
         preserve,
         is_fresh,
-        None,
+        Some(LeafPermit::OpenFile(open_file_guard)),
     )
     .await
 }
@@ -947,8 +997,8 @@ struct FinalizeDir {
 }
 
 /// Build the [`CopyVisitor`] for one copy operation and process the root entry through the generic
-/// driver. Shared by [`copy_with_filter_base`] (root entry, no pre-acquired permit) and
-/// [`copy_child`] (rlink's fd-based delegation entry point, which may pass an already-held
+/// driver. Shared by [`copy_with_filter_base`] (which acquires root admission before parent setup)
+/// and [`copy_child`] (rlink's fd-based delegation entry point, which may pass an already-held
 /// open-files permit). The root is processed exactly like a nested child via
 /// [`crate::walk_driver::process_entry`]: it is classified authoritatively, then dispatched to
 /// `visit_leaf` (file/symlink/special) or `dir_pre`/recurse/`dir_post` (directory).
@@ -1009,15 +1059,8 @@ impl WalkVisitor for CopyVisitor {
     }
 
     fn permit_kind(&self) -> PermitKind {
-        // copy holds an open file descriptor across a regular-file copy.
+        // copy retains fd-backed handles across every non-recursive leaf operation.
         PermitKind::OpenFile
-    }
-
-    fn want_permit(&self, hint: Option<EntryKind>) -> bool {
-        // pre-acquire the open-files permit only for a known regular-file hint. symlinks are
-        // excluded (with --dereference they may resolve to directories — deadlock risk) and so is
-        // DT_UNKNOWN (it might be a directory). this matches `copy_dir_contents`'s old policy.
-        hint == Some(EntryKind::File)
     }
 
     fn fail_early(&self) -> bool {
@@ -1058,11 +1101,17 @@ impl WalkVisitor for CopyVisitor {
         let dst_name = self.dst_name_for(cx)?;
         let is_fresh = parent_ctx.is_fresh;
         // --dereference: resolve a symlink to its target by path and copy that instead. this is the
-        // one path-based branch we intentionally keep (hardening -L is out of scope). drop the
-        // (regular-file-only) pre-acquired permit first: it is meaningless for a symlink that may
-        // resolve to a directory and could deadlock the recursive `copy()` under a saturated pool.
+        // one path-based branch we intentionally keep (hardening -L is out of scope). transfer the
+        // provisional admission into the target's root walk; that walk releases it if authoritative
+        // classification proves the target is a directory.
         if self.settings.dereference && kind == EntryKind::Symlink {
-            drop(permit);
+            let open_file_guard = match permit {
+                Some(permit) => permit.into_open_file(),
+                None => throttle::open_file_permit().await,
+            };
+            // canonicalize/recurse no longer uses the pinned symlink; release that fd before the
+            // potentially deep path-based traversal too.
+            drop(handle);
             // invariant: only the explicit `--dereference` path may re-resolve an entry by path
             // (`canonicalize`). the non-dereference walk is fully fd-based and must never reach
             // here. a future refactor that wires `dereference == false` into this branch trips in
@@ -1080,24 +1129,23 @@ impl WalkVisitor for CopyVisitor {
             .await
             .with_context(|| format!("failed reading src symlink {:?}", src_path))
             .map_err(|err| Error::new(err, Default::default()))?;
-            return copy(
+            return copy_with_filter_base_admitted(
                 self.prog_track,
                 &link,
                 &dst_path,
                 &self.settings,
                 &self.preserve,
                 is_fresh,
+                std::path::Path::new(""),
+                Some(open_file_guard),
             )
             .await;
         }
         match kind {
             EntryKind::File => {
-                // hold the open-files permit across the file copy. the driver pre-acquired it for a
-                // regular-file hint; if it didn't (an unknown hint that turned out to be a file),
-                // acquire it now.
-                let _guard = match permit {
-                    Some(p) => p,
-                    None => LeafPermit::OpenFile(throttle::open_file_permit().await),
+                let open_file_guard = match permit {
+                    Some(permit) => permit.into_open_file(),
+                    None => throttle::open_file_permit().await,
                 };
                 copy_file_fd(
                     self.prog_track,
@@ -1111,11 +1159,16 @@ impl WalkVisitor for CopyVisitor {
                     &self.settings,
                     &self.preserve,
                     is_fresh,
+                    open_file_guard,
                 )
                 .await
             }
             EntryKind::Symlink => {
-                drop(permit);
+                // retain admission through the complete fd-bearing symlink operation.
+                let _guard = match permit {
+                    Some(permit) => permit,
+                    None => LeafPermit::OpenFile(throttle::open_file_permit().await),
+                };
                 copy_symlink_fd(
                     self.prog_track,
                     src_parent,
@@ -1131,7 +1184,11 @@ impl WalkVisitor for CopyVisitor {
                 .await
             }
             EntryKind::Special => {
-                drop(permit);
+                // retain admission through this non-recursive classification decision.
+                let _guard = match permit {
+                    Some(permit) => permit,
+                    None => LeafPermit::OpenFile(throttle::open_file_permit().await),
+                };
                 if self.settings.skip_specials {
                     tracing::debug!("skipping special file {:?}", src_path);
                     if let Some(mode) = self.settings.dry_run {
@@ -1439,6 +1496,23 @@ async fn dry_run_dst_exists(dst_path: &std::path::Path) -> Result<bool, Error> {
     }
 }
 
+/// Run non-cancellable blocking work while keeping its open-file admission alive.
+///
+/// Tokio cannot abort a `spawn_blocking` closure once it starts. Moving the guard into the closure
+/// prevents cancellation of the awaiting async task from releasing capacity while detached work
+/// still owns file descriptors. On normal completion the guard returns to the async caller so it
+/// can remain live across any subsequent fd-bearing work.
+async fn spawn_blocking_with_open_file_guard<T, F>(
+    open_file_guard: throttle::OpenFileGuard,
+    work: F,
+) -> Result<(T, throttle::OpenFileGuard), tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || (work(), open_file_guard)).await
+}
+
 /// Copy a regular file fd-relative: create (or overwrite) the destination via `dst_parent`,
 /// copy the bytes with `copy_file_range_all`, then apply metadata through the destination's own
 /// fd — the open is held from creation through metadata, closing the path-based re-open TOCTOU
@@ -1457,6 +1531,7 @@ async fn copy_file_fd(
     settings: &Settings,
     preserve: &preserve::Settings,
     is_fresh: bool,
+    open_file_guard: throttle::OpenFileGuard,
 ) -> Result<Summary, Error> {
     // bring `FileMeta::size()` into scope locally; importing the trait at module level would
     // collide with `std::os::unix::fs::MetadataExt` on `std::fs::Metadata` elsewhere in this file.
@@ -1628,16 +1703,23 @@ async fn copy_file_fd(
     // the data copy is the data path, not a metadata syscall — it is deliberately NOT wrapped in a
     // congestion probe (matching the old `tokio::fs::copy`), so the large/variable copy latency
     // never pollutes the per-metadata-op controller baseline. backpressure comes from the
-    // open-files permit the caller holds. the dst file is returned so its still-open fd can carry
-    // the metadata application that follows, closing the path-based re-open TOCTOU window.
-    let (copied, dst_file) = tokio::task::spawn_blocking(move || {
-        copy_file_range_all(&src_file, &dst_file, len).map(|copied| (copied, dst_file))
-    })
-    .await
-    .map_err(std::io::Error::other)
-    .and_then(|res| res)
-    .with_context(|| format!("failed copying data to {:?}", dst_path))
-    .map_err(|err| Error::new(err, copy_summary))?;
+    // open-files admission moved into the non-cancellable blocking closure. the dst file and guard
+    // are returned so both remain live through the metadata application that follows, closing the
+    // path-based re-open and cancellation-lifetime gaps.
+    let (copy_result, open_file_guard) =
+        spawn_blocking_with_open_file_guard(open_file_guard, move || {
+            copy_file_range_all(&src_file, &dst_file, len).map(|copied| (copied, dst_file))
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .with_context(|| format!("failed copying data to {:?}", dst_path))
+        .map_err(|err| Error::new(err, copy_summary))?;
+    // bind the guard before the returned destination file so reverse local-drop order closes the
+    // fd before releasing admission on every success/error exit below.
+    let _open_file_guard = open_file_guard;
+    let (copied, dst_file) = copy_result
+        .with_context(|| format!("failed copying data to {:?}", dst_path))
+        .map_err(|err| Error::new(err, copy_summary))?;
     // account for the bytes ACTUALLY copied, not `len` (the size snapshotted at open): if the source
     // is concurrently truncated, `copy_file_range_all` returns the shorter real count, so using `len`
     // would over-report. `len` still drives the copy loop and the iops-token reservation above.
@@ -4101,7 +4183,7 @@ mod copy_tests {
         #[test]
         fn test_check_empty_dir_cleanup_something_copied() {
             // when content was copied, keep
-            let mut filter = FilterSettings::new();
+            let mut filter = crate::filter::FilterSettings::new();
             filter.add_include("*.txt").unwrap();
             assert_eq!(
                 check_empty_dir_cleanup(Some(&filter), true, true, Path::new("any"), false, false),
@@ -5420,6 +5502,357 @@ mod copy_tests {
     mod max_open_files_tests {
         use super::*;
 
+        /// Public root setup must reserve open-file capacity before opening operand parents or
+        /// performing an fd-based filter probe.
+        #[tokio::test]
+        async fn filtered_public_root_waits_for_admission_before_setup() -> anyhow::Result<()> {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("src");
+            let dst = root.join("dst");
+            tokio::fs::write(&src, b"x").await?;
+            let mut filter = crate::filter::FilterSettings::new();
+            filter.add_exclude("src")?;
+            let mut settings = settings_with_delete(None);
+            settings.filter = Some(filter);
+            throttle::set_max_open_files(1);
+            let stat_resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
+            throttle::set_max_ops_in_flight(stat_resource, 1);
+            let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
+            let operation = copy(
+                &PROGRESS,
+                &src,
+                &dst,
+                &settings,
+                &NO_PRESERVE_SETTINGS,
+                false,
+            );
+            tokio::pin!(operation);
+            let stopped_at_stat_gate = futures::poll!(operation.as_mut()).is_pending();
+            let mut second_permit = Box::pin(throttle::open_file_permit());
+            let setup_bypassed_admission = futures::poll!(second_permit.as_mut()).is_ready();
+            drop(second_permit);
+            drop(held_stat);
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(20), operation.as_mut()).await;
+            throttle::set_max_ops_in_flight(stat_resource, 0);
+            throttle::set_max_open_files(0);
+            assert!(
+                stopped_at_stat_gate,
+                "copy root did not reach the held stat gate"
+            );
+            let summary =
+                result.context("copy root did not resume after stat capacity was released")??;
+            assert!(
+                !setup_bypassed_admission,
+                "copy performed root setup before open-file admission"
+            );
+            assert_eq!(summary.files_skipped, 1);
+            Ok(())
+        }
+
+        /// An entry with no `d_type` hint reserves open-file capacity under the shared
+        /// pre-spawn policy.
+        #[tokio::test]
+        async fn unknown_type_reserves_max_open_files_capacity() {
+            throttle::set_max_open_files(1);
+            let held_permit = throttle::open_file_permit().await;
+            let visitor = CopyVisitor {
+                prog_track: &PROGRESS,
+                dst_root: PathBuf::new(),
+                filter_base: PathBuf::new(),
+                settings: settings_with_delete(None),
+                preserve: *NO_PRESERVE_SETTINGS,
+                dst_parent: None,
+                root_is_fresh: false,
+            };
+            let acquire = crate::walk::preacquire_leaf_permit(visitor.permit_kind(), None);
+            tokio::pin!(acquire);
+            assert!(
+                futures::poll!(acquire.as_mut()).is_pending(),
+                "DT_UNKNOWN must not bypass pre-spawn open-file backpressure"
+            );
+            drop(held_permit);
+            let permit = acquire.await;
+            throttle::set_max_open_files(0);
+            assert!(
+                permit.is_some(),
+                "DT_UNKNOWN must reserve capacity for authoritative classification"
+            );
+        }
+
+        /// A non-dereferenced symlink must retain its admission permit through the
+        /// fd-bearing readlink/create work, not release it immediately after classification.
+        #[tokio::test]
+        async fn symlink_holds_open_file_capacity_until_copy_finishes() -> anyhow::Result<()> {
+            let root = testutils::create_temp_dir().await?;
+            let src_name = std::ffi::OsStr::new("src-link");
+            let dst_name = std::ffi::OsStr::new("dst-link");
+            tokio::fs::symlink("target", root.join(src_name)).await?;
+            let src_parent = Arc::new(
+                Dir::open_parent_dir(&root, congestion::Side::Source)
+                    .await?
+                    .into_tree(),
+            );
+            let dst_parent = Arc::new(
+                Dir::open_parent_dir(&root, congestion::Side::Destination)
+                    .await?
+                    .into_tree(),
+            );
+            let handle = src_parent.child(src_name).await?;
+            assert_eq!(handle.kind(), EntryKind::Symlink);
+            let visitor = CopyVisitor {
+                prog_track: &PROGRESS,
+                dst_root: root.join(dst_name),
+                filter_base: PathBuf::new(),
+                settings: settings_with_delete(None),
+                preserve: *NO_PRESERVE_SETTINGS,
+                dst_parent: Some(Arc::clone(&dst_parent)),
+                root_is_fresh: true,
+            };
+            let cx = EntryCx {
+                parent: src_parent,
+                name: src_name.to_owned(),
+                rel_path: PathBuf::new(),
+                filter_path: PathBuf::new(),
+                real_path: root.join(src_name),
+                dry_run: false,
+                prog_track: &PROGRESS,
+            };
+            let parent_ctx = CopyDirContext {
+                dst_dir: Some(dst_parent),
+                is_fresh: true,
+            };
+            throttle::set_max_open_files(1);
+            let permit = Some(LeafPermit::OpenFile(throttle::open_file_permit().await));
+            let readlink_resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::ReadLink);
+            throttle::set_max_ops_in_flight(readlink_resource, 1);
+            let held_readlink = throttle::ops_in_flight_permit(readlink_resource).await;
+            let visit = visitor.visit_leaf(&cx, &parent_ctx, handle, EntryKind::Symlink, permit);
+            tokio::pin!(visit);
+            let stopped_at_readlink_gate = futures::poll!(visit.as_mut()).is_pending();
+            let mut second_permit = Box::pin(throttle::open_file_permit());
+            let released_before_copy_finished = futures::poll!(second_permit.as_mut()).is_ready();
+            drop(second_permit);
+            drop(held_readlink);
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(20), visit.as_mut()).await;
+            throttle::set_max_ops_in_flight(readlink_resource, 0);
+            throttle::set_max_open_files(0);
+            assert!(
+                stopped_at_readlink_gate,
+                "symlink copy did not reach the held readlink gate"
+            );
+            assert!(
+                !released_before_copy_finished,
+                "symlink released its open-file permit while fd-bearing work was still pending"
+            );
+            let summary = result
+                .context("symlink copy did not resume after readlink capacity was released")?
+                .map_err(|error| error.source)?;
+            assert_eq!(summary.symlinks_created, 1);
+            assert_eq!(
+                tokio::fs::read_link(root.join(dst_name)).await?,
+                std::path::Path::new("target")
+            );
+            Ok(())
+        }
+
+        /// A dereferenced symlink must transfer its admission guard into the target copy. Releasing
+        /// it before `canonicalize` lets a wide directory of symlinks spawn unbounded target walks
+        /// which open parent/entry fds before reacquiring capacity.
+        #[tokio::test]
+        async fn dereferenced_symlink_transfers_open_file_capacity_to_target_copy()
+        -> anyhow::Result<()> {
+            let root = testutils::create_temp_dir().await?;
+            let src_name = std::ffi::OsStr::new("src-link");
+            tokio::fs::write(root.join("target"), b"payload").await?;
+            tokio::fs::symlink("target", root.join(src_name)).await?;
+            let src_parent = Arc::new(
+                Dir::open_parent_dir(&root, congestion::Side::Source)
+                    .await?
+                    .into_tree(),
+            );
+            let handle = src_parent.child(src_name).await?;
+            let mut settings = settings_with_delete(None);
+            settings.dereference = true;
+            settings.dry_run = Some(crate::config::DryRunMode::Brief);
+            let visitor = CopyVisitor {
+                prog_track: &PROGRESS,
+                dst_root: root.join("dst"),
+                filter_base: PathBuf::new(),
+                settings,
+                preserve: *NO_PRESERVE_SETTINGS,
+                dst_parent: None,
+                root_is_fresh: false,
+            };
+            let cx = EntryCx {
+                parent: src_parent,
+                name: src_name.to_owned(),
+                rel_path: PathBuf::new(),
+                filter_path: PathBuf::new(),
+                real_path: root.join(src_name),
+                dry_run: true,
+                prog_track: &PROGRESS,
+            };
+            let parent_ctx = CopyDirContext {
+                dst_dir: None,
+                is_fresh: false,
+            };
+            throttle::set_max_open_files(1);
+            let permit = Some(LeafPermit::OpenFile(throttle::open_file_permit().await));
+            let stat_resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
+            throttle::set_max_ops_in_flight(stat_resource, 1);
+            let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
+            let visit = visitor.visit_leaf(&cx, &parent_ctx, handle, EntryKind::Symlink, permit);
+            tokio::pin!(visit);
+            let stopped_at_canonicalize_gate = futures::poll!(visit.as_mut()).is_pending();
+            // Queue a test waiter immediately behind canonicalize. Once canonicalize releases its
+            // Stat slot, FIFO semaphore ordering gives that slot to this waiter before the target
+            // root setup can acquire its next Stat slot. Holding it therefore pins `visit` inside
+            // target setup, on the far side of the guard-transfer boundary.
+            let mut target_setup_gate = Box::pin(throttle::ops_in_flight_permit(stat_resource));
+            let target_setup_waiter_queued =
+                futures::poll!(target_setup_gate.as_mut()).is_pending();
+            drop(held_stat);
+            let gate_race = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                tokio::select! {
+                    permit = target_setup_gate.as_mut() => Ok(permit),
+                    result = visit.as_mut() => Err(result),
+                }
+            })
+            .await;
+            let mut setup_guard = None;
+            let mut early_visit_result = None;
+            let gate_timed_out = match gate_race {
+                Ok(Ok(guard)) => {
+                    setup_guard = Some(guard);
+                    false
+                }
+                Ok(Err(result)) => {
+                    early_visit_result = Some(result);
+                    false
+                }
+                Err(_) => true,
+            };
+            drop(target_setup_gate);
+            let finished_before_target_setup = early_visit_result.is_some();
+            let mut second_permit = Box::pin(throttle::open_file_permit());
+            let released_inside_target_setup = futures::poll!(second_permit.as_mut()).is_ready();
+            drop(second_permit);
+            drop(setup_guard);
+            let result = match early_visit_result {
+                Some(result) => Ok(result),
+                None => {
+                    tokio::time::timeout(std::time::Duration::from_secs(20), visit.as_mut()).await
+                }
+            };
+            throttle::set_max_ops_in_flight(stat_resource, 0);
+            throttle::set_max_open_files(0);
+            assert!(
+                stopped_at_canonicalize_gate,
+                "dereference did not reach the held canonicalize Stat gate"
+            );
+            assert!(
+                target_setup_waiter_queued,
+                "target-setup test waiter did not queue behind canonicalize"
+            );
+            assert!(
+                !gate_timed_out,
+                "canonicalize did not release its Stat slot"
+            );
+            assert!(
+                !finished_before_target_setup,
+                "dereferenced copy finished before reaching target setup"
+            );
+            assert!(
+                !released_inside_target_setup,
+                "dereference released admission instead of transferring it into target setup"
+            );
+            let summary = result
+                .context("dereferenced copy did not resume after target setup was released")?
+                .map_err(|error| error.source)?;
+            assert_eq!(summary.files_copied, 1);
+            Ok(())
+        }
+
+        /// A dereferenced symlink whose target is a directory must release the transferred guard
+        /// after authoritative target classification. Any strong ambient admission retained by the
+        /// outer symlink visitor would make the first descendant wait forever at a limit of one.
+        #[tokio::test]
+        async fn dereferenced_symlink_directory_releases_capacity_before_descent()
+        -> anyhow::Result<()> {
+            let root = testutils::create_temp_dir().await?;
+            let target = root.join("target");
+            let src = root.join("src-link");
+            let dst = root.join("dst");
+            tokio::fs::create_dir(&target).await?;
+            tokio::fs::write(target.join("child"), b"payload").await?;
+            tokio::fs::symlink("target", &src).await?;
+            let mut settings = settings_with_delete(None);
+            settings.dereference = true;
+            throttle::set_max_open_files(1);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                copy(
+                    &PROGRESS,
+                    &src,
+                    &dst,
+                    &settings,
+                    &NO_PRESERVE_SETTINGS,
+                    false,
+                ),
+            )
+            .await;
+            throttle::set_max_open_files(0);
+            let summary = result.context(
+                "dereferenced directory copy retained admission across recursive descent",
+            )??;
+            assert_eq!(summary.files_copied, 1);
+            assert_eq!(tokio::fs::read(dst.join("child")).await?, b"payload");
+            Ok(())
+        }
+
+        /// Cancelling an async waiter must not release admission while its non-cancellable blocking
+        /// work is still running with file descriptors.
+        #[tokio::test]
+        async fn cancelled_blocking_copy_work_retains_open_file_capacity() -> anyhow::Result<()> {
+            throttle::set_max_open_files(1);
+            let open_file_guard = throttle::open_file_permit().await;
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let task = tokio::spawn(spawn_blocking_with_open_file_guard(
+                open_file_guard,
+                move || {
+                    let _ = started_tx.send(());
+                    release_rx.recv().expect("release sender must stay alive");
+                },
+            ));
+            started_rx.await?;
+            task.abort();
+            let join_error = task
+                .await
+                .err()
+                .context("the async waiter must observe cancellation")?;
+            assert!(join_error.is_cancelled());
+            let second_permit = throttle::open_file_permit();
+            tokio::pin!(second_permit);
+            assert!(
+                futures::poll!(second_permit.as_mut()).is_pending(),
+                "cancelling the waiter released capacity while blocking work was live"
+            );
+            release_tx.send(())?;
+            let permit =
+                tokio::time::timeout(std::time::Duration::from_secs(20), second_permit.as_mut())
+                    .await
+                    .context("capacity was not released after blocking work finished")?;
+            drop(permit);
+            throttle::set_max_open_files(0);
+            Ok(())
+        }
+
         /// wide copy: many files with a very low open-files limit.
         /// verifies all files are copied correctly under permit saturation.
         #[tokio::test]
@@ -5466,8 +5899,8 @@ mod copy_tests {
             Ok(())
         }
 
-        /// deep + wide copy: directory tree deeper than the open-files limit, with files
-        /// at every level. verifies no deadlock occurs (directories don't consume permits).
+        /// Deep + wide copy: a directory tree deeper than the open-files limit, with files at
+        /// every level. Verifies directories do not retain leaf admission across recursion.
         #[tokio::test]
         #[traced_test]
         async fn deep_tree_no_deadlock_under_open_files_saturation() -> Result<(), anyhow::Error> {
@@ -5476,7 +5909,7 @@ mod copy_tests {
             let dst = tmp_dir.join("dst");
             let depth = 20;
             let files_per_level = 5;
-            let limit = 4;
+            let limit = 1;
             // create a directory chain deeper than the permit limit, with files at each level
             let mut dir = src.clone();
             for level in 0..depth {

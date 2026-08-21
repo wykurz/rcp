@@ -402,9 +402,32 @@ pub(crate) fn install_tracing_subscriber(
     }
 }
 
-/// Build a multi-threaded tokio runtime configured per `runtime`, and apply
-/// the `max_open_files` limit from `throttle`. Falls back to ~80% of the
-/// system rlimit (capped at 4096) when `max_open_files` is unset.
+/// Derive a conservative leaf-operation count from the process descriptor limit.
+///
+/// A hardened local copy can simultaneously own a classification handle, source file, destination
+/// file, and overwrite-planning handle. Its separately-sized pending-metadata pool can add one
+/// classification handle per operation. Dividing an 80%-of-`RLIMIT_NOFILE` budget by those five
+/// modeled descriptor units leaves the remaining 20% for recursive directory handles and process
+/// support fds. This is deliberately a conservative heuristic, not a hard process-wide ceiling:
+/// arbitrary directory depth is outside leaf admission. A nonzero system limit gets at least one
+/// operation so very small test/container limits do not silently disable backpressure.
+fn default_leaf_operation_limit(fd_limit: usize) -> usize {
+    if fd_limit == 0 {
+        return 0;
+    }
+    const DESCRIPTOR_UNITS_PER_OPERATION_PAIR: usize = 5;
+    const MAX_LEAF_OPERATIONS: usize = 4096;
+    let descriptor_budget = fd_limit.saturating_mul(8) / 10;
+    std::cmp::min(
+        (descriptor_budget / DESCRIPTOR_UNITS_PER_OPERATION_PAIR).max(1),
+        MAX_LEAF_OPERATIONS,
+    )
+}
+
+/// Build a multi-threaded tokio runtime configured per `runtime`, and apply the
+/// `max_open_files` leaf-operation admission limit from `throttle`. Falls back
+/// to an admission count derived from an 80%-of-rlimit descriptor budget (five modeled descriptor
+/// units across the two pools, capped at 4096 operations) when `max_open_files` is unset.
 pub(crate) fn build_tokio_runtime(
     runtime: &RuntimeConfig,
     throttle: &ThrottleConfig,
@@ -424,17 +447,37 @@ pub(crate) fn build_tokio_runtime(
         let limit = get_max_open_files().expect(
             "We failed to query rlimit, if this is expected try specifying --max-open-files",
         ) as usize;
-        // use ~80% of the system limit, but cap at 4096 to avoid overwhelming
-        // distributed filesystems
-        std::cmp::min(limit / 10 * 8, 4096)
+        default_leaf_operation_limit(limit)
     });
     if set_max_open_files > 0 {
-        tracing::info!("Setting max open files to: {}", set_max_open_files);
+        tracing::info!(
+            "Setting max concurrent leaf operations per admission pool to: {}",
+            set_max_open_files
+        );
         throttle::set_max_open_files(set_max_open_files);
     } else {
-        tracing::info!("Not applying any limit to max open files!");
+        tracing::info!("Not applying any leaf-operation admission limit");
     }
     builder.build().expect("Failed to create runtime")
+}
+
+#[cfg(test)]
+mod default_leaf_operation_limit_tests {
+    use super::*;
+
+    #[test]
+    fn reserves_descriptor_headroom_for_each_leaf_operation() {
+        assert_eq!(default_leaf_operation_limit(100), 16);
+        assert_eq!(default_leaf_operation_limit(4096), 655);
+        assert_eq!(default_leaf_operation_limit(1_000_000), 4096);
+    }
+
+    #[test]
+    fn keeps_a_small_nonzero_limit_live() {
+        assert_eq!(default_leaf_operation_limit(1), 1);
+        assert_eq!(default_leaf_operation_limit(4), 1);
+        assert_eq!(default_leaf_operation_limit(0), 0);
+    }
 }
 
 /// Spawn the ops/iops throttle replenisher tasks onto `runtime` if the
