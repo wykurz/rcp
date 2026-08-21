@@ -5846,15 +5846,12 @@ mod copy_tests {
             let admission_was_retained =
                 started_result.is_ok() && futures::poll!(second_permit.as_mut()).is_pending();
             let release_result = release_tx.send(());
-            let completion_result = completion_rx.await;
-            let permit_result =
-                tokio::time::timeout(std::time::Duration::from_secs(20), second_permit.as_mut())
+            let (completion_result, permit) =
+                testutils::await_completion_and_capacity(completion_rx, second_permit.as_mut())
                     .await;
             started_result.context("blocking copy work did not start")?;
             release_result.context("blocking copy work ended before its release")?;
             completion_result.context("blocking copy work did not report completion")?;
-            let permit =
-                permit_result.context("capacity was not released after blocking work finished")?;
             drop(permit);
             assert!(waiter_was_cancelled);
             assert!(
