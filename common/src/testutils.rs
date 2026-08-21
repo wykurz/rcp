@@ -4,6 +4,49 @@ use anyhow::{Context, Result};
 use async_recursion::async_recursion;
 use std::os::unix::fs::MetadataExt;
 
+static ADMISSION_LIMIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Exclusively configures process-global admission limits for one test.
+pub struct AdmissionLimit {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl AdmissionLimit {
+    /// Acquires exclusive access and starts from unlimited admission state.
+    pub async fn new() -> Self {
+        let guard = ADMISSION_LIMIT_LOCK.lock().await;
+        reset_admission_limits();
+        Self { _guard: guard }
+    }
+
+    /// Sets the shared OpenFile and PendingMeta limits.
+    pub fn set_max_open_files(&self, max_open_files: usize) {
+        throttle::set_max_open_files(max_open_files);
+    }
+
+    /// Sets one metadata operation's in-flight limit.
+    pub fn set_max_ops_in_flight(&self, resource: throttle::Resource, max_in_flight: usize) {
+        throttle::set_max_ops_in_flight(resource, max_in_flight);
+    }
+}
+
+impl Drop for AdmissionLimit {
+    fn drop(&mut self) {
+        reset_admission_limits();
+    }
+}
+
+fn reset_admission_limits() {
+    throttle::set_max_open_files(0);
+    for side in throttle::Side::ALL {
+        for op in throttle::MetadataOp::ALL {
+            throttle::set_max_ops_in_flight(throttle::Resource::meta(side, op), 0);
+        }
+    }
+    throttle::disable_ops_throttle();
+    congestion::clear_sample_sink();
+}
+
 pub async fn create_temp_dir() -> Result<std::path::PathBuf> {
     let mut idx = 0;
     loop {
@@ -113,4 +156,40 @@ pub async fn check_dirs_identical(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn admission_limits_reset_when_a_guarded_section_panics() {
+        let limit = AdmissionLimit::new().await;
+        let resource = throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
+
+        let panic = catch_unwind(AssertUnwindSafe(move || {
+            limit.set_max_open_files(1);
+            limit.set_max_ops_in_flight(resource, 1);
+            panic!("leave the guarded section early");
+        }));
+        assert!(panic.is_err());
+
+        let _later_section = ADMISSION_LIMIT_LOCK.lock().await;
+        let first_open = throttle::open_file_permit().await;
+        let second_open = tokio::time::timeout(Duration::from_millis(100), async {
+            throttle::open_file_permit().await
+        })
+        .await
+        .expect("OpenFile admission was not reset after panic");
+        let first_pending = throttle::pending_meta_permit().await;
+        let second_pending = tokio::time::timeout(Duration::from_millis(100), async {
+            throttle::pending_meta_permit().await
+        })
+        .await
+        .expect("PendingMeta admission was not reset after panic");
+        assert_eq!(throttle::current_ops_in_flight_limit(resource), 0);
+        drop((first_open, second_open, first_pending, second_pending));
+    }
 }

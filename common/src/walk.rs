@@ -642,7 +642,8 @@ mod tests {
     // acquire rather than the disabled-pool no-op.
     #[tokio::test]
     async fn preacquire_leaf_permit_respects_max_open_files_kind_and_hint() {
-        throttle::set_max_open_files(4);
+        let admission = crate::testutils::AdmissionLimit::new().await;
+        admission.set_max_open_files(4);
         // `None` kind never takes a permit, regardless of hint.
         assert!(
             preacquire_leaf_permit(PermitKind::None, Some(EntryKind::File))
@@ -663,7 +664,6 @@ mod tests {
         let permit = preacquire_leaf_permit(PermitKind::OpenFile, None).await;
         assert!(matches!(permit, Some(LeafPermit::OpenFile(_))));
         drop(permit);
-        throttle::set_max_open_files(0);
     }
 
     // split_root_operand: a normal operand splits via parent()/file_name() (single component ->

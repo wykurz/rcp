@@ -3259,7 +3259,8 @@ mod tests {
             let root = crate::testutils::create_temp_dir().await?;
             let file_path = root.join("held-unprobed");
             tokio::fs::write(&file_path, b"x").await?;
-            throttle::set_max_open_files(1);
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
             let open_file_guard = throttle::open_file_permit().await;
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -3279,23 +3280,21 @@ mod tests {
             });
             started_rx.await?;
             task.abort();
-            let join_error = task
-                .await
-                .expect_err("the async unprobed waiter must observe cancellation");
-            assert!(join_error.is_cancelled());
+            let waiter_was_cancelled = matches!(task.await, Err(error) if error.is_cancelled());
 
             let mut second_permit = Box::pin(throttle::open_file_permit());
-            assert!(
-                futures::poll!(second_permit.as_mut()).is_pending(),
-                "cancelling the waiter released admission while detached work held an fd"
-            );
+            let admission_was_retained = futures::poll!(second_permit.as_mut()).is_pending();
             release_tx.send(())?;
             let permit =
                 tokio::time::timeout(std::time::Duration::from_secs(20), second_permit.as_mut())
                     .await
                     .context("admission was not released after detached unprobed work finished")?;
             drop(permit);
-            throttle::set_max_open_files(0);
+            assert!(waiter_was_cancelled);
+            assert!(
+                admission_was_retained,
+                "cancelling the waiter released admission while detached work held an fd"
+            );
             Ok(())
         }
 
@@ -3307,10 +3306,11 @@ mod tests {
             let root = crate::testutils::create_temp_dir().await?;
             let file_path = root.join("held");
             tokio::fs::write(&file_path, b"x").await?;
-            throttle::set_max_open_files(1);
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
-            throttle::set_max_ops_in_flight(stat_resource, 1);
+            admission.set_max_ops_in_flight(stat_resource, 1);
             let open_file_guard = throttle::open_file_permit().await;
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -3334,23 +3334,14 @@ mod tests {
             });
             started_rx.await?;
             task.abort();
-            let join_error = task
-                .await
-                .expect_err("the async metadata waiter must observe cancellation");
-            assert!(join_error.is_cancelled());
+            let waiter_was_cancelled = matches!(task.await, Err(error) if error.is_cancelled());
 
             let second_permit = throttle::open_file_permit();
             tokio::pin!(second_permit);
-            assert!(
-                futures::poll!(second_permit.as_mut()).is_pending(),
-                "cancelling the waiter released admission while detached work held an fd"
-            );
+            let admission_was_retained = futures::poll!(second_permit.as_mut()).is_pending();
             let second_stat_permit = throttle::ops_in_flight_permit(stat_resource);
             tokio::pin!(second_stat_permit);
-            assert!(
-                futures::poll!(second_stat_permit.as_mut()).is_pending(),
-                "cancelling the waiter released metadata capacity while its syscall was live"
-            );
+            let metadata_was_retained = futures::poll!(second_stat_permit.as_mut()).is_pending();
             release_tx.send(())?;
             let permit =
                 tokio::time::timeout(std::time::Duration::from_secs(20), second_permit.as_mut())
@@ -3364,8 +3355,15 @@ mod tests {
             .await
             .context("metadata capacity was not released after detached work finished")?;
             drop(stat_permit);
-            throttle::set_max_ops_in_flight(stat_resource, 0);
-            throttle::set_max_open_files(0);
+            assert!(waiter_was_cancelled);
+            assert!(
+                admission_was_retained,
+                "cancelling the waiter released admission while detached work held an fd"
+            );
+            assert!(
+                metadata_was_retained,
+                "cancelling the waiter released metadata capacity while its syscall was live"
+            );
             Ok(())
         }
 
@@ -3377,7 +3375,8 @@ mod tests {
             let root = crate::testutils::create_temp_dir().await?;
             let file_path = root.join("returned");
             tokio::fs::write(&file_path, b"x").await?;
-            throttle::set_max_open_files(1);
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
             let open_file_guard = throttle::open_file_permit().await;
             let (work_started_tx, work_started_rx) = tokio::sync::oneshot::channel();
             let (release_work_tx, release_work_rx) = std::sync::mpsc::channel();
@@ -3407,26 +3406,27 @@ mod tests {
             });
             work_started_rx.await?;
             task.abort();
-            assert!(
-                matches!(task.await, Err(error) if error.is_cancelled()),
-                "the async metadata waiter must observe cancellation"
-            );
+            let waiter_was_cancelled = matches!(task.await, Err(error) if error.is_cancelled());
 
             release_work_tx.send(())?;
             drop_started_rx.await?;
             let second_permit = throttle::open_file_permit();
             tokio::pin!(second_permit);
-            assert!(
-                futures::poll!(second_permit.as_mut()).is_pending(),
-                "admission was released before the abandoned returned fd was dropped"
-            );
+            let admission_was_retained = futures::poll!(second_permit.as_mut()).is_pending();
             release_drop_tx.send(())?;
             let permit =
                 tokio::time::timeout(std::time::Duration::from_secs(20), second_permit.as_mut())
                     .await
                     .context("admission was not released after the returned fd was dropped")?;
             drop(permit);
-            throttle::set_max_open_files(0);
+            assert!(
+                waiter_was_cancelled,
+                "the async metadata waiter must observe cancellation"
+            );
+            assert!(
+                admission_was_retained,
+                "admission was released before the abandoned returned fd was dropped"
+            );
             Ok(())
         }
     }

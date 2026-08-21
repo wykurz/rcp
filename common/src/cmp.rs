@@ -1794,7 +1794,8 @@ mod cmp_tests {
                 src_dir = src_dir.join(format!("d{}", level));
                 dst_dir = dst_dir.join(format!("d{}", level));
             }
-            throttle::set_max_open_files(limit);
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(limit);
             let compare_settings = Settings {
                 fail_early: false,
                 exit_early: false,
@@ -1848,7 +1849,8 @@ mod cmp_tests {
                 dir = dir.join(format!("d{}", level));
             }
             tokio::fs::create_dir(&dst).await?;
-            throttle::set_max_open_files(limit);
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(limit);
             let compare_settings = Settings {
                 fail_early: false,
                 exit_early: false,

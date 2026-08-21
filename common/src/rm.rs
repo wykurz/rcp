@@ -1974,10 +1974,11 @@ mod tests {
                 dry_run: None,
                 time_filter: None,
             };
-            throttle::set_max_open_files(1);
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
-            throttle::set_max_ops_in_flight(stat_resource, 1);
+            admission.set_max_ops_in_flight(stat_resource, 1);
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
             let operation = rm(&PROGRESS, &path, &settings);
             tokio::pin!(operation);
@@ -1988,8 +1989,6 @@ mod tests {
             drop(held_stat);
             let result =
                 tokio::time::timeout(std::time::Duration::from_secs(20), operation.as_mut()).await;
-            throttle::set_max_ops_in_flight(stat_resource, 0);
-            throttle::set_max_open_files(0);
             assert!(
                 stopped_at_stat_gate,
                 "rm root did not reach the held stat gate"
@@ -2019,18 +2018,23 @@ mod tests {
                 .await?;
             }
             // set a very low limit to force permit contention
-            throttle::set_max_open_files(4);
-            let summary = rm(
-                &PROGRESS,
-                &test_path,
-                &Settings {
-                    fail_early: true,
-                    filter: None,
-                    dry_run: None,
-                    time_filter: None,
-                },
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(4);
+            let summary = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                rm(
+                    &PROGRESS,
+                    &test_path,
+                    &Settings {
+                        fail_early: true,
+                        filter: None,
+                        dry_run: None,
+                        time_filter: None,
+                    },
+                ),
             )
-            .await?;
+            .await
+            .context("rm timed out — possible deadlock")??;
             assert_eq!(summary.files_removed, file_count);
             assert_eq!(summary.directories_removed, 1);
             assert!(!test_path.exists());
@@ -2059,7 +2063,8 @@ mod tests {
                 }
                 dir = dir.join(format!("d{}", level));
             }
-            throttle::set_max_open_files(limit);
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(limit);
             let summary = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 rm(
@@ -2107,7 +2112,8 @@ mod tests {
             tokio::fs::write(dir_path.join("c"), b"x").await?;
             // size the pending-meta pool to a single permit so a held-across-recursion permit
             // strands the child's pre-acquire — the saturation the fd-walk must tolerate.
-            throttle::set_max_open_files(1);
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
             // open the container of `d` and classify `d` itself: an authoritative directory.
             let parent = Dir::open_parent_dir(&root, congestion::Side::Source)
                 .await
@@ -2151,10 +2157,6 @@ mod tests {
                 process_entry(visitor, cx, (), permit),
             )
             .await;
-            // restore the default (disabled) pool before asserting so a failure here can't strand
-            // the tiny limit for any concurrent test (the serial group already isolates us, but
-            // this keeps the process-global knob clean on the failure path too).
-            throttle::set_max_open_files(0);
             let summary = result
                 .context(
                     "process_entry hung — leaf permit held across directory recursion (deadlock)",

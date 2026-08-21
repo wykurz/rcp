@@ -4101,10 +4101,11 @@ mod link_tests {
             let mut settings = common_settings(false, false);
             settings.filter = Some(filter.clone());
             settings.copy_settings.filter = Some(filter);
-            throttle::set_max_open_files(1);
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
-            throttle::set_max_ops_in_flight(stat_resource, 1);
+            admission.set_max_ops_in_flight(stat_resource, 1);
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
             let operation = link(&PROGRESS, &root, &src, &dst, &None, &settings, false);
             tokio::pin!(operation);
@@ -4115,8 +4116,6 @@ mod link_tests {
             drop(held_stat);
             let result =
                 tokio::time::timeout(std::time::Duration::from_secs(20), operation.as_mut()).await;
-            throttle::set_max_ops_in_flight(stat_resource, 0);
-            throttle::set_max_open_files(0);
             assert!(
                 stopped_at_stat_gate,
                 "rlink root did not reach the held stat gate"
@@ -4147,10 +4146,11 @@ mod link_tests {
             let mut settings = common_settings(false, false);
             settings.dry_run = Some(crate::config::DryRunMode::Brief);
             settings.copy_settings.dry_run = settings.dry_run;
-            throttle::set_max_open_files(1);
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
-            throttle::set_max_ops_in_flight(stat_resource, 1);
+            admission.set_max_ops_in_flight(stat_resource, 1);
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
             let operation = link_internal(
                 &PROGRESS,
@@ -4175,8 +4175,6 @@ mod link_tests {
             drop(held_stat);
             let result =
                 tokio::time::timeout(std::time::Duration::from_secs(20), operation.as_mut()).await;
-            throttle::set_max_ops_in_flight(stat_resource, 0);
-            throttle::set_max_open_files(0);
             assert!(
                 stopped_at_stat_gate,
                 "rlink root did not reach the held stat gate"
@@ -4208,17 +4206,18 @@ mod link_tests {
             let dst_parent = Arc::new(
                 Dir::open_root_dir(&dst_root, false, congestion::Side::Destination).await?,
             );
-            throttle::set_max_open_files(1);
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
             let permit = Some(LeafPermit::OpenFile(throttle::open_file_permit().await));
             let hard_link_resource = throttle::Resource::meta(
                 throttle::Side::Destination,
                 throttle::MetadataOp::HardLink,
             );
-            throttle::set_max_ops_in_flight(hard_link_resource, 1);
+            admission.set_max_ops_in_flight(hard_link_resource, 1);
             let held_hard_link = throttle::ops_in_flight_permit(hard_link_resource).await;
             let dst_entry = dst_root.join("entry");
             let task_dst_entry = dst_entry.clone();
-            let task = tokio::spawn(async move {
+            let mut task = tokio::spawn(async move {
                 link_internal(
                     &PROGRESS,
                     &src_parent,
@@ -4244,12 +4243,18 @@ mod link_tests {
             let released_before_link_finished = second_permit.is_ok();
             drop(second_permit);
             drop(held_hard_link);
-            let summary = tokio::time::timeout(std::time::Duration::from_secs(20), task)
-                .await
-                .context("hard link did not resume after metadata capacity was released")??
-                .map_err(|error| error.source)?;
-            throttle::set_max_ops_in_flight(hard_link_resource, 0);
-            throttle::set_max_open_files(0);
+            let task_result =
+                tokio::time::timeout(std::time::Duration::from_secs(20), &mut task).await;
+            let task_result = match task_result {
+                Ok(result) => result,
+                Err(error) => {
+                    task.abort();
+                    let _ = task.await;
+                    return Err(error)
+                        .context("hard link did not resume after metadata capacity was released");
+                }
+            };
+            let summary = task_result?.map_err(|error| error.source)?;
             assert!(
                 !released_before_link_finished,
                 "hard-link work released its open-file permit before linkat completed"
@@ -4283,7 +4288,8 @@ mod link_tests {
                 }
                 dir = dir.join(format!("d{}", level));
             }
-            throttle::set_max_open_files(limit);
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(limit);
             let summary = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 link(
@@ -4347,7 +4353,8 @@ mod link_tests {
                 }
             }
             // saturate the pool so retaining delegated admission during descent blocks child work.
-            throttle::set_max_open_files(2);
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(2);
             let summary = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 link(
@@ -4396,12 +4403,13 @@ mod link_tests {
             }
             let progress: &'static progress::Progress =
                 Box::leak(Box::new(progress::Progress::new()));
-            throttle::set_max_open_files(1);
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
             let readlink_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::ReadLink);
-            throttle::set_max_ops_in_flight(readlink_resource, 1);
+            admission.set_max_ops_in_flight(readlink_resource, 1);
             let held_readlink = throttle::ops_in_flight_permit(readlink_resource).await;
-            let task = tokio::spawn(async move {
+            let mut task = tokio::spawn(async move {
                 link(
                     progress,
                     &tmp_dir,
@@ -4413,7 +4421,7 @@ mod link_tests {
                 )
                 .await
             });
-            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let first_worker = tokio::time::timeout(std::time::Duration::from_secs(20), async {
                 loop {
                     if progress.ops.get().started >= 2 {
                         break;
@@ -4421,17 +4429,28 @@ mod link_tests {
                     tokio::task::yield_now().await;
                 }
             })
-            .await
-            .context("the first update-only worker did not start")?;
+            .await;
+            if let Err(error) = first_worker {
+                drop(held_readlink);
+                task.abort();
+                let _ = task.await;
+                return Err(error).context("the first update-only worker did not start");
+            }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let started_while_blocked = progress.ops.get().started;
             drop(held_readlink);
-            let summary = tokio::time::timeout(std::time::Duration::from_secs(20), task)
-                .await
-                .context("update-only copies did not resume after ReadLink was released")??
-                .map_err(|error| error.source)?;
-            throttle::set_max_ops_in_flight(readlink_resource, 0);
-            throttle::set_max_open_files(0);
+            let task_result =
+                tokio::time::timeout(std::time::Duration::from_secs(20), &mut task).await;
+            let task_result = match task_result {
+                Ok(result) => result,
+                Err(error) => {
+                    task.abort();
+                    let _ = task.await;
+                    return Err(error)
+                        .context("update-only copies did not resume after ReadLink was released");
+                }
+            };
+            let summary = task_result?.map_err(|error| error.source)?;
             assert_eq!(
                 started_while_blocked, 2,
                 "root plus exactly one admitted update-only worker should be live"
@@ -4462,7 +4481,8 @@ mod link_tests {
             for i in 0..n {
                 tokio::fs::write(update.join(format!("u{}", i)), format!("upd-{}", i)).await?;
             }
-            throttle::set_max_open_files(2);
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(2);
             let summary = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 link(
@@ -4526,7 +4546,8 @@ mod link_tests {
                 }
             }
             // saturate both pools to force the deadlock if the cycle existed.
-            throttle::set_max_open_files(2);
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(2);
             let summary = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 link(

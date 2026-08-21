@@ -1967,10 +1967,11 @@ mod tests {
             let mut filter = crate::filter::FilterSettings::new();
             filter.add_exclude("victim")?;
             settings.filter = Some(filter);
-            throttle::set_max_open_files(1);
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Stat);
-            throttle::set_max_ops_in_flight(stat_resource, 1);
+            admission.set_max_ops_in_flight(stat_resource, 1);
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
             let operation = chmod(&PROGRESS, &path, &settings);
             tokio::pin!(operation);
@@ -1981,8 +1982,6 @@ mod tests {
             drop(held_stat);
             let result =
                 tokio::time::timeout(std::time::Duration::from_secs(20), operation.as_mut()).await;
-            throttle::set_max_ops_in_flight(stat_resource, 0);
-            throttle::set_max_open_files(0);
             assert!(
                 stopped_at_stat_gate,
                 "chmod root did not reach the held stat gate"
@@ -2021,7 +2020,8 @@ mod tests {
             std::fs::set_permissions(&child_path, std::fs::Permissions::from_mode(0o644))?;
             // size the pending-meta pool to a single permit so a held-across-recursion permit
             // strands the child's pre-acquire — the saturation the fd-walk must tolerate.
-            throttle::set_max_open_files(1);
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
             // open the container of `d` and classify `d` itself: an authoritative directory handle.
             let parent = Dir::open_parent_dir(&root, congestion::Side::Destination)
                 .await
@@ -2060,10 +2060,6 @@ mod tests {
                 process_entry(visitor, cx, (), permit),
             )
             .await;
-            // restore the default (disabled) pool before asserting so a failure here can't strand
-            // the tiny limit for any concurrent test (the serial group already isolates us, but
-            // this keeps the process-global knob clean on the failure path too).
-            throttle::set_max_open_files(0);
             let summary = result
                 .context(
                     "process_entry hung — leaf permit held across directory recursion (deadlock)",

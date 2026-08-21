@@ -803,7 +803,8 @@ mod tests {
             let root = crate::testutils::create_temp_dir().await?;
             let leaf_path = root.join("leaf");
             tokio::fs::write(&leaf_path, b"x").await?;
-            throttle::set_max_open_files(1);
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
             let parent = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -816,7 +817,7 @@ mod tests {
             });
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
-            throttle::set_max_ops_in_flight(stat_resource, 1);
+            admission.set_max_ops_in_flight(stat_resource, 1);
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
             let cx = root_cx(parent, std::ffi::OsStr::new("leaf"), leaf_path);
             let operation = process_entry(visitor, cx, (), None);
@@ -828,8 +829,6 @@ mod tests {
             drop(second_permit);
             drop(held_stat);
             let result = tokio::time::timeout(Duration::from_secs(20), operation.as_mut()).await;
-            throttle::set_max_ops_in_flight(stat_resource, 0);
-            throttle::set_max_open_files(0);
             assert!(
                 stopped_at_stat_gate,
                 "entry did not reach the held stat gate"
@@ -865,10 +864,11 @@ mod tests {
                 filter: Some(filter),
             });
             let parent_cx = root_cx(Arc::clone(&dir), std::ffi::OsStr::new("root"), root.clone());
-            throttle::set_max_open_files(1);
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
-            throttle::set_max_ops_in_flight(stat_resource, 1);
+            admission.set_max_ops_in_flight(stat_resource, 1);
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
             let walk = walk_dir_entries(
                 visitor,
@@ -885,8 +885,6 @@ mod tests {
             drop(second_permit);
             drop(held_stat);
             let result = tokio::time::timeout(Duration::from_secs(20), walk.as_mut()).await;
-            throttle::set_max_ops_in_flight(stat_resource, 0);
-            throttle::set_max_open_files(0);
             assert!(
                 stopped_at_stat_gate,
                 "DT_UNKNOWN filter probe did not reach the held stat gate"
@@ -933,7 +931,8 @@ mod tests {
             tokio::fs::write(dir_path.join("c"), b"x").await?;
             // size the pending-meta pool to a single permit (the `set_max_open_files`
             // knob sizes both pools).
-            throttle::set_max_open_files(1);
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
             // open the container of `d` and classify `d`: an authoritative directory.
             let parent = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
@@ -965,9 +964,6 @@ mod tests {
                 process_entry(visitor, cx, (), permit),
             )
             .await;
-            // restore the default (disabled) pool before asserting so a failure can't
-            // strand the tiny limit for a concurrent test.
-            throttle::set_max_open_files(0);
             let summary = result
                 .map_err(|_| {
                     anyhow::anyhow!(
