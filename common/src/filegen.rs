@@ -79,6 +79,14 @@ impl FileGenConfig {
     }
 }
 
+fn allocate_write_buffer(path: &std::path::Path, bufsize: usize) -> Vec<u8> {
+    #[cfg(test)]
+    crate::testutils::record_blocking_path_allocation(path);
+    #[cfg(not(test))]
+    let _ = path;
+    vec![0u8; bufsize]
+}
+
 #[instrument(skip(prog_track))]
 pub async fn write_file(
     prog_track: &'static progress::Progress,
@@ -115,32 +123,67 @@ pub async fn write_file(
         .await
         .with_context(|| format!("Error opening {:?}", &path))
         .map_err(|err| Error::new(err, Default::default()))?;
-        let write_path = path.clone();
-        let write_result = crate::safedir::run_fd_admitted_blocking(move || {
+        let mut file = file;
+        let mut bytes = None;
+        while filesize > 0 {
+            let writesize = std::cmp::min(filesize, bufsize);
+            let write_path = path.clone();
+            let chunk_output = crate::safedir::run_fd_admitted_blocking(move || {
+                use std::io::Write as _;
+
+                #[cfg(test)]
+                let gate_visit = {
+                    use std::os::fd::AsRawFd as _;
+                    crate::testutils::wait_on_blocking_path_gate(&write_path, file.as_raw_fd())
+                };
+                // rebind the captured owner after the visit so unwinding drops the fd before the
+                // completion witness. the tuple below preserves that order when a completed output
+                // is abandoned.
+                let mut file = file;
+                let mut bytes =
+                    bytes.unwrap_or_else(|| allocate_write_buffer(&write_path, bufsize));
+                // rng state is thread-local and never crosses a blocking boundary.
+                rand::fill(&mut bytes[..]);
+                let result = file
+                    .write_all(&bytes[..writesize])
+                    .with_context(|| format!("Error writing to {:?}", &write_path));
+                #[cfg(test)]
+                {
+                    Ok((result, file, gate_visit, bytes))
+                }
+                #[cfg(not(test))]
+                {
+                    Ok((result, file, bytes))
+                }
+            })
+            .await
+            .with_context(|| format!("Error running file writer for {:?}", &path))
+            .map_err(|err| Error::new(err, Default::default()))?;
+            #[cfg(test)]
+            let (write_result, returned_file, _gate_visit, returned_bytes) = chunk_output;
+            #[cfg(not(test))]
+            let (write_result, returned_file, returned_bytes) = chunk_output;
+            file = returned_file;
+            bytes = Some(returned_bytes);
+            write_result.map_err(|err| Error::new(err, Default::default()))?;
+            filesize -= writesize;
+            prog_track.bytes_copied.add(writesize as u64);
+        }
+        let flush_path = path.clone();
+        let (flush_result, file) = crate::safedir::run_fd_admitted_blocking(move || {
             use std::io::Write as _;
 
             let mut file = file;
-            let mut bytes = vec![0u8; bufsize];
-            let result = (|| -> anyhow::Result<()> {
-                while filesize > 0 {
-                    // rng state is thread-local and never crosses a blocking boundary.
-                    rand::fill(&mut bytes[..]);
-                    let writesize = std::cmp::min(filesize, bufsize);
-                    file.write_all(&bytes[..writesize])
-                        .with_context(|| format!("Error writing to {:?}", &write_path))?;
-                    filesize -= writesize;
-                    prog_track.bytes_copied.add(writesize as u64);
-                }
-                file.flush()
-                    .with_context(|| format!("Error flushing {:?}", &write_path))?;
-                Ok(())
-            })();
-            Ok(result)
+            let result = file
+                .flush()
+                .with_context(|| format!("Error flushing {:?}", &flush_path));
+            Ok((result, file))
         })
         .await
         .with_context(|| format!("Error running file writer for {:?}", &path))
         .map_err(|err| Error::new(err, Default::default()))?;
-        write_result.map_err(|err| Error::new(err, Default::default()))?;
+        flush_result.map_err(|err| Error::new(err, Default::default()))?;
+        drop(file);
         prog_track.files_copied.inc();
         Ok(Summary {
             files_created: 1,
@@ -508,5 +551,156 @@ mod tests {
             err_msg
         );
         Ok(())
+    }
+
+    mod max_open_files_tests {
+        use super::*;
+
+        static CANCELLATION_PROGRESS: std::sync::LazyLock<progress::Progress> =
+            std::sync::LazyLock::new(progress::Progress::new);
+        static REUSE_PROGRESS: std::sync::LazyLock<progress::Progress> =
+            std::sync::LazyLock::new(progress::Progress::new);
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn write_file_reuses_one_blocking_buffer_across_chunks() -> anyhow::Result<()> {
+            let root = testutils::create_temp_dir().await?;
+            let path = root.join("reused-buffer");
+            let bufsize = 4096;
+            let filesize = bufsize * 3;
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let gate = testutils::BlockingPathGate::install(path.clone());
+            gate.release_all();
+            let timeout = std::time::Duration::from_secs(20);
+            let runtime_thread = std::thread::current().id();
+
+            let write_result = match admission
+                .run_with_timeout(
+                    timeout,
+                    write_file(&REUSE_PROGRESS, path.clone(), filesize, bufsize, 0),
+                )
+                .await
+            {
+                Ok(Ok(summary)) => Ok(summary),
+                Ok(Err(error)) => Err(error.source),
+                Err(error) => Err(anyhow::Error::new(error)
+                    .context("multi-chunk write_file did not finish in time")),
+            };
+            let hit_count = gate.hit_count();
+            let allocation_count = gate.allocation_count();
+            let allocation_thread = gate.allocation_thread();
+            let final_len = tokio::fs::metadata(&path).await.map(|meta| meta.len());
+            drop(gate);
+            drop(admission);
+            let cleanup_result = tokio::fs::remove_dir_all(root).await;
+
+            let summary = write_result?;
+            let final_len = final_len?;
+            cleanup_result?;
+            assert_eq!(hit_count, 3, "write_file did not submit one job per chunk");
+            assert_eq!(
+                allocation_count, 1,
+                "write_file allocated a new buffer instead of reusing the returned one"
+            );
+            assert_ne!(
+                allocation_thread,
+                Some(runtime_thread),
+                "filegen allocated its user-sized buffer on the async runtime thread"
+            );
+            assert_eq!(summary.files_created, 1);
+            assert_eq!(summary.bytes_written, filesize as u64);
+            assert_eq!(final_len, filesize as u64);
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn cancelled_write_file_stops_after_one_buffer_and_retains_capacity()
+        -> anyhow::Result<()> {
+            let root = testutils::create_temp_dir().await?;
+            let path = root.join("cancelled-file");
+            let bufsize = 4096;
+            let filesize = bufsize * 3;
+            let gate = testutils::BlockingPathGate::install(path.clone());
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let timeout = std::time::Duration::from_secs(20);
+            let runtime_thread = std::thread::current().id();
+            let bytes_before = CANCELLATION_PROGRESS.bytes_copied.get();
+            let files_before = CANCELLATION_PROGRESS.files_copied.get();
+            let task = tokio::spawn(write_file(
+                &CANCELLATION_PROGRESS,
+                path.clone(),
+                filesize,
+                bufsize,
+                0,
+            ));
+            let observations =
+                testutils::cancel_at_blocking_path(admission, gate, task, timeout, |_| {
+                    (
+                        CANCELLATION_PROGRESS.bytes_copied.get(),
+                        CANCELLATION_PROGRESS.files_copied.get(),
+                    )
+                })
+                .await;
+            let final_len = tokio::fs::metadata(&path).await.map(|meta| meta.len());
+            let final_bytes = CANCELLATION_PROGRESS.bytes_copied.get();
+            let final_files = CANCELLATION_PROGRESS.files_copied.get();
+            let cleanup_result = tokio::fs::remove_dir_all(root).await;
+
+            let (observations, (bytes_at_cancellation, files_at_cancellation)) = observations?;
+            let final_len = final_len?;
+            cleanup_result?;
+
+            assert!(observations.waiter_was_cancelled);
+            assert!(
+                observations.admission_was_retained_while_work_gated,
+                "cancelling write_file released capacity while its fd-owning job was live"
+            );
+            assert!(
+                observations.fd_was_open_while_work_gated,
+                "write_file closed its fd while the job was gated"
+            );
+            assert_eq!(observations.hit_count_before_release, 1);
+            assert_eq!(
+                observations.allocation_count_before_release, 0,
+                "filegen allocated its user-sized buffer before the admitted work gate released"
+            );
+            assert_eq!(bytes_at_cancellation, bytes_before);
+            assert_eq!(files_at_cancellation, files_before);
+            assert!(
+                observations.fd_was_closed_at_output_drop_start,
+                "write_file reached its output-drop boundary before its destination fd closed"
+            );
+            assert!(
+                observations.admission_was_retained_at_output_drop_start,
+                "write_file released capacity before its abandoned output dropped"
+            );
+            assert_eq!(
+                observations.final_hit_count, 1,
+                "cancellation submitted another buffer"
+            );
+            assert_eq!(
+                observations.final_allocation_count, 1,
+                "filegen did not allocate exactly one reusable buffer in admitted blocking work"
+            );
+            assert_ne!(
+                observations.allocation_thread,
+                Some(runtime_thread),
+                "filegen allocated its user-sized buffer on the async runtime thread"
+            );
+            assert_eq!(
+                final_len, bufsize as u64,
+                "cancellation must finish at most the already-submitted buffer"
+            );
+            assert_eq!(
+                final_bytes, bytes_before,
+                "an abandoned buffer must not advance byte progress"
+            );
+            assert_eq!(
+                final_files, files_before,
+                "a cancelled file must not be counted complete"
+            );
+            Ok(())
+        }
     }
 }

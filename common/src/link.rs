@@ -651,6 +651,30 @@ struct AdmittedLinkEntry {
     permit: Option<LeafPermit>,
 }
 
+enum UpdateAdmission {
+    NonDirectory(Option<LeafPermit>),
+    Directory(Option<LeafPermit>),
+}
+
+impl UpdateAdmission {
+    fn into_entry_admission(self) -> EntryAdmission {
+        let permit = match self {
+            Self::NonDirectory(permit) | Self::Directory(permit) => permit,
+        };
+        EntryAdmission::from(permit)
+    }
+}
+
+fn drop_link_handles_before_permit<S, U, P>(
+    src_handle: S,
+    update_handle: Option<U>,
+    permit: Option<P>,
+) {
+    drop(src_handle);
+    drop(update_handle);
+    drop(permit);
+}
+
 impl AdmittedLinkEntry {
     fn new(src_handle: Handle, permit: Option<LeafPermit>) -> Self {
         Self {
@@ -660,17 +684,29 @@ impl AdmittedLinkEntry {
         }
     }
 
-    fn into_source_leaf(self) -> AdmittedLeaf {
+    // the directory outcome returns the original private bundle so its two handles can be closed
+    // before the permit. boxing that expected recursive transition would allocate per directory.
+    #[allow(clippy::result_large_err)]
+    fn into_source_leaf(self) -> Result<AdmittedLeaf, Self> {
         let Self {
             src_handle,
             update_handle,
             permit,
         } = self;
-        drop(update_handle);
-        AdmittedLeaf::new(src_handle, permit)
+        match AdmittedLeaf::try_new(src_handle, permit) {
+            Ok(leaf) => {
+                drop(update_handle);
+                Ok(leaf)
+            }
+            Err((src_handle, permit)) => Err(Self {
+                src_handle,
+                update_handle,
+                permit,
+            }),
+        }
     }
 
-    fn into_update_permit(self) -> Option<LeafPermit> {
+    fn into_update_admission(self) -> UpdateAdmission {
         let Self {
             src_handle,
             update_handle,
@@ -679,13 +715,15 @@ impl AdmittedLinkEntry {
         drop(src_handle);
         let update_handle =
             update_handle.expect("update action requires a classified update entry");
-        if update_handle.kind() == EntryKind::Dir {
-            // delegated copy reclassifies directories and releases this provisional permit before
-            // descent; close the comparison handle without constructing a leaf bundle for it.
-            drop(update_handle);
-            permit
-        } else {
-            AdmittedLeaf::new(update_handle, permit).into_permit()
+        match AdmittedLeaf::try_new(update_handle, permit) {
+            Ok(leaf) => UpdateAdmission::NonDirectory(leaf.into_permit()),
+            Err((directory, permit)) => {
+                // close the authoritative directory comparison handle without constructing a leaf;
+                // the typed directory outcome transfers its provisional permit into copy, whose
+                // shared driver reclassifies under admission and releases before descent.
+                drop(directory);
+                UpdateAdmission::Directory(permit)
+            }
         }
     }
 
@@ -695,10 +733,10 @@ impl AdmittedLinkEntry {
             update_handle,
             permit,
         } = self;
-        let has_update_dir = update_handle.is_some();
-        drop(permit);
-        drop(src_handle);
-        drop(update_handle);
+        let has_update_dir = update_handle
+            .as_ref()
+            .is_some_and(|handle| handle.kind() == EntryKind::Dir);
+        drop_link_handles_before_permit(src_handle, update_handle, permit);
         has_update_dir
     }
 }
@@ -894,10 +932,11 @@ async fn link_internal(
             entry.update_handle = None;
         }
     }
-    // From this point every non-recursive action retains an `AdmittedLeaf` through its final
-    // fd-bearing operation. A delegated copy closes its action handle before taking the permit;
-    // comparison handles close before that transfer. Direct directory recursion closes admission
-    // and both classification handles inside this scope.
+    // From this point every non-recursive action retains the private entry bundle or an
+    // `AdmittedLeaf` through its final fd-bearing operation. A delegated non-directory closes its
+    // action handle before taking the permit; comparison handles close before that transfer. An
+    // authoritative delegated directory closes both handles before transferring its permit for
+    // admitted reclassification. Direct directory recursion closes admission and both handles here.
     if let Some(update_entry) = entry.update_handle.as_ref() {
         let (update_dir, update_name) = update.unwrap();
         let update_path = update_path.as_deref().unwrap();
@@ -912,11 +951,13 @@ async fn link_internal(
             );
             // delegate at this entry's logical path so that, under --delete, pruning inside the
             // delegated subtree matches include/exclude descendants at the correct filter root
-            // (e.g. `node/*.log`). Pass the held update parent + name and transfer admission; if
-            // the update side is a directory, copy's driver releases it before descent.
+            // (e.g. `node/*.log`). Pass the held update parent + name and transfer held admission.
+            // For an authoritative update directory, close both comparison handles before
+            // transferring its provisional permit for copy to reclassify and release before
+            // descent.
             // copy_child classifies the update entry again and does not consume either outer
             // classification handle. release both before transferring admission to that walk.
-            let permit = entry.into_update_permit();
+            let admission = entry.into_update_admission().into_entry_admission();
             return delegate_copy(
                 prog_track,
                 update_dir,
@@ -927,7 +968,7 @@ async fn link_internal(
                 rel_path,
                 settings,
                 is_fresh,
-                EntryAdmission::from(permit),
+                admission,
             )
             .await
             .map(LinkDispatch::Complete);
@@ -941,7 +982,14 @@ async fn link_internal(
             ) {
                 // unchanged file: hard-link from src while retaining admission across `linkat`.
                 tracing::debug!("no change, hard link 'src'");
-                let leaf = entry.into_source_leaf();
+                let leaf = match entry.into_source_leaf() {
+                    Ok(leaf) => leaf,
+                    Err(entry) => {
+                        return Ok(LinkDispatch::Directory {
+                            has_update_dir: entry.close_for_directory(),
+                        });
+                    }
+                };
                 if settings.dry_run.is_some() {
                     crate::dry_run::report_action("link", &src_path, Some(&dst_path), "file");
                     return Ok(LinkDispatch::Complete(Summary {
@@ -968,7 +1016,7 @@ async fn link_internal(
                 update_path
             );
             // changed file: delegate to copy, transferring the same admission guard.
-            let permit = entry.into_update_permit();
+            let admission = entry.into_update_admission().into_entry_admission();
             return delegate_copy(
                 prog_track,
                 update_dir,
@@ -979,7 +1027,7 @@ async fn link_internal(
                 rel_path,
                 settings,
                 is_fresh,
-                EntryAdmission::from(permit),
+                admission,
             )
             .await
             .map(LinkDispatch::Complete);
@@ -987,7 +1035,7 @@ async fn link_internal(
         if update_entry.kind() == EntryKind::Symlink {
             // update symlink: copy it under the same non-recursive admission guard.
             tracing::debug!("'update' is a symlink so just symlink that");
-            let permit = entry.into_update_permit();
+            let admission = entry.into_update_admission().into_entry_admission();
             return delegate_copy(
                 prog_track,
                 update_dir,
@@ -998,7 +1046,7 @@ async fn link_internal(
                 rel_path,
                 settings,
                 is_fresh,
-                EntryAdmission::from(permit),
+                admission,
             )
             .await
             .map(LinkDispatch::Complete);
@@ -1008,7 +1056,14 @@ async fn link_internal(
         // a source symlink, retaining admission across the non-recursive work.
         tracing::debug!("no 'update' entry");
         if entry.src_handle.kind() == EntryKind::File {
-            let leaf = entry.into_source_leaf();
+            let leaf = match entry.into_source_leaf() {
+                Ok(leaf) => leaf,
+                Err(entry) => {
+                    return Ok(LinkDispatch::Directory {
+                        has_update_dir: entry.close_for_directory(),
+                    });
+                }
+            };
             if settings.dry_run.is_some() {
                 crate::dry_run::report_action("link", &src_path, Some(&dst_path), "file");
                 return Ok(LinkDispatch::Complete(Summary {
@@ -1030,7 +1085,14 @@ async fn link_internal(
         }
         if entry.src_handle.kind() == EntryKind::Symlink {
             tracing::debug!("'src' is a symlink so just symlink that");
-            let permit = entry.into_source_leaf().into_permit();
+            let permit = match entry.into_source_leaf() {
+                Ok(leaf) => leaf.into_permit(),
+                Err(entry) => {
+                    return Ok(LinkDispatch::Directory {
+                        has_update_dir: entry.close_for_directory(),
+                    });
+                }
+            };
             return delegate_copy(
                 prog_track,
                 src_parent,
@@ -1913,6 +1975,20 @@ mod link_tests {
 
     static PROGRESS: std::sync::LazyLock<progress::Progress> =
         std::sync::LazyLock::new(progress::Progress::new);
+
+    #[test]
+    fn directory_close_primitive_drops_both_handles_before_permit() {
+        let events = testutils::DropEvents::default();
+        drop_link_handles_before_permit(
+            events.probe("source handle"),
+            Some(events.probe("update handle")),
+            Some(events.probe("permit")),
+        );
+        assert_eq!(
+            events.snapshot(),
+            ["source handle", "update handle", "permit"]
+        );
+    }
 
     mod delete_keep_set_tests {
         //! Pure-logic unit tests for `DeleteKeepSet`. No filesystem needed — these pin the
@@ -4223,6 +4299,66 @@ mod link_tests {
     mod max_open_files_tests {
         use super::*;
 
+        #[tokio::test]
+        async fn update_directory_transition_is_typed_and_transfers_held_admission()
+        -> anyhow::Result<()> {
+            use std::os::fd::AsRawFd as _;
+
+            let root = testutils::create_temp_dir().await?;
+            tokio::fs::write(root.join("source"), b"source").await?;
+            tokio::fs::create_dir(root.join("update")).await?;
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(1);
+            let parent = Dir::open_root_dir(&root, false, congestion::Side::Source).await?;
+            let src_handle = parent.child(std::ffi::OsStr::new("source")).await?;
+            let update_handle = parent.child(std::ffi::OsStr::new("update")).await?;
+            let src_fd = src_handle.as_fd().as_raw_fd();
+            let update_fd = update_handle.as_fd().as_raw_fd();
+            let mut entry = AdmittedLinkEntry::new(
+                src_handle,
+                Some(LeafPermit::OpenFile(throttle::open_file_permit().await)),
+            );
+            entry.update_handle = Some(update_handle);
+
+            let update_admission = entry.into_update_admission();
+            let took_directory_outcome = matches!(&update_admission, UpdateAdmission::Directory(_));
+            let entry_admission = update_admission.into_entry_admission();
+            let transferred_held_admission = matches!(&entry_admission, EntryAdmission::Held(_));
+            let source_closed = testutils::fd_is_closed(src_fd);
+            let update_closed = testutils::fd_is_closed(update_fd);
+            let mut next_permit = Box::pin(throttle::open_file_permit());
+            let (capacity_stayed_held, early_permit) = match futures::poll!(next_permit.as_mut()) {
+                std::task::Poll::Pending => (true, None),
+                std::task::Poll::Ready(permit) => (false, Some(permit)),
+            };
+            drop(entry_admission);
+            let reacquire_result = match early_permit {
+                Some(permit) => Ok(permit),
+                None => {
+                    tokio::time::timeout(std::time::Duration::from_secs(1), next_permit.as_mut())
+                        .await
+                        .context("the delegated directory did not return open-file capacity")
+                }
+            };
+            let reacquire_result = reacquire_result.map(drop);
+            drop(parent);
+            let cleanup_result = tokio::fs::remove_dir_all(root).await;
+            reacquire_result?;
+            cleanup_result?;
+            assert!(
+                took_directory_outcome,
+                "an update directory bypassed its checked type-state outcome"
+            );
+            assert!(transferred_held_admission);
+            assert!(source_closed);
+            assert!(update_closed);
+            assert!(
+                capacity_stayed_held,
+                "the typed directory transition changed Task 3 admission scheduling"
+            );
+            Ok(())
+        }
+
         /// A reliable file hint lets the rlink filter skip before open-file admission.
         #[tokio::test]
         async fn filtered_hinted_file_does_not_wait_for_admission() -> Result<(), anyhow::Error> {
@@ -4735,9 +4871,10 @@ mod link_tests {
         /// Scenario: many src entries are regular files (so the spawn loop
         /// pre-acquires open-files permits for them), but the corresponding
         /// `update` entries are directories (file types differ). link_internal
-        /// then transfers its admission into `copy_child` for the update directory. The copy driver
-        /// must release that guard after authoritative directory classification and before descent;
-        /// retaining it while children acquire would deadlock against a saturated pool.
+        /// then closes both comparison handles and transfers its admission into `copy_child` for
+        /// the update directory. The copy driver reclassifies under that guard and releases it
+        /// before descent; retaining it while children acquire would deadlock against a saturated
+        /// pool.
         #[tokio::test]
         #[traced_test]
         async fn type_changed_directory_releases_admission_before_recursion()

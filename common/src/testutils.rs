@@ -95,19 +95,534 @@ impl Drop for CompletionSignal {
 }
 
 /// Waits for blocking work and then for its abandoned output to release capacity.
-pub async fn await_completion_and_capacity<F>(
-    completion: tokio::sync::oneshot::Receiver<()>,
+pub async fn await_completion_and_capacity<C, F>(
+    completion: C,
     capacity: F,
-) -> (
-    Result<(), tokio::sync::oneshot::error::RecvError>,
-    F::Output,
-)
+) -> (C::Output, F::Output)
 where
+    C: std::future::Future,
     F: std::future::Future,
 {
     let completion_result = completion.await;
     let capacity = capacity.await;
     (completion_result, capacity)
+}
+
+/// Returns whether a raw file descriptor has been closed.
+pub fn fd_is_closed(raw_fd: std::os::fd::RawFd) -> bool {
+    // SAFETY: `F_GETFD` takes only the descriptor integer and writes through no userspace pointer;
+    // the kernel validates closed or invalid values, so this probe cannot violate memory safety.
+    let result = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
+    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+}
+
+/// Records the destruction order of test-only ownership probes.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct DropEvents(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+/// Records one event when dropped.
+#[cfg(test)]
+pub struct DropEvent {
+    name: &'static str,
+    events: DropEvents,
+}
+
+#[cfg(test)]
+impl DropEvents {
+    /// Creates a probe that appends `name` when dropped.
+    pub fn probe(&self, name: &'static str) -> DropEvent {
+        DropEvent {
+            name,
+            events: self.clone(),
+        }
+    }
+
+    /// Returns the events observed so far.
+    pub fn snapshot(&self) -> Vec<&'static str> {
+        lock_unpoisoned(&self.0).clone()
+    }
+}
+
+#[cfg(test)]
+impl Drop for DropEvent {
+    fn drop(&mut self) {
+        lock_unpoisoned(&self.events.0).push(self.name);
+    }
+}
+
+#[cfg(test)]
+struct BlockingPathDropBarrier {
+    released: std::sync::Mutex<bool>,
+    released_cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+struct BlockingPathGateState {
+    started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<std::os::fd::RawFd>>>,
+    released: std::sync::Mutex<bool>,
+    released_cv: std::sync::Condvar,
+    hit_count: std::sync::atomic::AtomicUsize,
+    allocation_count: std::sync::atomic::AtomicUsize,
+    allocation_thread: std::sync::Mutex<Option<std::thread::ThreadId>>,
+    visit: std::sync::Mutex<Option<BlockingPathGateVisit>>,
+    output_drop_barrier: std::sync::Arc<BlockingPathDropBarrier>,
+}
+
+#[cfg(test)]
+static BLOCKING_PATH_GATES: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, std::sync::Weak<BlockingPathGateState>>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn lock_unpoisoned<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Installs a failure-safe blocking gate for one exact test path.
+#[cfg(test)]
+pub struct BlockingPathGate {
+    path: std::path::PathBuf,
+    state: std::sync::Arc<BlockingPathGateState>,
+    started: Option<tokio::sync::oneshot::Receiver<std::os::fd::RawFd>>,
+    output_drop_started: Option<tokio::sync::oneshot::Receiver<()>>,
+    completed: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+/// Holds an abandoned output when its call site places this token after the file owner.
+#[cfg(test)]
+pub struct BlockingPathGateVisit {
+    output_drop_started: Option<tokio::sync::oneshot::Sender<()>>,
+    output_drop_barrier: std::sync::Arc<BlockingPathDropBarrier>,
+    _completion: CompletionSignal,
+}
+
+#[cfg(test)]
+impl Drop for BlockingPathGateVisit {
+    fn drop(&mut self) {
+        if let Some(started) = self.output_drop_started.take() {
+            let _ = started.send(());
+        }
+        let mut released = lock_unpoisoned(&self.output_drop_barrier.released);
+        while !*released {
+            released = self
+                .output_drop_barrier
+                .released_cv
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+#[cfg(test)]
+impl BlockingPathGate {
+    /// Installs a gate that unrelated filesystem paths cannot enter.
+    pub fn install(path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        let mut gates = lock_unpoisoned(&BLOCKING_PATH_GATES);
+        let occupied = gates.get(&path).and_then(std::sync::Weak::upgrade);
+        if occupied.is_some() {
+            drop(gates);
+            panic!("a blocking path gate is already installed for {path:?}");
+        }
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (output_drop_started_tx, output_drop_started_rx) = tokio::sync::oneshot::channel();
+        let (completion, completion_rx) = CompletionSignal::new();
+        let output_drop_barrier = std::sync::Arc::new(BlockingPathDropBarrier {
+            released: std::sync::Mutex::new(false),
+            released_cv: std::sync::Condvar::new(),
+        });
+        let state = std::sync::Arc::new(BlockingPathGateState {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            released: std::sync::Mutex::new(false),
+            released_cv: std::sync::Condvar::new(),
+            hit_count: std::sync::atomic::AtomicUsize::new(0),
+            allocation_count: std::sync::atomic::AtomicUsize::new(0),
+            allocation_thread: std::sync::Mutex::new(None),
+            visit: std::sync::Mutex::new(Some(BlockingPathGateVisit {
+                output_drop_started: Some(output_drop_started_tx),
+                output_drop_barrier: output_drop_barrier.clone(),
+                _completion: completion,
+            })),
+            output_drop_barrier,
+        });
+        gates.insert(path.clone(), std::sync::Arc::downgrade(&state));
+        drop(gates);
+        Self {
+            path,
+            state,
+            started: Some(started_rx),
+            output_drop_started: Some(output_drop_started_rx),
+            completed: Some(completion_rx),
+        }
+    }
+
+    /// Waits until production blocking work enters this path's gate.
+    pub async fn wait_started(&mut self) -> Result<std::os::fd::RawFd> {
+        self.started
+            .take()
+            .context("the blocking path gate can only be awaited once")?
+            .await
+            .context("blocking path work ended before entering its gate")
+    }
+
+    /// Waits until an abandoned output begins dropping its visit token.
+    pub async fn wait_output_drop_started(&mut self) -> Result<()> {
+        self.output_drop_started
+            .take()
+            .context("the blocking path output-drop start can only be awaited once")?
+            .await
+            .context("blocking path output ended without entering its drop barrier")
+    }
+
+    /// Waits until an abandoned output passes its drop barrier and releases its visit token.
+    pub async fn wait_completed(&mut self) -> Result<()> {
+        self.completed
+            .take()
+            .context("the blocking path completion can only be awaited once")?
+            .await
+            .context("blocking path output ended without its completion token")
+    }
+
+    /// Releases blocked production work. Calling this more than once is harmless.
+    pub fn release(&self) {
+        let mut released = lock_unpoisoned(&self.state.released);
+        *released = true;
+        self.state.released_cv.notify_all();
+    }
+
+    /// Releases the abandoned-output drop barrier. Calling this more than once is harmless.
+    pub fn release_output_drop(&self) {
+        let mut released = lock_unpoisoned(&self.state.output_drop_barrier.released);
+        *released = true;
+        self.state.output_drop_barrier.released_cv.notify_all();
+    }
+
+    /// Releases both blocking phases. Calling this more than once is harmless.
+    pub fn release_all(&self) {
+        self.release();
+        self.release_output_drop();
+    }
+
+    /// Returns how many blocking jobs entered this exact path's gate.
+    pub fn hit_count(&self) -> usize {
+        self.state
+            .hit_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Returns how many filegen buffers were allocated for this exact path.
+    pub fn allocation_count(&self) -> usize {
+        self.state
+            .allocation_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Returns the thread that performed the first recorded filegen buffer allocation.
+    pub fn allocation_thread(&self) -> Option<std::thread::ThreadId> {
+        *lock_unpoisoned(&self.state.allocation_thread)
+    }
+}
+
+#[cfg(test)]
+impl Drop for BlockingPathGate {
+    fn drop(&mut self) {
+        self.release_all();
+        let mut gates = lock_unpoisoned(&BLOCKING_PATH_GATES);
+        if gates
+            .get(&self.path)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|state| std::sync::Arc::ptr_eq(&state, &self.state))
+        {
+            gates.remove(&self.path);
+        }
+    }
+}
+
+/// Records one filegen buffer allocation for an installed exact-path gate.
+#[cfg(test)]
+pub fn record_blocking_path_allocation(path: &std::path::Path) {
+    if let Some(state) = lock_unpoisoned(&BLOCKING_PATH_GATES)
+        .get(path)
+        .and_then(std::sync::Weak::upgrade)
+    {
+        let mut allocation_thread = lock_unpoisoned(&state.allocation_thread);
+        allocation_thread.get_or_insert_with(|| std::thread::current().id());
+        drop(allocation_thread);
+        state
+            .allocation_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Blocks a production test job and returns its output-lifetime visit token.
+#[cfg(test)]
+#[must_use]
+pub fn wait_on_blocking_path_gate(
+    path: &std::path::Path,
+    raw_fd: std::os::fd::RawFd,
+) -> Option<BlockingPathGateVisit> {
+    let state = lock_unpoisoned(&BLOCKING_PATH_GATES)
+        .get(path)
+        .and_then(std::sync::Weak::upgrade);
+    let state = state?;
+    state
+        .hit_count
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Some(started) = lock_unpoisoned(&state.started).take() {
+        let _ = started.send(raw_fd);
+    }
+    let mut released = lock_unpoisoned(&state.released);
+    while !*released {
+        released = state
+            .released_cv
+            .wait(released)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    drop(released);
+    lock_unpoisoned(&state.visit).take()
+}
+
+/// Observations from cancelling one production task at its exact-path blocking boundary.
+#[cfg(test)]
+pub struct CancelledBlockingPathObservations {
+    pub waiter_was_cancelled: bool,
+    pub admission_was_retained_while_work_gated: bool,
+    pub fd_was_open_while_work_gated: bool,
+    pub hit_count_before_release: usize,
+    pub allocation_count_before_release: usize,
+    pub fd_was_closed_at_output_drop_start: bool,
+    pub admission_was_retained_at_output_drop_start: bool,
+    pub final_hit_count: usize,
+    pub final_allocation_count: usize,
+    pub allocation_thread: Option<std::thread::ThreadId>,
+}
+
+#[cfg(test)]
+async fn abort_and_quiesce_hit_blocking_path<T>(
+    admission: &AdmissionLimit,
+    gate: &mut BlockingPathGate,
+    task: &mut tokio::task::JoinHandle<T>,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    task.abort();
+    let _ = task.await;
+    gate.release_all();
+    admission
+        .run_with_timeout(timeout, async {
+            let output =
+                await_completion_and_capacity(gate.wait_completed(), throttle::open_file_permit());
+            let (completion, permit) = output.await;
+            drop(permit);
+            completion
+        })
+        .await
+        .context("blocking task did not quiesce after both gates released")??;
+    Ok(())
+}
+
+#[cfg(test)]
+async fn quiesce_unentered_blocking_path<T>(
+    admission: &AdmissionLimit,
+    gate: &mut BlockingPathGate,
+    task: &mut tokio::task::JoinHandle<T>,
+) -> Result<()> {
+    gate.release_all();
+    admission.quiesce(task).await;
+    if gate.hit_count() != 0 {
+        gate.wait_completed().await?;
+    }
+    Ok(())
+}
+
+/// Cancels a task inside an exact-path blocking job and quiesces every owned resource.
+///
+/// The supplied admission fixture must already have `max_open_files` set to one; the pending
+/// second permit is the old-epoch witness that the gated task still owns the only slot.
+#[cfg(test)]
+pub async fn cancel_at_blocking_path<T, O, F>(
+    admission: AdmissionLimit,
+    mut gate: BlockingPathGate,
+    mut task: tokio::task::JoinHandle<T>,
+    timeout: std::time::Duration,
+    observe_while_gated: F,
+) -> Result<(CancelledBlockingPathObservations, O)>
+where
+    T: Send + 'static,
+    F: FnOnce(std::os::fd::RawFd) -> O,
+{
+    enum StartOutcome {
+        Entered(Result<std::os::fd::RawFd>),
+        OwnerFinished,
+    }
+
+    let start_outcome = tokio::time::timeout(timeout, async {
+        tokio::select! {
+            started = gate.wait_started() => StartOutcome::Entered(started),
+            result = &mut task => {
+                let _ = result;
+                StartOutcome::OwnerFinished
+            }
+        }
+    })
+    .await;
+    let raw_fd = match start_outcome {
+        Ok(StartOutcome::Entered(Ok(raw_fd))) => raw_fd,
+        Ok(StartOutcome::Entered(Err(error))) => {
+            let cleanup_result = if gate.hit_count() != 0 {
+                abort_and_quiesce_hit_blocking_path(&admission, &mut gate, &mut task, timeout).await
+            } else {
+                quiesce_unentered_blocking_path(&admission, &mut gate, &mut task).await
+            };
+            drop(gate);
+            drop(admission);
+            cleanup_result.context("failed blocking gate did not quiesce its output")?;
+            return Err(error);
+        }
+        Ok(StartOutcome::OwnerFinished) => {
+            gate.release_all();
+            drop(gate);
+            drop(admission);
+            anyhow::bail!("task completed without entering its production blocking path gate");
+        }
+        Err(error) => {
+            let gate_was_hit = gate.hit_count() != 0;
+            let cleanup_result = if gate_was_hit {
+                abort_and_quiesce_hit_blocking_path(&admission, &mut gate, &mut task, timeout).await
+            } else {
+                quiesce_unentered_blocking_path(&admission, &mut gate, &mut task).await
+            };
+            drop(gate);
+            drop(admission);
+            cleanup_result.context("timed-out blocking task did not quiesce its output")?;
+            return Err(error)
+                .context("task did not enter its production blocking path gate in time");
+        }
+    };
+
+    task.abort();
+    let cancellation = tokio::time::timeout(timeout, &mut task).await;
+    if let Err(error) = cancellation {
+        let cleanup_result =
+            abort_and_quiesce_hit_blocking_path(&admission, &mut gate, &mut task, timeout).await;
+        drop(gate);
+        drop(admission);
+        cleanup_result.context("timed-out task cancellation did not quiesce its output")?;
+        return Err(error).context("blocking-path task did not cancel in time");
+    }
+    let waiter_was_cancelled = matches!(cancellation, Ok(Err(error)) if error.is_cancelled());
+    let mut second_permit = Box::pin(throttle::open_file_permit());
+    let (admission_was_retained_while_work_gated, mut acquired_permit) =
+        match futures::poll!(second_permit.as_mut()) {
+            std::task::Poll::Pending => (true, None),
+            std::task::Poll::Ready(permit) => (false, Some(permit)),
+        };
+    let fd_was_open_while_work_gated = !fd_is_closed(raw_fd);
+    let hit_count_before_release = gate.hit_count();
+    let allocation_count_before_release = gate.allocation_count();
+    let caller_observation =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observe_while_gated(raw_fd)));
+
+    gate.release();
+    let output_drop_started = tokio::time::timeout(timeout, gate.wait_output_drop_started()).await;
+    let (
+        fd_was_closed_at_output_drop_start,
+        admission_was_retained_at_output_drop_start,
+        output_drop_start_error,
+    ) = match output_drop_started {
+        Ok(Ok(())) => {
+            let fd_was_closed = fd_is_closed(raw_fd);
+            let admission_was_retained = if acquired_permit.is_some() {
+                false
+            } else {
+                match futures::poll!(second_permit.as_mut()) {
+                    std::task::Poll::Pending => true,
+                    std::task::Poll::Ready(permit) => {
+                        acquired_permit = Some(permit);
+                        false
+                    }
+                }
+            };
+            (fd_was_closed, admission_was_retained, None)
+        }
+        Ok(Err(error)) => (
+            false,
+            false,
+            Some(error.context("blocking output ended before its drop barrier")),
+        ),
+        Err(error) => (
+            false,
+            false,
+            Some(
+                anyhow::Error::new(error)
+                    .context("blocking output did not enter its drop barrier in time"),
+            ),
+        ),
+    };
+
+    gate.release_output_drop();
+    let capacity = async move {
+        match acquired_permit {
+            Some(permit) => permit,
+            None => second_permit.await,
+        }
+    };
+    let completion_and_capacity = admission
+        .run_with_timeout(
+            timeout,
+            await_completion_and_capacity(gate.wait_completed(), capacity),
+        )
+        .await;
+    let (permit, output_completion_error) = match completion_and_capacity {
+        Ok((Ok(()), permit)) => (Some(permit), None),
+        Ok((Err(error), permit)) => {
+            drop(permit);
+            (
+                None,
+                Some(error.context("blocking output lost its completion witness")),
+            )
+        }
+        Err(error) => (
+            None,
+            Some(
+                anyhow::Error::new(error)
+                    .context("blocking output did not quiesce after both gates released"),
+            ),
+        ),
+    };
+    let final_hit_count = gate.hit_count();
+    let final_allocation_count = gate.allocation_count();
+    let allocation_thread = gate.allocation_thread();
+    drop(permit);
+    drop(gate);
+    drop(admission);
+    let observations = CancelledBlockingPathObservations {
+        waiter_was_cancelled,
+        admission_was_retained_while_work_gated,
+        fd_was_open_while_work_gated,
+        hit_count_before_release,
+        allocation_count_before_release,
+        fd_was_closed_at_output_drop_start,
+        admission_was_retained_at_output_drop_start,
+        final_hit_count,
+        final_allocation_count,
+        allocation_thread,
+    };
+    let caller_observation = match caller_observation {
+        Ok(caller_observation) => caller_observation,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+    if let Some(error) = output_drop_start_error {
+        return Err(error);
+    }
+    if let Some(error) = output_completion_error {
+        return Err(error);
+    }
+    Ok((observations, caller_observation))
 }
 
 pub async fn create_temp_dir() -> Result<std::path::PathBuf> {
@@ -224,8 +739,77 @@ pub async fn check_dirs_identical(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt as _;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::time::Duration;
+
+    #[test]
+    fn duplicate_blocking_gate_registration_does_not_poison_the_registry() {
+        let path = std::path::PathBuf::from("blocking-path-gate-duplicate-registration-test");
+        let first = BlockingPathGate::install(path.clone());
+
+        let duplicate = catch_unwind(AssertUnwindSafe(|| {
+            drop(BlockingPathGate::install(path.clone()));
+        }));
+        assert!(duplicate.is_err());
+        drop(first);
+
+        drop(BlockingPathGate::install(path));
+    }
+
+    #[tokio::test]
+    async fn cancellation_controller_quiesces_before_resuming_observer_panic() -> anyhow::Result<()>
+    {
+        static PROGRESS: std::sync::LazyLock<crate::progress::Progress> =
+            std::sync::LazyLock::new(crate::progress::Progress::new);
+
+        let root = create_temp_dir().await?;
+        let path = root.join("controller-observer-panic");
+        let gate = BlockingPathGate::install(path.clone());
+        let admission = AdmissionLimit::new().await;
+        admission.set_max_open_files(1);
+        let timeout = Duration::from_secs(20);
+        let task = tokio::spawn(crate::filegen::write_file(
+            &PROGRESS,
+            path.clone(),
+            4096,
+            4096,
+            0,
+        ));
+        let observed_fd = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1));
+        let panic_fd = observed_fd.clone();
+        let controller = cancel_at_blocking_path(admission, gate, task, timeout, move |raw_fd| {
+            panic_fd.store(raw_fd, std::sync::atomic::Ordering::SeqCst);
+            panic!("observer panic after the production gate was entered");
+        });
+        let panic_result = AssertUnwindSafe(controller).catch_unwind().await;
+        let raw_fd = observed_fd.load(std::sync::atomic::Ordering::SeqCst);
+        let fd_was_closed = raw_fd >= 0 && fd_is_closed(raw_fd);
+        let admission_reacquired = tokio::time::timeout(timeout, AdmissionLimit::new()).await;
+        let admission_was_reacquired = admission_reacquired.is_ok();
+        drop(admission_reacquired);
+        let gate_reinstalled = catch_unwind(AssertUnwindSafe(|| {
+            drop(BlockingPathGate::install(path));
+        }))
+        .is_ok();
+        let cleanup_result = tokio::fs::remove_dir_all(root).await;
+
+        cleanup_result?;
+        assert!(panic_result.is_err(), "the observer panic was not resumed");
+        assert!(
+            fd_was_closed,
+            "the controller resumed its observer panic before the fd owner quiesced"
+        );
+        assert!(
+            admission_was_reacquired,
+            "the controller resumed its observer panic before unlocking admission state"
+        );
+        assert!(
+            gate_reinstalled,
+            "the controller resumed its observer panic before unregistering the path gate"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn admission_limits_reset_when_a_guarded_section_panics() {
