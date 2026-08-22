@@ -472,6 +472,13 @@ Specific invariants enforced:
   than a parameter of the creating call, so no call site can opt out of it.
 - On overwrite paths, a `recheck` verifies that the `(dev, ino)` of the entry matches the originally
   classified handle before performing the unlink.
+- Before recursively removing a directory, `rrm` rechecks its final name against the walked
+  directory and performs the `rmdir` relative to the held parent fd. After a successful `rmdir`, a
+  zero link count on the pinned walked-directory fd proves that inode was removed; a nonzero count
+  fails closed because a final-name replacement was removed instead. Filesystems that make a
+  just-unlinked pinned descriptor unqueryable with `ENOENT` or `ESTALE` are accepted as a weaker,
+  logged removal outcome only after that contained `rmdir` succeeds; any other post-`rmdir` stat
+  error remains a hard failure.
 - Directory names passed to any `*at()` call are validated to be single path components (no `/`,
   `.`, `..`).
 - **Source payload and metadata come from the same fd (read-side fidelity).** For each copied or
