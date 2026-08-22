@@ -6045,6 +6045,8 @@ mod link_tests {
             let update_handle = parent.child(std::ffi::OsStr::new("update")).await?;
             let src_fd = src_handle.as_fd().as_raw_fd();
             let update_fd = update_handle.as_fd().as_raw_fd();
+            let src_probe = testutils::FdIdentityProbe::capture(src_fd)?;
+            let update_probe = testutils::FdIdentityProbe::capture(update_fd)?;
             let mut entry = AdmittedLinkEntry::new(
                 src_handle,
                 Some(LeafPermit::OpenFile(throttle::open_file_permit().await)),
@@ -6054,15 +6056,15 @@ mod link_tests {
             let update_entry = entry.into_update_entry();
             let retained_directory = update_entry.kind() == EntryKind::Dir;
             let transferred_held_admission = update_entry.admission().is_some();
-            let source_closed = testutils::fd_is_closed(src_fd);
-            let update_stayed_open = !testutils::fd_is_closed(update_fd);
+            let source_closed = src_probe.original_is_closed()?;
+            let update_stayed_open = !update_probe.original_is_closed()?;
             let mut next_permit = Box::pin(throttle::open_file_permit());
             let (capacity_stayed_held, early_permit) = match futures::poll!(next_permit.as_mut()) {
                 std::task::Poll::Pending => (true, None),
                 std::task::Poll::Ready(permit) => (false, Some(permit)),
             };
             drop(update_entry);
-            let update_closed = testutils::fd_is_closed(update_fd);
+            let update_closed = update_probe.original_is_closed()?;
             let reacquire_result = match early_permit {
                 Some(permit) => Ok(permit),
                 None => {

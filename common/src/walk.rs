@@ -970,6 +970,7 @@ mod tests {
             .into_tree();
         let handle = parent.child(OsStr::new("directory")).await?;
         let raw_fd = handle.as_fd().as_raw_fd();
+        let probe = testutils::FdIdentityProbe::capture(raw_fd)?;
 
         let directory = match NonDirectoryHandle::try_from(handle) {
             Ok(_) => anyhow::bail!("a directory was accepted as a non-directory handle"),
@@ -977,9 +978,9 @@ mod tests {
         };
         assert_eq!(directory.kind(), EntryKind::Dir);
         assert_eq!(directory.as_fd().as_raw_fd(), raw_fd);
-        assert!(!testutils::fd_is_closed(raw_fd));
+        assert!(!probe.original_is_closed()?);
         drop(directory);
-        assert!(testutils::fd_is_closed(raw_fd));
+        assert!(probe.original_is_closed()?);
         drop(parent);
         tokio::fs::remove_dir_all(root).await?;
         Ok(())
@@ -996,6 +997,7 @@ mod tests {
             .into_tree();
         let handle = parent.child(OsStr::new("leaf")).await?;
         let raw_fd = handle.as_fd().as_raw_fd();
+        let probe = testutils::FdIdentityProbe::capture(raw_fd)?;
         let leaf = AdmittedLeaf::try_new(
             handle,
             Some(LeafPermit::OpenFile(throttle::open_file_permit().await)),
@@ -1006,7 +1008,7 @@ mod tests {
         assert!(leaf.admission().is_some());
         let permit = leaf.into_permit();
         assert!(
-            testutils::fd_is_closed(raw_fd),
+            probe.original_is_closed()?,
             "transfer retained the classification fd"
         );
         let mut next_permit = Box::pin(throttle::open_file_permit());

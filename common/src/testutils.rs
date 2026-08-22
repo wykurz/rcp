@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 
 static ADMISSION_LIMIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -108,12 +109,57 @@ where
     (completion_result, capacity)
 }
 
-/// Returns whether a raw file descriptor has been closed.
-pub fn fd_is_closed(raw_fd: std::os::fd::RawFd) -> bool {
-    // SAFETY: `F_GETFD` takes only the descriptor integer and writes through no userspace pointer;
-    // the kernel validates closed or invalid values, so this probe cannot violate memory safety.
-    let result = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
-    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+/// Captures the identity of a live file descriptor for later closure checks.
+#[derive(Clone, Copy)]
+pub struct FdIdentityProbe {
+    raw_fd: RawFd,
+    device: libc::dev_t,
+    inode: libc::ino_t,
+}
+
+impl FdIdentityProbe {
+    /// Duplicates `raw_fd` with close-on-exec and records the duplicate's identity.
+    pub fn capture(raw_fd: RawFd) -> std::io::Result<Self> {
+        // SAFETY: `F_DUPFD_CLOEXEC` reads only the descriptor integer and returns a new descriptor;
+        // the kernel validates `raw_fd` and sets close-on-exec before exposing the duplicate.
+        let duplicate_raw = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate_raw == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `duplicate_raw` was just returned by `F_DUPFD_CLOEXEC` and is owned exclusively
+        // by this function until `duplicate` is dropped.
+        let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate_raw) };
+        let identity = fd_identity(duplicate.as_raw_fd());
+        drop(duplicate);
+        let (device, inode) = identity?;
+        Ok(Self {
+            raw_fd,
+            device,
+            inode,
+        })
+    }
+
+    /// Returns whether the captured owner is gone, including when its numeric slot was reused.
+    pub fn original_is_closed(&self) -> std::io::Result<bool> {
+        match fd_identity(self.raw_fd) {
+            Ok((device, inode)) => Ok((device, inode) != (self.device, self.inode)),
+            Err(error) if error.raw_os_error() == Some(libc::EBADF) => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn fd_identity(raw_fd: RawFd) -> std::io::Result<(libc::dev_t, libc::ino_t)> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `stat` points to enough writable memory for `libc::stat`; the kernel validates the
+    // descriptor and initializes it fully before success is reported.
+    let result = unsafe { libc::fstat(raw_fd, stat.as_mut_ptr()) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful `fstat` initialized the complete `libc::stat` above.
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_dev, stat.st_ino))
 }
 
 /// Records the destruction order of test-only ownership probes.
@@ -503,6 +549,7 @@ where
                 .context("task did not enter its production blocking path gate in time");
         }
     };
+    let fd_probe = FdIdentityProbe::capture(raw_fd)?;
 
     task.abort();
     let cancellation = tokio::time::timeout(timeout, &mut task).await;
@@ -521,7 +568,7 @@ where
             std::task::Poll::Pending => (true, None),
             std::task::Poll::Ready(permit) => (false, Some(permit)),
         };
-    let fd_was_open_while_work_gated = !fd_is_closed(raw_fd);
+    let fd_was_open_while_work_gated = !fd_probe.original_is_closed()?;
     let hit_count_before_release = gate.hit_count();
     let allocation_count_before_release = gate.allocation_count();
     let caller_observation =
@@ -535,7 +582,7 @@ where
         output_drop_start_error,
     ) = match output_drop_started {
         Ok(Ok(())) => {
-            let fd_was_closed = fd_is_closed(raw_fd);
+            let fd_was_closed = fd_probe.original_is_closed()?;
             let admission_was_retained = if acquired_permit.is_some() {
                 false
             } else {
@@ -744,6 +791,50 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn fd_identity_probe_detects_a_closed_descriptor_slot_reused_for_another_file()
+    -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let first_path = dir.path().join("first");
+        let second_path = dir.path().join("second");
+        std::fs::write(&first_path, b"first")?;
+        std::fs::write(&second_path, b"second")?;
+        let first = std::fs::File::open(first_path)?;
+        let second = std::fs::File::open(second_path)?;
+        let first_fd = first.as_raw_fd();
+        let probe = FdIdentityProbe::capture(first_fd)?;
+
+        // SAFETY: both descriptors are live files, and `dup2` atomically replaces only `first_fd`.
+        let result = unsafe { libc::dup2(second.as_raw_fd(), first_fd) };
+        assert_ne!(result, -1, "failed to reuse the first descriptor slot");
+        // SAFETY: `F_GETFD` reads only the descriptor integer and writes through no userspace
+        // pointer; the kernel validates whether the reused numeric slot remains open.
+        let slot_flags = unsafe { libc::fcntl(first_fd, libc::F_GETFD) };
+        assert!(
+            slot_flags != -1,
+            "the reused descriptor slot must remain numerically open"
+        );
+        assert!(
+            probe.original_is_closed()?,
+            "a descriptor reused for another file must not appear to retain the original owner"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fd_identity_probe_distinguishes_a_live_original_from_a_closed_one() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("file");
+        std::fs::write(&path, b"contents")?;
+        let file = std::fs::File::open(path)?;
+        let probe = FdIdentityProbe::capture(file.as_raw_fd())?;
+
+        assert!(!probe.original_is_closed()?);
+        drop(file);
+        assert!(probe.original_is_closed()?);
+        Ok(())
+    }
+
+    #[test]
     fn duplicate_blocking_gate_registration_does_not_poison_the_registry() {
         let path = std::path::PathBuf::from("blocking-path-gate-duplicate-registration-test");
         let first = BlockingPathGate::install(path.clone());
@@ -776,15 +867,20 @@ mod tests {
             4096,
             0,
         ));
-        let observed_fd = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(-1));
-        let panic_fd = observed_fd.clone();
+        let observed_probe = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let panic_probe = observed_probe.clone();
         let controller = cancel_at_blocking_path(admission, gate, task, timeout, move |raw_fd| {
-            panic_fd.store(raw_fd, std::sync::atomic::Ordering::SeqCst);
+            *panic_probe.lock().expect("observer fd probe lock poisoned") =
+                Some(FdIdentityProbe::capture(raw_fd).expect("gated fd must be capturable"));
             panic!("observer panic after the production gate was entered");
         });
         let panic_result = AssertUnwindSafe(controller).catch_unwind().await;
-        let raw_fd = observed_fd.load(std::sync::atomic::Ordering::SeqCst);
-        let fd_was_closed = raw_fd >= 0 && fd_is_closed(raw_fd);
+        let fd_was_closed = observed_probe
+            .lock()
+            .expect("observer fd probe lock poisoned")
+            .take()
+            .expect("observer did not capture the gated fd")
+            .original_is_closed()?;
         let admission_reacquired = tokio::time::timeout(timeout, AdmissionLimit::new()).await;
         let admission_was_reacquired = admission_reacquired.is_ok();
         drop(admission_reacquired);

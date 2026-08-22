@@ -1876,7 +1876,7 @@ mod tests {
         ) -> anyhow::Result<(
             crate::testutils::AdmissionLimit,
             tokio::task::JoinHandle<Result<CountSummary, OperationError<CountSummary>>>,
-            std::os::fd::RawFd,
+            crate::testutils::FdIdentityProbe,
             Arc<tokio::sync::Notify>,
             std::path::PathBuf,
         )> {
@@ -1902,12 +1902,13 @@ mod tests {
                 walk::preacquire_leaf_permit(PermitKind::PendingMeta, Some(EntryKind::File)).await;
             let task = tokio::spawn(process_entry(visitor, cx, (), permit));
             let raw_fd = started_rx.await.context("leaf visitor did not start")?;
-            Ok((admission, task, raw_fd, release, root))
+            let probe = crate::testutils::FdIdentityProbe::capture(raw_fd)?;
+            Ok((admission, task, probe, release, root))
         }
 
         #[tokio::test(flavor = "current_thread")]
         async fn successful_leaf_holds_admission_through_visitor() -> anyhow::Result<()> {
-            let (_admission, task, raw_fd, release, root) =
+            let (_admission, task, probe, release, root) =
                 start_leaf_lifetime_operation(LeafOutcome::Success).await?;
             let mut next_permit = Box::pin(throttle::pending_meta_permit());
             assert!(
@@ -1918,7 +1919,7 @@ mod tests {
             let summary = task.await?.map_err(|error| error.source)?;
             assert_eq!(summary.files, 1);
             assert!(
-                crate::testutils::fd_is_closed(raw_fd),
+                probe.original_is_closed()?,
                 "successful leaf returned with its classification handle open"
             );
             let permit = tokio::time::timeout(Duration::from_secs(1), next_permit)
@@ -1931,7 +1932,7 @@ mod tests {
 
         #[tokio::test(flavor = "current_thread")]
         async fn failed_leaf_holds_admission_through_visitor() -> anyhow::Result<()> {
-            let (_admission, task, raw_fd, release, root) =
+            let (_admission, task, probe, release, root) =
                 start_leaf_lifetime_operation(LeafOutcome::Error).await?;
             let mut next_permit = Box::pin(throttle::pending_meta_permit());
             assert!(
@@ -1942,7 +1943,7 @@ mod tests {
             let error = task.await?.expect_err("leaf operation must fail");
             assert!(format!("{:#}", error.source).contains("leaf operation failed"));
             assert!(
-                crate::testutils::fd_is_closed(raw_fd),
+                probe.original_is_closed()?,
                 "failed leaf returned with its classification handle open"
             );
             let permit = tokio::time::timeout(Duration::from_secs(1), next_permit)
@@ -1955,7 +1956,7 @@ mod tests {
 
         #[tokio::test(flavor = "current_thread")]
         async fn cancelled_leaf_drops_handle_and_returns_admission() -> anyhow::Result<()> {
-            let (_admission, task, raw_fd, _release, root) =
+            let (_admission, task, probe, _release, root) =
                 start_leaf_lifetime_operation(LeafOutcome::Success).await?;
             let mut next_permit = Box::pin(throttle::pending_meta_permit());
             assert!(
@@ -1966,7 +1967,7 @@ mod tests {
             let task_error = task.await.expect_err("leaf task must be cancelled");
             assert!(task_error.is_cancelled());
             assert!(
-                crate::testutils::fd_is_closed(raw_fd),
+                probe.original_is_closed()?,
                 "cancelled leaf retained its classification handle"
             );
             let permit = tokio::time::timeout(Duration::from_secs(1), next_permit)
