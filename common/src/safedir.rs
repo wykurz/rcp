@@ -3487,23 +3487,24 @@ mod tests {
 
         struct QueuedFdCapture {
             file: Option<std::fs::File>,
-            raw_fd: RawFd,
-            observation: Arc<std::sync::Mutex<Option<QueuedFdDropObservation>>>,
+            probe: crate::testutils::FdIdentityProbe,
+            observation: Arc<std::sync::Mutex<Option<std::io::Result<QueuedFdDropObservation>>>>,
         }
 
         impl Drop for QueuedFdCapture {
             fn drop(&mut self) {
                 drop(self.file.take());
-                let fd_was_closed = crate::testutils::fd_is_closed(self.raw_fd);
                 let admission_was_retained = throttle::open_file_permit().now_or_never().is_none();
                 *self
                     .observation
                     .lock()
                     .expect("queued fd drop observation lock poisoned") =
-                    Some(QueuedFdDropObservation {
-                        fd_was_closed,
-                        admission_was_retained,
-                    });
+                    Some(self.probe.original_is_closed().map(|fd_was_closed| {
+                        QueuedFdDropObservation {
+                            fd_was_closed,
+                            admission_was_retained,
+                        }
+                    }));
             }
         }
 
@@ -3526,6 +3527,7 @@ mod tests {
                 let open_file_guard = throttle::open_file_permit().await;
                 let file = std::fs::File::open(file_path)?;
                 let raw_fd = file.as_raw_fd();
+                let probe = crate::testutils::FdIdentityProbe::capture(raw_fd)?;
                 let drop_observation = Arc::new(std::sync::Mutex::new(None));
 
                 let (blocker_started_tx, blocker_started_rx) = tokio::sync::oneshot::channel();
@@ -3545,7 +3547,7 @@ mod tests {
                     let admission = open_file_guard.admission();
                     let queued_capture = QueuedFdCapture {
                         file: Some(file),
-                        raw_fd,
+                        probe,
                         observation: Arc::clone(&drop_observation),
                     };
                     let mut waiter = Box::pin(with_fd_admission(admission, async move {
@@ -3565,10 +3567,12 @@ mod tests {
                     drop(open_file_guard);
                 }
 
-                let fd_was_closed_before_release = crate::testutils::fd_is_closed(raw_fd);
-                let drop_observation_before_release = *drop_observation
+                let fd_was_closed_before_release = probe.original_is_closed()?;
+                let drop_observation_before_release = drop_observation
                     .lock()
-                    .expect("queued fd drop observation lock poisoned");
+                    .expect("queued fd drop observation lock poisoned")
+                    .take()
+                    .transpose()?;
                 let mut next_permit = Box::pin(throttle::open_file_permit());
                 let (admission_returned_before_release, returned_admission) =
                     match futures::poll!(next_permit.as_mut()) {
