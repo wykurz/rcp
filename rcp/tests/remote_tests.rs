@@ -6235,6 +6235,111 @@ fn test_remote_source_no_ack_subtree_over_budget_does_not_hang() {
     );
 }
 
+#[test]
+fn test_remote_dereference_tree_over_budget_completes() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_root = src_dir.path().join("root");
+    std::fs::create_dir(&src_root).unwrap();
+    for i in 0..3 {
+        let sibling = src_root.join(format!("sibling{i}"));
+        std::fs::create_dir(&sibling).unwrap();
+        create_test_file(&sibling.join("file.txt"), &format!("content {i}"), 0o644);
+    }
+    let dst_root = dst_dir.path().join("root");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    run_rcp_and_expect_success(&[
+        "-L",
+        "--max-connections=1",
+        "--pending-writes-multiplier=1",
+        &src_remote,
+        &dst_remote,
+    ]);
+    for i in 0..3 {
+        assert_eq!(
+            get_file_content(&dst_root.join(format!("sibling{i}/file.txt"))),
+            format!("content {i}")
+        );
+    }
+}
+
+#[test]
+fn test_remote_dereference_empty_tree_over_budget_completes() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_root = src_dir.path().join("root");
+    std::fs::create_dir(&src_root).unwrap();
+    for i in 0..3 {
+        std::fs::create_dir(src_root.join(format!("empty{i}"))).unwrap();
+    }
+    let dst_root = dst_dir.path().join("root");
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    run_rcp_and_expect_success(&[
+        "-L",
+        "--max-connections=1",
+        "--pending-writes-multiplier=1",
+        &src_remote,
+        &dst_remote,
+    ]);
+    for i in 0..3 {
+        assert!(
+            dst_root.join(format!("empty{i}")).is_dir(),
+            "empty sibling {i} must be copied"
+        );
+    }
+}
+
+#[test]
+fn test_remote_dereference_no_ack_subtree_over_budget_does_not_hang() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_root = src_dir.path().join("root");
+    std::fs::create_dir(&src_root).unwrap();
+    for i in 0..3 {
+        let blocked = src_root.join(format!("blocked{i}"));
+        std::fs::create_dir(&blocked).unwrap();
+        create_test_file(&blocked.join("file.txt"), "blocked content", 0o644);
+    }
+    let src_ok = src_root.join("ok");
+    std::fs::create_dir(&src_ok).unwrap();
+    create_test_file(&src_ok.join("file.txt"), "ok content", 0o644);
+    let dst_root = dst_dir.path().join("root");
+    std::fs::create_dir(&dst_root).unwrap();
+    for i in 0..3 {
+        create_test_file(
+            &dst_root.join(format!("blocked{i}")),
+            "not a directory",
+            0o644,
+        );
+    }
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    let output = run_rcp_with_args(&[
+        "-L",
+        "--max-connections=1",
+        "--pending-writes-multiplier=1",
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output);
+    assert!(
+        !output.status.success(),
+        "blocked directories must report errors"
+    );
+    assert_eq!(
+        get_file_content(&dst_root.join("ok/file.txt")),
+        "ok content"
+    );
+    for i in 0..3 {
+        assert!(
+            dst_root.join(format!("blocked{i}")).is_file(),
+            "blocked destination path {i} must remain a file"
+        );
+    }
+}
+
 /// Regression for the SOURCE skip-accounting deadlock (PR #247 review): a counted
 /// child directory that the source FAILS TO OPEN mid fd-walk must not hang the copy.
 ///
@@ -7625,6 +7730,50 @@ fn test_remote_fail_early_saturated_budget_reports_real_cause() {
     for i in 0..10 {
         let _ = std::fs::set_permissions(
             src.join(format!("d{i}")).join("bad.txt"),
+            std::fs::Permissions::from_mode(0o600),
+        );
+    }
+}
+
+#[test]
+fn test_remote_dereference_fail_early_saturated_budget_reports_real_cause() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src = src_dir.path().canonicalize().unwrap();
+    let dst = dst_dir.path().canonicalize().unwrap();
+    for i in 0..10 {
+        let sibling = src.join(format!("sibling{i}"));
+        std::fs::create_dir(&sibling).unwrap();
+        let unreadable = sibling.join("unreadable.txt");
+        std::fs::write(&unreadable, b"secret").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let src_remote = format!("localhost:{}", src.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst.to_str().unwrap());
+    let output = run_rcp_and_expect_failure(&[
+        "-L",
+        "--max-connections=1",
+        "--pending-writes-multiplier=1",
+        "--fail-early",
+        &src_remote,
+        &dst_remote,
+    ]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Source: Permission denied"),
+        "top-level Source error must name the real cause (Permission denied); got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("FdBudgetClosed"),
+        "top-level error must not expose the synthetic budget wakeup; got:\n{combined}"
+    );
+    for i in 0..10 {
+        let _ = std::fs::set_permissions(
+            src.join(format!("sibling{i}/unreadable.txt")),
             std::fs::Permissions::from_mode(0o600),
         );
     }
