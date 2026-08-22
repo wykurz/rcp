@@ -1270,7 +1270,7 @@ async fn link_internal(
                     copy::DeleteScanAnchor::new(dst_root, rel_path),
                     settings,
                     is_fresh,
-                    admission.into(),
+                    admission,
                 )
                 .await
                 .map(|summary| LinkDispatch::Complete(LinkEntryResult::selected(summary)));
@@ -1330,7 +1330,7 @@ async fn link_internal(
                     copy::DeleteScanAnchor::new(dst_root, rel_path),
                     settings,
                     is_fresh,
-                    admission.into(),
+                    admission,
                 )
                 .await
                 .map(|summary| LinkDispatch::Complete(LinkEntryResult::selected(summary)));
@@ -1351,7 +1351,7 @@ async fn link_internal(
                     copy::DeleteScanAnchor::new(dst_root, rel_path),
                     settings,
                     is_fresh,
-                    admission.into(),
+                    admission,
                 )
                 .await
                 .map(|summary| LinkDispatch::Complete(LinkEntryResult::selected(summary)));
@@ -1403,7 +1403,7 @@ async fn link_internal(
                     copy::DeleteScanAnchor::new(dst_root, rel_path),
                     settings,
                     is_fresh,
-                    admission.into(),
+                    admission,
                 )
                 .await
                 .map(|summary| LinkDispatch::Complete(LinkEntryResult::selected(summary)));
@@ -1511,7 +1511,7 @@ async fn delegate_copy(
     delete_scan_anchor: copy::DeleteScanAnchor,
     settings: &Settings,
     is_fresh: bool,
-    admission: copy::CopyEntryAdmission,
+    admission: AdmittedEntry,
 ) -> Result<Summary, Error> {
     // link's dry-run mode owns whether a destination handle exists. Keep delegated copy behavior
     // aligned even for direct API callers that did not duplicate the mode into `copy_settings`;
@@ -1537,7 +1537,7 @@ async fn delegate_copy(
         &settings.preserve,
         is_fresh,
         delete_scan_anchor,
-        admission,
+        copy::CopyEntryAdmission::Filtered(admission),
     )
     .await
     .map_err(|err| {
@@ -2084,7 +2084,7 @@ async fn link_dir_contents(
                     delete_scan_anchor,
                     &settings,
                     is_fresh,
-                    entry.into(),
+                    entry,
                 )
                 .await
                 .map(|summary| LinkTaskResult::from_update(entry_name, summary))
@@ -4040,7 +4040,7 @@ mod link_tests {
                     copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
                     &settings,
                     false,
-                    entry.into(),
+                    entry,
                 ),
             )
             .await?;
@@ -4443,7 +4443,7 @@ mod link_tests {
                         copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
                         &settings,
                         false,
-                        entry.into(),
+                        entry,
                     )
                     .await?;
                     LinkTaskResult::from_update(std::ffi::OsString::from("node"), result)
@@ -4533,7 +4533,7 @@ mod link_tests {
                         copy::DeleteScanAnchor::new(&dst, std::path::Path::new("node")),
                         &settings,
                         false,
-                        entry.into(),
+                        entry,
                     )
                     .await?;
                     LinkTaskResult::from_update(std::ffi::OsString::from("node"), result)
