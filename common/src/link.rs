@@ -1175,7 +1175,7 @@ async fn link_internal(
                     }
                     None => None,
                 };
-                if settings.update_exclusive && entry.update_handle.is_none() {
+                if update.is_some() && settings.update_exclusive && entry.update_handle.is_none() {
                     return Ok(LinkDispatch::Complete(LinkEntryResult::filtered(
                         Default::default(),
                     )));
@@ -2670,6 +2670,28 @@ mod link_tests {
     }
 
     #[tokio::test]
+    async fn update_exclusive_without_update_links_the_source_normally() -> Result<(), anyhow::Error>
+    {
+        use std::os::unix::fs::MetadataExt;
+        let test_path = testutils::create_temp_dir().await?;
+        let src = test_path.join("src");
+        let dst = test_path.join("dst");
+        tokio::fs::write(&src, "SOURCE").await?;
+        let mut settings = common_settings(false, false);
+        settings.update_exclusive = true;
+        let summary = link(&PROGRESS, &test_path, &src, &dst, &None, &settings, false).await?;
+        assert_eq!(summary.hard_links_created, 1);
+        assert_eq!(tokio::fs::read_to_string(&dst).await?, "SOURCE");
+        let src_metadata = tokio::fs::metadata(&src).await?;
+        let dst_metadata = tokio::fs::metadata(&dst).await?;
+        assert_eq!(
+            (src_metadata.dev(), src_metadata.ino()),
+            (dst_metadata.dev(), dst_metadata.ino())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     #[traced_test]
     async fn test_basic_link() -> Result<(), anyhow::Error> {
         let tmp_dir = testutils::setup_test_dir().await?;
@@ -3656,6 +3678,7 @@ mod link_tests {
             let mut filter = FilterSettings::new();
             filter.add_include("foo").unwrap();
             let mut settings = common_settings(false, false);
+            settings.copy_settings.filter = Some(filter.clone());
             settings.filter = Some(filter);
             let summary = link(
                 &PROGRESS,
@@ -3686,6 +3709,7 @@ mod link_tests {
             filter.add_include("foo").unwrap();
             let mut settings = common_settings(false, false);
             settings.update_exclusive = true;
+            settings.copy_settings.filter = Some(filter.clone());
             settings.filter = Some(filter);
             let summary = link(
                 &PROGRESS,
