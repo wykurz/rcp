@@ -3527,7 +3527,21 @@ mod tests {
                 let open_file_guard = throttle::open_file_permit().await;
                 let file = std::fs::File::open(file_path)?;
                 let raw_fd = file.as_raw_fd();
-                let probe = crate::testutils::FdIdentityProbe::capture(raw_fd)?;
+                let probe = match crate::testutils::FdIdentityProbe::capture(raw_fd) {
+                    Ok(probe) => probe,
+                    Err(error) => {
+                        drop(file);
+                        drop(open_file_guard);
+                        drop(admission);
+                        let cleanup_result = tokio::fs::remove_dir_all(root).await;
+                        return match cleanup_result {
+                            Ok(()) => Err(error.into()),
+                            Err(cleanup_error) => Err(anyhow::Error::new(error).context(format!(
+                                "queued fd fixture did not clean up: {cleanup_error:#}"
+                            ))),
+                        };
+                    }
+                };
                 let drop_observation = Arc::new(std::sync::Mutex::new(None));
 
                 let (blocker_started_tx, blocker_started_rx) = tokio::sync::oneshot::channel();
@@ -3567,12 +3581,13 @@ mod tests {
                     drop(open_file_guard);
                 }
 
-                let fd_was_closed_before_release = probe.original_is_closed()?;
+                // preserve probe failures until the occupied worker has been released and joined.
+                let fd_was_closed_before_release = probe.original_is_closed();
                 let drop_observation_before_release = drop_observation
                     .lock()
                     .expect("queued fd drop observation lock poisoned")
                     .take()
-                    .transpose()?;
+                    .transpose();
                 let mut next_permit = Box::pin(throttle::open_file_permit());
                 let (admission_returned_before_release, returned_admission) =
                     match futures::poll!(next_permit.as_mut()) {
@@ -3585,20 +3600,44 @@ mod tests {
                 let queued_start_result =
                     tokio::time::timeout(std::time::Duration::from_secs(5), queued_started_rx)
                         .await;
-                let returned_admission = match returned_admission {
-                    Some(permit) => permit,
+                let capacity_error = match returned_admission {
+                    Some(permit) => {
+                        drop(permit);
+                        None
+                    }
                     None => tokio::time::timeout(
                         std::time::Duration::from_secs(5),
                         next_permit.as_mut(),
                     )
                     .await
-                    .context("queued blocking work did not eventually return admission")?,
+                    .map(drop)
+                    .map_err(anyhow::Error::new)
+                    .map_err(|error| {
+                        error.context("queued blocking work did not eventually return admission")
+                    })
+                    .err(),
                 };
-                drop(returned_admission);
+                drop(admission);
                 let cleanup_result = tokio::fs::remove_dir_all(root).await;
 
-                release_result.context("the blocking worker ended before its release")?;
-                blocker_result.context("the blocking worker panicked")?;
+                let release_error = release_result.err().map(|error| {
+                    anyhow::Error::new(error)
+                        .context("the blocking worker ended before its release")
+                });
+                let blocker_error = blocker_result
+                    .err()
+                    .map(|error| anyhow::Error::new(error).context("the blocking worker panicked"));
+                let fd_was_closed_before_release = fd_was_closed_before_release?;
+                let drop_observation_before_release = drop_observation_before_release?;
+                if let Some(error) = capacity_error {
+                    return Err(error);
+                }
+                if let Some(error) = release_error {
+                    return Err(error);
+                }
+                if let Some(error) = blocker_error {
+                    return Err(error);
+                }
                 cleanup_result?;
 
                 assert!(

@@ -970,7 +970,20 @@ mod tests {
             .into_tree();
         let handle = parent.child(OsStr::new("directory")).await?;
         let raw_fd = handle.as_fd().as_raw_fd();
-        let probe = testutils::FdIdentityProbe::capture(raw_fd)?;
+        let probe = match testutils::FdIdentityProbe::capture(raw_fd) {
+            Ok(probe) => probe,
+            Err(error) => {
+                drop(handle);
+                drop(parent);
+                let cleanup_result = tokio::fs::remove_dir_all(root).await;
+                return match cleanup_result {
+                    Ok(()) => Err(error.into()),
+                    Err(cleanup_error) => Err(anyhow::Error::new(error).context(format!(
+                        "directory conversion fixture did not clean up: {cleanup_error:#}"
+                    ))),
+                };
+            }
+        };
 
         let directory = match NonDirectoryHandle::try_from(handle) {
             Ok(_) => anyhow::bail!("a directory was accepted as a non-directory handle"),
@@ -978,11 +991,16 @@ mod tests {
         };
         assert_eq!(directory.kind(), EntryKind::Dir);
         assert_eq!(directory.as_fd().as_raw_fd(), raw_fd);
-        assert!(!probe.original_is_closed()?);
+        let fd_was_open_before_drop = probe.original_is_closed().map(|closed| !closed);
         drop(directory);
-        assert!(probe.original_is_closed()?);
+        let fd_was_closed_after_drop = probe.original_is_closed();
         drop(parent);
-        tokio::fs::remove_dir_all(root).await?;
+        let cleanup_result = tokio::fs::remove_dir_all(root).await;
+        let fd_was_open_before_drop = fd_was_open_before_drop?;
+        let fd_was_closed_after_drop = fd_was_closed_after_drop?;
+        cleanup_result?;
+        assert!(fd_was_open_before_drop);
+        assert!(fd_was_closed_after_drop);
         Ok(())
     }
 
@@ -997,7 +1015,21 @@ mod tests {
             .into_tree();
         let handle = parent.child(OsStr::new("leaf")).await?;
         let raw_fd = handle.as_fd().as_raw_fd();
-        let probe = testutils::FdIdentityProbe::capture(raw_fd)?;
+        let probe = match testutils::FdIdentityProbe::capture(raw_fd) {
+            Ok(probe) => probe,
+            Err(error) => {
+                drop(handle);
+                drop(parent);
+                drop(admission);
+                let cleanup_result = tokio::fs::remove_dir_all(root).await;
+                return match cleanup_result {
+                    Ok(()) => Err(error.into()),
+                    Err(cleanup_error) => Err(anyhow::Error::new(error).context(format!(
+                        "leaf permit fixture did not clean up: {cleanup_error:#}"
+                    ))),
+                };
+            }
+        };
         let leaf = AdmittedLeaf::try_new(
             handle,
             Some(LeafPermit::OpenFile(throttle::open_file_permit().await)),
@@ -1007,10 +1039,7 @@ mod tests {
         assert_eq!(leaf.handle().as_fd().as_raw_fd(), raw_fd);
         assert!(leaf.admission().is_some());
         let permit = leaf.into_permit();
-        assert!(
-            probe.original_is_closed()?,
-            "transfer retained the classification fd"
-        );
+        let fd_was_closed_after_transfer = probe.original_is_closed();
         let mut next_permit = Box::pin(throttle::open_file_permit());
         assert!(
             futures::poll!(next_permit.as_mut()).is_pending(),
@@ -1019,7 +1048,14 @@ mod tests {
         drop(permit);
         drop(next_permit.await);
         drop(parent);
-        tokio::fs::remove_dir_all(root).await?;
+        drop(admission);
+        let cleanup_result = tokio::fs::remove_dir_all(root).await;
+        let fd_was_closed_after_transfer = fd_was_closed_after_transfer?;
+        cleanup_result?;
+        assert!(
+            fd_was_closed_after_transfer,
+            "transfer retained the classification fd"
+        );
         Ok(())
     }
 

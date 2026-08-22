@@ -6045,8 +6045,33 @@ mod link_tests {
             let update_handle = parent.child(std::ffi::OsStr::new("update")).await?;
             let src_fd = src_handle.as_fd().as_raw_fd();
             let update_fd = update_handle.as_fd().as_raw_fd();
-            let src_probe = testutils::FdIdentityProbe::capture(src_fd)?;
-            let update_probe = testutils::FdIdentityProbe::capture(update_fd)?;
+            let src_probe = testutils::FdIdentityProbe::capture(src_fd);
+            let update_probe = testutils::FdIdentityProbe::capture(update_fd);
+            let (src_probe, update_probe) = match (src_probe, update_probe) {
+                (Ok(src_probe), Ok(update_probe)) => (src_probe, update_probe),
+                (src_probe, update_probe) => {
+                    let probe_error = match src_probe {
+                        Err(error) => error,
+                        Ok(_) => match update_probe {
+                            Err(error) => error,
+                            Ok(_) => {
+                                unreachable!("at least one fd identity probe must have failed")
+                            }
+                        },
+                    };
+                    drop(src_handle);
+                    drop(update_handle);
+                    drop(parent);
+                    drop(admission);
+                    let cleanup_result = tokio::fs::remove_dir_all(root).await;
+                    return match cleanup_result {
+                        Ok(()) => Err(probe_error.into()),
+                        Err(cleanup_error) => Err(anyhow::Error::new(probe_error).context(
+                            format!("link fd-lifetime fixture did not clean up: {cleanup_error:#}"),
+                        )),
+                    };
+                }
+            };
             let mut entry = AdmittedLinkEntry::new(
                 src_handle,
                 Some(LeafPermit::OpenFile(throttle::open_file_permit().await)),
@@ -6056,15 +6081,16 @@ mod link_tests {
             let update_entry = entry.into_update_entry();
             let retained_directory = update_entry.kind() == EntryKind::Dir;
             let transferred_held_admission = update_entry.admission().is_some();
-            let source_closed = src_probe.original_is_closed()?;
-            let update_stayed_open = !update_probe.original_is_closed()?;
+            // retain probe errors until the direct owner and its admission have both quiesced.
+            let source_closed = src_probe.original_is_closed();
+            let update_stayed_open = update_probe.original_is_closed().map(|closed| !closed);
             let mut next_permit = Box::pin(throttle::open_file_permit());
             let (capacity_stayed_held, early_permit) = match futures::poll!(next_permit.as_mut()) {
                 std::task::Poll::Pending => (true, None),
                 std::task::Poll::Ready(permit) => (false, Some(permit)),
             };
             drop(update_entry);
-            let update_closed = update_probe.original_is_closed()?;
+            let update_closed = update_probe.original_is_closed();
             let reacquire_result = match early_permit {
                 Some(permit) => Ok(permit),
                 None => {
@@ -6075,7 +6101,11 @@ mod link_tests {
             };
             let reacquire_result = reacquire_result.map(drop);
             drop(parent);
+            drop(admission);
             let cleanup_result = tokio::fs::remove_dir_all(root).await;
+            let source_closed = source_closed?;
+            let update_stayed_open = update_stayed_open?;
+            let update_closed = update_closed?;
             reacquire_result?;
             cleanup_result?;
             assert!(
