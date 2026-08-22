@@ -1111,47 +1111,45 @@ async fn run_copy_root(
         prog_track,
     };
     let root_ctx = visitor.root_dir_context();
-    if let Some(filter) = visitor.filter() {
-        let entry = match admission {
-            CopyEntryAdmission::Unclassified(admission) => {
+    match admission {
+        CopyEntryAdmission::Unclassified(admission) => {
+            if let Some(filter) = visitor.filter() {
                 let admission = crate::walk::ensure_entry_admission(
                     visitor.permit_kind(),
                     admission.require_admission(),
                 )
                 .await;
-                crate::walk::classify_admitted_entry(
+                let entry = crate::walk::classify_admitted_entry(
                     &root_cx.parent,
                     &root_cx.name,
                     admission.into_permit(),
                 )
                 .await
                 .with_context(|| format!("failed reading metadata from {:?}", &root_cx.real_path))
-                .map_err(|err| Error::new(err, Default::default()))?
+                .map_err(|err| Error::new(err, Default::default()))?;
+                let kind = entry.kind();
+                let skip_result = if filter_base.as_os_str().is_empty() {
+                    filter.should_include_root_item(
+                        std::path::Path::new(name),
+                        kind == EntryKind::Dir,
+                    )
+                } else {
+                    filter.should_include(filter_base, kind == EntryKind::Dir)
+                };
+                if !matches!(skip_result, crate::filter::FilterResult::Included) {
+                    if let Some(mode) = settings.dry_run {
+                        crate::dry_run::report_skip(
+                            &root_cx.real_path,
+                            &skip_result,
+                            mode,
+                            kind.label_long(),
+                        );
+                    }
+                    kind.inc_skipped(prog_track);
+                    return Ok(skipped_summary_for(kind));
+                }
+                return process_admitted_entry(visitor, root_cx, root_ctx, entry).await;
             }
-            CopyEntryAdmission::Admitted(entry) => entry,
-        };
-        let kind = entry.kind();
-        let skip_result = if filter_base.as_os_str().is_empty() {
-            filter.should_include_root_item(std::path::Path::new(name), kind == EntryKind::Dir)
-        } else {
-            filter.should_include(filter_base, kind == EntryKind::Dir)
-        };
-        if !matches!(skip_result, crate::filter::FilterResult::Included) {
-            if let Some(mode) = settings.dry_run {
-                crate::dry_run::report_skip(
-                    &root_cx.real_path,
-                    &skip_result,
-                    mode,
-                    kind.label_long(),
-                );
-            }
-            kind.inc_skipped(prog_track);
-            return Ok(skipped_summary_for(kind));
-        }
-        return process_admitted_entry(visitor, root_cx, root_ctx, entry).await;
-    }
-    match admission {
-        CopyEntryAdmission::Unclassified(admission) => {
             process_entry(visitor, root_cx, root_ctx, admission).await
         }
         CopyEntryAdmission::Admitted(entry) => {
