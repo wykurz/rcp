@@ -801,6 +801,76 @@ struct WalkEntryResult<S> {
     processed: Option<(usize, OsString)>,
 }
 
+struct WalkEntryFold<S> {
+    summary: S,
+    processed: Vec<(usize, OsString)>,
+    errors: crate::error_collector::ErrorCollector,
+}
+
+impl<S: WalkSummary> WalkEntryFold<S> {
+    fn new(summary: S) -> Self {
+        Self {
+            summary,
+            processed: Vec::new(),
+            errors: crate::error_collector::ErrorCollector::default(),
+        }
+    }
+
+    fn add_summary(&mut self, summary: S) {
+        self.summary = std::mem::take(&mut self.summary) + summary;
+    }
+
+    fn push(
+        &mut self,
+        result: Result<Result<WalkEntryResult<S>, OperationError<S>>, tokio::task::JoinError>,
+        fail_early: bool,
+    ) -> Result<(), anyhow::Error> {
+        match result {
+            Ok(Ok(child)) => {
+                self.add_summary(child.summary);
+                self.processed.extend(child.processed);
+            }
+            Ok(Err(error)) => {
+                tracing::error!("walk child failed with: {:#}", &error);
+                self.add_summary(error.summary);
+                if fail_early {
+                    return Err(error.source);
+                }
+                self.errors.push(error.source);
+            }
+            Err(join_error) => {
+                if fail_early {
+                    return Err(join_error.into());
+                }
+                self.errors.push(join_error.into());
+            }
+        }
+        Ok(())
+    }
+
+    fn fail(self, error: anyhow::Error) -> OperationError<S> {
+        OperationError::new(error, self.summary)
+    }
+
+    fn finish(self) -> Result<(S, ProcessedChildren), OperationError<S>> {
+        let Self {
+            summary,
+            mut processed,
+            errors,
+        } = self;
+        if let Some(error) = errors.into_error() {
+            return Err(OperationError::new(error, summary));
+        }
+        processed.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+        Ok((
+            summary,
+            ProcessedChildren {
+                names: processed.into_iter().map(|(_, name)| name).collect(),
+            },
+        ))
+    }
+}
+
 async fn process_scheduled_entry<V>(
     visitor: Arc<V>,
     cx: EntryCx,
@@ -840,6 +910,35 @@ where
     })
 }
 
+async fn ensure_scheduled_admission<S>(
+    scheduled: ScheduledEntry,
+    permit_kind: PermitKind,
+    join_set: &mut tokio::task::JoinSet<Result<WalkEntryResult<S>, OperationError<S>>>,
+    fail_early: bool,
+    fold: &mut WalkEntryFold<S>,
+) -> Result<ScheduledEntry, anyhow::Error>
+where
+    S: WalkSummary,
+{
+    let admission = scheduled.ensure_admission(permit_kind);
+    tokio::pin!(admission);
+    loop {
+        let has_tasks = !join_set.is_empty();
+        tokio::select! {
+            // a completed fail-early error must win over newly available capacity; otherwise later
+            // permanently pending siblings can consume that capacity and strand the unread error.
+            biased;
+            result = join_set.join_next(), if has_tasks => {
+                fold.push(
+                    result.expect("a non-empty walk JoinSet must yield one task result"),
+                    fail_early,
+                )?;
+            }
+            scheduled = &mut admission => return Ok(scheduled),
+        }
+    }
+}
+
 /// Process an already-enumerated directory listing.
 ///
 /// Keeping enumeration separate from admission/scheduling gives tests a deterministic way to
@@ -871,7 +970,8 @@ async fn walk_dir_entries_tracked<V>(
 where
     V: WalkVisitor,
 {
-    let mut skipped_summary = V::Summary::default();
+    let fail_early = visitor.fail_early();
+    let mut fold = WalkEntryFold::new(V::Summary::default());
     let mut join_set = tokio::task::JoinSet::new();
     for (ordinal, (entry_name, hint)) in entries.into_iter().enumerate() {
         // build the child's owned context once; reused whether it is skipped or spawned, and gives
@@ -890,8 +990,12 @@ where
             // the visitor confirmed that omitting this child cannot authorize downstream work, so
             // a reliable hint may retain this cheap path. every other outcome is scheduled; an
             // authoritative visitor rechecks it against the worker's exact classification.
-            skipped_summary = skipped_summary
-                + filter_skip_summary(visitor.as_ref(), &child_cx, hinted_kind, &skip_result);
+            fold.add_summary(filter_skip_summary(
+                visitor.as_ref(),
+                &child_cx,
+                hinted_kind,
+                &skip_result,
+            ));
             continue;
         }
         let admission = EntryAdmission::from_hint(hint);
@@ -905,7 +1009,21 @@ where
         // the inherited context (copy's destination parent dir).
         let task_visitor = Arc::clone(&visitor);
         let task_ctx = dir_ctx.clone();
-        let scheduled = scheduled.ensure_admission(visitor.permit_kind()).await;
+        let scheduled = match ensure_scheduled_admission(
+            scheduled,
+            visitor.permit_kind(),
+            &mut join_set,
+            fail_early,
+            &mut fold,
+        )
+        .await
+        {
+            Ok(scheduled) => scheduled,
+            Err(error) => {
+                abort_and_join(&mut join_set).await;
+                return Err(fold.fail(error));
+            }
+        };
         spawn_tracked(
             &mut join_set,
             process_scheduled_entry(
@@ -918,7 +1036,7 @@ where
             ),
         );
     }
-    join_walk_entries(join_set, visitor.fail_early(), skipped_summary).await
+    join_walk_entries(join_set, fail_early, fold).await
 }
 
 /// Cancels every remaining task and waits for their direct futures to finish dropping.
@@ -930,48 +1048,18 @@ pub(crate) async fn abort_and_join<T: 'static>(join_set: &mut tokio::task::JoinS
 async fn join_walk_entries<S>(
     mut join_set: tokio::task::JoinSet<Result<WalkEntryResult<S>, OperationError<S>>>,
     fail_early: bool,
-    base: S,
+    mut fold: WalkEntryFold<S>,
 ) -> Result<(S, ProcessedChildren), OperationError<S>>
 where
     S: WalkSummary,
 {
-    let mut summary = base;
-    let mut processed = Vec::new();
-    let errors = crate::error_collector::ErrorCollector::default();
     while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(Ok(child)) => {
-                summary = summary + child.summary;
-                processed.extend(child.processed);
-            }
-            Ok(Err(error)) => {
-                tracing::error!("walk child failed with: {:#}", &error);
-                summary = summary + error.summary;
-                if fail_early {
-                    abort_and_join(&mut join_set).await;
-                    return Err(OperationError::new(error.source, summary));
-                }
-                errors.push(error.source);
-            }
-            Err(join_error) => {
-                if fail_early {
-                    abort_and_join(&mut join_set).await;
-                    return Err(OperationError::new(join_error.into(), summary));
-                }
-                errors.push(join_error.into());
-            }
+        if let Err(error) = fold.push(result, fail_early) {
+            abort_and_join(&mut join_set).await;
+            return Err(fold.fail(error));
         }
     }
-    if let Some(error) = errors.into_error() {
-        return Err(OperationError::new(error, summary));
-    }
-    processed.sort_unstable_by_key(|(ordinal, _)| *ordinal);
-    Ok((
-        summary,
-        ProcessedChildren {
-            names: processed.into_iter().map(|(_, name)| name).collect(),
-        },
-    ))
+    fold.finish()
 }
 
 /// Join an already-populated `JoinSet` of per-child tasks and fold their summaries with fail-early /
@@ -2244,6 +2332,85 @@ mod tests {
                 vec![0, 1],
                 "fail-early returned before all scheduled child captures were dropped"
             );
+            Ok(())
+        }
+
+        /// A completed fail-early error is reaped while later scheduling waits for admission.
+        #[tokio::test(flavor = "current_thread")]
+        async fn fail_early_reaps_classification_error_while_next_admission_is_saturated()
+        -> anyhow::Result<()> {
+            let root = crate::testutils::create_temp_dir().await?;
+            tokio::fs::write(root.join("first-gated"), b"x").await?;
+            tokio::fs::write(root.join("second-gated"), b"x").await?;
+            tokio::fs::write(root.join("fourth"), b"x").await?;
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(2);
+            let dir = Arc::new(
+                Dir::open_parent_dir(&root, congestion::Side::Source)
+                    .await?
+                    .into_tree(),
+            );
+            let mut filter = FilterSettings::default();
+            filter.add_exclude("protected/")?;
+            let leaf_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let visitor = Arc::new(FailEarlyClassificationVisitor {
+                filter,
+                leaf_started: Arc::clone(&leaf_started),
+            });
+            let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
+            let dir_ctx = TaskDropContext::root(dropped_tx);
+            let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
+
+            // Every existing leaf enters the visitor's permanently pending future. No gate is
+            // released: only reaping `gone` and cancelling its siblings can make this return.
+            let error = admission
+                .run_with_timeout(
+                    Duration::from_secs(3),
+                    scope_tasks(walk_dir_entries(
+                        visitor,
+                        dir,
+                        &parent_cx,
+                        &dir_ctx,
+                        vec![
+                            (OsString::from("first-gated"), Some(EntryKind::File)),
+                            (OsString::from("gone"), Some(EntryKind::File)),
+                            (OsString::from("second-gated"), Some(EntryKind::File)),
+                            (OsString::from("fourth"), Some(EntryKind::File)),
+                        ],
+                    )),
+                )
+                .await
+                .context(
+                    "fail-early left a completed classification error unread while admission was \
+                     saturated",
+                )?
+                .expect_err("the vanished child classification must fail");
+
+            let created = dir_ctx.next_id.load(Ordering::SeqCst);
+            let mut dropped = Vec::new();
+            while let Ok(id) = dropped_rx.try_recv() {
+                dropped.push(id);
+            }
+            dropped.sort_unstable();
+            assert!(format!("{:#}", error.source).contains("gone"));
+            assert!(
+                leaf_started.load(Ordering::SeqCst),
+                "the permanently gated sibling did not start"
+            );
+            assert!(
+                created > 2,
+                "the fixture did not reach scheduling beyond the admission capacity"
+            );
+            assert_eq!(
+                dropped,
+                (0..created).collect::<Vec<_>>(),
+                "fail-early returned before every created task capture was dropped"
+            );
+            let returned = admission
+                .run_with_timeout(Duration::from_secs(1), throttle::pending_meta_permit())
+                .await
+                .context("fail-early cleanup retained PendingMeta admission")?;
+            drop(returned);
             Ok(())
         }
 
