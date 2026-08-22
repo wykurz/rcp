@@ -476,7 +476,7 @@ async fn link_inner(
             // default mode, or a degenerate destination (rejected by the authoritative split below)
             _ => None,
         };
-        // In default mode a dual root may take the same metadata-only exclusion fast path as a
+        // in default mode a dual root may take the same metadata-only exclusion fast path as a
         // source-only root. Both physical operands are one logical item in the source namespace,
         // so evaluate both types under `src_name`; the update operand's basename is irrelevant.
         // This path may only exclude. Every provisional include falls through to the fd-relative
@@ -1659,6 +1659,7 @@ async fn link_dir_entry(
             None, // dry-run: no destination dir is opened or locked, so nothing to restore
             settings,
             base,
+            UpdateEntries::Live,
         )
         .await;
     }
@@ -1716,6 +1717,7 @@ async fn link_dir_entry(
             copy_summary: base,
             ..Default::default()
         },
+        UpdateEntries::Live,
     )
     .await
 }
@@ -2028,6 +2030,12 @@ async fn ensure_update_only_admission(
     }
 }
 
+enum UpdateEntries {
+    Live,
+    #[cfg(test)]
+    Injected(Vec<(std::ffi::OsString, Option<EntryKind>)>),
+}
+
 /// The dual-tree body of a directory link: enumerate the source entries (hard-linking unchanged
 /// files, delegating copies, recursing into subdirectories), then enumerate the update entries and
 /// copy those not present in the source, then run `--delete` pruning, empty-directory cleanup, and
@@ -2054,6 +2062,7 @@ async fn link_dir_contents(
     reused_lock: Option<crate::safedir::ReusedDirLock>,
     settings: &Settings,
     base: Summary,
+    update_entries: UpdateEntries,
 ) -> Result<Summary, Error> {
     tracing::debug!("process contents of 'src' directory");
     let src_entries = src_dir
@@ -2107,11 +2116,11 @@ async fn link_dir_contents(
         };
         processed_files.insert(entry_name.clone());
         let admission = walk::ensure_entry_admission(PermitKind::OpenFile, admission).await;
-        // Acquire-then-IMMEDIATELY-spawn (the permit is moved into `do_link` and spawned on the next
+        // acquire-then-IMMEDIATELY-spawn (the permit is moved into `do_link` and spawned on the next
         // line, in the same loop step) is load-bearing: collecting a Vec of pre-acquired permits and
         // spawning later would hold N permits before any task runs and self-deadlock a saturated pool.
-        // This mirrors the single-tree driver's incremental acquire-then-spawn loop
-        // (`walk_driver::walk_dir_contents`, joined via `walk_driver::join_and_fold`).
+        // this mirrors the shared driver's incremental acquire-then-spawn loop; both reap ready
+        // workers into their exact-result folds while admission waits.
         let src_parent = Arc::clone(src_dir);
         let dst_parent = dst_dir.map(Arc::clone);
         let update_parent = update_dir.map(Arc::clone);
@@ -2147,16 +2156,20 @@ async fn link_dir_contents(
     if let Some(update_dir) = update_dir {
         let update_root = update_root.expect("update_dir present implies update_root present");
         tracing::debug!("process contents of 'update' directory");
-        let update_entries = update_dir
-            .read_entries()
-            .await
-            .with_context(|| {
-                format!(
-                    "cannot open directory {:?} for reading",
-                    update_path_dbg(update_root, rel_path)
-                )
-            })
-            .map_err(|err| Error::new(err, link_summary))?;
+        let update_entries = match update_entries {
+            UpdateEntries::Live => update_dir
+                .read_entries()
+                .await
+                .with_context(|| {
+                    format!(
+                        "cannot open directory {:?} for reading",
+                        update_path_dbg(update_root, rel_path)
+                    )
+                })
+                .map_err(|err| Error::new(err, link_summary))?,
+            #[cfg(test)]
+            UpdateEntries::Injected(entries) => entries,
+        };
         // iterate through update entries and copy names absent from src. reliable excluded hints
         // keep their cheap skip in ordinary real runs; delete and preview runs reclassify before an
         // observable decision. every entry that can reach copy transfers its exact handle and
@@ -6166,6 +6179,7 @@ mod link_tests {
                 None,
                 &settings,
                 Summary::default(),
+                UpdateEntries::Live,
             );
             let result = admission
                 .run_with_timeout(std::time::Duration::from_secs(1), operation)
@@ -6224,6 +6238,7 @@ mod link_tests {
                 None,
                 &settings,
                 Summary::default(),
+                UpdateEntries::Live,
             ));
             let result = admission
                 .run_with_timeout(std::time::Duration::from_secs(1), operation)
@@ -6397,6 +6412,7 @@ mod link_tests {
                 None,
                 &settings,
                 Summary::default(),
+                UpdateEntries::Live,
             ));
             let result = admission
                 .run_with_timeout(std::time::Duration::from_secs(1), operation)
@@ -6773,6 +6789,7 @@ mod link_tests {
             tokio::fs::create_dir(&dst).await?;
             tokio::fs::write(update.join("first"), b"first").await?;
             tokio::fs::write(update.join("second"), b"second").await?;
+            tokio::fs::write(update.join("uninjected"), b"uninjected").await?;
 
             let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(2);
@@ -6788,12 +6805,6 @@ mod link_tests {
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
-            let hints = update_dir.read_entries().await?;
-            assert_eq!(hints.len(), 2);
-            assert!(
-                hints.iter().all(|(_, hint)| *hint == Some(EntryKind::File)),
-                "the fixture filesystem must provide reliable file hints"
-            );
             let mut filter = crate::filter::FilterSettings::new();
             filter.add_exclude("never/")?;
             let mut settings = common_settings(false, false);
@@ -6817,6 +6828,10 @@ mod link_tests {
                 None,
                 &settings,
                 Summary::default(),
+                UpdateEntries::Injected(vec![
+                    (std::ffi::OsString::from("first"), Some(EntryKind::File)),
+                    (std::ffi::OsString::from("second"), Some(EntryKind::File)),
+                ]),
             ));
             tokio::pin!(operation);
             let available_while_classifying = loop {
@@ -6867,6 +6882,7 @@ mod link_tests {
             for name in ["first", "middle", "last"] {
                 tokio::fs::write(update.join(name), name.as_bytes()).await?;
             }
+            tokio::fs::write(update.join("uninjected"), b"uninjected").await?;
 
             let admission = testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(3);
@@ -6882,16 +6898,11 @@ mod link_tests {
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
             let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
-            let entries = update_dir.read_entries().await?;
-            assert_eq!(entries.len(), 3);
-            assert!(
-                entries
-                    .iter()
-                    .all(|(_, hint)| *hint == Some(EntryKind::File)),
-                "the fixture filesystem must provide reliable file hints"
-            );
-            let vanished = entries[1].0.clone();
-            let successful = [entries[0].0.clone(), entries[2].0.clone()];
+            let vanished = std::ffi::OsString::from("middle");
+            let successful = [
+                std::ffi::OsString::from("first"),
+                std::ffi::OsString::from("last"),
+            ];
             let settings = common_settings(false, false);
             let operation = crate::walk_driver::scope_tasks(link_dir_contents(
                 &PROGRESS,
@@ -6911,6 +6922,11 @@ mod link_tests {
                 None,
                 &settings,
                 Summary::default(),
+                UpdateEntries::Injected(vec![
+                    (std::ffi::OsString::from("first"), Some(EntryKind::File)),
+                    (std::ffi::OsString::from("middle"), Some(EntryKind::File)),
+                    (std::ffi::OsString::from("last"), Some(EntryKind::File)),
+                ]),
             ));
             tokio::pin!(operation);
             loop {

@@ -637,7 +637,7 @@ where
                 .context("task did not enter its production blocking path gate in time");
         }
     };
-    // Keep probe failures until the same release/join/completion/capacity cleanup used for normal
+    // keep probe failures until the same release/join/completion/capacity cleanup used for normal
     // cancellation has finished. Dropping a gate only opens its barriers; it does not await the
     // blocking output that those barriers release.
     let mut probe_error: Option<anyhow::Error> = None;
