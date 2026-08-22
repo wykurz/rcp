@@ -392,8 +392,8 @@ pub trait WalkVisitor: Send + Sync + 'static {
     /// Whether the walk stops at the first error (`--fail-early`).
     fn fail_early(&self) -> bool;
 
-    /// The active filter, if any (drives [`walk::filter_is_dir`] /
-    /// [`walk::should_skip_entry_ref`]).
+    /// The active filter, if any (applied to terminal reliable hints and, when required, the
+    /// worker's exact classification through [`walk::should_skip_entry_ref`]).
     fn filter(&self) -> Option<&crate::filter::FilterSettings>;
 
     /// Whether a filter decision must retain its authoritative entry until dispatch.
@@ -2508,7 +2508,7 @@ mod tests {
             let dir_ctx = TaskDropContext::root(dropped_tx);
             let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
 
-            // Every existing leaf enters the visitor's permanently pending future. No gate is
+            // every existing leaf enters the visitor's permanently pending future. No gate is
             // released: only reaping `gone` and cancelling its siblings can make this return.
             let error = admission
                 .run_with_timeout(

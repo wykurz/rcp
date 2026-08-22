@@ -9,6 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- When `--max-open-files` is omitted, tools other than `filegen` now derive the per-pool
+  descriptor-admission default from the process soft `RLIMIT_NOFILE`, capped at 4096. A zero soft
+  limit disables admission, and the process limit is never raised implicitly.
+
 - Local recursive copy, remove, chmod, and rlink walks now bound descriptor-heavy leaf work more
   reliably on wide trees. Filters used by destructive or observable operations classify the exact
   entry in the worker that acts on it, so stale directory hints cannot authorize an action or an

@@ -573,18 +573,18 @@ so the security-relevant invariants each live in exactly one place:
   `read_entries`).
 - **Admission scheduling (descriptor invariant)**: a reliable `getdents` type hint lets an ordinary
   source walk make a cheap filter decision before admission. A `DT_UNKNOWN` entry with an active
-  filter acquires first because its authoritative filter probe opens a handle; an included unknown
-  or known non-directory otherwise acquires immediately before spawn. A positive directory hint
-  normally takes no leaf admission. For destructive or observable filter decisions, the worker
-  instead owns one exact classification, applies the filter to that entry, and transfers the exact
-  result into dispatch. A skipped result has no processed/keep outcome; a selected result
-  contributes its exact outcome in directory-enumeration order. This prevents stale hints from
-  authorizing remove/delete work or destination protection. Rlink's dual-tree path similarly admits
-  before opening either source or update handle when an update counterpart needs classification,
-  because the source hint says nothing about that separate entry. An authoritative directory
-  releases any provisional permit inside the inner scope before `dir_pre` or descent. This bounds
-  fd-bearing leaf fan-out without putting arbitrary recursive directory depth/breadth into a pool,
-  which would recreate the deep-directory hold-and-wait deadlock.
+  filter acquires before spawn and is classified in its scheduled worker; an included unknown or
+  known non-directory otherwise acquires immediately before spawn. A positive directory hint
+  normally takes no leaf admission. For destructive or observable filter decisions, the worker owns
+  one exact classification, applies the filter to that entry, and transfers the exact result into
+  dispatch. A skipped result has no processed/keep outcome; a selected result contributes its exact
+  outcome in directory-enumeration order. This prevents stale hints from authorizing remove/delete
+  work or destination protection. Rlink's dual-tree path similarly admits before opening either
+  source or update handle when an update counterpart needs classification, because the source hint
+  says nothing about that separate entry. An authoritative directory releases any provisional permit
+  inside the inner scope before `dir_pre` or descent. This bounds fd-bearing leaf fan-out without
+  putting arbitrary recursive directory depth/breadth into a pool, which would recreate the
+  deep-directory hold-and-wait deadlock.
 - **Checked entry ownership**: `AdmittedEntry` binds an authoritative destructive-filter decision to
   dispatch without a second name lookup; only a checked non-directory handle can then construct
   `AdmittedLeaf`, so a directory-as-leaf state is unrepresentable in release builds. Their explicit
@@ -608,13 +608,14 @@ so the security-relevant invariants each live in exactly one place:
   `TrustedDir` type (`common/src/safedir.rs`); crossing below the named root yields a hardened `Dir`
   whose child opens are all `O_NOFOLLOW`. The boundary is type-enforced — a hardened child cannot be
   silently used where a trusted parent is required, and vice versa.
-- **Filter-classification errors**: ordinary hardened source walks and rlink's dual-tree driver
-  route `DT_UNKNOWN` `is_dir` decisions through `walk::filter_is_dir`; destructive remove/delete
-  filtering instead uses the authoritative kind in its transferred `AdmittedEntry`. Neither path
-  follows a symlink, and an error propagates rather than becoming a cheap non-directory result. The
-  path-based rcmp walk remains a read-only exception: a failed `DirEntry::file_type` currently falls
-  back to non-directory for filtering. Making that path fail closed is a follow-up; it does not
-  authorize filesystem mutation today.
+- **Filter-classification errors**: ordinary hardened shared walks classify `DT_UNKNOWN` entries in
+  their scheduled workers and fold the exact results. Only rlink's provisional source-side filter
+  probe routes its `DT_UNKNOWN` `is_dir` decision through `walk::filter_is_dir`; destructive
+  remove/delete filtering uses the authoritative kind in its transferred `AdmittedEntry`. None of
+  these paths follows a symlink, and an error propagates rather than becoming a cheap non-directory
+  result. The path-based rcmp walk remains a read-only exception: a failed `DirEntry::file_type`
+  currently falls back to non-directory for filtering. Making that path fail closed is a follow-up;
+  it does not authorize filesystem mutation today.
 - **Copy planning**: after destination-only preflight, local regular-file copies take a fresh
   by-name `O_PATH` metadata snapshot. Dry runs and identical/newer decisions return without an
   `O_RDONLY` payload open. Only an actionable create or replacement opens the payload; if its inode
@@ -638,8 +639,8 @@ so the security-relevant invariants each live in exactly one place:
 
 `rlink` is the documented exception: it walks two correlated trees (source plus `--update`) and so
 keeps its own dual-tree enumeration, but it shares the same substrate — the `TrustedDir` boundary,
-explicit entry admission, checked leaf ownership, and fallible `filter_is_dir` — rather than
-duplicating the hardening.
+explicit entry admission, checked leaf ownership, and `filter_is_dir` for its provisional
+source-side filter probe — rather than duplicating the hardening.
 
 ### Scope
 

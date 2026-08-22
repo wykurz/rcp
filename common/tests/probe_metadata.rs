@@ -150,12 +150,12 @@ async fn copy_emits_one_metadata_sample_per_tree_entry() {
     .await
     .expect("copy succeeds");
     congestion::clear_sample_sink();
-    // The local copy walk is fd-based (`common::safedir`), so the probe counts reflect
+    // the local copy walk is fd-based (`common::safedir`), so the probe counts reflect
     // fd-relative `openat`/`fstatat`/`mkdirat` syscalls rather than the old path-based
     // `symlink_metadata`/`create_dir`/`File::open`. The data copy (`copy_file_range`) stays
     // unprobed, like the `tokio::fs::copy` it replaced.
     //
-    // Source-side metadata (19 total):
+    // source-side metadata (19 total):
     //   - 1 open_root_dir(src parent)                                          = 1
     //   - root dir:  child(stat) + open_dir(stat) + meta(fstat)                = 3
     //   - 2 subdirs: child(stat) + open_dir(stat) + meta(fstat)    × 2         = 6
@@ -163,14 +163,14 @@ async fn copy_emits_one_metadata_sample_per_tree_entry() {
     //   (read_entries / getdents is deliberately unprobed; each directory's applied metadata is
     //    read from its own opened fd via `Dir::meta` — read-side fidelity, one fstat per dir)
     //
-    // The source-root ACL probe is deliberately NOT in this number: `spend_root_acl_probe` above
+    // the source-root ACL probe is deliberately NOT in this number: `spend_root_acl_probe` above
     // burns it first, so this counts the walk alone. Its cost is owned by `root_acl_probe_cost.rs`.
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Source),
         19,
         "expected 19 src metadata probes for the fd-based walk",
     );
-    // Destination-side metadata (25 total):
+    // destination-side metadata (25 total):
     //   - 1 open_root_dir(dst parent)                                          = 1
     //   - 3 dirs:  make_dir + 3 preserve (chown/chmod/utimens)                 = 4 each = 12
     //   - 3 files: create_file + 3 preserve (chown/chmod/utimens)              = 4 each = 12
@@ -445,12 +445,12 @@ async fn link_update_path_emits_probes_for_update_tree() {
     .await
     .expect("link succeeds");
     congestion::clear_sample_sink();
-    // The link walk is fd-based, and update-only entries are delegated to the fd-based
+    // the link walk is fd-based, and update-only entries are delegated to the fd-based
     // `copy::copy_child` using the HELD update/destination parent `Dir`s (so the delegation opens
     // no root dir of its own). read_entries/getdents is unprobed; failed (NotFound) probes are
     // discarded by `run_metadata_probed`.
     //
-    // Source-side (25 total):
+    // source-side (25 total):
     //   - open_root_dir(src parent) + open_root_dir(update parent)               = 2
     //   - root dir: src child + src open_dir + update child + update open_dir
     //               + meta(fstat, from the update dir)                            = 5
@@ -467,7 +467,7 @@ async fn link_update_path_emits_probes_for_update_tree() {
         "expected 25 src metadata probes — drops if the update-walk path stops spawning copies \
          for u*.txt",
     );
-    // Destination-side (28 total):
+    // destination-side (28 total):
     //   - open_root_dir(dst parent)                                              = 1
     //   - 3 dirs (root + a + b): make_dir (one probed op, see the copy test)
     //     + 3 preserve                                                           = 4 each = 12
