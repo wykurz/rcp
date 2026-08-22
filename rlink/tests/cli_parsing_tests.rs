@@ -410,21 +410,26 @@ fn require_toctou_safe_refuses_symlinked_prefix() {
     );
 }
 
-/// An excluded source under an execute-only (searchable, not readable) parent skips
-/// cleanly on the default path: the root filter classifies via a path stat and must
-/// not require opening the parent directory for read (regression test — the strict
-/// mode's pre-filter parent open must stay strict-only)
+/// An excluded dual root under an execute-only (searchable, not readable) source parent skips
+/// cleanly on the default path: the joint root filter classifies both operands via path stats and
+/// must not require opening either parent directory for read (regression test — the strict mode's
+/// pre-filter parent open must stay strict-only). The update root has a different physical basename,
+/// proving both operands are filtered under the source's logical name.
 #[test]
 fn filtered_out_root_skips_under_execute_only_parent() {
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let tmp = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(tmp.join("parent/src")).unwrap();
+    std::fs::create_dir_all(tmp.join("update")).unwrap();
     std::fs::write(tmp.join("parent/src/a.txt"), b"x").unwrap();
+    std::fs::write(tmp.join("update/b.txt"), b"y").unwrap();
     std::fs::set_permissions(tmp.join("parent"), std::fs::Permissions::from_mode(0o111)).unwrap();
     let assert = Command::cargo_bin("rlink")
         .unwrap()
         .arg("--exclude=src")
+        .arg("--update")
+        .arg(tmp.join("update"))
         .arg(tmp.join("parent/src"))
         .arg(tmp.join("dst"))
         .assert();
