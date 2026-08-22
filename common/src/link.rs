@@ -2064,7 +2064,8 @@ async fn link_dir_contents(
     let mut link_summary = base;
     let mut join_set = tokio::task::JoinSet::new();
     let errors = crate::error_collector::ErrorCollector::default();
-    // create a set of all the files we already processed
+    // source names suppress only duplicate update-only scheduling; worker results own --delete keep
+    // protection after their exact final selection.
     let mut processed_files = std::collections::HashSet::new();
     // keep-set for --delete: every spawned source/update worker folds its final exact outcome.
     let mut keep_set = DeleteKeepSet::new(settings.copy_settings.delete.as_ref());
