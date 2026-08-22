@@ -472,13 +472,13 @@ Specific invariants enforced:
   than a parameter of the creating call, so no call site can opt out of it.
 - On overwrite paths, a `recheck` verifies that the `(dev, ino)` of the entry matches the originally
   classified handle before performing the unlink.
-- Before recursively removing a directory, `rrm` rechecks its final name against the walked
-  directory and performs the `rmdir` relative to the held parent fd. After a successful `rmdir`, a
-  zero link count on the pinned walked-directory fd proves that inode was removed; a nonzero count
-  fails closed because a final-name replacement was removed instead. Filesystems that make a
-  just-unlinked pinned descriptor unqueryable with `ENOENT` or `ESTALE` are accepted as a weaker,
-  logged removal outcome only after that contained `rmdir` succeeds; any other post-`rmdir` stat
-  error remains a hard failure.
+- Before recursively removing a directory, `rrm` verifies that the opened descent handle is still
+  the walked inode. It rechecks the final name against that same inode immediately before the
+  fd-relative `rmdir`. After a successful `rmdir`, a zero link count on the pinned walked-directory
+  fd proves that inode was removed; a nonzero count fails closed because a final-name replacement
+  was removed instead. Filesystems that make a just-unlinked pinned descriptor unqueryable with
+  `ENOENT` or `ESTALE` are accepted only as a weaker, logged removed-but-unqueryable outcome after
+  that contained `rmdir` succeeds; any other post-`rmdir` stat error remains a hard failure.
 - Directory names passed to any `*at()` call are validated to be single path components (no `/`,
   `.`, `..`).
 - **Source payload and metadata come from the same fd (read-side fidelity).** For each copied or
@@ -575,14 +575,16 @@ so the security-relevant invariants each live in exactly one place:
   source walk make a cheap filter decision before admission. A `DT_UNKNOWN` entry with an active
   filter acquires first because its authoritative filter probe opens a handle; an included unknown
   or known non-directory otherwise acquires immediately before spawn. A positive directory hint
-  normally takes no leaf admission. Destructive remove/delete filtering is deliberately stricter:
-  every hint is advisory, so the driver acquires, classifies once, and transfers that exact
-  `AdmittedEntry` into dispatch. Rlink's dual-tree path similarly admits before opening either
-  source or update handle when an update counterpart needs classification, because the source hint
-  says nothing about that separate entry. An authoritative directory releases any provisional permit
-  inside the inner scope before `dir_pre` or descent. This bounds fd-bearing leaf fan-out without
-  putting arbitrary recursive directory depth/breadth into a pool, which would recreate the
-  deep-directory hold-and-wait deadlock.
+  normally takes no leaf admission. For destructive or observable filter decisions, the worker
+  instead owns one exact classification, applies the filter to that entry, and transfers the exact
+  result into dispatch. A skipped result has no processed/keep outcome; a selected result
+  contributes its exact outcome in directory-enumeration order. This prevents stale hints from
+  authorizing remove/delete work or destination protection. Rlink's dual-tree path similarly admits
+  before opening either source or update handle when an update counterpart needs classification,
+  because the source hint says nothing about that separate entry. An authoritative directory
+  releases any provisional permit inside the inner scope before `dir_pre` or descent. This bounds
+  fd-bearing leaf fan-out without putting arbitrary recursive directory depth/breadth into a pool,
+  which would recreate the deep-directory hold-and-wait deadlock.
 - **Checked entry ownership**: `AdmittedEntry` binds an authoritative destructive-filter decision to
   dispatch without a second name lookup; only a checked non-directory handle can then construct
   `AdmittedLeaf`, so a directory-as-leaf state is unrepresentable in release builds. Their explicit
@@ -613,6 +615,11 @@ so the security-relevant invariants each live in exactly one place:
   path-based rcmp walk remains a read-only exception: a failed `DirEntry::file_type` currently falls
   back to non-directory for filtering. Making that path fail closed is a follow-up; it does not
   authorize filesystem mutation today.
+- **Copy planning**: after destination-only preflight, local regular-file copies take a fresh
+  by-name `O_PATH` metadata snapshot. Dry runs and identical/newer decisions return without an
+  `O_RDONLY` payload open. Only an actionable create or replacement opens the payload; if its inode
+  differs from the snapshot, the destination plan is recomputed from the opened payload metadata
+  before any mutation.
 - **Cancellation boundary**: repository-owned blocking jobs routed through the canonical safedir
   runner attempt to upgrade a live ambient weak admission reference and retain it when present. If
   the async waiter is cancelled after an upgrade, work that has not started is discarded; for work

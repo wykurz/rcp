@@ -9,52 +9,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Leaf descriptor admission now covers fd-bearing classification and work throughout the shared
-  hardened copy/remove/chmod walk, rlink's dual-tree walk, and delete protection. This fixes
-  `EMFILE` failures seen on slow sources with wide trees, especially filesystems such as NFS that
-  frequently report `DT_UNKNOWN`: unknown entries that need a filter probe acquire admission before
-  the authoritative stat, while reliable skips remain cheap in non-destructive source walks.
-  Destructive remove/delete filtering treats every `d_type` as advisory: it classifies under
-  admission and transfers that exact handle into dispatch, so a stale hint cannot bypass a dir-only
-  exclude. Rlink's dual-tree path likewise admits a hinted source directory before touching either
-  side when an update counterpart also needs classification. If a source-only hint is stale, its
-  first handle is closed before admission and reclassification. Authoritative classification errors
-  now propagate on these paths, so delete no longer prunes after an uncertain filter decision.
+- Local recursive copy, remove, chmod, and rlink walks now bound descriptor-heavy leaf work more
+  reliably on wide trees. Filters used by destructive or observable operations classify the exact
+  entry in the worker that acts on it, so stale directory hints cannot authorize an action or an
+  incorrect `--delete` keep decision. Ordinary reliable-hint exclusions remain cheap, and hinted
+  directories do not consume leaf admission merely to descend.
 
-  Leaf ownership and cancellation boundaries are structural rather than call-site convention:
-  admitted entries transfer filter decisions without reopening and admitted leaves can contain only
-  checked non-directory handles; both explicitly close the handle before their permit on every
-  destructing exit. Remove verifies a directory after opening it for descent and rechecks that name
-  again before the final `rmdir`; nondirectory actions retain their classified handle for exact
-  metadata/accounting, and their fd-relative unlink cannot remove a swapped-in directory. Local
-  copy's synchronous data move and filegen's bounded synchronous chunks use one runner that retains
-  admission through cancellation and drops abandoned fd-bearing outputs before releasing it.
-  Recursive overwrite removal uses a separate metadata pool, so recursive-descent directory
-  descriptors remain outside leaf admission without creating a cross-pool wait cycle. Startup/test
-  setup and process reset now replace and close the prior semaphore epoch; `set_max(0)` does the
-  same for dynamically capped pools. Parked waiters wake and either retry on a nonzero replacement
-  or return when the pool is disabled, while old permits can return only to the retired epoch and
-  cannot shrink the new pool. Nonzero dynamic `set_max` updates the current epoch in place; growth
-  now cancels pending shrink debt before adding capacity, shrink publication gates replacement
-  admission, and a raw permit returned by a cancelled Tokio waiter pays that debt before admitting
-  work. Admitted remote source/destination payload streaming retains a documented
-  cancellation-lifetime follow-up; its wire behavior is unchanged.
+- In the shared local walk and rlink machinery, fail-early now waits for recursively spawned async
+  descendants to quiesce before returning. This does not extend to every `rcpd` traversal. Blocking
+  work that has already started remains outside that wait so the bounded runtime shutdown can still
+  abandon storage that never responds.
 
-  Fail-early traversal now quiesces every recursively spawned async descendant before returning,
-  including tasks that had not yet received their first poll. Cancelling an async waiter discards
-  blocking work that has not started; a blocking job that won the start/cancel race is deliberately
-  not part of that wait and keeps its descriptor-admission lease until its work and abandoned output
-  finish. The existing bounded runtime shutdown therefore remains able to abandon a job stuck
-  indefinitely on dead storage.
+- Local file-copy planning now checks the destination and current source metadata before opening a
+  regular file for payload reads. Dry runs and identical/newer overwrite skips no longer require
+  read permission for source data; actionable copies reopen the payload and re-plan if its identity
+  changed.
 
-  When `--max-open-files` is omitted and the current soft `RLIMIT_NOFILE` is nonzero, each
-  independent OpenFile and PendingMeta pool now receives
-  `min(max(1, floor((soft limit × 80%) / 5)), 4096)`; a zero soft limit leaves admission disabled.
-  The process soft limit is no longer silently raised to its hard limit. Compared with the previous
-  released default, this is approximately one fifth as many admitted operations only for uncapped
-  runs whose soft and hard limits were equal; a lower soft limit can reduce the count further, while
-  systems where both old and new calculations hit 4096 may see no change. An explicit
-  `--max-open-files=N` and filegen's available-CPU-parallelism default are unchanged.
+- Recursive removal now verifies the walked directory before descent and again before `rmdir`. After
+  a successful removal, a zero link count proves the pinned inode was unlinked; filesystems that
+  instead report `ENOENT` or `ESTALE` are accepted as a logged removed-but-unqueryable outcome. A
+  nonzero link count or any other error still fails closed.
 
 - The source-root ACL notice now fires only when the run **asked** for the fidelity a dropped ACL
   would undermine: `--preserve`/`--preserve-settings` requesting anything beyond the shipped
