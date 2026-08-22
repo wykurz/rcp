@@ -591,17 +591,19 @@ async fn copy_with_filter_base_admitted(
     .await
 }
 
-/// Classification state accepted by rlink's fd-relative copy delegation boundary.
+/// Classification state accepted by copy's fd-relative root boundary.
 ///
-/// An admitted entry retains the exact handle whose type selected the copy action. The shared
-/// driver consumes that classification owner directly, so a final-component type swap cannot route
-/// an excluded replacement type through a new classification. Regular-file and directory payload
-/// opens remain fd-relative by parent and name, preserving their existing same-type replacement
-/// semantics; symlink payload stays pinned to the admitted handle. Ordinary delegated entries
-/// retain the existing classify-under-admission path.
+/// An admitted entry retains the exact handle whose type selected the copy action, but its root
+/// filter decision is still pending. A filtered entry is rlink's exact handle after filtering in
+/// its logical namespace, so the shared driver must consume it directly rather than re-filter it
+/// under a delegated physical basename. Regular-file and directory payload opens remain fd-relative
+/// by parent and name, preserving their existing same-type replacement semantics; symlink payload
+/// stays pinned to the admitted handle. Ordinary unclassified entries retain the existing
+/// classify-under-admission path.
 pub(crate) enum CopyEntryAdmission {
     Unclassified(EntryAdmission),
     Admitted(AdmittedEntry),
+    Filtered(AdmittedEntry),
 }
 
 impl From<EntryAdmission> for CopyEntryAdmission {
@@ -1062,11 +1064,42 @@ struct FinalizeDir {
     is_root: bool,
 }
 
+async fn filter_and_process_admitted_root(
+    visitor: Arc<CopyVisitor>,
+    root_cx: EntryCx,
+    root_ctx: CopyDirContext,
+    entry: AdmittedEntry,
+    filter: &crate::filter::FilterSettings,
+) -> Result<Summary, Error> {
+    let kind = entry.kind();
+    let filter_result = if root_cx.filter_path.as_os_str().is_empty() {
+        filter.should_include_root_item(
+            std::path::Path::new(root_cx.name.as_os_str()),
+            kind == EntryKind::Dir,
+        )
+    } else {
+        filter.should_include(&root_cx.filter_path, kind == EntryKind::Dir)
+    };
+    if !matches!(filter_result, crate::filter::FilterResult::Included) {
+        if let Some(mode) = visitor.settings.dry_run {
+            crate::dry_run::report_skip(
+                &root_cx.real_path,
+                &filter_result,
+                mode,
+                kind.label_long(),
+            );
+        }
+        kind.inc_skipped(visitor.prog_track);
+        return Ok(skipped_summary_for(kind));
+    }
+    process_admitted_entry(visitor, root_cx, root_ctx, entry).await
+}
+
 /// Build the [`CopyVisitor`] for one copy operation and process the root entry through the generic
 /// driver. Shared by [`copy_with_filter_base`] (which acquires root admission before parent setup)
-/// and [`copy_child`] (rlink's fd-based delegation entry point, which may pass an unclassified
-/// admission state or an exact [`AdmittedEntry`]). The root is processed exactly like a nested child
-/// via [`process_entry`] or [`process_admitted_entry`], then dispatched to `visit_leaf`
+/// and [`copy_child`] (rlink's fd-based delegation entry point, which may pass an unclassified,
+/// admitted, or already-filtered exact entry). The root is processed exactly like a nested child via
+/// [`process_entry`] or [`process_admitted_entry`], then dispatched to `visit_leaf`
 /// (file/symlink/special) or `dir_pre`/recurse/`dir_post` (directory).
 #[allow(clippy::too_many_arguments)]
 async fn run_copy_root(
@@ -1113,7 +1146,7 @@ async fn run_copy_root(
     let root_ctx = visitor.root_dir_context();
     match admission {
         CopyEntryAdmission::Unclassified(admission) => {
-            if let Some(filter) = visitor.filter() {
+            if let Some(filter) = visitor.filter().cloned() {
                 let admission = crate::walk::ensure_entry_admission(
                     visitor.permit_kind(),
                     admission.require_admission(),
@@ -1127,32 +1160,23 @@ async fn run_copy_root(
                 .await
                 .with_context(|| format!("failed reading metadata from {:?}", &root_cx.real_path))
                 .map_err(|err| Error::new(err, Default::default()))?;
-                let kind = entry.kind();
-                let skip_result = if filter_base.as_os_str().is_empty() {
-                    filter.should_include_root_item(
-                        std::path::Path::new(name),
-                        kind == EntryKind::Dir,
-                    )
-                } else {
-                    filter.should_include(filter_base, kind == EntryKind::Dir)
-                };
-                if !matches!(skip_result, crate::filter::FilterResult::Included) {
-                    if let Some(mode) = settings.dry_run {
-                        crate::dry_run::report_skip(
-                            &root_cx.real_path,
-                            &skip_result,
-                            mode,
-                            kind.label_long(),
-                        );
-                    }
-                    kind.inc_skipped(prog_track);
-                    return Ok(skipped_summary_for(kind));
-                }
-                return process_admitted_entry(visitor, root_cx, root_ctx, entry).await;
+                return filter_and_process_admitted_root(
+                    visitor, root_cx, root_ctx, entry, &filter,
+                )
+                .await;
             }
             process_entry(visitor, root_cx, root_ctx, admission).await
         }
         CopyEntryAdmission::Admitted(entry) => {
+            if let Some(filter) = visitor.filter().cloned() {
+                return filter_and_process_admitted_root(
+                    visitor, root_cx, root_ctx, entry, &filter,
+                )
+                .await;
+            }
+            process_admitted_entry(visitor, root_cx, root_ctx, entry).await
+        }
+        CopyEntryAdmission::Filtered(entry) => {
             process_admitted_entry(visitor, root_cx, root_ctx, entry).await
         }
     }
