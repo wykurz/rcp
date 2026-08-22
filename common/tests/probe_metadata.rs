@@ -7,6 +7,7 @@
 
 use common::{copy, link, preserve, progress, rm};
 use congestion::testing::CollectingSink;
+use std::os::unix::fs::PermissionsExt;
 
 static PROGRESS: std::sync::LazyLock<progress::Progress> =
     std::sync::LazyLock::new(progress::Progress::new);
@@ -154,11 +155,11 @@ async fn copy_emits_one_metadata_sample_per_tree_entry() {
     // `symlink_metadata`/`create_dir`/`File::open`. The data copy (`copy_file_range`) stays
     // unprobed, like the `tokio::fs::copy` it replaced.
     //
-    // Source-side metadata (16 total):
+    // Source-side metadata (19 total):
     //   - 1 open_root_dir(src parent)                                          = 1
     //   - root dir:  child(stat) + open_dir(stat) + meta(fstat)                = 3
     //   - 2 subdirs: child(stat) + open_dir(stat) + meta(fstat)    × 2         = 6
-    //   - 3 files:   child(stat) + open_file_read(fstat)           × 3         = 6
+    //   - 3 files:   child(classify) + child(plan) + open_file_read × 3         = 9
     //   (read_entries / getdents is deliberately unprobed; each directory's applied metadata is
     //    read from its own opened fd via `Dir::meta` — read-side fidelity, one fstat per dir)
     //
@@ -166,8 +167,8 @@ async fn copy_emits_one_metadata_sample_per_tree_entry() {
     // burns it first, so this counts the walk alone. Its cost is owned by `root_acl_probe_cost.rs`.
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Source),
-        16,
-        "expected 16 src metadata probes for the fd-based walk",
+        19,
+        "expected 19 src metadata probes for the fd-based walk",
     );
     // Destination-side metadata (25 total):
     //   - 1 open_root_dir(dst parent)                                          = 1
@@ -181,6 +182,58 @@ async fn copy_emits_one_metadata_sample_per_tree_entry() {
         sink.metadata_count_for(congestion::Side::Destination),
         25,
         "expected 25 dst metadata probes for the fd-based walk",
+    );
+}
+
+#[tokio::test]
+async fn identical_overwrite_plans_without_a_payload_probe() {
+    let _guard = SINK_GUARD.lock().await;
+    spend_root_acl_probe().await;
+    let sink = install_sink();
+    let tmp = make_tempdir("copy_identical_overwrite_samples").await;
+    let src = tmp.join("src");
+    let dst = tmp.join("dst");
+    tokio::fs::write(&src, b"SRC-NEW").await.expect("write src");
+    tokio::fs::write(&dst, b"KEEP-ME").await.expect("write dst");
+    tokio::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o000))
+        .await
+        .expect("make src unreadable");
+    let result = copy::copy(
+        &PROGRESS,
+        &src,
+        &dst,
+        &copy::Settings {
+            overwrite: true,
+            overwrite_compare: common::filecmp::MetadataCmpSettings {
+                size: true,
+                ..Default::default()
+            },
+            ..default_copy_settings()
+        },
+        &preserve::preserve_none(),
+        false,
+    )
+    .await;
+    congestion::clear_sample_sink();
+    tokio::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600))
+        .await
+        .expect("restore src permissions");
+    let summary = result.expect("identical overwrite skips without opening the payload");
+    assert_eq!(summary.files_unchanged, 1);
+    assert_eq!(summary.files_copied, 0);
+    assert_eq!(std::fs::read_to_string(&dst).expect("read dst"), "KEEP-ME");
+    // source parent open + admitted classification + fresh by-name metadata planning. An eager
+    // open_file_read would add a fourth source Stat probe after the metadata-only plan.
+    assert_eq!(
+        sink.metadata_count_for(congestion::Side::Source),
+        3,
+        "identical overwrite must not probe the source payload",
+    );
+    // destination parent open + overwrite-candidate classification; a skip performs no mutation.
+    assert_eq!(
+        sink.metadata_count_for(congestion::Side::Destination),
+        2,
+        "identical overwrite must only preflight the destination",
     );
 }
 
@@ -397,20 +450,21 @@ async fn link_update_path_emits_probes_for_update_tree() {
     // no root dir of its own). read_entries/getdents is unprobed; failed (NotFound) probes are
     // discarded by `run_metadata_probed`.
     //
-    // Source-side (22 total):
+    // Source-side (25 total):
     //   - open_root_dir(src parent) + open_root_dir(update parent)               = 2
     //   - root dir: src child + src open_dir + update child + update open_dir
     //               + meta(fstat, from the update dir)                            = 5
     //   - a/, b/:   src child + src open_dir + meta(fstat, from src dir) (× 2); the update
     //               lookups are NotFound and discarded                            = 6
     //   - 3 src .txt files: src child only (hard link reads src via linkat)       = 3
-    //   - 3 update-only files via copy_child: child + open_file_read (× 3)        = 6
-    //   2 + 5 + 6 + 3 + 6 = 22. (Drops if the update-walk path stops spawning copies for u*.txt.)
+    //   - 3 update-only files via copy_child: child(classify) + child(plan)
+    //     + open_file_read (× 3)                                                = 9
+    //   2 + 5 + 6 + 3 + 9 = 25. (Drops if the update-walk path stops spawning copies for u*.txt.)
     //   (each directory's applied metadata is read from its own opened fd via `Dir::meta`.)
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Source),
-        22,
-        "expected 22 src metadata probes — drops if the update-walk path stops spawning copies \
+        25,
+        "expected 25 src metadata probes — drops if the update-walk path stops spawning copies \
          for u*.txt",
     );
     // Destination-side (28 total):
