@@ -257,8 +257,11 @@ mod tests {
             tokio::fs::write(dst.join("protected"), b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
             admission.set_max_open_files(1);
-            let held = throttle::pending_meta_permit().await;
             let dst_dir = open_dst(&dst).await?;
+            let stat_resource =
+                throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Stat);
+            admission.set_max_ops_in_flight(stat_resource, 1);
+            let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
             let mut filter = crate::filter::FilterSettings::new();
             filter.add_exclude("protected")?;
             let keep = HashSet::new();
@@ -278,20 +281,24 @@ mod tests {
                 )],
             );
             tokio::pin!(prune);
-            let first_poll = futures::poll!(prune.as_mut());
-            let waited_for_admission = first_poll.is_pending();
-            drop(held);
-            let result = match first_poll {
-                std::task::Poll::Ready(result) => result,
-                std::task::Poll::Pending => admission
-                    .run_with_timeout(std::time::Duration::from_secs(20), prune.as_mut())
-                    .await
-                    .context("filtered hinted delete did not resume after admission release")?,
-            };
+            let stopped_at_stat_gate = futures::poll!(prune.as_mut()).is_pending();
+            let mut second_permit = Box::pin(throttle::pending_meta_permit());
+            let classification_owned_admission =
+                futures::poll!(second_permit.as_mut()).is_pending();
+            drop(second_permit);
+            drop(held_stat);
+            let result = admission
+                .run_with_timeout(std::time::Duration::from_secs(20), prune.as_mut())
+                .await
+                .context("filtered hinted delete did not resume after stat release")?;
             let summary = result.map_err(|error| error.source)?;
             assert!(
-                waited_for_admission,
-                "delete protection trusted a file hint without authoritative admission"
+                stopped_at_stat_gate,
+                "delete protection did not reach the held destination Stat gate"
+            );
+            assert!(
+                classification_owned_admission,
+                "delete protection reached classification without owning admission"
             );
             assert_eq!(summary.files_removed, 0);
             assert!(dst.join("protected").exists());
