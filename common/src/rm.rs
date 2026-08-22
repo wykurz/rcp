@@ -969,20 +969,44 @@ impl WalkVisitor for RmVisitor {
             .await
         {
             Ok(()) => {
-                let walked_dir_was_unlinked = dir
-                    .pinned_inode_is_unlinked()
+                let post_rmdir_outcome = dir
+                    .post_rmdir_fstat_outcome()
                     .await
                     .with_context(|| {
                         format!("failed verifying removal of walked directory {path:?}")
                     })
                     .map_err(|err| Error::new(err, rm_summary))?;
-                if !walked_dir_was_unlinked {
-                    return Err(Error::new(
-                        anyhow!(std::io::Error::from_raw_os_error(libc::ESTALE)).context(format!(
-                            "walked directory {path:?} remained linked after removing its name"
-                        )),
-                        rm_summary,
-                    ));
+                match post_rmdir_outcome {
+                    safedir::PostRmdirFstatOutcome::Unlinked => {}
+                    safedir::PostRmdirFstatOutcome::StillLinked { link_count } => {
+                        return Err(Error::new(
+                            anyhow!(std::io::Error::from_raw_os_error(libc::ESTALE)).context(
+                                format!(
+                                    "walked directory {path:?} remained linked after removing its \
+                                     name (nlink={link_count})"
+                                ),
+                            ),
+                            rm_summary,
+                        ));
+                    }
+                    safedir::PostRmdirFstatOutcome::UnqueryableAfterSuccess(errno) => {
+                        tracing::warn!(
+                            ?errno,
+                            "accepted removal of directory {path:?}: the pinned descriptor is \
+                             unqueryable after successful rmdir"
+                        );
+                    }
+                    safedir::PostRmdirFstatOutcome::Error(errno) => {
+                        return Err(Error::new(
+                            anyhow!(std::io::Error::from_raw_os_error(errno as i32)).context(
+                                format!(
+                                    "failed verifying removal of walked directory {path:?} after \
+                                     successful rmdir"
+                                ),
+                            ),
+                            rm_summary,
+                        ));
+                    }
                 }
                 prog_track.directories_removed.inc();
                 rm_summary.directories_removed += 1;
