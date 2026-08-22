@@ -7768,8 +7768,8 @@ fn test_remote_dereference_fail_early_saturated_budget_reports_real_cause() {
         "top-level Source error must name the real cause (Permission denied); got:\n{combined}"
     );
     assert!(
-        !combined.contains("FdBudgetClosed"),
-        "top-level error must not expose the synthetic budget wakeup; got:\n{combined}"
+        !combined.contains("Source: source dir-fd budget semaphore closed"),
+        "top-level Source error must not be the synthetic budget wakeup; got:\n{combined}"
     );
     for i in 0..10 {
         let _ = std::fs::set_permissions(
