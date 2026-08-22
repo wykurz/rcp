@@ -844,9 +844,9 @@ impl CopyVisitor {
         if child_error.is_some() {
             return Ok(());
         }
-        // the keep-set: every source child the driver spawned for this directory (filter-IN, special
-        // files included — they have a source counterpart so must not be pruned). this is exactly the
-        // set `copy_dir_contents` built inline before the skip-specials check.
+        // the keep-set: every source child whose final exact decision included it and whose work
+        // succeeded (special files included — they have a source counterpart so must not be pruned).
+        // this is exactly the set `copy_dir_contents` built inline before the skip-specials check.
         let keep_set: std::collections::HashSet<OsString> =
             processed.names().iter().cloned().collect();
         let relative_dir = self.filter_base.join(rel_path);
