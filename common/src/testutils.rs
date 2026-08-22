@@ -1007,11 +1007,13 @@ mod tests {
                 let visit = wait_on_blocking_path_gate(&task_path, file.as_raw_fd());
                 std::thread::sleep(Duration::from_millis(100));
                 Ok((
-                    file,
-                    visit,
-                    DelayedDrop(Duration::from_millis(100)),
+                    (
+                        file,
+                        visit,
+                        DelayedDrop(Duration::from_millis(100)),
+                        owner_dropped,
+                    ),
                     held_permit,
-                    owner_dropped,
                 ))
             })
             .await??;
