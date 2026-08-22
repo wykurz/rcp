@@ -117,9 +117,75 @@ pub struct FdIdentityProbe {
     inode: libc::ino_t,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FdIdentityProbeOperation {
+    Capture,
+    OriginalIsClosed,
+}
+
+#[cfg(test)]
+static FD_IDENTITY_PROBE_FAILURE: std::sync::LazyLock<
+    std::sync::Mutex<Option<(FdIdentityProbeOperation, usize)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+pub(crate) struct FdIdentityProbeFailureGuard;
+
+#[cfg(test)]
+pub(crate) fn inject_fd_identity_probe_failure(
+    operation: FdIdentityProbeOperation,
+    occurrence: usize,
+) -> FdIdentityProbeFailureGuard {
+    assert!(occurrence != 0, "failure occurrence must be nonzero");
+    let mut failure = FD_IDENTITY_PROBE_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        failure.is_none(),
+        "an fd identity probe failure is already armed"
+    );
+    *failure = Some((operation, occurrence));
+    FdIdentityProbeFailureGuard
+}
+
+#[cfg(test)]
+impl Drop for FdIdentityProbeFailureGuard {
+    fn drop(&mut self) {
+        *FD_IDENTITY_PROBE_FAILURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+#[cfg(test)]
+fn take_injected_fd_identity_probe_failure(
+    operation: FdIdentityProbeOperation,
+) -> Option<std::io::Error> {
+    let mut failure = FD_IDENTITY_PROBE_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (armed_operation, occurrence) = failure.as_mut()?;
+    if *armed_operation != operation {
+        return None;
+    }
+    if *occurrence > 1 {
+        *occurrence -= 1;
+        return None;
+    }
+    *failure = None;
+    Some(std::io::Error::other("injected fd identity probe failure"))
+}
+
 impl FdIdentityProbe {
     /// Duplicates `raw_fd` with close-on-exec and records the duplicate's identity.
     pub fn capture(raw_fd: RawFd) -> std::io::Result<Self> {
+        #[cfg(test)]
+        if let Some(error) =
+            take_injected_fd_identity_probe_failure(FdIdentityProbeOperation::Capture)
+        {
+            return Err(error);
+        }
         // SAFETY: `F_DUPFD_CLOEXEC` reads only the descriptor integer and returns a new descriptor;
         // the kernel validates `raw_fd` and sets close-on-exec before exposing the duplicate.
         let duplicate_raw = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 0) };
@@ -141,6 +207,12 @@ impl FdIdentityProbe {
 
     /// Returns whether the captured owner is gone, including when its numeric slot was reused.
     pub fn original_is_closed(&self) -> std::io::Result<bool> {
+        #[cfg(test)]
+        if let Some(error) =
+            take_injected_fd_identity_probe_failure(FdIdentityProbeOperation::OriginalIsClosed)
+        {
+            return Err(error);
+        }
         match fd_identity(self.raw_fd) {
             Ok((device, inode)) => Ok((device, inode) != (self.device, self.inode)),
             Err(error) if error.raw_os_error() == Some(libc::EBADF) => Ok(true),
@@ -485,6 +557,22 @@ async fn quiesce_unentered_blocking_path<T>(
     Ok(())
 }
 
+#[cfg(test)]
+fn record_fd_identity_probe_result(
+    probe_error: &mut Option<anyhow::Error>,
+    result: std::io::Result<bool>,
+) -> bool {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            if probe_error.is_none() {
+                *probe_error = Some(error.into());
+            }
+            false
+        }
+    }
+}
+
 /// Cancels a task inside an exact-path blocking job and quiesces every owned resource.
 ///
 /// The supplied admission fixture must already have `max_open_files` set to one; the pending
@@ -549,7 +637,17 @@ where
                 .context("task did not enter its production blocking path gate in time");
         }
     };
-    let fd_probe = FdIdentityProbe::capture(raw_fd)?;
+    // Keep probe failures until the same release/join/completion/capacity cleanup used for normal
+    // cancellation has finished. Dropping a gate only opens its barriers; it does not await the
+    // blocking output that those barriers release.
+    let mut probe_error: Option<anyhow::Error> = None;
+    let fd_probe = match FdIdentityProbe::capture(raw_fd) {
+        Ok(probe) => Some(probe),
+        Err(error) => {
+            probe_error = Some(error.into());
+            None
+        }
+    };
 
     task.abort();
     let cancellation = tokio::time::timeout(timeout, &mut task).await;
@@ -558,8 +656,26 @@ where
             abort_and_quiesce_hit_blocking_path(&admission, &mut gate, &mut task, timeout).await;
         drop(gate);
         drop(admission);
-        cleanup_result.context("timed-out task cancellation did not quiesce its output")?;
-        return Err(error).context("blocking-path task did not cancel in time");
+        let cancellation_error =
+            anyhow::Error::new(error).context("blocking-path task did not cancel in time");
+        let cleanup_error = cleanup_result
+            .err()
+            .map(|error| error.context("timed-out task cancellation did not quiesce its output"));
+        if let Some(probe_error) = probe_error {
+            return Err(match cleanup_error {
+                Some(cleanup_error) => probe_error.context(format!(
+                    "blocking-path cancellation also failed after the probe error: {cancellation_error:#}; \
+                     cleanup failed: {cleanup_error:#}"
+                )),
+                None => probe_error.context(format!(
+                    "blocking-path cancellation also timed out after the probe error: {cancellation_error:#}"
+                )),
+            });
+        }
+        if let Some(cleanup_error) = cleanup_error {
+            return Err(cleanup_error);
+        }
+        return Err(cancellation_error);
     }
     let waiter_was_cancelled = matches!(cancellation, Ok(Err(error)) if error.is_cancelled());
     let mut second_permit = Box::pin(throttle::open_file_permit());
@@ -568,7 +684,12 @@ where
             std::task::Poll::Pending => (true, None),
             std::task::Poll::Ready(permit) => (false, Some(permit)),
         };
-    let fd_was_open_while_work_gated = !fd_probe.original_is_closed()?;
+    let fd_was_open_while_work_gated = match fd_probe.as_ref() {
+        Some(probe) => {
+            !record_fd_identity_probe_result(&mut probe_error, probe.original_is_closed())
+        }
+        None => false,
+    };
     let hit_count_before_release = gate.hit_count();
     let allocation_count_before_release = gate.allocation_count();
     let caller_observation =
@@ -582,7 +703,12 @@ where
         output_drop_start_error,
     ) = match output_drop_started {
         Ok(Ok(())) => {
-            let fd_was_closed = fd_probe.original_is_closed()?;
+            let fd_was_closed = match fd_probe.as_ref() {
+                Some(probe) => {
+                    record_fd_identity_probe_result(&mut probe_error, probe.original_is_closed())
+                }
+                None => false,
+            };
             let admission_was_retained = if acquired_permit.is_some() {
                 false
             } else {
@@ -663,6 +789,9 @@ where
         Ok(caller_observation) => caller_observation,
         Err(payload) => std::panic::resume_unwind(payload),
     };
+    if let Some(error) = probe_error {
+        return Err(error);
+    }
     if let Some(error) = output_drop_start_error {
         return Err(error);
     }
@@ -790,6 +919,14 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::time::Duration;
 
+    struct DelayedDrop(Duration);
+
+    impl Drop for DelayedDrop {
+        fn drop(&mut self) {
+            std::thread::sleep(self.0);
+        }
+    }
+
     #[test]
     fn fd_identity_probe_detects_a_closed_descriptor_slot_reused_for_another_file()
     -> std::io::Result<()> {
@@ -848,6 +985,100 @@ mod tests {
         drop(BlockingPathGate::install(path));
     }
 
+    async fn cancellation_controller_quiesces_before_returning_injected_probe_error(
+        failure_point: FdIdentityProbeOperation,
+        occurrence: usize,
+    ) -> anyhow::Result<()> {
+        let root = create_temp_dir().await?;
+        let path = root.join("controller-injected-probe-error");
+        tokio::fs::write(&path, b"x").await?;
+        let gate = BlockingPathGate::install(path.clone());
+        let admission = AdmissionLimit::new().await;
+        admission.set_max_open_files(1);
+        let held_permit = throttle::open_file_permit().await;
+        let release_after_gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let task_release = std::sync::Arc::clone(&release_after_gate);
+        let (owner_dropped, mut owner_dropped_rx) = CompletionSignal::new();
+        let (task_finished_tx, task_finished_rx) = tokio::sync::oneshot::channel();
+        let task_path = path.clone();
+        let task = tokio::spawn(async move {
+            let output = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+                let file = std::fs::File::open(&task_path)?;
+                let visit = wait_on_blocking_path_gate(&task_path, file.as_raw_fd());
+                std::thread::sleep(Duration::from_millis(100));
+                Ok((
+                    file,
+                    visit,
+                    DelayedDrop(Duration::from_millis(100)),
+                    held_permit,
+                    owner_dropped,
+                ))
+            })
+            .await??;
+            let _output = output;
+            task_release.notified().await;
+            let _ = task_finished_tx.send(());
+            Ok::<(), anyhow::Error>(())
+        });
+        let _failure = inject_fd_identity_probe_failure(failure_point, occurrence);
+
+        let result =
+            cancel_at_blocking_path(admission, gate, task, Duration::from_secs(5), |_| ()).await;
+        let owner_dropped_before_error = owner_dropped_rx.try_recv().is_ok();
+        release_after_gate.notify_waiters();
+        let task_finished = tokio::time::timeout(Duration::from_secs(5), task_finished_rx).await;
+        let cleanup_result = tokio::fs::remove_dir_all(root).await;
+
+        let error = match result {
+            Ok(_) => anyhow::bail!("the injected identity probe error was not returned"),
+            Err(error) => error,
+        };
+        cleanup_result?;
+        assert!(
+            format!("{error:#}").contains("injected fd identity probe failure"),
+            "the controller returned an unexpected error: {error:#}"
+        );
+        assert!(
+            owner_dropped_before_error,
+            "the controller returned its probe error before the blocked output dropped"
+        );
+        assert!(
+            task_finished.is_ok(),
+            "the detached task did not finish after its test-only release"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_controller_quiesces_before_returning_an_injected_capture_error()
+    -> anyhow::Result<()> {
+        cancellation_controller_quiesces_before_returning_injected_probe_error(
+            FdIdentityProbeOperation::Capture,
+            1,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn cancellation_controller_quiesces_before_returning_an_injected_gated_probe_error()
+    -> anyhow::Result<()> {
+        cancellation_controller_quiesces_before_returning_injected_probe_error(
+            FdIdentityProbeOperation::OriginalIsClosed,
+            1,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn cancellation_controller_quiesces_before_returning_an_injected_output_drop_probe_error()
+    -> anyhow::Result<()> {
+        cancellation_controller_quiesces_before_returning_injected_probe_error(
+            FdIdentityProbeOperation::OriginalIsClosed,
+            2,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn cancellation_controller_quiesces_before_resuming_observer_panic() -> anyhow::Result<()>
     {
@@ -880,7 +1111,7 @@ mod tests {
             .expect("observer fd probe lock poisoned")
             .take()
             .expect("observer did not capture the gated fd")
-            .original_is_closed()?;
+            .original_is_closed();
         let admission_reacquired = tokio::time::timeout(timeout, AdmissionLimit::new()).await;
         let admission_was_reacquired = admission_reacquired.is_ok();
         drop(admission_reacquired);
@@ -890,6 +1121,7 @@ mod tests {
         .is_ok();
         let cleanup_result = tokio::fs::remove_dir_all(root).await;
 
+        let fd_was_closed = fd_was_closed?;
         cleanup_result?;
         assert!(panic_result.is_err(), "the observer panic was not resumed");
         assert!(

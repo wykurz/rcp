@@ -1721,6 +1721,7 @@ mod tests {
             started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<std::os::fd::RawFd>>>,
             release: Arc<tokio::sync::Notify>,
             outcome: LeafOutcome,
+            dropped: Option<crate::testutils::DropEvents>,
         }
 
         struct DirPreLifetimeVisitor {
@@ -1835,6 +1836,7 @@ mod tests {
                 leaf: AdmittedLeaf,
             ) -> Result<CountSummary, OperationError<CountSummary>> {
                 let raw_fd = leaf.handle().as_fd().as_raw_fd();
+                let _dropped = self.dropped.as_ref().map(|events| events.probe("leaf"));
                 if let Some(started) = self.started.lock().expect("started lock poisoned").take() {
                     let _ = started.send(raw_fd);
                 }
@@ -1871,8 +1873,46 @@ mod tests {
             }
         }
 
+        async fn quiesce_failed_leaf_lifetime_operation(
+            admission: crate::testutils::AdmissionLimit,
+            task: tokio::task::JoinHandle<Result<CountSummary, OperationError<CountSummary>>>,
+            release: Arc<tokio::sync::Notify>,
+            root: std::path::PathBuf,
+        ) -> anyhow::Result<()> {
+            // wake the blocked visitor before aborting so either exit path can make progress.
+            release.notify_waiters();
+            task.abort();
+            let task_result = task.await;
+            let capacity_error =
+                match tokio::time::timeout(Duration::from_secs(1), throttle::pending_meta_permit())
+                    .await
+                {
+                    Ok(permit) => {
+                        drop(permit);
+                        None
+                    }
+                    Err(error) => Some(error),
+                };
+            drop(admission);
+            let cleanup_result = tokio::fs::remove_dir_all(root).await;
+
+            if let Err(error) = task_result
+                && !error.is_cancelled()
+            {
+                return Err(anyhow::Error::new(error)
+                    .context("failed leaf task did not join after probe setup failed"));
+            }
+            if let Some(error) = capacity_error {
+                return Err(anyhow::Error::new(error)
+                    .context("failed leaf task did not return pending-meta admission"));
+            }
+            cleanup_result.context("failed leaf task fixture did not clean up")?;
+            Ok(())
+        }
+
         async fn start_leaf_lifetime_operation(
             outcome: LeafOutcome,
+            dropped: Option<crate::testutils::DropEvents>,
         ) -> anyhow::Result<(
             crate::testutils::AdmissionLimit,
             tokio::task::JoinHandle<Result<CountSummary, OperationError<CountSummary>>>,
@@ -1896,85 +1936,191 @@ mod tests {
                 started: std::sync::Mutex::new(Some(started_tx)),
                 release: Arc::clone(&release),
                 outcome,
+                dropped,
             });
             let cx = root_cx(parent, OsStr::new("leaf"), leaf_path);
             let permit =
                 walk::preacquire_leaf_permit(PermitKind::PendingMeta, Some(EntryKind::File)).await;
             let task = tokio::spawn(process_entry(visitor, cx, (), permit));
-            let raw_fd = started_rx.await.context("leaf visitor did not start")?;
-            let probe = crate::testutils::FdIdentityProbe::capture(raw_fd)?;
+            let raw_fd = match started_rx.await {
+                Ok(raw_fd) => raw_fd,
+                Err(error) => {
+                    let failure = anyhow::Error::new(error).context("leaf visitor did not start");
+                    let cleanup =
+                        quiesce_failed_leaf_lifetime_operation(admission, task, release, root)
+                            .await;
+                    return match cleanup {
+                        Ok(()) => Err(failure),
+                        Err(cleanup_error) => Err(failure.context(format!(
+                            "failed to quiesce the leaf task after probe setup failed: {cleanup_error:#}"
+                        ))),
+                    };
+                }
+            };
+            let probe = match crate::testutils::FdIdentityProbe::capture(raw_fd) {
+                Ok(probe) => probe,
+                Err(error) => {
+                    let failure = anyhow::Error::new(error);
+                    let cleanup =
+                        quiesce_failed_leaf_lifetime_operation(admission, task, release, root)
+                            .await;
+                    return match cleanup {
+                        Ok(()) => Err(failure),
+                        Err(cleanup_error) => Err(failure.context(format!(
+                            "failed to quiesce the leaf task after probe setup failed: {cleanup_error:#}"
+                        ))),
+                    };
+                }
+            };
             Ok((admission, task, probe, release, root))
         }
 
         #[tokio::test(flavor = "current_thread")]
+        async fn failed_leaf_probe_capture_quiesces_before_returning_error() -> anyhow::Result<()> {
+            let events = crate::testutils::DropEvents::default();
+            let _failure = crate::testutils::inject_fd_identity_probe_failure(
+                crate::testutils::FdIdentityProbeOperation::Capture,
+                1,
+            );
+            let result =
+                start_leaf_lifetime_operation(LeafOutcome::Success, Some(events.clone())).await;
+
+            let error = match result {
+                Ok(_) => anyhow::bail!("the injected leaf probe capture error was not returned"),
+                Err(error) => error,
+            };
+            assert!(
+                format!("{error:#}").contains("injected fd identity probe failure"),
+                "the leaf-start helper returned an unexpected error: {error:#}"
+            );
+            assert_eq!(
+                events.snapshot(),
+                ["leaf"],
+                "the leaf task remained live when probe capture returned its error"
+            );
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "current_thread")]
         async fn successful_leaf_holds_admission_through_visitor() -> anyhow::Result<()> {
-            let (_admission, task, probe, release, root) =
-                start_leaf_lifetime_operation(LeafOutcome::Success).await?;
+            let (admission, task, probe, release, root) =
+                start_leaf_lifetime_operation(LeafOutcome::Success, None).await?;
             let mut next_permit = Box::pin(throttle::pending_meta_permit());
             assert!(
                 futures::poll!(next_permit.as_mut()).is_pending(),
                 "leaf admission returned while its classification handle was live"
             );
             release.notify_one();
-            let summary = task.await?.map_err(|error| error.source)?;
+            let summary_result = match task.await {
+                Ok(Ok(summary)) => Ok(summary),
+                Ok(Err(error)) => Err(error.source),
+                Err(error) => Err(anyhow::Error::new(error)),
+            };
+            let fd_was_closed = probe.original_is_closed();
+            let capacity_error = match tokio::time::timeout(Duration::from_secs(1), next_permit)
+                .await
+            {
+                Ok(permit) => {
+                    drop(permit);
+                    None
+                }
+                Err(error) => Some(
+                    anyhow::Error::new(error).context("successful leaf did not return admission"),
+                ),
+            };
+            drop(admission);
+            let cleanup_result = tokio::fs::remove_dir_all(root).await;
+
+            let summary = summary_result?;
+            let fd_was_closed = fd_was_closed?;
+            if let Some(error) = capacity_error {
+                return Err(error);
+            }
+            cleanup_result?;
             assert_eq!(summary.files, 1);
             assert!(
-                probe.original_is_closed()?,
+                fd_was_closed,
                 "successful leaf returned with its classification handle open"
             );
-            let permit = tokio::time::timeout(Duration::from_secs(1), next_permit)
-                .await
-                .context("successful leaf did not return admission")?;
-            drop(permit);
-            tokio::fs::remove_dir_all(root).await?;
             Ok(())
         }
 
         #[tokio::test(flavor = "current_thread")]
         async fn failed_leaf_holds_admission_through_visitor() -> anyhow::Result<()> {
-            let (_admission, task, probe, release, root) =
-                start_leaf_lifetime_operation(LeafOutcome::Error).await?;
+            let (admission, task, probe, release, root) =
+                start_leaf_lifetime_operation(LeafOutcome::Error, None).await?;
             let mut next_permit = Box::pin(throttle::pending_meta_permit());
             assert!(
                 futures::poll!(next_permit.as_mut()).is_pending(),
                 "leaf admission returned while its classification handle was live"
             );
             release.notify_one();
-            let error = task.await?.expect_err("leaf operation must fail");
+            let task_result = task.await;
+            let fd_was_closed = probe.original_is_closed();
+            let capacity_error =
+                match tokio::time::timeout(Duration::from_secs(1), next_permit).await {
+                    Ok(permit) => {
+                        drop(permit);
+                        None
+                    }
+                    Err(error) => Some(
+                        anyhow::Error::new(error).context("failed leaf did not return admission"),
+                    ),
+                };
+            drop(admission);
+            let cleanup_result = tokio::fs::remove_dir_all(root).await;
+
+            let error = task_result?.expect_err("leaf operation must fail");
+            let fd_was_closed = fd_was_closed?;
+            if let Some(error) = capacity_error {
+                return Err(error);
+            }
+            cleanup_result?;
             assert!(format!("{:#}", error.source).contains("leaf operation failed"));
             assert!(
-                probe.original_is_closed()?,
+                fd_was_closed,
                 "failed leaf returned with its classification handle open"
             );
-            let permit = tokio::time::timeout(Duration::from_secs(1), next_permit)
-                .await
-                .context("failed leaf did not return admission")?;
-            drop(permit);
-            tokio::fs::remove_dir_all(root).await?;
             Ok(())
         }
 
         #[tokio::test(flavor = "current_thread")]
         async fn cancelled_leaf_drops_handle_and_returns_admission() -> anyhow::Result<()> {
-            let (_admission, task, probe, _release, root) =
-                start_leaf_lifetime_operation(LeafOutcome::Success).await?;
+            let (admission, task, probe, _release, root) =
+                start_leaf_lifetime_operation(LeafOutcome::Success, None).await?;
             let mut next_permit = Box::pin(throttle::pending_meta_permit());
             assert!(
                 futures::poll!(next_permit.as_mut()).is_pending(),
                 "leaf admission returned while its classification handle was live"
             );
             task.abort();
-            let task_error = task.await.expect_err("leaf task must be cancelled");
+            let task_result = task.await;
+            let fd_was_closed = probe.original_is_closed();
+            let capacity_error = match tokio::time::timeout(Duration::from_secs(1), next_permit)
+                .await
+            {
+                Ok(permit) => {
+                    drop(permit);
+                    None
+                }
+                Err(error) => Some(
+                    anyhow::Error::new(error).context("cancelled leaf did not return admission"),
+                ),
+            };
+            drop(admission);
+            let cleanup_result = tokio::fs::remove_dir_all(root).await;
+
+            let task_error = task_result.expect_err("leaf task must be cancelled");
+            let fd_was_closed = fd_was_closed?;
+            if let Some(error) = capacity_error {
+                return Err(error);
+            }
+            cleanup_result?;
             assert!(task_error.is_cancelled());
             assert!(
-                probe.original_is_closed()?,
+                fd_was_closed,
                 "cancelled leaf retained its classification handle"
             );
-            let permit = tokio::time::timeout(Duration::from_secs(1), next_permit)
-                .await
-                .context("cancelled leaf did not return admission")?;
-            drop(permit);
-            tokio::fs::remove_dir_all(root).await?;
             Ok(())
         }
 
