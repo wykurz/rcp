@@ -6292,6 +6292,149 @@ fn test_remote_dereference_empty_tree_over_budget_completes() {
 }
 
 #[test]
+fn test_remote_dereference_symlinked_root_and_directory_over_budget_completes() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_root = src_dir.path().join("real_root");
+    std::fs::create_dir(&src_root).unwrap();
+    for i in 0..2 {
+        let sibling = src_root.join(format!("sibling{i}"));
+        std::fs::create_dir(&sibling).unwrap();
+        create_test_file(&sibling.join("file.txt"), &format!("content {i}"), 0o644);
+    }
+    let linked_target = src_dir.path().join("linked_target");
+    std::fs::create_dir(&linked_target).unwrap();
+    create_test_file(&linked_target.join("payload.txt"), "linked content", 0o644);
+    std::os::unix::fs::symlink(&linked_target, src_root.join("linked_directory")).unwrap();
+    let src_link = src_dir.path().join("root_link");
+    std::os::unix::fs::symlink(&src_root, &src_link).unwrap();
+    let dst_root = dst_dir.path().join("root");
+    let src_remote = format!("localhost:{}", src_link.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    run_rcp_and_expect_success(&[
+        "-L",
+        "--max-connections=1",
+        "--pending-writes-multiplier=1",
+        &src_remote,
+        &dst_remote,
+    ]);
+    assert!(
+        dst_root.is_dir(),
+        "the symlinked root must become a directory"
+    );
+    assert!(
+        !dst_root.is_symlink(),
+        "the symlinked root must not remain a symlink"
+    );
+    let dst_linked = dst_root.join("linked_directory");
+    assert!(
+        dst_linked.is_dir(),
+        "the nested directory symlink must become a directory"
+    );
+    assert!(
+        !dst_linked.is_symlink(),
+        "the nested directory symlink must not remain a symlink"
+    );
+    assert_eq!(
+        get_file_content(&dst_linked.join("payload.txt")),
+        "linked content"
+    );
+    for i in 0..2 {
+        assert_eq!(
+            get_file_content(&dst_root.join(format!("sibling{i}/file.txt"))),
+            format!("content {i}")
+        );
+    }
+}
+
+struct RestoreDirectoryModesOnDrop {
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl Drop for RestoreDirectoryModesOnDrop {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+}
+
+#[test]
+fn test_remote_dereference_unreadable_nested_directories_over_budget_continues() {
+    require_local_ssh();
+    if can_read_unreadable_dir() {
+        eprintln!(
+            "skipping: running as root, cannot make a directory unreadable to the remote user"
+        );
+        return;
+    }
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_root = src_dir.path().join("root");
+    std::fs::create_dir(&src_root).unwrap();
+    let dst_root = dst_dir.path().join("root");
+    let mut cleanup_paths = Vec::new();
+    for i in 0..3 {
+        let unreadable = src_root.join(format!("unreadable{i}"));
+        std::fs::create_dir(&unreadable).unwrap();
+        create_test_file(&unreadable.join("hidden.txt"), "hidden", 0o644);
+        cleanup_paths.push(unreadable.clone());
+        cleanup_paths.push(dst_root.join(format!("unreadable{i}")));
+    }
+    let _restore_modes = RestoreDirectoryModesOnDrop {
+        paths: cleanup_paths,
+    };
+    for i in 0..3 {
+        std::fs::set_permissions(
+            src_root.join(format!("unreadable{i}")),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+    }
+    let readable = src_root.join("zzz_readable");
+    std::fs::create_dir(&readable).unwrap();
+    create_test_file(&readable.join("payload.txt"), "readable content", 0o644);
+    let src_remote = format!("localhost:{}", src_root.to_str().unwrap());
+    let dst_remote = format!("localhost:{}", dst_root.to_str().unwrap());
+    let output = run_rcp_and_expect_failure(&[
+        "-L",
+        "--max-connections=1",
+        "--pending-writes-multiplier=1",
+        &src_remote,
+        &dst_remote,
+    ]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Permission denied"),
+        "the copy must report the unreadable-directory cause; got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("source dir-fd budget semaphore closed"),
+        "the copy must not report the synthetic credit-close wakeup; got:\n{combined}"
+    );
+    assert_eq!(
+        get_file_content(&dst_root.join("zzz_readable/payload.txt")),
+        "readable content"
+    );
+    for i in 0..3 {
+        let dst_unreadable = dst_root.join(format!("unreadable{i}"));
+        assert!(
+            dst_unreadable.is_dir(),
+            "unreadable directory {i} must be materialized as an empty directory"
+        );
+        std::fs::set_permissions(&dst_unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&dst_unreadable).unwrap().count(),
+            0,
+            "unreadable directory {i} must be empty"
+        );
+    }
+}
+
+#[test]
 fn test_remote_dereference_no_ack_subtree_over_budget_does_not_hang() {
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
