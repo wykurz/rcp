@@ -80,92 +80,96 @@ async fn prune_entries(
     let mut summary = crate::rm::Summary::default();
     let errors = crate::error_collector::ErrorCollector::default();
     for (name, hint) in entries {
-        if keep.contains(&name) {
-            continue;
-        }
-        // the entry's path relative to the destination (mirror) root: anchors filter matching and
-        // reconstructs the display path inside `rm_child`. Computed once and reused below.
-        let rel = relative_dir.join(&name);
-        let protect_excluded = !delete_settings.delete_excluded && filter.is_some();
-        let mut admitted_entry = None;
-        // an exclude-protection decision authorizes deletion, so `d_type` is never authoritative
-        // here. Classify once under admission and transfer this exact handle into rm; otherwise a
-        // stale File hint for a real directory could bypass a dir-only exclude such as `cache/`.
-        let is_dir = if protect_excluded {
-            let admission = crate::walk::ensure_entry_admission(
-                crate::walk::PermitKind::PendingMeta,
-                crate::walk::EntryAdmission::RootOrDelegated,
-            )
-            .await;
-            let entry =
-                crate::walk::classify_admitted_entry(dst_dir, &name, admission.into_permit())
-                    .await
-                    .with_context(|| format!("failed reading metadata from {rel:?}"))
-                    .map_err(|error| crate::rm::Error::new(error, summary))?;
-            let is_dir = entry.kind() == crate::walk::EntryKind::Dir;
-            admitted_entry = Some(entry);
-            is_dir
-        } else {
-            false
-        };
-        // exclude-protection: keep destination entries the filter would exclude,
-        // unless --delete-excluded was requested.
-        if !delete_settings.delete_excluded
-            && let Some(filter) = filter
-            && !matches!(
-                filter.should_include(&rel, is_dir),
-                crate::filter::FilterResult::Included
-            )
-        {
-            tracing::debug!("protecting excluded destination entry {:?}", rel);
-            continue;
-        }
-        // Protect excluded descendants when removing an extraneous directory: rm::rm_child applies
-        // the filter recursively (skipping excluded entries), so an extra dir containing e.g.
-        // `*.log` files keeps them and survives non-empty — upholding the documented
-        // "excluded files are protected by default" guarantee (and matching rsync). With
-        // --delete-excluded we pass no filter so the whole subtree is removed. The filter is
-        // anchored at the destination (mirror) root, so the entry's destination-root-relative path
-        // `relative_dir.join(name)` matches path/anchored patterns like `cache/*.log` correctly.
-        let rm_settings = crate::rm::Settings {
-            fail_early,
-            filter: if delete_settings.delete_excluded {
-                None
-            } else {
-                filter.cloned()
-            },
-            time_filter: None,
-            dry_run,
-        };
-        let result = match admitted_entry {
-            Some(entry) => {
-                crate::rm::rm_child_admitted_entry(
-                    prog_track,
-                    dst_dir,
-                    &name,
-                    &rel,
-                    &rm_settings,
-                    entry,
-                )
-                .await
+        let result: Result<crate::rm::Summary, crate::rm::Error> = async {
+            if keep.contains(&name) {
+                return Ok(Default::default());
             }
-            None => {
+            // the entry's path relative to the destination (mirror) root: anchors filter matching
+            // and reconstructs the display path inside `rm_child`. Computed once and reused below.
+            let rel = relative_dir.join(&name);
+            let protect_excluded = !delete_settings.delete_excluded && filter.is_some();
+            let mut admitted_entry = None;
+            // an exclude-protection decision authorizes deletion, so `d_type` is never authoritative
+            // here. Classify once under admission and transfer this exact handle into rm; otherwise a
+            // stale File hint for a real directory could bypass a dir-only exclude such as `cache/`.
+            let is_dir = if protect_excluded {
                 let admission = crate::walk::ensure_entry_admission(
                     crate::walk::PermitKind::PendingMeta,
-                    crate::walk::EntryAdmission::from_hint(hint),
+                    crate::walk::EntryAdmission::RootOrDelegated,
                 )
                 .await;
-                crate::rm::rm_child_admitted(
-                    prog_track,
-                    dst_dir,
-                    &name,
-                    &rel,
-                    &rm_settings,
-                    admission,
+                let entry =
+                    crate::walk::classify_admitted_entry(dst_dir, &name, admission.into_permit())
+                        .await
+                        .with_context(|| format!("failed reading metadata from {rel:?}"))
+                        .map_err(|error| crate::rm::Error::new(error, Default::default()))?;
+                let is_dir = entry.kind() == crate::walk::EntryKind::Dir;
+                admitted_entry = Some(entry);
+                is_dir
+            } else {
+                false
+            };
+            // exclude-protection: keep destination entries the filter would exclude,
+            // unless --delete-excluded was requested.
+            if !delete_settings.delete_excluded
+                && let Some(filter) = filter
+                && !matches!(
+                    filter.should_include(&rel, is_dir),
+                    crate::filter::FilterResult::Included
                 )
-                .await
+            {
+                tracing::debug!("protecting excluded destination entry {:?}", rel);
+                return Ok(Default::default());
             }
-        };
+            // Protect excluded descendants when removing an extraneous directory: rm::rm_child
+            // applies the filter recursively (skipping excluded entries), so an extra dir containing
+            // e.g. `*.log` files keeps them and survives non-empty — upholding the documented
+            // "excluded files are protected by default" guarantee (and matching rsync). With
+            // --delete-excluded we pass no filter so the whole subtree is removed. The filter is
+            // anchored at the destination (mirror) root, so the entry's destination-root-relative
+            // path `relative_dir.join(name)` matches path/anchored patterns like `cache/*.log`
+            // correctly.
+            let rm_settings = crate::rm::Settings {
+                fail_early,
+                filter: if delete_settings.delete_excluded {
+                    None
+                } else {
+                    filter.cloned()
+                },
+                time_filter: None,
+                dry_run,
+            };
+            match admitted_entry {
+                Some(entry) => {
+                    crate::rm::rm_child_admitted_entry(
+                        prog_track,
+                        dst_dir,
+                        &name,
+                        &rel,
+                        &rm_settings,
+                        entry,
+                    )
+                    .await
+                }
+                None => {
+                    let admission = crate::walk::ensure_entry_admission(
+                        crate::walk::PermitKind::PendingMeta,
+                        crate::walk::EntryAdmission::from_hint(hint),
+                    )
+                    .await;
+                    crate::rm::rm_child_admitted(
+                        prog_track,
+                        dst_dir,
+                        &name,
+                        &rel,
+                        &rm_settings,
+                        admission,
+                    )
+                    .await
+                }
+            }
+        }
+        .await;
         match result {
             Ok(rm_summary) => {
                 summary = summary + rm_summary;
@@ -362,16 +366,20 @@ mod tests {
             Ok(())
         }
 
-        /// A failed authoritative delete-protection probe must abort pruning.
+        /// Keep-going records a failed authoritative probe and continues with later siblings.
         #[tokio::test]
-        async fn failed_authoritative_probe_aborts_delete_protection() -> anyhow::Result<()> {
+        async fn failed_authoritative_probe_keeps_going_in_entry_order() -> anyhow::Result<()> {
             let tmp = tempfile::tempdir()?;
             let dst = tmp.path().join("dst");
             tokio::fs::create_dir(&dst).await?;
+            tokio::fs::write(dst.join("before"), b"b").await?;
+            tokio::fs::write(dst.join("kept"), b"k").await?;
+            tokio::fs::write(dst.join("after"), b"a").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
             let dst_dir = open_dst(&dst).await?;
-            let mut filter = crate::filter::FilterSettings::new();
-            filter.add_exclude("vanished")?;
+            let filter = crate::filter::FilterSettings::new();
+            let mut keep = HashSet::new();
+            keep.insert(std::ffi::OsString::from("kept"));
             let result = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(20),
@@ -379,20 +387,90 @@ mod tests {
                         &PROGRESS,
                         &dst_dir,
                         std::path::Path::new(""),
-                        &HashSet::new(),
+                        &keep,
                         Some(&filter),
                         &delete_settings(false),
                         false,
                         None,
-                        vec![(std::ffi::OsString::from("vanished"), None)],
+                        vec![
+                            (std::ffi::OsString::from("before"), None),
+                            (std::ffi::OsString::from("vanished"), None),
+                            (std::ffi::OsString::from("kept"), None),
+                            (std::ffi::OsString::from("after"), None),
+                        ],
                     ),
                 )
                 .await
-                .context("failed delete-protection probe did not terminate")?;
+                .context("keep-going delete-protection probe did not terminate")?;
             let error = result.expect_err("a missing authoritative probe target must fail");
             let rendered = format!("{:#}", error.source);
             assert!(rendered.contains("failed reading metadata from"));
             assert!(rendered.contains("vanished"));
+            assert_eq!(error.summary.bytes_removed, 2);
+            assert_eq!(error.summary.files_removed, 2);
+            assert_eq!(error.summary.symlinks_removed, 0);
+            assert_eq!(error.summary.directories_removed, 0);
+            assert_eq!(error.summary.files_skipped, 0);
+            assert_eq!(error.summary.symlinks_skipped, 0);
+            assert_eq!(error.summary.directories_skipped, 0);
+            assert!(!dst.join("before").exists());
+            assert!(!dst.join("vanished").exists());
+            assert!(dst.join("kept").exists());
+            assert!(!dst.join("after").exists());
+            Ok(())
+        }
+
+        /// Fail-early reports completed work and leaves siblings after a failed probe untouched.
+        #[tokio::test]
+        async fn failed_authoritative_probe_stops_early_in_entry_order() -> anyhow::Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let dst = tmp.path().join("dst");
+            tokio::fs::create_dir(&dst).await?;
+            tokio::fs::write(dst.join("before"), b"b").await?;
+            tokio::fs::write(dst.join("kept"), b"k").await?;
+            tokio::fs::write(dst.join("after"), b"a").await?;
+            let admission = crate::testutils::AdmissionLimit::new().await;
+            let dst_dir = open_dst(&dst).await?;
+            let filter = crate::filter::FilterSettings::new();
+            let mut keep = HashSet::new();
+            keep.insert(std::ffi::OsString::from("kept"));
+            let result = admission
+                .run_with_timeout(
+                    std::time::Duration::from_secs(20),
+                    prune_entries(
+                        &PROGRESS,
+                        &dst_dir,
+                        std::path::Path::new(""),
+                        &keep,
+                        Some(&filter),
+                        &delete_settings(false),
+                        true,
+                        None,
+                        vec![
+                            (std::ffi::OsString::from("before"), None),
+                            (std::ffi::OsString::from("vanished"), None),
+                            (std::ffi::OsString::from("kept"), None),
+                            (std::ffi::OsString::from("after"), None),
+                        ],
+                    ),
+                )
+                .await
+                .context("fail-early delete-protection probe did not terminate")?;
+            let error = result.expect_err("a missing authoritative probe target must fail");
+            let rendered = format!("{:#}", error.source);
+            assert!(rendered.contains("failed reading metadata from"));
+            assert!(rendered.contains("vanished"));
+            assert_eq!(error.summary.bytes_removed, 1);
+            assert_eq!(error.summary.files_removed, 1);
+            assert_eq!(error.summary.symlinks_removed, 0);
+            assert_eq!(error.summary.directories_removed, 0);
+            assert_eq!(error.summary.files_skipped, 0);
+            assert_eq!(error.summary.symlinks_skipped, 0);
+            assert_eq!(error.summary.directories_skipped, 0);
+            assert!(!dst.join("before").exists());
+            assert!(!dst.join("vanished").exists());
+            assert!(dst.join("kept").exists());
+            assert!(dst.join("after").exists());
             Ok(())
         }
     }
