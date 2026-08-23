@@ -1243,9 +1243,9 @@ async fn link_internal(
                     )));
                 }
             }
-        // a nested source loop may have filtered from an advisory hint or a DT_UNKNOWN probe whose
-        // handle was closed before this worker ran. Re-evaluate BOTH sides from the exact handles that
-        // can drive materialization, so a later type swap cannot inherit either earlier decision.
+        // a nested source loop may have filtered from an advisory hint. Re-evaluate BOTH sides from
+        // the exact handles that can drive materialization, so a later type swap cannot inherit that
+        // earlier decision.
         } else if !rel_path.as_os_str().is_empty()
             && let Some(filter) = settings.filter.as_ref()
         {
@@ -1659,6 +1659,7 @@ async fn link_dir_entry(
             None, // dry-run: no destination dir is opened or locked, so nothing to restore
             settings,
             base,
+            SourceEntries::Live,
             UpdateEntries::Live,
         )
         .await;
@@ -1717,6 +1718,7 @@ async fn link_dir_entry(
             copy_summary: base,
             ..Default::default()
         },
+        SourceEntries::Live,
         UpdateEntries::Live,
     )
     .await
@@ -1753,39 +1755,26 @@ enum SourceEntryDecision {
     Dispatch(EntryAdmission),
 }
 
-/// Apply source-loop hint fast paths and return the admission state to transfer into the worker.
-async fn select_source_for_dispatch(
-    src_dir: &Arc<Dir>,
-    name: &std::ffi::OsStr,
+/// Apply reliable source-hint exclusions and return the admission state to transfer into the
+/// worker. An unknown hint always defers type-sensitive filtering and accounting to the exact
+/// worker classification.
+fn select_source_for_dispatch(
     hint: Option<EntryKind>,
     relative_path: &std::path::Path,
     settings: &Settings,
     has_update: bool,
-) -> std::io::Result<SourceEntryDecision> {
-    let kind = hint.unwrap_or(EntryKind::File);
-    let mut admission = source_entry_admission(hint, has_update);
-    if settings.filter.is_some() {
-        // a DT_UNKNOWN filter decision opens an O_PATH handle, so it is the only source-only
-        // decision path that acquires before filtering. reliable hints keep cheap exits outside
-        // open-file admission.
-        if hint.is_none() {
-            admission = walk::ensure_entry_admission(PermitKind::OpenFile, admission).await;
-        }
-        // on DT_UNKNOWN, an exact directory probe is required for is-dir-dependent filters;
-        // reliable hints avoid the extra fstat. The worker repeats the joint filter decision
-        // from both final handles before acting.
-        let entry_is_dir = safedir::with_optional_fd_admission(
-            admission.admission(),
-            walk::filter_is_dir(settings.filter.as_ref(), src_dir, name, hint, false),
+) -> SourceEntryDecision {
+    if let Some(kind) = hint
+        && let Some(result) = walk::should_skip_entry_ref(
+            settings.filter.as_ref(),
+            relative_path,
+            kind == EntryKind::Dir,
         )
-        .await?;
-        if let Some(result) = walk::should_skip_entry(&settings.filter, relative_path, entry_is_dir)
-            && !requires_exact_entry_outcome(settings)
-        {
-            return Ok(SourceEntryDecision::Filtered { kind, result });
-        }
+        && !requires_exact_entry_outcome(settings)
+    {
+        return SourceEntryDecision::Filtered { kind, result };
     }
-    Ok(SourceEntryDecision::Dispatch(admission))
+    SourceEntryDecision::Dispatch(source_entry_admission(hint, has_update))
 }
 
 /// Terminal exact selection for an update-only directory entry.
@@ -1994,11 +1983,11 @@ fn fold_link_task_result(
     Ok(())
 }
 
-/// Await update-only admission while reaping ready children. A completed fail-early error wins a
-/// tie with newly available capacity, so another permanently pending worker cannot consume that
-/// capacity and strand the unread error.
+/// Await link-entry admission while reaping ready children. A completed fail-early error wins a tie
+/// with newly available capacity, so another permanently pending worker cannot consume that
+/// capacity and strand the unread error. Both source and update-only producers use this boundary.
 #[allow(clippy::too_many_arguments)]
-async fn ensure_update_only_admission(
+async fn ensure_link_admission(
     admission: EntryAdmission,
     join_set: &mut tokio::task::JoinSet<Result<LinkTaskResult, Error>>,
     link_summary: &mut Summary,
@@ -2028,6 +2017,12 @@ async fn ensure_update_only_admission(
             admission = &mut admission => return Ok(admission),
         }
     }
+}
+
+enum SourceEntries {
+    Live,
+    #[cfg(test)]
+    Injected(Vec<(std::ffi::OsString, Option<EntryKind>)>),
 }
 
 enum UpdateEntries {
@@ -2062,14 +2057,19 @@ async fn link_dir_contents(
     reused_lock: Option<crate::safedir::ReusedDirLock>,
     settings: &Settings,
     base: Summary,
+    source_entries: SourceEntries,
     update_entries: UpdateEntries,
 ) -> Result<Summary, Error> {
     tracing::debug!("process contents of 'src' directory");
-    let src_entries = src_dir
-        .read_entries()
-        .await
-        .with_context(|| format!("cannot open directory {src_path:?} for reading"))
-        .map_err(|err| Error::new(err, base))?;
+    let src_entries = match source_entries {
+        SourceEntries::Live => src_dir
+            .read_entries()
+            .await
+            .with_context(|| format!("cannot open directory {src_path:?} for reading"))
+            .map_err(|err| Error::new(err, base))?,
+        #[cfg(test)]
+        SourceEntries::Injected(entries) => entries,
+    };
     let mut link_summary = base;
     let mut join_set = tokio::task::JoinSet::new();
     let errors = crate::error_collector::ErrorCollector::default();
@@ -2082,26 +2082,7 @@ async fn link_dir_contents(
     for (entry_name, hint) in src_entries {
         let entry_rel = rel_path.join(&entry_name);
         let entry_path = src_path.join(&entry_name);
-        let decision = match select_source_for_dispatch(
-            src_dir,
-            &entry_name,
-            hint,
-            &entry_rel,
-            settings,
-            update_dir.is_some(),
-        )
-        .await
-        {
-            Ok(decision) => decision,
-            Err(error) => {
-                crate::walk_driver::abort_and_join(&mut join_set).await;
-                return Err(Error::new(
-                    anyhow::Error::new(error)
-                        .context(format!("failed reading metadata from {entry_path:?}")),
-                    link_summary,
-                ));
-            }
-        };
+        let decision = select_source_for_dispatch(hint, &entry_rel, settings, update_dir.is_some());
         let admission = match decision {
             SourceEntryDecision::Filtered { kind, result } => {
                 if let Some(mode) = settings.dry_run {
@@ -2115,7 +2096,24 @@ async fn link_dir_contents(
             SourceEntryDecision::Dispatch(admission) => admission,
         };
         processed_files.insert(entry_name.clone());
-        let admission = walk::ensure_entry_admission(PermitKind::OpenFile, admission).await;
+        let admission = match ensure_link_admission(
+            admission,
+            &mut join_set,
+            &mut link_summary,
+            &mut keep_set,
+            &errors,
+            settings.copy_settings.fail_early,
+            src_path,
+            dst_path,
+        )
+        .await
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                crate::walk_driver::abort_and_join(&mut join_set).await;
+                return Err(Error::new(error, link_summary));
+            }
+        };
         // acquire-then-IMMEDIATELY-spawn (the permit is moved into `do_link` and spawned on the next
         // line, in the same loop step) is load-bearing: collecting a Vec of pre-acquired permits and
         // spawning later would hold N permits before any task runs and self-deadlock a saturated pool.
@@ -2202,7 +2200,7 @@ async fn link_dir_contents(
                 }
                 UpdateOnlyDispatch::Dispatch(admission) => admission,
             };
-            let admission = match ensure_update_only_admission(
+            let admission = match ensure_link_admission(
                 admission,
                 &mut join_set,
                 &mut link_summary,
@@ -4312,14 +4310,11 @@ mod link_tests {
             settings.copy_settings.filter = Some(filter);
             settings.copy_settings.delete = Some(delete_settings.clone());
             let decision = select_source_for_dispatch(
-                &src_dir,
-                std::ffi::OsStr::new("node"),
                 Some(EntryKind::Dir),
                 std::path::Path::new("node"),
                 &settings,
                 false,
-            )
-            .await?;
+            );
 
             let mut summary = Summary::default();
             let mut keep_set = DeleteKeepSet::new(Some(&delete_settings));
@@ -4392,14 +4387,11 @@ mod link_tests {
             settings.copy_settings.filter = Some(filter);
             settings.dry_run = Some(crate::config::DryRunMode::Brief);
             let decision = select_source_for_dispatch(
-                &src_dir,
-                std::ffi::OsStr::new("node"),
                 Some(EntryKind::Dir),
                 std::path::Path::new("node"),
                 &settings,
                 false,
-            )
-            .await?;
+            );
 
             let mut summary = Summary::default();
             let mut keep_set = DeleteKeepSet::new(None);
@@ -4462,14 +4454,11 @@ mod link_tests {
             settings.copy_settings.skip_specials = true;
             settings.copy_settings.delete = Some(delete_settings.clone());
             let decision = select_source_for_dispatch(
-                &src_dir,
-                std::ffi::OsStr::new("node"),
                 Some(EntryKind::Special),
                 std::path::Path::new("node"),
                 &settings,
                 false,
-            )
-            .await?;
+            );
 
             let mut summary = Summary::default();
             let mut keep_set = DeleteKeepSet::new(Some(&delete_settings));
@@ -4701,6 +4690,32 @@ mod link_tests {
             assert_eq!(summary.copy_summary.files_skipped, 1);
             Ok(())
         }
+
+        /// An excluded source-only root under an execute-only parent must retain the default
+        /// path's metadata-only filter exit instead of requiring a readable parent directory.
+        #[tokio::test]
+        async fn excluded_source_only_root_skips_under_execute_only_parent()
+        -> Result<(), anyhow::Error> {
+            let test_path = testutils::create_temp_dir().await?;
+            let parent = test_path.join("parent");
+            let src = parent.join("src");
+            let dst = test_path.join("dst");
+            tokio::fs::create_dir_all(&src).await?;
+            tokio::fs::write(src.join("leaf"), b"leaf").await?;
+            let mut filter = FilterSettings::new();
+            filter.add_exclude("src")?;
+            let mut settings = common_settings(false, false);
+            settings.filter = Some(filter.clone());
+            settings.copy_settings.filter = Some(filter);
+            tokio::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o111)).await?;
+            let result = link(&PROGRESS, &test_path, &src, &dst, &None, &settings, false).await;
+            tokio::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).await?;
+            let summary = result?;
+            assert_eq!(summary.copy_summary.directories_skipped, 1);
+            assert!(!dst.exists());
+            Ok(())
+        }
+
         /// Test that filters apply to root directories with simple exclude patterns.
         #[tokio::test]
         #[traced_test]
@@ -6044,6 +6059,38 @@ mod link_tests {
     mod max_open_files_tests {
         use super::*;
 
+        fn available_open_file_capacity(capacity: usize) -> usize {
+            let waker = futures::task::noop_waker();
+            let mut context = std::task::Context::from_waker(&waker);
+            let mut permits = Vec::new();
+            for _ in 0..capacity {
+                let mut permit = Box::pin(throttle::open_file_permit());
+                match std::future::Future::poll(permit.as_mut(), &mut context) {
+                    std::task::Poll::Ready(permit) => permits.push(permit),
+                    std::task::Poll::Pending => break,
+                }
+            }
+            permits.len()
+        }
+
+        async fn reacquire_all_open_file_capacity(
+            admission: &testutils::AdmissionLimit,
+            capacity: usize,
+        ) -> Result<(), anyhow::Error> {
+            let permits = admission
+                .run_with_timeout(std::time::Duration::from_secs(20), async {
+                    let mut permits = Vec::new();
+                    for _ in 0..capacity {
+                        permits.push(throttle::open_file_permit().await);
+                    }
+                    permits
+                })
+                .await
+                .context("link operation did not return all open-file capacity")?;
+            drop(permits);
+            Ok(())
+        }
+
         #[tokio::test]
         async fn update_directory_transition_retains_exact_handle_and_held_admission()
         -> anyhow::Result<()> {
@@ -6179,6 +6226,7 @@ mod link_tests {
                 None,
                 &settings,
                 Summary::default(),
+                SourceEntries::Live,
                 UpdateEntries::Live,
             );
             let result = admission
@@ -6238,6 +6286,7 @@ mod link_tests {
                 None,
                 &settings,
                 Summary::default(),
+                SourceEntries::Live,
                 UpdateEntries::Live,
             ));
             let result = admission
@@ -6412,6 +6461,7 @@ mod link_tests {
                 None,
                 &settings,
                 Summary::default(),
+                SourceEntries::Live,
                 UpdateEntries::Live,
             ));
             let result = admission
@@ -6776,6 +6826,338 @@ mod link_tests {
             Ok(())
         }
 
+        /// A completed source error must be reaped while the producer waits to admit a later
+        /// entry. Otherwise two blocked symlink workers can retain the whole pool forever.
+        #[tokio::test(flavor = "current_thread")]
+        async fn source_fail_early_reaps_error_while_later_admission_is_saturated()
+        -> Result<(), anyhow::Error> {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("src");
+            let dst = root.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&dst).await?;
+            tokio::fs::write(src.join("vanished"), b"vanished").await?;
+            tokio::fs::symlink("target-a", src.join("blocked-a")).await?;
+            tokio::fs::symlink("target-b", src.join("blocked-b")).await?;
+            tokio::fs::write(src.join("later"), b"later").await?;
+            tokio::fs::write(src.join("uninjected"), b"uninjected").await?;
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(2);
+            let stat_resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
+            admission.set_max_ops_in_flight(stat_resource, 1);
+            let readlink_resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::ReadLink);
+            admission.set_max_ops_in_flight(readlink_resource, 1);
+            let src_dir =
+                Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+            let dst_dir =
+                Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
+            let dst_parent =
+                Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Destination).await?);
+            let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
+            let mut held_readlink = Some(throttle::ops_in_flight_permit(readlink_resource).await);
+            let mut filter = crate::filter::FilterSettings::new();
+            filter.add_exclude("never/")?;
+            let mut settings = common_settings(false, false);
+            settings.filter = Some(filter.clone());
+            settings.copy_settings.filter = Some(filter);
+            settings.copy_settings.fail_early = true;
+            let operation = crate::walk_driver::scope_tasks(link_dir_contents(
+                &PROGRESS,
+                &src_dir,
+                None,
+                Some(&dst_dir),
+                Some(&dst_parent),
+                std::ffi::OsStr::new("dst"),
+                &src,
+                &dst,
+                None,
+                std::path::Path::new(""),
+                &src,
+                &dst,
+                false,
+                false,
+                None,
+                &settings,
+                Summary::default(),
+                SourceEntries::Injected(vec![
+                    (std::ffi::OsString::from("vanished"), Some(EntryKind::File)),
+                    (
+                        std::ffi::OsString::from("blocked-a"),
+                        Some(EntryKind::Symlink),
+                    ),
+                    (
+                        std::ffi::OsString::from("blocked-b"),
+                        Some(EntryKind::Symlink),
+                    ),
+                    (std::ffi::OsString::from("later"), Some(EntryKind::File)),
+                ]),
+                UpdateEntries::Live,
+            ));
+            tokio::pin!(operation);
+            let mut completed_while_gated = None;
+            let saturated = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let std::task::Poll::Ready(output) = futures::poll!(operation.as_mut()) {
+                        completed_while_gated = Some(output);
+                        return;
+                    }
+                    if available_open_file_capacity(2) == 0 {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let remove_result = tokio::fs::remove_file(src.join("vanished")).await;
+            drop(held_stat);
+            if let Some(output) = completed_while_gated {
+                drop(held_readlink.take());
+                reacquire_all_open_file_capacity(&admission, 2).await?;
+                return Err(anyhow!(
+                    "source link completed before its gated workers saturated admission: {:?}",
+                    output.err().map(|error| format!("{:#}", error.source))
+                ));
+            }
+            if let Err(error) = saturated {
+                drop(held_readlink.take());
+                let _ = admission
+                    .run_with_timeout(std::time::Duration::from_secs(20), operation.as_mut())
+                    .await;
+                reacquire_all_open_file_capacity(&admission, 2).await?;
+                return Err(error).context("source workers did not saturate open-file admission");
+            }
+            if let Err(error) = remove_result {
+                drop(held_readlink.take());
+                let _ = admission
+                    .run_with_timeout(std::time::Duration::from_secs(20), operation.as_mut())
+                    .await;
+                reacquire_all_open_file_capacity(&admission, 2).await?;
+                return Err(error).context("failed to remove the injected source entry");
+            }
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(1), operation.as_mut()).await;
+            drop(held_readlink.take());
+            if result.is_err() {
+                let _ = admission
+                    .run_with_timeout(std::time::Duration::from_secs(20), operation.as_mut())
+                    .await;
+            }
+            reacquire_all_open_file_capacity(&admission, 2).await?;
+            let error = result
+                .context("fail-early source error was not reaped during admission")?
+                .expect_err("the vanished source entry must fail the link");
+            assert!(format!("{:#}", error.source).contains("vanished"));
+            assert!(!dst.join("later").exists());
+            assert!(!dst.join("uninjected").exists());
+            Ok(())
+        }
+
+        /// Unknown source classification errors are child errors, so keep-going must still run
+        /// later siblings and fold the successful work into the combined result.
+        #[tokio::test(flavor = "current_thread")]
+        async fn source_unknown_classification_error_keeps_going_with_siblings()
+        -> Result<(), anyhow::Error> {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("src");
+            let dst = root.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&dst).await?;
+            tokio::fs::write(src.join("first"), b"first").await?;
+            tokio::fs::write(src.join("last"), b"last").await?;
+            tokio::fs::write(src.join("uninjected"), b"uninjected").await?;
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(3);
+            let src_dir =
+                Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+            let dst_dir =
+                Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
+            let dst_parent =
+                Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Destination).await?);
+            let mut filter = crate::filter::FilterSettings::new();
+            filter.add_exclude("never/")?;
+            let mut settings = common_settings(false, false);
+            settings.filter = Some(filter.clone());
+            settings.copy_settings.filter = Some(filter);
+            let operation = crate::walk_driver::scope_tasks(link_dir_contents(
+                &PROGRESS,
+                &src_dir,
+                None,
+                Some(&dst_dir),
+                Some(&dst_parent),
+                std::ffi::OsStr::new("dst"),
+                &src,
+                &dst,
+                None,
+                std::path::Path::new(""),
+                &src,
+                &dst,
+                false,
+                false,
+                None,
+                &settings,
+                Summary::default(),
+                SourceEntries::Injected(vec![
+                    (std::ffi::OsString::from("first"), None),
+                    (std::ffi::OsString::from("vanished"), None),
+                    (std::ffi::OsString::from("last"), None),
+                ]),
+                UpdateEntries::Live,
+            ));
+            let result = admission
+                .run_with_timeout(std::time::Duration::from_secs(20), operation)
+                .await;
+            reacquire_all_open_file_capacity(&admission, 3).await?;
+            let error = result
+                .context("keep-going unknown-source link did not terminate")?
+                .expect_err("the injected vanished source must fail");
+            assert_eq!(error.summary.hard_links_created, 2);
+            assert_eq!(tokio::fs::read(dst.join("first")).await?, b"first");
+            assert_eq!(tokio::fs::read(dst.join("last")).await?, b"last");
+            assert!(!dst.join("uninjected").exists());
+            Ok(())
+        }
+
+        /// An excluded unknown directory must be counted from its exact worker classification,
+        /// never from a fallback file kind in the producer loop.
+        #[tokio::test]
+        async fn source_unknown_excluded_directory_uses_directory_skip_accounting()
+        -> Result<(), anyhow::Error> {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("src");
+            let dst = root.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&dst).await?;
+            tokio::fs::create_dir(src.join("node")).await?;
+            tokio::fs::write(src.join("uninjected"), b"uninjected").await?;
+            let src_dir =
+                Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+            let dst_dir =
+                Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
+            let dst_parent =
+                Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Destination).await?);
+            let mut filter = crate::filter::FilterSettings::new();
+            filter.add_exclude("node/")?;
+            let mut settings = common_settings(false, false);
+            settings.filter = Some(filter.clone());
+            settings.copy_settings.filter = Some(filter);
+            let summary = crate::walk_driver::scope_tasks(link_dir_contents(
+                &PROGRESS,
+                &src_dir,
+                None,
+                Some(&dst_dir),
+                Some(&dst_parent),
+                std::ffi::OsStr::new("dst"),
+                &src,
+                &dst,
+                None,
+                std::path::Path::new(""),
+                &src,
+                &dst,
+                false,
+                false,
+                None,
+                &settings,
+                Summary::default(),
+                SourceEntries::Injected(vec![(std::ffi::OsString::from("node"), None)]),
+                UpdateEntries::Live,
+            ))
+            .await?;
+            assert_eq!(summary.copy_summary.directories_skipped, 1);
+            assert_eq!(summary.copy_summary.files_skipped, 0);
+            assert!(!dst.join("node").exists());
+            assert!(!dst.join("uninjected").exists());
+            Ok(())
+        }
+
+        /// Unknown source entries must be admitted and spawned independently before either exact
+        /// classification completes.
+        #[tokio::test(flavor = "current_thread")]
+        async fn source_unknown_workers_classify_concurrently() -> Result<(), anyhow::Error> {
+            let root = testutils::create_temp_dir().await?;
+            let src = root.join("src");
+            let dst = root.join("dst");
+            tokio::fs::create_dir(&src).await?;
+            tokio::fs::create_dir(&dst).await?;
+            tokio::fs::write(src.join("first"), b"first").await?;
+            tokio::fs::write(src.join("second"), b"second").await?;
+            tokio::fs::write(src.join("uninjected"), b"uninjected").await?;
+            let admission = testutils::AdmissionLimit::new().await;
+            admission.set_max_open_files(2);
+            let stat_resource =
+                throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
+            admission.set_max_ops_in_flight(stat_resource, 1);
+            let src_dir =
+                Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
+            let dst_dir =
+                Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
+            let dst_parent =
+                Arc::new(Dir::open_root_dir(&root, false, congestion::Side::Destination).await?);
+            let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
+            let mut filter = crate::filter::FilterSettings::new();
+            filter.add_exclude("never/")?;
+            let mut settings = common_settings(false, false);
+            settings.filter = Some(filter.clone());
+            settings.copy_settings.filter = Some(filter);
+            let operation = crate::walk_driver::scope_tasks(link_dir_contents(
+                &PROGRESS,
+                &src_dir,
+                None,
+                Some(&dst_dir),
+                Some(&dst_parent),
+                std::ffi::OsStr::new("dst"),
+                &src,
+                &dst,
+                None,
+                std::path::Path::new(""),
+                &src,
+                &dst,
+                false,
+                false,
+                None,
+                &settings,
+                Summary::default(),
+                SourceEntries::Injected(vec![
+                    (std::ffi::OsString::from("first"), None),
+                    (std::ffi::OsString::from("second"), None),
+                ]),
+                UpdateEntries::Live,
+            ));
+            tokio::pin!(operation);
+            let mut completed_while_gated = None;
+            let concurrent = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let std::task::Poll::Ready(output) = futures::poll!(operation.as_mut()) {
+                        completed_while_gated = Some(output);
+                        return;
+                    }
+                    if available_open_file_capacity(2) == 0 {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            drop(held_stat);
+            let task_result = admission
+                .run_with_timeout(std::time::Duration::from_secs(20), operation.as_mut())
+                .await;
+            reacquire_all_open_file_capacity(&admission, 2).await?;
+            if let Some(output) = completed_while_gated {
+                return Err(anyhow!(
+                    "unknown source link completed before gated classifications: {:?}",
+                    output.err().map(|error| format!("{:#}", error.source))
+                ));
+            }
+            concurrent.context("unknown source workers did not classify concurrently")?;
+            let summary = task_result
+                .context("unknown source classifications did not resume after stat release")??;
+            assert_eq!(summary.hard_links_created, 2);
+            assert!(!dst.join("uninjected").exists());
+            Ok(())
+        }
+
         /// Included update-only file hints must be admitted and spawned independently before
         /// either worker's exact classification completes.
         #[tokio::test(flavor = "current_thread")]
@@ -6828,6 +7210,7 @@ mod link_tests {
                 None,
                 &settings,
                 Summary::default(),
+                SourceEntries::Live,
                 UpdateEntries::Injected(vec![
                     (std::ffi::OsString::from("first"), Some(EntryKind::File)),
                     (std::ffi::OsString::from("second"), Some(EntryKind::File)),
@@ -6922,6 +7305,7 @@ mod link_tests {
                 None,
                 &settings,
                 Summary::default(),
+                SourceEntries::Live,
                 UpdateEntries::Injected(vec![
                     (std::ffi::OsString::from("first"), Some(EntryKind::File)),
                     (std::ffi::OsString::from("middle"), Some(EntryKind::File)),
