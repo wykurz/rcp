@@ -155,11 +155,11 @@ async fn copy_emits_one_metadata_sample_per_tree_entry() {
     // `symlink_metadata`/`create_dir`/`File::open`. The data copy (`copy_file_range`) stays
     // unprobed, like the `tokio::fs::copy` it replaced.
     //
-    // source-side metadata (19 total):
+    // source-side metadata (16 total):
     //   - 1 open_root_dir(src parent)                                          = 1
     //   - root dir:  child(stat) + open_dir(stat) + meta(fstat)                = 3
     //   - 2 subdirs: child(stat) + open_dir(stat) + meta(fstat)    × 2         = 6
-    //   - 3 files:   child(classify) + child(plan) + open_file_read × 3         = 9
+    //   - 3 files:   child(classify) + open_file_read × 3                       = 6
     //   (read_entries / getdents is deliberately unprobed; each directory's applied metadata is
     //    read from its own opened fd via `Dir::meta` — read-side fidelity, one fstat per dir)
     //
@@ -167,8 +167,8 @@ async fn copy_emits_one_metadata_sample_per_tree_entry() {
     // burns it first, so this counts the walk alone. Its cost is owned by `root_acl_probe_cost.rs`.
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Source),
-        19,
-        "expected 19 src metadata probes for the fd-based walk",
+        16,
+        "expected 16 src metadata probes for the fd-based walk",
     );
     // destination-side metadata (25 total):
     //   - 1 open_root_dir(dst parent)                                          = 1
@@ -222,11 +222,11 @@ async fn identical_overwrite_plans_without_a_payload_probe() {
     assert_eq!(summary.files_unchanged, 1);
     assert_eq!(summary.files_copied, 0);
     assert_eq!(std::fs::read_to_string(&dst).expect("read dst"), "KEEP-ME");
-    // source parent open + admitted classification + fresh by-name metadata planning. An eager
-    // open_file_read would add a fourth source Stat probe after the metadata-only plan.
+    // source parent open + admitted classification. Planning from the admitted metadata must not
+    // add a by-name probe, and the identical skip must not open the payload.
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Source),
-        3,
+        2,
         "identical overwrite must not probe the source payload",
     );
     // destination parent open + overwrite-candidate classification; a skip performs no mutation.
@@ -450,21 +450,20 @@ async fn link_update_path_emits_probes_for_update_tree() {
     // no root dir of its own). read_entries/getdents is unprobed; failed (NotFound) probes are
     // discarded by `run_metadata_probed`.
     //
-    // source-side (25 total):
+    // source-side (22 total):
     //   - open_root_dir(src parent) + open_root_dir(update parent)               = 2
     //   - root dir: src child + src open_dir + update child + update open_dir
     //               + meta(fstat, from the update dir)                            = 5
     //   - a/, b/:   src child + src open_dir + meta(fstat, from src dir) (× 2); the update
     //               lookups are NotFound and discarded                            = 6
     //   - 3 src .txt files: src child only (hard link reads src via linkat)       = 3
-    //   - 3 update-only files via copy_child: child(classify) + child(plan)
-    //     + open_file_read (× 3)                                                = 9
-    //   2 + 5 + 6 + 3 + 9 = 25. (Drops if the update-walk path stops spawning copies for u*.txt.)
+    //   - 3 update-only files via copy_child: child(classify) + open_file_read (× 3) = 6
+    //   2 + 5 + 6 + 3 + 6 = 22. (Drops if the update-walk path stops spawning copies for u*.txt.)
     //   (each directory's applied metadata is read from its own opened fd via `Dir::meta`.)
     assert_eq!(
         sink.metadata_count_for(congestion::Side::Source),
-        25,
-        "expected 25 src metadata probes — drops if the update-walk path stops spawning copies \
+        22,
+        "expected 22 src metadata probes — drops if the update-walk path stops spawning copies \
          for u*.txt",
     );
     // destination-side (28 total):
