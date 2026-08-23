@@ -13,21 +13,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   descriptor-admission default from the process soft `RLIMIT_NOFILE`, capped at 4096. A zero soft
   limit disables admission, and the process limit is never raised implicitly.
 
-- Local recursive copy, remove, chmod, and rlink walks now bound descriptor-heavy leaf work more
-  reliably on wide trees. Filters used by destructive or observable operations classify the exact
-  entry in the worker that acts on it, so stale directory hints cannot authorize an action or an
-  incorrect `--delete` keep decision. Ordinary reliable-hint exclusions remain cheap, and hinted
-  directories do not consume leaf admission merely to descend.
+- Local recursive copy, remove, chmod, and rlink walks now bound descriptor-heavy leaf work on wide
+  or slow trees, preventing `EMFILE` (Too many open files) failures from unbounded leaf fan-out. On
+  NFS and other filesystems that report `DT_UNKNOWN`, rlink classifies unknown source and update
+  entries in their scheduled workers, so type-sensitive filtering, keep-going errors, and directory
+  skip accounting use the entry those workers actually opened. Destructive or observable shared walk
+  filters likewise classify the exact entry in the worker that acts on it, so stale directory hints
+  cannot authorize an action or an incorrect `--delete` keep decision. Ordinary reliable-hint
+  exclusions remain cheap, and hinted directories do not consume leaf admission merely to descend.
 
-- In the shared local walk and rlink machinery, fail-early now waits for recursively spawned async
-  descendants to quiesce before returning. This does not extend to every `rcpd` traversal. Blocking
-  work that has already started remains outside that wait so the bounded runtime shutdown can still
-  abandon storage that never responds.
+- In the shared local copy/remove/chmod walks and rlink machinery, fail-early now waits for
+  recursively spawned async descendants to quiesce before returning. Rlink's source and update
+  producers also reap a ready child error before newly available admission can launch more work.
+  These guarantees do not extend to every `rcpd` traversal. Blocking work that has already started
+  remains outside the async wait so the bounded runtime shutdown can still abandon storage that
+  never responds.
 
-- Local file-copy planning now checks the destination and current source metadata before opening a
-  regular file for payload reads. Dry runs and identical/newer overwrite skips no longer require
-  read permission for source data; actionable copies reopen the payload and re-plan if its identity
-  changed.
+- Local regular-file copies now use the admitted `O_PATH` metadata as a point-in-time snapshot for
+  dry-run accounting and the initial overwrite comparison. Dry runs and identical/newer skips return
+  without an `O_RDONLY` payload open; actionable `Vacant` or `Replace` plans open the current
+  payload, and a changed `(dev, ino)` makes an overwrite candidate re-plan from the payload fd
+  before any destination mutation. This does not freeze the source name: a later same-parent,
+  same-type replacement after a metadata-only skip remains an accepted race.
+
+- Local `--delete` exclude protection now honors keep-going when exact entry classification fails:
+  the error is reported, later siblings are still processed, and completed removal totals are
+  retained. With fail-early, the traversal stops after reporting only work completed before the
+  failed entry.
 
 - Recursive removal now verifies the walked directory before descent and again before `rmdir`. After
   a successful removal, a zero link count proves the pinned inode was unlinked; filesystems that

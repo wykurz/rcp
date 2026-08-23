@@ -125,6 +125,8 @@ pub(crate) enum FdIdentityProbeOperation {
 }
 
 #[cfg(test)]
+// process-global injectors require nextest isolation or libtest `--test-threads=1`; parallel
+// in-process libtest is unsupported.
 static FD_IDENTITY_PROBE_FAILURE: std::sync::LazyLock<
     std::sync::Mutex<Option<(FdIdentityProbeOperation, usize)>>,
 > = std::sync::LazyLock::new(Default::default);
