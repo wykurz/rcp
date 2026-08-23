@@ -1404,7 +1404,7 @@ impl WalkVisitor for CopyVisitor {
                     // un-throttled syscall re-resolving a path we had just probed.
                     Ok(meta) => !meta.is_dir(),
                     // `NotFound` is the ONE error that means the slot is empty — the same rule
-                    // [`dry_run_dst_exists`] and [`plan_dst_file`] follow. Every other failure
+                    // [`dry_run_dst_exists`] and [`preflight_dst_file`] follow. Every other failure
                     // (`EACCES` on a destination parent, `ELOOP`, `ENOTDIR`, `EIO`) says we could not
                     // look, and reporting those as "nothing there" made `--dry-run` announce
                     // "would copy" and exit 0 for a subtree the real run cannot even reach.
@@ -1611,8 +1611,9 @@ async fn dry_run_dst_exists(dst_path: &std::path::Path) -> Result<bool, Error> {
     }
     match tokio::fs::symlink_metadata(dst_path).await {
         Ok(_) => Ok(true),
-        // `NotFound` is the ONE error that means the slot is empty — the same rule [`plan_dst_file`]
-        // and the remote destination follow. Every other failure (EACCES on a parent directory,
+        // `NotFound` is the ONE error that means the slot is empty — the same rule
+        // [`preflight_dst_file`] and the remote destination follow. Every other failure (EACCES on a
+        // parent directory,
         // ELOOP, ENOTDIR, EIO) says we could not LOOK, not that there is nothing there. Reporting
         // those as vacant made `--dry-run --ignore-existing` print "would copy" and exit 0 through a
         // destination parent it cannot even traverse — predicting a copy the real run then fails, and
@@ -1682,45 +1683,43 @@ async fn copy_file_fd(
         } else {
             preflight_dst_file(prog_track, dst_parent, dst_name, dst_path, settings).await?
         };
-        let preflight = match preflight {
+        // the admitted handle is the approved point-in-time metadata snapshot. Only a vacant slot
+        // or a candidate that differs from that snapshot needs the current payload opened.
+        let (current, plan) = match preflight {
             DestinationPreflight::Skip(summary) => return Ok(summary),
-            preflight => preflight,
+            DestinationPreflight::Vacant => (
+                CurrentRegular::open(src_parent, name, src_path).await?,
+                FilePlan::Vacant,
+            ),
+            DestinationPreflight::OverwriteCandidate(dst_handle) => {
+                match plan_overwrite_candidate(prog_track, &dst_handle, src_handle.meta(), settings)
+                {
+                    OverwriteCandidateDecision::Skip(summary) => return Ok(summary),
+                    OverwriteCandidateDecision::Replace => {}
+                }
+                // if the actionable payload no longer has the admitted identity, re-plan from the
+                // payload fd's paired metadata before touching the destination.
+                let current = CurrentRegular::open(src_parent, name, src_path).await?;
+                if !current.matches(src_handle)
+                    && let OverwriteCandidateDecision::Skip(summary) =
+                        plan_overwrite_candidate(prog_track, &dst_handle, &current.meta, settings)
+                {
+                    return Ok(summary);
+                }
+                (current, FilePlan::Replace(dst_handle))
+            }
         };
-        // `src_handle` is the pinned type authorization selected by the caller. Metadata planning
-        // remains by-name: a fresh O_PATH handle snapshots the current regular entry without
-        // requiring payload-read permission or reusing the selected handle's potentially stale
-        // metadata.
-        let metadata_current = CurrentRegularMetadata::open(src_parent, name, src_path).await?;
-        let initial_decision =
-            plan_dst_file(prog_track, &preflight, metadata_current.meta(), settings);
-        if let FilePlanDecision::Skip(summary) = initial_decision {
-            return Ok(summary);
-        }
-        // only an actionable plan acquires O_RDONLY. If the name changed since metadata planning,
-        // recompute against the payload fd's paired metadata before any destination mutation.
-        let current = CurrentRegular::open(src_parent, name, src_path).await?;
-        let decision = if metadata_current.matches(&current) {
-            initial_decision
-        } else {
-            plan_dst_file(prog_track, &preflight, &current.meta, settings)
-        };
-        drop(metadata_current);
-        let plan = finish_dst_plan(preflight, decision);
-        if let FilePlan::Skip(summary) = plan {
-            return Ok(summary);
-        }
         return copy_current_regular(
             prog_track, src_parent, dst_parent, dst_name, dst_path, src_path, current, plan,
             settings, preserve,
         )
         .await;
     }
-    let metadata_current = CurrentRegularMetadata::open(src_parent, name, src_path).await?;
     // dry-run: report and return what would happen without touching the destination.
     crate::dry_run::report_action("copy", src_path, Some(dst_path), "file");
     Ok(Summary {
         files_copied: 1,
-        bytes_copied: metadata_current.meta().size(),
+        bytes_copied: src_handle.meta().size(),
         ..Default::default()
     })
 }
@@ -1811,10 +1810,19 @@ async fn copy_current_regular(
                     .await
                     // rebuild from `err.source`, never from a stringified error: the chain must survive.
                     .map_err(|err| Error::new(err.source, err.summary + copy_summary))?;
-            let decision = plan_dst_file(prog_track, &preflight, &src_meta, settings);
-            let plan = match finish_dst_plan(preflight, decision) {
-                FilePlan::Skip(summary) => return Ok(skip_summary(summary, &copy_summary)),
-                plan => plan,
+            let plan = match preflight {
+                DestinationPreflight::Vacant => FilePlan::Vacant,
+                DestinationPreflight::Skip(summary) => {
+                    return Ok(skip_summary(summary, &copy_summary));
+                }
+                DestinationPreflight::OverwriteCandidate(dst_handle) => {
+                    match plan_overwrite_candidate(prog_track, &dst_handle, &src_meta, settings) {
+                        OverwriteCandidateDecision::Skip(summary) => {
+                            return Ok(skip_summary(summary, &copy_summary));
+                        }
+                        OverwriteCandidateDecision::Replace => FilePlan::Replace(dst_handle),
+                    }
+                }
             };
             execute_dst_plan(
                 prog_track,
@@ -2089,39 +2097,6 @@ async fn copy_symlink_fd(
     }
 }
 
-/// A metadata-only snapshot of the current by-name regular source.
-struct CurrentRegularMetadata(Handle);
-
-impl CurrentRegularMetadata {
-    /// Opens the current final component O_PATH and rejects a replacement of any non-regular type.
-    async fn open(
-        src_parent: &Dir,
-        name: &OsStr,
-        src_path: &std::path::Path,
-    ) -> Result<Self, Error> {
-        let handle = src_parent
-            .child(name)
-            .await
-            .with_context(|| format!("failed reading metadata from src file {:?}", src_path))
-            .map_err(|err| Error::new(err, Default::default()))?;
-        if handle.kind() != EntryKind::File {
-            return Err(Error::new(
-                anyhow!("source {:?} is no longer a regular file", src_path),
-                Default::default(),
-            ));
-        }
-        Ok(Self(handle))
-    }
-
-    fn meta(&self) -> &FileMeta {
-        self.0.meta()
-    }
-
-    fn matches(&self, current: &CurrentRegular) -> bool {
-        self.0.dev() == current.meta.dev() && self.0.ino() == current.meta.ino()
-    }
-}
-
 /// The current by-name regular source whose metadata and bytes come from one open descriptor.
 struct CurrentRegular {
     file: std::fs::File,
@@ -2142,6 +2117,10 @@ impl CurrentRegular {
             .map_err(|err| Error::new(err, Default::default()))?;
         Ok(Self { file, meta })
     }
+
+    fn matches(&self, handle: &Handle) -> bool {
+        self.meta.dev() == handle.dev() && self.meta.ino() == handle.ino()
+    }
 }
 
 /// Source-independent decision made before reopening the current regular source.
@@ -2160,9 +2139,6 @@ enum DestinationPreflight {
 enum FilePlan {
     /// Nothing is in the way. Create straight away.
     Vacant,
-    /// Leave the destination alone and return this summary without creating anything
-    /// (`--ignore-existing`, or a file the comparison deems identical / newer).
-    Skip(Summary),
     /// An entry is in the way and `--overwrite` says to replace it. Carries the handle it was
     /// classified through, which [`remove_existing`] re-checks by inode before unlinking — so the
     /// gap between planning and executing fails closed rather than removing whatever occupies the
@@ -2175,36 +2151,15 @@ enum FilePlan {
     Replace(Handle),
 }
 
-/// Reusable metadata-only decision for a destination preflight.
+/// Metadata-dependent decision for an occupied overwrite candidate.
 #[derive(Clone, Copy, Debug)]
-enum FilePlanDecision {
-    Vacant,
+enum OverwriteCandidateDecision {
     Skip(Summary),
     Replace,
 }
 
-/// Pair a borrowed planning decision back with the preflight state that owns its destination
-/// handle. This is the only step that consumes the candidate, after source identity is settled.
-fn finish_dst_plan(preflight: DestinationPreflight, decision: FilePlanDecision) -> FilePlan {
-    match decision {
-        FilePlanDecision::Skip(summary) => FilePlan::Skip(summary),
-        FilePlanDecision::Vacant => match preflight {
-            DestinationPreflight::Vacant => FilePlan::Vacant,
-            DestinationPreflight::Skip(_) | DestinationPreflight::OverwriteCandidate(_) => {
-                unreachable!("vacant decision requires a vacant preflight")
-            }
-        },
-        FilePlanDecision::Replace => match preflight {
-            DestinationPreflight::OverwriteCandidate(dst_handle) => FilePlan::Replace(dst_handle),
-            DestinationPreflight::Vacant | DestinationPreflight::Skip(_) => {
-                unreachable!("replace decision requires an overwrite candidate")
-            }
-        },
-    }
-}
-
-/// Merge a [`FilePlan::Skip`]'s summary with removals the copy already performed, producing what
-/// the caller returns.
+/// Merge a skipped plan's summary with removals the copy already performed, producing what the
+/// caller returns.
 ///
 /// Needed because a copy can plan the slot twice — once up front, then again after `create_file`
 /// reports it refilled — and a removal performed before the first create must survive into the
@@ -2220,10 +2175,10 @@ fn skip_summary(skip: Summary, copy_summary: &Summary) -> Summary {
 /// Carry out the one mutating step a [`FilePlan`] can call for, folding its accounting into the
 /// running copy summary so every later error payload reports the removal that already happened.
 ///
-/// Split from [`preflight_dst_file`] and [`plan_dst_file`] deliberately: the caller settles
-/// destination-only outcomes, opens the current source, and reserves throttle capacity before
-/// actually unlinking. When those were one step, a copy that then failed to open its source had
-/// already deleted a destination it could no longer replace. The split buys nothing against
+/// Split from [`preflight_dst_file`] and [`plan_overwrite_candidate`] deliberately: the caller
+/// settles destination-only outcomes, opens the current source, and reserves throttle capacity
+/// before actually unlinking. When those were one step, a copy that then failed to open its source
+/// had already deleted a destination it could no longer replace. The split buys nothing against
 /// *cancellation* — see [`copy_file_fd`] for why rcp does not chase that.
 async fn execute_dst_plan(
     prog_track: &'static progress::Progress,
@@ -2236,9 +2191,6 @@ async fn execute_dst_plan(
 ) -> Result<(), Error> {
     let dst_handle = match plan {
         FilePlan::Vacant => return Ok(()),
-        // the caller returns on `Skip` before reaching here; treating it as a no-op keeps this
-        // total rather than panicking on a shape only a caller bug could produce.
-        FilePlan::Skip(_) => return Ok(()),
         FilePlan::Replace(dst_handle) => dst_handle,
     };
     match remove_existing(
@@ -2264,7 +2216,8 @@ async fn execute_dst_plan(
 ///
 /// An occupied slot either skips under `--ignore-existing`, fails without `--overwrite`, or becomes
 /// an [`DestinationPreflight::OverwriteCandidate`] whose metadata-dependent comparison is deferred
-/// to [`plan_dst_file`]. A vacant slot needs no source metadata either. This function never mutates.
+/// to [`plan_overwrite_candidate`]. A vacant slot needs no source metadata either. This function
+/// never mutates.
 ///
 /// [`copy_file_fd`] calls this from both of its routes: up front when the destination is not
 /// known-fresh, and again when the destination was believed fresh but `create_file` reported the
@@ -2316,25 +2269,20 @@ async fn preflight_dst_file(
     Ok(DestinationPreflight::OverwriteCandidate(dst_handle))
 }
 
-/// Inspect destination planning using a current regular source's metadata without consuming the
-/// destination candidate. The caller can therefore repeat the decision if payload identity drifts.
-fn plan_dst_file(
+/// Inspect an overwrite candidate using a regular source's metadata without consuming the
+/// destination handle. The caller can therefore repeat the decision if payload identity drifts.
+fn plan_overwrite_candidate(
     prog_track: &'static progress::Progress,
-    preflight: &DestinationPreflight,
+    dst_handle: &Handle,
     src_meta: &FileMeta,
     settings: &Settings,
-) -> FilePlanDecision {
-    let dst_handle = match preflight {
-        DestinationPreflight::Vacant => return FilePlanDecision::Vacant,
-        DestinationPreflight::Skip(summary) => return FilePlanDecision::Skip(*summary),
-        DestinationPreflight::OverwriteCandidate(dst_handle) => dst_handle,
-    };
+) -> OverwriteCandidateDecision {
     tracing::debug!("file exists, check if it's identical");
     if dst_handle.kind() == EntryKind::File {
         if filecmp::metadata_equal(&settings.overwrite_compare, src_meta, dst_handle.meta()) {
             tracing::debug!("file is identical, skipping");
             prog_track.files_unchanged.inc();
-            return FilePlanDecision::Skip(Summary {
+            return OverwriteCandidateDecision::Skip(Summary {
                 files_unchanged: 1,
                 ..Default::default()
             });
@@ -2344,14 +2292,14 @@ fn plan_dst_file(
         {
             tracing::debug!("dest is newer than source, skipping");
             prog_track.files_unchanged.inc();
-            return FilePlanDecision::Skip(Summary {
+            return OverwriteCandidateDecision::Skip(Summary {
                 files_unchanged: 1,
                 ..Default::default()
             });
         }
     }
     tracing::info!("destination differs, will replace existing entry");
-    FilePlanDecision::Replace
+    OverwriteCandidateDecision::Replace
 }
 
 /// An opened destination directory plus the bookkeeping the caller needs.
@@ -3963,7 +3911,7 @@ mod copy_tests {
                 // source open — which now happens BEFORE the destination is unlinked, so
                 // `bar/baz/4.txt` survives a copy that could never have replaced it. Removing it
                 // first and discovering the unreadable source afterwards is the data-loss shape
-                // `plan_dst_file`/`execute_dst_plan` exist to prevent.
+                // `plan_overwrite_candidate`/`execute_dst_plan` exist to prevent.
                 assert_eq!(error.summary.rm_summary.files_removed, 1);
                 assert!(
                     output_path.join("baz").join("4.txt").exists(),
@@ -7117,12 +7065,11 @@ mod copy_tests {
         Ok(())
     }
 
-    /// An admitted regular file retains its selected handle only for type authorization. Overwrite
-    /// planning must compare the destination with the current by-name file that will supply the
-    /// bytes, not with the earlier selected inode.
+    /// The admitted handle is the approved point-in-time metadata snapshot. A later same-type
+    /// replacement does not force work when that snapshot already matches the destination.
     #[tokio::test]
     #[traced_test]
-    async fn admitted_file_replacement_overwrites_destination_matching_selected_file()
+    async fn admitted_file_replacement_matching_destination_does_not_force_work()
     -> Result<(), anyhow::Error> {
         let root = testutils::create_temp_dir().await?;
         let src = root.join("source");
@@ -7185,11 +7132,84 @@ mod copy_tests {
             .context("admitted replacement copy did not return open-file capacity")?;
         drop(returned);
 
-        assert_eq!(summary.files_copied, 1);
-        assert_eq!(
-            tokio::fs::read_to_string(&dst).await?,
-            "CURRENT-BY-NAME-REPLACEMENT"
+        assert_eq!(summary.files_unchanged, 1);
+        assert_eq!(summary.files_copied, 0);
+        assert_eq!(summary.rm_summary.files_removed, 0);
+        assert_eq!(tokio::fs::read_to_string(&dst).await?, "SELECTED-A");
+        Ok(())
+    }
+
+    /// An action planned from the admitted snapshot must be reconsidered when the opened payload
+    /// has another identity. The payload fd's paired metadata can turn that replace into a skip.
+    #[tokio::test]
+    #[traced_test]
+    async fn actionable_admitted_file_replacement_replans_against_opened_payload()
+    -> Result<(), anyhow::Error> {
+        let root = testutils::create_temp_dir().await?;
+        let src = root.join("source");
+        let dst = root.join("destination");
+        tokio::fs::write(&src, "SELECTED-A").await?;
+        tokio::fs::write(&dst, "KEEP-ME").await?;
+
+        let admission = testutils::AdmissionLimit::new().await;
+        admission.set_max_open_files(1);
+        let src_parent = Arc::new(
+            Dir::open_parent_dir(&root, congestion::Side::Source)
+                .await?
+                .into_tree(),
         );
+        let dst_parent = Arc::new(
+            Dir::open_parent_dir(&root, congestion::Side::Destination)
+                .await?
+                .into_tree(),
+        );
+        let selected = src_parent.child(std::ffi::OsStr::new("source")).await?;
+        assert_eq!(selected.kind(), EntryKind::File);
+        let permit = crate::walk::ensure_leaf_permit(PermitKind::OpenFile, None).await;
+        let entry = AdmittedEntry::new(selected, permit);
+
+        tokio::fs::remove_file(&src).await?;
+        tokio::fs::write(&src, "PAYLOAD").await?;
+        let mut settings = settings_with_delete(None);
+        settings.overwrite = true;
+        settings.overwrite_compare = filecmp::MetadataCmpSettings {
+            size: true,
+            ..Default::default()
+        };
+
+        let summary = admission
+            .run_with_timeout(
+                std::time::Duration::from_secs(20),
+                copy_child(
+                    &PROGRESS,
+                    &src_parent,
+                    Some(&dst_parent),
+                    std::ffi::OsStr::new("source"),
+                    &src,
+                    &dst,
+                    std::path::Path::new(""),
+                    &settings,
+                    &NO_PRESERVE_SETTINGS,
+                    false,
+                    DeleteScanAnchor::new(&dst, std::path::Path::new("")),
+                    CopyEntryAdmission::Admitted(entry),
+                ),
+            )
+            .await
+            .context("actionable admitted replacement did not finish at a limit of one")??;
+        let returned = admission
+            .run_with_timeout(
+                std::time::Duration::from_secs(20),
+                throttle::open_file_permit(),
+            )
+            .await
+            .context("actionable admitted replacement did not return open-file capacity")?;
+        drop(returned);
+
+        assert_eq!(summary.files_unchanged, 1);
+        assert_eq!(summary.files_copied, 0);
+        assert_eq!(summary.rm_summary.files_removed, 0);
+        assert_eq!(tokio::fs::read_to_string(&dst).await?, "KEEP-ME");
         Ok(())
     }
 
