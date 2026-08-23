@@ -31,12 +31,13 @@ cargo test --doc                            # Documentation tests
 
 ### Test Profiles
 
-The project uses [cargo-nextest](https://nexte.st/) for faster test execution:
+The project uses [cargo-nextest](https://nexte.st/) for faster test execution.
 
-Tests that mutate process-global admission, congestion, hooks, or file-descriptor state must run
-through nextest's per-test process isolation, or through libtest with `--test-threads=1`. The
-standard `just test` and `just ci` paths use nextest; the Nix libtest check phase keeps
-`--test-threads=1` for the same contract. Do not add broad serialization for unrelated tests.
+Fixtures that mutate process-global admission, congestion, hooks, or file-descriptor state are
+supported through nextest's per-test process isolation or through libtest with `--test-threads=1`.
+Parallel in-process libtest is unsupported for these fixtures. The standard `just test` and
+`just ci` paths use nextest; the Nix libtest check phase keeps `--test-threads=1` for the same
+contract. Do not add broad serialization for unrelated tests.
 
 ```bash
 # Default profile (debug tests)
