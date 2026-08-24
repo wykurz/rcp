@@ -176,14 +176,6 @@ struct Args {
     #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
     quiet: bool,
 
-    #[arg(
-        long,
-        value_name = "N",
-        help = common::cli::LEAF_ADMISSION_HELP,
-        help_heading = "Performance & throttling"
-    )]
-    max_open_files: Option<usize>,
-
     /// Chunk size for calculating I/O operations per file
     ///
     /// Required when using --iops-throttle (must be > 0)
@@ -273,10 +265,12 @@ struct Args {
     #[arg(long, value_name = "SIZE", help_heading = "Remote copy options")]
     remote_copy_buffer_size: Option<bytesize::ByteSize>,
 
-    /// Maximum concurrent TCP connections for file transfers (default: 100)
+    /// Maximum concurrent data connections (default: 100)
     ///
-    /// Each file transfer uses one TCP connection. Higher values allow more
-    /// parallel file transfers but use more resources.
+    /// This separately configurable ceiling defaults to 100. Effective data streams are
+    /// min(--max-files-in-flight, --max-connections). Higher values allow more parallel file
+    /// transfers but use more resources. To raise remote parallelism above the CPU-derived file
+    /// default, increase both ceilings.
     #[arg(
         long,
         default_value = "100",
@@ -288,9 +282,8 @@ struct Args {
 
     /// Multiplier for pending file writes (default: 4)
     ///
-    /// Controls backpressure by limiting pending file transfers to
-    /// max_connections × multiplier. Higher values allow more files to be
-    /// queued but use more memory when the destination is slow.
+    /// Pending capacity is effective data streams × pending-writes-multiplier. Higher values allow
+    /// more files to be queued but use more memory when the destination is slow.
     #[arg(
         long,
         default_value = "4",
@@ -462,44 +455,37 @@ fn rcpd_closed_quietly(role: &str, host: &str, expected: &str) -> String {
     )
 }
 
-#[instrument]
-async fn run_rcpd_master(
+#[derive(Debug)]
+struct MasterRemoteConfigs {
+    tcp: remote::TcpConfig,
+    rcpd: remote::protocol::RcpdConfig,
+}
+
+fn build_master_remote_configs(
     args: &Args,
-    preserve: &common::preserve::Settings,
-    src: &path::RemotePath,
-    dst: &path::RemotePath,
-) -> anyhow::Result<common::copy::Summary> {
-    tracing::debug!("running rcpd src/dst");
-    // install rustls crypto provider (ring) before any TLS operations
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
-    // build TCP config (used for the master's own connections to each rcpd)
-    let tcp_config = remote::TcpConfig {
+    files_in_flight: common::ResolvedFilesInFlight,
+    master_cert_fingerprint: Option<remote::protocol::CertFingerprint>,
+) -> anyhow::Result<MasterRemoteConfigs> {
+    let configured_connections = std::num::NonZeroUsize::new(args.max_connections)
+        .expect("clap rejects zero --max-connections");
+    let effective_connections =
+        remote::effective_max_connections(files_in_flight.limit(), configured_connections);
+    let tcp = remote::TcpConfig {
         port_ranges: args.port_ranges.clone(),
         conn_timeout_sec: args.remote_copy_conn_timeout_sec,
         network_profile: args.network_profile,
         buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
-        max_connections: args.max_connections,
+        max_connections: effective_connections.get(),
         pending_writes_multiplier: args.pending_writes_multiplier,
         keepalive_sec: args.remote_keepalive_sec,
     };
-    let mut rcpd_processes: Vec<remote::RcpdProcess> = vec![];
-    // generate master's TLS certificate for authenticating to rcpd (when encryption enabled)
-    let master_cert = if !args.no_encryption {
-        Some(
-            remote::tls::generate_self_signed_cert()
-                .context("failed to generate master TLS certificate")?,
-        )
-    } else {
-        None
-    };
-    let rcpd_config = remote::protocol::RcpdConfig {
+    tcp.max_pending_files()?;
+    let rcpd = remote::protocol::RcpdConfig {
         verbose: args.common.verbose,
         fail_early: args.fail_early,
         max_workers: args.common.max_workers,
         max_blocking_threads: args.common.max_blocking_threads,
-        max_open_files: args.max_open_files,
+        max_files_in_flight: files_in_flight.limit(),
         ops_throttle: args.common.ops_throttle,
         iops_throttle: args.common.iops_throttle,
         chunk_size: args.chunk_size.0 as usize,
@@ -521,7 +507,7 @@ async fn run_rcpd_master(
             || args.common.auto_meta_histogram_log.is_some()
         {
             args.common
-                .throttle_config(args.max_open_files, args.chunk_size.0)
+                .throttle_config(files_in_flight, args.chunk_size.0)
                 .auto_meta
         } else {
             None
@@ -549,7 +535,7 @@ async fn run_rcpd_master(
         remote_keepalive_sec: args.remote_keepalive_sec,
         network_profile: args.network_profile,
         buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
-        max_connections: args.max_connections,
+        max_connections: effective_connections.get(),
         pending_writes_multiplier: args.pending_writes_multiplier,
         chrome_trace_prefix: args.chrome_trace.clone(),
         flamegraph_prefix: args.flamegraph.clone(),
@@ -557,8 +543,45 @@ async fn run_rcpd_master(
         tokio_console: args.tokio_console,
         tokio_console_port: args.tokio_console_port,
         encryption: !args.no_encryption,
-        master_cert_fingerprint: master_cert.as_ref().map(|c| c.fingerprint),
+        master_cert_fingerprint,
     };
+    Ok(MasterRemoteConfigs { tcp, rcpd })
+}
+
+#[instrument]
+async fn run_rcpd_master(
+    args: &Args,
+    preserve: &common::preserve::Settings,
+    src: &path::RemotePath,
+    dst: &path::RemotePath,
+    files_in_flight: common::ResolvedFilesInFlight,
+) -> anyhow::Result<common::copy::Summary> {
+    tracing::debug!("running rcpd src/dst");
+    // install rustls crypto provider (ring) before any TLS operations
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+    let mut rcpd_processes: Vec<remote::RcpdProcess> = vec![];
+    // generate master's TLS certificate for authenticating to rcpd (when encryption enabled)
+    let master_cert = if !args.no_encryption {
+        Some(
+            remote::tls::generate_self_signed_cert()
+                .context("failed to generate master TLS certificate")?,
+        )
+    } else {
+        None
+    };
+    let configs = build_master_remote_configs(
+        args,
+        files_in_flight,
+        master_cert.as_ref().map(|c| c.fingerprint),
+    )?;
+    tracing::info!(
+        "Effective remote connection count: {}",
+        configs.tcp.max_connections
+    );
+    let tcp_config = configs.tcp;
+    let rcpd_config = configs.rcpd;
     // deduplicate sessions if src and dst are the same host
     // this avoids deploying rcpd twice to the same location
     let sessions = if src.session() == dst.session() {
@@ -917,7 +940,10 @@ async fn run_rcpd_master(
 }
 
 #[instrument]
-async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
+async fn async_main(
+    args: Args,
+    files_in_flight: common::ResolvedFilesInFlight,
+) -> anyhow::Result<common::copy::Summary> {
     if args.paths.len() < 2 {
         return Err(anyhow!(
             "You must specify at least one source path and one destination path!"
@@ -1035,7 +1061,9 @@ async fn async_main(args: Args) -> anyhow::Result<common::copy::Summary> {
                 remote_dst.path()
             ));
         }
-        return match run_rcpd_master(&args, &preserve, &remote_src, &remote_dst).await {
+        return match run_rcpd_master(&args, &preserve, &remote_src, &remote_dst, files_in_flight)
+            .await
+        {
             Ok(summary) => Ok(summary),
             Err(error) => {
                 if let Some(copy_error) = error.downcast_ref::<common::copy::Error>()
@@ -1294,6 +1322,7 @@ fn main() -> Result<(), anyhow::Error> {
     }
 
     let args = Args::parse();
+    let files_in_flight = args.common.resolve_files_in_flight();
 
     // TOCTOU linter: must run before the async runtime starts. The verdict
     // (dereference/Linux) applies to every operation, local or remote. Operands
@@ -1335,7 +1364,7 @@ fn main() -> Result<(), anyhow::Error> {
     let is_dry_run = dry_run_warnings.is_some();
     let func = {
         let args = args.clone();
-        || async_main(args)
+        move || async_main(args, files_in_flight)
     };
     let output = args
         .common
@@ -1343,7 +1372,7 @@ fn main() -> Result<(), anyhow::Error> {
     let runtime = args.common.runtime_config();
     let mut throttle = args
         .common
-        .throttle_config(args.max_open_files, args.chunk_size.0);
+        .throttle_config(files_in_flight, args.chunk_size.0);
     if is_remote_operation {
         // In remote mode the master runs no metadata controllers — all probes
         // fire inside rcpd on the remote hosts. Clear both histogram fields so
@@ -1396,4 +1425,51 @@ fn main() -> Result<(), anyhow::Error> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn master_args(extra: &[&str]) -> Args {
+        let mut argv = vec!["rcp"];
+        argv.extend_from_slice(extra);
+        argv.extend_from_slice(&["localhost:/src", "localhost:/dst"]);
+        Args::try_parse_from(argv).unwrap()
+    }
+
+    #[test]
+    fn master_propagates_one_effective_connection_count_to_both_daemons() {
+        let args = master_args(&["--max-connections=12"]);
+        let files_in_flight =
+            common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(3).unwrap());
+        let configs = build_master_remote_configs(&args, files_in_flight, None).unwrap();
+        assert_eq!(configs.tcp.max_connections, 3);
+        let source_args = configs.rcpd.clone().to_args();
+        let destination_args = configs.rcpd.to_args();
+        assert!(source_args.iter().any(|arg| arg == "--max-connections=3"));
+        assert!(
+            destination_args
+                .iter()
+                .any(|arg| arg == "--max-connections=3")
+        );
+        assert_eq!(source_args, destination_args);
+    }
+
+    #[test]
+    fn master_rejects_pending_capacity_overflow_before_spawn() {
+        let max_connections = usize::MAX.to_string();
+        let args = master_args(&[
+            &format!("--max-connections={max_connections}"),
+            "--pending-writes-multiplier=2",
+            "--max-open-files=0",
+        ]);
+        let error =
+            build_master_remote_configs(&args, common::ResolvedFilesInFlight::unlimited(), None)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("pending file capacity overflow"),
+            "unexpected error: {error:#}"
+        );
+    }
 }

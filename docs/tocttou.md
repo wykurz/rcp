@@ -599,12 +599,14 @@ so the security-relevant invariants each live in exactly one place:
   fd-bearing parent/classification work. Delegated shared-driver and rlink entries either ensure or
   transfer admission before final classification. This statement does not cover every remote rcpd
   parent/root open; remote source and destination have separate protocol-specific setup.
-- **Independent pools and recursive overwrite**: the same configured `N` is assigned to separate
-  OpenFile and PendingMeta semaphores, not one combined pool. Copy/link overwrite leaf work can
-  retain OpenFile admission while recursively invoking rm, which draws from PendingMeta. That
-  OpenFile → PendingMeta call is the only direction between those two descriptor-admission pools;
-  recursive directory handles and process-support descriptors remain outside both `--max-open-files`
-  pools and their default soft-limit heuristic.
+- **Independent pools and recursive overwrite**: the runtime intersects the file-work ceiling with
+  the internal soft-`RLIMIT_NOFILE` descriptor ceiling independently for the OpenFile and
+  PendingMeta semaphores. Those pools receive the same effective numerical ceiling, not one combined
+  total. Copy/link overwrite leaf work can retain OpenFile admission while recursively invoking rm,
+  which draws from PendingMeta. That OpenFile → PendingMeta call is the only direction between those
+  descriptor-admission pools; recursive directory handles and process-support descriptors remain
+  outside them. The static `--max-files-in-flight` ceiling therefore limits applicable file-like
+  work rather than every process descriptor or all possible concurrent activity.
 - **Trusted vs hardened boundary**: the symlink-following parent-prefix open returns a distinct
   `TrustedDir` type (`common/src/safedir.rs`); crossing below the named root yields a hardened `Dir`
   whose child opens are all `O_NOFOLLOW`. The boundary is type-enforced — a hardened child cannot be

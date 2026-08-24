@@ -9,9 +9,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- When `--max-open-files` is omitted, tools other than `filegen` now derive the per-pool
-  descriptor-admission default from the process soft `RLIMIT_NOFILE`, capped at 4096. A zero soft
-  limit disables admission, and the process limit is never raised implicitly.
+- `--max-files-in-flight=N` now caps applicable file-like work across the tools. Explicit values are
+  positive (including `1`); when omitted, the common default is
+  `max(std::thread::available_parallelism(), 4)`, including for `filegen`. This is a work ceiling,
+  not a process-descriptor count or a guarantee of achieved concurrency. The runtime still applies
+  its internal soft-`RLIMIT_NOFILE` descriptor safety ceiling independently to OpenFile and
+  PendingMeta, which have the same effective numerical limit but are not a combined pool.
+
+- Remote copies now clamp pooled data streams to the lower of `--max-files-in-flight` and
+  `--max-connections`, validate pending-file capacity after that clamp, and apply descriptor safety
+  locally at each endpoint. For one compatibility release, hidden `--max-open-files` remains
+  accepted with a warning and conflicts with the new name: positive values map to the new ceiling,
+  and legacy `0` removes only the user ceiling while retaining descriptor safety.
 
 - Local recursive copy, remove, chmod, and rlink walks now bound descriptor-heavy leaf work on wide
   or slow trees, preventing `EMFILE` (Too many open files) failures from unbounded leaf fan-out. On
@@ -58,11 +67,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   since its CLI default is `all` rather than the shipped default; `rlink --preserve-settings=none`
   goes quiet like everything else that asked for nothing.
 
-- `WIRE_REVISION` is now 2. Carrying the arming flag to a remote source adds a field to
-  `MasterHello::Source`'s `capture`, which reshapes the hello, and the crate version does not change
-  with it — so without the bump a stale same-version `rcpd` (on `PATH` or in the deploy cache) would
-  pass the compatibility check and then misdecode the hello mid-copy. Builds now advertise
-  `0.39.0+w2`, and a cached `rcpd-0.39.0-w1` is no longer resolved.
+- `WIRE_REVISION` is now 3. Revision 2 remains the historical wire-schema change: carrying the
+  arming flag to a remote source added a field to `MasterHello::Source`'s `capture`, which reshaped
+  the hello. Revision 3 instead protects the version-sensitive rcpd spawn CLI contract for
+  `--max-files-in-flight`; it does not change any serialized-message schema. Without the revision
+  bumps, a stale same-version `rcpd` (on `PATH` or in the deploy cache) could pass compatibility and
+  then misdecode the hello or receive unsupported spawn arguments. Builds now advertise `0.39.0+w3`,
+  and a cached `rcpd-0.39.0-w2` is no longer resolved.
 
 ## [0.38.0] - 2026-08-05
 

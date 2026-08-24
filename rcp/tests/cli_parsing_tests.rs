@@ -8,6 +8,147 @@
 
 use assert_cmd::Command;
 
+fn rcp() -> Command {
+    Command::cargo_bin("rcp").unwrap()
+}
+
+fn rcpd() -> Command {
+    Command::cargo_bin("rcpd").unwrap()
+}
+
+#[test]
+fn rcp_parses_positive_max_files_in_flight_before_help() {
+    rcp()
+        .args(["--max-files-in-flight=1", "--help"])
+        .assert()
+        .success();
+    rcp()
+        .args(["--max-files-in-flight=0", "--help"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("at least 1"));
+}
+
+#[test]
+fn rcpd_parses_positive_max_files_in_flight_before_help() {
+    rcpd()
+        .args(["--max-files-in-flight=1", "--help"])
+        .assert()
+        .success();
+    rcpd()
+        .args(["--max-files-in-flight=0", "--help"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("at least 1"));
+}
+
+fn assert_effective_remote_parallelism_help(command: &mut Command) {
+    let output = command
+        .arg("--help")
+        .output()
+        .expect("help command must run");
+    assert!(output.status.success(), "help command must succeed");
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        help.contains("Effective data streams are min(--max-files-in-flight, --max-connections)."),
+        "help must describe the effective stream intersection: {help}"
+    );
+    assert!(
+        help.contains("Pending capacity is effective data streams × pending-writes-multiplier."),
+        "help must derive pending capacity from effective streams: {help}"
+    );
+    assert!(
+        help.contains("Maximum concurrent data connections (default: 100)"),
+        "help must retain the configured connection ceiling and its default: {help}"
+    );
+}
+
+#[test]
+fn rcp_help_describes_effective_remote_parallelism() {
+    assert_effective_remote_parallelism_help(&mut rcp());
+}
+
+#[test]
+fn rcpd_help_describes_effective_remote_parallelism() {
+    assert_effective_remote_parallelism_help(&mut rcpd());
+}
+
+#[test]
+fn legacy_max_open_files_warns_for_local_copies() {
+    let temp = tempfile::tempdir().expect("temporary directory must be created");
+    let source = temp.path().join("source");
+    let finite_destination = temp.path().join("finite-destination");
+    let unlimited_destination = temp.path().join("unlimited-destination");
+    std::fs::write(&source, b"x").expect("source file must be written");
+    rcp()
+        .args([
+            "--max-open-files=1",
+            source.to_str().unwrap(),
+            finite_destination.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("--max-open-files is deprecated"));
+    rcp()
+        .args([
+            "--max-open-files=0",
+            source.to_str().unwrap(),
+            unlimited_destination.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("descriptor safety"));
+}
+
+#[test]
+fn max_file_limit_names_conflict() {
+    rcp()
+        .args([
+            "--max-files-in-flight=1",
+            "--max-open-files=1",
+            "/tmp/source",
+            "/tmp/destination",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("cannot be used with"));
+}
+
+#[test]
+fn direct_rcpd_legacy_warning_leaves_connection_record_on_stderr() {
+    use std::io::BufRead;
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("rcpd"))
+        .args([
+            "--role=source",
+            "--no-encryption",
+            "--max-open-files=0",
+            "--remote-copy-conn-timeout-sec=1",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("rcpd must start");
+    let stderr = child.stderr.take().expect("rcpd stderr must be piped");
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        let _ = line_tx.send(line);
+    });
+    let first_stderr = line_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("rcpd must announce its listener before the watchdog deadline");
+    assert!(first_stderr.starts_with("RCP_TCP "));
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .expect("rcpd must exit after stdin closes");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--max-open-files=0 is deprecated"));
+}
+
 /// Test that --help output is generated without errors
 #[test]
 fn test_help_runs() {
@@ -789,9 +930,9 @@ fn toctou_check_and_require_toctou_safe_conflict() {
 }
 
 /// `--max-connections=0` must be rejected: a zero-size connection pool / zero
-/// pending-file budget (`max_connections * multiplier`) would deadlock the remote
-/// source. Regression for PR #247 review — the nonzero parser was previously wired
-/// only to `--pending-writes-multiplier`, not `--max-connections`.
+/// pending-file budget (`effective_streams * multiplier`) would deadlock the remote source.
+/// Regression for PR #247 review — the nonzero parser was previously wired only to
+/// `--pending-writes-multiplier`, not `--max-connections`.
 #[test]
 fn test_max_connections_zero_rejected() {
     Command::cargo_bin("rcp")

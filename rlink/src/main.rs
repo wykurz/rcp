@@ -141,14 +141,6 @@ struct Args {
     #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
     quiet: bool,
 
-    #[arg(
-        long,
-        value_name = "N",
-        help = common::cli::LEAF_ADMISSION_HELP,
-        help_heading = "Performance & throttling"
-    )]
-    max_open_files: Option<usize>,
-
     /// Chunk size for calculating I/O operations per file
     ///
     /// Required when using --iops-throttle (must be > 0)
@@ -305,6 +297,7 @@ async fn async_main(args: Args) -> Result<common::link::Summary> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let files_in_flight = args.common.resolve_files_in_flight();
 
     // TOCTOU linter: must run before the async runtime starts.
     // rlink has no --dereference flag; dereference is always false. Operands
@@ -351,7 +344,7 @@ fn main() -> Result<()> {
     let runtime = args.common.runtime_config();
     let throttle = args
         .common
-        .throttle_config(args.max_open_files, args.chunk_size);
+        .throttle_config(files_in_flight, args.chunk_size);
     let tracing = common::TracingConfig::local("rlink");
     let progress = if is_dry_run {
         None

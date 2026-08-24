@@ -1627,7 +1627,7 @@ mod tests {
                 time_filter: None,
             };
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let target_dir =
                 Arc::new(Dir::open_root_dir(&target, false, congestion::Side::Source).await?);
             let visitor = Arc::new(RmVisitor {
@@ -2230,8 +2230,8 @@ mod tests {
         }
     }
 
-    /// Stress tests exercising max-open-files saturation during rm.
-    mod max_open_files_tests {
+    /// Stress tests exercising max-files-in-flight saturation during rm.
+    mod max_files_in_flight_tests {
         use super::*;
 
         /// Cancelling a started permission relax must leave its original mode restored after the
@@ -2269,7 +2269,7 @@ mod tests {
             };
             let gate = testutils::BlockingPathGate::install(target.clone());
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let permit = throttle::open_file_permit().await;
             let fd_admission = permit.admission();
             let task = tokio::spawn(async move {
@@ -2341,7 +2341,7 @@ mod tests {
                 time_filter: None,
             };
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
@@ -2370,11 +2370,11 @@ mod tests {
             Ok(())
         }
 
-        /// wide rm: many files with a very low open-files limit.
-        /// verifies all files are removed correctly under permit saturation.
+        /// Wide rm: many files with a very low files-in-flight limit.
+        /// Verifies all files are removed correctly under permit saturation.
         #[tokio::test]
         #[traced_test]
-        async fn wide_rm_under_open_files_saturation() -> Result<(), anyhow::Error> {
+        async fn wide_rm_under_files_in_flight_saturation() -> Result<(), anyhow::Error> {
             let test_path = testutils::create_temp_dir().await?;
             let file_count = 200;
             for i in 0..file_count {
@@ -2386,7 +2386,7 @@ mod tests {
             }
             // set a very low limit to force permit contention
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(4);
+            admission.set_files_in_flight(4);
             let summary = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(30),
@@ -2409,11 +2409,12 @@ mod tests {
             Ok(())
         }
 
-        /// Deep + wide rm: a directory tree deeper than the open-files limit, with files at every
+        /// Deep + wide rm: a directory tree deeper than the files-in-flight limit, with files at every
         /// level. Verifies directories do not retain leaf admission across recursion.
         #[tokio::test]
         #[traced_test]
-        async fn deep_tree_no_deadlock_under_open_files_saturation() -> Result<(), anyhow::Error> {
+        async fn deep_tree_no_deadlock_under_files_in_flight_saturation()
+        -> Result<(), anyhow::Error> {
             let test_path = testutils::create_temp_dir().await?;
             let depth = 20;
             let files_per_level = 5;
@@ -2432,7 +2433,7 @@ mod tests {
                 dir = dir.join(format!("d{}", level));
             }
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(limit);
+            admission.set_files_in_flight(limit);
             let summary = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(30),
@@ -2482,7 +2483,7 @@ mod tests {
             // size the pending-meta pool to a single permit so a held-across-recursion permit
             // strands the child's pre-acquire — the saturation the fd-walk must tolerate.
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             // open the container of `d` and classify `d` itself: an authoritative directory.
             let parent = Dir::open_parent_dir(&root, congestion::Side::Source)
                 .await

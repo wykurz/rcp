@@ -1956,10 +1956,10 @@ mod tests {
         Ok(())
     }
 
-    /// Stress tests exercising `pending_meta` (max-open-files) saturation during rchm. The module
-    /// name carries the `max_open_files` substring so nextest's serial test-group isolates these
+    /// Stress tests exercising `pending_meta` (max-files-in-flight) saturation during rchm. The module
+    /// name carries the `max_files_in_flight` substring so nextest's serial test-group isolates these
     /// from anything else that mutates the process-wide throttle limit (see `.config/nextest.toml`).
-    mod max_open_files_tests {
+    mod max_files_in_flight_tests {
         use super::*;
         use crate::walk_driver::process_entry;
 
@@ -1978,7 +1978,7 @@ mod tests {
             filter.add_exclude("victim")?;
             settings.filter = Some(filter);
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
@@ -2032,7 +2032,7 @@ mod tests {
             // size the pending-meta pool to a single permit so a held-across-recursion permit
             // strands the child's pre-acquire — the saturation the fd-walk must tolerate.
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             // open the container of `d` and classify `d` itself: an authoritative directory handle.
             let parent = Dir::open_parent_dir(&root, congestion::Side::Destination)
                 .await

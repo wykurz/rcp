@@ -25,7 +25,7 @@ fn auto_meta_histogram_log_records_real_probes() {
         tick_interval: std::time::Duration::from_millis(50),
     };
     let throttle = common::ThrottleConfig {
-        max_open_files: None,
+        files_in_flight: common::ResolvedFilesInFlight::automatic(),
         ops_throttle: 0,
         iops_throttle: 0,
         chunk_size: 0,

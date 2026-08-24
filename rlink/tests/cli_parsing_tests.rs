@@ -6,6 +6,21 @@
 use assert_cmd::Command;
 
 #[test]
+fn parses_positive_max_files_in_flight_before_help() {
+    Command::cargo_bin("rlink")
+        .unwrap()
+        .args(["--max-files-in-flight=1", "--help"])
+        .assert()
+        .success();
+    Command::cargo_bin("rlink")
+        .unwrap()
+        .args(["--max-files-in-flight=0", "--help"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("at least 1"));
+}
+
+#[test]
 fn test_help_runs() {
     Command::cargo_bin("rlink")
         .unwrap()

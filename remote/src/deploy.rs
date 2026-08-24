@@ -94,8 +94,12 @@
 //!   if the directory already exists.
 
 use anyhow::Context;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Output, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
+
+const LOCAL_RCPD_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 
 const TRANSFER_HINTS: &str = "\
     This may indicate:\n\
@@ -153,29 +157,45 @@ fn format_write_error(
 ///
 /// # Errors
 ///
-/// Returns an error if no suitable binary is found
-pub fn find_local_rcpd_binary() -> anyhow::Result<PathBuf> {
+/// Returns an error if no compatible binary is found
+pub async fn find_local_rcpd_binary() -> anyhow::Result<PathBuf> {
     let mut searched_paths = Vec::new();
+    let local_version = common::version::ProtocolVersion::current();
 
     // try same directory as current executable first
-    // this ensures we use the same build (debug/release) as the running rcp
-    // and covers development builds where rcp and rcpd are both in target/
+    // this normally finds the same build (debug/release) as the running rcp and covers development
+    // builds where rcp and rcpd are both in target/. Compatibility is still verified: co-location
+    // is a search preference, not proof that two independently replaced files match.
     if let Ok(current_exe) = std::env::current_exe()
         && let Some(bin_dir) = current_exe.parent()
     {
         let path = bin_dir.join("rcpd");
         searched_paths.push(format!("Same directory: {}", path.display()));
         if path.exists() && path.is_file() {
-            tracing::info!("Found local rcpd binary at {}", path.display());
-            return Ok(path);
+            match check_local_rcpd_version(&path, &local_version, LOCAL_RCPD_VERSION_TIMEOUT).await
+            {
+                Ok(()) => {
+                    tracing::info!("Found compatible local rcpd binary at {}", path.display());
+                    return Ok(path);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "skipping local rcpd candidate {}: {:#}",
+                        path.display(),
+                        &error
+                    );
+                    searched_paths.push(format!("  rejected {}: {error:#}", path.display()));
+                }
+            }
         }
     }
 
     // try PATH (covers cargo install, nixpkgs, and other system installations)
     tracing::debug!("Trying to find rcpd in PATH");
-    let which_output = std::process::Command::new("which")
+    let which_output = tokio::process::Command::new("which")
         .arg("rcpd")
         .output()
+        .await
         .ok();
 
     if let Some(output) = which_output
@@ -187,14 +207,31 @@ pub fn find_local_rcpd_binary() -> anyhow::Result<PathBuf> {
             let path = PathBuf::from(path_str);
             searched_paths.push(format!("PATH: {}", path.display()));
             if path.exists() && path.is_file() {
-                tracing::info!("Found local rcpd binary in PATH: {}", path.display());
-                return Ok(path);
+                match check_local_rcpd_version(&path, &local_version, LOCAL_RCPD_VERSION_TIMEOUT)
+                    .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            "Found compatible local rcpd binary in PATH: {}",
+                            path.display()
+                        );
+                        return Ok(path);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "skipping local rcpd candidate {}: {:#}",
+                            path.display(),
+                            &error
+                        );
+                        searched_paths.push(format!("  rejected {}: {error:#}", path.display()));
+                    }
+                }
             }
         }
     }
 
     anyhow::bail!(
-        "no local rcpd binary found for deployment\n\
+        "no compatible local rcpd binary found for deployment\n\
         \n\
         Searched in:\n\
         {}\n\
@@ -209,6 +246,121 @@ pub fn find_local_rcpd_binary() -> anyhow::Result<PathBuf> {
             .collect::<Vec<_>>()
             .join("\n")
     )
+}
+
+/// Verify that one local deployment candidate implements the master's protocol contract.
+async fn check_local_rcpd_version(
+    path: &Path,
+    local_version: &common::version::ProtocolVersion,
+    probe_timeout: Duration,
+) -> anyhow::Result<()> {
+    let output = run_local_version_probe(path, probe_timeout).await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "local rcpd candidate {} failed --protocol-version with status {:?}: {}",
+            path.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let candidate_version =
+        common::version::ProtocolVersion::from_json(String::from_utf8_lossy(&output.stdout).trim())
+            .with_context(|| {
+                format!(
+                    "failed to parse --protocol-version output from local rcpd candidate {}",
+                    path.display()
+                )
+            })?;
+    if !local_version.is_compatible_with(&candidate_version) {
+        anyhow::bail!(
+            "local rcpd candidate {} reports {}, but rcp requires {}",
+            path.display(),
+            candidate_version,
+            local_version
+        );
+    }
+    Ok(())
+}
+
+/// Run one version probe without blocking a Tokio worker or trusting pipe EOF indefinitely.
+async fn run_local_version_probe(path: &Path, probe_timeout: Duration) -> anyhow::Result<Output> {
+    use tokio::io::AsyncReadExt;
+
+    let mut child = tokio::process::Command::new(path)
+        .arg("--protocol-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to execute local rcpd candidate {} with --protocol-version",
+                path.display()
+            )
+        })?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("local rcpd version probe stdout was not piped")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("local rcpd version probe stderr was not piped")?;
+
+    let collect_output = async {
+        let mut stdout_data = Vec::new();
+        let mut stderr_data = Vec::new();
+        let (status, stdout_result, stderr_result) = tokio::join!(
+            child.wait(),
+            stdout.read_to_end(&mut stdout_data),
+            stderr.read_to_end(&mut stderr_data),
+        );
+        let status = status.with_context(|| {
+            format!("failed to wait for local rcpd candidate {}", path.display())
+        })?;
+        stdout_result.with_context(|| {
+            format!(
+                "failed to read --protocol-version stdout from local rcpd candidate {}",
+                path.display()
+            )
+        })?;
+        stderr_result.with_context(|| {
+            format!(
+                "failed to read --protocol-version stderr from local rcpd candidate {}",
+                path.display()
+            )
+        })?;
+        Ok(Output {
+            status,
+            stdout: stdout_data,
+            stderr: stderr_data,
+        })
+    };
+
+    match tokio::time::timeout(probe_timeout, collect_output).await {
+        Ok(output) => output,
+        Err(elapsed) => {
+            // dropping both read ends before termination prevents a descendant which inherited the
+            // candidate's pipes from extending the probe lifetime after the candidate has exited.
+            drop(stdout);
+            drop(stderr);
+            child.kill().await.with_context(|| {
+                format!(
+                    "local rcpd candidate {} timed out after {} and could not be terminated and reaped",
+                    path.display(),
+                    humantime::format_duration(probe_timeout)
+                )
+            })?;
+            Err(elapsed).with_context(|| {
+                format!(
+                    "local rcpd candidate {} did not complete --protocol-version within {}",
+                    path.display(),
+                    humantime::format_duration(probe_timeout)
+                )
+            })
+        }
+    }
 }
 
 /// Deploy rcpd binary to remote host
@@ -709,6 +861,82 @@ pub async fn cleanup_old_versions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    struct TestDirectory(PathBuf);
+
+    #[cfg(unix)]
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "rcp-local-version-probe-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir(&path).expect("failed to create version-probe test directory");
+            Self(path)
+        }
+
+        fn script(&self, name: &str, contents: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = self.0.join(name);
+            std::fs::write(&path, contents).expect("failed to write version-probe script");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("failed to make version-probe script executable");
+            path
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn version_probe_timeout_falls_back_after_descendant_keeps_pipes_open() {
+        let test_dir = TestDirectory::new();
+        let hanging = test_dir.script("hanging-rcpd", "#!/bin/sh\n(sleep 2) &\nexit 0\n");
+        let local_version = common::version::ProtocolVersion::current();
+        let compatible = test_dir.script(
+            "compatible-rcpd",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"semantic\":\"{}\"}}'\n",
+                local_version.semantic
+            ),
+        );
+
+        let candidates = [hanging.as_path(), compatible.as_path()];
+        let (selected, rejections) = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut rejections = Vec::new();
+            for candidate in candidates {
+                match check_local_rcpd_version(candidate, &local_version, Duration::from_millis(50))
+                    .await
+                {
+                    Ok(()) => return (Some(candidate.to_path_buf()), rejections),
+                    Err(error) => rejections.push(error),
+                }
+            }
+            (None, rejections)
+        })
+        .await
+        .expect("candidate fallback must complete within its watchdog");
+
+        assert_eq!(selected.as_deref(), Some(compatible.as_path()));
+        assert_eq!(rejections.len(), 1);
+        assert!(
+            format!("{:#}", rejections[0]).contains("did not complete --protocol-version within"),
+            "timeout rejection must remain actionable: {:#}",
+            rejections[0]
+        );
+        assert!(
+            rejections[0].chain().count() >= 2,
+            "timeout rejection must preserve the elapsed source error"
+        );
+    }
 
     // the temp name is what keeps two concurrent deployments off each other's file. It has to be
     // built here rather than by the remote shell: `shell_escape` single-quotes every path, so a

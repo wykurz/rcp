@@ -67,13 +67,6 @@ struct Args {
     /// Quiet mode, don't report errors
     #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
     quiet: bool,
-    #[arg(
-        long,
-        value_name = "N",
-        help = common::cli::LEAF_ADMISSION_HELP,
-        help_heading = "Performance & throttling"
-    )]
-    max_open_files: Option<usize>,
     /// Chunk size used to calculate number of I/O per file
     ///
     /// Modifying this setting to a value > 0 is REQUIRED when using --iops-throttle.
@@ -232,6 +225,7 @@ async fn async_main(args: Args) -> Result<common::chmod::Summary> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let files_in_flight = args.common.resolve_files_in_flight();
     common::filter::reject_created_before_on_musl("rchm", args.created_before.as_deref())?;
     // TOCTOU linter: must run before the async runtime starts.
     // rchm has no --dereference flag; dereference is always false. Operands are
@@ -273,7 +267,7 @@ fn main() -> Result<()> {
     let runtime = args.common.runtime_config();
     let throttle = args
         .common
-        .throttle_config(args.max_open_files, args.chunk_size);
+        .throttle_config(files_in_flight, args.chunk_size);
     let tracing = common::TracingConfig::local("rchm");
     let progress = if is_dry_run {
         None

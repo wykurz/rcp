@@ -1,6 +1,105 @@
 //! Configuration types for runtime and execution settings
 
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
+
+pub const MIN_DEFAULT_FILES_IN_FLIGHT: usize = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum ConcurrencyLimit {
+    Unlimited,
+    Limited(std::num::NonZeroUsize),
+}
+
+impl ConcurrencyLimit {
+    #[must_use]
+    pub fn meet(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unlimited, limit) | (limit, Self::Unlimited) => limit,
+            (Self::Limited(left), Self::Limited(right)) => {
+                Self::Limited(std::cmp::min(left, right))
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn semaphore_capacity(self) -> usize {
+        match self {
+            Self::Unlimited => 0,
+            Self::Limited(value) => value.get(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FilesInFlightSource {
+    Automatic,
+    Explicit,
+    DeprecatedMaxOpenFiles,
+    Propagated,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedFilesInFlight {
+    limit: ConcurrencyLimit,
+    source: FilesInFlightSource,
+}
+
+fn default_files_in_flight_from(available: Option<NonZeroUsize>) -> NonZeroUsize {
+    let available = available.map_or(1, NonZeroUsize::get);
+    NonZeroUsize::new(available.max(MIN_DEFAULT_FILES_IN_FLIGHT))
+        .expect("the minimum files-in-flight value is nonzero")
+}
+
+fn default_files_in_flight() -> NonZeroUsize {
+    default_files_in_flight_from(std::thread::available_parallelism().ok())
+}
+
+impl ResolvedFilesInFlight {
+    pub fn automatic() -> Self {
+        Self {
+            limit: ConcurrencyLimit::Limited(default_files_in_flight()),
+            source: FilesInFlightSource::Automatic,
+        }
+    }
+
+    pub const fn explicit(value: NonZeroUsize) -> Self {
+        Self {
+            limit: ConcurrencyLimit::Limited(value),
+            source: FilesInFlightSource::Explicit,
+        }
+    }
+
+    pub const fn unlimited() -> Self {
+        Self {
+            limit: ConcurrencyLimit::Unlimited,
+            source: FilesInFlightSource::Explicit,
+        }
+    }
+
+    pub fn legacy(value: usize) -> Self {
+        Self {
+            limit: NonZeroUsize::new(value)
+                .map_or(ConcurrencyLimit::Unlimited, ConcurrencyLimit::Limited),
+            source: FilesInFlightSource::DeprecatedMaxOpenFiles,
+        }
+    }
+
+    pub const fn propagated(self) -> Self {
+        Self {
+            limit: self.limit,
+            source: FilesInFlightSource::Propagated,
+        }
+    }
+
+    pub const fn limit(self) -> ConcurrencyLimit {
+        self.limit
+    }
+
+    pub const fn source(self) -> FilesInFlightSource {
+        self.source
+    }
+}
 
 /// Dry-run mode for previewing operations without executing them
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
@@ -56,12 +155,8 @@ pub struct AutoMetaThrottleConfig {
 /// Throttling configuration for resource control
 #[derive(Debug, Clone)]
 pub struct ThrottleConfig {
-    /// Admission count assigned to each independent OpenFile and PendingMeta pool.
-    ///
-    /// `None` derives a per-pool count from the current soft `RLIMIT_NOFILE`, five modeled
-    /// descriptor units, and a 4096 cap; a zero soft limit leaves admission disabled. `Some(0)`
-    /// also disables descriptor admission.
-    pub max_open_files: Option<usize>,
+    /// User-selected ceiling for file-like work, including its source for compatibility warnings.
+    pub files_in_flight: ResolvedFilesInFlight,
     /// Operations per second throttle (0 = no throttle)
     pub ops_throttle: usize,
     /// I/O operations per second throttle (0 = no throttle)
@@ -86,7 +181,7 @@ pub struct ThrottleConfig {
 impl Default for ThrottleConfig {
     fn default() -> Self {
         Self {
-            max_open_files: None,
+            files_in_flight: ResolvedFilesInFlight::automatic(),
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,
@@ -110,6 +205,20 @@ impl Default for ThrottleConfig {
 pub const AUTO_META_MIN_OPS_THROTTLE: usize = 10;
 
 impl ThrottleConfig {
+    #[must_use]
+    pub fn deprecated_max_open_files_warning(&self) -> Option<&'static str> {
+        if self.files_in_flight.source() != FilesInFlightSource::DeprecatedMaxOpenFiles {
+            return None;
+        }
+        match self.files_in_flight.limit() {
+            ConcurrencyLimit::Unlimited => Some(
+                "--max-open-files=0 is deprecated; use --max-files-in-flight instead. It removes the user ceiling but no longer disables descriptor safety.",
+            ),
+            ConcurrencyLimit::Limited(_) => {
+                Some("--max-open-files is deprecated; use --max-files-in-flight instead.")
+            }
+        }
+    }
     /// Validate configuration and return errors if invalid
     pub fn validate(&self) -> Result<(), String> {
         if self.iops_throttle > 0 && self.chunk_size == 0 {
@@ -390,6 +499,48 @@ impl Default for TracingConfig {
 }
 
 #[cfg(test)]
+mod files_in_flight_policy_tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+
+    #[test]
+    fn limit_meet_uses_the_lower_finite_value() {
+        let four = ConcurrencyLimit::Limited(NonZeroUsize::new(4).unwrap());
+        let eight = ConcurrencyLimit::Limited(NonZeroUsize::new(8).unwrap());
+        assert_eq!(four.meet(eight), four);
+        assert_eq!(ConcurrencyLimit::Unlimited.meet(eight), eight);
+        assert_eq!(eight.meet(ConcurrencyLimit::Unlimited), eight);
+        assert_eq!(
+            ConcurrencyLimit::Unlimited.meet(ConcurrencyLimit::Unlimited),
+            ConcurrencyLimit::Unlimited,
+        );
+    }
+
+    #[test]
+    fn unlimited_uses_the_zero_semaphore_sentinel() {
+        assert_eq!(ConcurrencyLimit::Unlimited.semaphore_capacity(), 0);
+    }
+
+    #[test]
+    fn explicit_unlimited_file_ceiling_removes_only_the_user_cap() {
+        let limit = ResolvedFilesInFlight::unlimited();
+        assert_eq!(limit.limit(), ConcurrencyLimit::Unlimited);
+        assert_eq!(limit.source(), FilesInFlightSource::Explicit);
+    }
+
+    #[test]
+    fn automatic_files_in_flight_has_a_floor_of_four() {
+        assert_eq!(default_files_in_flight_from(None).get(), 4);
+        assert_eq!(default_files_in_flight_from(NonZeroUsize::new(2)).get(), 4);
+        assert_eq!(default_files_in_flight_from(NonZeroUsize::new(4)).get(), 4);
+        assert_eq!(
+            default_files_in_flight_from(NonZeroUsize::new(12)).get(),
+            12
+        );
+    }
+}
+
+#[cfg(test)]
 mod auto_meta_validation_tests {
     use super::*;
 
@@ -412,7 +563,7 @@ mod auto_meta_validation_tests {
 
     fn config_with(auto: AutoMetaThrottleConfig) -> ThrottleConfig {
         ThrottleConfig {
-            max_open_files: None,
+            files_in_flight: ResolvedFilesInFlight::automatic(),
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,
@@ -553,7 +704,7 @@ mod auto_meta_validation_tests {
         // cadence. Without auto-meta, the adaptive get_replenish_interval
         // picks an interval that works for any rate.
         let config = ThrottleConfig {
-            max_open_files: None,
+            files_in_flight: ResolvedFilesInFlight::automatic(),
             ops_throttle: 5,
             iops_throttle: 0,
             chunk_size: 0,
@@ -578,7 +729,7 @@ mod auto_meta_validation_tests {
     fn histogram_log_without_throttle_is_rejected() {
         // Recording a log requires the throttle pipeline to be live.
         let config = ThrottleConfig {
-            max_open_files: None,
+            files_in_flight: ResolvedFilesInFlight::automatic(),
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,
@@ -599,7 +750,7 @@ mod auto_meta_validation_tests {
         // --auto-meta-histogram alone (no log path) without --auto-meta-throttle
         // is rejected for the same reason: nothing to histogram.
         let config = ThrottleConfig {
-            max_open_files: None,
+            files_in_flight: ResolvedFilesInFlight::automatic(),
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,

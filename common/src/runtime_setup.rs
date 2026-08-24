@@ -6,7 +6,9 @@
 //! kept separate from the crate root purely to keep `lib.rs` focused on the
 //! public surface.
 
-use crate::config::{AutoMetaThrottleConfig, RuntimeConfig, ThrottleConfig, TracingConfig};
+use crate::config::{
+    AutoMetaThrottleConfig, ConcurrencyLimit, RuntimeConfig, ThrottleConfig, TracingConfig,
+};
 use crate::{
     PBAR, PROGRESS, REMOTE_RUNTIME_STATS, RuntimeStats, auto_meta, histogram_logger, is_localhost,
     observability, progress, store_logger_cancel, store_logger_handle, walk,
@@ -413,9 +415,9 @@ pub(crate) fn install_tracing_subscriber(
 /// workflows, not a hard process-wide ceiling: recursive directories and process support
 /// descriptors are outside leaf admission. A nonzero soft limit gets at least one operation so very
 /// small test/container limits do not silently disable backpressure.
-fn default_leaf_operation_limit(soft_limit: u64) -> usize {
+fn descriptor_admission_limit(soft_limit: u64) -> ConcurrencyLimit {
     if soft_limit == 0 {
-        return 0;
+        return ConcurrencyLimit::Unlimited;
     }
     const OPEN_FILE_DESCRIPTOR_UNITS: u64 = 4;
     const OVERLAPPING_PENDING_META_DESCRIPTOR_UNITS: u64 = 1;
@@ -427,14 +429,23 @@ fn default_leaf_operation_limit(soft_limit: u64) -> usize {
         (descriptor_budget / DESCRIPTOR_UNITS_PER_OPERATION).max(1),
         MAX_LEAF_OPERATIONS_PER_POOL,
     );
-    usize::try_from(leaf_operation_limit).expect("the leaf-operation cap fits in usize")
+    ConcurrencyLimit::Limited(
+        std::num::NonZeroUsize::new(
+            usize::try_from(leaf_operation_limit).expect("the leaf-operation cap fits in usize"),
+        )
+        .expect("the nonzero soft limit produces a nonzero admission cap"),
+    )
+}
+
+fn resolve_leaf_capacity(
+    files_in_flight: ConcurrencyLimit,
+    descriptor_limit: ConcurrencyLimit,
+) -> ConcurrencyLimit {
+    files_in_flight.meet(descriptor_limit)
 }
 
 /// Build a multi-threaded tokio runtime configured per `runtime`, and apply the
-/// `max_open_files` leaf-operation admission limit from `throttle`. Falls back
-/// to a per-pool admission count derived from an 80%-of-soft-rlimit descriptor budget (five modeled
-/// descriptor units across the two independent pools, capped at 4096 operations per pool) when
-/// `max_open_files` is unset.
+/// file-like work and descriptor-safe admission limits from `throttle`.
 pub(crate) fn build_tokio_runtime(
     runtime: &RuntimeConfig,
     throttle: &ThrottleConfig,
@@ -447,21 +458,24 @@ pub(crate) fn build_tokio_runtime(
     if runtime.max_blocking_threads > 0 {
         builder.max_blocking_threads(runtime.max_blocking_threads);
     }
-    let leaf_operation_limit = throttle.max_open_files.unwrap_or_else(|| {
-        let soft_limit = get_soft_open_file_limit().expect(
-            "We failed to query rlimit, if this is expected try specifying --max-open-files",
-        );
-        default_leaf_operation_limit(soft_limit)
-    });
-    if leaf_operation_limit > 0 {
-        tracing::info!(
-            "Setting max concurrent leaf operations per admission pool to: {}",
-            leaf_operation_limit
-        );
-    } else {
-        tracing::info!("Disabling leaf-operation admission limits");
-    }
-    throttle::set_max_open_files(leaf_operation_limit);
+    let soft_limit = get_soft_open_file_limit().expect(
+        "We failed to query rlimit; --max-files-in-flight controls performance but cannot bypass descriptor safety",
+    );
+    let descriptor_limit = descriptor_admission_limit(soft_limit);
+    let open_file = resolve_leaf_capacity(throttle.files_in_flight.limit(), descriptor_limit);
+    let pending_meta = resolve_leaf_capacity(throttle.files_in_flight.limit(), descriptor_limit);
+    tracing::info!(
+        "Resolved file admission: file_ceiling={:?}, source={:?}, descriptor_ceiling={:?}, open_file={:?}, pending_meta={:?}",
+        throttle.files_in_flight.limit(),
+        throttle.files_in_flight.source(),
+        descriptor_limit,
+        open_file,
+        pending_meta,
+    );
+    throttle::set_admission_limits(
+        open_file.semaphore_capacity(),
+        pending_meta.semaphore_capacity(),
+    );
     builder.build().expect("Failed to create runtime")
 }
 
@@ -478,11 +492,14 @@ mod default_leaf_operation_limit_tests {
     #[cfg(target_os = "linux")]
     const RLIMIT_CHILD_SKIP: &str = "RCP_TEST_RUNTIME_SETUP_RLIMIT_CHILD:skip";
     #[cfg(target_os = "linux")]
-    const ZERO_LIMIT_CHILD_MARKER: &str = "RCP_TEST_RUNTIME_SETUP_ZERO_LIMIT_CHILD";
+    const UNLIMITED_FILE_CEILING_CHILD_MARKER: &str =
+        "RCP_TEST_RUNTIME_SETUP_UNLIMITED_FILE_CEILING_CHILD";
     #[cfg(target_os = "linux")]
-    const ZERO_LIMIT_CHILD_MARKER_VALUE: &str = "replaces-stale-admission-epoch-v1";
+    const UNLIMITED_FILE_CEILING_CHILD_MARKER_VALUE: &str =
+        "uses-descriptor-safety-after-stale-admission-epoch-v1";
     #[cfg(target_os = "linux")]
-    const ZERO_LIMIT_CHILD_SUCCESS: &str = "RCP_TEST_RUNTIME_SETUP_ZERO_LIMIT_CHILD:success";
+    const UNLIMITED_FILE_CEILING_CHILD_SUCCESS: &str =
+        "RCP_TEST_RUNTIME_SETUP_UNLIMITED_FILE_CEILING_CHILD:success";
 
     #[cfg(target_os = "linux")]
     fn nofile_limit() -> libc::rlimit {
@@ -503,32 +520,58 @@ mod default_leaf_operation_limit_tests {
 
     #[test]
     fn reserves_descriptor_headroom_for_each_leaf_operation() {
-        assert_eq!(default_leaf_operation_limit(100), 16);
-        assert_eq!(default_leaf_operation_limit(4096), 655);
-        assert_eq!(default_leaf_operation_limit(1_000_000), 4096);
-        assert_eq!(default_leaf_operation_limit(u64::MAX), 4096);
+        assert_eq!(descriptor_admission_limit(100).semaphore_capacity(), 16);
+        assert_eq!(descriptor_admission_limit(4096).semaphore_capacity(), 655);
+        assert_eq!(
+            descriptor_admission_limit(1_000_000).semaphore_capacity(),
+            4096
+        );
+        assert_eq!(
+            descriptor_admission_limit(u64::MAX).semaphore_capacity(),
+            4096
+        );
     }
 
     #[test]
     fn keeps_a_small_nonzero_limit_live() {
-        assert_eq!(default_leaf_operation_limit(1), 1);
-        assert_eq!(default_leaf_operation_limit(4), 1);
-        assert_eq!(default_leaf_operation_limit(0), 0);
+        assert_eq!(descriptor_admission_limit(1).semaphore_capacity(), 1);
+        assert_eq!(descriptor_admission_limit(4).semaphore_capacity(), 1);
+        assert_eq!(descriptor_admission_limit(0), ConcurrencyLimit::Unlimited);
+    }
+
+    #[test]
+    fn file_and_descriptor_ceilings_are_intersected() {
+        let limited =
+            |value| ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(value).unwrap());
+        assert_eq!(resolve_leaf_capacity(limited(8), limited(40)), limited(8));
+        assert_eq!(resolve_leaf_capacity(limited(80), limited(40)), limited(40));
+        assert_eq!(
+            resolve_leaf_capacity(ConcurrencyLimit::Unlimited, limited(40)),
+            limited(40)
+        );
+        assert_eq!(
+            resolve_leaf_capacity(limited(8), ConcurrencyLimit::Unlimited),
+            limited(8)
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn build_tokio_runtime_zero_limit_replaces_stale_admission_epochs() {
-        let is_child = std::env::var_os(ZERO_LIMIT_CHILD_MARKER)
-            .is_some_and(|value| value == std::ffi::OsStr::new(ZERO_LIMIT_CHILD_MARKER_VALUE));
+    fn build_tokio_runtime_unlimited_file_ceiling_uses_descriptor_safety_after_stale_epoch() {
+        let is_child = std::env::var_os(UNLIMITED_FILE_CEILING_CHILD_MARKER).is_some_and(|value| {
+            value == std::ffi::OsStr::new(UNLIMITED_FILE_CEILING_CHILD_MARKER_VALUE)
+        });
         if !is_child {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "runtime_setup::default_leaf_operation_limit_tests::build_tokio_runtime_zero_limit_replaces_stale_admission_epochs",
+                    "runtime_setup::default_leaf_operation_limit_tests::build_tokio_runtime_unlimited_file_ceiling_uses_descriptor_safety_after_stale_epoch",
                     "--nocapture",
                 ])
-                .env(ZERO_LIMIT_CHILD_MARKER, ZERO_LIMIT_CHILD_MARKER_VALUE)
+                .env(
+                    UNLIMITED_FILE_CEILING_CHILD_MARKER,
+                    UNLIMITED_FILE_CEILING_CHILD_MARKER_VALUE,
+                )
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -538,8 +581,8 @@ mod default_leaf_operation_limit_tests {
                 "child test failed:\n{stdout}\n{stderr}"
             );
             assert!(
-                stdout.contains(ZERO_LIMIT_CHILD_SUCCESS)
-                    || stderr.contains(ZERO_LIMIT_CHILD_SUCCESS),
+                stdout.contains(UNLIMITED_FILE_CEILING_CHILD_SUCCESS)
+                    || stderr.contains(UNLIMITED_FILE_CEILING_CHILD_SUCCESS),
                 "child branch did not emit its sentinel:\n{stdout}\n{stderr}"
             );
             return;
@@ -549,7 +592,9 @@ mod default_leaf_operation_limit_tests {
             max_blocking_threads: 1,
         };
         let old_limit = ThrottleConfig {
-            max_open_files: Some(1),
+            files_in_flight: crate::ResolvedFilesInFlight::explicit(
+                std::num::NonZeroUsize::new(1).unwrap(),
+            ),
             ..ThrottleConfig::default()
         };
         let admission_runtime = build_tokio_runtime(&runtime, &old_limit);
@@ -559,24 +604,24 @@ mod default_leaf_operation_limit_tests {
                 throttle::pending_meta_permit()
             )
         });
-        let disabled_limit = ThrottleConfig {
-            max_open_files: Some(0),
+        let unlimited_file_ceiling = ThrottleConfig {
+            files_in_flight: crate::ResolvedFilesInFlight::unlimited(),
             ..ThrottleConfig::default()
         };
-        drop(build_tokio_runtime(&runtime, &disabled_limit));
+        drop(build_tokio_runtime(&runtime, &unlimited_file_ceiling));
         let (new_open_file, new_pending_meta) = admission_runtime.block_on(async {
             let open_file = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
                 throttle::open_file_permit(),
             )
             .await
-            .expect("zero OpenFile cap must not wait behind the stale epoch");
+            .expect("unlimited file ceiling must use descriptor safety instead of a stale OpenFile epoch");
             let pending_meta = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
                 throttle::pending_meta_permit(),
             )
             .await
-            .expect("zero PendingMeta cap must not wait behind the stale epoch");
+            .expect("unlimited file ceiling must use descriptor safety instead of a stale PendingMeta epoch");
             (open_file, pending_meta)
         });
         drop((
@@ -585,20 +630,20 @@ mod default_leaf_operation_limit_tests {
             old_open_file,
             old_pending_meta,
         ));
-        throttle::set_max_open_files(0);
-        println!("{ZERO_LIMIT_CHILD_SUCCESS}");
+        throttle::set_admission_limits(0, 0);
+        println!("{UNLIMITED_FILE_CEILING_CHILD_SUCCESS}");
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn build_tokio_runtime_preserves_session_soft_limit() {
+    fn build_tokio_runtime_preserves_session_soft_limit_with_unlimited_file_ceiling() {
         let is_child = std::env::var_os(RLIMIT_CHILD_MARKER)
             .is_some_and(|value| value == std::ffi::OsStr::new(RLIMIT_CHILD_MARKER_VALUE));
         if !is_child {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "runtime_setup::default_leaf_operation_limit_tests::build_tokio_runtime_preserves_session_soft_limit",
+                    "runtime_setup::default_leaf_operation_limit_tests::build_tokio_runtime_preserves_session_soft_limit_with_unlimited_file_ceiling",
                     "--nocapture",
                 ])
                 .env(RLIMIT_CHILD_MARKER, RLIMIT_CHILD_MARKER_VALUE)
@@ -648,7 +693,7 @@ mod default_leaf_operation_limit_tests {
             max_blocking_threads: 1,
         };
         let throttle = ThrottleConfig {
-            max_open_files: None,
+            files_in_flight: crate::ResolvedFilesInFlight::unlimited(),
             ..ThrottleConfig::default()
         };
         let runtime = build_tokio_runtime(&runtime, &throttle);
@@ -696,7 +741,7 @@ mod default_leaf_operation_limit_tests {
             })
             .expect("derived admission boundary must complete within its watchdog");
         drop((open_files, pending_meta));
-        throttle::set_max_open_files(0);
+        throttle::set_admission_limits(0, 0);
         println!("{RLIMIT_CHILD_SUCCESS}");
     }
 }

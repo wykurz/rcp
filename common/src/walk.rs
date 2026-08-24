@@ -920,9 +920,9 @@ mod tests {
     // process-global; configure a small cap so the OpenFile case exercises a real
     // acquire rather than the disabled-pool no-op.
     #[tokio::test]
-    async fn preacquire_leaf_permit_respects_max_open_files_kind_and_hint() {
+    async fn preacquire_leaf_permit_respects_max_files_in_flight_kind_and_hint() {
         let admission = crate::testutils::AdmissionLimit::new().await;
-        admission.set_max_open_files(4);
+        admission.set_files_in_flight(4);
         // `None` kind never takes a permit, regardless of hint.
         assert!(
             preacquire_leaf_permit(PermitKind::None, Some(EntryKind::File))
@@ -1009,7 +1009,7 @@ mod tests {
         let root = testutils::create_temp_dir().await?;
         tokio::fs::write(root.join("leaf"), b"x").await?;
         let admission = testutils::AdmissionLimit::new().await;
-        admission.set_max_open_files(1);
+        admission.set_files_in_flight(1);
         let parent = Dir::open_parent_dir(&root, congestion::Side::Source)
             .await?
             .into_tree();

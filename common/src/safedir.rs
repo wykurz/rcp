@@ -3486,7 +3486,7 @@ mod tests {
         Ok(())
     }
 
-    mod max_open_files_tests {
+    mod max_files_in_flight_tests {
         use super::*;
         use anyhow::Context as _;
         use futures::FutureExt as _;
@@ -3553,7 +3553,7 @@ mod tests {
                 let file_path = root.join("queued-capture");
                 tokio::fs::write(&file_path, b"x").await?;
                 let admission = crate::testutils::AdmissionLimit::new().await;
-                admission.set_max_open_files(1);
+                admission.set_files_in_flight(1);
                 let open_file_guard = throttle::open_file_permit().await;
                 let file = std::fs::File::open(file_path)?;
                 let raw_fd = file.as_raw_fd();
@@ -3705,7 +3705,7 @@ mod tests {
             let file_path = root.join("held-unprobed");
             tokio::fs::write(&file_path, b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let open_file_guard = throttle::open_file_permit().await;
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -3759,7 +3759,7 @@ mod tests {
             let file_path = root.join("held");
             tokio::fs::write(&file_path, b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
@@ -3831,7 +3831,7 @@ mod tests {
             let file_path = root.join("returned");
             tokio::fs::write(&file_path, b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let open_file_guard = throttle::open_file_permit().await;
             let (work_started_tx, work_started_rx) = tokio::sync::oneshot::channel();
             let (release_work_tx, release_work_rx) = std::sync::mpsc::channel();
@@ -3906,7 +3906,7 @@ mod tests {
             let file_path = root.join("returned-unprobed");
             tokio::fs::write(&file_path, b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let open_file_guard = throttle::open_file_permit().await;
             let (work_started_tx, work_started_rx) = tokio::sync::oneshot::channel();
             let (release_work_tx, release_work_rx) = std::sync::mpsc::channel();

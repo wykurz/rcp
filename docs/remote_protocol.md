@@ -40,11 +40,34 @@ therefore does not separately validate it; see the strict-operand residual in
 version-matched rcpd binaries (see binary discovery in [remote_copy.md](remote_copy.md)) understand
 the flag.
 
+**Propagated file-work ceiling:** The master resolves `--max-files-in-flight` once, then passes its
+ceiling to each rcpd as a version-sensitive spawn argument rather than adding it to `MasterHello` or
+any data message. A finite ceiling becomes `--max-files-in-flight=N`; legacy `--max-open-files=0`
+becomes that hidden compatibility argument so a daemon does not replace the master's unlimited user
+ceiling with its own CPU default. Every propagated value also carries the hidden
+`--files-in-flight-propagated` marker, which prevents daemon-side duplicate deprecation warnings
+while preserving direct rcpd invocation behavior. The master also resolves the effective data-stream
+count once as `min(max-files-in-flight, max-connections)` and puts that identical value in both rcpd
+spawn configurations. An unlimited legacy file ceiling leaves `max-connections` as the stream
+ceiling. A directly launched rcpd makes the same intersection using its local automatic CPU-based
+file policy. This is why wire revision 3 changed solely to protect the rcpd spawn-argument contract:
+`MasterHello` and all data-protocol messages keep exactly the same schema.
+
 **Special Case - Same Host Copies:** When source and destination are on the same host, the master:
 
 - Deploys rcpd only once (if needed)
 - Starts two separate rcpd processes with different roles
 - Both processes share the same SSH session but have distinct connections
+
+**Auto-deployment compatibility:** Auto-deployment applies the same exact compatibility policy as
+normal remote discovery at both boundaries. The master runs `--protocol-version` on each local
+candidate in search order (beside `rcp`, then `PATH`) and continues to later candidates when one is
+stale, stalls its bounded version probe, or is otherwise unusable. A timed-out candidate is
+terminated and reaped, and its output pipes are released before the search continues. The master
+names the cache target with the accepted version's compatibility tag, transfers and publishes the
+binary, then runs `--protocol-version` on that deployed remote path before constructing either
+role's spawn command. Thus neither co-location nor a current-looking cache filename is treated as
+proof that the binary implements the current serialized and rcpd spawn contract.
 
 ### 1.3 Connection Topology
 
@@ -956,7 +979,8 @@ EOF handshake.
 - **Lifetime**: Entire copy operation (reused for multiple files)
 - **Usage**: Length-prefixed file headers + raw data (size from header determines bytes to read per
   file)
-- **Pool size**: Controlled by `--max-connections` (default: 100)
+- **Pool size**: Effective streams are `min(--max-files-in-flight, --max-connections)`.
+  `--max-connections` remains a separately configurable ceiling with a default of 100.
 
 ### 6.3 Process Termination
 
@@ -1116,7 +1140,9 @@ again.
 
 Data connections are pooled for efficiency:
 
-- Pool size defaults to 100 connections (configurable via `--max-connections`)
+- The configured pool ceiling defaults to 100 connections (`--max-connections`), while the effective
+  pool size is `min(max-files-in-flight, max-connections)`
+- Unlimited legacy file input leaves the configured connection ceiling in force
 - Destination opens connections to source's data port up to pool size
 - Source accepts connections into a shared pool of available send streams; each file-send task
   borrows the next free connection and returns it for reuse (RAII)
@@ -1186,8 +1212,10 @@ slower than the source (slow disk, congested network, etc.).
 Three source-side mechanisms work together:
 
 1. **Pending task limit**: A semaphore limits the total number of file-sending tasks that can be
-   active at once. Default is `max_connections × 4` (configurable via
-   `--pending-writes-multiplier`). Tasks wait on this semaphore before being spawned.
+   active at once. Its capacity is `effective streams × pending-writes-multiplier`, where effective
+   streams are `min(max-files-in-flight, max-connections)`; the product uses checked arithmetic and
+   invalid zero/overflow configurations fail before either daemon is spawned (and before a directly
+   launched daemon announces its listener). Tasks wait on this semaphore before being spawned.
 
 2. **Connection backpressure**: A file task borrows a pooled data connection before taking
    file-specific resources, so queued tasks do not open files or allocate data buffers while the
@@ -1214,26 +1242,31 @@ On the destination the corresponding order begins after the header is consumed: 
 OpenFile admission, take the operations gate, resolve/plan the parent and entry, acquire IOPS, then
 remove/create/write as required. The two rcpd processes do not share a pool.
 
-**Effect with defaults (100 connections, 4× multiplier):**
+**Effect with defaults (100 configured connections, automatic file ceiling, 4× multiplier):**
 
-- Maximum 400 pending tasks at any time
-- Up to 100 simultaneous source file-data transfers/handles at the connection default, possibly
-  fewer under source OpenFile admission. Destination leaf work is admitted independently; directory,
-  socket, and process-support descriptors are additional.
+- At most `4 × min(automatic file ceiling, 100)` pending tasks
+- Up to `min(automatic file ceiling, 100)` simultaneous source file-data transfers at the stream
+  layer, possibly fewer under source OpenFile admission. Destination leaf work is admitted
+  independently; directory, socket, and process-support descriptors are additional.
 - Each destination directory registered for completion retains its directory fd until completion;
   these recursive-descent descriptors are outside leaf admission.
-- Up to approximately 1.6 GiB of payload buffers per source or destination `rcpd` (100 × 16 MiB
-  each), or approximately 3.2 GiB aggregate for one source and one destination, plus protocol and
-  runtime overhead.
+- Up to 16 MiB per effective datacenter-profile stream in each rcpd, plus protocol and runtime
+  overhead.
 
 **Configuration:**
 
-- `--max-connections=N`: Maximum concurrent data connections (default: 100)
-- `--pending-writes-multiplier=N`: Multiplier for pending tasks (default: 4)
-- `--max-open-files=N`: Assign `N` to each rcpd's independent OpenFile and PendingMeta admission
-  pools (`0` disables admission). An explicit value is propagated to both rcpds. When absent, each
-  rcpd derives its own per-pool count from its unchanged current soft `RLIMIT_NOFILE` using five
-  modeled descriptor units, capped at 4096; a zero soft limit leaves admission disabled.
+- `--max-connections=N`: Separately configurable data-connection ceiling (default: 100). Effective
+  streams are `min(max-files-in-flight, max-connections)`.
+- `--pending-writes-multiplier=N`: Pending capacity is effective streams × this multiplier (default:
+  4).
+- `--max-files-in-flight=N`: Set the master-resolved ceiling for file-like work on both rcpds. The
+  automatic default is available CPU parallelism with a floor of four. The same ceiling also clamps
+  data streams, while unlimited legacy input leaves `--max-connections` as their ceiling. Each
+  endpoint separately intersects the file ceiling with its own unchanged current soft
+  `RLIMIT_NOFILE` descriptor-safety heuristic (80% / five modeled units, capped at 4096) for its
+  local OpenFile and PendingMeta admission. Those local pools remain independent and are not wire
+  state. The hidden legacy `--max-open-files=0` removes only the user ceiling; descriptor safety
+  remains active.
 
 The multiplier ensures work is always queued when connections become available, avoiding idle time
 between file transfers.
@@ -1327,9 +1360,19 @@ Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
 - `--remote-keepalive-sec=N` (default: 120, `0` disables) - Liveness budget for every rcp TCP
   connection
 - `--port-ranges=RANGES` (optional) - Restrict TCP to specific port ranges (e.g., "8000-8999")
-- `--max-connections=N` (default: 100) - Maximum concurrent data connections
-- `--pending-writes-multiplier=N` (default: 4) - Multiplier for pending file tasks (backpressure)
+- `--max-connections=N` (default: 100) - Separately configurable data-connection ceiling; effective
+  streams are `min(max-files-in-flight, max-connections)`
+- `--max-files-in-flight=N` - Master-resolved file-work ceiling; finite values also clamp effective
+  data connections, while legacy unlimited input does not
+- `--pending-writes-multiplier=N` (default: 4) - Pending capacity is effective streams × this
+  multiplier, checked before pending file tasks are admitted
 - `--network-profile=PROFILE` (default: datacenter) - Buffer sizing profile
+
+The master validates the pending-task product before any SSH/process spawn and propagates the same
+effective stream count to both endpoints. A directly launched daemon validates before announcing its
+listener. This configuration travels only in version-sensitive rcpd spawn arguments: no
+`MasterHello` or data-message field changed, and compatibility revision 3 changed solely to protect
+that spawn contract.
 
 ### 8.2 Network Profiles
 
@@ -1348,6 +1391,9 @@ Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
 - **Datacenter**: Use default settings for best performance
 - **Internet/WAN**: Use `--network-profile=internet` for better behavior on higher-latency links
 - **Firewall-restricted**: Use `--port-ranges` to specify allowed ports
+- **More remote parallelism**: To exceed the CPU-derived file-work default, increase both
+  `--max-files-in-flight` and `--max-connections`; increasing either ceiling alone may leave the
+  effective stream count unchanged.
 
 ### 8.4 Connection Liveness
 

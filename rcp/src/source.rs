@@ -3179,7 +3179,7 @@ async fn handle_connection(
 ) -> anyhow::Result<()> {
     tracing::info!("Destination control connection established");
     let pool_size = tcp_config.max_connections;
-    let max_pending_files = pool_size * tcp_config.pending_writes_multiplier;
+    let max_pending_files = tcp_config.max_pending_files()?;
     // the control stream's socket options (no-delay, buffers, liveness) were applied by the caller
     // when it accepted the connection
     // wrap control connection with TLS if configured; the handshake is bounded because a peer that

@@ -20,9 +20,9 @@ impl AdmissionLimit {
         Self { _guard: guard }
     }
 
-    /// Sets the shared OpenFile and PendingMeta limits.
-    pub fn set_max_open_files(&self, max_open_files: usize) {
-        throttle::set_max_open_files(max_open_files);
+    /// Sets the shared file-in-flight limits.
+    pub fn set_files_in_flight(&self, files_in_flight: usize) {
+        throttle::set_admission_limits(files_in_flight, files_in_flight);
     }
 
     /// Sets one metadata operation's in-flight limit.
@@ -66,7 +66,7 @@ impl Drop for AdmissionLimit {
 }
 
 fn reset_admission_limits() {
-    throttle::set_max_open_files(0);
+    throttle::set_admission_limits(0, 0);
     for side in throttle::Side::ALL {
         for op in throttle::MetadataOp::ALL {
             throttle::set_max_ops_in_flight(throttle::Resource::meta(side, op), 0);
@@ -577,7 +577,7 @@ fn record_fd_identity_probe_result(
 
 /// Cancels a task inside an exact-path blocking job and quiesces every owned resource.
 ///
-/// The supplied admission fixture must already have `max_open_files` set to one; the pending
+/// The supplied admission fixture must already have `max_files_in_flight` set to one; the pending
 /// second permit is the old-epoch witness that the gated task still owns the only slot.
 #[cfg(test)]
 pub async fn cancel_at_blocking_path<T, O, F>(
@@ -996,7 +996,7 @@ mod tests {
         tokio::fs::write(&path, b"x").await?;
         let gate = BlockingPathGate::install(path.clone());
         let admission = AdmissionLimit::new().await;
-        admission.set_max_open_files(1);
+        admission.set_files_in_flight(1);
         let held_permit = throttle::open_file_permit().await;
         let release_after_gate = std::sync::Arc::new(tokio::sync::Notify::new());
         let task_release = std::sync::Arc::clone(&release_after_gate);
@@ -1093,7 +1093,7 @@ mod tests {
         let path = root.join("controller-observer-panic");
         let gate = BlockingPathGate::install(path.clone());
         let admission = AdmissionLimit::new().await;
-        admission.set_max_open_files(1);
+        admission.set_files_in_flight(1);
         let timeout = Duration::from_secs(20);
         let task = tokio::spawn(crate::filegen::write_file(
             &PROGRESS,
@@ -1149,7 +1149,7 @@ mod tests {
         let resource = throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
 
         let panic = catch_unwind(AssertUnwindSafe(move || {
-            limit.set_max_open_files(1);
+            limit.set_files_in_flight(1);
             limit.set_max_ops_in_flight(resource, 1);
             panic!("leave the guarded section early");
         }));
@@ -1175,7 +1175,7 @@ mod tests {
     #[tokio::test]
     async fn timed_out_admission_work_finishes_after_limits_are_removed() {
         let limit = AdmissionLimit::new().await;
-        limit.set_max_open_files(1);
+        limit.set_files_in_flight(1);
         let held_open = throttle::open_file_permit().await;
         let held_pending = throttle::pending_meta_permit().await;
         let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1202,7 +1202,7 @@ mod tests {
     #[tokio::test]
     async fn completion_witness_also_waits_for_capacity() {
         let limit = AdmissionLimit::new().await;
-        limit.set_max_open_files(1);
+        limit.set_files_in_flight(1);
         let held = throttle::open_file_permit().await;
         let (completion, completion_rx) = CompletionSignal::new();
         let owner_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

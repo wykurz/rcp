@@ -108,14 +108,6 @@ struct Args {
     )]
     output_format: common::cmp::OutputFormat,
 
-    /// Descriptor admission count assigned to the independent OpenFile and PendingMeta pools, not a
-    /// literal fd maximum or combined total; rcmp uses PendingMeta for metadata tasks, while
-    /// recursive ReadDir descriptors remain outside admission. 0 disables admission. For a nonzero
-    /// soft RLIMIT_NOFILE, the default per pool is
-    /// min(max(1, floor((soft limit * 80%) / 5)), 4096); zero leaves admission disabled.
-    #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
-    max_open_files: Option<usize>,
-
     /// Chunk size used to calculate number of I/O per file
     ///
     /// Modifying this setting to a value > 0 is REQUIRED when using --iops-throttle.
@@ -173,6 +165,7 @@ async fn async_main(args: Args) -> Result<common::cmp::FormattedSummary> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let files_in_flight = args.common.resolve_files_in_flight();
     let func = {
         let args = args.clone();
         || async_main(args)
@@ -184,7 +177,7 @@ fn main() -> Result<()> {
     let runtime = args.common.runtime_config();
     let throttle = args
         .common
-        .throttle_config(args.max_open_files, args.chunk_size);
+        .throttle_config(files_in_flight, args.chunk_size);
     let tracing = common::TracingConfig::local("rcmp");
     // note: rcmp historically does not treat --progress-delay alone as implying
     // --progress (unlike rrm/rlink). preserve that behavior here.

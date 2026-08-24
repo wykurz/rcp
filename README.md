@@ -305,19 +305,19 @@ Two complementary mechanisms: **static caps** that you set once based on budget 
 - set `--iops-throttle` to limit the maximum number of I/O operations per second
   - MUST be used with `--chunk-size`, which is used to calculate I/O operations per file
 
-- set `--max-open-files=N` to apply descriptor backpressure to leaf operations
-  - the same `N` is assigned to two independent pools: OpenFile for fd-bearing leaf work and
-    PendingMeta for spawned metadata work; it is not a combined pool total or a literal descriptor
-    maximum
-  - `0` disables descriptor admission; when omitted and the current soft `RLIMIT_NOFILE` is nonzero,
-    RCP tools except `filegen` derive each pool's count as
-    `min(max(1, floor((soft limit × 80%) / 5)), 4096)`; a zero soft limit leaves admission disabled
-  - the five modeled units are the shipped copy/link overlap: four simultaneous OpenFile leaf
-    descriptors during overwrite recheck (source classification, destination planning, source data,
-    and the fresh destination identity check) plus one PendingMeta classification descriptor in
-    recursive rm/delete work. Metadata-only tools can transiently use two descriptors per
-    PendingMeta operation but do not run the four-descriptor OpenFile path concurrently. Recursive
-    directory, network socket, and process-support descriptors remain outside this heuristic
+- set `--max-files-in-flight=N` to cap applicable file-like copy, link, comparison, removal, chmod,
+  and generation work
+  - explicit `N` must be positive; `1` is valid and `0` is rejected. When omitted, the default is
+    `max(std::thread::available_parallelism(), 4)`
+  - this is a ceiling on applicable work, not a literal count of process descriptors or a promise
+    that the workload will achieve that much parallelism
+  - the runtime independently intersects that ceiling with its soft-`RLIMIT_NOFILE` safety ceiling
+    for each of two pools: OpenFile for fd-bearing leaf work and PendingMeta for spawned metadata
+    work. The pools receive the same effective numerical ceiling, but are not a combined total;
+    recursive directory, network socket, and process-support descriptors remain outside them
+  - during one compatibility release, the hidden `--max-open-files=N` spelling remains accepted and
+    warns. It conflicts with the new name; positive values map to the new ceiling, while legacy `0`
+    removes only the user ceiling and leaves descriptor safety in effect
 
 ### Adaptive metadata throttling (`--auto-meta-throttle`)
 
@@ -701,10 +701,11 @@ ulimit -n 65536
 * hard nofile 65536
 ```
 
-`rcp` queries the current session's **soft** limit without changing it. When `--max-open-files` is
-omitted, that value drives the five-unit per-pool heuristic described in
-[Static caps](#static-caps). Raising the soft limit can therefore increase default leaf parallelism
-until the 4096-operation cap. The setting is not a literal count of every descriptor in the process.
+`rcp` queries the current session's **soft** limit without changing it. It derives a descriptor
+safety ceiling from 80% of that limit, five modeled descriptor units, and a 4096-operation cap; that
+ceiling is independently intersected with `--max-files-in-flight` for each file-work pool. Raising
+the soft limit can therefore raise safety headroom, but does not change the CPU-based default
+file-work ceiling. Neither setting is a literal count of every descriptor in the process.
 
 ### Network Backlog (10+ Gbps)
 
@@ -756,14 +757,17 @@ rcp --network-profile=internet host1:/data host2:/data
 
 ### Concurrent Connections
 
-Control concurrent TCP connections for file transfers (default: 100):
+Remote data streams are `min(--max-files-in-flight, --max-connections)`. `--max-connections` is a
+separately configurable ceiling with a default of 100; pending capacity is that effective stream
+count times `--pending-writes-multiplier`. To raise remote parallelism above the CPU-derived
+file-work default, raise both ceilings:
 
 ```bash
 # Increase for many small files on high-bandwidth links
-rcp --max-connections=200 host1:/many-small-files host2:/dest
+rcp --max-files-in-flight=200 --max-connections=200 host1:/many-small-files host2:/dest
 
-# Decrease to reduce resource usage
-rcp --max-connections=16 host1:/data host2:/dest
+# Decrease both ceilings to reduce file work and stream resource usage
+rcp --max-files-in-flight=16 --max-connections=16 host1:/data host2:/dest
 ```
 
 ## Diagnosing Performance Issues
@@ -798,22 +802,18 @@ For optimal performance on high-speed networks:
 The `filegen` tool generates random test data, which is CPU-intensive. Unlike other rcp tools that
 are typically I/O-bound, filegen's bottleneck is often the CPU generating random bytes.
 
-**Default behavior**: `filegen` defaults `--max-open-files` to
-`std::thread::available_parallelism()` rather than using the soft-rlimit heuristic used by the other
-tools. This respects the CPU parallelism available to the process (including affinity/resource
-constraints) and avoids excessive random-data-generation contention.
+**Default behavior**: `filegen` shares the common `--max-files-in-flight` default:
+`max(std::thread::available_parallelism(), 4)`. This respects the CPU parallelism available to the
+process (including affinity/resource constraints) while retaining enough work to cover I/O latency.
 
 **Tuning for your workload**:
 
 ```bash
-# Use default (available CPU parallelism) - optimal for fast storage
+# Use the common CPU-based default - optimal for fast storage
 filegen /tmp 3,2 10 1M --progress
 
 # Increase for slow storage where I/O latency dominates
-filegen /tmp 3,2 10 1M --max-open-files=64 --progress
-
-# Disable file-write admission (other runtime and congestion gates still apply)
-filegen /tmp 3,2 10 1M --max-open-files=0 --progress
+filegen /tmp 3,2 10 1M --max-files-in-flight=64 --progress
 ```
 
 # Profiling

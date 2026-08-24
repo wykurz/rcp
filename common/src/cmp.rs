@@ -1765,16 +1765,16 @@ mod cmp_tests {
         assert_ne!(path_to_json_string(literal), path_to_json_string(raw));
     }
 
-    /// Stress tests exercising max-open-files saturation during cmp.
-    mod max_open_files_tests {
+    /// Stress tests exercising max-files-in-flight saturation during cmp.
+    mod max_files_in_flight_tests {
         use super::*;
         use anyhow::Context;
 
-        /// Deep + wide cmp: a directory tree deeper than the open-files limit, with files at every
+        /// Deep + wide cmp: a directory tree deeper than the files-in-flight limit, with files at every
         /// level. Verifies directories do not retain pending-metadata permits across recursion.
         #[tokio::test]
         #[traced_test]
-        async fn deep_tree_no_deadlock_under_open_files_saturation() -> Result<()> {
+        async fn deep_tree_no_deadlock_under_files_in_flight_saturation() -> Result<()> {
             let tmp_dir = testutils::create_temp_dir().await?;
             let src = tmp_dir.join("src");
             let dst = tmp_dir.join("dst");
@@ -1797,7 +1797,7 @@ mod cmp_tests {
                 dst_dir = dst_dir.join(format!("d{}", level));
             }
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(limit);
+            admission.set_files_in_flight(limit);
             let compare_settings = Settings {
                 fail_early: false,
                 exit_early: false,
@@ -1835,7 +1835,7 @@ mod cmp_tests {
         /// verifies expand_missing_tree's recursion bounds tasks under the permit cap.
         #[tokio::test]
         #[traced_test]
-        async fn expand_missing_under_open_files_saturation() -> Result<()> {
+        async fn expand_missing_under_files_in_flight_saturation() -> Result<()> {
             let tmp_dir = testutils::create_temp_dir().await?;
             let src = tmp_dir.join("src");
             let dst = tmp_dir.join("dst");
@@ -1853,7 +1853,7 @@ mod cmp_tests {
             }
             tokio::fs::create_dir(&dst).await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(limit);
+            admission.set_files_in_flight(limit);
             let compare_settings = Settings {
                 fail_early: false,
                 exit_early: false,
