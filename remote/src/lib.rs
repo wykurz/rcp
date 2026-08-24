@@ -219,6 +219,20 @@ pub const DEFAULT_PENDING_WRITES_MULTIPLIER: usize = 4;
 /// Exposed as `--remote-keepalive-sec`; see [`configure_tcp_socket`].
 pub const DEFAULT_REMOTE_KEEPALIVE_SEC: u64 = 120;
 
+/// Intersect the configured data-stream ceiling with the file-work ceiling.
+#[must_use]
+pub fn effective_max_connections(
+    files_in_flight: common::ConcurrencyLimit,
+    configured: std::num::NonZeroUsize,
+) -> std::num::NonZeroUsize {
+    match files_in_flight.meet(common::ConcurrencyLimit::Limited(configured)) {
+        common::ConcurrencyLimit::Limited(value) => value,
+        common::ConcurrencyLimit::Unlimited => {
+            unreachable!("a finite connection ceiling always makes the intersection finite")
+        }
+    }
+}
+
 impl Default for TcpConfig {
     fn default() -> Self {
         Self {
@@ -275,6 +289,17 @@ impl TcpConfig {
     pub fn effective_buffer_size(&self) -> usize {
         self.buffer_size
             .unwrap_or_else(|| self.network_profile.default_remote_copy_buffer_size())
+    }
+    /// Return the pending-file task capacity after validating its raw public fields.
+    pub fn max_pending_files(&self) -> anyhow::Result<usize> {
+        let max_connections = std::num::NonZeroUsize::new(self.max_connections)
+            .context("max connections must be nonzero")?;
+        let multiplier = std::num::NonZeroUsize::new(self.pending_writes_multiplier)
+            .context("pending writes multiplier must be nonzero")?;
+        max_connections
+            .get()
+            .checked_mul(multiplier.get())
+            .context("pending file capacity overflow")
     }
 }
 
@@ -802,8 +827,9 @@ async fn check_rcpd_version(
             Remote: rcpd {} on host '{}'\n\
             \n\
             The rcpd version on the remote host must exactly match the rcp version,\n\
-            including the +w wire revision — two builds of the same release can\n\
-            differ when the development wire schema moved between them (then\n\
+            including the +w compatibility revision — two builds of the same release can\n\
+            differ when the development remote protocol or rcpd spawn contract moved\n\
+            between them (then\n\
             reinstall/redeploy the remote build rather than pinning a version).\n\
             \n\
             To fix this, install the matching version on the remote host:\n\
@@ -868,6 +894,7 @@ pub async fn start_rcpd(
                     );
                     // find local rcpd binary
                     let local_rcpd = deploy::find_local_rcpd_binary()
+                        .await
                         .context("failed to find local rcpd binary for deployment")?;
                     tracing::info!("Found local rcpd binary at {}", local_rcpd.display());
                     // get version for deployment path
@@ -881,6 +908,14 @@ pub async fn start_rcpd(
                     )
                     .await
                     .context("failed to deploy rcpd to remote host")?;
+                    check_rcpd_version(&ssh_session, &deployed_path, remote_host)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "deployed rcpd at {} failed compatibility verification",
+                                deployed_path
+                            )
+                        })?;
                     tracing::info!("Successfully deployed rcpd to {}", deployed_path);
                     // cleanup old versions (best effort, don't fail if this errors)
                     if let Err(e) = deploy::cleanup_old_versions(&ssh_session, 3).await {
@@ -1515,6 +1550,76 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Mutex;
+
+    fn nonzero(value: usize) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(value).unwrap()
+    }
+
+    #[test]
+    fn effective_connections_meet_finite_file_ceiling() {
+        let configured = nonzero(8);
+        for (files_in_flight, expected) in [(3, 3), (8, 8), (12, 8)] {
+            assert_eq!(
+                effective_max_connections(
+                    common::ConcurrencyLimit::Limited(nonzero(files_in_flight)),
+                    configured,
+                ),
+                nonzero(expected),
+            );
+        }
+    }
+
+    #[test]
+    fn effective_connections_keep_configured_ceiling_when_files_are_unlimited() {
+        assert_eq!(
+            effective_max_connections(common::ConcurrencyLimit::Unlimited, nonzero(8)),
+            nonzero(8),
+        );
+    }
+
+    #[test]
+    fn pending_file_capacity_uses_connections_and_multiplier() {
+        let config = TcpConfig::default()
+            .with_max_connections(3)
+            .with_pending_writes_multiplier(4);
+        assert_eq!(config.max_pending_files().unwrap(), 12);
+    }
+
+    #[test]
+    fn pending_file_capacity_rejects_overflow() {
+        let config = TcpConfig::default()
+            .with_max_connections(usize::MAX)
+            .with_pending_writes_multiplier(2);
+        let error = config.max_pending_files().unwrap_err();
+        assert!(
+            error.to_string().contains("pending file capacity overflow"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn pending_file_capacity_rejects_zero_connections() {
+        let config = TcpConfig::default().with_max_connections(0);
+        let error = config.max_pending_files().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("max connections must be nonzero"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn pending_file_capacity_rejects_zero_multiplier() {
+        let config = TcpConfig::default().with_pending_writes_multiplier(0);
+        let error = config.max_pending_files().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("pending writes multiplier must be nonzero"),
+            "unexpected error: {error:#}"
+        );
+    }
 
     struct MockDiscoverySession {
         test_responses: HashMap<String, bool>,

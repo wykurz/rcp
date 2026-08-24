@@ -91,17 +91,6 @@ struct Args {
     #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
     quiet: bool,
 
-    /// Concurrent file-write admission limit
-    ///
-    /// Since filegen's random data generation is CPU-intensive, the default uses available CPU
-    /// parallelism. This optimizes performance by matching concurrency to compute capacity rather
-    /// than allowing excessive parallelism that would cause CPU contention.
-    ///
-    /// Set to 0 to disable file-write admission. Increase if using slow storage where I/O latency
-    /// dominates.
-    #[arg(long, value_name = "N", help_heading = "Performance & throttling")]
-    max_open_files: Option<usize>,
-
     /// Chunk size used to calculate number of I/O per file
     ///
     /// Modifying this setting to a value > 0 is REQUIRED when using --iops-throttle.
@@ -153,24 +142,16 @@ async fn async_main(args: Args) -> Result<common::filegen::Summary> {
 
 fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
+    let files_in_flight = args.common.resolve_files_in_flight();
     let func = {
         let args = args.clone();
         || async_main(args)
     };
     let output = args.common.output_config(args.quiet, args.summary);
     let runtime = args.common.runtime_config();
-    // filegen's random data generation is CPU-intensive, so we default to
-    // available parallelism rather than the soft-rlimit leaf-admission heuristic used by other
-    // tools
-    // use 1 as absolute minimum to avoid accidentally disabling limits.
-    let max_open_files = args.max_open_files.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-    });
     let throttle = args
         .common
-        .throttle_config(Some(max_open_files), args.chunk_size);
+        .throttle_config(files_in_flight, args.chunk_size);
     let tracing = common::TracingConfig::local("filegen");
     // note: filegen historically does not treat --progress-delay alone as
     // implying --progress (unlike rrm/rlink). preserve that behavior here.

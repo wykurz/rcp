@@ -1392,7 +1392,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn fail_early_returns_while_non_cancellable_work_retains_admission() {
         let admission = crate::testutils::AdmissionLimit::new().await;
-        admission.set_max_open_files(1);
+        admission.set_files_in_flight(1);
         let open_file_guard = throttle::open_file_permit().await;
         let fd_admission = open_file_guard.admission();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -1505,9 +1505,9 @@ mod tests {
     }
 
     /// Driver-level deadlock regression. The module name carries the
-    /// `max_open_files` substring so nextest's serial test-group isolates this
+    /// `max_files_in_flight` substring so nextest's serial test-group isolates this
     /// process-wide throttle mutation (see `.config/nextest.toml`).
-    mod max_open_files_tests {
+    mod max_files_in_flight_tests {
         use super::*;
         use anyhow::Context;
         use std::os::fd::AsRawFd;
@@ -1924,7 +1924,7 @@ mod tests {
             let leaf_path = root.join("leaf");
             tokio::fs::write(&leaf_path, b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let parent = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -2132,7 +2132,7 @@ mod tests {
             tokio::fs::create_dir(&directory_path).await?;
             tokio::fs::write(&file_path, b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let parent = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -2205,7 +2205,7 @@ mod tests {
             let leaf_path = root.join("leaf");
             tokio::fs::write(&leaf_path, b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let parent = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -2270,7 +2270,7 @@ mod tests {
                 authoritative_filter: false,
             });
             let parent_cx = root_cx(Arc::clone(&dir), std::ffi::OsStr::new("root"), root.clone());
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
@@ -2323,7 +2323,7 @@ mod tests {
             tokio::fs::write(root.join("first"), b"x").await?;
             tokio::fs::write(root.join("second"), b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(2);
+            admission.set_files_in_flight(2);
             let dir = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -2431,7 +2431,7 @@ mod tests {
             let root = crate::testutils::create_temp_dir().await?;
             tokio::fs::write(root.join("gated"), b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(2);
+            admission.set_files_in_flight(2);
             let dir = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -2491,7 +2491,7 @@ mod tests {
             tokio::fs::write(root.join("second-gated"), b"x").await?;
             tokio::fs::write(root.join("fourth"), b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(2);
+            admission.set_files_in_flight(2);
             let dir = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -2570,7 +2570,7 @@ mod tests {
             tokio::fs::create_dir(root.join("B")).await?;
             tokio::fs::write(root.join("C"), b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(3);
+            admission.set_files_in_flight(3);
             let dir = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -2678,7 +2678,7 @@ mod tests {
             let root = crate::testutils::create_temp_dir().await?;
             tokio::fs::write(root.join("leaf"), b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let held = throttle::pending_meta_permit().await;
             let dir = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
@@ -2729,7 +2729,7 @@ mod tests {
             let root = crate::testutils::create_temp_dir().await?;
             tokio::fs::write(root.join("leaf"), b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let held = throttle::pending_meta_permit().await;
             let dir = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
@@ -2779,7 +2779,7 @@ mod tests {
             tokio::fs::create_dir(root.join("cache")).await?;
             tokio::fs::write(root.join("cache").join("child"), b"protected").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let dir = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -2821,7 +2821,7 @@ mod tests {
             let root = crate::testutils::create_temp_dir().await?;
             tokio::fs::write(root.join("leaf"), b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let dir = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -2909,7 +2909,7 @@ mod tests {
                 }
             }
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let dir = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -2951,7 +2951,7 @@ mod tests {
             let root = crate::testutils::create_temp_dir().await?;
             tokio::fs::create_dir(root.join("dir")).await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let held = throttle::pending_meta_permit().await;
             let parent = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
@@ -2992,7 +2992,7 @@ mod tests {
             let entry = root.join("entry");
             tokio::fs::write(&entry, b"old").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let held_leaf = throttle::pending_meta_permit().await;
             let parent = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
@@ -3110,10 +3110,10 @@ mod tests {
             let dir_path = root.join("d");
             tokio::fs::create_dir(&dir_path).await?;
             tokio::fs::write(dir_path.join("c"), b"x").await?;
-            // size the pending-meta pool to a single permit (the `set_max_open_files`
+            // size the pending-meta pool to a single permit (the `set_files_in_flight`
             // knob sizes both pools).
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             // open the container of `d` and classify `d`: an authoritative directory.
             let parent = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)

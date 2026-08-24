@@ -260,8 +260,8 @@ selection or ordering. TLS 1.3 is **pinned** — every connection is configured 
 unconditionally: TLS 1.3 has been available at both ends since the TLS layer was introduced (rustls
 has always offered it), so pinning never excludes a legitimate rcp/rcpd peer. A peer that cannot
 negotiate 1.3 simply fails the handshake — the correct outcome — rather than silently downgrading.
-(This does not depend on the version check, which `--auto-deploy-rcpd` can bypass; see
-[Remote Copy](remote_copy.md).)
+This defense remains independent of the compatibility checks at remote discovery and deployment
+boundaries; see [Remote Copy](remote_copy.md).
 
 ## Disabling Encryption
 

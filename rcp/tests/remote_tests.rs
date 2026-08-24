@@ -180,6 +180,27 @@ fn print_command_output(output: &std::process::Output) {
     eprintln!("=== END RCP OUTPUT ===");
 }
 
+fn assert_two_rcpd_logs_report_connection_count(
+    log_dir: &std::path::Path,
+    expected_connections: usize,
+) {
+    let logs: Vec<_> = std::fs::read_dir(log_dir)
+        .expect("rcpd log directory must be readable")
+        .map(|entry| entry.expect("rcpd log entry must be readable").path())
+        .filter(|path| path.is_file())
+        .collect();
+    assert_eq!(logs.len(), 2, "source and destination rcpd must each log");
+    let expected = format!("Effective remote connection count: {expected_connections}");
+    for log in logs {
+        let contents = std::fs::read_to_string(&log).expect("rcpd log must be readable");
+        assert!(
+            contents.contains(&expected),
+            "{} did not report {expected}",
+            log.display()
+        );
+    }
+}
+
 fn run_rcp_and_expect_success(args: &[&str]) -> std::process::Output {
     let output = run_rcp_with_args(args);
     print_command_output(&output);
@@ -521,6 +542,76 @@ fn test_remote_copy_directory() {
     assert_eq!(summary.files_copied, 2);
     assert_eq!(summary.directories_created, 1);
     assert_eq!(summary.bytes_copied, 40); // "remote dir content 1" (20) + "remote dir content 2" (20)
+}
+
+#[test]
+fn test_remote_max_files_in_flight_clamps_both_daemons() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("finite_clamp.txt");
+    let dst_file = dst_dir.path().join("finite_clamp.txt");
+    create_test_file(&src_file, "finite clamp", 0o644);
+    let src_remote = format!("localhost:{}", src_file.display());
+    let dst_remote = format!("localhost:{}", dst_file.display());
+    let logs = tempfile::tempdir().unwrap();
+    let log_prefix = logs.path().join("rcpd");
+    let log_arg = format!("--rcpd-debug-log-prefix={}", log_prefix.display());
+    let output = run_rcp_with_args(&[
+        "--max-files-in-flight=1",
+        "--max-connections=4",
+        &log_arg,
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output);
+    assert!(output.status.success(), "finite-clamped remote copy failed");
+    assert_eq!(get_file_content(&dst_file), "finite clamp");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Effective remote connection count: 1"),
+        "the master must clamp four configured connections to the finite file ceiling"
+    );
+    assert_two_rcpd_logs_report_connection_count(logs.path(), 1);
+}
+
+#[test]
+fn test_remote_legacy_unlimited_warns_once_from_initiating_rcp() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("legacy_unlimited.txt");
+    let dst_file = dst_dir.path().join("legacy_unlimited.txt");
+    create_test_file(&src_file, "legacy unlimited", 0o644);
+    let src_remote = format!("localhost:{}", src_file.display());
+    let dst_remote = format!("localhost:{}", dst_file.display());
+    let logs = tempfile::tempdir().unwrap();
+    let log_prefix = logs.path().join("rcpd");
+    let log_arg = format!("--rcpd-debug-log-prefix={}", log_prefix.display());
+    let output = run_rcp_with_args(&[
+        "--max-open-files=0",
+        "--max-connections=3",
+        &log_arg,
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output);
+    assert!(
+        output.status.success(),
+        "legacy-unlimited remote copy failed"
+    );
+    assert_eq!(get_file_content(&dst_file), "legacy unlimited");
+    let warning = "--max-open-files=0 is deprecated";
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches(warning).count(),
+        1,
+        "the initiating rcp must emit exactly one deprecation warning"
+    );
+    assert_eq!(
+        stdout.matches(warning).count(),
+        0,
+        "propagated source and destination parser inputs must not emit warnings"
+    );
+    assert_two_rcpd_logs_report_connection_count(logs.path(), 3);
 }
 
 /// Test copying many small files to exercise stream pooling.
@@ -3214,6 +3305,135 @@ fn test_remote_auto_deploy_on_version_mismatch() {
     );
 
     eprintln!("✓ Auto-deployment on version mismatch test succeeded");
+}
+
+#[test]
+fn test_remote_auto_deploy_skips_mismatched_local_candidate() {
+    require_local_ssh();
+    let home = make_test_home();
+    let override_home = home.path().to_str().unwrap().to_string();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("local_candidate_mismatch.txt");
+    let dst_file = dst_dir.path().join("local_candidate_mismatch.txt");
+    create_test_file(&src_file, "compatible fallback deployed", 0o644);
+    let src_remote = format!("localhost:{}", src_file.display());
+    let dst_remote = format!("localhost:{}", dst_file.display());
+
+    // running a copy of rcp gives the test sole ownership of its same-directory candidate
+    let master_dir = tempfile::tempdir().unwrap();
+    let copied_rcp = master_dir.path().join("rcp");
+    std::fs::copy(assert_cmd::cargo::cargo_bin("rcp"), &copied_rcp)
+        .expect("failed to copy rcp test binary");
+    std::fs::set_permissions(&copied_rcp, std::fs::Permissions::from_mode(0o755))
+        .expect("failed to make copied rcp executable");
+    let stale_rcpd = master_dir.path().join("rcpd");
+    std::fs::write(
+        &stale_rcpd,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--protocol-version\" ]; then\n\
+           echo '{\"semantic\":\"0.0.0+w0\"}'\n\
+           exit 0\n\
+         fi\n\
+         echo 'stale local candidate was spawned' >&2\n\
+         exit 42\n",
+    )
+    .expect("failed to create stale local rcpd candidate");
+    std::fs::set_permissions(&stale_rcpd, std::fs::Permissions::from_mode(0o755))
+        .expect("failed to make stale local rcpd candidate executable");
+
+    // the real test rcpd is a later PATH candidate and must remain available as the fallback
+    let compatible_rcpd = assert_cmd::cargo::cargo_bin("rcpd");
+    let compatible_dir = compatible_rcpd.parent().expect("rcpd must have a parent");
+    let ambient_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(compatible_dir.to_path_buf()).chain(std::env::split_paths(&ambient_path)),
+    )
+    .expect("failed to build fallback PATH");
+    let output = std::process::Command::new("timeout")
+        .args(["90", copied_rcp.to_str().unwrap()])
+        .args(["-vv", "--force-remote", "--auto-deploy-rcpd"])
+        .arg("--rcpd-path=/nonexistent/rcpd")
+        .args([&src_remote, &dst_remote])
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .env("RCP_REMOTE_HOME_OVERRIDE", &override_home)
+        .output()
+        .expect("failed to execute copied rcp command");
+    assert_not_timeout(&output);
+    print_command_output(&output);
+    assert!(
+        output.status.success(),
+        "auto-deploy must skip the stale same-directory candidate and deploy the compatible PATH candidate"
+    );
+    assert_eq!(get_file_content(&dst_file), "compatible fallback deployed");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("stale local candidate was spawned"),
+        "the incompatible candidate must never reach the remote spawn boundary"
+    );
+}
+
+#[test]
+fn test_remote_auto_deploy_skips_hanging_local_candidate() {
+    require_local_ssh();
+    let home = make_test_home();
+    let override_home = home.path().to_str().unwrap().to_string();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("local_candidate_hang.txt");
+    let dst_file = dst_dir.path().join("local_candidate_hang.txt");
+    create_test_file(&src_file, "compatible fallback deployed", 0o644);
+    let src_remote = format!("localhost:{}", src_file.display());
+    let dst_remote = format!("localhost:{}", dst_file.display());
+
+    // running a copy of rcp gives the test sole ownership of its same-directory candidate
+    let master_dir = tempfile::tempdir().unwrap();
+    let copied_rcp = master_dir.path().join("rcp");
+    std::fs::copy(assert_cmd::cargo::cargo_bin("rcp"), &copied_rcp)
+        .expect("failed to copy rcp test binary");
+    std::fs::set_permissions(&copied_rcp, std::fs::Permissions::from_mode(0o755))
+        .expect("failed to make copied rcp executable");
+    let hanging_rcpd = master_dir.path().join("rcpd");
+    std::fs::write(
+        &hanging_rcpd,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--protocol-version\" ]; then\n\
+           exec sleep 60\n\
+         fi\n\
+         echo 'hanging local candidate was spawned' >&2\n\
+         exit 42\n",
+    )
+    .expect("failed to create hanging local rcpd candidate");
+    std::fs::set_permissions(&hanging_rcpd, std::fs::Permissions::from_mode(0o755))
+        .expect("failed to make hanging local rcpd candidate executable");
+
+    // the real test rcpd is a later PATH candidate and must remain available as the fallback
+    let compatible_rcpd = assert_cmd::cargo::cargo_bin("rcpd");
+    let compatible_dir = compatible_rcpd.parent().expect("rcpd must have a parent");
+    let ambient_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(compatible_dir.to_path_buf()).chain(std::env::split_paths(&ambient_path)),
+    )
+    .expect("failed to build fallback PATH");
+    let output = std::process::Command::new("timeout")
+        .args(["30", copied_rcp.to_str().unwrap()])
+        .args(["--force-remote", "--auto-deploy-rcpd"])
+        .arg("--rcpd-path=/nonexistent/rcpd")
+        .args([&src_remote, &dst_remote])
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .env("RCP_REMOTE_HOME_OVERRIDE", &override_home)
+        .output()
+        .expect("failed to execute copied rcp command");
+    print_command_output(&output);
+    assert_not_timeout(&output);
+    assert!(
+        output.status.success(),
+        "auto-deploy must time out the hanging same-directory candidate and deploy the compatible PATH candidate"
+    );
+    assert_eq!(get_file_content(&dst_file), "compatible fallback deployed");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("hanging local candidate was spawned"),
+        "the rejected candidate must never reach the remote spawn boundary"
+    );
 }
 
 #[test]

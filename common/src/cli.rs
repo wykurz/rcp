@@ -8,13 +8,11 @@
 //! - `chunk_size` — rcp/rcpd parse as `bytesize::ByteSize` (e.g. "16MiB"),
 //!   others as bare `u64`.
 //! - `summary` — rcpd streams results to the master and never prints a summary.
-//! - `max_open_files` — filegen falls back to available CPU parallelism instead of the
-//!   soft-rlimit-based leaf-admission heuristic, because random-data generation is CPU-bound.
 //! - `quiet` — rcmp's `--quiet` also suppresses stdout differences (not just
 //!   error output), so its help text differs from the other tools.
 
-/// Shared help for the leaf-operation descriptor-admission setting.
-pub const LEAF_ADMISSION_HELP: &str = "Leaf-operation descriptor admission count. N is assigned to each of the independent OpenFile and PendingMeta pools; it is not a literal fd maximum or a combined pool total. 0 disables admission. With a nonzero soft RLIMIT_NOFILE, the default per pool is min(max(1, floor((soft limit * 80%) / 5)), 4096); a zero soft limit leaves admission disabled.";
+/// Shared help for the file-like operation concurrency setting.
+pub const FILES_IN_FLIGHT_HELP: &str = "Maximum concurrent file-like operations. The default is the available CPU parallelism with a floor of 4. Explicit values must be at least 1. This applies to file copy, link, comparison, removal, chmod, and generation work; lower internal safety ceilings may apply.";
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct CommonArgs {
@@ -56,6 +54,19 @@ pub struct CommonArgs {
         help_heading = "Performance & throttling"
     )]
     pub iops_throttle: usize,
+    /// Maximum concurrent file-like operations.
+    #[arg(long, value_name = "N", value_parser = parse_positive_usize,
+          help = FILES_IN_FLIGHT_HELP,
+          help_heading = "Performance & throttling",
+          conflicts_with = "max_open_files")]
+    pub max_files_in_flight: Option<std::num::NonZeroUsize>,
+    #[arg(
+        long,
+        value_name = "N",
+        hide = true,
+        conflicts_with = "max_files_in_flight"
+    )]
+    pub max_open_files: Option<usize>,
     // Advanced settings
     /// Number of worker threads (0 = number of CPU cores)
     #[arg(
@@ -218,6 +229,15 @@ pub struct CommonArgs {
 }
 
 impl CommonArgs {
+    #[must_use]
+    pub fn resolve_files_in_flight(&self) -> crate::ResolvedFilesInFlight {
+        match (self.max_files_in_flight, self.max_open_files) {
+            (Some(value), None) => crate::ResolvedFilesInFlight::explicit(value),
+            (None, Some(value)) => crate::ResolvedFilesInFlight::legacy(value),
+            (None, None) => crate::ResolvedFilesInFlight::automatic(),
+            (Some(_), Some(_)) => unreachable!("clap rejects conflicting file limits"),
+        }
+    }
     /// Build a [`crate::OutputConfig`]. `quiet` and `print_summary` are
     /// supplied by the caller (each binary owns its own `--quiet` and
     /// `--summary` flags so it can document binary-specific semantics).
@@ -238,13 +258,11 @@ impl CommonArgs {
             max_blocking_threads: self.max_blocking_threads,
         }
     }
-    /// Build a [`crate::ThrottleConfig`]. `max_open_files` and `chunk_size`
-    /// are supplied by the caller (filegen has its own `--max-open-files`
-    /// default; chunk_size has different parser types per binary).
+    /// Build a [`crate::ThrottleConfig`]. `chunk_size` has different parser types per binary.
     #[must_use]
     pub fn throttle_config(
         &self,
-        max_open_files: Option<usize>,
+        files_in_flight: crate::ResolvedFilesInFlight,
         chunk_size: u64,
     ) -> crate::ThrottleConfig {
         let auto_meta_implied = self.auto_meta_throttle
@@ -265,7 +283,7 @@ impl CommonArgs {
             tick_interval: self.auto_meta_tick_interval.into(),
         });
         crate::ThrottleConfig {
-            max_open_files,
+            files_in_flight,
             ops_throttle: self.ops_throttle,
             iops_throttle: self.iops_throttle,
             chunk_size,
@@ -312,21 +330,81 @@ impl CommonArgs {
     }
 }
 
+fn parse_positive_usize(value: &str) -> Result<std::num::NonZeroUsize, String> {
+    let value = value.parse::<usize>().map_err(|error| error.to_string())?;
+    std::num::NonZeroUsize::new(value).ok_or_else(|| "value must be at least 1".to_string())
+}
+
 #[cfg(test)]
 mod implies_tests {
     use super::*;
     use clap::Parser;
+    use std::num::NonZeroUsize;
 
-    #[derive(Parser)]
+    #[derive(Debug, Parser)]
     struct TestCli {
         #[command(flatten)]
         common: CommonArgs,
     }
 
     #[test]
+    fn max_files_in_flight_resolves_cli_sources() {
+        let explicit = TestCli::try_parse_from(["test", "--max-files-in-flight=1"])
+            .expect("positive max-files-in-flight must parse")
+            .common
+            .resolve_files_in_flight();
+        assert_eq!(
+            explicit,
+            crate::ResolvedFilesInFlight::explicit(NonZeroUsize::new(1).unwrap())
+        );
+        let automatic = TestCli::try_parse_from(["test"])
+            .expect("omitted max-files-in-flight must parse")
+            .common
+            .resolve_files_in_flight();
+        assert_eq!(automatic.source(), crate::FilesInFlightSource::Automatic);
+        let legacy_zero = TestCli::try_parse_from(["test", "--max-open-files=0"])
+            .expect("legacy zero must parse")
+            .common
+            .resolve_files_in_flight();
+        assert_eq!(legacy_zero.limit(), crate::ConcurrencyLimit::Unlimited);
+        assert_eq!(
+            legacy_zero.source(),
+            crate::FilesInFlightSource::DeprecatedMaxOpenFiles
+        );
+        let legacy_positive = TestCli::try_parse_from(["test", "--max-open-files=7"])
+            .expect("positive legacy value must parse")
+            .common
+            .resolve_files_in_flight();
+        assert_eq!(legacy_positive, crate::ResolvedFilesInFlight::legacy(7));
+    }
+
+    #[test]
+    fn max_files_in_flight_rejects_invalid_and_conflicting_values() {
+        let zero = TestCli::try_parse_from(["test", "--max-files-in-flight=0"])
+            .expect_err("zero max-files-in-flight must be rejected");
+        assert!(zero.to_string().contains("value must be at least 1"));
+        assert!(TestCli::try_parse_from(["test", "--max-files-in-flight=nope"]).is_err());
+        assert!(
+            TestCli::try_parse_from(["test", "--max-files-in-flight=1", "--max-open-files=1",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn long_help_only_advertises_max_files_in_flight() {
+        let help = TestCli::try_parse_from(["test", "--help"])
+            .expect_err("help must stop clap parsing")
+            .to_string();
+        assert!(help.contains("--max-files-in-flight"));
+        assert!(!help.contains("--max-open-files"));
+    }
+
+    #[test]
     fn auto_meta_histogram_implies_throttle_at_cli() {
         let cli = TestCli::parse_from(["test", "--auto-meta-histogram"]);
-        let throttle = cli.common.throttle_config(None, 0);
+        let throttle = cli
+            .common
+            .throttle_config(cli.common.resolve_files_in_flight(), 0);
         assert!(
             throttle.auto_meta.is_some(),
             "histogram flag must imply auto_meta"
@@ -337,7 +415,9 @@ mod implies_tests {
     #[test]
     fn auto_meta_histogram_log_implies_throttle_at_cli() {
         let cli = TestCli::parse_from(["test", "--auto-meta-histogram-log", "/tmp/x.hdr"]);
-        let throttle = cli.common.throttle_config(None, 0);
+        let throttle = cli
+            .common
+            .throttle_config(cli.common.resolve_files_in_flight(), 0);
         assert!(
             throttle.auto_meta.is_some(),
             "histogram-log flag must imply auto_meta"
@@ -348,7 +428,9 @@ mod implies_tests {
     #[test]
     fn no_auto_meta_flags_means_no_throttle() {
         let cli = TestCli::parse_from(["test"]);
-        let throttle = cli.common.throttle_config(None, 0);
+        let throttle = cli
+            .common
+            .throttle_config(cli.common.resolve_files_in_flight(), 0);
         assert!(throttle.auto_meta.is_none());
         assert!(!throttle.histogram_enabled);
     }
@@ -366,7 +448,12 @@ mod implies_tests {
         let cli = TestCli::parse_from(["test", "--auto-meta-histogram"]);
         // `throttle_config()` returns `auto_meta = Some(...)` because the
         // panel needs the throttle pipeline locally — that's intentional.
-        assert!(cli.common.throttle_config(None, 0).auto_meta.is_some());
+        assert!(
+            cli.common
+                .throttle_config(cli.common.resolve_files_in_flight(), 0)
+                .auto_meta
+                .is_some()
+        );
         // But the *explicit* throttle field must stay false so the rcp binary
         // can distinguish "panel only" from "user explicitly asked for throttle".
         assert!(

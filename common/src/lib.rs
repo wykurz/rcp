@@ -138,7 +138,8 @@ pub mod walk;
 pub mod walk_driver;
 
 pub use config::{
-    AutoMetaThrottleConfig, DryRunMode, DryRunWarnings, OutputConfig, RuntimeConfig,
+    AutoMetaThrottleConfig, ConcurrencyLimit, DryRunMode, DryRunWarnings, FilesInFlightSource,
+    MIN_DEFAULT_FILES_IN_FLIGHT, OutputConfig, ResolvedFilesInFlight, RuntimeConfig,
     ThrottleConfig, TracingConfig,
 };
 // Re-export `Side` from the congestion crate so downstream binaries
@@ -176,6 +177,22 @@ impl std::fmt::Display for RcpdType {
 
 // Type alias for progress snapshots
 pub type ProgressSnapshot<T> = enum_map::EnumMap<RcpdType, T>;
+
+#[derive(Debug, Eq, PartialEq)]
+enum CompatibilityWarningDestination {
+    Stderr,
+    Stdout,
+}
+
+fn compatibility_warning_destination(
+    tracing_config: &TracingConfig,
+) -> CompatibilityWarningDestination {
+    if tracing_config.remote_layer.is_some() {
+        CompatibilityWarningDestination::Stdout
+    } else {
+        CompatibilityWarningDestination::Stderr
+    }
+}
 
 /// runtime statistics collected from a process (CPU time, memory usage)
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -627,6 +644,12 @@ where
     // tracing guards must outlive the runtime so chrome/flame traces flush
     // extract trace_identifier before install_tracing_subscriber consumes tracing_config
     let trace_identifier = tracing_config.trace_identifier.clone();
+    if let Some(warning) = throttle_config.deprecated_max_open_files_warning() {
+        match compatibility_warning_destination(&tracing_config) {
+            CompatibilityWarningDestination::Stderr => eprintln!("{warning}"),
+            CompatibilityWarningDestination::Stdout => println!("{warning}"),
+        }
+    }
     if let Err(e) =
         runtime_setup::validate_histogram_log_target(&throttle_config, &trace_identifier)
     {
@@ -710,11 +733,27 @@ fn reset_process_throttle_state() {
     }
     throttle::disable_ops_throttle();
     // Without these resets, a second run() in the same process inherits
-    // the previous run's open-files cap and iops-throttle even when the
-    // caller passes 0 ("no limit"): `set_max_open_files` / `init_iops_tokens`
-    // are skipped on 0, leaving the prior `setup(N)` in force. setup(0)
-    // disables the semaphore, so the next run sees a clean slate and can
-    // either re-init with a fresh value or stay disabled.
-    throttle::set_max_open_files(0);
+    // the previous run's file-admission caps and iops-throttle. setup(0)
+    // disables the semaphores, so the next run sees a clean slate and can
+    // either configure fresh values or leave either admission pool unlimited.
+    throttle::set_admission_limits(0, 0);
     throttle::init_iops_tokens(0);
+}
+
+#[cfg(test)]
+mod compatibility_warning_destination_tests {
+    use super::*;
+
+    #[test]
+    fn direct_rcpd_warnings_use_stdout() {
+        let (layer, _, _) = crate::remote_tracing::RemoteTracingLayer::new();
+        let tracing = TracingConfig {
+            remote_layer: Some(layer),
+            ..TracingConfig::default()
+        };
+        assert_eq!(
+            compatibility_warning_destination(&tracing),
+            CompatibilityWarningDestination::Stdout
+        );
+    }
 }

@@ -11,6 +11,19 @@ fn rchm() -> Command {
 }
 
 #[test]
+fn parses_positive_max_files_in_flight_before_help() {
+    rchm()
+        .args(["--max-files-in-flight=1", "--help"])
+        .assert()
+        .success();
+    rchm()
+        .args(["--max-files-in-flight=0", "--help"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("at least 1"));
+}
+
+#[test]
 fn errors_when_no_operation_given() {
     // the common harness routes runtime errors to stdout (see common::run)
     rchm()

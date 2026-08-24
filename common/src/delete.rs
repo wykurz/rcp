@@ -210,7 +210,7 @@ mod tests {
         ))
     }
 
-    mod max_open_files_tests {
+    mod max_files_in_flight_tests {
         use super::*;
 
         /// Delete protection must classify the entry it will remove rather than trust `d_type`.
@@ -221,7 +221,7 @@ mod tests {
             tokio::fs::create_dir_all(dst.join("cache")).await?;
             tokio::fs::write(dst.join("cache").join("child"), b"protected").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let dst_dir = open_dst(&dst).await?;
             let mut filter = crate::filter::FilterSettings::new();
             filter.add_exclude("cache/")?;
@@ -260,7 +260,7 @@ mod tests {
             tokio::fs::create_dir(&dst).await?;
             tokio::fs::write(dst.join("protected"), b"x").await?;
             let admission = crate::testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let dst_dir = open_dst(&dst).await?;
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Stat);
@@ -324,7 +324,7 @@ mod tests {
             filter.add_exclude("protected")?;
             let keep = HashSet::new();
             let settings = delete_settings(false);
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);

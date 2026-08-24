@@ -186,8 +186,9 @@ The `--auto-deploy-rcpd` flag enables automatic transfer and installation of rcp
 ### Deployment Workflow
 
 1. **Find local rcpd binary**:
-   - Check same directory as rcp (ensures matching build)
-   - Fall back to PATH via `which rcpd`
+   - Check same directory as rcp with a bounded `--protocol-version` probe
+   - Fall back to later candidates such as PATH when an earlier candidate is missing, unusable, or
+     incompatible; a timed-out probe is terminated and reaped before fallback
 
 2. **Transfer binary to a temp file**:
    - Read local rcpd binary
@@ -198,6 +199,7 @@ The `--auto-deploy-rcpd` flag enables automatic transfer and installation of rcp
 3. **Verify, then publish**:
    - Verify SHA-256 checksum **of the temp file** (a mismatch removes it, publishing nothing)
    - Atomic rename to the final location
+   - Re-run `--protocol-version` on the published remote path before spawning it
    - Clean up old versions (keeps last 3)
 
 ### Transfer Mechanism
@@ -247,10 +249,10 @@ present.
 
 ### Error Messages
 
-**Local binary not found**:
+**Compatible local binary not found**:
 
 ```
-no local rcpd binary found for deployment
+no compatible local rcpd binary found for deployment
 
 Searched in:
 - Same directory: /path/to/rcp/rcpd
@@ -261,10 +263,9 @@ To use auto-deployment, ensure rcpd is available:
 - or build with: cargo build --release --bin rcpd
 ```
 
-(A `PATH:` line is added to the "Searched in" list only in the unusual case where `which rcpd`
-resolves to a path that then doesn't exist or isn't a regular file; when `which` finds a usable
-binary it is deployed, and when it finds nothing no `PATH:` line is shown — hence the common
-not-found output lists only the same-directory candidate.)
+(A `PATH:` line is added when `which rcpd` resolves a candidate. An incompatible candidate remains
+in the list with its rejection reason; a compatible one is deployed. When `which` finds nothing, no
+`PATH:` line is shown — hence the common not-found output lists only the same-directory candidate.)
 
 **Checksum mismatch**:
 
@@ -322,17 +323,10 @@ timeout is involved. Two distinct outcomes:
   set: the master fails with the version-mismatch error shown in
   [Version Mismatch Error](#version-mismatch-error), not the "not found" error. (With
   `--auto-deploy-rcpd`, a mismatch instead triggers deployment: the master ships its *local* rcpd
-  binary — the one beside `rcp`, or failing that one found via `which rcpd` — and stores it under
-  the local `rcp`'s version. Note the local binary's own protocol version is **not** re-verified
-  before it is shipped and launched, so this assumes the local rcpd is the build that matches `rcp`;
-  see the note below.)
-
-> **Caveat:** auto-deployment trusts the local rcpd it finds; `find_local_rcpd_binary` selects by
-> existence, not version. The same-directory candidate is *expected* to be the co-built sibling that
-> matches `rcp` — but that is an expectation, not a verified guarantee — and a `which rcpd` fallback
-> could resolve to a stale binary. Either would be deployed under the current version's filename and
-> launched with a potentially incompatible protocol. Prefer keeping `rcpd` next to `rcp`, or deploy
-> manually, when versions may diverge.
+  binary — the first compatible candidate beside `rcp` or on PATH — and stores it under the local
+  `rcp`'s compatibility tag. Each local candidate's own `--protocol-version` is checked before
+  deployment, with stale candidates skipped in favor of later fallbacks. The published remote path
+  is checked again before either rcpd role is spawned.)
 
 #### Master Cannot Connect to rcpd
 
@@ -473,8 +467,15 @@ cargo build --target x86_64-unknown-linux-gnu
 | `--remote-copy-conn-timeout-sec=N` | Connection timeout (default: 15; 60 with `--auto-deploy-rcpd`) |
 | `--remote-keepalive-sec=N`         | Dead-peer detection budget, 0 disables (default: 120)          |
 | `--port-ranges=RANGES`             | Restrict TCP to specific ports (e.g., "8000-8999")             |
+| `--max-files-in-flight=N`          | Ceiling on applicable file-like work (default: max(CPUs, 4))   |
 | `--max-connections=N`              | Maximum concurrent data connections (default: 100)             |
 | `--network-profile=PROFILE`        | Buffer sizing: `datacenter` (default) or `internet`            |
+
+For a remote copy, the number of parallel TCP data streams is the lower of `--max-files-in-flight`
+and `--max-connections`; it is a stream ceiling, not a guarantee that every stream is busy. The
+master validates pending-file sizing after applying that lower ceiling and passes the resulting
+stream count to both daemons. Each endpoint separately applies its local soft-RLIMIT descriptor
+safety when admitting its own file-like work.
 
 ### Network Profiles
 

@@ -441,11 +441,9 @@ pub struct RcpdConfig {
     pub fail_early: bool,
     pub max_workers: usize,
     pub max_blocking_threads: usize,
-    /// Explicit `Some(N)` is propagated from the master to both rcpds and assigns `N` to each local
-    /// descriptor-admission pool (`0` disables them). With `None`, each process derives its own
-    /// default from its unchanged current soft `RLIMIT_NOFILE` (zero leaves admission disabled); no
-    /// derived count crosses the wire.
-    pub max_open_files: Option<usize>,
+    /// Master-resolved file-like work limit, propagated through the version-sensitive rcpd spawn
+    /// contract rather than a protocol message.
+    pub max_files_in_flight: common::ConcurrencyLimit,
     pub ops_throttle: usize,
     pub iops_throttle: usize,
     pub chunk_size: usize,
@@ -487,7 +485,7 @@ pub struct RcpdConfig {
     pub network_profile: crate::NetworkProfile,
     /// Buffer size for file transfers (defaults to profile-specific value)
     pub buffer_size: Option<usize>,
-    /// Maximum concurrent connections in the pool
+    /// Effective concurrent data-stream ceiling resolved by the master
     pub max_connections: usize,
     /// Multiplier for pending file writes (max pending = max_connections × multiplier)
     pub pending_writes_multiplier: usize,
@@ -527,9 +525,13 @@ impl RcpdConfig {
         if self.fail_early {
             args.push("--fail-early".to_string());
         }
-        if let Some(v) = self.max_open_files {
-            args.push(format!("--max-open-files={v}"));
+        match self.max_files_in_flight {
+            common::ConcurrencyLimit::Limited(value) => {
+                args.push(format!("--max-files-in-flight={value}"));
+            }
+            common::ConcurrencyLimit::Unlimited => args.push("--max-open-files=0".to_string()),
         }
+        args.push("--files-in-flight-propagated".to_string());
         if self.dereference {
             args.push("--dereference".to_string());
         }
@@ -1043,7 +1045,9 @@ mod tests {
             fail_early: false,
             max_workers: 0,
             max_blocking_threads: 0,
-            max_open_files: None,
+            max_files_in_flight: common::ConcurrencyLimit::Limited(
+                std::num::NonZeroUsize::new(4).unwrap(),
+            ),
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,
@@ -1088,6 +1092,37 @@ mod tests {
             args.iter()
                 .any(|a| a == "--overwrite-manifest-max-entries=123456"),
             "expected manifest cap flag in {args:?}"
+        );
+    }
+
+    #[test]
+    fn to_args_propagates_finite_files_in_flight() {
+        let mut config = minimal_rcpd_config();
+        config.max_files_in_flight =
+            common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(7).unwrap());
+        let args = config.to_args();
+        assert!(args.iter().any(|arg| arg == "--max-files-in-flight=7"));
+        assert!(args.iter().any(|arg| arg == "--files-in-flight-propagated"));
+    }
+
+    #[test]
+    fn to_args_preserves_legacy_unlimited_files_in_flight() {
+        let mut config = minimal_rcpd_config();
+        config.max_files_in_flight = common::ConcurrencyLimit::Unlimited;
+        let args = config.to_args();
+        assert!(args.iter().any(|arg| arg == "--max-open-files=0"));
+        assert!(args.iter().any(|arg| arg == "--files-in-flight-propagated"));
+    }
+
+    #[test]
+    fn to_args_propagates_effective_connection_count() {
+        let mut config = minimal_rcpd_config();
+        config.max_connections = 7;
+        assert!(
+            config
+                .to_args()
+                .iter()
+                .any(|arg| arg == "--max-connections=7")
         );
     }
 

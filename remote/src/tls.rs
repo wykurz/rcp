@@ -21,7 +21,8 @@ pub type Fingerprint = [u8; 32];
 /// unconditionally: TLS 1.3 has been available at both ends since the TLS layer was introduced
 /// (rustls has always offered it), so pinning never excludes a legitimate rcp/rcpd peer. A peer
 /// that cannot negotiate 1.3 fails the handshake — the correct outcome — rather than silently
-/// downgrading. (This does not rely on the version check, which auto-deploy can bypass.)
+/// downgrading. This defense remains independent of the compatibility checks at discovery and
+/// deployment boundaries.
 const TLS_VERSIONS: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
 /// A certified key pair (certificate + private key) with its fingerprint.

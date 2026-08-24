@@ -1855,7 +1855,7 @@ async fn copy_current_regular(
     // the data copy is the data path, not a metadata syscall — it is deliberately NOT wrapped in a
     // congestion probe (matching the old `tokio::fs::copy`), so the large/variable copy latency
     // never pollutes the per-metadata-op controller baseline. backpressure comes from the
-    // open-files admission retained by the canonical non-cancellable blocking boundary. the
+    // OpenFile admission retained by the canonical non-cancellable blocking boundary. the
     // destination file is returned so it remains live through metadata application, closing the
     // path-based re-open and cancellation-lifetime gaps.
     #[cfg(test)]
@@ -4964,7 +4964,7 @@ mod copy_tests {
             ));
 
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let src_parent = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
                     .await?
@@ -5052,7 +5052,7 @@ mod copy_tests {
             tokio::fs::write(node.join("replacement.txt"), "EXCLUDED").await?;
             tokio::fs::create_dir(&dst).await?;
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let src_dir =
                 Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
             let dst_dir =
@@ -5129,7 +5129,7 @@ mod copy_tests {
             settings.filter = Some(filter);
 
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let src_dir =
                 Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
             let dst_dir =
@@ -5223,7 +5223,7 @@ mod copy_tests {
             settings.filter = Some(filter);
             settings.dry_run = Some(crate::config::DryRunMode::Brief);
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let src_dir =
                 Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
             let visitor = Arc::new(CopyVisitor {
@@ -6061,8 +6061,8 @@ mod copy_tests {
         }
     }
 
-    /// stress tests exercising max-open-files saturation during copy
-    mod max_open_files_tests {
+    /// Stress tests exercise max-files-in-flight saturation during copy.
+    mod max_files_in_flight_tests {
         use super::*;
 
         /// Public root setup must reserve open-file capacity before opening operand parents or
@@ -6078,7 +6078,7 @@ mod copy_tests {
             let mut settings = settings_with_delete(None);
             settings.filter = Some(filter);
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
@@ -6117,9 +6117,9 @@ mod copy_tests {
         /// An entry with no `d_type` hint reserves open-file capacity under the shared
         /// pre-spawn policy.
         #[tokio::test]
-        async fn unknown_type_reserves_max_open_files_capacity() {
+        async fn unknown_type_reserves_max_files_in_flight_capacity() {
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let held_permit = throttle::open_file_permit().await;
             let visitor = CopyVisitor {
                 prog_track: &PROGRESS,
@@ -6193,7 +6193,7 @@ mod copy_tests {
                 dst_dir: Some(dst_parent),
                 is_fresh: true,
             };
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let permit = Some(LeafPermit::OpenFile(throttle::open_file_permit().await));
             let readlink_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::ReadLink);
@@ -6274,7 +6274,7 @@ mod copy_tests {
                 dst_dir: None,
                 is_fresh: false,
             };
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let permit = Some(LeafPermit::OpenFile(throttle::open_file_permit().await));
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
@@ -6370,7 +6370,7 @@ mod copy_tests {
             let mut settings = settings_with_delete(None);
             settings.dereference = true;
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let result = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(20),
@@ -6406,7 +6406,7 @@ mod copy_tests {
             }
             let gate = testutils::BlockingPathGate::install(dst.clone());
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let timeout = std::time::Duration::from_secs(20);
             let settings = settings_with_delete(None);
             let task = tokio::spawn(async move {
@@ -6448,11 +6448,11 @@ mod copy_tests {
             Ok(())
         }
 
-        /// wide copy: many files with a very low open-files limit.
-        /// verifies all files are copied correctly under permit saturation.
+        /// Wide copy: many files with a very low files-in-flight limit.
+        /// Verifies all files are copied correctly under permit saturation.
         #[tokio::test]
         #[traced_test]
-        async fn wide_copy_under_open_files_saturation() -> Result<(), anyhow::Error> {
+        async fn wide_copy_under_files_in_flight_saturation() -> Result<(), anyhow::Error> {
             let tmp_dir = testutils::create_temp_dir().await?;
             let src = tmp_dir.join("src");
             let dst = tmp_dir.join("dst");
@@ -6463,7 +6463,7 @@ mod copy_tests {
             }
             // set a very low limit to force permit contention
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(4);
+            admission.set_files_in_flight(4);
             let summary = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(30),
@@ -6500,11 +6500,12 @@ mod copy_tests {
             Ok(())
         }
 
-        /// Deep + wide copy: a directory tree deeper than the open-files limit, with files at
+        /// Deep + wide copy: a directory tree deeper than the files-in-flight limit, with files at
         /// every level. Verifies directories do not retain leaf admission across recursion.
         #[tokio::test]
         #[traced_test]
-        async fn deep_tree_no_deadlock_under_open_files_saturation() -> Result<(), anyhow::Error> {
+        async fn deep_tree_no_deadlock_under_files_in_flight_saturation()
+        -> Result<(), anyhow::Error> {
             let tmp_dir = testutils::create_temp_dir().await?;
             let src = tmp_dir.join("src");
             let dst = tmp_dir.join("dst");
@@ -6525,7 +6526,7 @@ mod copy_tests {
                 dir = dir.join(format!("d{}", level));
             }
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(limit);
+            admission.set_files_in_flight(limit);
             let summary = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(30),
@@ -6598,11 +6599,11 @@ mod copy_tests {
                     .await?;
                 }
             }
-            // Saturate the open-files pool: if rm shared this pool, every
+            // Saturate the OpenFile pool: if rm shared this pool, every
             // outer copy task would hold its single permit and the inner rm
             // recursion would block forever.
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(2);
+            admission.set_files_in_flight(1);
             let summary = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(30),
@@ -6630,7 +6631,7 @@ mod copy_tests {
                 )
                 .await
                 .context(
-                    "copy timed out — deadlock between copy_file_fd's open-files permit and inner rm",
+                    "copy timed out — deadlock between copy_file_fd's OpenFile permit and inner rm",
                 )?
                 .context("copy failed")?;
             assert_eq!(summary.files_copied, n);
@@ -7078,7 +7079,7 @@ mod copy_tests {
         tokio::fs::hard_link(&src, &dst).await?;
 
         let admission = testutils::AdmissionLimit::new().await;
-        admission.set_max_open_files(1);
+        admission.set_files_in_flight(1);
         let src_parent = Arc::new(
             Dir::open_parent_dir(&root, congestion::Side::Source)
                 .await?
@@ -7152,7 +7153,7 @@ mod copy_tests {
         tokio::fs::write(&dst, "KEEP-ME").await?;
 
         let admission = testutils::AdmissionLimit::new().await;
-        admission.set_max_open_files(1);
+        admission.set_files_in_flight(1);
         let src_parent = Arc::new(
             Dir::open_parent_dir(&root, congestion::Side::Source)
                 .await?
@@ -7298,7 +7299,7 @@ mod copy_tests {
         tokio::fs::write(&dst, "PRECIOUS").await?;
 
         let admission = testutils::AdmissionLimit::new().await;
-        admission.set_max_open_files(1);
+        admission.set_files_in_flight(1);
         let src_parent = Arc::new(
             Dir::open_parent_dir(&root, congestion::Side::Source)
                 .await?
@@ -7358,7 +7359,7 @@ mod copy_tests {
         tokio::fs::write(&dst, "PRECIOUS").await?;
 
         let admission = testutils::AdmissionLimit::new().await;
-        admission.set_max_open_files(1);
+        admission.set_files_in_flight(1);
         let src_parent = Arc::new(
             Dir::open_parent_dir(&root, congestion::Side::Source)
                 .await?
@@ -7423,7 +7424,7 @@ mod copy_tests {
         tokio::fs::write(&dst, "PRECIOUS").await?;
 
         let admission = testutils::AdmissionLimit::new().await;
-        admission.set_max_open_files(1);
+        admission.set_files_in_flight(1);
         let src_parent = Arc::new(
             Dir::open_parent_dir(&root, congestion::Side::Source)
                 .await?
@@ -8555,7 +8556,7 @@ mod copy_tests {
     }
 
     // Task 1.6: a single very wide directory (many sibling files) copies fully within a timeout. The
-    // per-entry open-files permit bounds concurrency; this confirms the wide fan-out drains without
+    // per-entry file-in-flight permit bounds concurrency; this confirms the wide fan-out drains without
     // fd exhaustion or a hang.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copy_wide_tree_completes() -> Result<(), anyhow::Error> {

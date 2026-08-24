@@ -3917,7 +3917,7 @@ mod link_tests {
             tokio::fs::write(&update, "SELECTED-UPDATE-FILE").await?;
 
             let admission_limits = testutils::AdmissionLimit::new().await;
-            admission_limits.set_max_open_files(1);
+            admission_limits.set_files_in_flight(1);
             let permit = walk::ensure_leaf_permit(PermitKind::OpenFile, None).await;
             let src_parent = Arc::new(
                 Dir::open_parent_dir(&test_path, congestion::Side::Source)
@@ -4000,7 +4000,7 @@ mod link_tests {
             tokio::fs::create_dir(&update).await?;
 
             let admission_limits = testutils::AdmissionLimit::new().await;
-            admission_limits.set_max_open_files(1);
+            admission_limits.set_files_in_flight(1);
             let permit = walk::ensure_leaf_permit(PermitKind::OpenFile, None).await;
             let parent = Arc::new(
                 Dir::open_parent_dir(&test_path, congestion::Side::Source)
@@ -4082,7 +4082,7 @@ mod link_tests {
             tokio::fs::write(&update, "SELECTED-UPDATE").await?;
 
             let admission_limits = testutils::AdmissionLimit::new().await;
-            admission_limits.set_max_open_files(1);
+            admission_limits.set_files_in_flight(1);
             let permit = walk::ensure_leaf_permit(PermitKind::OpenFile, None).await;
             let parent = Arc::new(
                 Dir::open_parent_dir(&test_path, congestion::Side::Source)
@@ -4137,7 +4137,7 @@ mod link_tests {
             let update = test_path.join("update");
             let dst = test_path.join("dst");
             let admission_limits = testutils::AdmissionLimit::new().await;
-            admission_limits.set_max_open_files(1);
+            admission_limits.set_files_in_flight(1);
             tokio::fs::create_dir(&update).await?;
             tokio::fs::create_dir(&dst).await?;
             let entry_path = update.join("node");
@@ -6055,8 +6055,8 @@ mod link_tests {
         Ok(())
     }
 
-    /// Stress tests exercising max-open-files saturation during link.
-    mod max_open_files_tests {
+    /// Stress tests exercising max-files-in-flight saturation during link.
+    mod max_files_in_flight_tests {
         use super::*;
 
         fn available_open_file_capacity(capacity: usize) -> usize {
@@ -6100,7 +6100,7 @@ mod link_tests {
             tokio::fs::write(root.join("source"), b"source").await?;
             tokio::fs::create_dir(root.join("update")).await?;
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let parent = Dir::open_root_dir(&root, false, congestion::Side::Source).await?;
             let src_handle = parent.child(std::ffi::OsStr::new("source")).await?;
             let update_handle = parent.child(std::ffi::OsStr::new("update")).await?;
@@ -6192,7 +6192,7 @@ mod link_tests {
             tokio::fs::create_dir(&src).await?;
             tokio::fs::write(src.join("leaf"), b"x").await?;
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let held = throttle::open_file_permit().await;
             let src_dir =
                 Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
@@ -6250,7 +6250,7 @@ mod link_tests {
             tokio::fs::create_dir(&update).await?;
             tokio::fs::write(update.join("leaf"), b"x").await?;
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let held = throttle::open_file_permit().await;
             let src_dir =
                 Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
@@ -6321,7 +6321,7 @@ mod link_tests {
             let dst_path = root.join("dst");
             tokio::fs::create_dir(&src_path).await?;
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let held = throttle::open_file_permit().await;
             let src_parent = Arc::new(
                 Dir::open_parent_dir(&root, congestion::Side::Source)
@@ -6372,7 +6372,7 @@ mod link_tests {
             tokio::fs::write(update_root.join("entry"), b"x").await?;
 
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
@@ -6434,7 +6434,7 @@ mod link_tests {
             tokio::fs::create_dir(&update).await?;
             tokio::fs::create_dir(update.join("dir")).await?;
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let held = throttle::open_file_permit().await;
             let src_dir =
                 Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
@@ -6490,7 +6490,7 @@ mod link_tests {
             settings.filter = Some(filter.clone());
             settings.copy_settings.filter = Some(filter);
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
@@ -6536,7 +6536,7 @@ mod link_tests {
             let mut settings = common_settings(false, false);
             settings.dry_run = Some(crate::config::DryRunMode::Brief);
             settings.copy_settings.dry_run = settings.dry_run;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
@@ -6598,7 +6598,7 @@ mod link_tests {
                 Dir::open_root_dir(&dst_root, false, congestion::Side::Destination).await?,
             );
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let permit = Some(LeafPermit::OpenFile(throttle::open_file_permit().await));
             let hard_link_resource = throttle::Resource::meta(
                 throttle::Side::Destination,
@@ -6649,11 +6649,12 @@ mod link_tests {
             Ok(())
         }
 
-        /// Deep + wide link: a directory tree deeper than the open-files limit, with files at every
+        /// Deep + wide link: a directory tree deeper than the files-in-flight limit, with files at every
         /// level. Verifies directories do not retain leaf admission across recursion.
         #[tokio::test]
         #[traced_test]
-        async fn deep_tree_no_deadlock_under_open_files_saturation() -> Result<(), anyhow::Error> {
+        async fn deep_tree_no_deadlock_under_files_in_flight_saturation()
+        -> Result<(), anyhow::Error> {
             let tmp_dir = testutils::create_temp_dir().await?;
             let src = tmp_dir.join("src");
             let dst = tmp_dir.join("dst");
@@ -6674,7 +6675,7 @@ mod link_tests {
                 dir = dir.join(format!("d{}", level));
             }
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(limit);
+            admission.set_files_in_flight(limit);
             let summary = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(30),
@@ -6728,7 +6729,7 @@ mod link_tests {
                 tokio::fs::create_dir(&update_dir).await?;
             }
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let summary = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(5),
@@ -6757,7 +6758,7 @@ mod link_tests {
         /// A file-type-changed directory must release transferred admission before recursion.
         ///
         /// Scenario: many src entries are regular files (so the spawn loop
-        /// pre-acquires open-files permits for them), but the corresponding
+        /// pre-acquires files-in-flight permits for them), but the corresponding
         /// `update` entries are directories (file types differ). link_internal
         /// then closes the source comparison handle and transfers the selected update handle plus
         /// admission into `copy_child`. The copy driver dispatches that exact classification and
@@ -6791,7 +6792,7 @@ mod link_tests {
             }
             // saturate the pool so retaining delegated admission during descent blocks child work.
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(2);
+            admission.set_files_in_flight(2);
             let summary = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(30),
@@ -6842,7 +6843,7 @@ mod link_tests {
             tokio::fs::write(src.join("later"), b"later").await?;
             tokio::fs::write(src.join("uninjected"), b"uninjected").await?;
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(2);
+            admission.set_files_in_flight(2);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
@@ -6968,7 +6969,7 @@ mod link_tests {
             tokio::fs::write(src.join("last"), b"last").await?;
             tokio::fs::write(src.join("uninjected"), b"uninjected").await?;
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(3);
+            admission.set_files_in_flight(3);
             let src_dir =
                 Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
             let dst_dir =
@@ -7084,7 +7085,7 @@ mod link_tests {
             tokio::fs::write(src.join("second"), b"second").await?;
             tokio::fs::write(src.join("uninjected"), b"uninjected").await?;
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(2);
+            admission.set_files_in_flight(2);
             let stat_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::Stat);
             admission.set_max_ops_in_flight(stat_resource, 1);
@@ -7174,7 +7175,7 @@ mod link_tests {
             tokio::fs::write(update.join("uninjected"), b"uninjected").await?;
 
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(2);
+            admission.set_files_in_flight(2);
             let src_dir =
                 Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
             let update_dir =
@@ -7268,7 +7269,7 @@ mod link_tests {
             tokio::fs::write(update.join("uninjected"), b"uninjected").await?;
 
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(3);
+            admission.set_files_in_flight(3);
             let src_dir =
                 Arc::new(Dir::open_root_dir(&src, false, congestion::Side::Source).await?);
             let update_dir =
@@ -7374,7 +7375,7 @@ mod link_tests {
             let progress: &'static progress::Progress =
                 Box::leak(Box::new(progress::Progress::new()));
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let readlink_resource =
                 throttle::Resource::meta(throttle::Side::Source, throttle::MetadataOp::ReadLink);
             admission.set_max_ops_in_flight(readlink_resource, 1);
@@ -7426,7 +7427,7 @@ mod link_tests {
         ///
         /// Scenario: update has many regular files that don't exist in src.
         /// The loop at site 3 spawns a copy::copy task per entry under a
-        /// saturated open-files pool. Each outer iteration transfers its guard into copy_child, so
+        /// saturated files-in-flight pool. Each outer iteration transfers its guard into copy_child, so
         /// delegated classification does not reacquire while the caller retains capacity.
         #[tokio::test]
         #[traced_test]
@@ -7444,7 +7445,7 @@ mod link_tests {
                 tokio::fs::write(update.join(format!("u{}", i)), format!("upd-{}", i)).await?;
             }
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(2);
+            admission.set_files_in_flight(2);
             let summary = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(30),
@@ -7509,7 +7510,7 @@ mod link_tests {
             }
             // saturate both pools to force the deadlock if the cycle existed.
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(2);
+            admission.set_files_in_flight(1);
             let summary = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(30),

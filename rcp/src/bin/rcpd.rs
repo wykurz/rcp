@@ -93,14 +93,6 @@ struct Args {
     #[arg(short = 'q', long = "quiet", help_heading = "Progress & output")]
     quiet: bool,
 
-    #[arg(
-        long,
-        value_name = "N",
-        help = common::cli::LEAF_ADMISSION_HELP,
-        help_heading = "Performance & throttling"
-    )]
-    max_open_files: Option<usize>,
-
     /// Chunk size for calculating I/O operations per file
     ///
     /// Required when using --iops-throttle (must be > 0)
@@ -117,6 +109,9 @@ struct Args {
     // a no-op via CommonArgs to keep the shared definition simple.
     #[command(flatten)]
     common: common::cli::CommonArgs,
+
+    #[arg(long, hide = true)]
+    files_in_flight_propagated: bool,
 
     // Remote copy options
     /// IP address to bind TCP server to (set by master, internal use only)
@@ -187,7 +182,11 @@ struct Args {
     #[arg(long, value_name = "BYTES", help_heading = "Remote copy options")]
     buffer_size: Option<usize>,
 
-    /// Maximum concurrent TCP connections for file transfers (default: 100)
+    /// Maximum concurrent data connections (default: 100)
+    ///
+    /// This separately configurable ceiling defaults to 100. Effective data streams are
+    /// min(--max-files-in-flight, --max-connections). To raise remote parallelism above the
+    /// CPU-derived file default, increase both ceilings.
     #[arg(
         long,
         default_value = "100",
@@ -199,8 +198,7 @@ struct Args {
 
     /// Multiplier for pending file writes (default: 4)
     ///
-    /// Controls backpressure by limiting pending file transfers to
-    /// max_connections × multiplier.
+    /// Pending capacity is effective data streams × pending-writes-multiplier.
     #[arg(
         long,
         default_value = "4",
@@ -256,18 +254,35 @@ struct Args {
 }
 
 impl Args {
+    fn resolve_files_in_flight(&self) -> common::ResolvedFilesInFlight {
+        let files_in_flight = self.common.resolve_files_in_flight();
+        if self.files_in_flight_propagated {
+            files_in_flight.propagated()
+        } else {
+            files_in_flight
+        }
+    }
     /// Build the remote TCP config from CLI args. Shared by the listener setup in `async_main`
     /// and the source/destination operations in `run_operation`.
-    fn to_tcp_config(&self) -> remote::TcpConfig {
-        remote::TcpConfig {
+    fn to_tcp_config(
+        &self,
+        files_in_flight: common::ResolvedFilesInFlight,
+    ) -> anyhow::Result<remote::TcpConfig> {
+        let configured_connections = std::num::NonZeroUsize::new(self.max_connections)
+            .expect("clap rejects zero --max-connections");
+        let effective_connections =
+            remote::effective_max_connections(files_in_flight.limit(), configured_connections);
+        let config = remote::TcpConfig {
             port_ranges: self.port_ranges.clone(),
             conn_timeout_sec: self.remote_copy_conn_timeout_sec,
             network_profile: self.network_profile,
             buffer_size: self.buffer_size,
-            max_connections: self.max_connections,
+            max_connections: effective_connections.get(),
             pending_writes_multiplier: self.pending_writes_multiplier,
             keepalive_sec: self.remote_keepalive_sec,
-        }
+        };
+        config.max_pending_files()?;
+        Ok(config)
     }
     /// Build the copy settings shared by the source and destination arms. `filter`/`dry_run` come
     /// from the `MasterHello`; the destination passes `None` for both (filtering happens at source).
@@ -369,6 +384,7 @@ fn rcpd_result_from(
 /// closes the SSH channel (stdin EOF) is not misread as a mid-operation disconnect.
 async fn run_operation<W, R>(
     args: Args,
+    tcp_config: &remote::TcpConfig,
     master_send_stream: remote::streams::SendStream<W>,
     mut master_recv_stream: remote::streams::RecvStream<R>,
     cert_key: Option<remote::tls::CertifiedKey>,
@@ -434,8 +450,6 @@ where
             runtime_stats: common::collect_runtime_stats(),
         }
     };
-    // build tcp_config first so we can use its effective_buffer_size()
-    let tcp_config = args.to_tcp_config();
     let rcpd_result = match master_hello {
         remote::protocol::MasterHello::Source {
             src,
@@ -446,7 +460,7 @@ where
             capture,
         } => {
             // build settings with filter from MasterHello
-            let settings = args.to_copy_settings(filter, dry_run, &tcp_config)?;
+            let settings = args.to_copy_settings(filter, dry_run, tcp_config)?;
             tracing::info!("Starting source");
             let shared_send = std::sync::Arc::new(tokio::sync::Mutex::new(master_send_stream));
             let operation = async {
@@ -457,7 +471,7 @@ where
                         &dst,
                         &settings,
                         capture,
-                        &tcp_config,
+                        tcp_config,
                         args.bind_ip.as_deref(),
                         cert_key.as_ref(),
                         dest_cert_fingerprint,
@@ -510,7 +524,7 @@ where
             // destination doesn't use filter (filtering happens at source).
             // empty directory cleanup decisions are communicated per-directory
             // via keep_if_empty in the Directory message.
-            let settings = args.to_copy_settings(None, None, &tcp_config)?;
+            let settings = args.to_copy_settings(None, None, tcp_config)?;
             tracing::info!("Starting destination");
             // same Arc<Mutex> shape as the source arm: the best-effort close runs AFTER the
             // select, so the stream must outlive the (dropped) operation future
@@ -524,7 +538,7 @@ where
                         &settings,
                         args.overwrite_manifest_max_entries,
                         &preserve,
-                        &tcp_config,
+                        tcp_config,
                         cert_key.as_ref(),
                         source_cert_fingerprint,
                     )
@@ -565,6 +579,7 @@ where
 async fn async_main(
     args: Args,
     tracing_receiver: tokio::sync::mpsc::UnboundedReceiver<common::remote_tracing::TracingMessage>,
+    files_in_flight: common::ResolvedFilesInFlight,
 ) -> anyhow::Result<String> {
     // install rustls crypto provider (ring) before any TLS operations
     if !args.no_encryption {
@@ -573,7 +588,11 @@ async fn async_main(
             .ok(); // ignore if already installed
     }
     // build TCP config for listener creation
-    let tcp_config = args.to_tcp_config();
+    let tcp_config = args.to_tcp_config(files_in_flight)?;
+    tracing::info!(
+        "Effective remote connection count: {}",
+        tcp_config.max_connections
+    );
     // generate TLS certificate and create server config (if encryption enabled)
     let (cert_key, tls_acceptor) = if !args.no_encryption {
         let cert_key = remote::tls::generate_self_signed_cert()
@@ -724,6 +743,7 @@ async fn async_main(
         let result_committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let operation = run_operation(
             args.clone(),
+            &tcp_config,
             master_send_stream,
             master_recv_stream,
             cert_key.clone(),
@@ -776,6 +796,7 @@ async fn async_main(
         // stdin not available - rely on TCP timeouts only
         match run_operation(
             args.clone(),
+            &tcp_config,
             master_send_stream,
             master_recv_stream,
             cert_key.clone(),
@@ -840,6 +861,7 @@ fn main() -> Result<(), anyhow::Error> {
     }
 
     let args = Args::parse();
+    let files_in_flight = args.resolve_files_in_flight();
     // TOCTOU linter: arms strict operand resolution when the master passed
     // --require-toctou-safe, and fail-closes on this host if the invocation
     // cannot be hardened (e.g. -L, or a pre-openat2 kernel). Operands arrive
@@ -866,7 +888,7 @@ fn main() -> Result<(), anyhow::Error> {
         common::remote_tracing::RemoteTracingLayer::new();
     let func = {
         let args = args.clone();
-        || async_main(args, tracing_receiver)
+        || async_main(args, tracing_receiver, files_in_flight)
     };
     let debug_log_file = args.debug_log_prefix.as_ref().map(|prefix| {
         let filename = common::generate_debug_log_filename(prefix);
@@ -878,7 +900,7 @@ fn main() -> Result<(), anyhow::Error> {
     let runtime = args.common.runtime_config();
     let throttle = args
         .common
-        .throttle_config(args.max_open_files, args.chunk_size);
+        .throttle_config(files_in_flight, args.chunk_size);
     let tracing = common::TracingConfig {
         remote_layer: Some(tracing_layer),
         debug_log_file,
@@ -910,4 +932,54 @@ fn main() -> Result<(), anyhow::Error> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn daemon_args(extra: &[&str]) -> Args {
+        let mut argv = vec!["rcpd", "--role=source"];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).unwrap()
+    }
+
+    #[test]
+    fn direct_daemon_uses_automatic_file_limit_for_connections() {
+        let args = daemon_args(&[]);
+        let files_in_flight = args.resolve_files_in_flight();
+        assert_eq!(
+            files_in_flight.source(),
+            common::FilesInFlightSource::Automatic
+        );
+        let expected = match files_in_flight.limit() {
+            common::ConcurrencyLimit::Limited(value) => value.get().min(args.max_connections),
+            common::ConcurrencyLimit::Unlimited => panic!("automatic policy must be finite"),
+        };
+        assert_eq!(
+            args.to_tcp_config(files_in_flight).unwrap().max_connections,
+            expected
+        );
+    }
+
+    #[test]
+    fn propagated_marker_changes_only_file_limit_provenance() {
+        let direct = daemon_args(&["--max-files-in-flight=7"]);
+        let propagated = daemon_args(&["--max-files-in-flight=7", "--files-in-flight-propagated"]);
+        let direct_limit = direct.resolve_files_in_flight();
+        let propagated_limit = propagated.resolve_files_in_flight();
+        assert_eq!(direct_limit.limit(), propagated_limit.limit());
+        assert_eq!(direct_limit.source(), common::FilesInFlightSource::Explicit);
+        assert_eq!(
+            propagated_limit.source(),
+            common::FilesInFlightSource::Propagated
+        );
+        assert_eq!(
+            direct.to_tcp_config(direct_limit).unwrap().max_connections,
+            propagated
+                .to_tcp_config(propagated_limit)
+                .unwrap()
+                .max_connections
+        );
+    }
 }

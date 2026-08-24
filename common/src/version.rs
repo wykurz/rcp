@@ -31,21 +31,20 @@ pub struct ProtocolVersion {
     pub git_hash: Option<String>,
 }
 
-/// The remote wire-schema revision, carried INSIDE [`ProtocolVersion::semantic`] as semver build
-/// metadata (`0.38.0+w1`) rather than as a separate field — deliberately, for symmetry: the
-/// compatibility check is a string equality on `semantic`, so a build predating this constant
+/// The remote protocol/process-contract revision, carried INSIDE [`ProtocolVersion::semantic`] as
+/// semver build metadata (`0.38.0+w1`) rather than as a separate field — deliberately, for symmetry:
+/// the compatibility check is a string equality on `semantic`, so a build predating this constant
 /// rejects a current one exactly as a current build rejects it ("0.38.0" != "0.38.0+w1"), no
-/// matter which side was upgraded first. A separate field would protect only the new side — an
-/// old parser ignores unknown JSON fields and would accept the changed schema.
+/// matter which side was upgraded first. A separate field would protect only the new side — an old
+/// parser ignores unknown JSON fields and could accept a changed serialized or spawn contract.
 ///
-/// Bump this on ANY wire-visible change to `remote/src/protocol` — a message added, removed, or
-/// reshaped; an enum variant added; a field's meaning changed — whenever the crate version does
-/// not also change. The crate version alone cannot tell two 0.38.0-dev builds apart, so a stale
-/// same-version `rcpd` (on `PATH` or in the deploy cache) would otherwise pass the compatibility
-/// check and then fail — or misbehave — mid-copy when the schemas diverge. Revision 1 covers the
-/// 0.38.0-dev `WireAcls` reshape; revision 2 the 0.39.0-dev `ExtendedMetadataCapture` gaining
-/// `root_acl_notice`, which lengthens `MasterHello::Source` by a field.
-pub const WIRE_REVISION: u32 = 2;
+/// Bump this on any wire-visible change to `remote/src/protocol` OR a version-sensitive rcpd spawn
+/// argument change whenever the crate version does not also change. The crate version alone cannot
+/// tell two 0.38.0-dev builds apart, so a stale same-version `rcpd` (on `PATH` or in the deploy
+/// cache) would otherwise pass compatibility and then fail — or misbehave — mid-copy. Revision 1
+/// covers the 0.38.0-dev `WireAcls` reshape; revision 2 the 0.39.0-dev `ExtendedMetadataCapture`
+/// gaining `root_acl_notice`; revision 3 covers the max-files-in-flight rcpd spawn contract.
+pub const WIRE_REVISION: u32 = 3;
 
 impl ProtocolVersion {
     /// Get the current protocol version
@@ -95,9 +94,10 @@ impl ProtocolVersion {
     pub fn is_compatible_with(&self, other: &Self) -> bool {
         // exact version match for now
         // in the future, we might allow minor version skew (e.g., 0.22.x compatible with 0.22.y).
-        // `semantic` embeds the wire revision as build metadata (see WIRE_REVISION), so this one
-        // string equality also rejects two same-release builds straddling a wire change — in BOTH
-        // directions, including a peer built before the revision existed.
+        // `semantic` embeds the remote compatibility revision as build metadata (see
+        // WIRE_REVISION), so this one string equality also rejects two same-release builds
+        // straddling a protocol/process-contract change — in BOTH directions, including a peer
+        // built before the revision existed.
         self.semantic == other.semantic
     }
 
@@ -106,7 +106,7 @@ impl ProtocolVersion {
     ///
     /// One string for BOTH the discovery probe and the deploy target, so an incompatible
     /// same-release cached binary is never found (its filename carries the old revision) and a
-    /// fresh deploy never overwrites a binary another wire revision still resolves to.
+    /// fresh deploy never overwrites a binary another compatibility revision still resolves to.
     pub fn cache_tag(&self) -> String {
         self.semantic.replace('+', "-")
     }
@@ -237,13 +237,13 @@ mod tests {
         assert!(a.is_compatible_with(&a.clone()));
         assert!(
             a.semantic.contains("+w"),
-            "the wire revision must ride inside `semantic`, where even a pre-revision peer's              string comparison sees it"
+            "the compatibility revision must ride inside `semantic`, where even a pre-revision peer's string comparison sees it"
         );
         let mut b = a.clone();
         b.semantic = format!("{}+w{}", a.crate_version(), WIRE_REVISION + 1);
         assert!(
             !a.is_compatible_with(&b),
-            "same release with a different wire schema must be rejected"
+            "same release with a different remote protocol/process contract must be rejected"
         );
         // a build predating the revision reports the bare crate version; the SAME string
         // equality both sides have always used rejects it — symmetry is the point
@@ -255,6 +255,11 @@ mod tests {
         assert!(!a.is_compatible_with(&legacy));
         assert!(!legacy.is_compatible_with(&a));
         assert_eq!(a.cache_tag(), a.semantic.replace('+', "-"));
+    }
+
+    #[test]
+    fn revision_three_covers_files_in_flight_spawn_contract() {
+        assert_eq!(WIRE_REVISION, 3);
     }
 
     #[test]

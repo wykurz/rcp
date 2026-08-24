@@ -552,7 +552,7 @@ mod tests {
         Ok(())
     }
 
-    mod max_open_files_tests {
+    mod max_files_in_flight_tests {
         use super::*;
 
         static CANCELLATION_PROGRESS: std::sync::LazyLock<progress::Progress> =
@@ -567,7 +567,7 @@ mod tests {
             let bufsize = 4096;
             let filesize = bufsize * 3;
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let gate = testutils::BlockingPathGate::install(path.clone());
             gate.release_all();
             let timeout = std::time::Duration::from_secs(20);
@@ -621,7 +621,7 @@ mod tests {
             let filesize = bufsize * 3;
             let gate = testutils::BlockingPathGate::install(path.clone());
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_max_open_files(1);
+            admission.set_files_in_flight(1);
             let timeout = std::time::Duration::from_secs(20);
             let runtime_thread = std::thread::current().id();
             let bytes_before = CANCELLATION_PROGRESS.bytes_copied.get();

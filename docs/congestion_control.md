@@ -478,7 +478,10 @@ Two important properties follow from this placement:
 
 ## Interaction with Static Throttles
 
-The adaptive and static knobs compose:
+The adaptive metadata limits are per-resource `cwnd` values that move with observed metadata
+latency. They are distinct from `--max-files-in-flight`, a static ceiling on applicable file-like
+work; that ceiling does not replace adaptive limits or promise achieved concurrency. The adaptive
+and static knobs compose:
 
 ```
           rate gate     concurrency gate
@@ -493,8 +496,8 @@ caller ───> [  ] ────────> [    ] ────> syscall
 
 Either can be enabled independently:
 
-- **Neither**: default — no metadata rate or adaptive-concurrency cap beyond the separate
-  leaf-operation descriptor-admission caps.
+- **Neither**: default — no metadata rate or adaptive-concurrency cap beyond the separate static
+  file-work and descriptor-safety ceilings.
 - **Static rate only**: a hard ceiling on operations per second, useful for budget-bound deployments
   where the limit is known in advance.
 - **Adaptive concurrency only**: `cwnd` alone adapts to the filesystem's response; this is the
