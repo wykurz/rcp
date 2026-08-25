@@ -124,9 +124,179 @@ use tracing::instrument;
 
 const REMOTE_RCPD_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const FAILED_RCPD_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const PREPARATION_OWNED_WORK_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Prefix for an intentional daemon refusal in place of a readiness record.
 pub const RCPD_STARTUP_ERROR_PREFIX: &str = "RCP_ERROR ";
+
+#[derive(Debug)]
+struct PeerPreparationCancelled;
+
+impl std::fmt::Display for PeerPreparationCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("rcpd preparation cancelled because peer preparation failed")
+    }
+}
+
+impl std::error::Error for PeerPreparationCancelled {}
+
+/// Cancellation and owned-work completion policy for one endpoint preparation.
+#[derive(Clone)]
+pub(crate) struct PreparationContext {
+    cancellation: tokio_util::sync::CancellationToken,
+}
+
+/// Owns a just-established session until preparation either commits it or abandons it.
+///
+/// `openssh::Session::drop` synchronously invokes `ssh -O exit`; running that destructor on a
+/// cancelled preparation future would put an unbounded subprocess wait back on the coordinator's
+/// Tokio worker. Error paths therefore hand the last reference to the blocking pool.
+struct PreparingSshSession {
+    session: Option<std::sync::Arc<openssh::Session>>,
+}
+
+impl PreparingSshSession {
+    fn new(session: std::sync::Arc<openssh::Session>) -> Self {
+        Self {
+            session: Some(session),
+        }
+    }
+
+    fn session(&self) -> &std::sync::Arc<openssh::Session> {
+        self.session
+            .as_ref()
+            .expect("preparation session is present")
+    }
+
+    fn into_inner(mut self) -> std::sync::Arc<openssh::Session> {
+        self.session.take().expect("preparation session is present")
+    }
+}
+
+impl Drop for PreparingSshSession {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            tokio::task::spawn_blocking(move || drop(session));
+        }
+    }
+}
+
+impl PreparationContext {
+    fn new(cancellation: tokio_util::sync::CancellationToken) -> Self {
+        Self { cancellation }
+    }
+
+    fn uncancelled() -> Self {
+        Self::new(tokio_util::sync::CancellationToken::new())
+    }
+
+    fn cancellation_error() -> anyhow::Error {
+        anyhow::Error::new(PeerPreparationCancelled)
+    }
+
+    fn ensure_active(&self) -> anyhow::Result<()> {
+        if self.cancellation.is_cancelled() {
+            return Err(Self::cancellation_error());
+        }
+        Ok(())
+    }
+
+    /// Await cancellation-safe work that owns no process or session after its future is dropped.
+    pub(crate) async fn run<T>(
+        &self,
+        operation: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => Err(Self::cancellation_error()),
+            result = operation => result,
+        }
+    }
+
+    /// Await a task that owns process/session state, retaining it in the background after grace.
+    pub(crate) async fn run_owned<T>(
+        &self,
+        mut task: tokio::task::JoinHandle<anyhow::Result<T>>,
+        grace: std::time::Duration,
+        operation: &'static str,
+    ) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+    {
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => {
+                match tokio::time::timeout(grace, &mut task).await {
+                    Ok(Ok(Ok(_))) => tracing::debug!("{operation} completed during cancellation grace"),
+                    Ok(Ok(Err(error))) => tracing::debug!("{operation} failed during cancellation grace: {error:#}"),
+                    Ok(Err(error)) => tracing::debug!("{operation} owner task failed during cancellation grace: {error:#}"),
+                    Err(_) => tracing::debug!(
+                        "{operation} did not complete during cancellation grace; background owner retained its process/session"
+                    ),
+                }
+                Err(Self::cancellation_error())
+            }
+            result = &mut task => result
+                .with_context(|| format!("{operation} owner task failed"))?,
+        }
+    }
+
+    /// Run a remote command in an owned task so cancellation cannot orphan its local SSH child.
+    fn remote_output_task(
+        mut command: openssh::OwningCommand<std::sync::Arc<openssh::Session>>,
+        operation: String,
+    ) -> tokio::task::JoinHandle<anyhow::Result<std::process::Output>> {
+        tokio::spawn(async move {
+            command
+                .output()
+                .await
+                .with_context(|| format!("{operation} failed"))
+        })
+    }
+
+    async fn remote_output(
+        &self,
+        command: openssh::OwningCommand<std::sync::Arc<openssh::Session>>,
+        operation: &'static str,
+    ) -> anyhow::Result<std::process::Output> {
+        let task = Self::remote_output_task(command, operation.to_string());
+        self.run_owned(task, PREPARATION_OWNED_WORK_GRACE, operation)
+            .await
+    }
+
+    /// Run a remote command with its documented hard deadline.
+    ///
+    /// On deadline the local SSH channel is explicitly aborted. The remote command may outlive
+    /// that channel, which is why this is reserved for probes whose hard deadline is itself part
+    /// of the protocol contract, never for staging ownership.
+    async fn remote_output_with_deadline(
+        &self,
+        command: openssh::OwningCommand<std::sync::Arc<openssh::Session>>,
+        operation: &str,
+        deadline: std::time::Duration,
+    ) -> anyhow::Result<std::process::Output> {
+        let mut task = Self::remote_output_task(command, operation.to_string());
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => {
+                match tokio::time::timeout(PREPARATION_OWNED_WORK_GRACE, &mut task).await {
+                    Ok(_) => {}
+                    Err(_) => task.abort(),
+                }
+                Err(Self::cancellation_error())
+            }
+            result = tokio::time::timeout(deadline, &mut task) => match result {
+                Ok(result) => result.with_context(|| format!("{operation} owner task failed"))?,
+                Err(elapsed) => {
+                    task.abort();
+                    Err(elapsed).with_context(|| {
+                        format!("{operation} within {}", humantime::format_duration(deadline))
+                    })
+                }
+            },
+        }
+    }
+}
 
 pub mod deploy;
 pub mod port_ranges;
@@ -392,7 +562,8 @@ pub use common::is_localhost;
 
 async fn setup_ssh_session(
     session: &SshSession,
-) -> anyhow::Result<std::sync::Arc<openssh::Session>> {
+    preparation: &PreparationContext,
+) -> anyhow::Result<PreparingSshSession> {
     let host = session.host.as_str();
     let destination = match (session.user.as_deref(), session.port) {
         (Some(user), Some(port)) => format!("ssh://{user}@{host}:{port}"),
@@ -407,13 +578,17 @@ async fn setup_ssh_session(
         tracing::debug!("Using SSH control directory: {}", dir.display());
         builder.control_directory(dir);
     }
-    let session = std::sync::Arc::new(
-        builder
-            .connect(destination)
-            .await
-            .context("Failed to establish SSH connection")?,
-    );
-    Ok(session)
+    let connect = tokio::spawn(async move {
+        Ok(PreparingSshSession::new(std::sync::Arc::new(
+            builder
+                .connect(destination)
+                .await
+                .context("Failed to establish SSH connection")?,
+        )))
+    });
+    preparation
+        .run_owned(connect, PREPARATION_OWNED_WORK_GRACE, "SSH session setup")
+        .await
 }
 
 /// Where to put the SSH connection-multiplexing socket.
@@ -511,8 +686,9 @@ fn control_dir_is_usable(dir: &std::path::Path) -> bool {
 pub async fn get_remote_home_for_session(
     session: &SshSession,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let ssh_session = setup_ssh_session(session).await?;
-    let home = get_remote_home(&ssh_session).await?;
+    let preparation = PreparationContext::uncancelled();
+    let ssh_session = setup_ssh_session(session, &preparation).await?;
+    let home = get_remote_home_with_context(ssh_session.session(), &preparation).await?;
     Ok(std::path::PathBuf::from(home))
 }
 
@@ -576,16 +752,22 @@ pub(crate) fn shell_escape(s: &str) -> String {
 ///
 /// Returns an error if HOME is not set or is empty
 pub async fn get_remote_home(session: &std::sync::Arc<openssh::Session>) -> anyhow::Result<String> {
+    get_remote_home_with_context(session, &PreparationContext::uncancelled()).await
+}
+
+async fn get_remote_home_with_context(
+    session: &std::sync::Arc<openssh::Session>,
+    preparation: &PreparationContext,
+) -> anyhow::Result<String> {
     if let Ok(home_override) = std::env::var("RCP_REMOTE_HOME_OVERRIDE")
         && !home_override.is_empty()
     {
         return Ok(home_override);
     }
-    let output = session
-        .command("sh")
-        .arg("-c")
-        .arg("echo \"${HOME:?HOME not set}\"")
-        .output()
+    let mut command = session.clone().arc_command("sh");
+    command.arg("-c").arg("echo \"${HOME:?HOME not set}\"");
+    let output = preparation
+        .remote_output(command, "remote HOME lookup")
         .await
         .context("failed to check HOME environment variable on remote host")?;
 
@@ -671,6 +853,7 @@ trait DiscoverySession {
 
 struct RealDiscoverySession<'a> {
     session: &'a std::sync::Arc<openssh::Session>,
+    preparation: &'a PreparationContext,
 }
 
 impl<'a> DiscoverySession for RealDiscoverySession<'a> {
@@ -680,12 +863,13 @@ impl<'a> DiscoverySession for RealDiscoverySession<'a> {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'b>>
     {
         Box::pin(async move {
-            let output = self
-                .session
-                .command("sh")
+            let mut command = self.session.clone().arc_command("sh");
+            command
                 .arg("-c")
-                .arg(format!("test -x {}", shell_escape(path)))
-                .output()
+                .arg(format!("test -x {}", shell_escape(path)));
+            let output = self
+                .preparation
+                .remote_output(command, "remote executable discovery")
                 .await?;
             Ok(output.status.success())
         })
@@ -697,7 +881,12 @@ impl<'a> DiscoverySession for RealDiscoverySession<'a> {
         Box<dyn std::future::Future<Output = anyhow::Result<Option<String>>> + Send + 'b>,
     > {
         Box::pin(async move {
-            let output = self.session.command("which").arg(binary).output().await?;
+            let mut command = self.session.clone().arc_command("which");
+            command.arg(binary);
+            let output = self
+                .preparation
+                .remote_output(command, "remote PATH discovery")
+                .await?;
             if output.status.success() {
                 let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !path.is_empty() {
@@ -711,7 +900,7 @@ impl<'a> DiscoverySession for RealDiscoverySession<'a> {
         &'b self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'b>>
     {
-        Box::pin(get_remote_home(self.session))
+        Box::pin(get_remote_home_with_context(self.session, self.preparation))
     }
 }
 
@@ -730,8 +919,12 @@ impl<'a> DiscoverySession for RealDiscoverySession<'a> {
 async fn discover_rcpd_path(
     session: &std::sync::Arc<openssh::Session>,
     explicit_path: Option<&str>,
+    preparation: &PreparationContext,
 ) -> anyhow::Result<String> {
-    let real_session = RealDiscoverySession { session };
+    let real_session = RealDiscoverySession {
+        session,
+        preparation,
+    };
     discover_rcpd_path_internal(&real_session, explicit_path, None).await
 }
 
@@ -832,11 +1025,12 @@ async fn try_discover_and_check_version(
     session: &std::sync::Arc<openssh::Session>,
     explicit_path: Option<&str>,
     remote_host: &str,
+    preparation: &PreparationContext,
 ) -> anyhow::Result<String> {
     // discover rcpd binary on remote host
-    let rcpd_path = discover_rcpd_path(session, explicit_path).await?;
+    let rcpd_path = discover_rcpd_path(session, explicit_path, preparation).await?;
     // check version compatibility
-    check_rcpd_version(session, &rcpd_path, remote_host).await?;
+    check_rcpd_version(session, &rcpd_path, remote_host, preparation).await?;
     Ok(rcpd_path)
 }
 
@@ -847,25 +1041,20 @@ async fn check_rcpd_version(
     session: &std::sync::Arc<openssh::Session>,
     rcpd_path: &str,
     remote_host: &str,
+    preparation: &PreparationContext,
 ) -> anyhow::Result<()> {
     let local_version = common::version::ProtocolVersion::current();
 
     tracing::debug!("Checking rcpd version on remote host: {}", remote_host);
 
     // run rcpd --protocol-version on remote (call binary directly, no shell)
-    let output = run_remote_version_probe(
-        remote_host,
-        async {
-            session
-                .command(rcpd_path)
-                .arg("--protocol-version")
-                .output()
-                .await
-                .context("Failed to execute rcpd --protocol-version on remote host")
-        },
-        REMOTE_RCPD_VERSION_TIMEOUT,
-    )
-    .await?;
+    let mut command = session.clone().arc_command(rcpd_path.to_string());
+    command.arg("--protocol-version");
+    let operation =
+        format!("rcpd on remote host '{remote_host}' did not complete --protocol-version");
+    let output = preparation
+        .remote_output_with_deadline(command, &operation, REMOTE_RCPD_VERSION_TIMEOUT)
+        .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -919,6 +1108,7 @@ async fn check_rcpd_version(
     Ok(())
 }
 
+#[cfg(test)]
 async fn run_remote_version_probe<F>(
     remote_host: &str,
     probe: F,
@@ -1089,6 +1279,110 @@ pub async fn prepare_rcpd(
     .await
 }
 
+/// Prepare two endpoint sessions, sharing one result for a same-session copy.
+pub async fn prepare_rcpd_endpoints(
+    source: &SshSession,
+    destination: &SshSession,
+    explicit_rcpd_path: Option<&str>,
+    auto_deploy_rcpd: bool,
+) -> anyhow::Result<(PreparedRcpd, PreparedRcpd)> {
+    if source == destination {
+        let prepared = prepare_rcpd(source, explicit_rcpd_path, auto_deploy_rcpd).await?;
+        return Ok((prepared.clone(), prepared));
+    }
+    join_remote_preparations(
+        |preparation| {
+            prepare_rcpd_with_context(source, explicit_rcpd_path, auto_deploy_rcpd, preparation)
+        },
+        |preparation| {
+            prepare_rcpd_with_context(
+                destination,
+                explicit_rcpd_path,
+                auto_deploy_rcpd,
+                preparation,
+            )
+        },
+    )
+    .await
+}
+
+/// Await both preparations after the first intrinsic error cancels its peer.
+///
+/// Every production endpoint path receives a [`PreparationContext`], so awaiting both preserves
+/// cleanup ownership without allowing an uncancellable peer to hide the first error indefinitely.
+pub(crate) async fn join_remote_preparations<
+    Source,
+    Destination,
+    SourceFuture,
+    DestinationFuture,
+    S,
+    D,
+>(
+    source: Source,
+    destination: Destination,
+) -> anyhow::Result<(S, D)>
+where
+    Source: FnOnce(PreparationContext) -> SourceFuture,
+    Destination: FnOnce(PreparationContext) -> DestinationFuture,
+    SourceFuture: std::future::Future<Output = anyhow::Result<S>>,
+    DestinationFuture: std::future::Future<Output = anyhow::Result<D>>,
+{
+    const SOURCE: u8 = 1;
+    const DESTINATION: u8 = 2;
+
+    async fn prepare<Prepare, PrepareFuture, Prepared>(
+        prepare: Prepare,
+        preparation: PreparationContext,
+        first_failure: std::sync::Arc<std::sync::atomic::AtomicU8>,
+        endpoint: u8,
+    ) -> anyhow::Result<Prepared>
+    where
+        Prepare: FnOnce(PreparationContext) -> PrepareFuture,
+        PrepareFuture: std::future::Future<Output = anyhow::Result<Prepared>>,
+    {
+        let cancellation = preparation.cancellation.clone();
+        let result = prepare(preparation).await;
+        if result.is_err()
+            && first_failure
+                .compare_exchange(
+                    0,
+                    endpoint,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+        {
+            cancellation.cancel();
+        }
+        result
+    }
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let first_failure = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let source_preparation = prepare(
+        source,
+        PreparationContext::new(cancellation.clone()),
+        first_failure.clone(),
+        SOURCE,
+    );
+    let destination_preparation = prepare(
+        destination,
+        PreparationContext::new(cancellation),
+        first_failure.clone(),
+        DESTINATION,
+    );
+    let (source, destination) = tokio::join!(source_preparation, destination_preparation);
+    match (
+        first_failure.load(std::sync::atomic::Ordering::SeqCst),
+        source,
+        destination,
+    ) {
+        (SOURCE, Err(error), _) | (DESTINATION, _, Err(error)) => Err(error),
+        (_, Ok(source), Ok(destination)) => Ok((source, destination)),
+        (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+    }
+}
+
 #[instrument(skip(cancellation))]
 pub async fn prepare_rcpd_with_cancellation(
     session: &SshSession,
@@ -1096,47 +1390,82 @@ pub async fn prepare_rcpd_with_cancellation(
     auto_deploy_rcpd: bool,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<PreparedRcpd> {
+    prepare_rcpd_with_context(
+        session,
+        explicit_rcpd_path,
+        auto_deploy_rcpd,
+        PreparationContext::new(cancellation),
+    )
+    .await
+}
+
+#[instrument(skip(preparation))]
+async fn prepare_rcpd_with_context(
+    session: &SshSession,
+    explicit_rcpd_path: Option<&str>,
+    auto_deploy_rcpd: bool,
+    preparation: PreparationContext,
+) -> anyhow::Result<PreparedRcpd> {
     tracing::info!("Preparing rcpd server on: {:?}", session);
     let remote_host = &session.host;
-    let ssh_session = setup_ssh_session(session).await?;
-    let rcpd_path =
-        match try_discover_and_check_version(&ssh_session, explicit_rcpd_path, remote_host).await {
-            Ok(path) => path,
-            Err(error) => {
-                if !auto_deploy_rcpd {
-                    return Err(error);
-                }
-                tracing::info!("rcpd unavailable or incompatible, attempting auto-deployment");
-                let local_rcpd = deploy::find_local_rcpd_binary()
-                    .await
-                    .context("failed to find local rcpd binary for deployment")?;
-                tracing::info!("Found local rcpd binary at {}", local_rcpd.display());
-                let local_version = common::version::ProtocolVersion::current();
-                let deployed_path = deploy::deploy_rcpd(
-                    &ssh_session,
-                    &local_rcpd,
-                    &local_version.cache_tag(),
-                    remote_host,
-                    &cancellation,
-                )
+    let ssh_session = setup_ssh_session(session, &preparation).await?;
+    let rcpd_path = match try_discover_and_check_version(
+        ssh_session.session(),
+        explicit_rcpd_path,
+        remote_host,
+        &preparation,
+    )
+    .await
+    {
+        Ok(path) => path,
+        Err(error) => {
+            preparation.ensure_active()?;
+            if !auto_deploy_rcpd {
+                return Err(error);
+            }
+            tracing::info!("rcpd unavailable or incompatible, attempting auto-deployment");
+            let local_rcpd = deploy::find_local_rcpd_binary_with_context(&preparation)
                 .await
-                .context("failed to deploy rcpd to remote host")?;
-                check_rcpd_version(&ssh_session, &deployed_path, remote_host)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "deployed rcpd at {deployed_path} failed compatibility verification"
-                        )
-                    })?;
-                tracing::info!("Successfully deployed rcpd to {deployed_path}");
-                if let Err(error) = deploy::cleanup_old_versions(&ssh_session, 3).await {
+                .context("failed to find local rcpd binary for deployment")?;
+            tracing::info!("Found local rcpd binary at {}", local_rcpd.display());
+            let local_version = common::version::ProtocolVersion::current();
+            let deployed_path = deploy::deploy_rcpd_with_context(
+                ssh_session.session(),
+                &local_rcpd,
+                &local_version.cache_tag(),
+                remote_host,
+                &preparation,
+            )
+            .await
+            .context("failed to deploy rcpd to remote host")?;
+            check_rcpd_version(
+                ssh_session.session(),
+                &deployed_path,
+                remote_host,
+                &preparation,
+            )
+            .await
+            .with_context(|| {
+                format!("deployed rcpd at {deployed_path} failed compatibility verification")
+            })?;
+            tracing::info!("Successfully deployed rcpd to {deployed_path}");
+            match deploy::cleanup_old_versions_with_context(ssh_session.session(), 3, &preparation)
+                .await
+            {
+                Ok(()) => {}
+                Err(_) if preparation.cancellation.is_cancelled() => {
+                    return Err(PreparationContext::cancellation_error());
+                }
+                Err(error) => {
                     tracing::warn!("failed to cleanup old versions (non-fatal): {error:#}");
                 }
-                deployed_path
             }
-        };
+            deployed_path
+        }
+    };
+    preparation.ensure_active()?;
     Ok(PreparedRcpd {
-        session: ssh_session,
+        session: ssh_session.into_inner(),
         rcpd_path,
         remote: session.clone(),
     })
@@ -2181,6 +2510,107 @@ mod tests {
                 }
             })
         }
+    }
+
+    struct PendingDiscoverySession {
+        preparation: PreparationContext,
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        release: tokio_util::sync::CancellationToken,
+        finished: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl DiscoverySession for PendingDiscoverySession {
+        fn test_executable<'a>(
+            &'a self,
+            _path: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>
+        {
+            let started = self.started.lock().unwrap().take();
+            let active = self.active.clone();
+            let release = self.release.clone();
+            let finished = self.finished.clone();
+            Box::pin(async move {
+                let owner = tokio::spawn(async move {
+                    active.store(true, std::sync::atomic::Ordering::SeqCst);
+                    started.unwrap().send(()).unwrap();
+                    release.cancelled().await;
+                    active.store(false, std::sync::atomic::Ordering::SeqCst);
+                    finished.notify_one();
+                    anyhow::Ok(false)
+                });
+                self.preparation
+                    .run_owned(
+                        owner,
+                        std::time::Duration::from_millis(20),
+                        "remote executable discovery",
+                    )
+                    .await
+            })
+        }
+
+        fn which<'a>(
+            &'a self,
+            _binary: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<Option<String>>> + Send + 'a>,
+        > {
+            unreachable!("explicit discovery must not fall through to PATH")
+        }
+
+        fn remote_home<'a>(
+            &'a self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>
+        {
+            unreachable!("explicit discovery must not inspect HOME")
+        }
+    }
+
+    #[tokio::test]
+    async fn paired_preparation_detaches_a_peer_blocked_in_discovery() {
+        let (discovery_started, wait_for_discovery) = tokio::sync::oneshot::channel();
+        let discovery_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let active_after_return = discovery_active.clone();
+        let discovery_release = tokio_util::sync::CancellationToken::new();
+        let release_after_return = discovery_release.clone();
+        let discovery_finished = std::sync::Arc::new(tokio::sync::Notify::new());
+        let finished_after_return = discovery_finished.clone();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            join_remote_preparations(
+                move |_preparation| async move {
+                    wait_for_discovery.await.unwrap();
+                    Err::<String, _>(anyhow::anyhow!("source preparation failed"))
+                },
+                move |preparation| async move {
+                    let session = PendingDiscoverySession {
+                        preparation,
+                        started: Mutex::new(Some(discovery_started)),
+                        active: discovery_active,
+                        release: discovery_release,
+                        finished: discovery_finished,
+                    };
+                    discover_rcpd_path_internal(&session, Some("/blocked/rcpd"), None).await
+                },
+            ),
+        )
+        .await
+        .expect("peer cancellation must bound blocked discovery")
+        .unwrap_err();
+
+        assert_eq!(result.to_string(), "source preparation failed");
+        assert!(
+            active_after_return.load(std::sync::atomic::Ordering::SeqCst),
+            "blocked discovery must retain its owner after the foreground grace"
+        );
+        let finished = finished_after_return.notified();
+        tokio::pin!(finished);
+        release_after_return.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), finished)
+            .await
+            .expect("detached discovery owner must remain runnable");
+        assert!(!active_after_return.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

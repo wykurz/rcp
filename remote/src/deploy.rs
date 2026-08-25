@@ -101,6 +101,8 @@ use std::time::Duration;
 
 const LOCAL_RCPD_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 const LOCAL_RCPD_CLEANUP_GRACE: Duration = Duration::from_secs(1);
+const REMOTE_STAGING_OWNER_GRACE: Duration = Duration::from_secs(1);
+const REMOTE_TEMP_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 
 const TRANSFER_HINTS: &str = "\
     This may indicate:\n\
@@ -160,6 +162,12 @@ fn format_write_error(
 ///
 /// Returns an error if no compatible binary is found
 pub async fn find_local_rcpd_binary() -> anyhow::Result<PathBuf> {
+    find_local_rcpd_binary_with_context(&crate::PreparationContext::uncancelled()).await
+}
+
+pub(crate) async fn find_local_rcpd_binary_with_context(
+    preparation: &crate::PreparationContext,
+) -> anyhow::Result<PathBuf> {
     let mut searched_paths = Vec::new();
     let local_version = common::version::ProtocolVersion::current();
 
@@ -173,6 +181,10 @@ pub async fn find_local_rcpd_binary() -> anyhow::Result<PathBuf> {
         let path = bin_dir.join("rcpd");
         searched_paths.push(format!("Same directory: {}", path.display()));
         if path.exists() && path.is_file() {
+            // The probe owns a child and has its own hard two-second deadline plus bounded reap
+            // funnel. Await that owner directly: an outer cancellation select could drop it before
+            // the funnel runs. Peer failure can therefore delay this path by at most the existing
+            // protocol-version deadline, never indefinitely.
             match check_local_rcpd_version(&path, &local_version, LOCAL_RCPD_VERSION_TIMEOUT).await
             {
                 Ok(()) => {
@@ -193,9 +205,16 @@ pub async fn find_local_rcpd_binary() -> anyhow::Result<PathBuf> {
 
     // try PATH (covers cargo install, nixpkgs, and other system installations)
     tracing::debug!("Trying to find rcpd in PATH");
-    let which_output = tokio::process::Command::new("which")
-        .arg("rcpd")
-        .output()
+    let which = tokio::spawn(async {
+        tokio::process::Command::new("which")
+            .arg("rcpd")
+            .kill_on_drop(true)
+            .output()
+            .await
+            .context("failed to run local rcpd PATH discovery")
+    });
+    let which_output = preparation
+        .run_owned(which, LOCAL_RCPD_CLEANUP_GRACE, "local rcpd PATH discovery")
         .await
         .ok();
 
@@ -208,6 +227,7 @@ pub async fn find_local_rcpd_binary() -> anyhow::Result<PathBuf> {
             let path = PathBuf::from(path_str);
             searched_paths.push(format!("PATH: {}", path.display()));
             if path.exists() && path.is_file() {
+                // Keep child ownership inside the probe's fixed-deadline termination/reap funnel.
                 match check_local_rcpd_version(&path, &local_version, LOCAL_RCPD_VERSION_TIMEOUT)
                     .await
                 {
@@ -424,36 +444,57 @@ pub async fn deploy_rcpd(
     remote_host: &str,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<String> {
+    deploy_rcpd_with_context(
+        session,
+        local_rcpd_path,
+        version,
+        remote_host,
+        &crate::PreparationContext::new(cancellation.clone()),
+    )
+    .await
+}
+
+pub(crate) async fn deploy_rcpd_with_context(
+    session: &Arc<openssh::Session>,
+    local_rcpd_path: &std::path::Path,
+    version: &str,
+    remote_host: &str,
+    preparation: &crate::PreparationContext,
+) -> anyhow::Result<String> {
     tracing::info!(
         "Deploying rcpd {} to remote host '{}'",
         version,
         remote_host
     );
 
-    ensure_deployment_active(cancellation)?;
+    preparation.ensure_active()?;
 
     // read local binary
-    let binary = tokio::fs::read(local_rcpd_path).await.with_context(|| {
-        format!(
-            "failed to read local rcpd binary from {}",
-            local_rcpd_path.display()
-        )
-    })?;
+    let binary = preparation
+        .run(async {
+            tokio::fs::read(local_rcpd_path).await.with_context(|| {
+                format!(
+                    "failed to read local rcpd binary from {}",
+                    local_rcpd_path.display()
+                )
+            })
+        })
+        .await?;
 
     tracing::info!(
         "Read local rcpd binary ({} bytes) from {}",
         binary.len(),
         local_rcpd_path.display()
     );
-    ensure_deployment_active(cancellation)?;
+    preparation.ensure_active()?;
 
     // compute checksum before transfer
     let expected_checksum = compute_sha256(&binary);
     tracing::debug!("Expected SHA-256: {}", hex::encode(&expected_checksum));
 
     // validate HOME is set and construct remote path
-    let home = crate::get_remote_home(session).await?;
-    ensure_deployment_active(cancellation)?;
+    let home = crate::get_remote_home_with_context(session, preparation).await?;
+    preparation.ensure_active()?;
     let remote_path = format!("{}/.cache/rcp/bin/rcpd-{}", home, version);
 
     // The temp path is chosen HERE, before anything can create it, so that every failure below has
@@ -462,6 +503,11 @@ pub async fn deploy_rcpd(
     // disk, a killed command — leaked it silently, and every retry leaked another:
     // `cleanup_old_versions` globs `rcpd-*`, which never matches these dotfiles.
     let temp_path = remote_temp_path(&remote_path)?;
+    let cleanup = RemoteTempCleanup {
+        session: session.clone(),
+        temp_path: temp_path.clone(),
+    };
+    let cleanup_after_error = cleanup.clone();
     stage_with_cleanup(
         stage_and_publish(
             session,
@@ -469,34 +515,95 @@ pub async fn deploy_rcpd(
             &remote_path,
             &temp_path,
             &expected_checksum,
-            cancellation,
+            preparation,
+            cleanup,
         ),
-        remove_remote_temp(session, &temp_path),
+        async move { cleanup_after_error.attempt().await },
+        REMOTE_TEMP_CLEANUP_GRACE,
     )
     .await?;
 
     Ok(remote_path)
 }
 
-fn ensure_deployment_active(
-    cancellation: &tokio_util::sync::CancellationToken,
-) -> anyhow::Result<()> {
-    if cancellation.is_cancelled() {
-        anyhow::bail!("rcpd deployment cancelled because peer preparation failed");
-    }
-    Ok(())
-}
-
 async fn stage_with_cleanup<T>(
     stage: impl std::future::Future<Output = anyhow::Result<T>>,
-    cleanup: impl std::future::Future<Output = ()>,
+    cleanup: impl std::future::Future<Output = ()> + Send + 'static,
+    cleanup_grace: Duration,
 ) -> anyhow::Result<T> {
     let staged = stage.await;
     if staged.is_err() {
-        // one funnel owns every non-published temp path, including cooperative cancellation
-        cleanup.await;
+        // one funnel makes the prompt best-effort attempt for every non-published temp path;
+        // staging-child ownership independently retries after that child actually exits
+        if !cleanup_with_deadline(cleanup, cleanup_grace).await {
+            tracing::debug!(
+                "remote deployment temp cleanup exceeded its grace; background owner retained the cleanup command"
+            );
+        }
     }
     staged
+}
+
+async fn await_staging_owner<T>(
+    preparation: &crate::PreparationContext,
+    owner: tokio::task::JoinHandle<anyhow::Result<T>>,
+    grace: Duration,
+) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+{
+    preparation
+        .run_owned(owner, grace, "remote staging child finish")
+        .await
+}
+
+#[derive(Clone)]
+struct RemoteTempCleanup {
+    session: Arc<openssh::Session>,
+    temp_path: String,
+}
+
+impl RemoteTempCleanup {
+    async fn attempt(&self) {
+        remove_remote_temp(&self.session, &self.temp_path).await;
+    }
+}
+
+/// Owns a spawned staging child until it is transferred into the explicit finisher task.
+struct StagingChildOwner {
+    child: Option<openssh::Child<Arc<openssh::Session>>>,
+    cleanup: RemoteTempCleanup,
+}
+
+impl StagingChildOwner {
+    fn new(child: openssh::Child<Arc<openssh::Session>>, cleanup: RemoteTempCleanup) -> Self {
+        Self {
+            child: Some(child),
+            cleanup,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut openssh::Child<Arc<openssh::Session>> {
+        self.child.as_mut().expect("staging child is present")
+    }
+
+    fn into_child(mut self) -> openssh::Child<Arc<openssh::Session>> {
+        self.child.take().expect("staging child is present")
+    }
+}
+
+impl Drop for StagingChildOwner {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.take() {
+            let cleanup = self.cleanup.clone();
+            tokio::spawn(async move {
+                if let Err(error) = child.wait_with_output().await {
+                    tracing::debug!("failed to finish abandoned staging child: {error:#}");
+                }
+                cleanup.attempt().await;
+            });
+        }
+    }
 }
 
 /// Transfer the binary to `temp_path`, verify it there, and only then publish it to `remote_path`.
@@ -510,21 +617,22 @@ async fn stage_and_publish(
     remote_path: &str,
     temp_path: &str,
     expected_checksum: &[u8],
-    cancellation: &tokio_util::sync::CancellationToken,
+    preparation: &crate::PreparationContext,
+    cleanup: RemoteTempCleanup,
 ) -> anyhow::Result<()> {
-    ensure_deployment_active(cancellation)?;
-    transfer_binary_base64(session, binary, temp_path, cancellation).await?;
+    preparation.ensure_active()?;
+    transfer_binary_base64(session, binary, temp_path, preparation, cleanup).await?;
     tracing::info!("Binary transferred to {}", temp_path);
-    ensure_deployment_active(cancellation)?;
+    preparation.ensure_active()?;
 
     // verify BEFORE publishing: a truncated or corrupt transfer must never become visible under the
     // name other processes execute, so the checksum is taken on the temp file and the rename
     // happens only if it matches.
-    verify_remote_checksum(session, temp_path, expected_checksum).await?;
+    verify_remote_checksum(session, temp_path, expected_checksum, preparation).await?;
     tracing::info!("Checksum verified successfully");
-    ensure_deployment_active(cancellation)?;
+    preparation.ensure_active()?;
 
-    publish_remote_binary(session, temp_path, remote_path).await
+    publish_remote_binary(session, temp_path, remote_path, preparation).await
 }
 
 /// Build the remote shell command that STAGES the binary — and only stages it.
@@ -588,13 +696,13 @@ async fn publish_remote_binary(
     session: &Arc<openssh::Session>,
     temp_path: &str,
     remote_path: &str,
+    preparation: &crate::PreparationContext,
 ) -> anyhow::Result<()> {
     let cmd = publish_command(temp_path, remote_path);
-    let output = session
-        .command("sh")
-        .arg("-c")
-        .arg(&cmd)
-        .output()
+    let mut command = session.clone().arc_command("sh");
+    command.arg("-c").arg(&cmd);
+    let output = preparation
+        .remote_output(command, "remote deployment publish")
         .await
         .context("failed to run the publishing rename on the remote host")?;
     if !output.status.success() {
@@ -619,7 +727,13 @@ async fn publish_remote_binary(
 /// else will ever open or execute it.
 async fn remove_remote_temp(session: &Arc<openssh::Session>, temp_path: &str) {
     let cmd = format!("rm -f {}", crate::shell_escape(temp_path));
-    match session.command("sh").arg("-c").arg(&cmd).output().await {
+    let mut command = session.clone().arc_command("sh");
+    command.arg("-c").arg(&cmd);
+    let cleanup = crate::PreparationContext::uncancelled();
+    match cleanup
+        .remote_output(command, "remote deployment temp cleanup")
+        .await
+    {
         Ok(output) if output.status.success() => {}
         Ok(output) => tracing::warn!(
             "could not remove the temp file {} on the remote host: {}",
@@ -680,7 +794,8 @@ async fn transfer_binary_base64(
     session: &Arc<openssh::Session>,
     binary: &[u8],
     temp_path: &str,
-    cancellation: &tokio_util::sync::CancellationToken,
+    preparation: &crate::PreparationContext,
+    cleanup: RemoteTempCleanup,
 ) -> anyhow::Result<()> {
     use base64::Engine;
 
@@ -699,29 +814,44 @@ async fn transfer_binary_base64(
 
     tracing::debug!("Running remote command: mkdir && base64 && chmod");
 
-    let mut child = session
-        .command("sh")
+    let mut command = session.clone().arc_command("sh");
+    command
         .arg("-c")
         .arg(&cmd)
         .stdin(openssh::Stdio::piped())
         .stdout(openssh::Stdio::piped())
-        .stderr(openssh::Stdio::piped())
-        .spawn()
-        .await
-        .context("failed to spawn remote command for binary transfer")?;
+        .stderr(openssh::Stdio::piped());
+    let cleanup_after_spawn = cleanup.clone();
+    let spawn = tokio::spawn(async move {
+        let child = command
+            .spawn()
+            .await
+            .context("failed to spawn remote command for binary transfer")?;
+        Ok(StagingChildOwner::new(child, cleanup_after_spawn))
+    });
+    let mut child = preparation
+        .run_owned(
+            spawn,
+            REMOTE_STAGING_OWNER_GRACE,
+            "remote staging child spawn",
+        )
+        .await?;
 
     // take handles for all streams
     let mut stdin = child
+        .child_mut()
         .stdin()
         .take()
         .context("failed to get stdin for remote command")?;
 
     let mut stdout = child
+        .child_mut()
         .stdout()
         .take()
         .context("failed to get stdout for remote command")?;
 
     let mut stderr = child
+        .child_mut()
         .stderr()
         .take()
         .context("failed to get stderr for remote command")?;
@@ -735,44 +865,57 @@ async fn transfer_binary_base64(
     // stderr to learn why the remote command failed
     let write_result = tokio::select! {
         biased;
-        () = cancellation.cancelled() => None,
+        () = preparation.cancellation.cancelled() => None,
         result = stdin.write_all(encoded.as_bytes()) => Some(result),
     };
+    let shutdown_stdin = matches!(write_result, Some(Ok(())));
+    let child = child.into_child();
+    let cancellation = preparation.cancellation.clone();
+    let cleanup_after_child = cleanup.clone();
+    let finish = tokio::spawn(async move {
+        let result = async {
+            let shutdown_result = if shutdown_stdin {
+                // shutdown stdin to send EOF to the remote `base64 -d` process
+                Some(stdin.shutdown().await)
+            } else {
+                None
+            };
+            // dropping stdin sends EOF even after a failed or cancelled write
+            drop(stdin);
 
-    let shutdown_result = if matches!(write_result, Some(Ok(()))) {
-        // shutdown stdin to send EOF to the remote `base64 -d` process
-        Some(stdin.shutdown().await)
-    } else {
-        None
-    };
-    // drop stdin so the remote process can finish even if the write failed
-    drop(stdin);
+            // read stdout and stderr to completion — stderr is critical for diagnostics when the
+            // remote command fails before accepting all input
+            let stdout_fut = async {
+                let mut buf = Vec::new();
+                let _ = stdout.read_to_end(&mut buf).await;
+                buf
+            };
+            let stderr_fut = async {
+                let mut buf = Vec::new();
+                let _ = stderr.read_to_end(&mut buf).await;
+                buf
+            };
+            let (_stdout_data, stderr_data) = tokio::join!(stdout_fut, stderr_fut);
+            let status = child
+                .wait()
+                .await
+                .context("failed to wait for remote command completion")?;
+            anyhow::Ok((shutdown_result, stderr_data, status))
+        }
+        .await;
+        if cancellation.is_cancelled() {
+            // ordered retry: the prompt cleanup attempt may have unlinked the unique path while
+            // base64 still held it open; retry after child completion removes any surviving name
+            cleanup_after_child.attempt().await;
+        }
+        result
+    });
+    let (shutdown_result, stderr_data, status) =
+        await_staging_owner(preparation, finish, REMOTE_STAGING_OWNER_GRACE).await?;
 
-    // read stdout and stderr to completion — stderr is critical for diagnostics
-    // when the remote command fails before accepting all input
-    let stdout_fut = async {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf).await;
-        buf
-    };
-
-    let stderr_fut = async {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf).await;
-        buf
-    };
-
-    let (_stdout_data, stderr_data) = tokio::join!(stdout_fut, stderr_fut);
-
-    // wait for command to complete
-    let status = child
-        .wait()
-        .await
-        .context("failed to wait for remote command completion")?;
-
-    // if writing to stdin failed (broken pipe), the remote command exited early —
-    // include stderr so the user sees the actual cause (e.g. "Permission denied")
-    ensure_deployment_active(cancellation)?;
+    // if writing to stdin failed (broken pipe), the remote command exited early — include stderr
+    // so the user sees the actual cause (e.g. "Permission denied")
+    preparation.ensure_active()?;
 
     if let Some(shutdown_result) = shutdown_result {
         shutdown_result.context("failed to shutdown stdin")?;
@@ -815,17 +958,17 @@ async fn verify_remote_checksum(
     session: &Arc<openssh::Session>,
     remote_path: &str,
     expected_checksum: &[u8],
+    preparation: &crate::PreparationContext,
 ) -> anyhow::Result<()> {
     // escape remote_path for safe shell usage
     let cmd = format!("sha256sum {}", crate::shell_escape(remote_path));
 
     tracing::debug!("Verifying checksum on remote host");
 
-    let output = session
-        .command("sh")
-        .arg("-c")
-        .arg(&cmd)
-        .output()
+    let mut command = session.clone().arc_command("sh");
+    command.arg("-c").arg(&cmd);
+    let output = preparation
+        .remote_output(command, "remote deployment checksum")
         .await
         .context("failed to run sha256sum on remote host")?;
 
@@ -887,11 +1030,24 @@ pub async fn cleanup_old_versions(
     session: &Arc<openssh::Session>,
     keep_count: usize,
 ) -> anyhow::Result<()> {
+    cleanup_old_versions_with_context(
+        session,
+        keep_count,
+        &crate::PreparationContext::uncancelled(),
+    )
+    .await
+}
+
+pub(crate) async fn cleanup_old_versions_with_context(
+    session: &Arc<openssh::Session>,
+    keep_count: usize,
+    preparation: &crate::PreparationContext,
+) -> anyhow::Result<()> {
     tracing::debug!("Cleaning up old rcpd versions (keeping {})", keep_count);
 
     // validate HOME is set before constructing the cache path
     // if this fails, we log and return Ok since cleanup is best-effort
-    let home = match crate::get_remote_home(session).await {
+    let home = match crate::get_remote_home_with_context(session, preparation).await {
         Ok(h) => h,
         Err(e) => {
             tracing::warn!(
@@ -911,11 +1067,10 @@ pub async fn cleanup_old_versions(
         keep_count + 1
     );
 
-    let output = session
-        .command("sh")
-        .arg("-c")
-        .arg(&cmd)
-        .output()
+    let mut command = session.clone().arc_command("sh");
+    command.arg("-c").arg(&cmd);
+    let output = preparation
+        .remote_output(command, "remote old-version cleanup")
         .await
         .context("failed to run cleanup command on remote host")?;
 
@@ -1042,6 +1197,7 @@ mod tests {
             async move {
                 tokio::fs::remove_file(&cleanup_path).await.unwrap();
             },
+            Duration::from_millis(100),
         );
         let cancel = async move {
             stage_is_started.await.unwrap();
@@ -1053,6 +1209,94 @@ mod tests {
         assert!(
             !temp_path.exists(),
             "staging returned before its private temp path was removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paired_preparation_detaches_owned_staging_and_orders_cleanup_retry() {
+        let test_dir = TestDirectory::new();
+        let temp_path = test_dir.0.join("deployment-temp");
+        let stage_path = temp_path.clone();
+        let cleanup_path = temp_path.clone();
+        let owner_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owner_observed = owner_active.clone();
+        let cleanup_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_observed = cleanup_attempted.clone();
+        let ordered_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_after_return = ordered_events.clone();
+        let owner_release = tokio_util::sync::CancellationToken::new();
+        let release_after_return = owner_release.clone();
+        let owner_finished = std::sync::Arc::new(tokio::sync::Notify::new());
+        let finished_after_return = owner_finished.clone();
+        let (stage_started, wait_for_stage) = tokio::sync::oneshot::channel();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::join_remote_preparations(
+                move |_preparation| async move {
+                    wait_for_stage.await.unwrap();
+                    Err::<(), _>(anyhow::anyhow!("source preparation failed"))
+                },
+                move |preparation| async move {
+                    stage_with_cleanup(
+                        async move {
+                            tokio::fs::write(&stage_path, b"partial binary")
+                                .await
+                                .unwrap();
+                            let owner_events = ordered_events.clone();
+                            let owner = tokio::spawn(async move {
+                                owner_active.store(true, std::sync::atomic::Ordering::SeqCst);
+                                stage_started.send(()).unwrap();
+                                owner_release.cancelled().await;
+                                owner_events.lock().unwrap().push("child finished");
+                                owner_events.lock().unwrap().push("temp cleanup retried");
+                                owner_active.store(false, std::sync::atomic::Ordering::SeqCst);
+                                owner_finished.notify_one();
+                                anyhow::Ok(())
+                            });
+                            await_staging_owner(&preparation, owner, Duration::from_millis(20))
+                                .await
+                        },
+                        async move {
+                            cleanup_attempted.store(true, std::sync::atomic::Ordering::SeqCst);
+                            tokio::fs::remove_file(&cleanup_path).await.unwrap();
+                        },
+                        Duration::from_millis(100),
+                    )
+                    .await
+                },
+            ),
+        )
+        .await
+        .expect("peer cancellation must bound staging teardown")
+        .unwrap_err();
+
+        assert_eq!(result.to_string(), "source preparation failed");
+        assert!(
+            owner_observed.load(std::sync::atomic::Ordering::SeqCst),
+            "the staging owner must remain alive after its foreground grace instead of being aborted"
+        );
+        assert!(
+            cleanup_observed.load(std::sync::atomic::Ordering::SeqCst),
+            "cancellation must attempt private temp cleanup"
+        );
+        assert!(
+            !temp_path.exists(),
+            "the prompt best-effort cleanup attempt must finish before pair return"
+        );
+
+        let finished = finished_after_return.notified();
+        tokio::pin!(finished);
+        release_after_return.cancel();
+        tokio::time::timeout(Duration::from_secs(1), finished)
+            .await
+            .expect("detached staging owner must remain runnable");
+        assert!(!owner_observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            *events_after_return.lock().unwrap(),
+            ["child finished", "temp cleanup retried"],
+            "the detached owner must retry cleanup only after child completion"
         );
     }
 

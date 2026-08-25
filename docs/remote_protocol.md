@@ -77,8 +77,19 @@ version's compatibility tag, transfers and publishes the binary, then probes tha
 path before constructing either role's spawn command. Thus neither co-location nor a current-looking
 cache filename is treated as proof that the binary implements the current serialized and rcpd spawn
 contract. For distinct hosts, the first preparation failure cooperatively cancels its peer without
-dropping the peer future. A deployment interrupted that way closes and reaps its staging command,
-then awaits removal of its private temp path before paired preparation returns.
+dropping owned work or replacing the original error. Each potentially blocking preparation stage
+either has the documented two-second version-probe deadline or runs under a cancellation-aware owner
+with a bounded foreground grace. If SSH setup, discovery, HOME lookup, verification, or cleanup
+remains blocked after that grace, its task retains the local child/session in the background and
+paired preparation may return the first endpoint error.
+
+Staging has a stricter ownership funnel because disconnecting an SSH channel does not prove that the
+remote shell stopped. Cancellation closes staging stdin, then a retained owner drains both pipes and
+waits for the command without being aborted. A separate, independently bounded `rm -f` attempt runs
+promptly; after the staging command eventually exits, its owner retries removal in case the first
+attempt raced the writer. The foreground therefore stays completion-bounded without claiming remote
+termination or successful temp removal before pair return. A surviving temp name is private to that
+deployment and is never discovered, executed, or adopted by a retry.
 
 **Startup stderr ownership and notices:** A successfully started daemon reserves its first stderr
 line for exactly one readiness record. Chrome-trace, flamegraph, Tokio-console, legacy-option, and
