@@ -198,12 +198,9 @@ fn direct_rcpd_flamegraph_leaves_connection_record_on_stderr() {
 
 #[test]
 fn direct_rcpd_tokio_console_leaves_connection_record_on_stderr() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
     assert_direct_rcpd_readiness_first(&[
         "--tokio-console".to_string(),
-        format!("--tokio-console-port={port}"),
+        "--tokio-console-port=0".to_string(),
     ]);
 }
 

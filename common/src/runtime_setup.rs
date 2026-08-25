@@ -455,24 +455,71 @@ fn resolve_leaf_capacity(
     files_in_flight.meet(descriptor_limit)
 }
 
-fn descriptor_clamp_notice(
+#[derive(Debug, Eq, PartialEq)]
+enum DescriptorClampVisibility {
+    Notice,
+    Verbose,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DescriptorClampDiagnostic {
+    visibility: DescriptorClampVisibility,
+    message: String,
+}
+
+fn descriptor_clamp_diagnostic(
     files_in_flight: crate::ResolvedFilesInFlight,
     effective: ConcurrencyLimit,
-) -> Option<(std::num::NonZeroUsize, std::num::NonZeroUsize)> {
-    if !matches!(
-        files_in_flight.source(),
-        crate::FilesInFlightSource::Explicit | crate::FilesInFlightSource::DeprecatedMaxOpenFiles
-    ) {
+) -> Option<DescriptorClampDiagnostic> {
+    if files_in_flight.limit() == effective {
         return None;
     }
-    match (files_in_flight.limit(), effective) {
-        (ConcurrencyLimit::Limited(requested), ConcurrencyLimit::Limited(effective))
-            if effective < requested =>
-        {
-            Some((requested, effective))
+    let ConcurrencyLimit::Limited(effective) = effective else {
+        return None;
+    };
+    let diagnostic = match (files_in_flight.source(), files_in_flight.limit()) {
+        (crate::FilesInFlightSource::Automatic, requested) => DescriptorClampDiagnostic {
+            visibility: DescriptorClampVisibility::Verbose,
+            message: format!(
+                "Automatic file admission was reduced by descriptor safety: requested={requested:?}, effective={:?}",
+                ConcurrencyLimit::Limited(effective),
+            ),
+        },
+        (crate::FilesInFlightSource::Explicit, ConcurrencyLimit::Limited(requested)) => {
+            DescriptorClampDiagnostic {
+                visibility: DescriptorClampVisibility::Notice,
+                message: format!(
+                    "Requested --max-files-in-flight={requested}, but descriptor safety reduced endpoint file admission to {effective}"
+                ),
+            }
         }
-        _ => None,
-    }
+        (
+            crate::FilesInFlightSource::DeprecatedMaxOpenFiles,
+            ConcurrencyLimit::Limited(requested),
+        ) => DescriptorClampDiagnostic {
+            visibility: DescriptorClampVisibility::Notice,
+            message: format!(
+                "Requested --max-open-files={requested}, but descriptor safety reduced endpoint file admission to {effective}"
+            ),
+        },
+        (crate::FilesInFlightSource::DeprecatedMaxOpenFiles, ConcurrencyLimit::Unlimited) => {
+            DescriptorClampDiagnostic {
+                visibility: DescriptorClampVisibility::Notice,
+                message: format!(
+                    "Requested unlimited file admission with --max-open-files=0, but descriptor safety reduced endpoint file admission to {effective}"
+                ),
+            }
+        }
+        (crate::FilesInFlightSource::Explicit, ConcurrencyLimit::Unlimited) => {
+            DescriptorClampDiagnostic {
+                visibility: DescriptorClampVisibility::Notice,
+                message: format!(
+                    "Configured unlimited file admission, but descriptor safety reduced endpoint file admission to {effective}"
+                ),
+            }
+        }
+    };
+    Some(diagnostic)
 }
 
 /// Build a multi-threaded tokio runtime configured per `runtime`, and apply the
@@ -508,20 +555,16 @@ pub(crate) fn build_tokio_runtime(
         open_file,
         pending_meta,
     );
-    if throttle.apply_files_in_flight {
-        if let Some((requested, effective)) =
-            descriptor_clamp_notice(throttle.files_in_flight, open_file)
-        {
-            tracing::warn!(
-                target: NOTICE_TARGET,
-                "Requested --max-files-in-flight={requested}, but descriptor safety reduced endpoint file admission to {effective}"
-            );
-        } else if open_file != throttle.files_in_flight.limit() {
-            tracing::info!(
-                "Automatic file admission was reduced by descriptor safety: requested={:?}, effective={:?}",
-                throttle.files_in_flight.limit(),
-                open_file,
-            );
+    if throttle.apply_files_in_flight
+        && let Some(diagnostic) = descriptor_clamp_diagnostic(throttle.files_in_flight, open_file)
+    {
+        match diagnostic.visibility {
+            DescriptorClampVisibility::Notice => {
+                tracing::warn!(target: NOTICE_TARGET, "{}", diagnostic.message);
+            }
+            DescriptorClampVisibility::Verbose => {
+                tracing::info!("{}", diagnostic.message);
+            }
         }
     }
     throttle::set_admission_limits(
@@ -608,20 +651,35 @@ mod default_leaf_operation_limit_tests {
     }
 
     #[test]
-    fn descriptor_clamp_notices_only_explicit_finite_reductions() {
+    fn descriptor_clamp_diagnostics_preserve_file_limit_provenance() {
         let eight = std::num::NonZeroUsize::new(8).unwrap();
         let four = std::num::NonZeroUsize::new(4).unwrap();
         let effective = ConcurrencyLimit::Limited(four);
         assert_eq!(
-            descriptor_clamp_notice(crate::ResolvedFilesInFlight::explicit(eight), effective),
-            Some((eight, four))
-        );
-        assert_eq!(
-            descriptor_clamp_notice(
-                crate::ResolvedFilesInFlight::automatic_with(eight),
+            descriptor_clamp_diagnostic(
+                crate::ResolvedFilesInFlight::legacy(eight.get()),
                 effective
             ),
-            None
+            Some(DescriptorClampDiagnostic {
+                visibility: DescriptorClampVisibility::Notice,
+                message: "Requested --max-open-files=8, but descriptor safety reduced endpoint file admission to 4".to_string(),
+            })
+        );
+        assert_eq!(
+            descriptor_clamp_diagnostic(crate::ResolvedFilesInFlight::legacy(0), effective),
+            Some(DescriptorClampDiagnostic {
+                visibility: DescriptorClampVisibility::Notice,
+                message: "Requested unlimited file admission with --max-open-files=0, but descriptor safety reduced endpoint file admission to 4".to_string(),
+            })
+        );
+        assert_eq!(
+            descriptor_clamp_diagnostic(
+                crate::ResolvedFilesInFlight::automatic_with(eight), effective
+            ),
+            Some(DescriptorClampDiagnostic {
+                visibility: DescriptorClampVisibility::Verbose,
+                message: "Automatic file admission was reduced by descriptor safety: requested=Limited(8), effective=Limited(4)".to_string(),
+            })
         );
     }
 
