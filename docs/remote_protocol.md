@@ -76,16 +76,21 @@ hanging SSH channel cannot block fallback. The master names the cache target wit
 version's compatibility tag, transfers and publishes the binary, then probes that deployed remote
 path before constructing either role's spawn command. Thus neither co-location nor a current-looking
 cache filename is treated as proof that the binary implements the current serialized and rcpd spawn
-contract.
+contract. For distinct hosts, the first preparation failure cooperatively cancels its peer without
+dropping the peer future. A deployment interrupted that way closes and reaps its staging command,
+then awaits removal of its private temp path before paired preparation returns.
 
 **Startup stderr ownership and notices:** A successfully started daemon reserves its first stderr
 line for exactly one readiness record. Chrome-trace, flamegraph, Tokio-console, legacy-option, and
 explicit concurrency-clamp announcements are collected until tracing is installed and emitted
 through the default-visible `rcp::notice` target. Remote tracing queues daemon notices until the
 master connects, so they reach master output without becoming readiness preamble. An intentional
-fatal startup refusal may instead emit one diagnostic and exit. An explicit `F` reduced by `M`, or
-by endpoint descriptor safety, produces a notice naming requested and effective values; an automatic
-reduction is verbose-only.
+fatal startup refusal instead emits one `RCP_ERROR <diagnostic>` record and exits. The master treats
+that typed record as a nested failure cause, closes its stdin, and gives an owned reaper a bounded
+grace before returning; if the grace expires, the detached reaper retains child ownership. Arbitrary
+stderr remains an invalid readiness record. An explicit `F` reduced by `M`, or by endpoint
+descriptor safety, produces a notice naming requested and effective values; an automatic reduction
+is verbose-only.
 
 ### 1.3 Connection Topology
 

@@ -404,6 +404,7 @@ where
 /// * `local_rcpd_path` - Path to the local static rcpd binary to deploy
 /// * `version` - Semantic version string for the binary
 /// * `remote_host` - Hostname for logging/error messages
+/// * `cancellation` - Peer-preparation cancellation signal
 ///
 /// # Returns
 ///
@@ -421,12 +422,15 @@ pub async fn deploy_rcpd(
     local_rcpd_path: &std::path::Path,
     version: &str,
     remote_host: &str,
+    cancellation: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<String> {
     tracing::info!(
         "Deploying rcpd {} to remote host '{}'",
         version,
         remote_host
     );
+
+    ensure_deployment_active(cancellation)?;
 
     // read local binary
     let binary = tokio::fs::read(local_rcpd_path).await.with_context(|| {
@@ -441,6 +445,7 @@ pub async fn deploy_rcpd(
         binary.len(),
         local_rcpd_path.display()
     );
+    ensure_deployment_active(cancellation)?;
 
     // compute checksum before transfer
     let expected_checksum = compute_sha256(&binary);
@@ -448,6 +453,7 @@ pub async fn deploy_rcpd(
 
     // validate HOME is set and construct remote path
     let home = crate::get_remote_home(session).await?;
+    ensure_deployment_active(cancellation)?;
     let remote_path = format!("{}/.cache/rcp/bin/rcpd-{}", home, version);
 
     // The temp path is chosen HERE, before anything can create it, so that every failure below has
@@ -456,44 +462,67 @@ pub async fn deploy_rcpd(
     // disk, a killed command — leaked it silently, and every retry leaked another:
     // `cleanup_old_versions` globs `rcpd-*`, which never matches these dotfiles.
     let temp_path = remote_temp_path(&remote_path)?;
-    let staged = stage_and_publish(
-        session,
-        &binary,
-        &remote_path,
-        &temp_path,
-        &expected_checksum,
+    stage_with_cleanup(
+        stage_and_publish(
+            session,
+            &binary,
+            &remote_path,
+            &temp_path,
+            &expected_checksum,
+            cancellation,
+        ),
+        remove_remote_temp(session, &temp_path),
     )
-    .await;
-    if staged.is_err() {
-        // ONE funnel. Everything between choosing the name and publishing it exits through here, so
-        // no path — present or future — can forget to clean up after itself.
-        remove_remote_temp(session, &temp_path).await;
-    }
-    staged?;
+    .await?;
 
     Ok(remote_path)
 }
 
+fn ensure_deployment_active(
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
+    if cancellation.is_cancelled() {
+        anyhow::bail!("rcpd deployment cancelled because peer preparation failed");
+    }
+    Ok(())
+}
+
+async fn stage_with_cleanup<T>(
+    stage: impl std::future::Future<Output = anyhow::Result<T>>,
+    cleanup: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<T> {
+    let staged = stage.await;
+    if staged.is_err() {
+        // one funnel owns every non-published temp path, including cooperative cancellation
+        cleanup.await;
+    }
+    staged
+}
+
 /// Transfer the binary to `temp_path`, verify it there, and only then publish it to `remote_path`.
 ///
-/// Every error is the caller's cue to remove `temp_path`; this function deliberately does no
-/// cleanup of its own, so there is exactly one place that decides what happens to a temp file that
-/// will not be published (see [`deploy_rcpd_binary`]).
+/// Every error, including cooperative cancellation, is the caller's cue to remove `temp_path`;
+/// this function deliberately does no cleanup of its own, so [`stage_with_cleanup`] is the one
+/// place that decides what happens to a temp file that will not be published.
 async fn stage_and_publish(
     session: &Arc<openssh::Session>,
     binary: &[u8],
     remote_path: &str,
     temp_path: &str,
     expected_checksum: &[u8],
+    cancellation: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
-    transfer_binary_base64(session, binary, temp_path).await?;
+    ensure_deployment_active(cancellation)?;
+    transfer_binary_base64(session, binary, temp_path, cancellation).await?;
     tracing::info!("Binary transferred to {}", temp_path);
+    ensure_deployment_active(cancellation)?;
 
     // verify BEFORE publishing: a truncated or corrupt transfer must never become visible under the
     // name other processes execute, so the checksum is taken on the temp file and the rename
     // happens only if it matches.
     verify_remote_checksum(session, temp_path, expected_checksum).await?;
     tracing::info!("Checksum verified successfully");
+    ensure_deployment_active(cancellation)?;
 
     publish_remote_binary(session, temp_path, remote_path).await
 }
@@ -641,15 +670,17 @@ fn unique_temp_filename(filename: &str) -> String {
 /// * `binary` - Binary content to transfer
 /// * `temp_path` - This deployment's private staging path, from [`remote_temp_path`]. Its parent
 ///   directory is created; the final path is not touched here.
+/// * `cancellation` - Peer-preparation cancellation signal
 ///
 /// # Errors
 ///
 /// Returns an error if directory creation, transfer, or permission setting fails. The caller owns
-/// `temp_path` and is responsible for removing it on any error — see [`deploy_rcpd_binary`].
+/// `temp_path` and is responsible for removing it on any error — see [`stage_with_cleanup`].
 async fn transfer_binary_base64(
     session: &Arc<openssh::Session>,
     binary: &[u8],
     temp_path: &str,
+    cancellation: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     use base64::Engine;
 
@@ -702,12 +733,18 @@ async fn transfer_binary_base64(
     // write all base64 data to stdin, capturing errors instead of returning
     // immediately — if this fails (e.g. broken pipe), we still need to read
     // stderr to learn why the remote command failed
-    let write_result = stdin.write_all(encoded.as_bytes()).await;
+    let write_result = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => None,
+        result = stdin.write_all(encoded.as_bytes()) => Some(result),
+    };
 
-    if write_result.is_ok() {
+    let shutdown_result = if matches!(write_result, Some(Ok(()))) {
         // shutdown stdin to send EOF to the remote `base64 -d` process
-        stdin.shutdown().await.context("failed to shutdown stdin")?;
-    }
+        Some(stdin.shutdown().await)
+    } else {
+        None
+    };
     // drop stdin so the remote process can finish even if the write failed
     drop(stdin);
 
@@ -735,7 +772,13 @@ async fn transfer_binary_base64(
 
     // if writing to stdin failed (broken pipe), the remote command exited early —
     // include stderr so the user sees the actual cause (e.g. "Permission denied")
-    if let Err(write_err) = write_result {
+    ensure_deployment_active(cancellation)?;
+
+    if let Some(shutdown_result) = shutdown_result {
+        shutdown_result.context("failed to shutdown stdin")?;
+    }
+
+    if let Some(Err(write_err)) = write_result {
         anyhow::bail!("{}", format_write_error(&write_err, &stderr_data, &status));
     }
 
@@ -974,6 +1017,43 @@ mod tests {
             cleanup_with_deadline(std::future::pending::<()>(), Duration::from_millis(20)).await;
         assert!(!completed);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_staging_removes_temp_before_returning() {
+        let test_dir = TestDirectory::new();
+        let temp_path = test_dir.0.join("deployment-temp");
+        let stage_path = temp_path.clone();
+        let cleanup_path = temp_path.clone();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let stage_cancellation = cancellation.clone();
+        let (stage_started, stage_is_started) = tokio::sync::oneshot::channel();
+
+        let staging = stage_with_cleanup(
+            async move {
+                tokio::fs::write(&stage_path, b"partial binary")
+                    .await
+                    .unwrap();
+                stage_started.send(()).unwrap();
+                stage_cancellation.cancelled().await;
+                Err::<(), _>(anyhow::anyhow!("deployment cancelled"))
+            },
+            async move {
+                tokio::fs::remove_file(&cleanup_path).await.unwrap();
+            },
+        );
+        let cancel = async move {
+            stage_is_started.await.unwrap();
+            cancellation.cancel();
+        };
+        let (result, ()) = tokio::join!(staging, cancel);
+
+        assert_eq!(result.unwrap_err().to_string(), "deployment cancelled");
+        assert!(
+            !temp_path.exists(),
+            "staging returned before its private temp path was removed"
+        );
     }
 
     // the temp name is what keeps two concurrent deployments off each other's file. It has to be

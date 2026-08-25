@@ -84,6 +84,16 @@ fn run_rcp_with_args(args: &[&str]) -> std::process::Output {
     run_rcp_with_args_internal(args, None, &[])
 }
 
+fn run_rcp_with_args_at_default_verbosity(args: &[&str]) -> std::process::Output {
+    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
+    let mut cmd = std::process::Command::new("timeout");
+    cmd.args(["90", rcp_path.to_str().unwrap(), "--force-remote"]);
+    cmd.args(args);
+    let output = cmd.output().expect("Failed to execute rcp command");
+    assert_not_timeout(&output);
+    output
+}
+
 fn run_rcp_with_args_home_and_env(
     args: &[&str],
     home: &std::path::Path,
@@ -111,6 +121,27 @@ fn make_test_home() -> tempfile::TempDir {
     let temp_home = tempfile::tempdir().unwrap();
     link_real_ssh_dir(temp_home.path());
     temp_home
+}
+
+fn shell_quote_for_test(value: &std::path::Path) -> String {
+    format!("'{}'", value.to_string_lossy().replace('\'', "'\"'\"'"))
+}
+
+fn marking_rcpd_wrapper(directory: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let wrapper = directory.join("marking-rcpd");
+    let marker = directory.join("rcpd-invocations");
+    let rcpd = assert_cmd::cargo::cargo_bin("rcpd");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexec {} \"$@\"\n",
+            shell_quote_for_test(&marker),
+            shell_quote_for_test(&rcpd),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (wrapper, marker)
 }
 
 /// A test HOME deliberately longer than the ~48 bytes that the SSH control socket path used to
@@ -3972,6 +4003,110 @@ fn test_remote_localhost_without_force_remote_is_local() {
         "Should NOT use rcpd without --force-remote, but got: {stdout}"
     );
     assert_eq!(get_file_content(&dst_file), "local copy test");
+}
+
+#[test]
+fn test_remote_pure_local_invalid_glob_precedes_home_and_probe() {
+    require_local_ssh();
+    let scratch = tempfile::tempdir().unwrap();
+    let (wrapper, marker) = marking_rcpd_wrapper(scratch.path());
+    let rcpd_path = format!("--rcpd-path={}", wrapper.display());
+    let destination = scratch.path().join("destination");
+    let output = run_rcp_with_args(&[
+        &rcpd_path,
+        "--include=[",
+        "localhost:~/source",
+        destination.to_str().unwrap(),
+    ]);
+    print_command_output(&output);
+    assert!(!output.status.success(), "invalid glob must fail");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("Connecting to SSH destination"),
+        "invalid local filter configuration must precede remote HOME SSH"
+    );
+    assert!(
+        !marker.exists(),
+        "invalid initiating-host configuration must fail before any rcpd probe"
+    );
+}
+
+#[test]
+fn test_remote_pure_local_unreadable_filter_file_precedes_home_and_probe() {
+    require_local_ssh();
+    let scratch = tempfile::tempdir().unwrap();
+    let (wrapper, marker) = marking_rcpd_wrapper(scratch.path());
+    let unreadable = scratch.path().join("filter-is-a-directory");
+    std::fs::create_dir(&unreadable).unwrap();
+    let rcpd_path = format!("--rcpd-path={}", wrapper.display());
+    let filter_file = format!("--filter-file={}", unreadable.display());
+    let destination = scratch.path().join("destination");
+    let output = run_rcp_with_args(&[
+        &rcpd_path,
+        &filter_file,
+        "localhost:~/source",
+        destination.to_str().unwrap(),
+    ]);
+    print_command_output(&output);
+    assert!(!output.status.success(), "unreadable filter file must fail");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("Connecting to SSH destination"),
+        "unreadable local filter configuration must precede remote HOME SSH"
+    );
+    assert!(
+        !marker.exists(),
+        "unreadable initiating-host filter must fail before any rcpd probe"
+    );
+}
+
+#[test]
+fn test_remote_automatic_capacity_failure_reports_cause_and_skips_destination() {
+    require_local_ssh();
+    let scratch = tempfile::tempdir().unwrap();
+    let (wrapper, marker) = marking_rcpd_wrapper(scratch.path());
+    let source = scratch.path().join("source");
+    let destination = scratch.path().join("destination");
+    std::fs::write(&source, b"capacity failure").unwrap();
+    let rcpd_path = format!("--rcpd-path={}", wrapper.display());
+    let multiplier = format!("--pending-writes-multiplier={}", usize::MAX);
+    let source_remote = format!("localhost:{}", source.display());
+    let output = run_rcp_with_args_at_default_verbosity(&[
+        &rcpd_path,
+        "--no-encryption",
+        &multiplier,
+        &source_remote,
+        destination.to_str().unwrap(),
+    ]);
+    print_command_output(&output);
+    assert!(
+        !output.status.success(),
+        "invalid automatic capacity must fail"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("pending file capacity"),
+        "initiating rcp must report the source daemon's real cause: {combined}"
+    );
+    assert!(
+        combined.contains("Caused by:"),
+        "the daemon diagnostic must remain a nested source: {combined}"
+    );
+    let invocations = std::fs::read_to_string(&marker).unwrap();
+    assert!(
+        invocations
+            .lines()
+            .any(|line| line.contains("--role source")),
+        "source role must have reached its capacity refusal: {invocations}"
+    );
+    assert!(
+        !invocations
+            .lines()
+            .any(|line| line.contains("--role destination")),
+        "destination must not spawn after source readiness refusal: {invocations}"
+    );
 }
 
 // ============================================================================
