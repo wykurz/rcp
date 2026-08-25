@@ -1326,9 +1326,25 @@ where
     Destination: FnOnce(PreparationContext) -> DestinationFuture,
     SourceFuture: std::future::Future<Output = anyhow::Result<S>>,
     DestinationFuture: std::future::Future<Output = anyhow::Result<D>>,
+    S: Send + 'static,
+    D: Send + 'static,
 {
     const SOURCE: u8 = 1;
     const DESTINATION: u8 = 2;
+
+    fn take_error_and_defer_success<T: Send + 'static>(
+        result: anyhow::Result<T>,
+    ) -> Option<anyhow::Error> {
+        match result {
+            Ok(value) => {
+                // a prepared endpoint can own the last openssh Session reference, whose Drop
+                // synchronously waits for `ssh -O exit`; keep that destructor off the coordinator
+                tokio::task::spawn_blocking(move || drop(value));
+                None
+            }
+            Err(error) => Some(error),
+        }
+    }
 
     async fn prepare<Prepare, PrepareFuture, Prepared>(
         prepare: Prepare,
@@ -1372,14 +1388,21 @@ where
         DESTINATION,
     );
     let (source, destination) = tokio::join!(source_preparation, destination_preparation);
-    match (
-        first_failure.load(std::sync::atomic::Ordering::SeqCst),
-        source,
-        destination,
-    ) {
-        (SOURCE, Err(error), _) | (DESTINATION, _, Err(error)) => Err(error),
-        (_, Ok(source), Ok(destination)) => Ok((source, destination)),
-        (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+    match (source, destination) {
+        (Ok(source), Ok(destination)) => Ok((source, destination)),
+        (source, destination) => {
+            let source_error = take_error_and_defer_success(source);
+            let destination_error = take_error_and_defer_success(destination);
+            match (
+                first_failure.load(std::sync::atomic::Ordering::SeqCst),
+                source_error,
+                destination_error,
+            ) {
+                (SOURCE, Some(error), _) | (DESTINATION, _, Some(error)) => Err(error),
+                (_, Some(error), _) | (_, _, Some(error)) => Err(error),
+                (_, None, None) => unreachable!("an error outcome must retain at least one error"),
+            }
+        }
     }
 }
 
@@ -2125,7 +2148,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Condvar, Mutex};
 
     fn nonzero(value: usize) -> std::num::NonZeroUsize {
         std::num::NonZeroUsize::new(value).unwrap()
@@ -2510,6 +2533,108 @@ mod tests {
                 }
             })
         }
+    }
+
+    struct BlockingDrop {
+        started: Option<std::sync::mpsc::Sender<()>>,
+        release: std::sync::Arc<(Mutex<bool>, Condvar)>,
+        finished: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl Drop for BlockingDrop {
+        fn drop(&mut self) {
+            let _ = self.started.take().unwrap().send(());
+            let (released, release_changed) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = release_changed.wait(released).unwrap();
+            }
+            let _ = self.finished.take().unwrap().send(());
+        }
+    }
+
+    struct BlockingDropRelease(std::sync::Arc<(Mutex<bool>, Condvar)>);
+
+    impl BlockingDropRelease {
+        fn release(&self) {
+            let (released, release_changed) = &*self.0;
+            *released.lock().unwrap() = true;
+            release_changed.notify_all();
+        }
+    }
+
+    impl Drop for BlockingDropRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    #[test]
+    fn paired_preparation_returns_error_while_successful_peer_drop_is_blocked() {
+        let watchdog = std::time::Duration::from_secs(5);
+        let (drop_started, wait_for_drop) = std::sync::mpsc::channel();
+        let (drop_finished, wait_for_drop_finish) = std::sync::mpsc::channel();
+        let release = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+        let release_guard = BlockingDropRelease(release.clone());
+        let successful_peer = BlockingDrop {
+            started: Some(drop_started),
+            release,
+            finished: Some(drop_finished),
+        };
+        let (success_ready, wait_for_success) = tokio::sync::oneshot::channel();
+        let (result_ready, wait_for_result) = std::sync::mpsc::channel();
+
+        let coordinator = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(join_remote_preparations(
+                move |_preparation| async move {
+                    success_ready.send(()).unwrap();
+                    anyhow::Ok(successful_peer)
+                },
+                move |_preparation| async move {
+                    wait_for_success.await.unwrap();
+                    Err::<(), _>(anyhow::anyhow!("destination preparation failed"))
+                },
+            ));
+            let _ = result_ready.send(result);
+            runtime.shutdown_timeout(watchdog);
+        });
+
+        let drop_started_result = wait_for_drop.recv_timeout(watchdog);
+        let result_before_release = wait_for_result.recv_timeout(watchdog);
+        let returned_while_drop_blocked = result_before_release.is_ok();
+        release_guard.release();
+        let drop_finished_result = wait_for_drop_finish.recv_timeout(watchdog);
+        let coordinator_result = match result_before_release {
+            Ok(result) => Some(result),
+            Err(_) => wait_for_result.recv_timeout(watchdog).ok(),
+        };
+        let coordinator_joined = coordinator.join();
+
+        assert!(
+            drop_started_result.is_ok(),
+            "successful peer disposal must start before the watchdog"
+        );
+        assert!(
+            drop_finished_result.is_ok(),
+            "successful peer disposal must finish after release"
+        );
+        assert!(
+            coordinator_joined.is_ok(),
+            "coordinator thread must finish after disposal is released"
+        );
+        assert!(
+            returned_while_drop_blocked,
+            "the intrinsic endpoint error must return without synchronously waiting for successful peer Drop"
+        );
+        let error = match coordinator_result.expect("coordinator must return a result") {
+            Ok(_) => panic!("paired preparation unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "destination preparation failed");
     }
 
     struct PendingDiscoverySession {
