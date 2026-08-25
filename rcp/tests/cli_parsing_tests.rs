@@ -119,6 +119,33 @@ fn direct_rcpd_legacy_warning_leaves_connection_record_on_stderr() {
     assert_direct_rcpd_readiness_first(&["--max-open-files=0".to_string()]);
 }
 
+#[test]
+fn direct_rcpd_automatic_capacity_failure_uses_stderr_startup_record() {
+    let multiplier = usize::MAX.to_string();
+    let output = rcpd()
+        .args([
+            "--role=source",
+            "--no-encryption",
+            &format!("--pending-writes-multiplier={multiplier}"),
+        ])
+        .output()
+        .expect("rcpd capacity refusal must complete");
+    assert!(!output.status.success(), "invalid capacity must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("RCP_ERROR "),
+        "startup refusal must own the first stderr record: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("pending file capacity"),
+        "startup record must retain the capacity cause: {stderr:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("pending file capacity"),
+        "the fatal startup cause must not be hidden in the stdout log stream"
+    );
+}
+
 fn assert_direct_rcpd_readiness_first(extra: &[String]) -> std::process::Output {
     use std::io::BufRead;
 

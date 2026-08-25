@@ -597,6 +597,7 @@ async fn async_main(
     args: Args,
     tracing_receiver: tokio::sync::mpsc::UnboundedReceiver<common::remote_tracing::TracingMessage>,
     files_in_flight: common::ResolvedFilesInFlight,
+    concurrency: remote::ResolvedRemoteConcurrency,
 ) -> anyhow::Result<String> {
     // install rustls crypto provider (ring) before any TLS operations
     if !args.no_encryption {
@@ -605,7 +606,6 @@ async fn async_main(
             .ok(); // ignore if already installed
     }
     // build TCP config for listener creation
-    let concurrency = args.resolve_remote_concurrency(files_in_flight)?;
     let tcp_config = args.to_tcp_config(concurrency);
     tracing::info!(
         "Effective remote connection count: {}",
@@ -864,6 +864,17 @@ async fn async_main(
     }
 }
 
+fn exit_with_startup_refusal(diagnostic: &str, code: i32) -> ! {
+    let one_line = diagnostic
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!("{}{one_line}", remote::RCPD_STARTUP_ERROR_PREFIX);
+    std::process::exit(code);
+}
+
 fn main() -> Result<(), anyhow::Error> {
     // handle --protocol-version flag before parsing full arguments
     // this allows it to work without required arguments
@@ -884,25 +895,22 @@ fn main() -> Result<(), anyhow::Error> {
 
     let args = Args::parse();
     let files_in_flight = args.resolve_files_in_flight();
+    let concurrency = match args.resolve_remote_concurrency(files_in_flight) {
+        Ok(concurrency) => concurrency,
+        Err(error) => exit_with_startup_refusal(&format!("{error:#}"), 1),
+    };
     // TOCTOU linter: arms strict operand resolution when the master passed
     // --require-toctou-safe, and fail-closes on this host if the invocation
     // cannot be hardened (e.g. -L, or a pre-openat2 kernel). Operands arrive
     // via the master — which already linted their strict form — so none are
     // passed here. Unlike the tools' `enforce_or_exit` (stdout), a refusal is
-    // printed to STDERR as a single line: the master reads rcpd's first stderr
-    // line for the startup handshake, so this is what surfaces in its error —
+    // printed to STDERR as a typed single-line refusal: the master reads rcpd's
+    // first stderr line for the startup handshake, so this is what surfaces in its error —
     // on stdout the reason would drown in the log drain and the user would only
     // see a generic handshake failure.
     match common::toctou_check::run_linter(args.dereference, false, args.require_toctou_safe, &[]) {
         common::toctou_check::LinterAction::Exit { output, code } => {
-            let one_line = output
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            eprintln!("rcpd: {one_line}");
-            std::process::exit(code);
+            exit_with_startup_refusal(&output, code);
         }
         common::toctou_check::LinterAction::Proceed => {}
     }
@@ -910,7 +918,7 @@ fn main() -> Result<(), anyhow::Error> {
         common::remote_tracing::RemoteTracingLayer::new();
     let func = {
         let args = args.clone();
-        || async_main(args, tracing_receiver, files_in_flight)
+        || async_main(args, tracing_receiver, files_in_flight, concurrency)
     };
     let debug_log_file = args.debug_log_prefix.as_ref().map(|prefix| {
         let filename = common::generate_debug_log_filename(prefix);

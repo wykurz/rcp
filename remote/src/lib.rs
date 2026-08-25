@@ -123,6 +123,10 @@ use anyhow::{Context, anyhow};
 use tracing::instrument;
 
 const REMOTE_RCPD_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const FAILED_RCPD_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Prefix for an intentional daemon refusal in place of a readiness record.
+pub const RCPD_STARTUP_ERROR_PREFIX: &str = "RCP_ERROR ";
 
 pub mod deploy;
 pub mod port_ranges;
@@ -1027,6 +1031,31 @@ pub fn parse_rcpd_readiness(line: &str) -> anyhow::Result<RcpdConnectionInfo> {
     })
 }
 
+#[derive(Debug)]
+struct RcpdStartupRefusal(String);
+
+impl std::fmt::Display for RcpdStartupRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RcpdStartupRefusal {}
+
+fn parse_rcpd_startup_record(line: &str) -> anyhow::Result<RcpdConnectionInfo> {
+    if let Some(diagnostic) = line.strip_prefix(RCPD_STARTUP_ERROR_PREFIX) {
+        let diagnostic = diagnostic.trim();
+        if diagnostic.is_empty() {
+            anyhow::bail!("rcpd refused startup without a diagnostic");
+        }
+        return Err(anyhow::Error::new(RcpdStartupRefusal(
+            diagnostic.to_string(),
+        )))
+        .context("rcpd refused startup");
+    }
+    parse_rcpd_readiness(line)
+}
+
 /// Result of starting an rcpd process.
 pub struct RcpdProcess {
     /// SSH child process handle
@@ -1046,11 +1075,26 @@ pub struct PreparedRcpd {
     remote: SshSession,
 }
 
-#[instrument]
 pub async fn prepare_rcpd(
     session: &SshSession,
     explicit_rcpd_path: Option<&str>,
     auto_deploy_rcpd: bool,
+) -> anyhow::Result<PreparedRcpd> {
+    prepare_rcpd_with_cancellation(
+        session,
+        explicit_rcpd_path,
+        auto_deploy_rcpd,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+#[instrument(skip(cancellation))]
+pub async fn prepare_rcpd_with_cancellation(
+    session: &SshSession,
+    explicit_rcpd_path: Option<&str>,
+    auto_deploy_rcpd: bool,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<PreparedRcpd> {
     tracing::info!("Preparing rcpd server on: {:?}", session);
     let remote_host = &session.host;
@@ -1073,6 +1117,7 @@ pub async fn prepare_rcpd(
                     &local_rcpd,
                     &local_version.cache_tag(),
                     remote_host,
+                    &cancellation,
                 )
                 .await
                 .context("failed to deploy rcpd to remote host")?;
@@ -1120,6 +1165,8 @@ impl PreparedRcpd {
         bind_ip: Option<&str>,
         role: protocol::RcpdRole,
     ) -> anyhow::Result<RcpdProcess> {
+        use tokio::io::AsyncBufReadExt;
+
         tracing::info!("Starting prepared rcpd server on: {:?}", self.remote);
         let session = &self.remote;
         // run rcpd command remotely
@@ -1143,15 +1190,30 @@ impl PreparedRcpd {
         // (rcpd uses stderr for the protocol line because stdout is reserved for logs per convention;
         // rcpd doesn't display progress bars locally - it sends progress data over the network)
         // format: "RCP_TLS <addr> <fingerprint> <F> <E>" or "RCP_TCP <addr> <F> <E>"
-        let stderr = child.stderr().take().context("rcpd stderr not available")?;
-        let mut stderr_reader = tokio::io::BufReader::new(stderr);
-        let mut line = String::new();
-        use tokio::io::AsyncBufReadExt;
-        stderr_reader
-            .read_line(&mut line)
-            .await
-            .context("failed to read connection info from rcpd")?;
-        let line = line.trim();
+        let startup = async {
+            let stderr = child.stderr().take().context("rcpd stderr not available")?;
+            let mut stderr_reader = tokio::io::BufReader::new(stderr);
+            let mut line = String::new();
+            let bytes_read = stderr_reader
+                .read_line(&mut line)
+                .await
+                .context("failed to read connection info from rcpd")?;
+            if bytes_read == 0 {
+                anyhow::bail!("rcpd exited before writing a readiness record");
+            }
+            let line = line.trim().to_string();
+            tracing::debug!("rcpd connection line: {}", line);
+            let conn_info = parse_rcpd_startup_record(&line)?;
+            anyhow::Ok((conn_info, stderr_reader))
+        }
+        .await;
+        let (conn_info, mut stderr_reader) = match startup {
+            Ok(startup) => startup,
+            Err(error) => {
+                reap_failed_rcpd(child, &session.host).await;
+                return Err(error);
+            }
+        };
         // spawn background task to drain remaining stderr to prevent SIGPIPE and capture diagnostics
         // we store the JoinHandle to keep the task alive for the lifetime of RcpdProcess
         let host_stderr = session.host.clone();
@@ -1201,8 +1263,6 @@ impl PreparedRcpd {
         } else {
             None
         };
-        tracing::debug!("rcpd connection line: {}", line);
-        let conn_info = parse_rcpd_readiness(line)?;
         tracing::info!(
             "rcpd listening on {} (encryption={})",
             conn_info.addr,
@@ -1214,6 +1274,28 @@ impl PreparedRcpd {
             _stderr_drain: stderr_drain,
             _stdout_drain: stdout_drain,
         })
+    }
+}
+
+async fn reap_failed_rcpd(child: openssh::Child<std::sync::Arc<openssh::Session>>, host: &str) {
+    let host = host.to_string();
+    let mut reaper = tokio::spawn(async move { child.wait_with_output().await });
+    match tokio::time::timeout(FAILED_RCPD_REAP_GRACE, &mut reaper).await {
+        Ok(Ok(Ok(output))) => tracing::debug!(
+            host,
+            status = ?output.status.code(),
+            "reaped rcpd after failed startup"
+        ),
+        Ok(Ok(Err(error))) => {
+            tracing::debug!(host, "failed to reap rcpd after startup error: {error:#}")
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(host, "rcpd startup reaper task failed: {error:#}")
+        }
+        Err(_) => tracing::debug!(
+            host,
+            "rcpd did not exit within the startup cleanup grace; background reaper retained ownership"
+        ),
     }
 }
 
@@ -1720,6 +1802,50 @@ mod tests {
         std::num::NonZeroUsize::new(value).unwrap()
     }
 
+    fn test_rcpd_config() -> protocol::RcpdConfig {
+        protocol::RcpdConfig {
+            verbose: 0,
+            fail_early: false,
+            max_workers: 0,
+            max_blocking_threads: 0,
+            files_in_flight: protocol::RcpdFilesInFlight::Explicit(
+                common::ConcurrencyLimit::Limited(nonzero(4)),
+            ),
+            ops_throttle: 0,
+            iops_throttle: 0,
+            chunk_size: 0,
+            auto_meta: None,
+            auto_meta_histogram: false,
+            auto_meta_histogram_log: None,
+            auto_meta_histogram_interval: std::time::Duration::from_secs(1),
+            dereference: false,
+            require_toctou_safe: false,
+            overwrite: false,
+            overwrite_compare: "size,mtime".to_string(),
+            overwrite_manifest_max_entries: protocol::DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES,
+            overwrite_filter: None,
+            ignore_existing: false,
+            skip_specials: false,
+            debug_log_prefix: None,
+            port_ranges: None,
+            progress: false,
+            progress_delay: None,
+            remote_copy_conn_timeout_sec: 1,
+            remote_keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
+            network_profile: NetworkProfile::default(),
+            buffer_size: None,
+            max_connections: 4,
+            pending_writes_multiplier: 1,
+            chrome_trace_prefix: None,
+            flamegraph_prefix: None,
+            profile_level: None,
+            tokio_console: false,
+            tokio_console_port: None,
+            encryption: false,
+            master_cert_fingerprint: None,
+        }
+    }
+
     #[test]
     fn rejects_effective_streams_above_tokio_semaphore_capacity() {
         let too_many = tokio::sync::Semaphore::MAX_PERMITS.checked_add(1).unwrap();
@@ -1832,47 +1958,7 @@ mod tests {
         );
         std::fs::write(&script, contents).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let config = protocol::RcpdConfig {
-            verbose: 0,
-            fail_early: false,
-            max_workers: 0,
-            max_blocking_threads: 0,
-            files_in_flight: protocol::RcpdFilesInFlight::Explicit(
-                common::ConcurrencyLimit::Limited(nonzero(4)),
-            ),
-            ops_throttle: 0,
-            iops_throttle: 0,
-            chunk_size: 0,
-            auto_meta: None,
-            auto_meta_histogram: false,
-            auto_meta_histogram_log: None,
-            auto_meta_histogram_interval: std::time::Duration::from_secs(1),
-            dereference: false,
-            require_toctou_safe: false,
-            overwrite: false,
-            overwrite_compare: "size,mtime".to_string(),
-            overwrite_manifest_max_entries: protocol::DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES,
-            overwrite_filter: None,
-            ignore_existing: false,
-            skip_specials: false,
-            debug_log_prefix: None,
-            port_ranges: None,
-            progress: false,
-            progress_delay: None,
-            remote_copy_conn_timeout_sec: 1,
-            remote_keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
-            network_profile: NetworkProfile::default(),
-            buffer_size: None,
-            max_connections: 4,
-            pending_writes_multiplier: 1,
-            chrome_trace_prefix: None,
-            flamegraph_prefix: None,
-            profile_level: None,
-            tokio_console: false,
-            tokio_console_port: None,
-            encryption: false,
-            master_cert_fingerprint: None,
-        };
+        let config = test_rcpd_config();
         let prepared = prepare_rcpd(&SshSession::local(), Some(script.to_str().unwrap()), false)
             .await
             .unwrap();
@@ -1887,6 +1973,70 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "probe\n");
         wait_for_rcpd_process(source.child).await.unwrap();
         wait_for_rcpd_process(destination.child).await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_rcpd_bootstrap_reaps_child_before_returning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "rcp-failed-bootstrap-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let script = directory.join("rcpd");
+        let source_exit = directory.join("source-exit");
+        let destination_exit = directory.join("destination-exit");
+        let version = common::version::ProtocolVersion::current()
+            .to_json()
+            .unwrap();
+        let contents = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\nif [ \"$2\" = source ]; then\n  printf '%s\\n' 'RCP_ERROR pending file capacity test refusal' >&2\n  marker={}\nelse\n  printf '%s\\n' 'not a readiness record' >&2\n  marker={}\nfi\ncat >/dev/null\nprintf 'exited\\n' > \"$marker\"\n",
+            shell_escape(&version),
+            shell_escape(source_exit.to_str().unwrap()),
+            shell_escape(destination_exit.to_str().unwrap()),
+        );
+        std::fs::write(&script, contents).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let prepared = prepare_rcpd(&SshSession::local(), Some(script.to_str().unwrap()), false)
+            .await
+            .unwrap();
+        let config = test_rcpd_config();
+
+        let refusal = match prepared
+            .spawn(&config, None, protocol::RcpdRole::Source)
+            .await
+        {
+            Ok(_) => panic!("startup refusal unexpectedly produced an rcpd process"),
+            Err(error) => error,
+        };
+        assert!(refusal.to_string().contains("rcpd refused startup"));
+        assert!(refusal.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("pending file capacity test refusal")
+        }));
+        assert_eq!(std::fs::read_to_string(&source_exit).unwrap(), "exited\n");
+
+        let malformed = match prepared
+            .spawn(&config, None, protocol::RcpdRole::Destination)
+            .await
+        {
+            Ok(_) => panic!("malformed readiness unexpectedly produced an rcpd process"),
+            Err(error) => error,
+        };
+        assert!(
+            malformed
+                .to_string()
+                .contains("unexpected output from rcpd")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&destination_exit).unwrap(),
+            "exited\n"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 

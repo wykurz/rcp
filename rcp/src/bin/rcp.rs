@@ -458,6 +458,7 @@ struct MasterRemoteConfigs {
 struct MasterRemoteRequest {
     tcp: remote::TcpConfig,
     rcpd: remote::protocol::RcpdConfig,
+    filter: Option<common::filter::FilterSettings>,
     files_in_flight: common::ResolvedFilesInFlight,
     configured_connections: std::num::NonZeroUsize,
     pending_writes_multiplier: std::num::NonZeroUsize,
@@ -470,6 +471,20 @@ fn build_master_remote_request(
     files_in_flight: common::ResolvedFilesInFlight,
     master_cert_fingerprint: Option<remote::protocol::CertFingerprint>,
 ) -> anyhow::Result<MasterRemoteRequest> {
+    let filter = common::filter::FilterSettings::from_args(
+        args.filter_file.as_deref(),
+        &args.include,
+        &args.exclude,
+    )
+    .context("invalid filter configuration")?;
+    // rcpd still receives the version-sensitive CLI spelling, but syntax owned entirely by the
+    // initiating host must fail before remote HOME expansion, SSH, discovery, or deployment.
+    common::parse_metadata_cmp_settings(&args.overwrite_compare)
+        .context("invalid --overwrite-compare configuration")?;
+    if let Some(ranges) = args.port_ranges.as_deref() {
+        remote::port_ranges::PortRanges::parse(ranges)
+            .context("invalid --port-ranges configuration")?;
+    }
     let configured_connections = args.max_connections;
     let resolved_explicit = (!matches!(
         files_in_flight.source(),
@@ -569,6 +584,7 @@ fn build_master_remote_request(
     Ok(MasterRemoteRequest {
         tcp,
         rcpd,
+        filter,
         files_in_flight,
         configured_connections,
         pending_writes_multiplier: args.pending_writes_multiplier,
@@ -681,6 +697,71 @@ fn build_master_remote_configs(
     build_source_remote_config(&request)
 }
 
+/// Prepares distinct endpoints concurrently without dropping either future on the first failure.
+///
+/// The first failing side owns the user-facing error and cooperatively cancels its peer. Awaiting
+/// both futures is load-bearing: a peer in deployment must finish reaping its staging command and
+/// removing its private temp path before this function returns.
+async fn join_remote_preparations<Source, Destination, SourceFuture, DestinationFuture, S, D>(
+    source: Source,
+    destination: Destination,
+) -> anyhow::Result<(S, D)>
+where
+    Source: FnOnce(tokio_util::sync::CancellationToken) -> SourceFuture,
+    Destination: FnOnce(tokio_util::sync::CancellationToken) -> DestinationFuture,
+    SourceFuture: std::future::Future<Output = anyhow::Result<S>>,
+    DestinationFuture: std::future::Future<Output = anyhow::Result<D>>,
+{
+    const SOURCE: u8 = 1;
+    const DESTINATION: u8 = 2;
+
+    async fn prepare<Prepare, PrepareFuture, Prepared>(
+        prepare: Prepare,
+        cancellation: tokio_util::sync::CancellationToken,
+        first_failure: std::sync::Arc<std::sync::atomic::AtomicU8>,
+        endpoint: u8,
+    ) -> anyhow::Result<Prepared>
+    where
+        Prepare: FnOnce(tokio_util::sync::CancellationToken) -> PrepareFuture,
+        PrepareFuture: std::future::Future<Output = anyhow::Result<Prepared>>,
+    {
+        let result = prepare(cancellation.clone()).await;
+        if result.is_err()
+            && first_failure
+                .compare_exchange(
+                    0,
+                    endpoint,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+        {
+            cancellation.cancel();
+        }
+        result
+    }
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let first_failure = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let source_preparation = prepare(source, cancellation.clone(), first_failure.clone(), SOURCE);
+    let destination_preparation = prepare(
+        destination,
+        cancellation,
+        first_failure.clone(),
+        DESTINATION,
+    );
+    let (source, destination) = tokio::join!(source_preparation, destination_preparation);
+    match (
+        first_failure.load(std::sync::atomic::Ordering::SeqCst),
+        source,
+        destination,
+    ) {
+        (SOURCE, Err(error), _) | (DESTINATION, _, Err(error)) => Err(error),
+        (_, Ok(source), Ok(destination)) => Ok((source, destination)),
+        (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+    }
+}
+
 #[instrument(skip(master_cert))]
 async fn run_rcpd_master(
     args: &Args,
@@ -710,18 +791,25 @@ async fn run_rcpd_master(
         .await?;
         (prepared.clone(), prepared)
     } else {
-        tokio::try_join!(
-            remote::prepare_rcpd(
-                src.session(),
-                args.rcpd_path.as_deref(),
-                args.auto_deploy_rcpd,
-            ),
-            remote::prepare_rcpd(
-                dst.session(),
-                args.rcpd_path.as_deref(),
-                args.auto_deploy_rcpd,
-            ),
-        )?
+        join_remote_preparations(
+            |cancellation| {
+                remote::prepare_rcpd_with_cancellation(
+                    src.session(),
+                    args.rcpd_path.as_deref(),
+                    args.auto_deploy_rcpd,
+                    cancellation,
+                )
+            },
+            |cancellation| {
+                remote::prepare_rcpd_with_cancellation(
+                    dst.session(),
+                    args.rcpd_path.as_deref(),
+                    args.auto_deploy_rcpd,
+                    cancellation,
+                )
+            },
+        )
+        .await?
     };
 
     let source_rcpd = {
@@ -883,12 +971,7 @@ async fn run_rcpd_master(
             tracing::debug!("Destination tracing receiver ended: {e:#}");
         }
     });
-    // build filter settings from CLI arguments for source-side filtering
-    let filter = common::filter::FilterSettings::from_args(
-        args.filter_file.as_deref(),
-        &args.include,
-        &args.exclude,
-    )?;
+    let filter = request.filter;
     // send MasterHello to source rcpd (include dest fingerprint for mutual TLS)
     {
         let _span = tracing::trace_span!("send_master_hello_to_source").entered();
@@ -1728,6 +1811,56 @@ mod tests {
     }
 
     #[test]
+    fn master_rejects_invalid_filter_before_remote_side_effects() {
+        let args = master_args(&["--include=["]);
+        let error =
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
+                .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("invalid glob pattern"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn master_rejects_unreadable_filter_file_before_remote_side_effects() {
+        let filter_directory = tempfile::tempdir().unwrap();
+        let filter_arg = format!("--filter-file={}", filter_directory.path().display());
+        let args = master_args(&[&filter_arg]);
+        let error =
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
+                .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("filter file"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn master_rejects_invalid_overwrite_compare_before_remote_side_effects() {
+        let args = master_args(&["--overwrite-compare=size,unknown"]);
+        let error =
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
+                .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Unknown metadata comparison setting"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn master_rejects_invalid_port_ranges_before_remote_side_effects() {
+        let args = master_args(&["--port-ranges=9000-8000"]);
+        let error =
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
+                .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("start port 9000 > end port 8000"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn master_propagates_one_effective_connection_count_to_both_daemons() {
         let args = master_args(&["--max-connections=12"]);
         let files_in_flight =
@@ -1775,6 +1908,42 @@ mod tests {
                 std::num::NonZeroUsize::new(200).unwrap(),
                 std::num::NonZeroUsize::new(100).unwrap()
             ))
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_preparation_waits_for_cancelled_peer_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let temp_marker = directory.path().join("remote-deployment-temp");
+        let cleanup_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_observed = cleanup_finished.clone();
+        let destination_marker = temp_marker.clone();
+        let (stage_started, stage_is_started) = tokio::sync::oneshot::channel();
+
+        let error = join_remote_preparations(
+            move |_cancellation| async move {
+                stage_is_started.await.unwrap();
+                Err::<(), _>(anyhow::anyhow!("source preparation failed"))
+            },
+            move |cancellation| async move {
+                tokio::fs::write(&destination_marker, b"partial deployment")
+                    .await
+                    .unwrap();
+                stage_started.send(()).unwrap();
+                cancellation.cancelled().await;
+                tokio::fs::remove_file(&destination_marker).await.unwrap();
+                cleanup_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err::<(), _>(anyhow::anyhow!("destination preparation cancelled"))
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "source preparation failed");
+        assert!(cleanup_observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !temp_marker.exists(),
+            "paired preparation returned before peer temp cleanup"
         );
     }
 }
