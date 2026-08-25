@@ -43,8 +43,9 @@ pub struct ProtocolVersion {
 /// tell two 0.38.0-dev builds apart, so a stale same-version `rcpd` (on `PATH` or in the deploy
 /// cache) would otherwise pass compatibility and then fail — or misbehave — mid-copy. Revision 1
 /// covers the 0.38.0-dev `WireAcls` reshape; revision 2 the 0.39.0-dev `ExtendedMetadataCapture`
-/// gaining `root_acl_notice`; revision 3 covers the max-files-in-flight rcpd spawn contract.
-pub const WIRE_REVISION: u32 = 3;
+/// gaining `root_acl_notice`; revision 3 covers the first max-files-in-flight rcpd spawn contract;
+/// revision 4 covers source-owned concurrency, its internal overrides, and readiness fields.
+pub const WIRE_REVISION: u32 = 4;
 
 impl ProtocolVersion {
     /// Get the current protocol version
@@ -258,8 +259,8 @@ mod tests {
     }
 
     #[test]
-    fn revision_three_covers_files_in_flight_spawn_contract() {
-        assert_eq!(WIRE_REVISION, 3);
+    fn revision_four_covers_source_owned_remote_concurrency() {
+        assert_eq!(WIRE_REVISION, 4);
     }
 
     #[test]

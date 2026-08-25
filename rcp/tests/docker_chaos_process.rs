@@ -25,7 +25,6 @@ struct TestCleanupGuard<'a> {
     network_containers: Vec<&'a str>,
     files_to_remove: Vec<(&'a str, String)>,
     containers_to_kill_rcpd: Vec<&'a str>,
-    containers_to_resume_rcpd: Vec<&'a str>,
 }
 
 impl<'a> TestCleanupGuard<'a> {
@@ -35,7 +34,6 @@ impl<'a> TestCleanupGuard<'a> {
             network_containers: Vec::new(),
             files_to_remove: Vec::new(),
             containers_to_kill_rcpd: Vec::new(),
-            containers_to_resume_rcpd: Vec::new(),
         }
     }
     fn clear_network_on(mut self, containers: Vec<&'a str>) -> Self {
@@ -50,18 +48,10 @@ impl<'a> TestCleanupGuard<'a> {
         self.containers_to_kill_rcpd = containers;
         self
     }
-    fn resume_rcpd_on(mut self, containers: Vec<&'a str>) -> Self {
-        self.containers_to_resume_rcpd = containers;
-        self
-    }
 }
 
 impl Drop for TestCleanupGuard<'_> {
     fn drop(&mut self) {
-        // resume any paused rcpd first (before killing)
-        for container in &self.containers_to_resume_rcpd {
-            let _ = self.env.resume_rcpd(container);
-        }
         // kill any remaining rcpd processes
         for container in &self.containers_to_kill_rcpd {
             let _ = self.env.kill_rcpd(container);
@@ -251,79 +241,55 @@ fn test_chaos_kill_rcpd_mid_transfer() -> Result<()> {
     Ok(())
 }
 
-/// Test that pausing rcpd (simulating hang) eventually causes timeout.
+/// Test that transport liveness detects a source host blackholed after startup.
 ///
-/// This test verifies that rcp doesn't hang forever when rcpd stops responding.
-/// Note: This test may take a while due to timeout behavior.
+/// A stopped userspace process is not a vanished host: its kernel continues acknowledging TCP
+/// traffic. Apply packet loss after both daemons exist so the established control connection
+/// receives no acknowledgements, then require the explicit liveness budget to end the copy.
 #[test]
 #[ignore = "requires Docker containers (run: just docker-up)"]
-fn test_chaos_pause_rcpd_causes_timeout() -> Result<()> {
+fn test_chaos_post_start_source_blackhole_causes_timeout() -> Result<()> {
     let env = DockerEnv::new()?;
     // create a larger file (2MB) so transfer takes time
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
-    let src_path = format!("/tmp/chaos-pause-{}.bin", timestamp);
-    let dst_path = format!("/tmp/chaos-pause-{}-dst.bin", timestamp);
+    let src_path = format!("/tmp/chaos-blackhole-{}.bin", timestamp);
+    let dst_path = format!("/tmp/chaos-blackhole-{}-dst.bin", timestamp);
     // set up cleanup guard before any operations that might fail
-    // note: resume before kill, since kill on stopped process may leave zombies
     let _guard = TestCleanupGuard::new(&env)
-        .resume_rcpd_on(vec!["host-a", "host-b"])
         .kill_rcpd_on(vec!["host-a", "host-b"])
-        .clear_network_on(vec!["host-a", "host-b"])
+        .clear_network_on(vec!["host-a"])
         .remove_file("host-a", src_path.clone())
         .remove_file("host-b", dst_path.clone());
     env.create_file_with_size("host-a", &src_path, 2048)?;
-    // add latency to ensure transfer takes time
-    env.add_latency("host-a", 100, None)?;
-    env.add_latency("host-b", 100, None)?;
-    // spawn rcp in background
-    let mut child = env.spawn_rcp(&[
+    // keep the copy active until both source-first daemons are observable
+    env.add_bandwidth_limit("host-a", 1000)?;
+    let (mut child, stdout_file, stderr_file) = env.spawn_rcp_capturing(&[
+        "--remote-keepalive-sec=5",
         &format!("host-a:{}", src_path),
         &format!("host-b:{}", dst_path),
     ])?;
-    // wait for rcpd to start on both hosts (ensures transfer is in progress)
+    // wait for both daemons before blackholing the already-established source side
     let rcpd_a_started = wait_for_rcpd(&env, "host-a", Duration::from_secs(10))?;
     let rcpd_b_started = wait_for_rcpd(&env, "host-b", Duration::from_secs(10))?;
     assert!(rcpd_a_started, "rcpd should start on host-a");
     assert!(rcpd_b_started, "rcpd should start on host-b");
-    // verify transfer is still in progress (child hasn't exited yet)
     assert!(
         child.try_wait()?.is_none(),
         "transfer should still be in progress"
     );
-    // pause rcpd (SIGSTOP) - simulates hung process
-    env.pause_rcpd("host-a")?;
-    eprintln!("paused rcpd on host-a (SIGSTOP)");
-    let start = Instant::now();
-    // wait for rcp to complete (should timeout eventually)
-    // use a reasonable timeout for the test itself
-    let test_timeout = Duration::from_secs(60);
-    loop {
-        match child.try_wait()? {
-            Some(status) => {
-                let elapsed = start.elapsed();
-                eprintln!("rcp exited after {:?} with status: {:?}", elapsed, status);
-                // rcp should have failed due to timeout
-                assert!(!status.success(), "rcp should fail when rcpd is paused");
-                break;
-            }
-            None => {
-                if start.elapsed() > test_timeout {
-                    // guard handles cleanup (resume rcpd, kill rcpd, clear network, remove files)
-                    child.kill()?;
-                    let _ = child.wait(); // reap zombie
-                    panic!(
-                        "rcp did not timeout after {:?} - it may be hanging",
-                        test_timeout
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        }
-    }
+    env.add_packet_loss("host-a", 100.0)?;
+    eprintln!("blackholed host-a after both rcpd processes started");
+    let status = wait_with_timeout(child, Duration::from_secs(30))?;
+    assert_clean_failure(
+        status,
+        stdout_file.path(),
+        stderr_file.path(),
+        "rcp with a post-start source blackhole",
+    );
     // cleanup handled by _guard
-    eprintln!("✓ Pause rcpd timeout test passed");
+    eprintln!("✓ Post-start source blackhole timeout test passed");
     Ok(())
 }
 

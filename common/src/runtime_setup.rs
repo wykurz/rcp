@@ -348,11 +348,15 @@ pub(crate) fn install_tracing_subscriber(
     // apply env_filter to remote_tracing_layer so it respects verbose level
     let remote_tracing_layer =
         remote_tracing_layer.map(|layer| layer.with_filter(build_verbose_env_filter(verbose)));
+    let mut startup_notices = Vec::new();
+    let mut startup_errors = Vec::new();
     let console_layer = tokio_console.then(|| {
         let console_port = tokio_console_port.unwrap_or(6669);
         let retention_seconds: u64 =
             read_env_or_default("RCP_TOKIO_TRACING_CONSOLE_RETENTION_SECONDS", 60);
-        eprintln!("Tokio console server listening on 127.0.0.1:{console_port}");
+        startup_notices.push(format!(
+            "Tokio console server listening on 127.0.0.1:{console_port}"
+        ));
         console_subscriber::ConsoleLayer::builder()
             .retention(std::time::Duration::from_secs(retention_seconds))
             .server_addr(([127, 0, 0, 1], console_port))
@@ -367,7 +371,7 @@ pub(crate) fn install_tracing_subscriber(
     let mut chrome_guard = None;
     let chrome_layer = chrome_trace_prefix.as_ref().map(|prefix| {
         let filename = generate_trace_filename(prefix, &trace_identifier, "json");
-        eprintln!("Chrome trace will be written to: {filename}");
+        startup_notices.push(format!("Chrome trace will be written to: {filename}"));
         let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
             .file(&filename)
             .include_args(true)
@@ -378,14 +382,14 @@ pub(crate) fn install_tracing_subscriber(
     let mut flame_guard = None;
     let flame_layer = flamegraph_prefix.as_ref().and_then(|prefix| {
         let filename = generate_trace_filename(prefix, &trace_identifier, "folded");
-        eprintln!("Flamegraph data will be written to: {filename}");
         match tracing_flame::FlameLayer::with_file(&filename) {
             Ok((layer, guard)) => {
+                startup_notices.push(format!("Flamegraph data will be written to: {filename}"));
                 flame_guard = Some(guard);
                 Some(layer.with_filter(make_profile_filter()))
             }
             Err(e) => {
-                eprintln!("Failed to create flamegraph layer: {e:?}");
+                startup_errors.push(format!("Failed to create flamegraph layer: {e:?}"));
                 None
             }
         }
@@ -398,6 +402,13 @@ pub(crate) fn install_tracing_subscriber(
         .with(chrome_layer)
         .with(flame_layer)
         .init();
+    for notice in startup_notices {
+        tracing::warn!(target: NOTICE_TARGET, "{notice}");
+    }
+    for startup_error in startup_errors {
+        // rcp-error-log-allow: startup_error is an already-rendered String, not an error chain
+        tracing::error!("{startup_error}");
+    }
     TracingGuards {
         chrome: chrome_guard,
         flame: flame_guard,
@@ -444,6 +455,26 @@ fn resolve_leaf_capacity(
     files_in_flight.meet(descriptor_limit)
 }
 
+fn descriptor_clamp_notice(
+    files_in_flight: crate::ResolvedFilesInFlight,
+    effective: ConcurrencyLimit,
+) -> Option<(std::num::NonZeroUsize, std::num::NonZeroUsize)> {
+    if !matches!(
+        files_in_flight.source(),
+        crate::FilesInFlightSource::Explicit | crate::FilesInFlightSource::DeprecatedMaxOpenFiles
+    ) {
+        return None;
+    }
+    match (files_in_flight.limit(), effective) {
+        (ConcurrencyLimit::Limited(requested), ConcurrencyLimit::Limited(effective))
+            if effective < requested =>
+        {
+            Some((requested, effective))
+        }
+        _ => None,
+    }
+}
+
 /// Build a multi-threaded tokio runtime configured per `runtime`, and apply the
 /// file-like work and descriptor-safe admission limits from `throttle`.
 pub(crate) fn build_tokio_runtime(
@@ -462,8 +493,13 @@ pub(crate) fn build_tokio_runtime(
         "We failed to query rlimit; --max-files-in-flight controls performance but cannot bypass descriptor safety",
     );
     let descriptor_limit = descriptor_admission_limit(soft_limit);
-    let open_file = resolve_leaf_capacity(throttle.files_in_flight.limit(), descriptor_limit);
-    let pending_meta = resolve_leaf_capacity(throttle.files_in_flight.limit(), descriptor_limit);
+    let file_limit = if throttle.apply_files_in_flight {
+        throttle.files_in_flight.limit()
+    } else {
+        ConcurrencyLimit::Unlimited
+    };
+    let open_file = resolve_leaf_capacity(file_limit, descriptor_limit);
+    let pending_meta = resolve_leaf_capacity(file_limit, descriptor_limit);
     tracing::info!(
         "Resolved file admission: file_ceiling={:?}, source={:?}, descriptor_ceiling={:?}, open_file={:?}, pending_meta={:?}",
         throttle.files_in_flight.limit(),
@@ -472,6 +508,22 @@ pub(crate) fn build_tokio_runtime(
         open_file,
         pending_meta,
     );
+    if throttle.apply_files_in_flight {
+        if let Some((requested, effective)) =
+            descriptor_clamp_notice(throttle.files_in_flight, open_file)
+        {
+            tracing::warn!(
+                target: NOTICE_TARGET,
+                "Requested --max-files-in-flight={requested}, but descriptor safety reduced endpoint file admission to {effective}"
+            );
+        } else if open_file != throttle.files_in_flight.limit() {
+            tracing::info!(
+                "Automatic file admission was reduced by descriptor safety: requested={:?}, effective={:?}",
+                throttle.files_in_flight.limit(),
+                open_file,
+            );
+        }
+    }
     throttle::set_admission_limits(
         open_file.semaphore_capacity(),
         pending_meta.semaphore_capacity(),
@@ -552,6 +604,24 @@ mod default_leaf_operation_limit_tests {
         assert_eq!(
             resolve_leaf_capacity(limited(8), ConcurrencyLimit::Unlimited),
             limited(8)
+        );
+    }
+
+    #[test]
+    fn descriptor_clamp_notices_only_explicit_finite_reductions() {
+        let eight = std::num::NonZeroUsize::new(8).unwrap();
+        let four = std::num::NonZeroUsize::new(4).unwrap();
+        let effective = ConcurrencyLimit::Limited(four);
+        assert_eq!(
+            descriptor_clamp_notice(crate::ResolvedFilesInFlight::explicit(eight), effective),
+            Some((eight, four))
+        );
+        assert_eq!(
+            descriptor_clamp_notice(
+                crate::ResolvedFilesInFlight::automatic_with(eight),
+                effective
+            ),
+            None
         );
     }
 

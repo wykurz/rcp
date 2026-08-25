@@ -26,6 +26,7 @@ fn auto_meta_histogram_log_records_real_probes() {
     };
     let throttle = common::ThrottleConfig {
         files_in_flight: common::ResolvedFilesInFlight::automatic(),
+        apply_files_in_flight: true,
         ops_throttle: 0,
         iops_throttle: 0,
         chunk_size: 0,

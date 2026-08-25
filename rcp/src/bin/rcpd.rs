@@ -5,14 +5,6 @@ use tracing::instrument;
 
 use rcp_tools_rcp::{destination, source};
 
-fn parse_nonzero_usize(s: &str) -> Result<usize, String> {
-    let val: usize = s.parse().map_err(|e| format!("{e}"))?;
-    if val == 0 {
-        return Err("value must be at least 1".to_string());
-    }
-    Ok(val)
-}
-
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "rcpd",
@@ -110,8 +102,28 @@ struct Args {
     #[command(flatten)]
     common: common::cli::CommonArgs,
 
-    #[arg(long, hide = true)]
-    files_in_flight_propagated: bool,
+    #[arg(
+        long,
+        hide = true,
+        value_parser = common::cli::parse_positive_usize,
+        conflicts_with_all = [
+            "max_files_in_flight",
+            "max_open_files",
+            "explicit_unlimited_files_in_flight"
+        ]
+    )]
+    resolved_automatic_files_in_flight: Option<std::num::NonZeroUsize>,
+
+    #[arg(
+        long,
+        hide = true,
+        conflicts_with_all = [
+            "max_files_in_flight",
+            "max_open_files",
+            "resolved_automatic_files_in_flight"
+        ]
+    )]
+    explicit_unlimited_files_in_flight: bool,
 
     // Remote copy options
     /// IP address to bind TCP server to (set by master, internal use only)
@@ -191,10 +203,10 @@ struct Args {
         long,
         default_value = "100",
         value_name = "N",
-        value_parser = parse_nonzero_usize,
+        value_parser = common::cli::parse_positive_usize,
         help_heading = "Remote copy options"
     )]
-    max_connections: usize,
+    max_connections: std::num::NonZeroUsize,
 
     /// Multiplier for pending file writes (default: 4)
     ///
@@ -203,10 +215,10 @@ struct Args {
         long,
         default_value = "4",
         value_name = "N",
-        value_parser = parse_nonzero_usize,
+        value_parser = common::cli::parse_positive_usize,
         help_heading = "Remote copy options"
     )]
-    pending_writes_multiplier: usize,
+    pending_writes_multiplier: std::num::NonZeroUsize,
 
     /// Enable file-based debug logging
     ///
@@ -255,34 +267,36 @@ struct Args {
 
 impl Args {
     fn resolve_files_in_flight(&self) -> common::ResolvedFilesInFlight {
-        let files_in_flight = self.common.resolve_files_in_flight();
-        if self.files_in_flight_propagated {
-            files_in_flight.propagated()
+        if let Some(value) = self.resolved_automatic_files_in_flight {
+            common::ResolvedFilesInFlight::automatic_with(value)
+        } else if self.explicit_unlimited_files_in_flight {
+            common::ResolvedFilesInFlight::unlimited()
         } else {
-            files_in_flight
+            self.common.resolve_files_in_flight()
         }
+    }
+    fn resolve_remote_concurrency(
+        &self,
+        files_in_flight: common::ResolvedFilesInFlight,
+    ) -> anyhow::Result<remote::ResolvedRemoteConcurrency> {
+        remote::resolve_remote_concurrency(
+            files_in_flight.limit(),
+            self.max_connections,
+            self.pending_writes_multiplier,
+        )
     }
     /// Build the remote TCP config from CLI args. Shared by the listener setup in `async_main`
     /// and the source/destination operations in `run_operation`.
-    fn to_tcp_config(
-        &self,
-        files_in_flight: common::ResolvedFilesInFlight,
-    ) -> anyhow::Result<remote::TcpConfig> {
-        let configured_connections = std::num::NonZeroUsize::new(self.max_connections)
-            .expect("clap rejects zero --max-connections");
-        let effective_connections =
-            remote::effective_max_connections(files_in_flight.limit(), configured_connections);
-        let config = remote::TcpConfig {
+    fn to_tcp_config(&self, concurrency: remote::ResolvedRemoteConcurrency) -> remote::TcpConfig {
+        remote::TcpConfig {
             port_ranges: self.port_ranges.clone(),
             conn_timeout_sec: self.remote_copy_conn_timeout_sec,
             network_profile: self.network_profile,
             buffer_size: self.buffer_size,
-            max_connections: effective_connections.get(),
-            pending_writes_multiplier: self.pending_writes_multiplier,
+            max_connections: concurrency.max_connections().get(),
+            pending_writes_multiplier: self.pending_writes_multiplier.get(),
             keepalive_sec: self.remote_keepalive_sec,
-        };
-        config.max_pending_files()?;
-        Ok(config)
+        }
     }
     /// Build the copy settings shared by the source and destination arms. `filter`/`dry_run` come
     /// from the `MasterHello`; the destination passes `None` for both (filtering happens at source).
@@ -385,6 +399,7 @@ fn rcpd_result_from(
 async fn run_operation<W, R>(
     args: Args,
     tcp_config: &remote::TcpConfig,
+    concurrency: remote::ResolvedRemoteConcurrency,
     master_send_stream: remote::streams::SendStream<W>,
     mut master_recv_stream: remote::streams::RecvStream<R>,
     cert_key: Option<remote::tls::CertifiedKey>,
@@ -472,6 +487,7 @@ where
                         &settings,
                         capture,
                         tcp_config,
+                        concurrency,
                         args.bind_ip.as_deref(),
                         cert_key.as_ref(),
                         dest_cert_fingerprint,
@@ -539,6 +555,7 @@ where
                         args.overwrite_manifest_max_entries,
                         &preserve,
                         tcp_config,
+                        concurrency,
                         cert_key.as_ref(),
                         source_cert_fingerprint,
                     )
@@ -588,7 +605,8 @@ async fn async_main(
             .ok(); // ignore if already installed
     }
     // build TCP config for listener creation
-    let tcp_config = args.to_tcp_config(files_in_flight)?;
+    let concurrency = args.resolve_remote_concurrency(files_in_flight)?;
+    let tcp_config = args.to_tcp_config(concurrency);
     tracing::info!(
         "Effective remote connection count: {}",
         tcp_config.max_connections
@@ -623,13 +641,15 @@ async fn async_main(
     // output connection info to stderr (read by master via SSH)
     // we use stderr because stdout is reserved for logs per project convention
     // (rcpd doesn't display progress bars locally - it sends progress data over the network)
-    // format: "RCP_TLS <addr> <fingerprint>" or "RCP_TCP <addr>"
-    if let Some(ref cert) = cert_key {
-        let fingerprint_hex = remote::tls::fingerprint_to_hex(&cert.fingerprint);
-        eprintln!("RCP_TLS {} {}", listen_addr, fingerprint_hex);
-    } else {
-        eprintln!("RCP_TCP {}", listen_addr);
-    }
+    // format: "RCP_TLS <addr> <fingerprint> <F> <E>" or "RCP_TCP <addr> <F> <E>"
+    eprintln!(
+        "{}",
+        remote::format_rcpd_readiness(
+            listen_addr,
+            cert_key.as_ref().map(|cert| &cert.fingerprint),
+            concurrency,
+        )
+    );
     // flush stderr to ensure master receives the line immediately
     use std::io::Write;
     std::io::stderr()
@@ -744,6 +764,7 @@ async fn async_main(
         let operation = run_operation(
             args.clone(),
             &tcp_config,
+            concurrency,
             master_send_stream,
             master_recv_stream,
             cert_key.clone(),
@@ -797,6 +818,7 @@ async fn async_main(
         match run_operation(
             args.clone(),
             &tcp_config,
+            concurrency,
             master_send_stream,
             master_recv_stream,
             cert_key.clone(),
@@ -953,32 +975,33 @@ mod tests {
             common::FilesInFlightSource::Automatic
         );
         let expected = match files_in_flight.limit() {
-            common::ConcurrencyLimit::Limited(value) => value.get().min(args.max_connections),
+            common::ConcurrencyLimit::Limited(value) => value.get().min(args.max_connections.get()),
             common::ConcurrencyLimit::Unlimited => panic!("automatic policy must be finite"),
         };
-        assert_eq!(
-            args.to_tcp_config(files_in_flight).unwrap().max_connections,
-            expected
-        );
+        let concurrency = args.resolve_remote_concurrency(files_in_flight).unwrap();
+        assert_eq!(args.to_tcp_config(concurrency).max_connections, expected);
     }
 
     #[test]
-    fn propagated_marker_changes_only_file_limit_provenance() {
+    fn resolved_automatic_override_changes_only_file_limit_provenance() {
         let direct = daemon_args(&["--max-files-in-flight=7"]);
-        let propagated = daemon_args(&["--max-files-in-flight=7", "--files-in-flight-propagated"]);
+        let resolved_automatic = daemon_args(&["--resolved-automatic-files-in-flight=7"]);
         let direct_limit = direct.resolve_files_in_flight();
-        let propagated_limit = propagated.resolve_files_in_flight();
-        assert_eq!(direct_limit.limit(), propagated_limit.limit());
+        let automatic_limit = resolved_automatic.resolve_files_in_flight();
+        assert_eq!(direct_limit.limit(), automatic_limit.limit());
         assert_eq!(direct_limit.source(), common::FilesInFlightSource::Explicit);
         assert_eq!(
-            propagated_limit.source(),
-            common::FilesInFlightSource::Propagated
+            automatic_limit.source(),
+            common::FilesInFlightSource::Automatic
         );
+        let direct_concurrency = direct.resolve_remote_concurrency(direct_limit).unwrap();
+        let automatic_concurrency = resolved_automatic
+            .resolve_remote_concurrency(automatic_limit)
+            .unwrap();
         assert_eq!(
-            direct.to_tcp_config(direct_limit).unwrap().max_connections,
-            propagated
-                .to_tcp_config(propagated_limit)
-                .unwrap()
+            direct.to_tcp_config(direct_concurrency).max_connections,
+            resolved_automatic
+                .to_tcp_config(automatic_concurrency)
                 .max_connections
         );
     }

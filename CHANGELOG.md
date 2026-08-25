@@ -16,11 +16,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its internal soft-`RLIMIT_NOFILE` descriptor safety ceiling independently to OpenFile and
   PendingMeta, which have the same effective numerical limit but are not a combined pool.
 
-- Remote copies now clamp pooled data streams to the lower of `--max-files-in-flight` and
-  `--max-connections`, validate pending-file capacity after that clamp, and apply descriptor safety
-  locally at each endpoint. For one compatibility release, hidden `--max-open-files` remains
-  accepted with a warning and conflicts with the new name: positive values map to the new ceiling,
-  and legacy `0` removes only the user ceiling while retaining descriptor safety.
+- Remote automatic file concurrency is now source-owned: the source `rcpd` resolves its local CPU
+  default and reports the logical file ceiling `F` plus effective stream count
+  `E = min(F, --max-connections)` in its readiness record; the destination is then started with
+  those exact values. Explicit `--max-files-in-flight=N` and legacy unlimited input remain
+  master-authoritative. Effective-stream and pending-task capacities above Tokio's semaphore maximum
+  are rejected without panic. Explicit capacity is validated before remote `~` expansion; automatic
+  capacity is necessarily validated by the source before readiness and before the destination is
+  spawned. Each endpoint still applies descriptor safety locally.
+
+- Remote startup now prepares same-host source/destination daemons once, starts and connects the
+  source before constructing the destination, and reserves the first successful daemon stderr line
+  for the extended `RCP_TCP`/`RCP_TLS` readiness record. Profiling, Tokio-console, compatibility,
+  and explicit clamp announcements flow through the default-visible `rcp::notice` tracing target;
+  explicit stream or descriptor clamps warn, while automatic clamps remain verbose-only. Local and
+  remote `rcpd --protocol-version` probes are bounded at two seconds; local timeout cleanup also has
+  a one-second reap grace before an owned background reaper takes over.
 
 - Local recursive copy, remove, chmod, and rlink walks now bound descriptor-heavy leaf work on wide
   or slow trees, preventing `EMFILE` (Too many open files) failures from unbounded leaf fan-out. On
@@ -67,13 +78,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   since its CLI default is `all` rather than the shipped default; `rlink --preserve-settings=none`
   goes quiet like everything else that asked for nothing.
 
-- `WIRE_REVISION` is now 3. Revision 2 remains the historical wire-schema change: carrying the
+- `WIRE_REVISION` is now 4. Revision 2 remains the historical wire-schema change: carrying the
   arming flag to a remote source added a field to `MasterHello::Source`'s `capture`, which reshaped
-  the hello. Revision 3 instead protects the version-sensitive rcpd spawn CLI contract for
-  `--max-files-in-flight`; it does not change any serialized-message schema. Without the revision
-  bumps, a stale same-version `rcpd` (on `PATH` or in the deploy cache) could pass compatibility and
-  then misdecode the hello or receive unsupported spawn arguments. Builds now advertise `0.39.0+w3`,
-  and a cached `rcpd-0.39.0-w2` is no longer resolved.
+  the hello. Revision 3 protected the first version-sensitive rcpd file-limit spawn contract;
+  revision 4 protects source-owned negotiation, typed internal override arguments, and readiness
+  records that now carry `F` and `E`. Neither revision 3 nor 4 changes serialized message schemas.
+  Without the revision bumps, a stale same-version `rcpd` (on `PATH` or in the deploy cache) could
+  pass compatibility and then misdecode the hello, receive unsupported spawn arguments, or emit an
+  obsolete readiness record. Builds now advertise `0.39.0+w4`, and a cached `rcpd-0.39.0-w3` is no
+  longer resolved.
 
 ## [0.38.0] - 2026-08-05
 

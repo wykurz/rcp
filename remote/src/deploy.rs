@@ -100,6 +100,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const LOCAL_RCPD_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
+const LOCAL_RCPD_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 
 const TRANSFER_HINTS: &str = "\
     This may indicate:\n\
@@ -345,13 +346,32 @@ async fn run_local_version_probe(path: &Path, probe_timeout: Duration) -> anyhow
             // candidate's pipes from extending the probe lifetime after the candidate has exited.
             drop(stdout);
             drop(stderr);
-            child.kill().await.with_context(|| {
-                format!(
-                    "local rcpd candidate {} timed out after {} and could not be terminated and reaped",
+            if let Err(error) = child.start_kill() {
+                tracing::debug!(
+                    "failed to request termination of timed-out local rcpd candidate {}: {error:#}",
+                    path.display()
+                );
+            }
+            let candidate = path.to_path_buf();
+            let reaped = cleanup_with_deadline(
+                async move {
+                    if let Err(error) = child.wait().await {
+                        tracing::debug!(
+                            "failed to reap timed-out local rcpd candidate {}: {error:#}",
+                            candidate.display()
+                        );
+                    }
+                },
+                LOCAL_RCPD_CLEANUP_GRACE,
+            )
+            .await;
+            if !reaped {
+                tracing::debug!(
+                    "local rcpd candidate {} did not reap within {}; background reaper retained ownership",
                     path.display(),
-                    humantime::format_duration(probe_timeout)
-                )
-            })?;
+                    humantime::format_duration(LOCAL_RCPD_CLEANUP_GRACE)
+                );
+            }
             Err(elapsed).with_context(|| {
                 format!(
                     "local rcpd candidate {} did not complete --protocol-version within {}",
@@ -361,6 +381,15 @@ async fn run_local_version_probe(path: &Path, probe_timeout: Duration) -> anyhow
             })
         }
     }
+}
+
+async fn cleanup_with_deadline<F>(cleanup: F, grace: Duration) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::time::timeout(grace, tokio::spawn(cleanup))
+        .await
+        .is_ok()
 }
 
 /// Deploy rcpd binary to remote host
@@ -936,6 +965,15 @@ mod tests {
             rejections[0].chain().count() >= 2,
             "timeout rejection must preserve the elapsed source error"
         );
+    }
+
+    #[tokio::test]
+    async fn version_probe_pending_cleanup_returns_after_its_grace_period() {
+        let started = std::time::Instant::now();
+        let completed =
+            cleanup_with_deadline(std::future::pending::<()>(), Duration::from_millis(20)).await;
+        assert!(!completed);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     // the temp name is what keeps two concurrent deployments off each other's file. It has to be

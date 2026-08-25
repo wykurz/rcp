@@ -284,6 +284,7 @@ impl CommonArgs {
         });
         crate::ThrottleConfig {
             files_in_flight,
+            apply_files_in_flight: true,
             ops_throttle: self.ops_throttle,
             iops_throttle: self.iops_throttle,
             chunk_size,
@@ -330,7 +331,7 @@ impl CommonArgs {
     }
 }
 
-fn parse_positive_usize(value: &str) -> Result<std::num::NonZeroUsize, String> {
+pub fn parse_positive_usize(value: &str) -> Result<std::num::NonZeroUsize, String> {
     let value = value.parse::<usize>().map_err(|error| error.to_string())?;
     std::num::NonZeroUsize::new(value).ok_or_else(|| "value must be at least 1".to_string())
 }

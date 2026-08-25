@@ -178,22 +178,6 @@ impl std::fmt::Display for RcpdType {
 // Type alias for progress snapshots
 pub type ProgressSnapshot<T> = enum_map::EnumMap<RcpdType, T>;
 
-#[derive(Debug, Eq, PartialEq)]
-enum CompatibilityWarningDestination {
-    Stderr,
-    Stdout,
-}
-
-fn compatibility_warning_destination(
-    tracing_config: &TracingConfig,
-) -> CompatibilityWarningDestination {
-    if tracing_config.remote_layer.is_some() {
-        CompatibilityWarningDestination::Stdout
-    } else {
-        CompatibilityWarningDestination::Stderr
-    }
-}
-
 /// runtime statistics collected from a process (CPU time, memory usage)
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub struct RuntimeStats {
@@ -644,12 +628,6 @@ where
     // tracing guards must outlive the runtime so chrome/flame traces flush
     // extract trace_identifier before install_tracing_subscriber consumes tracing_config
     let trace_identifier = tracing_config.trace_identifier.clone();
-    if let Some(warning) = throttle_config.deprecated_max_open_files_warning() {
-        match compatibility_warning_destination(&tracing_config) {
-            CompatibilityWarningDestination::Stderr => eprintln!("{warning}"),
-            CompatibilityWarningDestination::Stdout => println!("{warning}"),
-        }
-    }
     if let Err(e) =
         runtime_setup::validate_histogram_log_target(&throttle_config, &trace_identifier)
     {
@@ -657,6 +635,9 @@ where
         return None;
     }
     let _tracing_guards = runtime_setup::install_tracing_subscriber(quiet, verbose, tracing_config);
+    if let Some(warning) = throttle_config.deprecated_max_open_files_warning() {
+        tracing::warn!(target: NOTICE_TARGET, "{warning}");
+    }
     let res = {
         let runtime = runtime_setup::build_tokio_runtime(&runtime_config, &throttle_config);
         runtime_setup::spawn_throttle_replenishers(&runtime, &throttle_config, &trace_identifier);
@@ -738,22 +719,4 @@ fn reset_process_throttle_state() {
     // either configure fresh values or leave either admission pool unlimited.
     throttle::set_admission_limits(0, 0);
     throttle::init_iops_tokens(0);
-}
-
-#[cfg(test)]
-mod compatibility_warning_destination_tests {
-    use super::*;
-
-    #[test]
-    fn direct_rcpd_warnings_use_stdout() {
-        let (layer, _, _) = crate::remote_tracing::RemoteTracingLayer::new();
-        let tracing = TracingConfig {
-            remote_layer: Some(layer),
-            ..TracingConfig::default()
-        };
-        assert_eq!(
-            compatibility_warning_destination(&tracing),
-            CompatibilityWarningDestination::Stdout
-        );
-    }
 }

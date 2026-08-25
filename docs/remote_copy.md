@@ -42,12 +42,15 @@ fingerprint pinning.
 
 ### Connection Flow
 
-1. **Master spawns rcpd via SSH**: `ssh host "rcpd --role source --master-cert-fp <fp>"`
-2. **rcpd generates ephemeral certificate** and outputs fingerprint to stderr
-3. **Master reads fingerprint** before connecting (trusted via SSH channel)
-4. **Master connects with TLS**, verifying rcpd's certificate fingerprint; rcpd in turn verifies
-   master's client certificate against `--master-cert-fp`
-5. **Master distributes fingerprints** to source and destination for mutual TLS
+1. **Master prepares compatible rcpd endpoints**, sharing one SSH preparation for a same-host copy
+2. **Master spawns source rcpd via SSH**: `ssh host "rcpd --role source --master-cert-fp <fp>"`
+3. **Source generates an ephemeral certificate** and reports its fingerprint plus negotiated file
+   and stream limits in the first stderr readiness record
+4. **Master connects to the source before spawning the destination**, then starts the destination
+   with the source-negotiated limits and verifies its readiness record matches
+5. **Master connects with TLS**, verifying each rcpd's certificate fingerprint; rcpd in turn
+   verifies master's client certificate against `--master-cert-fp`
+6. **Master distributes fingerprints** to source and destination for mutual TLS
 
 ### Disabling Encryption
 
@@ -135,7 +138,9 @@ pub struct ProtocolVersion {
    ```bash
    rcpd --protocol-version
    ```
-   Returns JSON with version information.
+   Returns JSON with version information. The probe has a two-second deadline; timeout errors retain
+   the affected host in their error chain, and auto-deployment may recover by publishing a
+   compatible local candidate.
 
 2. **Compare versions**:
    - Policy: Exact semantic version match required
@@ -188,7 +193,8 @@ The `--auto-deploy-rcpd` flag enables automatic transfer and installation of rcp
 1. **Find local rcpd binary**:
    - Check same directory as rcp with a bounded `--protocol-version` probe
    - Fall back to later candidates such as PATH when an earlier candidate is missing, unusable, or
-     incompatible; a timed-out probe is terminated and reaped before fallback
+     incompatible; a timed-out probe has its pipes closed, receives a kill request, and gets a
+     one-second reap grace before an owned background reaper permits fallback
 
 2. **Transfer binary to a temp file**:
    - Read local rcpd binary
@@ -199,7 +205,7 @@ The `--auto-deploy-rcpd` flag enables automatic transfer and installation of rcp
 3. **Verify, then publish**:
    - Verify SHA-256 checksum **of the temp file** (a mismatch removes it, publishing nothing)
    - Atomic rename to the final location
-   - Re-run `--protocol-version` on the published remote path before spawning it
+   - Re-run a bounded `--protocol-version` probe on the published remote path before spawning it
    - Clean up old versions (keeps last 3)
 
 ### Transfer Mechanism
@@ -283,22 +289,27 @@ Please try again or check network connectivity.
 
 ### Connection Flow
 
-1. **Master starts rcpd via SSH**
-   - SSH to source host, start rcpd
-   - SSH to destination host, start rcpd
+1. **Master prepares rcpd via SSH**
+   - Source and destination preparation may run concurrently on distinct hosts
+   - Equal SSH endpoint settings share one preparation, discovery, and optional deployment
 
-2. **Master connects to each rcpd**
-   - Each rcpd creates a TCP listener and reports its address (and TLS fingerprint) on stderr, which
-     master reads over SSH
-   - Master connects via TCP (control + tracing connections)
+2. **Master starts and connects to source rcpd**
+   - Source creates a TCP listener and emits `RCP_TLS <addr> <fingerprint> <F> <E>` (or plaintext
+     `RCP_TCP <addr> <F> <E>`) as its first stderr record
+   - Master immediately opens the source control and tracing connections
 
-3. **Source waits for Destination**
+3. **Master starts and connects to destination rcpd**
+   - Automatic policy uses the source-selected `F`; explicit policy retains master authority
+   - Destination readiness must report the same `F` and `E`, after which the master opens its
+     control and tracing connections
+
+4. **Source waits for Destination**
    - Source starts TCP listeners (control + data ports)
    - Source sends addresses to Master
    - Master forwards addresses to Destination
    - Destination connects to Source
 
-4. **Data transfer**
+5. **Data transfer**
    - Files sent over pooled data connections
    - Completion acknowledged via control channel
 
@@ -467,15 +478,24 @@ cargo build --target x86_64-unknown-linux-gnu
 | `--remote-copy-conn-timeout-sec=N` | Connection timeout (default: 15; 60 with `--auto-deploy-rcpd`) |
 | `--remote-keepalive-sec=N`         | Dead-peer detection budget, 0 disables (default: 120)          |
 | `--port-ranges=RANGES`             | Restrict TCP to specific ports (e.g., "8000-8999")             |
-| `--max-files-in-flight=N`          | Ceiling on applicable file-like work (default: max(CPUs, 4))   |
+| `--max-files-in-flight=N`          | Explicit ceiling; automatic remote default is source-owned     |
 | `--max-connections=N`              | Maximum concurrent data connections (default: 100)             |
 | `--network-profile=PROFILE`        | Buffer sizing: `datacenter` (default) or `internet`            |
 
-For a remote copy, the number of parallel TCP data streams is the lower of `--max-files-in-flight`
-and `--max-connections`; it is a stream ceiling, not a guarantee that every stream is busy. The
-master validates pending-file sizing after applying that lower ceiling and passes the resulting
-stream count to both daemons. Each endpoint separately applies its local soft-RLIMIT descriptor
-safety when admitting its own file-like work.
+For a remote copy, let `F` be the logical file-work ceiling and `M` be `--max-connections`; the
+effective stream count is `E = min(F, M)`, or `E = M` for the legacy explicit-unlimited policy. The
+source owns automatic `F` selection and the destination adopts its reported `F/E`; explicit `F`
+remains master-authoritative. Pending capacity is `E × --pending-writes-multiplier`. Values for `E`
+or that product above Tokio's semaphore maximum are rejected rather than reaching semaphore
+construction.
+
+Explicit limits can be checked before remote `~` expansion. Automatic limits cannot be known there:
+the source resolves and validates them before its readiness record and before destination spawn.
+Each endpoint separately applies its local soft-RLIMIT descriptor safety when admitting file-like
+work. Explicit connection or descriptor clamps produce a default-visible notice naming requested and
+effective values; automatic clamps are verbose-only. Profiling and Tokio-console artifact
+announcements likewise use the tracing notice target and reach master output only after the daemon
+readiness handshake. These readiness and internal spawn-contract changes are wire revision 4.
 
 ### Network Profiles
 

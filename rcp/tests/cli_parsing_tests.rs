@@ -88,7 +88,7 @@ fn legacy_max_open_files_warns_for_local_copies() {
         ])
         .assert()
         .success()
-        .stderr(predicates::str::contains("--max-open-files is deprecated"));
+        .stdout(predicates::str::contains("--max-open-files is deprecated"));
     rcp()
         .args([
             "--max-open-files=0",
@@ -97,7 +97,7 @@ fn legacy_max_open_files_warns_for_local_copies() {
         ])
         .assert()
         .success()
-        .stderr(predicates::str::contains("descriptor safety"));
+        .stdout(predicates::str::contains("descriptor safety"));
 }
 
 #[test]
@@ -116,15 +116,19 @@ fn max_file_limit_names_conflict() {
 
 #[test]
 fn direct_rcpd_legacy_warning_leaves_connection_record_on_stderr() {
+    assert_direct_rcpd_readiness_first(&["--max-open-files=0".to_string()]);
+}
+
+fn assert_direct_rcpd_readiness_first(extra: &[String]) -> std::process::Output {
     use std::io::BufRead;
 
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("rcpd"))
         .args([
             "--role=source",
             "--no-encryption",
-            "--max-open-files=0",
             "--remote-copy-conn-timeout-sec=1",
         ])
+        .args(extra)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -141,12 +145,39 @@ fn direct_rcpd_legacy_warning_leaves_connection_record_on_stderr() {
     let first_stderr = line_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("rcpd must announce its listener before the watchdog deadline");
-    assert!(first_stderr.starts_with("RCP_TCP "));
+    assert!(
+        first_stderr.starts_with("RCP_TCP "),
+        "readiness must own the first stderr line, got {first_stderr:?}"
+    );
     drop(child.stdin.take());
-    let output = child
+    child
         .wait_with_output()
-        .expect("rcpd must exit after stdin closes");
-    assert!(String::from_utf8_lossy(&output.stdout).contains("--max-open-files=0 is deprecated"));
+        .expect("rcpd must exit after stdin closes")
+}
+
+#[test]
+fn direct_rcpd_chrome_trace_leaves_connection_record_on_stderr() {
+    let temp = tempfile::tempdir().unwrap();
+    let prefix = temp.path().join("trace");
+    assert_direct_rcpd_readiness_first(&[format!("--chrome-trace={}", prefix.display())]);
+}
+
+#[test]
+fn direct_rcpd_flamegraph_leaves_connection_record_on_stderr() {
+    let temp = tempfile::tempdir().unwrap();
+    let prefix = temp.path().join("flame");
+    assert_direct_rcpd_readiness_first(&[format!("--flamegraph={}", prefix.display())]);
+}
+
+#[test]
+fn direct_rcpd_tokio_console_leaves_connection_record_on_stderr() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    assert_direct_rcpd_readiness_first(&[
+        "--tokio-console".to_string(),
+        format!("--tokio-console-port={port}"),
+    ]);
 }
 
 /// Test that --help output is generated without errors

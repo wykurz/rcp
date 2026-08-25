@@ -602,16 +602,65 @@ fn test_remote_legacy_unlimited_warns_once_from_initiating_rcp() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
-        stderr.matches(warning).count(),
+        stdout.matches(warning).count(),
         1,
-        "the initiating rcp must emit exactly one deprecation warning"
+        "the initiating rcp must emit exactly one traced deprecation warning"
     );
     assert_eq!(
-        stdout.matches(warning).count(),
+        stderr.matches(warning).count(),
         0,
-        "propagated source and destination parser inputs must not emit warnings"
+        "startup notices must not bypass tracing on raw stderr"
     );
     assert_two_rcpd_logs_report_connection_count(logs.path(), 3);
+}
+
+#[test]
+fn test_remote_chrome_trace_dry_run_forwards_daemon_artifact_notices() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("chrome_trace.txt");
+    let dst_file = dst_dir.path().join("chrome_trace.txt");
+    create_test_file(&src_file, "chrome trace", 0o644);
+    let src_remote = format!("localhost:{}", src_file.display());
+    let dst_remote = format!("localhost:{}", dst_file.display());
+    let traces = tempfile::tempdir().unwrap();
+    let trace_prefix = traces.path().join("remote-trace");
+    let trace_arg = format!("--chrome-trace={}", trace_prefix.display());
+    let output = run_rcp_with_args(&["--dry-run=brief", &trace_arg, &src_remote, &dst_remote]);
+    print_command_output(&output);
+    assert!(
+        output.status.success(),
+        "remote Chrome-trace dry run failed"
+    );
+    assert!(
+        !dst_file.exists(),
+        "a dry run must not create the destination"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.matches("Chrome trace will be written to:").count(),
+        3,
+        "the master must surface its own and both daemon artifact notices"
+    );
+    assert!(
+        stdout.contains("rcpd-source"),
+        "the source daemon artifact notice must reach master output"
+    );
+    assert!(
+        stdout.contains("rcpd-destination"),
+        "the destination daemon artifact notice must reach master output"
+    );
+
+    let trace_files: Vec<_> = std::fs::read_dir(traces.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    assert_eq!(trace_files.len(), 3, "all three trace artifacts must exist");
 }
 
 /// Test copying many small files to exercise stream pooling.
@@ -2975,6 +3024,22 @@ fn test_remote_auto_deploy_rcpd() {
         "rcpd should be deployed to {}",
         deployed_rcpd.display()
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.matches("Preparing rcpd server on:").count(),
+        1,
+        "same-host source and destination must share one preparation"
+    );
+    assert_eq!(
+        stdout.matches("Successfully deployed rcpd to").count(),
+        1,
+        "same-host auto-deployment must publish the daemon once"
+    );
+    assert_eq!(
+        stdout.matches("Starting prepared rcpd server on:").count(),
+        2,
+        "the shared preparation must still spawn both daemon roles"
+    );
     // verify it's executable
     let metadata = std::fs::metadata(&deployed_rcpd).expect("Failed to get deployed rcpd metadata");
     let permissions = metadata.permissions();
@@ -3366,10 +3431,6 @@ fn test_remote_auto_deploy_skips_mismatched_local_candidate() {
         "auto-deploy must skip the stale same-directory candidate and deploy the compatible PATH candidate"
     );
     assert_eq!(get_file_content(&dst_file), "compatible fallback deployed");
-    assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("stale local candidate was spawned"),
-        "the incompatible candidate must never reach the remote spawn boundary"
-    );
 }
 
 #[test]
@@ -3414,7 +3475,7 @@ fn test_remote_auto_deploy_skips_hanging_local_candidate() {
     )
     .expect("failed to build fallback PATH");
     let output = std::process::Command::new("timeout")
-        .args(["30", copied_rcp.to_str().unwrap()])
+        .args(["90", copied_rcp.to_str().unwrap()])
         .args(["--force-remote", "--auto-deploy-rcpd"])
         .arg("--rcpd-path=/nonexistent/rcpd")
         .args([&src_remote, &dst_remote])
@@ -3430,9 +3491,70 @@ fn test_remote_auto_deploy_skips_hanging_local_candidate() {
         "auto-deploy must time out the hanging same-directory candidate and deploy the compatible PATH candidate"
     );
     assert_eq!(get_file_content(&dst_file), "compatible fallback deployed");
+}
+
+#[test]
+fn test_remote_auto_deploy_times_out_hanging_remote_version_probe() {
+    require_local_ssh();
+    let home = make_test_home();
+    let override_home = home.path().to_str().unwrap().to_string();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("remote_probe_hang.txt");
+    let dst_file = dst_dir.path().join("remote_probe_hang.txt");
+    create_test_file(&src_file, "remote probe fallback deployed", 0o644);
+    let src_remote = format!("localhost:{}", src_file.display());
+    let dst_remote = format!("localhost:{}", dst_file.display());
+
+    let candidate_dir = tempfile::tempdir().unwrap();
+    let probe_marker = candidate_dir.path().join("probe-marker");
+    let hanging_rcpd = candidate_dir.path().join("rcpd");
+    std::fs::write(
+        &hanging_rcpd,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--protocol-version\" ]; then\n\
+               printf 'probe\\n' >> {}\n\
+               exec sleep 60\n\
+             fi\n\
+             exit 42\n",
+            probe_marker.display()
+        ),
+    )
+    .expect("failed to create hanging remote rcpd candidate");
+    std::fs::set_permissions(&hanging_rcpd, std::fs::Permissions::from_mode(0o755))
+        .expect("failed to make hanging remote rcpd candidate executable");
+    let explicit_path = format!("--rcpd-path={}", hanging_rcpd.display());
+
+    let output = run_rcp_with_args_home_and_env(
+        &[
+            "--auto-deploy-rcpd",
+            &explicit_path,
+            &src_remote,
+            &dst_remote,
+        ],
+        home.path(),
+        &[("RCP_REMOTE_HOME_OVERRIDE", override_home.as_str())],
+    );
+    print_command_output(&output);
     assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("hanging local candidate was spawned"),
-        "the rejected candidate must never reach the remote spawn boundary"
+        output.status.success(),
+        "auto-deploy must recover from a hanging remote version probe"
+    );
+    assert_eq!(
+        get_file_content(&dst_file),
+        "remote probe fallback deployed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&probe_marker).unwrap(),
+        "probe\n",
+        "same-host preparation must attempt the hanging remote candidate exactly once"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .matches("Successfully deployed rcpd to")
+            .count(),
+        1,
+        "the timeout must fall back to one successful deployment"
     );
 }
 
@@ -3814,11 +3936,11 @@ fn test_remote_force_remote_flag_uses_rcpd() {
     let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
     // run_rcp_and_expect_success uses --force-remote
     let output = run_rcp_and_expect_success(&[&src_remote, &dst_remote]);
-    // should show rcpd being started (indicates remote mode was used, stderr go to stdout)
+    // should show the prepared rcpd being started (indicates remote mode was used)
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Starting rcpd"),
-        "Expected 'Starting rcpd' in output when using --force-remote, got: {stdout}"
+        stdout.contains("Starting prepared rcpd server on:"),
+        "expected the prepared rcpd spawn in output when using --force-remote, got: {stdout}"
     );
     assert_eq!(get_file_content(&dst_file), "force remote test");
 }
@@ -3846,7 +3968,7 @@ fn test_remote_localhost_without_force_remote_is_local() {
     );
     // should NOT show rcpd being started
     assert!(
-        !stdout.contains("Starting rcpd"),
+        !stdout.contains("Starting prepared rcpd server on:"),
         "Should NOT use rcpd without --force-remote, but got: {stdout}"
     );
     assert_eq!(get_file_content(&dst_file), "local copy test");

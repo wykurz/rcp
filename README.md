@@ -308,7 +308,9 @@ Two complementary mechanisms: **static caps** that you set once based on budget 
 - set `--max-files-in-flight=N` to cap applicable file-like copy, link, comparison, removal, chmod,
   and generation work
   - explicit `N` must be positive; `1` is valid and `0` is rejected. When omitted, the default is
-    `max(std::thread::available_parallelism(), 4)`
+    `max(std::thread::available_parallelism(), 4)`. For a remote copy, the **source** `rcpd`
+    computes that automatic default from the source host; an explicit value remains controlled by
+    the initiating `rcp`
   - this is a ceiling on applicable work, not a literal count of process descriptors or a promise
     that the workload will achieve that much parallelism
   - the runtime independently intersects that ceiling with its soft-`RLIMIT_NOFILE` safety ceiling
@@ -385,6 +387,8 @@ remote host.
 When auto-deployment is enabled:
 
 - `rcp` finds the local `rcpd` binary (same directory or PATH)
+- Local and remote `rcpd --protocol-version` probes have a two-second deadline, so a hanging
+  candidate can fall back to deployment; local timeout cleanup gets a bounded one-second reap grace
 - Deploys it to `~/.cache/rcp/bin/rcpd-{version}` on remote hosts via SSH
 - Verifies integrity using SHA-256 checksums
 - Keeps the last 3 versions and cleans up older ones
@@ -759,8 +763,17 @@ rcp --network-profile=internet host1:/data host2:/data
 
 Remote data streams are `min(--max-files-in-flight, --max-connections)`. `--max-connections` is a
 separately configurable ceiling with a default of 100; pending capacity is that effective stream
-count times `--pending-writes-multiplier`. To raise remote parallelism above the CPU-derived
-file-work default, raise both ceilings:
+count times `--pending-writes-multiplier`. The source reports its resolved logical file limit and
+effective stream count in its first stderr readiness record; the master connects to it before
+starting the destination with the same negotiated values. This source-first readiness contract is
+wire revision 4.
+
+Explicit limits are validated before remote `~` expansion. Automatic limits are resolved and
+validated by the source before it announces readiness; effective-stream and pending capacities above
+Tokio's semaphore maximum are rejected. If an explicit file limit is clamped by the connection or
+descriptor-safety ceiling, a default-visible notice names the requested and effective values.
+Automatic clamps remain verbose-only. To raise remote parallelism above the source's CPU-derived
+file-work default, raise both ceilings explicitly:
 
 ```bash
 # Increase for many small files on high-bandwidth links
@@ -839,6 +852,11 @@ Example output:
 - `/tmp/trace-rcp-master-myhost-12345-2025-01-15T10:30:45.json`
 - `/tmp/trace-rcpd-source-host1-23456-2025-01-15T10:30:46.json`
 - `/tmp/trace-rcpd-destination-host2-34567-2025-01-15T10:30:46.json`
+
+Artifact paths, Tokio-console addresses, legacy-option warnings, and explicit concurrency-clamp
+warnings are emitted through the normal notice logging target. In remote mode, daemon artifact
+notices are forwarded to the master after its tracing connection is established; they never precede
+the daemon's readiness record on raw stderr.
 
 View traces by opening https://ui.perfetto.dev and dragging the JSON file into the browser.
 

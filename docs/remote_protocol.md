@@ -16,13 +16,16 @@ The remote copy system consists of three distinct components:
 **Spawning Sequence:**
 
 1. User invokes `rcp user@host1:/src user@host2:/dst`
-2. Master spawns source rcpd via SSH: `ssh user@host1 rcpd --role=source --master-cert-fp=... ...`
-3. Master spawns destination rcpd via SSH:
-   `ssh user@host2 rcpd --role=destination --master-cert-fp=... ...`
-4. Each rcpd creates a TCP listener and prints `RCP_TLS <addr> <fingerprint>` (or `RCP_TCP <addr>`
-   when encryption is disabled) to stderr; master reads that line via SSH
-5. Master connects to each rcpd's listener via TCP: first the control connection, then a second
-   connection used for tracing/progress forwarding
+2. Master validates pure configuration, then prepares compatible source and destination rcpd
+   endpoints. Equal `SshSession` values share one preparation; distinct endpoints may prepare
+   concurrently.
+3. Master spawns source rcpd via SSH: `ssh user@host1 rcpd --role=source --master-cert-fp=... ...`
+4. Source creates a TCP listener and prints `RCP_TLS <addr> <fingerprint> <F> <E>` (or
+   `RCP_TCP <addr> <F> <E>` when encryption is disabled) as the first stderr record. The master
+   immediately opens source control and tracing connections.
+5. Master constructs the destination configuration from source readiness, spawns destination rcpd,
+   verifies its readiness reports the same `F/E`, and opens destination control and tracing
+   connections.
 
 **Propagated security flags:** When the master runs with `--require-toctou-safe`, it mirrors the
 flag into each rcpd's spawn arguments (via `RcpdConfig::to_args()`). Each rcpd then arms strict
@@ -40,34 +43,49 @@ therefore does not separately validate it; see the strict-operand residual in
 version-matched rcpd binaries (see binary discovery in [remote_copy.md](remote_copy.md)) understand
 the flag.
 
-**Propagated file-work ceiling:** The master resolves `--max-files-in-flight` once, then passes its
-ceiling to each rcpd as a version-sensitive spawn argument rather than adding it to `MasterHello` or
-any data message. A finite ceiling becomes `--max-files-in-flight=N`; legacy `--max-open-files=0`
-becomes that hidden compatibility argument so a daemon does not replace the master's unlimited user
-ceiling with its own CPU default. Every propagated value also carries the hidden
-`--files-in-flight-propagated` marker, which prevents daemon-side duplicate deprecation warnings
-while preserving direct rcpd invocation behavior. The master also resolves the effective data-stream
-count once as `min(max-files-in-flight, max-connections)` and puts that identical value in both rcpd
-spawn configurations. An unlimited legacy file ceiling leaves `max-connections` as the stream
-ceiling. A directly launched rcpd makes the same intersection using its local automatic CPU-based
-file policy. This is why wire revision 3 changed solely to protect the rcpd spawn-argument contract:
-`MasterHello` and all data-protocol messages keep exactly the same schema.
+**Source-owned file-work ceiling:** Let `F` be the logical file ceiling, `M` the configured
+`--max-connections`, and `E = min(F, M)`. When `--max-files-in-flight` is omitted, the source `rcpd`
+selects `F` from its own CPU availability; the source readiness record makes that decision
+authoritative for the destination. An explicit finite `F` remains master-authoritative and becomes
+`--max-files-in-flight=N` on both roles. Legacy explicit unlimited input uses a hidden typed
+unlimited argument, never the deprecated spelling, and yields `E = M`. The automatic destination
+uses a hidden resolved-automatic argument that preserves automatic provenance while carrying source
+`F`. Neither internal form produces a duplicate compatibility warning.
+
+The resolved `E` and pending capacity `P = E × pending-writes-multiplier` use checked arithmetic,
+must be nonzero, and must not exceed `tokio::sync::Semaphore::MAX_PERMITS`. Explicit capacity can be
+validated before remote-home expansion or SSH; automatic capacity is resolved and validated by the
+source before it announces readiness and before destination spawn. `MasterHello` and data-message
+schemas remain unchanged. Wire revision 4 protects the extended readiness record, typed internal
+spawn arguments, and source-first bootstrap contract.
 
 **Special Case - Same Host Copies:** When source and destination are on the same host, the master:
 
-- Deploys rcpd only once (if needed)
+- Discovers, verifies, and deploys rcpd only once (if needed)
 - Starts two separate rcpd processes with different roles
 - Both processes share the same SSH session but have distinct connections
 
 **Auto-deployment compatibility:** Auto-deployment applies the same exact compatibility policy as
 normal remote discovery at both boundaries. The master runs `--protocol-version` on each local
 candidate in search order (beside `rcp`, then `PATH`) and continues to later candidates when one is
-stale, stalls its bounded version probe, or is otherwise unusable. A timed-out candidate is
-terminated and reaped, and its output pipes are released before the search continues. The master
-names the cache target with the accepted version's compatibility tag, transfers and publishes the
-binary, then runs `--protocol-version` on that deployed remote path before constructing either
-role's spawn command. Thus neither co-location nor a current-looking cache filename is treated as
-proof that the binary implements the current serialized and rcpd spawn contract.
+stale, stalls its two-second version probe, or is otherwise unusable. A timed-out local candidate
+has its pipes released and receives a kill request; reaping gets a one-second grace, after which an
+owned background reaper permits the search to continue without losing child ownership. Remote
+version probes, including post-deployment verification, have the same two-second deadline so a
+hanging SSH channel cannot block fallback. The master names the cache target with the accepted
+version's compatibility tag, transfers and publishes the binary, then probes that deployed remote
+path before constructing either role's spawn command. Thus neither co-location nor a current-looking
+cache filename is treated as proof that the binary implements the current serialized and rcpd spawn
+contract.
+
+**Startup stderr ownership and notices:** A successfully started daemon reserves its first stderr
+line for exactly one readiness record. Chrome-trace, flamegraph, Tokio-console, legacy-option, and
+explicit concurrency-clamp announcements are collected until tracing is installed and emitted
+through the default-visible `rcp::notice` target. Remote tracing queues daemon notices until the
+master connects, so they reach master output without becoming readiness preamble. An intentional
+fatal startup refusal may instead emit one diagnostic and exit. An explicit `F` reduced by `M`, or
+by endpoint descriptor safety, produces a notice naming requested and effective values; an automatic
+reduction is verbose-only.
 
 ### 1.3 Connection Topology
 
@@ -81,16 +99,14 @@ The system uses a **triangle topology** with TCP connections:
 The diagram distinguishes the SSH bootstrap from the rcp TCP connections and shows every
 application-data direction:
 
-1. Master uses SSH to start both rcpd processes. Each rcpd reports its listener address and, when
-   TLS is enabled, its certificate fingerprint back to master on SSH stderr.
-2. Master opens a bidirectional control TCP connection to source rcpd. Master sends
-   `MasterHello::Source`; source returns `SourceMasterHello` and later `RcpdResult`.
-3. Master separately opens source rcpd's tracing/progress TCP connection, drops its send half, and
-   receives tracing/progress data from source rcpd.
-4. Master opens a bidirectional control TCP connection to destination rcpd. Master sends
-   `MasterHello::Destination`; destination later returns `RcpdResult`.
-5. Master separately opens destination rcpd's tracing/progress TCP connection, drops its send half,
-   and receives tracing/progress data from destination rcpd.
+1. Master uses SSH to start source rcpd. It reports its listener address, optional TLS fingerprint,
+   logical file ceiling `F`, and effective stream count `E` back to master on SSH stderr.
+2. Master opens source rcpd's bidirectional control TCP connection and separate tracing/progress
+   connection, dropping the tracing send half.
+3. Master starts destination rcpd with source `F/E`, verifies its readiness, and opens destination's
+   control and tracing/progress connections in the same way.
+4. Master sends `MasterHello::Source`; source returns `SourceMasterHello` and later `RcpdResult`.
+5. Master sends `MasterHello::Destination`; destination later returns `RcpdResult`.
 6. Destination opens the source/destination bidirectional control connection. Directory and symlink
    messages flow source → destination; manifests, directory acknowledgements, and `DestinationDone`
    flow destination → source.
@@ -119,15 +135,16 @@ SSH remains protected and still launches rcpd and carries its listener announcem
 
 **Connection Establishment Order:**
 
-1. Master opens the control connection and then the separate tracing/progress connection to each
-   rcpd process (each rcpd listens; master learns the address from the `RCP_TLS`/`RCP_TCP` line on
-   the rcpd's stderr)
-2. Master sends `MasterHello::Source` to source rcpd with src/dst paths
-3. Source rcpd starts TCP listeners (control + data), sends `SourceMasterHello` back to master with
+1. Source rcpd reports readiness; master opens its control connection and then its separate
+   tracing/progress connection immediately.
+2. Destination rcpd is configured from source `F/E`, reports matching readiness, and receives the
+   corresponding two master connections.
+3. Master sends `MasterHello::Source` to source rcpd with src/dst paths.
+4. Source rcpd starts TCP listeners (control + data), sends `SourceMasterHello` back to master with
    both addresses
-4. Master sends `MasterHello::Destination` to destination rcpd with source addresses
-5. Destination rcpd connects to source's control port
-6. Destination opens a pool of connections to source's data port; files are streamed over these
+5. Master sends `MasterHello::Destination` to destination rcpd with source addresses
+6. Destination rcpd connects to source's control port
+7. Destination opens a pool of connections to source's data port; files are streamed over these
    pooled connections (the `size` field in each header delimits file boundaries)
 
 ### 1.4 Security Model
@@ -1214,8 +1231,10 @@ Three source-side mechanisms work together:
 1. **Pending task limit**: A semaphore limits the total number of file-sending tasks that can be
    active at once. Its capacity is `effective streams × pending-writes-multiplier`, where effective
    streams are `min(max-files-in-flight, max-connections)`; the product uses checked arithmetic and
-   invalid zero/overflow configurations fail before either daemon is spawned (and before a directly
-   launched daemon announces its listener). Tasks wait on this semaphore before being spawned.
+   invalid zero, overflow, or above-Tokio-maximum configurations fail before semaphore construction.
+   Explicit policy is checked by the master before daemon preparation; automatic policy is checked
+   by the source before readiness and destination spawn. A directly launched daemon also validates
+   before announcing its listener. Tasks wait on this semaphore before being spawned.
 
 2. **Connection backpressure**: A file task borrows a pooled data connection before taking
    file-specific resources, so queued tasks do not open files or allocate data buffers while the
@@ -1242,7 +1261,8 @@ On the destination the corresponding order begins after the header is consumed: 
 OpenFile admission, take the operations gate, resolve/plan the parent and entry, acquire IOPS, then
 remove/create/write as required. The two rcpd processes do not share a pool.
 
-**Effect with defaults (100 configured connections, automatic file ceiling, 4× multiplier):**
+**Effect with defaults (100 configured connections, source-owned automatic file ceiling, 4×
+multiplier):**
 
 - At most `4 × min(automatic file ceiling, 100)` pending tasks
 - Up to `min(automatic file ceiling, 100)` simultaneous source file-data transfers at the stream
@@ -1259,14 +1279,14 @@ remove/create/write as required. The two rcpd processes do not share a pool.
   streams are `min(max-files-in-flight, max-connections)`.
 - `--pending-writes-multiplier=N`: Pending capacity is effective streams × this multiplier (default:
   4).
-- `--max-files-in-flight=N`: Set the master-resolved ceiling for file-like work on both rcpds. The
-  automatic default is available CPU parallelism with a floor of four. The same ceiling also clamps
-  data streams, while unlimited legacy input leaves `--max-connections` as their ceiling. Each
-  endpoint separately intersects the file ceiling with its own unchanged current soft
-  `RLIMIT_NOFILE` descriptor-safety heuristic (80% / five modeled units, capped at 4096) for its
-  local OpenFile and PendingMeta admission. Those local pools remain independent and are not wire
-  state. The hidden legacy `--max-open-files=0` removes only the user ceiling; descriptor safety
-  remains active.
+- `--max-files-in-flight=N`: Set an explicit, master-authoritative ceiling for file-like work on
+  both rcpds. When omitted, the source chooses available CPU parallelism with a floor of four and
+  the destination adopts that source-selected value. The same ceiling also clamps data streams,
+  while unlimited legacy input leaves `--max-connections` as their ceiling. Each endpoint separately
+  intersects the file ceiling with its own unchanged current soft `RLIMIT_NOFILE` descriptor-safety
+  heuristic (80% / five modeled units, capped at 4096) for its local OpenFile and PendingMeta
+  admission. Those local pools remain independent and are not wire state. The hidden legacy
+  `--max-open-files=0` removes only the user ceiling; descriptor safety remains active.
 
 The multiplier ensures work is always queued when connections become available, avoiding idle time
 between file transfers.
@@ -1362,17 +1382,19 @@ Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
 - `--port-ranges=RANGES` (optional) - Restrict TCP to specific port ranges (e.g., "8000-8999")
 - `--max-connections=N` (default: 100) - Separately configurable data-connection ceiling; effective
   streams are `min(max-files-in-flight, max-connections)`
-- `--max-files-in-flight=N` - Master-resolved file-work ceiling; finite values also clamp effective
-  data connections, while legacy unlimited input does not
+- `--max-files-in-flight=N` - Explicit master-authoritative file-work ceiling; when omitted, the
+  source resolves the automatic ceiling and the destination adopts it. Finite values also clamp
+  effective data connections, while legacy unlimited input does not
 - `--pending-writes-multiplier=N` (default: 4) - Pending capacity is effective streams × this
   multiplier, checked before pending file tasks are admitted
 - `--network-profile=PROFILE` (default: datacenter) - Buffer sizing profile
 
-The master validates the pending-task product before any SSH/process spawn and propagates the same
-effective stream count to both endpoints. A directly launched daemon validates before announcing its
-listener. This configuration travels only in version-sensitive rcpd spawn arguments: no
-`MasterHello` or data-message field changed, and compatibility revision 3 changed solely to protect
-that spawn contract.
+For explicit policy, the master validates the pending-task product before remote-home lookup or SSH
+and configures the source. For automatic policy, source readiness supplies `F/E`; the source
+validates before readiness, and the master gives the destination the same values and rejects a
+mismatch in destination readiness. A directly launched daemon validates before announcing its
+listener. This configuration travels only in version-sensitive rcpd spawn arguments and readiness:
+no `MasterHello` or data-message field changed. Compatibility revision 4 protects this contract.
 
 ### 8.2 Network Profiles
 
