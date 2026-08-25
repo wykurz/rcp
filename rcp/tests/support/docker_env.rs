@@ -305,14 +305,13 @@ impl DockerEnv {
         Ok(size)
     }
 
-    /// Create a delayed rcpd wrapper script on a host
+    /// Creates a delayed rcpd wrapper script on a host.
     ///
-    /// This creates a wrapper that delays before executing the real rcpd,
-    /// useful for testing connection ordering scenarios.
-    /// Returns the path to the created wrapper script.
+    /// This creates a wrapper that delays role launches before executing the real rcpd, useful for
+    /// testing source-first startup ordering. Version probes bypass the delay so this test helper
+    /// preserves the production two-second discovery contract.
     ///
-    /// If wrapper_path is provided, uses that path. Otherwise generates a unique path.
-    /// This allows creating wrappers at the same path on multiple hosts.
+    /// `wrapper_path` allows creating wrappers at the same path on multiple hosts.
     #[allow(dead_code)]
     fn create_delayed_rcpd_wrapper_at_path(
         &self,
@@ -326,9 +325,11 @@ impl DockerEnv {
         let create_script = format!(
             r#"cat > {} <<'WRAPPER_EOF'
 #!/bin/sh
-# Delayed rcpd wrapper for connection ordering tests
-sleep {}
-# Call the real rcpd binary (absolute path to avoid recursion)
+# delayed rcpd wrapper for source-first startup tests
+if [ "$1" != "--protocol-version" ]; then
+    sleep {}
+fi
+# call the real rcpd binary (absolute path to avoid recursion)
 exec /home/testuser/.local/bin/rcpd "$@"
 WRAPPER_EOF
 chmod +x {}"#,
@@ -348,17 +349,17 @@ chmod +x {}"#,
         Ok(())
     }
 
-    /// Execute rcp command with a delayed rcpd on the source host
+    /// Executes rcp with delayed source-role startup.
     ///
     /// This creates wrapper scripts on both source and destination hosts:
-    /// - Source: delayed wrapper (to force destination to connect first)
-    /// - Destination: non-delayed wrapper (to use the same --rcpd-path)
+    /// - Source: delayed role launch.
+    /// - Destination: non-delayed role launch (using the same `--rcpd-path`).
     ///
-    /// Both wrappers are created at the same unique path on their respective hosts
-    /// to avoid concurrent test interference while ensuring rcp can find them.
-    // used in role ordering tests which are #[ignore]'d by default
+    /// Both wrappers are created at the same unique path on their respective hosts to avoid
+    /// concurrent test interference while ensuring rcp can find them.
+    // used in a role-ordering test which is #[ignore]'d by default
     #[allow(dead_code)]
-    pub fn exec_rcp_with_delayed_rcpd(
+    pub fn exec_rcp_with_delayed_source_rcpd(
         &self,
         source_host: &str,
         dest_host: &str,
@@ -468,9 +469,10 @@ impl DockerEnv {
         Ok(())
     }
 
-    /// Add packet loss to a container's network interface.
+    /// Set packet loss on a container's network interface.
     ///
-    /// This causes a percentage of outgoing packets to be dropped randomly.
+    /// This replaces any existing root traffic condition so callers can blackhole an active,
+    /// bandwidth-limited transfer without briefly releasing its queued packets.
     /// Use `clear_network_conditions` to remove the packet loss.
     ///
     /// # Arguments
@@ -486,7 +488,7 @@ impl DockerEnv {
                 &container_name,
                 "tc",
                 "qdisc",
-                "add",
+                "replace",
                 "dev",
                 "eth0",
                 "root",

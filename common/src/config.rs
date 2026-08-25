@@ -36,7 +36,6 @@ pub enum FilesInFlightSource {
     Automatic,
     Explicit,
     DeprecatedMaxOpenFiles,
-    Propagated,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,8 +56,12 @@ fn default_files_in_flight() -> NonZeroUsize {
 
 impl ResolvedFilesInFlight {
     pub fn automatic() -> Self {
+        Self::automatic_with(default_files_in_flight())
+    }
+
+    pub const fn automatic_with(value: NonZeroUsize) -> Self {
         Self {
-            limit: ConcurrencyLimit::Limited(default_files_in_flight()),
+            limit: ConcurrencyLimit::Limited(value),
             source: FilesInFlightSource::Automatic,
         }
     }
@@ -82,13 +85,6 @@ impl ResolvedFilesInFlight {
             limit: NonZeroUsize::new(value)
                 .map_or(ConcurrencyLimit::Unlimited, ConcurrencyLimit::Limited),
             source: FilesInFlightSource::DeprecatedMaxOpenFiles,
-        }
-    }
-
-    pub const fn propagated(self) -> Self {
-        Self {
-            limit: self.limit,
-            source: FilesInFlightSource::Propagated,
         }
     }
 
@@ -157,6 +153,8 @@ pub struct AutoMetaThrottleConfig {
 pub struct ThrottleConfig {
     /// User-selected ceiling for file-like work, including its source for compatibility warnings.
     pub files_in_flight: ResolvedFilesInFlight,
+    /// Whether this process performs file work governed by `files_in_flight`.
+    pub apply_files_in_flight: bool,
     /// Operations per second throttle (0 = no throttle)
     pub ops_throttle: usize,
     /// I/O operations per second throttle (0 = no throttle)
@@ -182,6 +180,7 @@ impl Default for ThrottleConfig {
     fn default() -> Self {
         Self {
             files_in_flight: ResolvedFilesInFlight::automatic(),
+            apply_files_in_flight: true,
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,
@@ -538,6 +537,16 @@ mod files_in_flight_policy_tests {
             12
         );
     }
+
+    #[test]
+    fn injected_automatic_file_limit_retains_automatic_provenance() {
+        let limit = ResolvedFilesInFlight::automatic_with(NonZeroUsize::new(12).unwrap());
+        assert_eq!(
+            limit.limit(),
+            ConcurrencyLimit::Limited(NonZeroUsize::new(12).unwrap())
+        );
+        assert_eq!(limit.source(), FilesInFlightSource::Automatic);
+    }
 }
 
 #[cfg(test)]
@@ -564,6 +573,7 @@ mod auto_meta_validation_tests {
     fn config_with(auto: AutoMetaThrottleConfig) -> ThrottleConfig {
         ThrottleConfig {
             files_in_flight: ResolvedFilesInFlight::automatic(),
+            apply_files_in_flight: true,
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,
@@ -705,6 +715,7 @@ mod auto_meta_validation_tests {
         // picks an interval that works for any rate.
         let config = ThrottleConfig {
             files_in_flight: ResolvedFilesInFlight::automatic(),
+            apply_files_in_flight: true,
             ops_throttle: 5,
             iops_throttle: 0,
             chunk_size: 0,
@@ -730,6 +741,7 @@ mod auto_meta_validation_tests {
         // Recording a log requires the throttle pipeline to be live.
         let config = ThrottleConfig {
             files_in_flight: ResolvedFilesInFlight::automatic(),
+            apply_files_in_flight: true,
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,
@@ -751,6 +763,7 @@ mod auto_meta_validation_tests {
         // is rejected for the same reason: nothing to histogram.
         let config = ThrottleConfig {
             files_in_flight: ResolvedFilesInFlight::automatic(),
+            apply_files_in_flight: true,
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,

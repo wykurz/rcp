@@ -435,15 +435,21 @@ pub enum DestinationMessage {
     DestinationDone,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum RcpdFilesInFlight {
+    Automatic,
+    ResolvedAutomatic(std::num::NonZeroUsize),
+    Explicit(common::ConcurrencyLimit),
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RcpdConfig {
     pub verbose: u8,
     pub fail_early: bool,
     pub max_workers: usize,
     pub max_blocking_threads: usize,
-    /// Master-resolved file-like work limit, propagated through the version-sensitive rcpd spawn
-    /// contract rather than a protocol message.
-    pub max_files_in_flight: common::ConcurrencyLimit,
+    /// File-like work policy for this daemon's version-sensitive spawn contract.
+    pub files_in_flight: RcpdFilesInFlight,
     pub ops_throttle: usize,
     pub iops_throttle: usize,
     pub chunk_size: usize,
@@ -525,13 +531,18 @@ impl RcpdConfig {
         if self.fail_early {
             args.push("--fail-early".to_string());
         }
-        match self.max_files_in_flight {
-            common::ConcurrencyLimit::Limited(value) => {
+        match self.files_in_flight {
+            RcpdFilesInFlight::Automatic => {}
+            RcpdFilesInFlight::ResolvedAutomatic(value) => {
+                args.push(format!("--resolved-automatic-files-in-flight={value}"));
+            }
+            RcpdFilesInFlight::Explicit(common::ConcurrencyLimit::Limited(value)) => {
                 args.push(format!("--max-files-in-flight={value}"));
             }
-            common::ConcurrencyLimit::Unlimited => args.push("--max-open-files=0".to_string()),
+            RcpdFilesInFlight::Explicit(common::ConcurrencyLimit::Unlimited) => {
+                args.push("--explicit-unlimited-files-in-flight".to_string());
+            }
         }
-        args.push("--files-in-flight-propagated".to_string());
         if self.dereference {
             args.push("--dereference".to_string());
         }
@@ -1045,9 +1056,9 @@ mod tests {
             fail_early: false,
             max_workers: 0,
             max_blocking_threads: 0,
-            max_files_in_flight: common::ConcurrencyLimit::Limited(
+            files_in_flight: RcpdFilesInFlight::Explicit(common::ConcurrencyLimit::Limited(
                 std::num::NonZeroUsize::new(4).unwrap(),
-            ),
+            )),
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,
@@ -1098,20 +1109,22 @@ mod tests {
     #[test]
     fn to_args_propagates_finite_files_in_flight() {
         let mut config = minimal_rcpd_config();
-        config.max_files_in_flight =
-            common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(7).unwrap());
+        config.files_in_flight = RcpdFilesInFlight::Explicit(common::ConcurrencyLimit::Limited(
+            std::num::NonZeroUsize::new(7).unwrap(),
+        ));
         let args = config.to_args();
         assert!(args.iter().any(|arg| arg == "--max-files-in-flight=7"));
-        assert!(args.iter().any(|arg| arg == "--files-in-flight-propagated"));
     }
 
     #[test]
     fn to_args_preserves_legacy_unlimited_files_in_flight() {
         let mut config = minimal_rcpd_config();
-        config.max_files_in_flight = common::ConcurrencyLimit::Unlimited;
+        config.files_in_flight = RcpdFilesInFlight::Explicit(common::ConcurrencyLimit::Unlimited);
         let args = config.to_args();
-        assert!(args.iter().any(|arg| arg == "--max-open-files=0"));
-        assert!(args.iter().any(|arg| arg == "--files-in-flight-propagated"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--explicit-unlimited-files-in-flight")
+        );
     }
 
     #[test]
@@ -1124,6 +1137,54 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "--max-connections=7")
         );
+    }
+
+    #[test]
+    fn rcpd_config_omits_an_automatic_file_limit_override() {
+        let mut config = minimal_rcpd_config();
+        config.files_in_flight = RcpdFilesInFlight::Automatic;
+        let args = config.to_args();
+        assert!(!args.iter().any(|arg| arg.contains("files-in-flight")));
+        assert!(!args.iter().any(|arg| arg.starts_with("--max-open-files")));
+    }
+
+    #[test]
+    fn rcpd_config_marks_a_resolved_automatic_file_limit() {
+        let mut config = minimal_rcpd_config();
+        config.files_in_flight =
+            RcpdFilesInFlight::ResolvedAutomatic(std::num::NonZeroUsize::new(7).unwrap());
+        let args = config.to_args();
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--resolved-automatic-files-in-flight=7")
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("--max-files-in-flight"))
+        );
+    }
+
+    #[test]
+    fn rcpd_config_uses_the_public_argument_for_an_explicit_finite_limit() {
+        let mut config = minimal_rcpd_config();
+        config.files_in_flight = RcpdFilesInFlight::Explicit(common::ConcurrencyLimit::Limited(
+            std::num::NonZeroUsize::new(7).unwrap(),
+        ));
+        let args = config.to_args();
+        assert!(args.iter().any(|arg| arg == "--max-files-in-flight=7"));
+    }
+
+    #[test]
+    fn rcpd_config_uses_an_internal_argument_for_explicit_unlimited() {
+        let mut config = minimal_rcpd_config();
+        config.files_in_flight = RcpdFilesInFlight::Explicit(common::ConcurrencyLimit::Unlimited);
+        let args = config.to_args();
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--explicit-unlimited-files-in-flight")
+        );
+        assert!(!args.iter().any(|arg| arg.starts_with("--max-open-files")));
     }
 
     #[test]

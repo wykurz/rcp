@@ -1798,6 +1798,7 @@ pub async fn run_destination(
     overwrite_manifest_max_entries: usize,
     preserve: &common::preserve::Settings,
     tcp_config: &remote::TcpConfig,
+    concurrency: remote::ResolvedRemoteConcurrency,
     cert_key: Option<&remote::tls::CertifiedKey>,
     source_cert_fingerprint: Option<remote::protocol::CertFingerprint>,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
@@ -1854,7 +1855,7 @@ pub async fn run_destination(
     // create a pool of data connections to source
     let data_pool = std::sync::Arc::new(DataConnectionPool::new(
         *src_data_addr,
-        tcp_config.max_connections,
+        concurrency.max_connections().get(),
         tcp_config.network_profile,
         tcp_config.keepalive_sec,
         tls_connector,

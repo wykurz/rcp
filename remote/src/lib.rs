@@ -122,6 +122,8 @@ compile_error!("tokio_unstable cfg must be enabled; see .cargo/config.toml");
 use anyhow::{Context, anyhow};
 use tracing::instrument;
 
+const REMOTE_RCPD_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub mod deploy;
 pub mod port_ranges;
 pub mod protocol;
@@ -219,6 +221,64 @@ pub const DEFAULT_PENDING_WRITES_MULTIPLIER: usize = 4;
 /// Exposed as `--remote-keepalive-sec`; see [`configure_tcp_socket`].
 pub const DEFAULT_REMOTE_KEEPALIVE_SEC: u64 = 120;
 
+/// Validated capacities used by the remote file-transfer pipeline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedRemoteConcurrency {
+    files_in_flight: common::ConcurrencyLimit,
+    max_connections: std::num::NonZeroUsize,
+    max_pending_files: std::num::NonZeroUsize,
+}
+
+impl ResolvedRemoteConcurrency {
+    #[must_use]
+    pub const fn files_in_flight(self) -> common::ConcurrencyLimit {
+        self.files_in_flight
+    }
+
+    #[must_use]
+    pub const fn max_connections(self) -> std::num::NonZeroUsize {
+        self.max_connections
+    }
+
+    #[must_use]
+    pub const fn max_pending_files(self) -> std::num::NonZeroUsize {
+        self.max_pending_files
+    }
+}
+
+/// Resolve and validate all capacities that become Tokio semaphores in remote copy.
+pub fn resolve_remote_concurrency(
+    files_in_flight: common::ConcurrencyLimit,
+    max_connections: std::num::NonZeroUsize,
+    pending_writes_multiplier: std::num::NonZeroUsize,
+) -> anyhow::Result<ResolvedRemoteConcurrency> {
+    let max_connections = effective_max_connections(files_in_flight, max_connections);
+    let max_pending_files = max_connections
+        .get()
+        .checked_mul(pending_writes_multiplier.get())
+        .context("pending file capacity overflow")?;
+    if max_connections.get() > tokio::sync::Semaphore::MAX_PERMITS {
+        anyhow::bail!(
+            "effective stream capacity {} exceeds the Tokio semaphore maximum {}",
+            max_connections,
+            tokio::sync::Semaphore::MAX_PERMITS,
+        );
+    }
+    if max_pending_files > tokio::sync::Semaphore::MAX_PERMITS {
+        anyhow::bail!(
+            "pending file capacity {} exceeds the Tokio semaphore maximum {}",
+            max_pending_files,
+            tokio::sync::Semaphore::MAX_PERMITS,
+        );
+    }
+    Ok(ResolvedRemoteConcurrency {
+        files_in_flight,
+        max_connections,
+        max_pending_files: std::num::NonZeroUsize::new(max_pending_files)
+            .expect("nonzero factors have a nonzero product"),
+    })
+}
+
 /// Intersect the configured data-stream ceiling with the file-work ceiling.
 #[must_use]
 pub fn effective_max_connections(
@@ -296,10 +356,13 @@ impl TcpConfig {
             .context("max connections must be nonzero")?;
         let multiplier = std::num::NonZeroUsize::new(self.pending_writes_multiplier)
             .context("pending writes multiplier must be nonzero")?;
-        max_connections
-            .get()
-            .checked_mul(multiplier.get())
-            .context("pending file capacity overflow")
+        Ok(resolve_remote_concurrency(
+            common::ConcurrencyLimit::Unlimited,
+            max_connections,
+            multiplier,
+        )?
+        .max_pending_files()
+        .get())
     }
 }
 
@@ -786,12 +849,19 @@ async fn check_rcpd_version(
     tracing::debug!("Checking rcpd version on remote host: {}", remote_host);
 
     // run rcpd --protocol-version on remote (call binary directly, no shell)
-    let output = session
-        .command(rcpd_path)
-        .arg("--protocol-version")
-        .output()
-        .await
-        .context("Failed to execute rcpd --protocol-version on remote host")?;
+    let output = run_remote_version_probe(
+        remote_host,
+        async {
+            session
+                .command(rcpd_path)
+                .arg("--protocol-version")
+                .output()
+                .await
+                .context("Failed to execute rcpd --protocol-version on remote host")
+        },
+        REMOTE_RCPD_VERSION_TIMEOUT,
+    )
+    .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -845,6 +915,25 @@ async fn check_rcpd_version(
     Ok(())
 }
 
+async fn run_remote_version_probe<F>(
+    remote_host: &str,
+    probe: F,
+    probe_timeout: std::time::Duration,
+) -> anyhow::Result<std::process::Output>
+where
+    F: std::future::Future<Output = anyhow::Result<std::process::Output>>,
+{
+    match tokio::time::timeout(probe_timeout, probe).await {
+        Ok(output) => output,
+        Err(elapsed) => Err(elapsed).with_context(|| {
+            format!(
+                "rcpd on remote host '{remote_host}' did not complete --protocol-version within {}",
+                humantime::format_duration(probe_timeout)
+            )
+        }),
+    }
+}
+
 /// Connection info received from rcpd after it starts listening.
 #[derive(Debug, Clone)]
 pub struct RcpdConnectionInfo {
@@ -852,6 +941,90 @@ pub struct RcpdConnectionInfo {
     pub addr: std::net::SocketAddr,
     /// TLS certificate fingerprint (None if encryption disabled)
     pub fingerprint: Option<tls::Fingerprint>,
+    /// Logical file-work ceiling resolved by this daemon.
+    pub files_in_flight: common::ConcurrencyLimit,
+    /// Effective data-stream count resolved by this daemon.
+    pub max_connections: std::num::NonZeroUsize,
+}
+
+/// Format the first stderr record emitted by a successfully started rcpd.
+#[must_use]
+pub fn format_rcpd_readiness(
+    addr: std::net::SocketAddr,
+    fingerprint: Option<&tls::Fingerprint>,
+    concurrency: ResolvedRemoteConcurrency,
+) -> String {
+    let files_in_flight = match concurrency.files_in_flight() {
+        common::ConcurrencyLimit::Unlimited => "unlimited".to_string(),
+        common::ConcurrencyLimit::Limited(value) => value.to_string(),
+    };
+    match fingerprint {
+        Some(fingerprint) => format!(
+            "RCP_TLS {} {} {} {}",
+            addr,
+            tls::fingerprint_to_hex(fingerprint),
+            files_in_flight,
+            concurrency.max_connections(),
+        ),
+        None => format!(
+            "RCP_TCP {} {} {}",
+            addr,
+            files_in_flight,
+            concurrency.max_connections(),
+        ),
+    }
+}
+
+/// Parse the version-sensitive first stderr record emitted by rcpd.
+pub fn parse_rcpd_readiness(line: &str) -> anyhow::Result<RcpdConnectionInfo> {
+    fn parse_files_in_flight(token: &str) -> anyhow::Result<common::ConcurrencyLimit> {
+        if token == "unlimited" {
+            return Ok(common::ConcurrencyLimit::Unlimited);
+        }
+        let value = token
+            .parse::<usize>()
+            .with_context(|| format!("invalid file limit in rcpd readiness record: {token}"))?;
+        let value = std::num::NonZeroUsize::new(value).with_context(|| {
+            format!("invalid zero file limit in rcpd readiness record: {token}")
+        })?;
+        Ok(common::ConcurrencyLimit::Limited(value))
+    }
+
+    let (kind, rest) = line
+        .split_once(' ')
+        .context("rcpd readiness record is missing its fields")?;
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    let (addr, fingerprint, files_token, connections_token) =
+        match (kind, parts.as_slice()) {
+            ("RCP_TLS", [addr, fingerprint, files, connections]) => (
+                addr,
+                Some(tls::fingerprint_from_hex(fingerprint).with_context(|| {
+                    format!("invalid fingerprint in RCP_TLS line: {fingerprint}")
+                })?),
+                files,
+                connections,
+            ),
+            ("RCP_TCP", [addr, files, connections]) => (addr, None, files, connections),
+            ("RCP_TLS", _) => anyhow::bail!("invalid RCP_TLS line from rcpd: {line}"),
+            ("RCP_TCP", _) => anyhow::bail!("invalid RCP_TCP line from rcpd: {line}"),
+            _ => anyhow::bail!("unexpected output from rcpd (expected RCP_TLS or RCP_TCP): {line}"),
+        };
+    let addr = addr
+        .parse()
+        .with_context(|| format!("invalid address in rcpd readiness record: {addr}"))?;
+    let files_in_flight = parse_files_in_flight(files_token)?;
+    let max_connections = connections_token.parse::<usize>().with_context(|| {
+        format!("invalid effective stream count in rcpd readiness record: {connections_token}")
+    })?;
+    let max_connections = std::num::NonZeroUsize::new(max_connections).with_context(|| {
+        format!("invalid zero stream count in rcpd readiness record: {connections_token}")
+    })?;
+    Ok(RcpdConnectionInfo {
+        addr,
+        fingerprint,
+        files_in_flight,
+        max_connections,
+    })
 }
 
 /// Result of starting an rcpd process.
@@ -866,6 +1039,64 @@ pub struct RcpdProcess {
     _stdout_drain: Option<tokio::task::JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+pub struct PreparedRcpd {
+    session: std::sync::Arc<openssh::Session>,
+    rcpd_path: String,
+    remote: SshSession,
+}
+
+#[instrument]
+pub async fn prepare_rcpd(
+    session: &SshSession,
+    explicit_rcpd_path: Option<&str>,
+    auto_deploy_rcpd: bool,
+) -> anyhow::Result<PreparedRcpd> {
+    tracing::info!("Preparing rcpd server on: {:?}", session);
+    let remote_host = &session.host;
+    let ssh_session = setup_ssh_session(session).await?;
+    let rcpd_path =
+        match try_discover_and_check_version(&ssh_session, explicit_rcpd_path, remote_host).await {
+            Ok(path) => path,
+            Err(error) => {
+                if !auto_deploy_rcpd {
+                    return Err(error);
+                }
+                tracing::info!("rcpd unavailable or incompatible, attempting auto-deployment");
+                let local_rcpd = deploy::find_local_rcpd_binary()
+                    .await
+                    .context("failed to find local rcpd binary for deployment")?;
+                tracing::info!("Found local rcpd binary at {}", local_rcpd.display());
+                let local_version = common::version::ProtocolVersion::current();
+                let deployed_path = deploy::deploy_rcpd(
+                    &ssh_session,
+                    &local_rcpd,
+                    &local_version.cache_tag(),
+                    remote_host,
+                )
+                .await
+                .context("failed to deploy rcpd to remote host")?;
+                check_rcpd_version(&ssh_session, &deployed_path, remote_host)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "deployed rcpd at {deployed_path} failed compatibility verification"
+                        )
+                    })?;
+                tracing::info!("Successfully deployed rcpd to {deployed_path}");
+                if let Err(error) = deploy::cleanup_old_versions(&ssh_session, 3).await {
+                    tracing::warn!("failed to cleanup old versions (non-fatal): {error:#}");
+                }
+                deployed_path
+            }
+        };
+    Ok(PreparedRcpd {
+        session: ssh_session,
+        rcpd_path,
+        remote: session.clone(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 #[instrument]
 pub async fn start_rcpd(
@@ -876,180 +1107,114 @@ pub async fn start_rcpd(
     bind_ip: Option<&str>,
     role: protocol::RcpdRole,
 ) -> anyhow::Result<RcpdProcess> {
-    tracing::info!("Starting rcpd server on: {:?}", session);
-    let remote_host = &session.host;
-    let ssh_session = setup_ssh_session(session).await?;
-    // try to discover rcpd binary on remote host and check version
-    let rcpd_path =
-        match try_discover_and_check_version(&ssh_session, explicit_rcpd_path, remote_host).await {
-            Ok(path) => {
-                // found compatible rcpd
-                path
-            }
-            Err(e) => {
-                // discovery or version check failed
-                if auto_deploy_rcpd {
-                    tracing::info!(
-                        "rcpd not found or version mismatch, attempting auto-deployment"
-                    );
-                    // find local rcpd binary
-                    let local_rcpd = deploy::find_local_rcpd_binary()
-                        .await
-                        .context("failed to find local rcpd binary for deployment")?;
-                    tracing::info!("Found local rcpd binary at {}", local_rcpd.display());
-                    // get version for deployment path
-                    let local_version = common::version::ProtocolVersion::current();
-                    // deploy to remote host
-                    let deployed_path = deploy::deploy_rcpd(
-                        &ssh_session,
-                        &local_rcpd,
-                        &local_version.cache_tag(),
-                        remote_host,
-                    )
-                    .await
-                    .context("failed to deploy rcpd to remote host")?;
-                    check_rcpd_version(&ssh_session, &deployed_path, remote_host)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "deployed rcpd at {} failed compatibility verification",
-                                deployed_path
-                            )
-                        })?;
-                    tracing::info!("Successfully deployed rcpd to {}", deployed_path);
-                    // cleanup old versions (best effort, don't fail if this errors)
-                    if let Err(e) = deploy::cleanup_old_versions(&ssh_session, 3).await {
-                        tracing::warn!("failed to cleanup old versions (non-fatal): {:#}", e);
-                    }
-                    deployed_path
-                } else {
-                    // no auto-deploy, return original error
-                    return Err(e);
-                }
-            }
-        };
-    // run rcpd command remotely
-    let rcpd_args = rcpd_config.to_args();
-    tracing::debug!("rcpd arguments: {:?}", rcpd_args);
-    let mut cmd = ssh_session.arc_command(&rcpd_path);
-    cmd.arg("--role").arg(role.to_string()).args(rcpd_args);
-    // add bind-ip if explicitly provided
-    if let Some(ip) = bind_ip {
-        tracing::debug!("passing --bind-ip {} to rcpd", ip);
-        cmd.arg("--bind-ip").arg(ip);
-    }
-    // configure stdin/stdout/stderr
-    // stdin must be piped so rcpd can monitor it for master disconnection (stdin watchdog)
-    cmd.stdin(openssh::Stdio::piped());
-    cmd.stdout(openssh::Stdio::piped());
-    cmd.stderr(openssh::Stdio::piped());
-    tracing::info!("Will run remotely: {cmd:?}");
-    let mut child = cmd.spawn().await.context("Failed to spawn rcpd command")?;
-    // read connection info from rcpd's stderr
-    // (rcpd uses stderr for the protocol line because stdout is reserved for logs per convention;
-    // rcpd doesn't display progress bars locally - it sends progress data over the network)
-    // format: "RCP_TLS <addr> <fingerprint>" or "RCP_TCP <addr>"
-    let stderr = child.stderr().take().context("rcpd stderr not available")?;
-    let mut stderr_reader = tokio::io::BufReader::new(stderr);
-    let mut line = String::new();
-    use tokio::io::AsyncBufReadExt;
-    stderr_reader
-        .read_line(&mut line)
+    prepare_rcpd(session, explicit_rcpd_path, auto_deploy_rcpd)
+        .await?
+        .spawn(rcpd_config, bind_ip, role)
         .await
-        .context("failed to read connection info from rcpd")?;
-    let line = line.trim();
-    // spawn background task to drain remaining stderr to prevent SIGPIPE and capture diagnostics
-    // we store the JoinHandle to keep the task alive for the lifetime of RcpdProcess
-    let host_stderr = session.host.clone();
-    let stderr_drain = tokio::spawn(async move {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match stderr_reader.read_line(&mut line).await {
-                Ok(0) => break, // EOF
-                Ok(_) => {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        tracing::debug!(host = %host_stderr, "rcpd stderr: {}", trimmed);
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(host = %host_stderr, "rcpd stderr read error: {:#}", e);
-                    break;
-                }
-            }
+}
+
+impl PreparedRcpd {
+    pub async fn spawn(
+        &self,
+        rcpd_config: &protocol::RcpdConfig,
+        bind_ip: Option<&str>,
+        role: protocol::RcpdRole,
+    ) -> anyhow::Result<RcpdProcess> {
+        tracing::info!("Starting prepared rcpd server on: {:?}", self.remote);
+        let session = &self.remote;
+        // run rcpd command remotely
+        let rcpd_args = rcpd_config.to_args();
+        tracing::debug!("rcpd arguments: {:?}", rcpd_args);
+        let mut cmd = self.session.clone().arc_command(&self.rcpd_path);
+        cmd.arg("--role").arg(role.to_string()).args(rcpd_args);
+        // add bind-ip if explicitly provided
+        if let Some(ip) = bind_ip {
+            tracing::debug!("passing --bind-ip {} to rcpd", ip);
+            cmd.arg("--bind-ip").arg(ip);
         }
-    });
-    // spawn background task to drain stdout (rcpd logs go here)
-    // we store the JoinHandle to keep the task alive for the lifetime of RcpdProcess
-    let stdout_drain = if let Some(stdout) = child.stdout().take() {
-        let host_stdout = session.host.clone();
-        let mut stdout_reader = tokio::io::BufReader::new(stdout);
-        Some(tokio::spawn(async move {
+        // configure stdin/stdout/stderr
+        // stdin must be piped so rcpd can monitor it for master disconnection (stdin watchdog)
+        cmd.stdin(openssh::Stdio::piped());
+        cmd.stdout(openssh::Stdio::piped());
+        cmd.stderr(openssh::Stdio::piped());
+        tracing::info!("Will run remotely: {cmd:?}");
+        let mut child = cmd.spawn().await.context("Failed to spawn rcpd command")?;
+        // read connection info from rcpd's stderr
+        // (rcpd uses stderr for the protocol line because stdout is reserved for logs per convention;
+        // rcpd doesn't display progress bars locally - it sends progress data over the network)
+        // format: "RCP_TLS <addr> <fingerprint> <F> <E>" or "RCP_TCP <addr> <F> <E>"
+        let stderr = child.stderr().take().context("rcpd stderr not available")?;
+        let mut stderr_reader = tokio::io::BufReader::new(stderr);
+        let mut line = String::new();
+        use tokio::io::AsyncBufReadExt;
+        stderr_reader
+            .read_line(&mut line)
+            .await
+            .context("failed to read connection info from rcpd")?;
+        let line = line.trim();
+        // spawn background task to drain remaining stderr to prevent SIGPIPE and capture diagnostics
+        // we store the JoinHandle to keep the task alive for the lifetime of RcpdProcess
+        let host_stderr = session.host.clone();
+        let stderr_drain = tokio::spawn(async move {
             let mut line = String::new();
             loop {
                 line.clear();
-                match stdout_reader.read_line(&mut line).await {
+                match stderr_reader.read_line(&mut line).await {
                     Ok(0) => break, // EOF
                     Ok(_) => {
                         let trimmed = line.trim();
                         if !trimmed.is_empty() {
-                            tracing::debug!(host = %host_stdout, "rcpd stdout: {}", trimmed);
+                            tracing::debug!(host = %host_stderr, "rcpd stderr: {}", trimmed);
                         }
                     }
                     Err(e) => {
-                        tracing::debug!(host = %host_stdout, "rcpd stdout read error: {:#}", e);
+                        tracing::debug!(host = %host_stderr, "rcpd stderr read error: {:#}", e);
                         break;
                     }
                 }
             }
-        }))
-    } else {
-        None
-    };
-    tracing::debug!("rcpd connection line: {}", line);
-    let conn_info = if let Some(rest) = line.strip_prefix("RCP_TLS ") {
-        // format: "RCP_TLS <addr> <fingerprint>"
-        let parts: Vec<&str> = rest.split_whitespace().collect();
-        if parts.len() != 2 {
-            anyhow::bail!("invalid RCP_TLS line from rcpd: {}", line);
-        }
-        let addr = parts[0]
-            .parse()
-            .with_context(|| format!("invalid address in RCP_TLS line: {}", parts[0]))?;
-        let fingerprint = tls::fingerprint_from_hex(parts[1])
-            .with_context(|| format!("invalid fingerprint in RCP_TLS line: {}", parts[1]))?;
-        RcpdConnectionInfo {
-            addr,
-            fingerprint: Some(fingerprint),
-        }
-    } else if let Some(rest) = line.strip_prefix("RCP_TCP ") {
-        // format: "RCP_TCP <addr>"
-        let addr = rest
-            .trim()
-            .parse()
-            .with_context(|| format!("invalid address in RCP_TCP line: {}", rest))?;
-        RcpdConnectionInfo {
-            addr,
-            fingerprint: None,
-        }
-    } else {
-        anyhow::bail!(
-            "unexpected output from rcpd (expected RCP_TLS or RCP_TCP): {}",
-            line
+        });
+        // spawn background task to drain stdout (rcpd logs go here)
+        // we store the JoinHandle to keep the task alive for the lifetime of RcpdProcess
+        let stdout_drain = if let Some(stdout) = child.stdout().take() {
+            let host_stdout = session.host.clone();
+            let mut stdout_reader = tokio::io::BufReader::new(stdout);
+            Some(tokio::spawn(async move {
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match stdout_reader.read_line(&mut line).await {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                tracing::debug!(host = %host_stdout, "rcpd stdout: {}", trimmed);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(host = %host_stdout, "rcpd stdout read error: {:#}", e);
+                            break;
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+        tracing::debug!("rcpd connection line: {}", line);
+        let conn_info = parse_rcpd_readiness(line)?;
+        tracing::info!(
+            "rcpd listening on {} (encryption={})",
+            conn_info.addr,
+            conn_info.fingerprint.is_some()
         );
-    };
-    tracing::info!(
-        "rcpd listening on {} (encryption={})",
-        conn_info.addr,
-        conn_info.fingerprint.is_some()
-    );
-    Ok(RcpdProcess {
-        child,
-        conn_info,
-        _stderr_drain: stderr_drain,
-        _stdout_drain: stdout_drain,
-    })
+        Ok(RcpdProcess {
+            child,
+            conn_info,
+            _stderr_drain: stderr_drain,
+            _stdout_drain: stdout_drain,
+        })
+    }
 }
 
 // ============================================================================
@@ -1556,7 +1721,177 @@ mod tests {
     }
 
     #[test]
-    fn effective_connections_meet_finite_file_ceiling() {
+    fn rejects_effective_streams_above_tokio_semaphore_capacity() {
+        let too_many = tokio::sync::Semaphore::MAX_PERMITS.checked_add(1).unwrap();
+        let error = resolve_remote_concurrency(
+            common::ConcurrencyLimit::Unlimited,
+            std::num::NonZeroUsize::new(too_many).unwrap(),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Tokio semaphore maximum"));
+    }
+
+    #[test]
+    fn rejects_nonoverflowing_pending_capacity_above_tokio_maximum() {
+        let half_plus_one = tokio::sync::Semaphore::MAX_PERMITS / 2 + 1;
+        let error = resolve_remote_concurrency(
+            common::ConcurrencyLimit::Unlimited,
+            std::num::NonZeroUsize::new(half_plus_one).unwrap(),
+            std::num::NonZeroUsize::new(2).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("pending file capacity"));
+    }
+
+    #[test]
+    fn readiness_records_report_negotiated_file_and_stream_limits() {
+        let fingerprint_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let cases = [
+            (
+                "RCP_TCP 127.0.0.1:1234 8 8".to_string(),
+                common::ConcurrencyLimit::Limited(nonzero(8)),
+                nonzero(8),
+                None,
+            ),
+            (
+                "RCP_TCP 127.0.0.1:1234 unlimited 100".to_string(),
+                common::ConcurrencyLimit::Unlimited,
+                nonzero(100),
+                None,
+            ),
+            (
+                format!("RCP_TLS 127.0.0.1:1234 {fingerprint_hex} 32 16"),
+                common::ConcurrencyLimit::Limited(nonzero(32)),
+                nonzero(16),
+                Some(tls::fingerprint_from_hex(fingerprint_hex).unwrap()),
+            ),
+        ];
+        for (record, expected_files, expected_streams, expected_fingerprint) in cases {
+            let parsed = parse_rcpd_readiness(&record).unwrap();
+            assert_eq!(parsed.addr, "127.0.0.1:1234".parse().unwrap());
+            assert_eq!(parsed.fingerprint, expected_fingerprint);
+            assert_eq!(parsed.files_in_flight, expected_files);
+            assert_eq!(parsed.max_connections, expected_streams);
+        }
+    }
+
+    #[test]
+    fn readiness_records_reject_invalid_limit_tokens() {
+        for record in [
+            "RCP_TCP 127.0.0.1:1234 0 1",
+            "RCP_TCP 127.0.0.1:1234 automatic 1",
+            "RCP_TCP 127.0.0.1:1234 1 0",
+        ] {
+            assert!(
+                parse_rcpd_readiness(record).is_err(),
+                "invalid readiness record was accepted: {record}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn version_probe_timeout_retains_the_elapsed_source() {
+        let started = std::time::Instant::now();
+        let error = run_remote_version_probe(
+            "example.test",
+            std::future::pending::<anyhow::Result<std::process::Output>>(),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("did not complete --protocol-version within 2s")
+        );
+        assert!(error.chain().count() >= 2);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepared_rcpd_spawns_both_roles_after_one_preparation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "rcp-prepared-rcpd-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let script = directory.join("rcpd");
+        let marker = directory.join("version-probes");
+        let version = common::version::ProtocolVersion::current()
+            .to_json()
+            .unwrap();
+        let contents = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf 'probe\\n' >> {}\n  printf '%s\\n' {}\n  exit 0\nfi\nprintf '%s\\n' 'RCP_TCP 127.0.0.1:1234 4 4' >&2\ncat >/dev/null\n",
+            shell_escape(marker.to_str().unwrap()),
+            shell_escape(&version),
+        );
+        std::fs::write(&script, contents).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = protocol::RcpdConfig {
+            verbose: 0,
+            fail_early: false,
+            max_workers: 0,
+            max_blocking_threads: 0,
+            files_in_flight: protocol::RcpdFilesInFlight::Explicit(
+                common::ConcurrencyLimit::Limited(nonzero(4)),
+            ),
+            ops_throttle: 0,
+            iops_throttle: 0,
+            chunk_size: 0,
+            auto_meta: None,
+            auto_meta_histogram: false,
+            auto_meta_histogram_log: None,
+            auto_meta_histogram_interval: std::time::Duration::from_secs(1),
+            dereference: false,
+            require_toctou_safe: false,
+            overwrite: false,
+            overwrite_compare: "size,mtime".to_string(),
+            overwrite_manifest_max_entries: protocol::DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES,
+            overwrite_filter: None,
+            ignore_existing: false,
+            skip_specials: false,
+            debug_log_prefix: None,
+            port_ranges: None,
+            progress: false,
+            progress_delay: None,
+            remote_copy_conn_timeout_sec: 1,
+            remote_keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
+            network_profile: NetworkProfile::default(),
+            buffer_size: None,
+            max_connections: 4,
+            pending_writes_multiplier: 1,
+            chrome_trace_prefix: None,
+            flamegraph_prefix: None,
+            profile_level: None,
+            tokio_console: false,
+            tokio_console_port: None,
+            encryption: false,
+            master_cert_fingerprint: None,
+        };
+        let prepared = prepare_rcpd(&SshSession::local(), Some(script.to_str().unwrap()), false)
+            .await
+            .unwrap();
+        let source = prepared
+            .spawn(&config, None, protocol::RcpdRole::Source)
+            .await
+            .unwrap();
+        let destination = prepared
+            .spawn(&config, None, protocol::RcpdRole::Destination)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "probe\n");
+        wait_for_rcpd_process(source.child).await.unwrap();
+        wait_for_rcpd_process(destination.child).await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn tcp_config_effective_connections_meet_finite_file_ceiling() {
         let configured = nonzero(8);
         for (files_in_flight, expected) in [(3, 3), (8, 8), (12, 8)] {
             assert_eq!(
@@ -1570,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_connections_keep_configured_ceiling_when_files_are_unlimited() {
+    fn tcp_config_effective_connections_keep_configured_ceiling_when_files_are_unlimited() {
         assert_eq!(
             effective_max_connections(common::ConcurrencyLimit::Unlimited, nonzero(8)),
             nonzero(8),
@@ -1578,7 +1913,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_file_capacity_uses_connections_and_multiplier() {
+    fn tcp_config_pending_file_capacity_uses_connections_and_multiplier() {
         let config = TcpConfig::default()
             .with_max_connections(3)
             .with_pending_writes_multiplier(4);
@@ -1586,7 +1921,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_file_capacity_rejects_overflow() {
+    fn tcp_config_pending_file_capacity_rejects_overflow() {
         let config = TcpConfig::default()
             .with_max_connections(usize::MAX)
             .with_pending_writes_multiplier(2);
@@ -1598,7 +1933,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_file_capacity_rejects_zero_connections() {
+    fn tcp_config_pending_file_capacity_rejects_zero_connections() {
         let config = TcpConfig::default().with_max_connections(0);
         let error = config.max_pending_files().unwrap_err();
         assert!(
@@ -1610,7 +1945,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_file_capacity_rejects_zero_multiplier() {
+    fn tcp_config_pending_file_capacity_rejects_zero_multiplier() {
         let config = TcpConfig::default().with_pending_writes_multiplier(0);
         let error = config.max_pending_files().unwrap_err();
         assert!(

@@ -929,8 +929,8 @@ fn test_localhost_prefix_performs_local_copy() {
         .stdout(predicates::str::contains(
             "Paths with 'localhost:' prefix are treated as local",
         ))
-        // should NOT show "Starting rcpd" which would indicate remote mode
-        .stdout(predicates::str::contains("Starting rcpd").not());
+        // should NOT show a prepared rcpd spawn, which would indicate remote mode
+        .stdout(predicates::str::contains("Starting prepared rcpd server").not());
     assert_eq!(get_file_content(&dst_file), "localhost test content");
 }
 
@@ -963,7 +963,7 @@ fn test_path_with_colons_is_local() {
         // should NOT show warning about localhost (it's just a regular local path, logs go to stdout)
         .stdout(predicates::str::contains("localhost").not())
         // should NOT try to use rcpd
-        .stdout(predicates::str::contains("Starting rcpd").not());
+        .stdout(predicates::str::contains("Starting prepared rcpd server").not());
     assert_eq!(get_file_content(&dst_file), "timestamp path content");
 }
 

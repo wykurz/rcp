@@ -21,16 +21,6 @@ test-group = 'serial'
 filter = 'binary(~docker)'
 test-group = 'serial'
 
-# saturation tests mutate the process-wide throttle admission semaphores.
-# Running them in parallel with each other
-# (or with anything else that depends on the global limit) can race the
-# `Semaphore::setup()` reconfiguration and produce flaky timeouts. Serialize
-# them by name — new saturation tests use a `max_files_in_flight_tests`
-# submodule. Explicit legacy compatibility tests remain under `max_open_files_tests`.
-[[profile.default.overrides]]
-filter = 'test(max_files_in_flight) | test(max_open_files)'
-test-group = 'serial'
-
 [profile.docker]
 # docker profile runs Docker integration tests (multi-host and chaos tests)
 # these tests are normally ignored and require Docker containers

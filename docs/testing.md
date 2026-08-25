@@ -200,27 +200,29 @@ cd tests/docker
 - Overwrite protection behavior
 - Error handling for missing files
 
-**Connection ordering scenarios** (`docker_multi_host_role_ordering.rs`):
+**Source-first startup and role assignment** (`docker_multi_host_role_ordering.rs`):
 
-- Role assignment verification regardless of connection timing
-- Delayed rcpd connection tests (forces specific connection order)
+- Source readiness before destination daemon startup, including a deliberately delayed source role
+- Repeated role assignment verification
 - Rapid successive operations
 - Bidirectional copies (A→B then B→A)
 
 **Key technique - Delayed wrapper**:
 
-The tests use a shell wrapper to delay rcpd startup on one host:
+The tests use a shell wrapper to delay source-role startup on one host:
 
 ```rust
-env.exec_rcp_with_delayed_rcpd(
-    "host-a",      // source (delayed)
-    "host-b",      // destination (connects first)
-    2000,          // delay in ms
-    &["host-a:/tmp/src.txt", "host-b:/tmp/dst.txt"]
+env.exec_rcp_with_delayed_source_rcpd(
+    "host-a", // source role is delayed
+    "host-b", // destination role is not delayed
+    2000,     // delay in ms
+    &["host-a:/tmp/src.txt", "host-b:/tmp/dst.txt"],
 )
 ```
 
-This deterministically reproduces timing scenarios that caused the original role-matching bug.
+The wrapper lets `--protocol-version` probes complete immediately so it preserves their two-second
+deadline. The test asserts that source readiness is logged before destination spawn even though the
+source role is delayed.
 
 ### Developer Setup (WSL2)
 

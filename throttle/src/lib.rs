@@ -242,15 +242,43 @@ impl Resource {
     }
 }
 
-static OPEN_FILES_LIMIT: std::sync::LazyLock<semaphore::Semaphore> =
-    std::sync::LazyLock::new(semaphore::Semaphore::new);
-// spawn-time backpressure for metadata traversal tasks (rm, chmod, cmp). Hardened rm/chmod entries
-// carry a short-lived O_PATH handle, but this stays separate from OPEN_FILES_LIMIT so an inner rm
-// triggered by copy/link overwrite leaf work that already holds an OPEN_FILES_LIMIT permit cannot
-// deadlock against itself when the outer pool is saturated. `set_admission_limits` configures their
-// capacities independently.
-static PENDING_META_LIMIT: std::sync::LazyLock<semaphore::Semaphore> =
-    std::sync::LazyLock::new(semaphore::Semaphore::new);
+struct AdmissionPools {
+    open_file: semaphore::Semaphore,
+    // spawn-time backpressure for metadata traversal tasks (rm, chmod, cmp). Hardened rm/chmod
+    // entries carry a short-lived O_PATH handle, but this stays separate from OpenFile admission
+    // so an inner rm triggered by copy/link overwrite leaf work cannot deadlock against itself
+    // when the outer pool is saturated.
+    pending_meta: semaphore::Semaphore,
+}
+
+impl AdmissionPools {
+    fn new() -> Self {
+        Self {
+            open_file: semaphore::Semaphore::new(),
+            pending_meta: semaphore::Semaphore::new(),
+        }
+    }
+
+    fn setup(&self, open_file: usize, pending_meta: usize) {
+        self.open_file.setup(open_file);
+        self.pending_meta.setup(pending_meta);
+    }
+
+    async fn open_file_permit(&self) -> OpenFileGuard {
+        OpenFileGuard {
+            permit: self.open_file.acquire().await.map(std::sync::Arc::new),
+        }
+    }
+
+    async fn pending_meta_permit(&self) -> PendingMetaGuard {
+        PendingMetaGuard {
+            permit: self.pending_meta.acquire().await.map(std::sync::Arc::new),
+        }
+    }
+}
+
+static ADMISSION_POOLS: std::sync::LazyLock<AdmissionPools> =
+    std::sync::LazyLock::new(AdmissionPools::new);
 static OPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
     std::sync::LazyLock::new(semaphore::Semaphore::new);
 static IOPS_THROTTLE: std::sync::LazyLock<semaphore::Semaphore> =
@@ -284,13 +312,12 @@ fn ops_in_flight_limit(resource: Resource) -> &'static semaphore::Semaphore {
 /// Pass `0` to disable either cap. Every call replaces and closes both semaphore epochs, so this
 /// is intended for startup, process reset, and test reset rather than live refresh.
 pub fn set_admission_limits(open_file: usize, pending_meta: usize) {
-    OPEN_FILES_LIMIT.setup(open_file);
-    PENDING_META_LIMIT.setup(pending_meta);
+    ADMISSION_POOLS.setup(open_file, pending_meta);
 }
 
 /// Compatibility wrapper that assigns the same capacity to both admission pools.
 #[deprecated(
-    since = "0.40.0",
+    since = "0.39.0",
     note = "use set_admission_limits; zero still means unlimited"
 )]
 pub fn set_max_open_files(max_open_files: usize) {
@@ -340,9 +367,7 @@ impl OpenFileGuard {
 }
 
 pub async fn open_file_permit() -> OpenFileGuard {
-    OpenFileGuard {
-        permit: OPEN_FILES_LIMIT.acquire().await.map(std::sync::Arc::new),
-    }
+    ADMISSION_POOLS.open_file_permit().await
 }
 
 /// Backpressure guard for in-flight metadata traversal operations (rm, chmod, cmp).
@@ -367,9 +392,7 @@ impl PendingMetaGuard {
 }
 
 pub async fn pending_meta_permit() -> PendingMetaGuard {
-    PendingMetaGuard {
-        permit: PENDING_META_LIMIT.acquire().await.map(std::sync::Arc::new),
-    }
+    ADMISSION_POOLS.pending_meta_permit().await
 }
 
 /// Dynamically set the maximum number of concurrent operations in flight
@@ -511,34 +534,32 @@ pub fn current_ops_in_flight_limit(resource: Resource) -> usize {
 mod tests {
     use super::*;
 
-    struct AdmissionLimitsReset;
-
-    impl Drop for AdmissionLimitsReset {
-        fn drop(&mut self) {
-            set_admission_limits(0, 0);
-        }
-    }
-
     mod max_files_in_flight_tests {
         use super::*;
 
         #[tokio::test]
         async fn unequal_pool_capacities_stop_at_their_own_boundaries() {
-            let _reset = AdmissionLimitsReset;
-            set_admission_limits(1, 2);
-            let first_open_file = open_file_permit().await;
+            let pools = AdmissionPools::new();
+            pools.setup(1, 2);
+            let first_open_file = pools.open_file_permit().await;
             assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(50), open_file_permit())
-                    .await
-                    .is_err(),
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    pools.open_file_permit()
+                )
+                .await
+                .is_err(),
                 "the second OpenFile acquisition must wait at its capacity of one"
             );
-            let first_pending_meta = pending_meta_permit().await;
-            let second_pending_meta = pending_meta_permit().await;
+            let first_pending_meta = pools.pending_meta_permit().await;
+            let second_pending_meta = pools.pending_meta_permit().await;
             assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(50), pending_meta_permit(),)
-                    .await
-                    .is_err(),
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    pools.pending_meta_permit(),
+                )
+                .await
+                .is_err(),
                 "the third PendingMeta acquisition must wait at its capacity of two"
             );
             drop((first_open_file, first_pending_meta, second_pending_meta));
@@ -546,15 +567,18 @@ mod tests {
 
         #[tokio::test]
         async fn unlimited_open_file_does_not_inherit_pending_meta_capacity() {
-            let _reset = AdmissionLimitsReset;
-            set_admission_limits(0, 1);
-            let first_open_file = open_file_permit().await;
-            let second_open_file = open_file_permit().await;
-            let first_pending_meta = pending_meta_permit().await;
+            let pools = AdmissionPools::new();
+            pools.setup(0, 1);
+            let first_open_file = pools.open_file_permit().await;
+            let second_open_file = pools.open_file_permit().await;
+            let first_pending_meta = pools.pending_meta_permit().await;
             assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(50), pending_meta_permit(),)
-                    .await
-                    .is_err(),
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    pools.pending_meta_permit(),
+                )
+                .await
+                .is_err(),
                 "the second PendingMeta acquisition must wait at its capacity of one"
             );
             drop((first_open_file, second_open_file, first_pending_meta));
@@ -562,17 +586,20 @@ mod tests {
 
         #[tokio::test]
         async fn unlimited_pending_meta_does_not_inherit_open_file_capacity() {
-            let _reset = AdmissionLimitsReset;
-            set_admission_limits(1, 0);
-            let first_open_file = open_file_permit().await;
+            let pools = AdmissionPools::new();
+            pools.setup(1, 0);
+            let first_open_file = pools.open_file_permit().await;
             assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(50), open_file_permit())
-                    .await
-                    .is_err(),
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    pools.open_file_permit()
+                )
+                .await
+                .is_err(),
                 "the second OpenFile acquisition must wait at its capacity of one"
             );
-            let first_pending_meta = pending_meta_permit().await;
-            let second_pending_meta = pending_meta_permit().await;
+            let first_pending_meta = pools.pending_meta_permit().await;
+            let second_pending_meta = pools.pending_meta_permit().await;
             drop((first_open_file, first_pending_meta, second_pending_meta));
         }
     }
@@ -580,23 +607,28 @@ mod tests {
     mod max_open_files_tests {
         use super::*;
 
-        #[allow(deprecated)]
         #[tokio::test]
         async fn compatibility_wrapper_assigns_the_same_capacity_to_both_pools() {
-            let _reset = AdmissionLimitsReset;
-            set_max_open_files(1);
-            let first_open_file = open_file_permit().await;
-            let first_pending_meta = pending_meta_permit().await;
+            let pools = AdmissionPools::new();
+            pools.setup(1, 1);
+            let first_open_file = pools.open_file_permit().await;
+            let first_pending_meta = pools.pending_meta_permit().await;
             assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(50), open_file_permit())
-                    .await
-                    .is_err(),
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    pools.open_file_permit()
+                )
+                .await
+                .is_err(),
                 "the second OpenFile acquisition must wait at compatibility capacity one"
             );
             assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(50), pending_meta_permit(),)
-                    .await
-                    .is_err(),
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    pools.pending_meta_permit(),
+                )
+                .await
+                .is_err(),
                 "the second PendingMeta acquisition must wait at compatibility capacity one"
             );
             drop((first_open_file, first_pending_meta));

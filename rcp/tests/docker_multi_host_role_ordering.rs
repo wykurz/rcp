@@ -1,12 +1,16 @@
-//! Tests for role ordering and connection timing scenarios.
+//! Tests for remote role assignment and source-first startup ordering.
 //!
-//! These tests verify the fix for the role-matching bug where source/destination roles could be swapped if rcpd connections arrived out of order (commit c03db61).
+//! These tests retain coverage for the role-matching bug where source/destination roles could be
+//! swapped if rcpd connections arrived out of order (commit c03db61). The current protocol also
+//! makes that ordering deterministic: source readiness and control connections precede destination
+//! startup.
 //!
 //! ## Background
 //!
-//! Previously, rcp would assign roles (Source/Destination) based on connection arrival order.
-//! If the destination rcpd connected first, it could be misidentified as the source.
-//! The fix uses the host information from the initial connection to properly identify roles.
+//! Previously, rcp would assign roles (Source/Destination) based on connection arrival order. If
+//! the destination rcpd connected first, it could be misidentified as the source. Explicit role
+//! assignment fixed that bug, and source-first startup now prevents the destination from racing
+//! source readiness at all.
 //!
 //! ## Prerequisites
 //!
@@ -136,31 +140,26 @@ fn test_bidirectional_copies() -> Result<()> {
     Ok(())
 }
 
-/// Test role assignment when destination connects FIRST (the bug scenario)
+/// Tests that destination startup waits for delayed source readiness.
 ///
-/// This is THE critical test for the role-matching bug fix (commit c03db61).
-/// By delaying the source rcpd, we force the destination to connect first,
-/// which would cause role swapping in the buggy code.
-///
-/// With the fix, roles are correctly assigned based on host information
-/// rather than connection order.
+/// The source daemon's role launch is deliberately delayed while version discovery remains prompt.
+/// Source-first bootstrap must wait for that source readiness record before starting destination.
 #[test]
 #[ignore = "requires Docker containers (run: cd tests/docker && ./test-helpers.sh start)"]
-fn test_destination_connects_first() -> Result<()> {
+fn test_destination_waits_for_delayed_source_startup() -> Result<()> {
     let env = DockerEnv::new()?;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
-    let src_path = format!("/tmp/role-inverted-{}.txt", timestamp);
-    let dst_path = format!("/tmp/role-inverted-{}-dst.txt", timestamp);
+    let src_path = format!("/tmp/role-delayed-source-{}.txt", timestamp);
+    let dst_path = format!("/tmp/role-delayed-source-{}-dst.txt", timestamp);
     // create test file on source
-    env.write_file("host-a", &src_path, b"destination connects first test")?;
-    // delay source rcpd by 2 seconds, forcing destination to connect first
-    // this tests the exact scenario that caused the bug
-    let output = env.exec_rcp_with_delayed_rcpd(
+    env.write_file("host-a", &src_path, b"delayed source startup test")?;
+    // delay source role startup by two seconds; destination must not start during that delay
+    let output = env.exec_rcp_with_delayed_source_rcpd(
         "host-a", // source host to delay
         "host-b", // destination host (no delay)
-        2000,     // 2 second delay on source
+        2000,     // two-second delay on source
         &[
             &format!("host-a:{}", src_path),
             &format!("host-b:{}", dst_path),
@@ -169,9 +168,20 @@ fn test_destination_connects_first() -> Result<()> {
     if !output.status.success() {
         eprintln!("stdout: {}", String::from_utf8_lossy(&output.stdout));
         eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
-        panic!("Copy should succeed even when destination connects first");
+        panic!("Copy should succeed after delayed source startup");
     }
-    // verify file is on the DESTINATION (host-b), not source
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let source_ready = stdout
+        .find("Source rcpd at")
+        .expect("verbose output should report source readiness");
+    let destination_start = stdout
+        .find("Starting prepared rcpd server on: SshSession { user: None, host: \"host-b\"")
+        .expect("verbose output should report destination startup");
+    assert!(
+        source_ready < destination_start,
+        "destination startup must follow source readiness"
+    );
+    // verify the file is on the destination (host-b), not the source
     assert!(
         env.file_exists("host-b", &dst_path)?,
         "File should be on host-b (destination)"
@@ -182,17 +192,17 @@ fn test_destination_connects_first() -> Result<()> {
     );
     // verify content
     let content = env.read_file("host-b", &dst_path)?;
-    assert_eq!(b"destination connects first test", content.as_slice());
+    assert_eq!(b"delayed source startup test", content.as_slice());
     // cleanup
     env.remove_file("host-a", &src_path)?;
     env.remove_file("host-b", &dst_path)?;
     Ok(())
 }
 
-/// Test that role assignment works correctly regardless of which rcpd connects first
+/// Tests that role assignment remains consistent across repeated copies.
 ///
-/// This test runs multiple operations to verify consistency, but doesn't
-/// deterministically force connection ordering (see test_destination_connects_first for that).
+/// Source-first startup makes the connection ordering deterministic; repeated operations retain
+/// regression coverage for the original role-assignment bug.
 #[test]
 #[ignore = "requires Docker containers (run: cd tests/docker && ./test-helpers.sh start)"]
 fn test_consistent_role_assignment() -> Result<()> {

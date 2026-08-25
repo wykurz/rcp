@@ -3174,12 +3174,13 @@ async fn handle_connection(
     src: &std::path::Path,
     dst: &std::path::Path,
     tcp_config: &remote::TcpConfig,
+    concurrency: remote::ResolvedRemoteConcurrency,
     error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
     tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Destination control connection established");
-    let pool_size = tcp_config.max_connections;
-    let max_pending_files = tcp_config.max_pending_files()?;
+    let pool_size = concurrency.max_connections().get();
+    let max_pending_files = concurrency.max_pending_files().get();
     // the control stream's socket options (no-delay, buffers, liveness) were applied by the caller
     // when it accepted the connection
     // wrap control connection with TLS if configured; the handshake is bounded because a peer that
@@ -4098,6 +4099,7 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
     // issues no xattr syscall at all.
     capture: ExtendedMetadataCapture,
     tcp_config: &remote::TcpConfig,
+    concurrency: remote::ResolvedRemoteConcurrency,
     bind_ip: Option<&str>,
     cert_key: Option<&remote::tls::CertifiedKey>,
     dest_cert_fingerprint: Option<remote::protocol::CertFingerprint>,
@@ -4179,6 +4181,7 @@ pub async fn run_source<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
                 src,
                 dst,
                 tcp_config,
+                concurrency,
                 error_collector.clone(),
                 tls_acceptor,
             )
