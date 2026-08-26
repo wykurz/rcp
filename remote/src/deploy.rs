@@ -108,6 +108,28 @@ use std::time::Duration;
 const LOCAL_RCPD_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 const LOCAL_RCPD_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 const REMOTE_STAGING_OWNER_GRACE: Duration = Duration::from_secs(1);
+const REMOTE_STAGING_FINALIZATION_MINIMUM: Duration = Duration::from_secs(60);
+const DEPLOYMENT_READY_RECORD: &str = "RCP_DEPLOY_READY";
+const DEPLOYMENT_READY_OUTPUT_LIMIT: usize = 4096;
+const DEPLOYMENT_WRITE_CHUNK_SIZE: usize = 64 * 1024;
+
+struct AbortOnDropTask<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortOnDropTask<T> {
+    fn new(task: tokio::task::JoinHandle<T>) -> Self {
+        Self(task)
+    }
+
+    async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
+        (&mut self.0).await
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 const TRANSFER_HINTS: &str = "\
     This may indicate:\n\
@@ -121,7 +143,7 @@ const TRANSFER_HINTS: &str = "\
 /// pipe because the remote command exited early), this formats the error to
 /// include remote stderr (which reveals the actual cause) and the exit status.
 fn format_write_error(
-    write_err: &std::io::Error,
+    write_err: &dyn std::fmt::Display,
     stderr_data: &[u8],
     status: &dyn std::fmt::Display,
 ) -> String {
@@ -129,7 +151,7 @@ fn format_write_error(
     let stderr = stderr.trim();
     if stderr.is_empty() {
         format!(
-            "failed to write base64 data to remote stdin: {write_err}\n\
+            "failed to write base64 data to remote stdin: {write_err:#}\n\
             \n\
             remote command exited with status: {status}\n\
             remote stderr was empty\n\
@@ -138,7 +160,7 @@ fn format_write_error(
         )
     } else {
         format!(
-            "failed to write base64 data to remote stdin: {write_err}\n\
+            "failed to write base64 data to remote stdin: {write_err:#}\n\
             \n\
             remote stderr: {stderr}\n\
             \n\
@@ -148,7 +170,7 @@ fn format_write_error(
 }
 
 fn validate_transfer_completion(
-    write_result: Option<std::io::Result<()>>,
+    write_result: Option<anyhow::Result<()>>,
     shutdown_result: Option<std::io::Result<()>>,
     stderr_data: &crate::CapturedOutput,
     status: &std::process::ExitStatus,
@@ -178,11 +200,27 @@ fn validate_transfer_completion(
     Ok(())
 }
 
+fn reconcile_transfer_finish<T>(
+    write_result: Option<anyhow::Result<()>>,
+    finish_result: anyhow::Result<T>,
+) -> anyhow::Result<(Option<anyhow::Result<()>>, T)> {
+    match (write_result, finish_result) {
+        (Some(Err(write_error)), Err(finish_error)) => {
+            tracing::debug!(
+                "remote deployment finalization also failed after the payload write failed: {finish_error:#}"
+            );
+            Err(write_error)
+        }
+        (write_result, Ok(finish)) => Ok((write_result, finish)),
+        (_, Err(finish_error)) => Err(finish_error),
+    }
+}
+
 /// Find local static rcpd binary suitable for deployment
 ///
 /// Searches in the following order:
 /// 1. Same directory as the current rcp executable
-/// 2. PATH via `which rcpd`
+/// 2. PATH via the shell's `command -v rcpd`
 ///
 /// This covers:
 /// - Development builds (cargo run/test): rcpd is in same directory as rcp in target/
@@ -233,25 +271,21 @@ pub(crate) async fn find_local_rcpd_binary_with_context(
     {
         let path = bin_dir.join("rcpd");
         searched_paths.push(format!("Same directory: {}", path.display()));
-        if path.exists() && path.is_file() {
-            // The probe owns a child and has its own hard two-second deadline plus bounded reap
-            // funnel. Await that owner directly: an outer cancellation select could drop it before
-            // the funnel runs. Peer failure can therefore delay this path by at most the existing
-            // protocol-version deadline, never indefinitely.
-            match check_local_rcpd_version(&path, &local_version, LOCAL_RCPD_VERSION_TIMEOUT).await
-            {
-                Ok(()) => {
-                    tracing::info!("Found compatible local rcpd binary at {}", path.display());
-                    return Ok(path);
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "skipping local rcpd candidate {}: {:#}",
-                        path.display(),
-                        &error
-                    );
-                    searched_paths.push(format!("  rejected {}: {error:#}", path.display()));
-                }
+        // the probe owns a fixed local shell child and has its own hard two-second deadline plus
+        // bounded reap funnel. Executing the candidate happens in that child, so a stalled candidate
+        // path is a rejection and cannot prevent the PATH fallback.
+        match check_local_rcpd_version(&path, &local_version, LOCAL_RCPD_VERSION_TIMEOUT).await {
+            Ok(()) => {
+                tracing::info!("Found compatible local rcpd binary at {}", path.display());
+                return Ok(path);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "skipping local rcpd candidate {}: {:#}",
+                    path.display(),
+                    &error
+                );
+                searched_paths.push(format!("  rejected {}: {error:#}", path.display()));
             }
         }
     }
@@ -259,8 +293,10 @@ pub(crate) async fn find_local_rcpd_binary_with_context(
     // try PATH (covers cargo install, nixpkgs, and other system installations)
     tracing::debug!("Trying to find rcpd in PATH");
     let which = tokio::spawn(async {
-        tokio::process::Command::new("which")
-            .arg("rcpd")
+        // keep PATH traversal in a known-local shell child. Spawning `which` by name would perform
+        // the same potentially stalled PATH lookup in the parent's synchronous spawn call.
+        tokio::process::Command::new("/bin/sh")
+            .args(["-c", "command -v rcpd"])
             .kill_on_drop(true)
             .output()
             .await
@@ -269,7 +305,11 @@ pub(crate) async fn find_local_rcpd_binary_with_context(
     let which_output = path_discovery_result(
         preparation,
         preparation
-            .run_owned(which, LOCAL_RCPD_CLEANUP_GRACE, "local rcpd PATH discovery")
+            .run_abortable_with_deadline(
+                which,
+                "local rcpd PATH discovery",
+                crate::BootstrapDeadline::new(LOCAL_RCPD_VERSION_TIMEOUT),
+            )
             .await,
         &mut searched_paths,
     )?;
@@ -282,26 +322,23 @@ pub(crate) async fn find_local_rcpd_binary_with_context(
         if !path_str.is_empty() {
             let path = PathBuf::from(path_str);
             searched_paths.push(format!("PATH: {}", path.display()));
-            if path.exists() && path.is_file() {
-                // Keep child ownership inside the probe's fixed-deadline termination/reap funnel.
-                match check_local_rcpd_version(&path, &local_version, LOCAL_RCPD_VERSION_TIMEOUT)
-                    .await
-                {
-                    Ok(()) => {
-                        tracing::info!(
-                            "Found compatible local rcpd binary in PATH: {}",
-                            path.display()
-                        );
-                        return Ok(path);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "skipping local rcpd candidate {}: {:#}",
-                            path.display(),
-                            &error
-                        );
-                        searched_paths.push(format!("  rejected {}: {error:#}", path.display()));
-                    }
+            // keep child ownership inside the probe's fixed-deadline termination/reap funnel.
+            match check_local_rcpd_version(&path, &local_version, LOCAL_RCPD_VERSION_TIMEOUT).await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        "Found compatible local rcpd binary in PATH: {}",
+                        path.display()
+                    );
+                    return Ok(path);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "skipping local rcpd candidate {}: {:#}",
+                        path.display(),
+                        &error
+                    );
+                    searched_paths.push(format!("  rejected {}: {error:#}", path.display()));
                 }
             }
         }
@@ -361,8 +398,12 @@ async fn check_local_rcpd_version(
 
 /// Run one version probe without blocking a Tokio worker or trusting pipe EOF indefinitely.
 async fn run_local_version_probe(path: &Path, probe_timeout: Duration) -> anyhow::Result<Output> {
-    let mut child = tokio::process::Command::new(path)
-        .arg("--protocol-version")
+    // launch a known-local shell first, then exec the candidate in that child. Spawning the
+    // candidate path directly makes the parent's spawn call wait for exec(2); a path on a stalled
+    // network filesystem could therefore block the Tokio worker before the probe timer starts.
+    let mut child = tokio::process::Command::new("/bin/sh")
+        .args(["-c", "exec \"$1\" --protocol-version", "rcp-version-probe"])
+        .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -535,6 +576,7 @@ pub async fn deploy_rcpd(
         version,
         remote_host,
         &crate::PreparationContext::new(cancellation.clone()),
+        crate::DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
     )
     .await
 }
@@ -545,6 +587,7 @@ pub(crate) async fn deploy_rcpd_with_context<S: crate::SshSessionOwner>(
     version: &str,
     remote_host: &str,
     preparation: &crate::PreparationContext,
+    bootstrap_timeout: std::time::Duration,
 ) -> anyhow::Result<String> {
     tracing::info!(
         "Deploying rcpd {} to remote host '{}'",
@@ -578,7 +621,12 @@ pub(crate) async fn deploy_rcpd_with_context<S: crate::SshSessionOwner>(
     tracing::debug!("Expected SHA-256: {}", hex::encode(&expected_checksum));
 
     // validate HOME is set and construct remote path
-    let home = crate::get_remote_home_with_context(session, preparation, None).await?;
+    let home = crate::get_remote_home_with_context(
+        session,
+        preparation,
+        crate::BootstrapDeadline::new(bootstrap_timeout),
+    )
+    .await?;
     preparation.ensure_active()?;
     let remote_path = format!("{}/.cache/rcp/bin/rcpd-{}", home, version);
 
@@ -586,30 +634,19 @@ pub(crate) async fn deploy_rcpd_with_context<S: crate::SshSessionOwner>(
     // ownership through its EXIT trap. A transfer that fails after creating the file must not leak
     // a dotfile that `cleanup_old_versions` will never match.
     let temp_path = remote_temp_path(&remote_path)?;
-    // one owned task retains the whole verify-then-publish transaction if its caller is dropped.
-    // the remote shell itself removes the private temp path on every non-published exit, so even
-    // runtime shutdown cannot strand cleanup in a Tokio task that will never be polled again.
-    let deployment_session = session.clone();
-    let deployment_preparation = preparation.clone();
-    let deployment_remote_path = remote_path.clone();
-    let deployment = tokio::spawn(async move {
-        transfer_binary_base64(
-            &deployment_session,
-            &binary,
-            &deployment_remote_path,
-            &temp_path,
-            &expected_checksum,
-            &deployment_preparation,
-        )
-        .await
-    });
-    preparation
-        .run_owned(
-            deployment,
-            REMOTE_STAGING_OWNER_GRACE,
-            "remote deployment transaction",
-        )
-        .await?;
+    // the transfer itself has no bootstrap deadline: the configured timeout bounds establishing
+    // each remote stage, not the time needed to transmit the binary. On cancellation, the local
+    // channel is closed after a short grace; the remote shell's EXIT trap owns the unique temp path.
+    transfer_binary_base64(
+        session,
+        &binary,
+        &remote_path,
+        &temp_path,
+        &expected_checksum,
+        preparation,
+        crate::BootstrapDeadline::new(bootstrap_timeout),
+    )
+    .await?;
 
     Ok(remote_path)
 }
@@ -632,7 +669,10 @@ fn deployment_command(
          trap cleanup EXIT; \
          trap 'exit 1' HUP INT TERM; \
          mkdir -p {} && \
-         base64 -d > {} && \
+         exec 3> {} && \
+         printf '{}\n' && \
+         base64 -d >&3 && \
+         exec 3>&- && \
          chmod 700 {} && \
          actual_checksum=$(sha256sum {}) && \
          actual_checksum=${{actual_checksum%% *}} && \
@@ -643,6 +683,7 @@ fn deployment_command(
          mv -fT {} {}",
         crate::shell_escape(dir),
         temp_path_escaped,
+        DEPLOYMENT_READY_RECORD,
         temp_path_escaped,
         temp_path_escaped,
         crate::shell_escape(&expected_checksum),
@@ -720,6 +761,7 @@ async fn transfer_binary_base64<S: crate::SshSessionOwner>(
     temp_path: &str,
     expected_checksum: &[u8],
     preparation: &crate::PreparationContext,
+    deadline: crate::BootstrapDeadline,
 ) -> anyhow::Result<()> {
     use base64::Engine;
 
@@ -752,28 +794,60 @@ async fn transfer_binary_base64<S: crate::SshSessionOwner>(
             .context("failed to spawn remote deployment transaction")
     });
     let mut child = preparation
-        .run_owned(
-            spawn,
-            REMOTE_STAGING_OWNER_GRACE,
-            "remote staging child spawn",
-        )
+        .run_abortable_with_deadline(spawn, "remote staging child spawn", deadline)
         .await?;
 
     // take handles for all streams
-    let mut stdin = child
+    let stdin = child
         .stdin()
         .take()
         .context("failed to get stdin for remote command")?;
 
-    let mut stdout = child
+    let stdout = child
         .stdout()
         .take()
         .context("failed to get stdout for remote command")?;
 
-    let mut stderr = child
+    let stderr = child
         .stderr()
         .take()
         .context("failed to get stderr for remote command")?;
+
+    // collect stderr before waiting for readiness. Failures in mkdir, opening the staging file, or
+    // shell startup happen before the marker and must retain their remote diagnostic.
+    let stderr_drain = AbortOnDropTask::new(tokio::spawn(crate::drain_bounded_output(
+        stderr,
+        crate::DIAGNOSTIC_CAPTURE_LIMIT,
+    )));
+
+    // spawning the local mux client does not prove that sshd has opened the exec channel. The
+    // remote shell announces readiness only after installing cleanup, creating the directory, and
+    // opening the staging file; deadline that record before a large write can fill the local pipe.
+    let readiness = tokio::spawn(async move {
+        let mut stdout = tokio::io::BufReader::new(stdout);
+        let preamble = read_deployment_readiness(&mut stdout).await?;
+        anyhow::Ok((child, stdin, stdout, preamble))
+    });
+    let readiness = preparation
+        .run_abortable_with_deadline(
+            readiness,
+            "waiting for remote deployment readiness",
+            deadline,
+        )
+        .await;
+    let (child, mut stdin, mut stdout, preamble) = match readiness {
+        Ok(ready) => ready,
+        Err(error) => {
+            let stderr_data = finish_deployment_stderr(stderr_drain).await;
+            return Err(attach_deployment_stderr(error, &stderr_data));
+        }
+    };
+    if !preamble.is_empty() {
+        tracing::debug!(
+            "remote deployment stdout before readiness:\n{}",
+            String::from_utf8_lossy(&preamble)
+        );
+    }
 
     // write to stdin and close it before reading stdout/stderr
     // this ensures the child process receives EOF on stdin before we wait for it to finish
@@ -785,36 +859,46 @@ async fn transfer_binary_base64<S: crate::SshSessionOwner>(
     let write_result = tokio::select! {
         biased;
         () = preparation.cancellation.cancelled() => None,
-        result = stdin.write_all(encoded.as_bytes()) => Some(result),
+        result = write_deployment_payload(&mut stdin, encoded.as_bytes(), deadline) => Some(result),
     };
     let shutdown_stdin = matches!(write_result, Some(Ok(())));
+    let finish_deadline = deadline.at_least(REMOTE_STAGING_FINALIZATION_MINIMUM);
     let finish = tokio::spawn(async move {
-        let shutdown_result = if shutdown_stdin {
-            // shutdown stdin to send EOF to the remote `base64 -d` process
-            Some(stdin.shutdown().await)
-        } else {
-            None
-        };
-        // dropping stdin sends EOF even after a failed or cancelled write
-        drop(stdin);
+        let mut stderr_drain = stderr_drain;
+        finish_deadline
+            .run("remote deployment verification", async move {
+                let shutdown_result = if shutdown_stdin {
+                    // shutdown stdin to send EOF to the remote `base64 -d` process
+                    Some(stdin.shutdown().await)
+                } else {
+                    None
+                };
+                // dropping stdin sends EOF even after a failed or cancelled write
+                drop(stdin);
 
-        // drain both pipes to EOF while retaining only a bounded stderr tail for diagnostics
-        let stdout_fut = crate::drain_bounded_output(&mut stdout, 0);
-        let stderr_fut = crate::drain_bounded_output(&mut stderr, crate::DIAGNOSTIC_CAPTURE_LIMIT);
-        let (stdout_data, stderr_data) = tokio::join!(stdout_fut, stderr_fut);
-        let status = child
-            .wait()
+                // drain both pipes to EOF while retaining only a bounded stderr tail for diagnostics
+                let stdout_fut = crate::drain_bounded_output(&mut stdout, 0);
+                let stderr_fut = stderr_drain.join();
+                let (stdout_data, stderr_data) = tokio::join!(stdout_fut, stderr_fut);
+                let stderr_data =
+                    stderr_data.context("remote deployment stderr collector failed")?;
+                let status = child
+                    .wait()
+                    .await
+                    .context("failed to wait for remote deployment transaction")?;
+                anyhow::Ok((shutdown_result, stdout_data, stderr_data, status))
+            })
             .await
-            .context("failed to wait for remote deployment transaction")?;
-        anyhow::Ok((shutdown_result, stdout_data, stderr_data, status))
     });
-    let (shutdown_result, stdout_data, stderr_data, status) = preparation
-        .run_owned(
+    let finish_result = preparation
+        .run_cancellation_owned_transaction(
             finish,
             REMOTE_STAGING_OWNER_GRACE,
             "remote deployment transaction finish",
         )
-        .await?;
+        .await;
+    let (write_result, (shutdown_result, stdout_data, stderr_data, status)) =
+        reconcile_transfer_finish(write_result, finish_result)?;
 
     // if writing to stdin failed (broken pipe), the remote command exited early — include stderr
     // so the user sees the actual cause (e.g. "Permission denied")
@@ -828,6 +912,119 @@ async fn transfer_binary_base64<S: crate::SshSessionOwner>(
     }
 
     validate_transfer_completion(write_result, shutdown_result, &stderr_data, &status)
+}
+
+async fn write_deployment_payload<W>(
+    writer: &mut W,
+    mut payload: &[u8],
+    deadline: crate::BootstrapDeadline,
+) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    while !payload.is_empty() {
+        let chunk_len = payload.len().min(DEPLOYMENT_WRITE_CHUNK_SIZE);
+        let written = deadline
+            .wait(
+                "remote deployment payload write",
+                writer.write(&payload[..chunk_len]),
+            )
+            .await?
+            .context("failed to write base64 data to remote stdin")?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to make progress writing remote deployment payload",
+            )
+            .into());
+        }
+        payload = &payload[written..];
+    }
+    Ok(())
+}
+
+async fn finish_deployment_stderr(
+    mut task: AbortOnDropTask<crate::CapturedOutput>,
+) -> crate::CapturedOutput {
+    match tokio::time::timeout(REMOTE_STAGING_OWNER_GRACE, task.join()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            tracing::debug!("remote deployment stderr collector failed: {error:#}");
+            crate::CapturedOutput::default()
+        }
+        Err(_) => {
+            tracing::debug!("remote deployment stderr collector did not finish during drain grace");
+            crate::CapturedOutput::default()
+        }
+    }
+}
+
+fn attach_deployment_stderr(
+    error: anyhow::Error,
+    stderr_data: &crate::CapturedOutput,
+) -> anyhow::Error {
+    let stderr = stderr_data.rendered();
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        error
+    } else {
+        error.context(format!("remote deployment stderr: {stderr}"))
+    }
+}
+
+async fn read_deployment_readiness<R>(reader: &mut R) -> anyhow::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+
+    let mut preamble = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        let available = reader
+            .fill_buf()
+            .await
+            .context("failed to read remote deployment readiness")?;
+        if available.is_empty() {
+            preamble.extend_from_slice(&line);
+            let preamble = String::from_utf8_lossy(&preamble);
+            anyhow::bail!(
+                "remote deployment exited before announcing readiness{}",
+                if preamble.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("; stdout before exit: {}", preamble.trim())
+                }
+            );
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        if preamble
+            .len()
+            .saturating_add(line.len())
+            .saturating_add(take)
+            > DEPLOYMENT_READY_OUTPUT_LIMIT
+        {
+            anyhow::bail!(
+                "remote deployment output before readiness exceeds the {}-byte limit",
+                DEPLOYMENT_READY_OUTPUT_LIMIT
+            );
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            let record = std::str::from_utf8(&line)
+                .context("remote deployment readiness output is not valid UTF-8")?
+                .trim_end_matches(['\r', '\n']);
+            if record == DEPLOYMENT_READY_RECORD {
+                return Ok(preamble);
+            }
+            preamble.extend_from_slice(&line);
+            line.clear();
+        }
+    }
 }
 
 /// Compute SHA-256 hash of data
@@ -857,6 +1054,7 @@ pub async fn cleanup_old_versions(
         session,
         keep_count,
         &crate::PreparationContext::uncancelled(),
+        crate::DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
     )
     .await
 }
@@ -865,12 +1063,19 @@ pub(crate) async fn cleanup_old_versions_with_context<S: crate::SshSessionOwner>
     session: &S,
     keep_count: usize,
     preparation: &crate::PreparationContext,
+    bootstrap_timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     tracing::debug!("Cleaning up old rcpd versions (keeping {})", keep_count);
 
     // validate HOME is set before constructing the cache path
     // if this fails, we log and return Ok since cleanup is best-effort
-    let home = match crate::get_remote_home_with_context(session, preparation, None).await {
+    let home = match crate::get_remote_home_with_context(
+        session,
+        preparation,
+        crate::BootstrapDeadline::new(bootstrap_timeout),
+    )
+    .await
+    {
         Ok(h) => h,
         Err(e) => {
             tracing::warn!(
@@ -893,7 +1098,11 @@ pub(crate) async fn cleanup_old_versions_with_context<S: crate::SshSessionOwner>
     let mut command = openssh::Session::to_command(session.clone(), "sh");
     command.arg("-c").arg(&cmd);
     let output = preparation
-        .remote_output(command, "remote old-version cleanup")
+        .remote_output(
+            command,
+            "remote old-version cleanup",
+            crate::BootstrapDeadline::new(bootstrap_timeout),
+        )
         .await
         .context("failed to run cleanup command on remote host")?;
 
@@ -1103,6 +1312,100 @@ mod tests {
         assert!(searched_paths.is_empty());
     }
 
+    #[tokio::test]
+    async fn deployment_readiness_accepts_a_bounded_stdout_preamble() {
+        let input = b"remote banner\nRCP_DEPLOY_READY\npost-marker output\n";
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+
+        let preamble = read_deployment_readiness(&mut reader).await.unwrap();
+
+        assert_eq!(preamble, b"remote banner\n");
+        let mut remaining = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut remaining)
+            .await
+            .unwrap();
+        assert_eq!(remaining, "post-marker output\n");
+    }
+
+    #[tokio::test]
+    async fn deployment_readiness_failure_retains_stdout_context() {
+        let input = b"remote banner\nstartup failed\n";
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+
+        let error = read_deployment_readiness(&mut reader).await.unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("exited before announcing readiness"),
+            "{error}"
+        );
+        assert!(error.contains("remote banner"), "{error}");
+        assert!(error.contains("startup failed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn deployment_readiness_failure_retains_unterminated_stdout_context() {
+        let input = b"remote banner\nstartup failed without newline";
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+
+        let error = read_deployment_readiness(&mut reader).await.unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(error.contains("remote banner"), "{error}");
+        assert!(error.contains("startup failed without newline"), "{error}");
+    }
+
+    #[test]
+    fn deployment_readiness_failure_retains_stderr_context() {
+        let stderr = crate::CapturedOutput {
+            bytes: b"mkdir: Permission denied\n".to_vec(),
+            ..crate::CapturedOutput::default()
+        };
+
+        let error = attach_deployment_stderr(
+            anyhow::anyhow!("remote deployment exited before announcing readiness"),
+            &stderr,
+        );
+
+        let error = format!("{error:#}");
+        assert!(error.contains("Permission denied"), "{error}");
+        assert!(
+            error.contains("exited before announcing readiness"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn payload_write_failure_precedes_a_later_finalization_failure() {
+        let error = reconcile_transfer_finish::<()>(
+            Some(Err(anyhow::anyhow!("sentinel payload write failure"))),
+            Err(anyhow::anyhow!("sentinel finalization failure")),
+        )
+        .unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(error.contains("sentinel payload write failure"), "{error}");
+        assert!(!error.contains("sentinel finalization failure"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn deployment_payload_write_times_out_without_progress() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+
+        let error = write_deployment_payload(
+            &mut writer,
+            b"payload larger than the pipe",
+            crate::BootstrapDeadline::new(Duration::from_millis(20)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("remote deployment payload write timed out after 20ms"),
+            "unexpected stalled-write error: {error:#}"
+        );
+    }
+
     // the temp name is what keeps two concurrent deployments off each other's file. It has to be
     // built here rather than by the remote shell: `shell_escape` single-quotes every path, so a
     // `$$` in the name would never expand and every deployment would share one `.tmp.$$` file —
@@ -1211,6 +1514,11 @@ mod tests {
             output.status.success(),
             "deployment failed: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "RCP_DEPLOY_READY\n",
+            "the shell must announce readiness before consuming the payload"
         );
         assert_eq!(std::fs::read(&remote_path).unwrap(), b"new binary");
         assert_eq!(

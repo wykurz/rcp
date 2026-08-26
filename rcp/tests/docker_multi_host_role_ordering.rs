@@ -1,9 +1,8 @@
 //! Tests for remote role assignment and source-first startup ordering.
 //!
-//! These tests retain coverage for the role-matching bug where source/destination roles could be
-//! swapped if rcpd connections arrived out of order (commit c03db61). The current protocol also
-//! makes that ordering deterministic: source readiness and control connections precede destination
-//! startup.
+//! These tests verify the invariant that superseded the old arrival-order role matching: source
+//! readiness and control connections precede destination startup, so a destination cannot arrive
+//! first and be mistaken for the source.
 //!
 //! ## Background
 //!

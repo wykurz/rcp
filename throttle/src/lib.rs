@@ -361,17 +361,13 @@ pub fn try_set_admission_limits(
     ADMISSION_POOLS.try_setup(open_file, pending_meta)
 }
 
-fn set_compatibility_admission_limit(pools: &AdmissionPools, max_open_files: usize) {
-    pools.setup(max_open_files, max_open_files);
-}
-
 /// Compatibility wrapper that assigns the same capacity to both admission pools.
 #[deprecated(
     since = "0.39.0",
     note = "use set_admission_limits; zero still means unlimited"
 )]
 pub fn set_max_open_files(max_open_files: usize) {
-    set_compatibility_admission_limit(&ADMISSION_POOLS, max_open_files);
+    set_admission_limits(max_open_files, max_open_files);
 }
 
 /// A cloneable, non-owning reference to one already-acquired fd-admission permit.
@@ -676,31 +672,34 @@ mod tests {
         }
     }
 
-    mod max_open_files_tests {
+    mod max_files_in_flight_compatibility_tests {
         use super::*;
 
+        struct ResetAdmission;
+
+        impl Drop for ResetAdmission {
+            fn drop(&mut self) {
+                set_admission_limits(0, 0);
+            }
+        }
+
+        #[allow(deprecated)]
         #[tokio::test]
         async fn compatibility_wrapper_assigns_the_same_capacity_to_both_pools() {
-            let pools = AdmissionPools::new();
-            set_compatibility_admission_limit(&pools, 1);
-            let first_open_file = pools.open_file_permit().await;
-            let first_pending_meta = pools.pending_meta_permit().await;
+            let _reset = ResetAdmission;
+            set_max_open_files(1);
+            let first_open_file = open_file_permit().await;
+            let first_pending_meta = pending_meta_permit().await;
             assert!(
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(50),
-                    pools.open_file_permit()
-                )
-                .await
-                .is_err(),
+                tokio::time::timeout(std::time::Duration::from_millis(50), open_file_permit())
+                    .await
+                    .is_err(),
                 "the second OpenFile acquisition must wait at compatibility capacity one"
             );
             assert!(
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(50),
-                    pools.pending_meta_permit(),
-                )
-                .await
-                .is_err(),
+                tokio::time::timeout(std::time::Duration::from_millis(50), pending_meta_permit(),)
+                    .await
+                    .is_err(),
                 "the second PendingMeta acquisition must wait at compatibility capacity one"
             );
             drop((first_open_file, first_pending_meta));

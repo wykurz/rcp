@@ -120,7 +120,7 @@ fn test_remote_direct_rcpd_legacy_warning_leaves_connection_record_on_stderr() {
 }
 
 #[test]
-fn direct_rcpd_automatic_capacity_failure_uses_stderr_startup_record() {
+fn test_remote_direct_rcpd_automatic_capacity_failure_uses_stderr_startup_record() {
     let multiplier = usize::MAX.to_string();
     let output = rcpd()
         .args([
@@ -147,7 +147,7 @@ fn direct_rcpd_automatic_capacity_failure_uses_stderr_startup_record() {
 }
 
 #[test]
-fn direct_rcpd_histogram_target_failure_uses_stderr_startup_record() {
+fn test_remote_direct_rcpd_histogram_target_failure_uses_stderr_startup_record() {
     let target = tempfile::tempdir().unwrap();
     let target_arg = format!("--auto-meta-histogram-log={}", target.path().display());
     let output = rcpd()
@@ -188,7 +188,7 @@ fn assert_direct_rcpd_tracing_target_failure(options: &[&str], expected_cause: &
 }
 
 #[test]
-fn direct_rcpd_debug_log_target_failure_uses_stderr_startup_record() {
+fn test_remote_direct_rcpd_debug_log_target_failure_uses_stderr_startup_record() {
     let target = tempfile::tempdir().unwrap();
     let prefix = target.path().join("missing").join("rcpd-log");
     assert_direct_rcpd_tracing_target_failure(
@@ -198,7 +198,7 @@ fn direct_rcpd_debug_log_target_failure_uses_stderr_startup_record() {
 }
 
 #[test]
-fn direct_rcpd_chrome_trace_target_failure_uses_stderr_startup_record() {
+fn test_remote_direct_rcpd_chrome_trace_target_failure_uses_stderr_startup_record() {
     let target = tempfile::tempdir().unwrap();
     let prefix = target.path().join("missing").join("trace");
     assert_direct_rcpd_tracing_target_failure(
@@ -208,7 +208,7 @@ fn direct_rcpd_chrome_trace_target_failure_uses_stderr_startup_record() {
 }
 
 #[test]
-fn direct_rcpd_invalid_profile_level_uses_stderr_startup_record() {
+fn test_remote_direct_rcpd_invalid_profile_level_uses_stderr_startup_record() {
     let target = tempfile::tempdir().unwrap();
     let prefix = target.path().join("trace");
     assert_direct_rcpd_tracing_target_failure(
@@ -941,9 +941,8 @@ fn test_remote_copy_timeout() {
         .assert()
         .success()
         .stdout(predicates::str::contains("remote SSH setup"))
-        .stdout(predicates::str::contains(
-            "rcpd version probes and readiness",
-        ));
+        .stdout(predicates::str::contains("binary discovery"))
+        .stdout(predicates::str::contains("daemon readiness"));
 }
 
 /// Test that --remote-keepalive-sec accepts a budget and the disabling 0

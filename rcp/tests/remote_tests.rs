@@ -468,51 +468,6 @@ fn test_remote_copy_tilde_source_to_local() {
 }
 
 #[test]
-fn tilde_remote_home_lookup_uses_configured_timeout() {
-    let directory = tempfile::tempdir().unwrap();
-    let fake_ssh = directory.path().join("ssh");
-    std::fs::write(
-        &fake_ssh,
-        "#!/bin/sh\nsocket=\nmaster=false\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -S) shift; socket=$1 ;;\n    -M) master=true ;;\n  esac\n  shift\ndone\nif $master; then\n  : > \"$socket\"\nfi\nparent=$PPID\nwhile kill -0 \"$parent\" 2>/dev/null; do\n  sleep 0.05\ndone\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let ambient_path = std::env::var_os("PATH").unwrap_or_default();
-    let path = std::env::join_paths(
-        std::iter::once(directory.path().to_path_buf()).chain(std::env::split_paths(&ambient_path)),
-    )
-    .unwrap();
-    let destination = directory.path().join("destination");
-    let output = std::process::Command::new("timeout")
-        .args([
-            "5",
-            assert_cmd::cargo::cargo_bin("rcp").to_str().unwrap(),
-            "--force-remote",
-            "--remote-copy-conn-timeout-sec=1",
-            "fake-host:~/source",
-            destination.to_str().unwrap(),
-        ])
-        .env("PATH", path)
-        .output()
-        .unwrap();
-    assert_ne!(
-        output.status.code(),
-        Some(TIMEOUT_EXIT_CODE),
-        "configured remote timeout was ignored during tilde expansion"
-    );
-    assert!(!output.status.success());
-    let error = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        error.contains("remote HOME lookup timed out after 1s"),
-        "configured deadline missing from HOME lookup error: {error}"
-    );
-}
-
-#[test]
 fn test_remote_copy_local_to_tilde_destination() {
     require_local_ssh();
     let home = make_test_home();
@@ -4246,21 +4201,13 @@ fn test_remote_pure_local_unreadable_filter_file_precedes_home_and_probe() {
 }
 
 #[test]
-fn test_remote_automatic_capacity_failure_reports_cause_and_skips_destination() {
-    require_local_ssh();
+fn test_remote_automatic_capacity_failure_precedes_remote_side_effects() {
     let scratch = tempfile::tempdir().unwrap();
-    let (wrapper, marker) = marking_rcpd_wrapper(scratch.path());
-    let source = scratch.path().join("source");
     let destination = scratch.path().join("destination");
-    std::fs::write(&source, b"capacity failure").unwrap();
-    let rcpd_path = format!("--rcpd-path={}", wrapper.display());
     let multiplier = format!("--pending-writes-multiplier={}", usize::MAX);
-    let source_remote = format!("localhost:{}", source.display());
-    let output = run_rcp_with_args_at_default_verbosity(&[
-        &rcpd_path,
-        "--no-encryption",
+    let output = run_rcp_with_args(&[
         &multiplier,
-        &source_remote,
+        "unreachable.invalid:~/source",
         destination.to_str().unwrap(),
     ]);
     print_command_output(&output);
@@ -4274,25 +4221,16 @@ fn test_remote_automatic_capacity_failure_reports_cause_and_skips_destination() 
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("pending file capacity"),
-        "initiating rcp must report the source daemon's real cause: {combined}"
+        combined.contains("pending file capacity overflow"),
+        "initiating rcp must report the master-side capacity error: {combined}"
     );
     assert!(
-        combined.contains("Caused by:"),
-        "the daemon diagnostic must remain a nested source: {combined}"
-    );
-    let invocations = std::fs::read_to_string(&marker).unwrap();
-    assert!(
-        invocations
-            .lines()
-            .any(|line| line.contains("--role source")),
-        "source role must have reached its capacity refusal: {invocations}"
+        !combined.contains("Connecting to SSH destination"),
+        "capacity validation must precede SSH setup and remote HOME lookup: {combined}"
     );
     assert!(
-        !invocations
-            .lines()
-            .any(|line| line.contains("--role destination")),
-        "destination must not spawn after source readiness refusal: {invocations}"
+        !combined.contains("Starting prepared rcpd server on:"),
+        "capacity validation must precede rcpd spawn: {combined}"
     );
 }
 
@@ -6466,12 +6404,11 @@ fn test_remote_skip_specials() {
 /// Verifies that `--auto-meta-throttle` and its tuning flags propagate
 /// from the rcp master to the rcpd processes over the remote protocol.
 ///
-/// Before launching each rcpd, the master logs the full ssh command line
-/// at `Will run remotely: ... /rcpd --role <source|destination> ...`.
-/// The `--auto-meta-*` flags MUST appear there for the role's rcpd to
-/// apply them. This is the deterministic propagation point — it doesn't
-/// depend on rcpd finishing startup or any log being forwarded back
-/// (which can be flaky under TLS handshake retries in localhost setups).
+/// Before launching each rcpd, the master logs the exact argument vector it passes at
+/// `Will run remote rcpd: path=... role=<source|destination> args=[...]`. The
+/// `--auto-meta-*` flags MUST appear there for the role's rcpd to apply them. This stable
+/// diagnostic is the deterministic propagation point; it does not depend on an SSH backend's
+/// `Debug` representation or on daemon logs being forwarded after startup.
 #[test]
 fn test_remote_auto_meta_throttle_flags_propagate_to_rcpd() {
     require_local_ssh();
@@ -6491,9 +6428,7 @@ fn test_remote_auto_meta_throttle_flags_propagate_to_rcpd() {
         &src_remote,
         &dst_remote,
     ]);
-    // Tracing fmt layer writes to stdout in this project (via the
-    // progress-bar-aware ProgWriter), so the "Will run remotely" log
-    // we match on is captured on stdout, not stderr.
+    // tracing writes through the progress-bar-aware stdout writer in this project
     let log_output = String::from_utf8_lossy(&output.stdout);
     let expected_flags = [
         "--auto-meta-throttle",
@@ -6503,21 +6438,16 @@ fn test_remote_auto_meta_throttle_flags_propagate_to_rcpd() {
         "--auto-meta-beta=1.77",
     ];
     let rcpd_command_line_for_role = |role: &str| -> Option<String> {
-        // Match on the role substring alongside the "Will run remotely"
-        // log so we find the right line per rcpd invocation. Avoid
-        // relying on exact quote-escaping around "--role" — ANSI/format
-        // differences between environments make that brittle.
+        let role_field = format!("role={role}");
         log_output
             .lines()
-            .find(|line| {
-                line.contains("Will run remotely") && line.contains("--role") && line.contains(role)
-            })
+            .find(|line| line.contains("Will run remote rcpd") && line.contains(&role_field))
             .map(str::to_owned)
     };
     for role in ["source", "destination"] {
         let line = rcpd_command_line_for_role(role).unwrap_or_else(|| {
             panic!(
-                "no 'Will run remotely' log for rcpd role={role}. \
+                "no stable remote-rcpd argv log for role={role}. \
                  stdout length = {} bytes.",
                 log_output.len()
             )

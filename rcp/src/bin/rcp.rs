@@ -204,8 +204,10 @@ struct Args {
 
     /// Connection timeout for remote setup and copy operations in seconds
     ///
-    /// Applies to: remote SSH setup, tilde-expansion HOME lookup, rcpd version probes and
-    /// readiness, rcpd→master connection, destination→source connection.
+    /// Applies to: remote SSH setup, binary discovery, tilde-expansion HOME lookup, rcpd version
+    /// probes, deployment readiness/write-idle periods, daemon readiness, rcpd→master connection,
+    /// and destination→source connection. It does not cap total deployment transfer time;
+    /// post-transfer verification gets at least 60 seconds.
     /// Default: 15s normally, 60s when --auto-deploy-rcpd is enabled (to account
     /// for sequential binary deployment to multiple hosts).
     #[arg(
@@ -577,18 +579,27 @@ fn build_master_remote_request(
     }
     let connection_ceiling = ConnectionCeiling::from_arg(args.max_connections);
     let configured_connections = connection_ceiling.value();
-    let resolved_explicit = (!matches!(
-        files_in_flight.source(),
-        common::FilesInFlightSource::Automatic
-    ))
-    .then(|| {
-        remote::resolve_remote_concurrency(
-            files_in_flight.limit(),
-            configured_connections,
-            args.pending_writes_multiplier,
-        )
-    })
-    .transpose()?;
+    let resolved_explicit = match files_in_flight.source() {
+        common::FilesInFlightSource::Automatic => {
+            // validate the configured connection upper bound before remote side effects. The source
+            // still selects its CPU-based file ceiling, but any capacity it reports at or below this
+            // bound is then guaranteed to be representable.
+            remote::resolve_remote_concurrency(
+                common::ConcurrencyLimit::Unlimited,
+                configured_connections,
+                args.pending_writes_multiplier,
+            )?;
+            None
+        }
+        common::FilesInFlightSource::Explicit
+        | common::FilesInFlightSource::DeprecatedMaxOpenFiles => {
+            Some(remote::resolve_remote_concurrency(
+                files_in_flight.limit(),
+                configured_connections,
+                args.pending_writes_multiplier,
+            )?)
+        }
+    };
     let tcp = remote::TcpConfig {
         port_ranges: args.port_ranges.clone(),
         conn_timeout_sec: args.remote_copy_conn_timeout_sec,
@@ -702,20 +713,18 @@ fn master_authoritative_rcpd_files_in_flight(
     }
 }
 
-fn build_source_remote_config(
-    request: &MasterRemoteRequest,
-) -> anyhow::Result<MasterRemoteConfigs> {
+fn build_source_remote_config(request: &MasterRemoteRequest) -> MasterRemoteConfigs {
     match request.resolved_explicit {
-        Some(concurrency) => Ok(endpoint_config(
+        Some(concurrency) => endpoint_config(
             request,
             master_authoritative_rcpd_files_in_flight(request.files_in_flight),
             Some(concurrency),
-        )),
-        None => Ok(endpoint_config(
+        ),
+        None => endpoint_config(
             request,
             remote::protocol::RcpdFilesInFlight::Automatic,
             None,
-        )),
+        ),
     }
 }
 
@@ -827,7 +836,7 @@ fn build_master_remote_configs(
     master_cert_fingerprint: Option<remote::protocol::CertFingerprint>,
 ) -> anyhow::Result<MasterRemoteConfigs> {
     let request = build_master_remote_request(args, files_in_flight, master_cert_fingerprint)?;
-    build_source_remote_config(&request)
+    Ok(build_source_remote_config(&request))
 }
 
 #[instrument(skip(master_cert))]
@@ -841,7 +850,7 @@ async fn run_rcpd_master(
 ) -> anyhow::Result<common::copy::Summary> {
     tracing::debug!("running rcpd src/dst");
     let mut rcpd_processes: Vec<remote::RcpdProcess> = vec![];
-    let source_config = build_source_remote_config(&request)?;
+    let source_config = build_source_remote_config(&request);
     let source_bind_ip = extract_bind_ip_from_host(&src.session().host);
     let same_session = src.session() == dst.session();
     let bootstrap_timeout = std::time::Duration::from_secs(request.tcp.conn_timeout_sec);
@@ -1738,6 +1747,7 @@ fn main() -> Result<(), anyhow::Error> {
         None
     };
     let res = common::run(progress, output, runtime, throttle, tracing, func);
+    remote::finish_pending_remote_cleanup();
     if let Some(warnings) = dry_run_warnings {
         warnings.print();
     }
@@ -1778,7 +1788,7 @@ mod tests {
                 .unwrap();
         assert_eq!(request.connection_ceiling.value().get(), 100);
         assert!(!request.connection_ceiling.is_explicit());
-        let source = build_source_remote_config(&request).unwrap();
+        let source = build_source_remote_config(&request);
         let spawn_args = source.rcpd.to_args();
         assert!(!spawn_args.iter().any(|arg| arg.contains("files-in-flight")));
         assert!(
@@ -1819,7 +1829,7 @@ mod tests {
         )
         .unwrap();
         assert!(request.connection_ceiling.is_explicit());
-        let source = build_source_remote_config(&request).unwrap();
+        let source = build_source_remote_config(&request);
         let source_readiness = readiness(
             common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(64).unwrap()),
             64,
@@ -1842,7 +1852,7 @@ mod tests {
         let request =
             build_master_remote_request(&args, common::ResolvedFilesInFlight::legacy(7), None)
                 .unwrap();
-        let source = build_source_remote_config(&request).unwrap();
+        let source = build_source_remote_config(&request);
         let source_readiness = readiness(
             common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(7).unwrap()),
             7,
@@ -1869,7 +1879,7 @@ mod tests {
         let request =
             build_master_remote_request(&args, common::ResolvedFilesInFlight::legacy(0), None)
                 .unwrap();
-        let source = build_source_remote_config(&request).unwrap();
+        let source = build_source_remote_config(&request);
         let source_readiness = readiness(common::ConcurrencyLimit::Unlimited, 100);
         let destination = build_destination_remote_config(&request, &source_readiness).unwrap();
         for config in [&source.rcpd, &destination.rcpd] {
@@ -1924,6 +1934,39 @@ mod tests {
         assert!(
             error.to_string().contains("pending file capacity"),
             "capacity validation must precede remote HOME lookup: {error:#}"
+        );
+    }
+
+    #[test]
+    fn master_rejects_capacity_invalid_for_every_automatic_source() {
+        let multiplier = usize::MAX.to_string();
+        let args = master_args(&[&format!("--pending-writes-multiplier={multiplier}")]);
+        let error =
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
+                .expect_err(
+                    "the automatic source floor makes this capacity unconditionally invalid",
+                );
+        assert!(
+            error.to_string().contains("pending file capacity"),
+            "unexpected automatic-capacity error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn master_rejects_automatic_capacity_invalid_at_connection_upper_bound() {
+        let multiplier = (tokio::sync::Semaphore::MAX_PERMITS / 8 + 1).to_string();
+        let args = master_args(&[
+            "--max-connections=8",
+            &format!("--pending-writes-multiplier={multiplier}"),
+        ]);
+        let error =
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
+                .expect_err(
+                    "an unsafe connection upper bound must fail before remote side effects",
+                );
+        assert!(
+            error.to_string().contains("pending file capacity"),
+            "unexpected automatic-capacity error: {error:#}"
         );
     }
 

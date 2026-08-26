@@ -96,7 +96,7 @@ impl ProtocolVersion {
         // exact version match for now
         // in the future, we might allow minor version skew (e.g., 0.22.x compatible with 0.22.y).
         // `semantic` embeds the remote compatibility revision as build metadata (see
-        // WIRE_REVISION), so this one string equality also rejects two same-release builds
+        // wire revision), so this one string equality also rejects two same-release builds
         // straddling a protocol/process-contract change — in BOTH directions, including a peer
         // built before the revision existed.
         self.semantic == other.semantic
