@@ -387,8 +387,9 @@ remote host.
 When auto-deployment is enabled:
 
 - `rcp` finds the local `rcpd` binary (same directory or PATH)
-- Local and remote `rcpd --protocol-version` probes have a two-second deadline, so a hanging
-  candidate can fall back to deployment; local timeout cleanup gets a bounded one-second reap grace
+- Local `rcpd --protocol-version` probes have a two-second deadline, while remote probes use the
+  configurable remote connection timeout, so a hanging candidate can fall back to deployment; local
+  timeout cleanup gets a bounded one-second reap grace
 - Deploys it to `~/.cache/rcp/bin/rcpd-{version}` on remote hosts via SSH
 - Verifies integrity using SHA-256 checksums
 - Keeps the last 3 versions and cleans up older ones
@@ -403,8 +404,8 @@ Manual deployment is still supported and may be preferred for:
 **Configuration options:**
 
 - `--port-ranges` - restrict TCP data ports to specific ranges (e.g., "8000-8999")
-- `--remote-copy-conn-timeout-sec` - connection timeout in seconds (default: 15; 60 with
-  `--auto-deploy-rcpd`)
+- `--remote-copy-conn-timeout-sec` - remote version-probe and TCP connection timeout in seconds
+  (default: 15; 60 with `--auto-deploy-rcpd`)
 - `--remote-keepalive-sec` - liveness budget for every rcp TCP connection in seconds, 0 disables
   (default: 120); idle connections everywhere, unacknowledged data on control connections only
 
@@ -770,10 +771,11 @@ wire revision 4.
 
 Explicit limits are validated before remote `~` expansion. Automatic limits are resolved and
 validated by the source before it announces readiness; effective-stream and pending capacities above
-Tokio's semaphore maximum are rejected. If an explicit file limit is clamped by the connection or
-descriptor-safety ceiling, a default-visible notice names the requested and effective values.
-Automatic clamps remain verbose-only. To raise remote parallelism above the source's CPU-derived
-file-work default, raise both ceilings explicitly:
+Tokio's semaphore maximum are rejected. If either explicitly requested file or connection ceiling is
+clamped by the other ceiling, or an explicit file limit is clamped by descriptor safety, a
+default-visible notice names the requested and effective values. The ordinary automatic/default
+intersection remains quiet. To raise remote parallelism above the source's CPU-derived file-work
+default, raise both ceilings explicitly:
 
 ```bash
 # Increase for many small files on high-bandwidth links

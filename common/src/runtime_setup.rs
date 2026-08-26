@@ -13,6 +13,7 @@ use crate::{
     PBAR, PROGRESS, REMOTE_RUNTIME_STATS, RuntimeStats, auto_meta, histogram_logger, is_localhost,
     observability, progress, store_logger_cancel, store_logger_handle, walk,
 };
+use anyhow::Context;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::prelude::*;
 
@@ -258,16 +259,17 @@ fn build_verbose_env_filter(verbose: u8) -> tracing_subscriber::EnvFilter {
 /// layers. Profiling layers don't share the verbose-level filter because they
 /// have their own `--profile-level`. Returns the formatted filter string —
 /// callers re-parse it per layer because EnvFilter isn't Clone.
-fn build_profile_filter_str(profile_level: Option<&str>) -> String {
+fn build_profile_filter_str(profile_level: Option<&str>) -> anyhow::Result<String> {
     let level_str = profile_level.unwrap_or("trace");
     let valid_levels = ["trace", "debug", "info", "warn", "error", "off"];
     if !valid_levels.contains(&level_str.to_lowercase().as_str()) {
-        eprintln!(
+        anyhow::bail!(
             "Invalid --profile-level '{level_str}'. Valid values: trace, debug, info, warn, error, off"
         );
-        std::process::exit(1);
     }
-    format!("tokio=off,quinn=off,h2=off,hyper=off,rustls=off,{level_str}")
+    Ok(format!(
+        "tokio=off,quinn=off,h2=off,hyper=off,rustls=off,{level_str}"
+    ))
 }
 
 /// Guards from chrome/flame tracing layers that must outlive the runtime to
@@ -288,16 +290,16 @@ pub(crate) fn install_tracing_subscriber(
     quiet: bool,
     verbose: u8,
     tracing_config: TracingConfig,
-) -> TracingGuards {
+) -> anyhow::Result<TracingGuards> {
     if quiet {
         assert!(
             verbose == 0,
             "Quiet mode and verbose mode are mutually exclusive"
         );
-        return TracingGuards {
+        return Ok(TracingGuards {
             chrome: None,
             flame: None,
-        };
+        });
     }
     let TracingConfig {
         remote_layer: remote_tracing_layer,
@@ -309,23 +311,25 @@ pub(crate) fn install_tracing_subscriber(
         tokio_console,
         tokio_console_port,
     } = tracing_config;
-    let file_layer = debug_log_file.map(|log_file_path| {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file_path)
-            .unwrap_or_else(|e| {
-                panic!("Failed to create debug log file at '{log_file_path}': {e}")
-            });
-        tracing_subscriber::fmt::layer()
-            .with_target(true)
-            .with_line_number(true)
-            .with_thread_ids(true)
-            .with_timer(LocalTimeFormatter)
-            .with_ansi(false)
-            .with_writer(file)
-            .with_filter(build_verbose_env_filter(verbose))
-    });
+    let file_layer = debug_log_file
+        .map(|log_file_path| {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_file_path)
+                .with_context(|| format!("failed to create debug log file at '{log_file_path}'"))?;
+            anyhow::Ok(
+                tracing_subscriber::fmt::layer()
+                    .with_target(true)
+                    .with_line_number(true)
+                    .with_thread_ids(true)
+                    .with_timer(LocalTimeFormatter)
+                    .with_ansi(false)
+                    .with_writer(file)
+                    .with_filter(build_verbose_env_filter(verbose)),
+            )
+        })
+        .transpose()?;
     // fmt_layer for local console output (when not using remote tracing)
     let fmt_layer = if remote_tracing_layer.is_some() {
         None
@@ -365,20 +369,26 @@ pub(crate) fn install_tracing_subscriber(
     // chrome/flame share a profile filter; build the string once and re-parse
     // per layer (EnvFilter isn't Clone).
     let profile_filter_str = (chrome_trace_prefix.is_some() || flamegraph_prefix.is_some())
-        .then(|| build_profile_filter_str(profile_level.as_deref()));
+        .then(|| build_profile_filter_str(profile_level.as_deref()))
+        .transpose()?;
     let make_profile_filter =
         || tracing_subscriber::EnvFilter::new(profile_filter_str.as_ref().unwrap());
     let mut chrome_guard = None;
-    let chrome_layer = chrome_trace_prefix.as_ref().map(|prefix| {
-        let filename = generate_trace_filename(prefix, &trace_identifier, "json");
-        startup_notices.push(format!("Chrome trace will be written to: {filename}"));
-        let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
-            .file(&filename)
-            .include_args(true)
-            .build();
-        chrome_guard = Some(guard);
-        layer.with_filter(make_profile_filter())
-    });
+    let chrome_layer = chrome_trace_prefix
+        .as_ref()
+        .map(|prefix| {
+            let filename = generate_trace_filename(prefix, &trace_identifier, "json");
+            let file = std::fs::File::create(&filename)
+                .with_context(|| format!("failed to create Chrome trace file at '{filename}'"))?;
+            startup_notices.push(format!("Chrome trace will be written to: {filename}"));
+            let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+                .writer(file)
+                .include_args(true)
+                .build();
+            chrome_guard = Some(guard);
+            anyhow::Ok(layer.with_filter(make_profile_filter()))
+        })
+        .transpose()?;
     let mut flame_guard = None;
     let flame_layer = flamegraph_prefix.as_ref().and_then(|prefix| {
         let filename = generate_trace_filename(prefix, &trace_identifier, "folded");
@@ -409,10 +419,10 @@ pub(crate) fn install_tracing_subscriber(
         // rcp-error-log-allow: startup_error is an already-rendered String, not an error chain
         tracing::error!("{startup_error}");
     }
-    TracingGuards {
+    Ok(TracingGuards {
         chrome: chrome_guard,
         flame: flame_guard,
-    }
+    })
 }
 
 /// Derive a conservative leaf-operation count from the process descriptor limit.
@@ -522,12 +532,23 @@ fn descriptor_clamp_diagnostic(
     Some(diagnostic)
 }
 
+fn configure_admission_limits(
+    open_file: ConcurrencyLimit,
+    pending_meta: ConcurrencyLimit,
+) -> anyhow::Result<()> {
+    throttle::try_set_admission_limits(
+        open_file.semaphore_capacity(),
+        pending_meta.semaphore_capacity(),
+    )
+    .context("failed to configure runtime file admission")
+}
+
 /// Build a multi-threaded tokio runtime configured per `runtime`, and apply the
 /// file-like work and descriptor-safe admission limits from `throttle`.
 pub(crate) fn build_tokio_runtime(
     runtime: &RuntimeConfig,
     throttle: &ThrottleConfig,
-) -> tokio::runtime::Runtime {
+) -> anyhow::Result<tokio::runtime::Runtime> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
     if runtime.max_workers > 0 {
@@ -536,9 +557,9 @@ pub(crate) fn build_tokio_runtime(
     if runtime.max_blocking_threads > 0 {
         builder.max_blocking_threads(runtime.max_blocking_threads);
     }
-    let soft_limit = get_soft_open_file_limit().expect(
-        "We failed to query rlimit; --max-files-in-flight controls performance but cannot bypass descriptor safety",
-    );
+    let soft_limit = get_soft_open_file_limit().context(
+        "failed to query rlimit; --max-files-in-flight controls performance but cannot bypass descriptor safety",
+    )?;
     let descriptor_limit = descriptor_admission_limit(soft_limit);
     let file_limit = if throttle.apply_files_in_flight {
         throttle.files_in_flight.limit()
@@ -567,11 +588,9 @@ pub(crate) fn build_tokio_runtime(
             }
         }
     }
-    throttle::set_admission_limits(
-        open_file.semaphore_capacity(),
-        pending_meta.semaphore_capacity(),
-    );
-    builder.build().expect("Failed to create runtime")
+    let runtime = builder.build().context("failed to create Tokio runtime")?;
+    configure_admission_limits(open_file, pending_meta)?;
+    Ok(runtime)
 }
 
 #[cfg(test)]
@@ -683,6 +702,23 @@ mod default_leaf_operation_limit_tests {
         );
     }
 
+    #[test]
+    fn runtime_admission_setup_propagates_oversized_capacity() {
+        let oversized = ConcurrencyLimit::Limited(
+            std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS + 1).unwrap(),
+        );
+
+        let error = configure_admission_limits(oversized, ConcurrencyLimit::Unlimited)
+            .expect_err("oversized OpenFile admission must return an error");
+
+        assert!(
+            error
+                .downcast_ref::<throttle::AdmissionCapacityError>()
+                .is_some(),
+            "runtime setup must preserve the typed throttle error: {error:#}"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn build_tokio_runtime_unlimited_file_ceiling_uses_descriptor_safety_after_stale_epoch() {
@@ -725,7 +761,8 @@ mod default_leaf_operation_limit_tests {
             ),
             ..ThrottleConfig::default()
         };
-        let admission_runtime = build_tokio_runtime(&runtime, &old_limit);
+        let admission_runtime =
+            build_tokio_runtime(&runtime, &old_limit).expect("runtime setup must succeed");
         let (old_open_file, old_pending_meta) = admission_runtime.block_on(async {
             tokio::join!(
                 throttle::open_file_permit(),
@@ -736,7 +773,10 @@ mod default_leaf_operation_limit_tests {
             files_in_flight: crate::ResolvedFilesInFlight::unlimited(),
             ..ThrottleConfig::default()
         };
-        drop(build_tokio_runtime(&runtime, &unlimited_file_ceiling));
+        drop(
+            build_tokio_runtime(&runtime, &unlimited_file_ceiling)
+                .expect("runtime setup must succeed"),
+        );
         let (new_open_file, new_pending_meta) = admission_runtime.block_on(async {
             let open_file = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
@@ -824,7 +864,7 @@ mod default_leaf_operation_limit_tests {
             files_in_flight: crate::ResolvedFilesInFlight::unlimited(),
             ..ThrottleConfig::default()
         };
-        let runtime = build_tokio_runtime(&runtime, &throttle);
+        let runtime = build_tokio_runtime(&runtime, &throttle).expect("runtime setup must succeed");
         let after = nofile_limit();
         assert_eq!(
             after.rlim_cur, TARGET_SOFT_LIMIT,

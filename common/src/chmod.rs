@@ -1956,9 +1956,8 @@ mod tests {
         Ok(())
     }
 
-    /// Stress tests exercising `pending_meta` (max-files-in-flight) saturation during rchm. The module
-    /// name carries the `max_files_in_flight` substring so nextest's serial test-group isolates these
-    /// from anything else that mutates the process-wide throttle limit (see `.config/nextest.toml`).
+    /// Stress tests exercising `pending_meta` (max-files-in-flight) saturation during rchm.
+    /// Each test scopes process-wide admission changes with an `AdmissionLimit` guard.
     mod max_files_in_flight_tests {
         use super::*;
         use crate::walk_driver::process_entry;

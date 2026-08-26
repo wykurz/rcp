@@ -7510,7 +7510,7 @@ mod link_tests {
             }
             // saturate both pools to force the deadlock if the cycle existed.
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_files_in_flight(1);
+            admission.set_files_in_flight(2);
             let summary = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(30),

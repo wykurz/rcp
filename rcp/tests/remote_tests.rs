@@ -694,11 +694,152 @@ fn test_remote_chrome_trace_dry_run_forwards_daemon_artifact_notices() {
     assert_eq!(trace_files.len(), 3, "all three trace artifacts must exist");
 }
 
+#[test]
+fn test_remote_destination_startup_failure_drains_source_tracing_notices() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("source_notice.txt");
+    let dst_file = dst_dir.path().join("source_notice.txt");
+    create_test_file(&src_file, "source startup notice", 0o644);
+    let src_remote = format!("localhost:{}", src_file.display());
+    let dst_remote = format!("localhost:{}", dst_file.display());
+
+    let scratch = tempfile::tempdir().unwrap();
+    let wrapper = scratch
+        .path()
+        .join("source-tracing-destination-refusal-rcpd");
+    let rcpd = assert_cmd::cargo::cargo_bin("rcpd");
+    let trace_prefix = scratch.path().join("source-startup-trace");
+    let source_trace_arg = format!("--chrome-trace={}", trace_prefix.display());
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--protocol-version\" ]; then\n\
+               exec {} \"$@\"\n\
+             fi\n\
+             if [ \"$1\" = \"--role\" ] && [ \"$2\" = \"source\" ]; then\n\
+               exec {} \"$@\" {}\n\
+             fi\n\
+             if [ \"$1\" = \"--role\" ] && [ \"$2\" = \"destination\" ]; then\n\
+               printf '%s\\n' \
+                 'RCP_ERROR destination startup refused for source tracing drain regression' >&2\n\
+               exit 17\n\
+             fi\n\
+             printf '%s\\n' 'RCP_ERROR unexpected test wrapper invocation' >&2\n\
+             exit 18\n",
+            shell_quote_for_test(&rcpd),
+            shell_quote_for_test(&rcpd),
+            shell_quote_for_test(std::path::Path::new(&source_trace_arg)),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let rcpd_path = format!("--rcpd-path={}", wrapper.display());
+    let output = run_rcp_with_args_at_default_verbosity(&[
+        &rcpd_path,
+        "--no-encryption",
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output);
+    assert!(
+        !output.status.success(),
+        "the destination startup refusal must fail the remote copy"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("destination startup refused for source tracing drain regression"),
+        "the destination's typed startup failure must remain visible: {combined}"
+    );
+    assert!(
+        combined.contains("Chrome trace will be written to:"),
+        "the source startup notice must be drained before the destination error returns: {combined}"
+    );
+    assert!(
+        combined.contains("rcpd-source"),
+        "the drained startup notice must retain source-daemon context: {combined}"
+    );
+}
+
+#[test]
+fn test_remote_source_connection_failure_waits_for_source_rcpd_cleanup() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("source_connect_failure.txt");
+    let dst_file = dst_dir.path().join("source_connect_failure.txt");
+    create_test_file(&src_file, "source cleanup", 0o644);
+    let src_remote = format!("localhost:{}", src_file.display());
+    let dst_remote = format!("localhost:{}", dst_file.display());
+
+    let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unavailable_port = unavailable.local_addr().unwrap().port();
+    drop(unavailable);
+
+    let scratch = tempfile::tempdir().unwrap();
+    let wrapper = scratch.path().join("source-connect-failure-rcpd");
+    let cleanup_marker = scratch.path().join("source-cleaned-up");
+    let destination_marker = scratch.path().join("destination-spawned");
+    let rcpd = assert_cmd::cargo::cargo_bin("rcpd");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--protocol-version\" ]; then\n\
+               exec {} \"$@\"\n\
+             fi\n\
+             if [ \"$1\" = \"--role\" ] && [ \"$2\" = \"source\" ]; then\n\
+               printf 'RCP_TCP 127.0.0.1:{} 4 4\\n' >&2\n\
+               cat >/dev/null\n\
+               sleep 0.5\n\
+               printf 'cleaned\\n' > {}\n\
+               exit 19\n\
+             fi\n\
+             printf 'spawned\\n' > {}\n\
+             exit 20\n",
+            shell_quote_for_test(&rcpd),
+            unavailable_port,
+            shell_quote_for_test(&cleanup_marker),
+            shell_quote_for_test(&destination_marker),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let rcpd_path = format!("--rcpd-path={}", wrapper.display());
+    let output = run_rcp_with_args_at_default_verbosity(&[
+        &rcpd_path,
+        "--no-encryption",
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output);
+    assert!(
+        !output.status.success(),
+        "the unavailable source listener must fail the copy"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cleanup_marker).unwrap(),
+        "cleaned\n",
+        "rcp must wait for source cleanup before returning the connection error"
+    );
+    assert!(
+        !destination_marker.exists(),
+        "destination must not spawn after a source connection failure"
+    );
+}
+
 /// Test copying many small files to exercise stream pooling.
 ///
 /// This test creates 150 small files in a directory and verifies they are all
-/// copied correctly. With stream pooling (default 100 streams), this exercises
-/// stream reuse as multiple files will be sent over the same streams.
+/// copied correctly. The default connection ceiling permits at most 100 streams,
+/// and the source's automatic file ceiling may lower that further, so this
+/// exercises stream reuse as multiple files are sent over the same streams.
 #[test]
 fn test_remote_copy_many_small_files() {
     require_local_ssh();
@@ -706,7 +847,7 @@ fn test_remote_copy_many_small_files() {
     let src_subdir = src_dir.path().join("many_files");
     let dst_subdir = dst_dir.path().join("many_files");
     std::fs::create_dir(&src_subdir).unwrap();
-    // create 150 small files (more than default pool size of 100)
+    // create 150 small files, more than the default connection ceiling
     // this exercises stream reuse without causing pool exhaustion issues
     let num_files: usize = 150;
     for i in 0..num_files {
@@ -3525,7 +3666,7 @@ fn test_remote_auto_deploy_skips_hanging_local_candidate() {
 }
 
 #[test]
-fn test_remote_auto_deploy_times_out_hanging_remote_version_probe() {
+fn test_remote_auto_deploy_uses_configured_timeout_for_hanging_remote_version_probe() {
     require_local_ssh();
     let home = make_test_home();
     let override_home = home.path().to_str().unwrap().to_string();
@@ -3559,6 +3700,7 @@ fn test_remote_auto_deploy_times_out_hanging_remote_version_probe() {
     let output = run_rcp_with_args_home_and_env(
         &[
             "--auto-deploy-rcpd",
+            "--remote-copy-conn-timeout-sec=1",
             &explicit_path,
             &src_remote,
             &dst_remote,
