@@ -468,6 +468,51 @@ fn test_remote_copy_tilde_source_to_local() {
 }
 
 #[test]
+fn tilde_remote_home_lookup_uses_configured_timeout() {
+    let directory = tempfile::tempdir().unwrap();
+    let fake_ssh = directory.path().join("ssh");
+    std::fs::write(
+        &fake_ssh,
+        "#!/bin/sh\nsocket=\nmaster=false\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -S) shift; socket=$1 ;;\n    -M) master=true ;;\n  esac\n  shift\ndone\nif $master; then\n  : > \"$socket\"\nfi\nparent=$PPID\nwhile kill -0 \"$parent\" 2>/dev/null; do\n  sleep 0.05\ndone\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ambient_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(directory.path().to_path_buf()).chain(std::env::split_paths(&ambient_path)),
+    )
+    .unwrap();
+    let destination = directory.path().join("destination");
+    let output = std::process::Command::new("timeout")
+        .args([
+            "5",
+            assert_cmd::cargo::cargo_bin("rcp").to_str().unwrap(),
+            "--force-remote",
+            "--remote-copy-conn-timeout-sec=1",
+            "fake-host:~/source",
+            destination.to_str().unwrap(),
+        ])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert_ne!(
+        output.status.code(),
+        Some(TIMEOUT_EXIT_CODE),
+        "configured remote timeout was ignored during tilde expansion"
+    );
+    assert!(!output.status.success());
+    let error = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        error.contains("remote HOME lookup timed out after 1s"),
+        "configured deadline missing from HOME lookup error: {error}"
+    );
+}
+
+#[test]
 fn test_remote_copy_local_to_tilde_destination() {
     require_local_ssh();
     let home = make_test_home();

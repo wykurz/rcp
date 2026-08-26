@@ -404,8 +404,9 @@ Manual deployment is still supported and may be preferred for:
 **Configuration options:**
 
 - `--port-ranges` - restrict TCP data ports to specific ranges (e.g., "8000-8999")
-- `--remote-copy-conn-timeout-sec` - remote version-probe and TCP connection timeout in seconds
-  (default: 15; 60 with `--auto-deploy-rcpd`)
+- `--remote-copy-conn-timeout-sec` - remote SSH setup, tilde-expansion HOME lookup, version-probe,
+  daemon-readiness, and TCP connection timeout in seconds (default: 15; 60 with
+  `--auto-deploy-rcpd`)
 - `--remote-keepalive-sec` - liveness budget for every rcp TCP connection in seconds, 0 disables
   (default: 120); idle connections everywhere, unacknowledged data on control connections only
 

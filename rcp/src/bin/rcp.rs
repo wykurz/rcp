@@ -204,8 +204,8 @@ struct Args {
 
     /// Connection timeout for remote setup and copy operations in seconds
     ///
-    /// Applies to: remote rcpd version probes, rcpd→master connection,
-    /// destination→source connection.
+    /// Applies to: remote SSH setup, tilde-expansion HOME lookup, rcpd version probes and
+    /// readiness, rcpd→master connection, destination→source connection.
     /// Default: 15s normally, 60s when --auto-deploy-rcpd is enabled (to account
     /// for sequential binary deployment to multiple hosts).
     #[arg(
@@ -844,16 +844,15 @@ async fn run_rcpd_master(
     let source_config = build_source_remote_config(&request)?;
     let source_bind_ip = extract_bind_ip_from_host(&src.session().host);
     let same_session = src.session() == dst.session();
-    let version_probe_timeout = std::time::Duration::from_secs(request.tcp.conn_timeout_sec);
-    let (prepared_source, prepared_destination) =
-        remote::prepare_rcpd_endpoints_with_probe_timeout(
-            src.session(),
-            dst.session(),
-            args.rcpd_path.as_deref(),
-            args.auto_deploy_rcpd,
-            version_probe_timeout,
-        )
-        .await?;
+    let bootstrap_timeout = std::time::Duration::from_secs(request.tcp.conn_timeout_sec);
+    let (prepared_source, prepared_destination) = remote::prepare_rcpd_endpoints_with_timeout(
+        src.session(),
+        dst.session(),
+        args.rcpd_path.as_deref(),
+        args.auto_deploy_rcpd,
+        bootstrap_timeout,
+    )
+    .await?;
 
     let source_rcpd = {
         let _span = tracing::trace_span!(
@@ -957,7 +956,7 @@ async fn run_rcpd_master(
             return Err(error);
         }
     };
-    // Start draining immediately. Source startup notices are already queued by this point and must
+    // start draining immediately. Source startup notices are already queued by this point and must
     // remain visible even if any part of destination bring-up fails.
     let source_tracing_task =
         spawn_tracing_receiver(source_tracing_recv, remote::tracelog::RcpdType::Source);
@@ -993,7 +992,7 @@ async fn run_rcpd_master(
                 .await?
         };
         let destination_conn_info = destination_rcpd.conn_info.clone();
-        // Retain process ownership before validation or connection work introduces another exit.
+        // retain process ownership before validation or connection work introduces another exit.
         rcpd_processes.push(destination_rcpd);
         validate_destination_readiness(&source_conn_info, &destination_conn_info)?;
         tracing::info!(
@@ -1330,7 +1329,7 @@ async fn async_main(
         } else {
             None
         };
-        // Explicit limits can be validated entirely by the master, so reject invalid capacities
+        // explicit limits can be validated entirely by the master, so reject invalid capacities
         // before a `~` operand can trigger a remote HOME lookup. Automatic selection remains
         // source-owned and is resolved only after source readiness.
         let request = build_master_remote_request(
@@ -1338,19 +1337,32 @@ async fn async_main(
             files_in_flight,
             master_cert.as_ref().map(|cert| cert.fingerprint),
         )?;
+        let remote_home_timeout = std::time::Duration::from_secs(request.tcp.conn_timeout_sec);
         // expand remote '~' using remote HOME if needed
         let same_session = remote_src.session() == remote_dst.session();
         if same_session && (remote_src.needs_remote_home() || remote_dst.needs_remote_home()) {
-            let home = remote::get_remote_home_for_session(remote_src.session()).await?;
+            let home = remote::get_remote_home_for_session_with_timeout(
+                remote_src.session(),
+                remote_home_timeout,
+            )
+            .await?;
             remote_src.apply_remote_home(&home);
             remote_dst.apply_remote_home(&home);
         } else {
             if remote_src.needs_remote_home() {
-                let home = remote::get_remote_home_for_session(remote_src.session()).await?;
+                let home = remote::get_remote_home_for_session_with_timeout(
+                    remote_src.session(),
+                    remote_home_timeout,
+                )
+                .await?;
                 remote_src.apply_remote_home(&home);
             }
             if remote_dst.needs_remote_home() {
-                let home = remote::get_remote_home_for_session(remote_dst.session()).await?;
+                let home = remote::get_remote_home_for_session_with_timeout(
+                    remote_dst.session(),
+                    remote_home_timeout,
+                )
+                .await?;
                 remote_dst.apply_remote_home(&home);
             }
         }
@@ -1425,7 +1437,7 @@ async fn async_main(
         // check for existing destination only when not using trailing slash (single source case)
         if src_strings.len() == 1 && !dst_string.ends_with('/') && !(args.overwrite || args.delete)
         {
-            // Under strict operand resolution, probe the destination fd-relative (parent opened
+            // under strict operand resolution, probe the destination fd-relative (parent opened
             // openat2 RESOLVE_NO_SYMLINKS) so a symlinked destination prefix fails closed instead
             // of being followed by a path-based `exists()`. The engine also validates the prefix
             // up front, so this is only the friendly pre-flight message; keeping it fd-relative
@@ -1448,7 +1460,7 @@ async fn async_main(
         }
         src_dst.push((src_path, dst_path));
     }
-    // Under --require-toctou-safe, refuse byte-equal duplicate resolved destinations up front — a
+    // under --require-toctou-safe, refuse byte-equal duplicate resolved destinations up front — a
     // clear error for the obvious `rcp /a/foo /b/foo /dst/` mistake. This is only the fast, EXACT
     // check: two sources can ALSO alias to the same destination directory via the filesystem (a
     // case-insensitive/casefold or Unicode-normalizing destination, or a bind mount), which a lexical
@@ -1503,7 +1515,7 @@ async fn async_main(
     let fail_early = settings.fail_early;
     let error_collector = common::error_collector::ErrorCollector::default();
     let mut copy_summary = common::copy::Summary::default();
-    // Under --require-toctou-safe, run multi-source copies SEQUENTIALLY instead of concurrently, so
+    // under --require-toctou-safe, run multi-source copies SEQUENTIALLY instead of concurrently, so
     // two sources that alias to the same destination directory (see the duplicate check above)
     // cannot run overlapping reused-directory lockdown/restore lifecycles against it. Strict
     // multi-source is the paranoid, uncommon path, so the sequential cost is acceptable.
@@ -1682,7 +1694,7 @@ fn main() -> Result<(), anyhow::Error> {
         .throttle_config(files_in_flight, args.chunk_size.0);
     if is_remote_operation {
         throttle.apply_files_in_flight = false;
-        // In remote mode the master runs no metadata controllers — all probes
+        // in remote mode the master runs no metadata controllers — all probes
         // fire inside rcpd on the remote hosts. Clear both histogram fields so
         // that:
         //   1. The master does not validate --auto-meta-histogram-log locally
@@ -1692,7 +1704,7 @@ fn main() -> Result<(), anyhow::Error> {
         //      filesystem.
         //   3. The master does not spawn accumulators that will never receive a
         //      sample (master has no controllers in remote mode).
-        // The RcpdConfig still carries the original path; each rcpd validates
+        // the RcpdConfig still carries the original path; each rcpd validates
         // and writes its own log locally.
         throttle.histogram_log_path = None;
         throttle.histogram_enabled = false;

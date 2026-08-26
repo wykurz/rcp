@@ -79,21 +79,23 @@ cache target with the accepted version's compatibility tag, transfers and publis
 probes that deployed remote path before constructing either role's spawn command. Thus neither
 co-location nor a current-looking cache filename is treated as proof that the binary implements the
 current serialized and rcpd spawn contract. For distinct hosts, the first preparation failure
-cooperatively cancels its peer without dropping owned work or replacing the original error. Each
-potentially blocking preparation stage either has a documented version-probe deadline or runs under
-a cancellation-aware owner with a bounded foreground grace. If SSH setup, discovery, HOME lookup,
-verification, or cleanup remains blocked after that grace, its task retains the local child/session
-in the background and paired preparation may return the first endpoint error.
+cooperatively cancels its peer without dropping owned work or replacing the original error. SSH
+control-socket readiness uses the same configured deadline and a cancellation-aware owner. Remote
+tilde expansion applies that deadline to its SSH setup and HOME lookup. Endpoint discovery,
+deployment-internal HOME lookup, deployment, and cleanup use cancellation-aware owners with bounded
+foreground grace. If one of those cancellation-owned stages remains blocked after that grace, its
+task retains the local child/session in the background and paired preparation may return the first
+endpoint error.
 
 The SSH multiplex master runs as a retained foreground `ssh -M -N` process; explicit
 `ForkAfterAuthentication=no` and `ControlPersist=no` command-line overrides prevent user or system
 SSH configuration from forking it away from its owner. Cancelling setup aborts that owner and
 `kill_on_drop` terminates the actual connecting process. After setup succeeds, a cloneable managed
 session keeps both the multiplex session and foreground child together through prepared and running
-daemon states. Whichever clone is dropped last detaches the library's blocking destructor and
-signals the retained master immediately, then moves bounded reaping to a dedicated OS thread.
-Cleanup therefore neither blocks a Tokio worker nor depends on a Tokio runtime that may already be
-shutting down.
+daemon states. Whichever clone is dropped last detaches the library's blocking destructor, signals
+the retained master, and removes its private control directory before returning. Only bounded
+process reaping moves to a dedicated OS thread, so it does not depend on a Tokio runtime that may
+already be shutting down. A failed synchronous directory removal is retried by that reaper.
 
 Deployment stages, verifies, and publishes through one remote `sh` transaction. Before anything can
 create the unique temp path, that shell installs an `EXIT` trap which removes it; checksum mismatch,
@@ -106,26 +108,28 @@ retains cleanup ownership independently of Tokio. A temp name surviving an unhan
 termination is private to that deployment and is never discovered, executed, or adopted by a retry.
 
 **Startup stderr ownership and notices:** A successfully started daemon reserves its first stderr
-line for exactly one readiness record. Chrome-trace, flamegraph, Tokio-console, legacy-option, and
-explicit concurrency-clamp announcements are collected until tracing is installed and emitted
-through the default-visible `rcp::notice` target. Remote tracing queues daemon notices until the
-master connects, so they reach master output without becoming readiness preamble. An intentional
-fatal startup refusal instead emits one `RCP_ERROR <diagnostic>` record and exits, including
-configuration failures found before tracing is installed. The master treats that typed record as a
-nested failure cause, closes its stdin, and gives an owned reaper a bounded grace before returning;
-if the grace expires, the detached reaper retains child ownership. If startup fails without a typed
-record, captured stdout and remaining stderr are attached to the handshake error. Arbitrary stderr
-remains an invalid readiness record. After readiness, bounded stdout/stderr collectors are joined on
-daemon completion, so a nonzero exit retains diagnostics without allowing unbounded output to grow
-in memory or leaving collector tasks detached. An explicit `F` reduced by `M`, an explicit `M`
-reduced by the source's `F`, or an explicit limit reduced by endpoint descriptor safety produces a
-notice naming the requested and effective values. The ordinary automatic/default intersection
-remains quiet. The master retains the source process before attempting its control/tracing
-connections and waits for daemon cleanup if either connection fails. It starts the source tracing
-receiver as soon as its tracing connection is established, before destination configuration or
-startup. Every later startup and protocol exit closes the control streams, waits for owned daemon
-processes, and gives tracing receivers a bounded drain, so already-queued source notices remain
-visible alongside a destination failure rather than being dropped during unwinding.
+line for exactly one readiness record. The master bounds that read by
+`--remote-copy-conn-timeout-sec` and rejects a record larger than 64 KiB. Chrome-trace, flamegraph,
+Tokio-console, legacy-option, and explicit concurrency-clamp announcements are collected until
+tracing is installed and emitted through the default-visible `rcp::notice` target. Remote tracing
+queues daemon notices until the master connects, so they reach master output without becoming
+readiness preamble. An intentional fatal startup refusal instead emits one `RCP_ERROR <diagnostic>`
+record and exits, including configuration failures found before tracing is installed. The master
+treats that typed record as a nested failure cause, closes its stdin, and gives an owned reaper a
+bounded grace before returning; if the grace expires, the detached reaper retains child ownership.
+If startup fails without a typed record, captured stdout and remaining stderr are attached to the
+handshake error. Arbitrary stderr remains an invalid readiness record. After readiness, bounded
+stdout/stderr collectors are joined on daemon completion, so a nonzero exit retains diagnostics
+without allowing unbounded output to grow in memory or leaving collector tasks detached. An explicit
+`F` reduced by `M`, an explicit `M` reduced by the source's `F`, or an explicit limit reduced by
+endpoint descriptor safety produces a notice naming the requested and effective values. The ordinary
+automatic/default intersection remains quiet. The master retains the source process before
+attempting its control/tracing connections and waits for daemon cleanup if either connection fails.
+It starts the source tracing receiver as soon as its tracing connection is established, before
+destination configuration or startup. Every later startup and protocol exit closes the control
+streams, waits for owned daemon processes, and gives tracing receivers a bounded drain, so
+already-queued source notices remain visible alongside a destination failure rather than being
+dropped during unwinding.
 
 ### 1.3 Connection Topology
 
@@ -1416,8 +1420,9 @@ destination drains it.
 
 Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
 
-- `--remote-copy-conn-timeout-sec=N` (default: 15; 60 with auto-deployment) - Timeout for remote
-  version probes and TCP connection setup
+- `--remote-copy-conn-timeout-sec=N` (default: 15; 60 with auto-deployment) - Timeout for SSH
+  session setup, tilde-expansion HOME lookup, remote version probes, daemon readiness, and TCP
+  connection setup
 - `--remote-keepalive-sec=N` (default: 120, `0` disables) - Liveness budget for every rcp TCP
   connection
 - `--port-ranges=RANGES` (optional) - Restrict TCP to specific port ranges (e.g., "8000-8999")

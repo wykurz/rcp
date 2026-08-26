@@ -115,7 +115,7 @@ fn max_file_limit_names_conflict() {
 }
 
 #[test]
-fn direct_rcpd_legacy_warning_leaves_connection_record_on_stderr() {
+fn test_remote_direct_rcpd_legacy_warning_leaves_connection_record_on_stderr() {
     assert_direct_rcpd_readiness_first(&["--max-open-files=0".to_string()]);
 }
 
@@ -257,21 +257,21 @@ fn assert_direct_rcpd_readiness_first(extra: &[String]) -> std::process::Output 
 }
 
 #[test]
-fn direct_rcpd_chrome_trace_leaves_connection_record_on_stderr() {
+fn test_remote_direct_rcpd_chrome_trace_leaves_connection_record_on_stderr() {
     let temp = tempfile::tempdir().unwrap();
     let prefix = temp.path().join("trace");
     assert_direct_rcpd_readiness_first(&[format!("--chrome-trace={}", prefix.display())]);
 }
 
 #[test]
-fn direct_rcpd_flamegraph_leaves_connection_record_on_stderr() {
+fn test_remote_direct_rcpd_flamegraph_leaves_connection_record_on_stderr() {
     let temp = tempfile::tempdir().unwrap();
     let prefix = temp.path().join("flame");
     assert_direct_rcpd_readiness_first(&[format!("--flamegraph={}", prefix.display())]);
 }
 
 #[test]
-fn direct_rcpd_tokio_console_leaves_connection_record_on_stderr() {
+fn test_remote_direct_rcpd_tokio_console_leaves_connection_record_on_stderr() {
     assert_direct_rcpd_readiness_first(&[
         "--tokio-console".to_string(),
         "--tokio-console-port=0".to_string(),
@@ -939,7 +939,11 @@ fn test_remote_copy_timeout() {
         .unwrap()
         .args(["--remote-copy-conn-timeout-sec", "30", "--help"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicates::str::contains("remote SSH setup"))
+        .stdout(predicates::str::contains(
+            "rcpd version probes and readiness",
+        ));
 }
 
 /// Test that --remote-keepalive-sec accepts a budget and the disabling 0

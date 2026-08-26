@@ -578,7 +578,7 @@ pub(crate) async fn deploy_rcpd_with_context<S: crate::SshSessionOwner>(
     tracing::debug!("Expected SHA-256: {}", hex::encode(&expected_checksum));
 
     // validate HOME is set and construct remote path
-    let home = crate::get_remote_home_with_context(session, preparation).await?;
+    let home = crate::get_remote_home_with_context(session, preparation, None).await?;
     preparation.ensure_active()?;
     let remote_path = format!("{}/.cache/rcp/bin/rcpd-{}", home, version);
 
@@ -870,7 +870,7 @@ pub(crate) async fn cleanup_old_versions_with_context<S: crate::SshSessionOwner>
 
     // validate HOME is set before constructing the cache path
     // if this fails, we log and return Ok since cleanup is best-effort
-    let home = match crate::get_remote_home_with_context(session, preparation).await {
+    let home = match crate::get_remote_home_with_context(session, preparation, None).await {
         Ok(h) => h,
         Err(e) => {
             tracing::warn!(
