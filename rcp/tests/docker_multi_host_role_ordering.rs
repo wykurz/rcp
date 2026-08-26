@@ -175,7 +175,7 @@ fn test_destination_waits_for_delayed_source_startup() -> Result<()> {
         .find("Source rcpd at")
         .expect("verbose output should report source readiness");
     let destination_start = stdout
-        .find("Starting prepared rcpd server on: SshSession { user: None, host: \"host-b\"")
+        .find("Starting prepared rcpd server on: host-b")
         .expect("verbose output should report destination startup");
     assert!(
         source_ready < destination_start,

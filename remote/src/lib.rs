@@ -128,6 +128,7 @@ const RCPD_OUTPUT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_s
 const PREPARATION_OWNED_WORK_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 const SSH_MASTER_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 const DIAGNOSTIC_CAPTURE_LIMIT: usize = 64 * 1024;
+const RCPD_STARTUP_RECORD_LIMIT: usize = 64 * 1024;
 
 #[derive(Default)]
 pub(crate) struct CapturedOutput {
@@ -306,9 +307,9 @@ struct ManagedSshSessionInner {
 
 impl Drop for ManagedSshSessionInner {
     fn drop(&mut self) {
-        // Detaching suppresses openssh's synchronous `ssh -O exit` destructor. Signal the actual
-        // retained master before returning from Drop so process exit cannot outrun cleanup; only
-        // bounded reaping and directory removal are deferred off the Tokio worker.
+        // detaching suppresses openssh's synchronous `ssh -O exit` destructor. Signal the actual
+        // retained master and remove its private control directory before returning from Drop;
+        // only bounded process reaping is deferred off the Tokio worker.
         let control_path = self
             .session
             .take()
@@ -319,6 +320,19 @@ impl Drop for ManagedSshSessionInner {
         {
             tracing::debug!("failed to terminate SSH multiplex master: {error:#}");
         }
+        let control_path = control_path.and_then(|control_path| {
+            let control_dir = control_path.parent()?;
+            match std::fs::remove_dir_all(control_dir) {
+                Ok(()) => None,
+                Err(error) => {
+                    tracing::debug!(
+                        "failed to remove SSH control directory {} synchronously: {error:#}",
+                        control_dir.display()
+                    );
+                    Some(control_path)
+                }
+            }
+        });
         let reaper = SshMasterReaper {
             launcher: self.launcher.take(),
             control_path,
@@ -429,11 +443,12 @@ impl PreparationContext {
         }
     }
 
-    /// Await owned work whose in-progress process is safe and necessary to abort on cancellation.
-    async fn run_abortable<T>(
+    /// Await owned work whose process must be aborted on cancellation or bootstrap timeout.
+    async fn run_abortable_with_deadline<T>(
         &self,
         mut task: tokio::task::JoinHandle<anyhow::Result<T>>,
         operation: &'static str,
+        deadline: BootstrapDeadline,
     ) -> anyhow::Result<T>
     where
         T: Send + 'static,
@@ -452,8 +467,24 @@ impl PreparationContext {
                 }
                 Err(Self::cancellation_error())
             }
-            result = &mut task => result
-                .with_context(|| format!("{operation} owner task failed"))?,
+            result = deadline.run(operation, async {
+                (&mut task)
+                    .await
+                    .with_context(|| format!("{operation} owner task failed"))?
+            }) => {
+                if !task.is_finished() {
+                    task.abort();
+                    match task.await {
+                        Err(error) if error.is_cancelled() => {
+                            tracing::debug!("aborted {operation} after its bootstrap deadline");
+                        }
+                        Ok(Ok(_)) => tracing::debug!("{operation} completed as its deadline elapsed"),
+                        Ok(Err(error)) => tracing::debug!("{operation} failed as its deadline elapsed: {error:#}"),
+                        Err(error) => tracing::debug!("{operation} owner task failed as its deadline elapsed: {error:#}"),
+                    }
+                }
+                result
+            }
         }
     }
 
@@ -492,6 +523,7 @@ impl PreparationContext {
         deadline: std::time::Duration,
     ) -> anyhow::Result<std::process::Output> {
         let mut task = Self::remote_output_task(command, operation.to_string());
+        let deadline = BootstrapDeadline::new(deadline);
         tokio::select! {
             biased;
             () = self.cancellation.cancelled() => {
@@ -501,19 +533,42 @@ impl PreparationContext {
                 }
                 Err(Self::cancellation_error())
             }
-            result = tokio::time::timeout(deadline, &mut task) => match result {
-                Ok(result) => result.with_context(|| format!("{operation} owner task failed"))?,
-                Err(elapsed) => {
+            result = deadline.run(operation, async {
+                (&mut task)
+                    .await
+                    .with_context(|| format!("{operation} owner task failed"))?
+            }) => {
+                if !task.is_finished() {
                     task.abort();
-                    Err(elapsed).with_context(|| {
-                        format!(
-                            "{operation} timed out after {}",
-                            humantime::format_duration(deadline)
-                        )
-                    })
+                    let _ = task.await;
                 }
-            },
+                result
+            }
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BootstrapDeadline(std::time::Duration);
+
+impl BootstrapDeadline {
+    const fn new(duration: std::time::Duration) -> Self {
+        Self(duration)
+    }
+
+    async fn run<T>(
+        self,
+        operation: &str,
+        future: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        tokio::time::timeout(self.0, future)
+            .await
+            .with_context(|| {
+                format!(
+                    "{operation} timed out after {}",
+                    humantime::format_duration(self.0)
+                )
+            })?
     }
 }
 
@@ -755,14 +810,17 @@ pub use common::is_localhost;
 async fn setup_ssh_session(
     session: &SshSession,
     preparation: &PreparationContext,
+    deadline: BootstrapDeadline,
 ) -> anyhow::Result<ManagedSshSession> {
-    setup_ssh_session_with_program(session, preparation, std::path::Path::new("ssh")).await
+    setup_ssh_session_with_program(session, preparation, std::path::Path::new("ssh"), deadline)
+        .await
 }
 
 async fn setup_ssh_session_with_program(
     session: &SshSession,
     preparation: &PreparationContext,
     ssh_program: &std::path::Path,
+    deadline: BootstrapDeadline,
 ) -> anyhow::Result<ManagedSshSession> {
     let session = session.clone();
     let control_dir = ssh_control_directory().context("no usable SSH control directory found")?;
@@ -773,7 +831,7 @@ async fn setup_ssh_session_with_program(
             .context("Failed to establish SSH connection")
     });
     preparation
-        .run_abortable(connect, "SSH session setup")
+        .run_abortable_with_deadline(connect, "SSH session setup", deadline)
         .await
 }
 
@@ -939,9 +997,19 @@ fn control_dir_is_usable(dir: &std::path::Path) -> bool {
 pub async fn get_remote_home_for_session(
     session: &SshSession,
 ) -> anyhow::Result<std::path::PathBuf> {
+    get_remote_home_for_session_with_timeout(session, DEFAULT_REMOTE_RCPD_VERSION_TIMEOUT).await
+}
+
+/// Retrieve a remote home directory with a caller-selected bootstrap timeout.
+#[instrument]
+pub async fn get_remote_home_for_session_with_timeout(
+    session: &SshSession,
+    bootstrap_timeout: std::time::Duration,
+) -> anyhow::Result<std::path::PathBuf> {
     let preparation = PreparationContext::uncancelled();
-    let ssh_session = setup_ssh_session(session, &preparation).await?;
-    let home = get_remote_home_with_context(&ssh_session, &preparation).await?;
+    let deadline = BootstrapDeadline::new(bootstrap_timeout);
+    let ssh_session = setup_ssh_session(session, &preparation, deadline).await?;
+    let home = get_remote_home_with_context(&ssh_session, &preparation, Some(deadline)).await?;
     Ok(std::path::PathBuf::from(home))
 }
 
@@ -1035,12 +1103,13 @@ pub(crate) fn shell_escape(s: &str) -> String {
 ///
 /// Returns an error if HOME is not set or is empty
 pub async fn get_remote_home(session: &std::sync::Arc<openssh::Session>) -> anyhow::Result<String> {
-    get_remote_home_with_context(session, &PreparationContext::uncancelled()).await
+    get_remote_home_with_context(session, &PreparationContext::uncancelled(), None).await
 }
 
 async fn get_remote_home_with_context<S: SshSessionOwner>(
     session: &S,
     preparation: &PreparationContext,
+    deadline: Option<BootstrapDeadline>,
 ) -> anyhow::Result<String> {
     if let Ok(home_override) = std::env::var("RCP_REMOTE_HOME_OVERRIDE")
         && !home_override.is_empty()
@@ -1049,10 +1118,19 @@ async fn get_remote_home_with_context<S: SshSessionOwner>(
     }
     let mut command = openssh::Session::to_command(session.clone(), "sh");
     command.arg("-c").arg("echo \"${HOME:?HOME not set}\"");
-    let output = preparation
-        .remote_output(command, "remote HOME lookup")
-        .await
-        .context("failed to check HOME environment variable on remote host")?;
+    let output = match deadline {
+        Some(deadline) => {
+            preparation
+                .remote_output_with_deadline(command, "remote HOME lookup", deadline.0)
+                .await
+        }
+        None => {
+            preparation
+                .remote_output(command, "remote HOME lookup")
+                .await
+        }
+    }
+    .context("failed to check HOME environment variable on remote host")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1183,7 +1261,11 @@ impl<S: SshSessionOwner> DiscoverySession for RealDiscoverySession<'_, S> {
         &'b self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'b>>
     {
-        Box::pin(get_remote_home_with_context(self.session, self.preparation))
+        Box::pin(get_remote_home_with_context(
+            self.session,
+            self.preparation,
+            None,
+        ))
     }
 }
 
@@ -1517,6 +1599,44 @@ fn parse_rcpd_startup_record(line: &str) -> anyhow::Result<RcpdConnectionInfo> {
     parse_rcpd_readiness(line)
 }
 
+async fn read_rcpd_startup_record<R>(reader: &mut R) -> anyhow::Result<RcpdConnectionInfo>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader
+            .fill_buf()
+            .await
+            .context("failed to read connection info from rcpd")?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                anyhow::bail!("rcpd exited before writing a readiness record");
+            }
+            break;
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        if bytes.len().saturating_add(take) > RCPD_STARTUP_RECORD_LIMIT {
+            anyhow::bail!(
+                "rcpd readiness record exceeds the {}-byte limit",
+                RCPD_STARTUP_RECORD_LIMIT
+            );
+        }
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            break;
+        }
+    }
+    let line = String::from_utf8(bytes).context("rcpd readiness record is not valid UTF-8")?;
+    let line = line.trim();
+    tracing::debug!("rcpd connection line: {line}");
+    parse_rcpd_startup_record(line)
+}
+
 /// Result of starting an rcpd process.
 pub struct RcpdProcess {
     /// SSH child process handle
@@ -1557,7 +1677,7 @@ pub async fn prepare_rcpd_endpoints(
     explicit_rcpd_path: Option<&str>,
     auto_deploy_rcpd: bool,
 ) -> anyhow::Result<(PreparedRcpd, PreparedRcpd)> {
-    prepare_rcpd_endpoints_with_probe_timeout(
+    prepare_rcpd_endpoints_with_timeout(
         source,
         destination,
         explicit_rcpd_path,
@@ -1567,13 +1687,13 @@ pub async fn prepare_rcpd_endpoints(
     .await
 }
 
-/// Prepare two endpoints with a caller-selected remote version-probe timeout.
-pub async fn prepare_rcpd_endpoints_with_probe_timeout(
+/// Prepare two endpoints with a caller-selected remote bootstrap timeout.
+pub async fn prepare_rcpd_endpoints_with_timeout(
     source: &SshSession,
     destination: &SshSession,
     explicit_rcpd_path: Option<&str>,
     auto_deploy_rcpd: bool,
-    version_probe_timeout: std::time::Duration,
+    bootstrap_timeout: std::time::Duration,
 ) -> anyhow::Result<(PreparedRcpd, PreparedRcpd)> {
     if source == destination {
         let prepared = prepare_rcpd_with_context(
@@ -1581,7 +1701,7 @@ pub async fn prepare_rcpd_endpoints_with_probe_timeout(
             explicit_rcpd_path,
             auto_deploy_rcpd,
             PreparationContext::uncancelled(),
-            version_probe_timeout,
+            bootstrap_timeout,
         )
         .await?;
         return Ok((prepared.clone(), prepared));
@@ -1593,7 +1713,7 @@ pub async fn prepare_rcpd_endpoints_with_probe_timeout(
                 explicit_rcpd_path,
                 auto_deploy_rcpd,
                 preparation,
-                version_probe_timeout,
+                bootstrap_timeout,
             )
         },
         |preparation| {
@@ -1602,9 +1722,30 @@ pub async fn prepare_rcpd_endpoints_with_probe_timeout(
                 explicit_rcpd_path,
                 auto_deploy_rcpd,
                 preparation,
-                version_probe_timeout,
+                bootstrap_timeout,
             )
         },
+    )
+    .await
+}
+
+/// Prepare two endpoints with a caller-selected remote version-probe timeout.
+///
+/// This compatibility wrapper now applies the timeout to SSH setup as well as version probes.
+#[deprecated(note = "use prepare_rcpd_endpoints_with_timeout")]
+pub async fn prepare_rcpd_endpoints_with_probe_timeout(
+    source: &SshSession,
+    destination: &SshSession,
+    explicit_rcpd_path: Option<&str>,
+    auto_deploy_rcpd: bool,
+    version_probe_timeout: std::time::Duration,
+) -> anyhow::Result<(PreparedRcpd, PreparedRcpd)> {
+    prepare_rcpd_endpoints_with_timeout(
+        source,
+        destination,
+        explicit_rcpd_path,
+        auto_deploy_rcpd,
+        version_probe_timeout,
     )
     .await
 }
@@ -1732,17 +1873,22 @@ async fn prepare_rcpd_with_context(
     explicit_rcpd_path: Option<&str>,
     auto_deploy_rcpd: bool,
     preparation: PreparationContext,
-    version_probe_timeout: std::time::Duration,
+    bootstrap_timeout: std::time::Duration,
 ) -> anyhow::Result<PreparedRcpd> {
     tracing::info!("Preparing rcpd server on: {:?}", session);
     let remote_host = &session.host;
-    let ssh_session = setup_ssh_session(session, &preparation).await?;
+    let ssh_session = setup_ssh_session(
+        session,
+        &preparation,
+        BootstrapDeadline::new(bootstrap_timeout),
+    )
+    .await?;
     let rcpd_path = match try_discover_and_check_version(
         &ssh_session,
         explicit_rcpd_path,
         remote_host,
         &preparation,
-        version_probe_timeout,
+        bootstrap_timeout,
     )
     .await
     {
@@ -1772,7 +1918,7 @@ async fn prepare_rcpd_with_context(
                 &deployed_path,
                 remote_host,
                 &preparation,
-                version_probe_timeout,
+                bootstrap_timeout,
             )
             .await
             .with_context(|| {
@@ -1809,14 +1955,14 @@ pub async fn start_rcpd(
     bind_ip: Option<&str>,
     role: protocol::RcpdRole,
 ) -> anyhow::Result<RcpdProcess> {
-    let version_probe_timeout =
+    let bootstrap_timeout =
         std::time::Duration::from_secs(rcpd_config.remote_copy_conn_timeout_sec);
     prepare_rcpd_with_context(
         session,
         explicit_rcpd_path,
         auto_deploy_rcpd,
         PreparationContext::uncancelled(),
-        version_probe_timeout,
+        bootstrap_timeout,
     )
     .await?
     .spawn(rcpd_config, bind_ip, role)
@@ -1830,9 +1976,7 @@ impl PreparedRcpd {
         bind_ip: Option<&str>,
         role: protocol::RcpdRole,
     ) -> anyhow::Result<RcpdProcess> {
-        use tokio::io::AsyncBufReadExt;
-
-        tracing::info!("Starting prepared rcpd server on: {:?}", self.remote);
+        tracing::info!("Starting prepared rcpd server on: {}", self.remote.host);
         let session = &self.remote;
         // run rcpd command remotely
         let rcpd_args = rcpd_config.to_args();
@@ -1861,19 +2005,13 @@ impl PreparedRcpd {
             return Err(attach_startup_diagnostic(error, diagnostic));
         };
         let mut stderr_reader = tokio::io::BufReader::new(stderr);
-        let startup = async {
-            let mut line = String::new();
-            let bytes_read = stderr_reader
-                .read_line(&mut line)
-                .await
-                .context("failed to read connection info from rcpd")?;
-            if bytes_read == 0 {
-                anyhow::bail!("rcpd exited before writing a readiness record");
-            }
-            let line = line.trim().to_string();
-            tracing::debug!("rcpd connection line: {}", line);
-            parse_rcpd_startup_record(&line)
-        }
+        let startup = BootstrapDeadline::new(std::time::Duration::from_secs(
+            rcpd_config.remote_copy_conn_timeout_sec,
+        ))
+        .run(
+            "waiting for rcpd readiness record",
+            read_rcpd_startup_record(&mut stderr_reader),
+        )
         .await;
         let conn_info = match startup {
             Ok(conn_info) => conn_info,
@@ -2639,6 +2777,81 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn test_remote_prepared_rcpd_readiness_uses_configured_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("rcpd");
+        let daemon_exit = directory.path().join("daemon-exit");
+        let version = common::version::ProtocolVersion::current()
+            .to_json()
+            .unwrap();
+        let contents = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\ncat >/dev/null\nprintf 'exited\\n' > {}\n",
+            shell_escape(&version),
+            shell_escape(daemon_exit.to_str().unwrap()),
+        );
+        std::fs::write(&script, contents).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let prepared = prepare_rcpd(&SshSession::local(), Some(script.to_str().unwrap()), false)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prepared.spawn(&test_rcpd_config(), None, protocol::RcpdRole::Source),
+        )
+        .await
+        .expect("the configured one-second readiness deadline was not honored");
+        let error = match result {
+            Ok(_) => panic!("rcpd without a readiness record unexpectedly started"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("timed out after 1s"),
+            "configured deadline missing from readiness error: {error}"
+        );
+        assert_eq!(std::fs::read_to_string(daemon_exit).unwrap(), "exited\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remote_prepared_rcpd_rejects_an_oversized_readiness_record() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("rcpd");
+        let version = common::version::ProtocolVersion::current()
+            .to_json()
+            .unwrap();
+        let contents = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\ndd if=/dev/zero bs=71680 count=1 2>/dev/null | tr '\\000' x >&2\ncat >/dev/null\n",
+            shell_escape(&version),
+        );
+        std::fs::write(&script, contents).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let prepared = prepare_rcpd(&SshSession::local(), Some(script.to_str().unwrap()), false)
+            .await
+            .unwrap();
+        let mut config = test_rcpd_config();
+        config.remote_copy_conn_timeout_sec = 5;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            prepared.spawn(&config, None, protocol::RcpdRole::Source),
+        )
+        .await
+        .expect("an oversized readiness record must fail before the connection deadline");
+        let error = match result {
+            Ok(_) => panic!("an oversized readiness record unexpectedly started rcpd"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("readiness record exceeds"),
+            "oversized readiness error omitted the size limit: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn test_remote_prepared_rcpd_spawns_both_roles_after_one_preparation() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2817,10 +3030,19 @@ mod tests {
         let cancellation = tokio_util::sync::CancellationToken::new();
         let preparation = PreparationContext::new(cancellation.clone());
         let setup = tokio::spawn(async move {
-            setup_ssh_session_with_program(&session, &preparation, &launcher).await
+            setup_ssh_session_with_program(
+                &session,
+                &preparation,
+                &launcher,
+                BootstrapDeadline::new(DEFAULT_REMOTE_RCPD_VERSION_TIMEOUT),
+            )
+            .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while !pid_file.exists() {
+            while std::fs::read_to_string(&pid_file)
+                .map(|pid| pid.trim().is_empty())
+                .unwrap_or(true)
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -2861,6 +3083,80 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_remote_ssh_setup_deadline_terminates_its_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let launcher = directory.path().join("ssh");
+        let pid_file = directory.path().join("pid");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > {}\nexec sleep 30\n",
+                shell_escape(pid_file.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let session = SshSession::local();
+        let preparation = PreparationContext::uncancelled();
+        let mut setup = tokio::spawn(async move {
+            setup_ssh_session_with_program(
+                &session,
+                &preparation,
+                &launcher,
+                BootstrapDeadline::new(std::time::Duration::from_millis(500)),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while std::fs::read_to_string(&pid_file)
+                .map(|pid| pid.trim().is_empty())
+                .unwrap_or(true)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fake SSH launcher must start");
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let process = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
+        let result = match tokio::time::timeout(std::time::Duration::from_secs(2), &mut setup).await
+        {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                setup.abort();
+                let _ = setup.await;
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", pid.trim()])
+                    .status();
+                panic!("the configured SSH setup deadline was not honored");
+            }
+        };
+        let error = match result {
+            Ok(_) => panic!("SSH setup without a control socket unexpectedly succeeded"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("SSH session setup timed out after 500ms"),
+            "configured deadline missing from SSH setup error: {error}"
+        );
+        let terminated = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while process_is_running(&process) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if terminated.is_err() {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", pid.trim()])
+                .status();
+            panic!("timed-out SSH setup must terminate its launcher");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_remote_managed_ssh_drop_terminates_master_without_a_runtime() {
         use std::os::unix::fs::PermissionsExt;
@@ -2873,11 +3169,13 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let launcher = directory.join("ssh");
         let pid_file = directory.join("pid");
+        let socket_file = directory.join("socket");
         std::fs::write(
             &launcher,
             format!(
-                "#!/bin/sh\nsocket=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -S ]; then\n    shift\n    socket=$1\n  fi\n  shift\ndone\nprintf '%s\\n' \"$$\" > {}\n: > \"$socket\"\nexec sleep 30\n",
+                "#!/bin/sh\nsocket=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -S ]; then\n    shift\n    socket=$1\n  fi\n  shift\ndone\nprintf '%s\\n' \"$$\" > {}\nprintf '%s\\n' \"$socket\" > {}\n: > \"$socket\"\nexec sleep 30\n",
                 shell_escape(pid_file.to_str().unwrap()),
+                shell_escape(socket_file.to_str().unwrap()),
             ),
         )
         .unwrap();
@@ -2892,14 +3190,23 @@ mod tests {
                 &SshSession::local(),
                 &PreparationContext::uncancelled(),
                 &launcher,
+                BootstrapDeadline::new(DEFAULT_REMOTE_RCPD_VERSION_TIMEOUT),
             ))
             .unwrap();
         let pid = std::fs::read_to_string(&pid_file).unwrap();
         let process = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
         assert!(process_is_running(&process));
+        let control_path =
+            std::path::PathBuf::from(std::fs::read_to_string(&socket_file).unwrap().trim());
+        let control_directory = control_path.parent().unwrap().to_path_buf();
+        assert!(control_directory.exists());
         runtime.shutdown_timeout(std::time::Duration::from_millis(100));
 
         drop(managed);
+        assert!(
+            !control_directory.exists(),
+            "final session drop must remove its private SSH control directory synchronously"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         while process_is_running(&process) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -3743,5 +4050,20 @@ mod tests {
         let _ = (base.send_buffer_size(), base.recv_buffer_size());
         assert!(dc.send_buffer_size().unwrap() >= net.send_buffer_size().unwrap());
         assert!(dc.recv_buffer_size().unwrap() >= net.recv_buffer_size().unwrap());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn probe_timeout_endpoint_preparation_api_remains_available() {
+        let source = SshSession::local();
+        let destination = SshSession::local();
+        let preparation = prepare_rcpd_endpoints_with_probe_timeout(
+            &source,
+            &destination,
+            None,
+            false,
+            std::time::Duration::from_secs(1),
+        );
+        drop(preparation);
     }
 }

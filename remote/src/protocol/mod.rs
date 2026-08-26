@@ -492,7 +492,8 @@ pub struct RcpdConfig {
     pub network_profile: crate::NetworkProfile,
     /// Buffer size for file transfers (defaults to profile-specific value)
     pub buffer_size: Option<usize>,
-    /// Effective concurrent data-stream ceiling resolved by the master
+    /// Connection ceiling passed to this daemon. The automatic source receives configured `M`;
+    /// negotiated source/destination configurations receive effective `E`.
     pub max_connections: usize,
     /// Multiplier for pending file writes (max pending = max_connections × multiplier)
     pub pending_writes_multiplier: usize,

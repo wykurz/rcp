@@ -217,9 +217,10 @@ those deadlines are part of binary compatibility discovery.
 
 The SSH multiplex master runs as a retained foreground `ssh -M -N` process. Command-line
 `ForkAfterAuthentication=no` and `ControlPersist=no` overrides prevent user or system SSH
-configuration from backgrounding it. Cancelling setup terminates that actual process. On success,
-one cloneable managed owner carries the multiplex session and foreground child through daemon
-startup and execution; final teardown signals the master immediately and reaps it on a dedicated OS
+configuration from backgrounding it. Cancelling setup or reaching the configured remote setup
+deadline terminates that actual process. On success, one cloneable managed owner carries the
+multiplex session and foreground child through daemon startup and execution; final teardown signals
+the master, removes its private control directory synchronously, and reaps it on a dedicated OS
 thread, remaining safe after the Tokio runtime has begun shutting down.
 
 Cancellation during staging closes stdin but does not assume that disconnecting SSH terminates the
@@ -435,13 +436,15 @@ failed to connect to <addr>
 
 ### Timeout Configuration
 
-| Timeout              | Default                             | Configuration                    |
-| -------------------- | ----------------------------------- | -------------------------------- |
-| SSH connection       | ~30s                                | SSH config                       |
-| Remote version probe | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Master → rcpd        | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Destination → Source | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Dead-peer detection  | 120s (0 disables)                   | `--remote-keepalive-sec`         |
+| Timeout               | Default                             | Configuration                    |
+| --------------------- | ----------------------------------- | -------------------------------- |
+| SSH session setup     | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Tilde HOME lookup     | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Remote version probe  | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| rcpd readiness record | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Master → rcpd         | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Destination → Source  | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Dead-peer detection   | 120s (0 disables)                   | `--remote-keepalive-sec`         |
 
 Dead-peer detection covers idle connections everywhere, and unacknowledged data on control
 connections only — a data transfer to a vanished host still falls back to the kernel's
@@ -520,7 +523,7 @@ cargo build --target x86_64-unknown-linux-gnu
 | ---------------------------------- | ------------------------------------------------------------------ |
 | `--rcpd-path=PATH`                 | Override rcpd binary path on remote hosts                          |
 | `--auto-deploy-rcpd`               | Automatically deploy rcpd to remote hosts                          |
-| `--remote-copy-conn-timeout-sec=N` | Remote probe/connection timeout (default: 15; 60 with auto-deploy) |
+| `--remote-copy-conn-timeout-sec=N` | Remote setup/connection timeout (default: 15; 60 with auto-deploy) |
 | `--remote-keepalive-sec=N`         | Dead-peer detection budget, 0 disables (default: 120)              |
 | `--port-ranges=RANGES`             | Restrict TCP to specific ports (e.g., "8000-8999")                 |
 | `--max-files-in-flight=N`          | Explicit ceiling; automatic remote default is source-owned         |

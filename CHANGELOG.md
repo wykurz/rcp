@@ -38,17 +38,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - SSH multiplex masters now remain owned foreground processes; command-line overrides disable both
   `ForkAfterAuthentication` and `ControlPersist` even when SSH configuration enables them.
-  Cancellation terminates the actual connecting process, while the final successful-session owner
-  signals it immediately and reaps it on an OS cleanup thread that remains safe during runtime
-  shutdown. Daemon configuration refusals discovered before tracing use the structured `RCP_ERROR`
-  startup record, and unstructured startup failures retain captured stdout/stderr in the error
-  chain. The source tracing receiver starts before destination bring-up and is drained on later
-  startup failures, preserving queued source notices beside the destination error. Source connection
-  failures also wait for daemon cleanup. Daemon completion joins bounded stdout/stderr collectors,
-  and deployment drains bounded diagnostics while preferring the remote failure over a secondary
-  stdin-shutdown error. Explicit connection requests clamped by the source file ceiling now produce
-  a default-visible notice; legacy file-limit notices preserve the `--max-open-files` spelling the
-  user supplied.
+  Cancellation or the configured remote setup deadline terminates the actual connecting process. The
+  final successful-session owner signals it immediately, removes its private control directory
+  synchronously, and reaps it on an OS cleanup thread that remains safe during runtime shutdown.
+  Remote tilde expansion and daemon readiness reads use that same configured deadline; readiness
+  records larger than 64 KiB are rejected. Daemon configuration refusals discovered before tracing
+  use the structured `RCP_ERROR` startup record, and unstructured startup failures retain captured
+  stdout/stderr in the error chain. The source tracing receiver starts before destination bring-up
+  and is drained on later startup failures, preserving queued source notices beside the destination
+  error. Source connection failures also wait for daemon cleanup. Daemon completion joins bounded
+  stdout/stderr collectors, and deployment drains bounded diagnostics while preferring the remote
+  failure over a secondary stdin-shutdown error. Explicit connection requests clamped by the source
+  file ceiling now produce a default-visible notice; legacy file-limit notices preserve the
+  `--max-open-files` spelling the user supplied.
 
 - `remote::TcpConfig` now contains transport settings only. Its pre-existing remote-capacity fields
   and builders moved out; validated file/stream capacities are represented by
