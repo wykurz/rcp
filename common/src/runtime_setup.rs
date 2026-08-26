@@ -532,15 +532,9 @@ fn descriptor_clamp_diagnostic(
     Some(diagnostic)
 }
 
-fn configure_admission_limits(
-    open_file: ConcurrencyLimit,
-    pending_meta: ConcurrencyLimit,
-) -> anyhow::Result<()> {
-    throttle::try_set_admission_limits(
-        open_file.semaphore_capacity(),
-        pending_meta.semaphore_capacity(),
-    )
-    .context("failed to configure runtime file admission")
+fn configure_leaf_admission_limit(capacity: ConcurrencyLimit) -> anyhow::Result<()> {
+    throttle::try_set_admission_limits(capacity.semaphore_capacity(), capacity.semaphore_capacity())
+        .context("failed to configure runtime file admission")
 }
 
 /// Build a multi-threaded tokio runtime configured per `runtime`, and apply the
@@ -566,18 +560,18 @@ pub(crate) fn build_tokio_runtime(
     } else {
         ConcurrencyLimit::Unlimited
     };
-    let open_file = resolve_leaf_capacity(file_limit, descriptor_limit);
-    let pending_meta = resolve_leaf_capacity(file_limit, descriptor_limit);
+    let leaf_capacity = resolve_leaf_capacity(file_limit, descriptor_limit);
     tracing::info!(
         "Resolved file admission: file_ceiling={:?}, source={:?}, descriptor_ceiling={:?}, open_file={:?}, pending_meta={:?}",
         throttle.files_in_flight.limit(),
         throttle.files_in_flight.source(),
         descriptor_limit,
-        open_file,
-        pending_meta,
+        leaf_capacity,
+        leaf_capacity,
     );
     if throttle.apply_files_in_flight
-        && let Some(diagnostic) = descriptor_clamp_diagnostic(throttle.files_in_flight, open_file)
+        && let Some(diagnostic) =
+            descriptor_clamp_diagnostic(throttle.files_in_flight, leaf_capacity)
     {
         match diagnostic.visibility {
             DescriptorClampVisibility::Notice => {
@@ -589,7 +583,7 @@ pub(crate) fn build_tokio_runtime(
         }
     }
     let runtime = builder.build().context("failed to create Tokio runtime")?;
-    configure_admission_limits(open_file, pending_meta)?;
+    configure_leaf_admission_limit(leaf_capacity)?;
     Ok(runtime)
 }
 
@@ -708,8 +702,8 @@ mod default_leaf_operation_limit_tests {
             std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS + 1).unwrap(),
         );
 
-        let error = configure_admission_limits(oversized, ConcurrencyLimit::Unlimited)
-            .expect_err("oversized OpenFile admission must return an error");
+        let error = configure_leaf_admission_limit(oversized)
+            .expect_err("oversized leaf admission must return an error");
 
         assert!(
             error

@@ -21,6 +21,12 @@ test-group = 'serial'
 filter = 'binary(~docker)'
 test-group = 'serial'
 
+# saturation regressions use tight admission-timeout budgets. Serialize the renamed modules so
+# CPU contention on small CI runners cannot consume most of those budgets before a task is polled.
+[[profile.default.overrides]]
+filter = 'test(max_files_in_flight)'
+test-group = 'serial'
+
 [profile.docker]
 # docker profile runs Docker integration tests (multi-host and chaos tests)
 # these tests are normally ignored and require Docker containers

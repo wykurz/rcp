@@ -55,10 +55,11 @@ while carrying source `F`.
 
 The resolved `E` and pending capacity `P = E × pending-writes-multiplier` use checked arithmetic,
 must be nonzero, and must not exceed `tokio::sync::Semaphore::MAX_PERMITS`. Explicit capacity can be
-validated before remote-home expansion or SSH; automatic capacity is resolved and validated by the
-source before it announces readiness and before destination spawn. `MasterHello` and data-message
-schemas remain unchanged. Wire revision 4 protects the extended readiness record, typed internal
-spawn arguments, and source-first bootstrap contract.
+validated before remote-home expansion or SSH. For automatic capacity, the master validates the
+configured connection upper bound before remote side effects; the source resolves and validates the
+actual CPU-selected capacity before it announces readiness and before destination spawn.
+`MasterHello` and data-message schemas remain unchanged. Wire revision 4 protects the extended
+readiness record, typed internal spawn arguments, and source-first bootstrap contract.
 
 **Special Case - Same Host Copies:** When source and destination are on the same host, the master:
 
@@ -71,65 +72,75 @@ normal remote discovery at both boundaries. The master runs `--protocol-version`
 candidate in search order (beside `rcp`, then `PATH`) and continues to later candidates when one is
 stale, stalls its two-second version probe, or is otherwise unusable. A timed-out local candidate
 has its pipes released and receives a kill request; reaping gets a one-second grace, after which an
-owned background reaper permits the search to continue without losing child ownership. Remote
-version probes, including post-deployment verification, use the initiating `rcp` process's
-`--remote-copy-conn-timeout-sec` deadline so slow-but-healthy hosts can be given an appropriate
-budget without allowing a hanging SSH channel to block fallback indefinitely. The master names the
-cache target with the accepted version's compatibility tag, transfers and publishes the binary, then
-probes that deployed remote path before constructing either role's spawn command. Thus neither
-co-location nor a current-looking cache filename is treated as proof that the binary implements the
-current serialized and rcpd spawn contract. For distinct hosts, the first preparation failure
-cooperatively cancels its peer without dropping owned work or replacing the original error. SSH
-control-socket readiness uses the same configured deadline and a cancellation-aware owner. Remote
-tilde expansion applies that deadline to its SSH setup and HOME lookup. Endpoint discovery,
-deployment-internal HOME lookup, deployment, and cleanup use cancellation-aware owners with bounded
-foreground grace. If one of those cancellation-owned stages remains blocked after that grace, its
-task retains the local child/session in the background and paired preparation may return the first
-endpoint error.
+owned, runtime-scoped background reaper permits the search to continue without immediately losing
+child ownership. Remote version probes, including post-deployment verification, use the initiating
+`rcp` process's `--remote-copy-conn-timeout-sec` deadline so slow-but-healthy hosts can be given an
+appropriate budget without allowing a hanging SSH channel to block fallback indefinitely. The master
+names the cache target with the accepted version's compatibility tag, transfers and publishes the
+binary, then probes that deployed remote path before constructing either role's spawn command. Thus
+neither co-location nor a current-looking cache filename is treated as proof that the binary
+implements the current serialized and rcpd spawn contract. For distinct hosts, the first preparation
+failure cooperatively cancels its peer without dropping owned work or replacing the original error.
+SSH control-socket readiness uses the same configured deadline and a cancellation-aware owner. Every
+read-only remote bootstrap command — HOME lookup, executable checks, PATH discovery, and version
+probes — goes through one helper that requires that per-stage timeout; expiry aborts and joins its
+local SSH-channel task. Cleanup is best effort and uses the same bounded helper. Binary deployment
+uses the timeout for its HOME lookup, SSH command, readiness marker, and each payload-write idle
+period, but not as a wall-clock limit on transmitting the binary. Post-EOF checksum verification and
+publication use a bounded stage of at least 60 seconds. On peer cancellation, the transfer gets a
+bounded grace to close stdin and finish before its local SSH-channel task is aborted and joined.
 
 The SSH multiplex master runs as a retained foreground `ssh -M -N` process; explicit
 `ForkAfterAuthentication=no` and `ControlPersist=no` command-line overrides prevent user or system
 SSH configuration from forking it away from its owner. Cancelling setup aborts that owner and
-`kill_on_drop` terminates the actual connecting process. After setup succeeds, a cloneable managed
-session keeps both the multiplex session and foreground child together through prepared and running
-daemon states. Whichever clone is dropped last detaches the library's blocking destructor, signals
-the retained master, and removes its private control directory before returning. Only bounded
-process reaping moves to a dedicated OS thread, so it does not depend on a Tokio runtime that may
-already be shutting down. A failed synchronous directory removal is retried by that reaper.
+`kill_on_drop` terminates the actual connecting process. The configured SSH executable is resolved
+inside a known-local shell child. After setup, commands open channels with the native OpenSSH
+multiplex protocol over the retained control socket rather than synchronously spawning another local
+`ssh`, so their configured deadline also covers exec-channel creation. A cloneable managed session
+keeps both the multiplex session and foreground child together through prepared and running daemon
+states. Whichever clone is dropped last releases the resumed native-mux handle without asking it to
+shut down the externally owned master, then signals that master before returning. Process reaping
+and private control-directory removal move together to a tracked OS thread, so neither can block or
+depend on a Tokio runtime that may already be shutting down. Before process exit, the CLI gives all
+completed-session cleanup workers a bounded join; a filesystem operation still blocked after that
+grace is abandoned with the process.
 
 Deployment stages, verifies, and publishes through one remote `sh` transaction. Before anything can
-create the unique temp path, that shell installs an `EXIT` trap which removes it; checksum mismatch,
-transfer failure, SSH-channel disconnect, and handled `HUP`/`INT`/`TERM` therefore all clean up in
-the same process that owns the writer. Only a checksum-verified file reaches the final
-same-directory rename. Cancellation closes staging stdin, then a retained owner drains both pipes
-and waits for the command without being aborted. The foreground remains completion-bounded: after
-its grace expires, the owned transaction may continue in the background, while the remote shell
-retains cleanup ownership independently of Tokio. A temp name surviving an unhandled remote
-termination is private to that deployment and is never discovered, executed, or adopted by a retry.
+create the unique temp path, that shell installs an `EXIT` trap which removes it. After directory
+creation and opening the staging file on descriptor 3, it emits `RCP_DEPLOY_READY` on stdout. The
+master bounds and validates that marker before sending payload bytes; bounded stdout preamble and
+stderr are retained when setup fails. Checksum mismatch, transfer failure, SSH-channel disconnect,
+and handled `HUP`/`INT`/`TERM` therefore all clean up in the same process that owns the writer. Only
+a checksum-verified file reaches the final same-directory rename. Cancellation closes staging stdin
+and waits briefly for the command while its owner drains both pipes; after that grace the local
+SSH-channel task is aborted and joined. The configured timeout limits idle payload writes, not total
+binary-transmission duration. The remote shell retains durable cleanup ownership independently of
+the local Tokio task. A temp name surviving an unhandled remote termination is private to that
+deployment and is never discovered, executed, or adopted by a retry.
 
 **Startup stderr ownership and notices:** A successfully started daemon reserves its first stderr
-line for exactly one readiness record. The master bounds that read by
-`--remote-copy-conn-timeout-sec` and rejects a record larger than 64 KiB. Chrome-trace, flamegraph,
-Tokio-console, legacy-option, and explicit concurrency-clamp announcements are collected until
-tracing is installed and emitted through the default-visible `rcp::notice` target. Remote tracing
-queues daemon notices until the master connects, so they reach master output without becoming
-readiness preamble. An intentional fatal startup refusal instead emits one `RCP_ERROR <diagnostic>`
-record and exits, including configuration failures found before tracing is installed. The master
-treats that typed record as a nested failure cause, closes its stdin, and gives an owned reaper a
-bounded grace before returning; if the grace expires, the detached reaper retains child ownership.
-If startup fails without a typed record, captured stdout and remaining stderr are attached to the
-handshake error. Arbitrary stderr remains an invalid readiness record. After readiness, bounded
-stdout/stderr collectors are joined on daemon completion, so a nonzero exit retains diagnostics
-without allowing unbounded output to grow in memory or leaving collector tasks detached. An explicit
-`F` reduced by `M`, an explicit `M` reduced by the source's `F`, or an explicit limit reduced by
-endpoint descriptor safety produces a notice naming the requested and effective values. The ordinary
-automatic/default intersection remains quiet. The master retains the source process before
-attempting its control/tracing connections and waits for daemon cleanup if either connection fails.
-It starts the source tracing receiver as soon as its tracing connection is established, before
-destination configuration or startup. Every later startup and protocol exit closes the control
-streams, waits for owned daemon processes, and gives tracing receivers a bounded drain, so
-already-queued source notices remain visible alongside a destination failure rather than being
-dropped during unwinding.
+line for exactly one readiness record. The master bounds both SSH exec-channel creation and that
+read by `--remote-copy-conn-timeout-sec`, and rejects a record larger than 64 KiB. Chrome-trace,
+flamegraph, Tokio-console, legacy-option, and explicit concurrency-clamp announcements are collected
+until tracing is installed and emitted through the default-visible `rcp::notice` target. Remote
+tracing queues daemon notices until the master connects, so they reach master output without
+becoming readiness preamble. An intentional fatal startup refusal instead emits one
+`RCP_ERROR <diagnostic>` record and exits, including configuration failures found before tracing is
+installed. The master treats that typed record as a nested failure cause, closes its stdin, and
+gives an owned reaper a bounded grace before returning; if the grace expires, the detached reaper
+retains child ownership while the runtime remains active. If startup fails without a typed record,
+captured stdout and remaining stderr are attached to the handshake error. Arbitrary stderr remains
+an invalid readiness record. After readiness, bounded stdout/stderr collectors are joined on daemon
+completion, so a nonzero exit retains diagnostics without allowing unbounded output to grow in
+memory or leaving collector tasks detached. An explicit `F` reduced by `M`, an explicit `M` reduced
+by the source's `F`, or an explicit limit reduced by endpoint descriptor safety produces a notice
+naming the requested and effective values. The ordinary automatic/default intersection remains
+quiet. The master retains the source process before attempting its control/tracing connections and
+waits for daemon cleanup if either connection fails. It starts the source tracing receiver as soon
+as its tracing connection is established, before destination configuration or startup. Every later
+startup and protocol exit closes the control streams, waits for owned daemon processes, and gives
+tracing receivers a bounded drain, so already-queued source notices remain visible alongside a
+destination failure rather than being dropped during unwinding.
 
 ### 1.3 Connection Topology
 
@@ -1421,8 +1432,10 @@ destination drains it.
 Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
 
 - `--remote-copy-conn-timeout-sec=N` (default: 15; 60 with auto-deployment) - Timeout for SSH
-  session setup, tilde-expansion HOME lookup, remote version probes, daemon readiness, and TCP
-  connection setup
+  session setup, remote binary discovery, tilde-expansion HOME lookup, remote version probes,
+  deployment command/readiness, each deployment payload-write idle period, cleanup commands, daemon
+  SSH exec/readiness, and TCP connection setup; it does not cap total binary-transfer duration, and
+  post-EOF deployment verification gets at least 60 seconds
 - `--remote-keepalive-sec=N` (default: 120, `0` disables) - Liveness budget for every rcp TCP
   connection
 - `--port-ranges=RANGES` (optional) - Restrict TCP to specific port ranges (e.g., "8000-8999")
@@ -1435,12 +1448,18 @@ Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
   multiplier, checked before pending file tasks are admitted
 - `--network-profile=PROFILE` (default: datacenter) - Buffer sizing profile
 
+Old-version cleanup is idempotent, best-effort cache hygiene. Its deadline bounds the master's local
+SSH wait; a remote cleanup command that has already started may finish independently after that
+channel is closed.
+
 For explicit policy, the master validates the pending-task product before remote-home lookup or SSH
-and configures the source. For automatic policy, source readiness supplies `F/E`; the source
-validates before readiness, and the master gives the destination the same values and rejects a
-mismatch in destination readiness. A directly launched daemon validates before announcing its
-listener. This configuration travels only in version-sensitive rcpd spawn arguments and readiness:
-no `MasterHello` or data-message field changed. Compatibility revision 4 protects this contract.
+and configures the source. For automatic policy, the master validates the configured connection
+upper bound before remote side effects; source readiness then supplies `F/E`, the source validates
+its actual product before readiness, and the master gives the destination the same values and
+rejects a mismatch in destination readiness. A directly launched daemon validates before announcing
+its listener. This configuration travels only in version-sensitive rcpd spawn arguments and
+readiness: no `MasterHello` or data-message field changed. Compatibility revision 4 protects this
+contract.
 
 ### 8.2 Network Profiles
 

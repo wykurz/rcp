@@ -209,27 +209,31 @@ The `--auto-deploy-rcpd` flag enables automatic transfer and installation of rcp
    - Clean up old versions (keeps last 3)
 
 For distinct hosts, the first preparation failure cancels its peer while preserving the first real
-error. SSH setup, discovery, HOME lookup, transfer verification, publication, and cleanup are
-observed through bounded foreground waits; a still-blocked task retains its local child/session in
-the background instead of holding up the failing endpoint indefinitely. The fixed two-second local
-version-probe deadline and configurable remote version-probe deadline remain exceptions because
-those deadlines are part of binary compatibility discovery.
+error. Every read-only remote bootstrap command — HOME lookup, executable checks, PATH discovery,
+and version probes — uses the configured remote bootstrap deadline and aborts its local SSH channel
+on expiry. The timeout is applied independently to each stage. Cleanup uses the same bounded helper.
+Binary deployment uses it for command setup, readiness, and each payload-write idle period, but not
+as a wall-clock limit on transmitting the binary; post-EOF verification gets at least 60 seconds.
+Local version probes use their separate fixed two-second deadline.
 
 The SSH multiplex master runs as a retained foreground `ssh -M -N` process. Command-line
 `ForkAfterAuthentication=no` and `ControlPersist=no` overrides prevent user or system SSH
 configuration from backgrounding it. Cancelling setup or reaching the configured remote setup
-deadline terminates that actual process. On success, one cloneable managed owner carries the
+deadline terminates that actual process. The configured SSH executable is resolved inside a
+known-local shell child. Once the master is ready, rcp opens exec channels through OpenSSH's native
+multiplex protocol over the retained control socket; it does not synchronously find and spawn a new
+local `ssh` process for each remote command. On success, one cloneable managed owner carries the
 multiplex session and foreground child through daemon startup and execution; final teardown signals
-the master, removes its private control directory synchronously, and reaps it on a dedicated OS
-thread, remaining safe after the Tokio runtime has begun shutting down.
+the master and moves both directory removal and process reaping to a tracked OS thread, remaining
+safe after the Tokio runtime has begun shutting down. The CLI gives those workers a bounded join
+before process exit.
 
-Cancellation during staging closes stdin but does not assume that disconnecting SSH terminates the
-remote shell. A retained owner drains the transaction pipes and waits for the child, even if its
-bounded foreground grace expires. The remote shell installs its `EXIT` cleanup trap before creating
-the temp file, so the writer itself removes that path after cancellation, transfer failure, checksum
-mismatch, or handled termination. Pair return does not guarantee that the remote transaction has
-already exited; a unique dotfile surviving an unhandled remote termination is inert and never
-reused.
+Cancellation during staging closes stdin and gives the local SSH-channel task a bounded grace to
+drain the transaction pipes and wait for the child. If it remains blocked, the task is aborted and
+joined before preparation returns. Disconnecting SSH does not guarantee that the remote shell has
+exited, so that shell installs its `EXIT` cleanup trap before creating the temp file. The writer
+itself removes the path after cancellation, transfer failure, checksum mismatch, or handled
+termination. A unique dotfile surviving an unhandled remote termination is inert and never reused.
 
 ### Transfer Mechanism
 
@@ -241,13 +245,24 @@ cleanup() { rm -f ~/.cache/rcp/bin/.rcpd-{version}.tmp.{unique}; }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 mkdir -p ~/.cache/rcp/bin && \
-base64 -d > ~/.cache/rcp/bin/.rcpd-{version}.tmp.{unique} && \
+exec 3> ~/.cache/rcp/bin/.rcpd-{version}.tmp.{unique} && \
+printf 'RCP_DEPLOY_READY\n' && \
+base64 -d >&3 && \
+exec 3>&- && \
 chmod 700 ~/.cache/rcp/bin/.rcpd-{version}.tmp.{unique} && \
 actual_checksum=$(sha256sum ~/.cache/rcp/bin/.rcpd-{version}.tmp.{unique}) && \
 actual_checksum=${actual_checksum%% *} && \
-test "$actual_checksum" = "{expected_checksum}" && \
+if [ "$actual_checksum" != "{expected_checksum}" ]; then \
+  printf 'checksum mismatch after transfer: expected %s, got %s\n' \
+    "{expected_checksum}" "$actual_checksum" >&2; \
+  exit 1; \
+fi && \
 mv -fT ~/.cache/rcp/bin/.rcpd-{version}.tmp.{unique} ~/.cache/rcp/bin/rcpd-{version}
 ```
+
+The master waits for `RCP_DEPLOY_READY` before writing the payload. The marker is emitted only after
+the cleanup traps are installed, the cache directory exists, and the private staging file is open;
+startup stdout preamble and stderr are bounded and retained for diagnostics.
 
 Automatic deployment targets Linux and relies on the GNU/BusyBox forms of `base64 -d`, `sha256sum`,
 and `mv -T`. The `-T` publication guard makes an existing directory at the final cache path fail
@@ -307,9 +322,10 @@ To use auto-deployment, ensure rcpd is available:
 - or build with: cargo build --release --bin rcpd
 ```
 
-(A `PATH:` line is added when `which rcpd` resolves a candidate. An incompatible candidate remains
-in the list with its rejection reason; a compatible one is deployed. When `which` finds nothing, no
-`PATH:` line is shown — hence the common not-found output lists only the same-directory candidate.)
+(A `PATH:` line is added when `command -v rcpd` resolves a local deployment candidate. An
+incompatible candidate remains in the list with its rejection reason; a compatible one is deployed.
+When `command -v` finds nothing, no `PATH:` line is shown — hence the common not-found output lists
+only the same-directory candidate.)
 
 **Checksum mismatch**:
 
@@ -331,10 +347,12 @@ Please try again or check network connectivity.
    - Source and destination preparation may run concurrently on distinct hosts
    - Equal SSH endpoint settings share one preparation, discovery, and optional deployment
    - On a distinct-host failure, the first endpoint error cancels its peer; bounded foreground grace
-     prevents a blocked peer from hiding that error, while detached owners retain any local SSH
-     child/session and staging cleanup responsibility
+     prevents a blocked peer from hiding that error, while remote bootstrap tasks close their local
+     SSH channels before returning
 
 2. **Master starts and connects to source rcpd**
+   - The configured remote bootstrap timeout bounds both SSH exec-channel creation and the first
+     readiness record
    - Source creates a TCP listener and emits `RCP_TLS <addr> <fingerprint> <F> <E>` (or plaintext
      `RCP_TCP <addr> <F> <E>`) as its first stderr record
    - Master immediately opens the source control and tracing connections
@@ -362,16 +380,15 @@ Please try again or check network connectivity.
 
 **Handling**: SSH library returns the endpoint error. For a distinct-host copy the master cancels
 peer preparation, gives its currently owned work a bounded grace, and then displays the original
-error even if that peer remains blocked in a retained background owner. A cancelled SSH connect
-terminates the retained foreground multiplex master, and successful session teardown uses the same
-off-runtime ownership path.
+error. A cancelled SSH connect terminates the retained foreground multiplex master, and successful
+session teardown uses the same off-runtime ownership path.
 
 #### rcpd Binary Not Found
 
 **Scenario**: rcpd doesn't exist on remote host
 
-**Handling**: Binary discovery and a version check run *before* rcpd is spawned — no connection
-timeout is involved. Two distinct outcomes:
+**Handling**: Binary discovery and a version check run *before* rcpd is spawned. Both use the remote
+bootstrap timeout, including each executable check and PATH lookup. Two distinct outcomes:
 
 - **No binary found** (and `--auto-deploy-rcpd` is not set): the master fails immediately with the
   `rcpd binary not found on remote host` error shown in [Error Handling](#error-handling).
@@ -436,15 +453,24 @@ failed to connect to <addr>
 
 ### Timeout Configuration
 
-| Timeout               | Default                             | Configuration                    |
-| --------------------- | ----------------------------------- | -------------------------------- |
-| SSH session setup     | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Tilde HOME lookup     | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Remote version probe  | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| rcpd readiness record | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Master → rcpd         | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Destination → Source  | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
-| Dead-peer detection   | 120s (0 disables)                   | `--remote-keepalive-sec`         |
+| Timeout                    | Default                             | Configuration                    |
+| -------------------------- | ----------------------------------- | -------------------------------- |
+| SSH session setup          | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Remote binary discovery    | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Tilde HOME lookup          | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Remote version probe       | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Deployment setup/readiness | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Deployment write idle      | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Deployment verification    | At least 60s                        | `--remote-copy-conn-timeout-sec` |
+| Old-version cleanup        | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| rcpd SSH exec/readiness    | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Master → rcpd              | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Destination → Source       | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Dead-peer detection        | 120s (0 disables)                   | `--remote-keepalive-sec`         |
+
+Old-version cleanup is idempotent, best-effort cache hygiene. When its deadline expires, the master
+closes its local SSH channel instead of delaying bootstrap indefinitely; an already-started remote
+cleanup command may finish independently.
 
 Dead-peer detection covers idle connections everywhere, and unacknowledged data on control
 connections only — a data transfer to a vanished host still falls back to the kernel's
@@ -519,16 +545,16 @@ cargo build --target x86_64-unknown-linux-gnu
 
 ### rcp Flags for Remote Operations
 
-| Flag                               | Description                                                        |
-| ---------------------------------- | ------------------------------------------------------------------ |
-| `--rcpd-path=PATH`                 | Override rcpd binary path on remote hosts                          |
-| `--auto-deploy-rcpd`               | Automatically deploy rcpd to remote hosts                          |
-| `--remote-copy-conn-timeout-sec=N` | Remote setup/connection timeout (default: 15; 60 with auto-deploy) |
-| `--remote-keepalive-sec=N`         | Dead-peer detection budget, 0 disables (default: 120)              |
-| `--port-ranges=RANGES`             | Restrict TCP to specific ports (e.g., "8000-8999")                 |
-| `--max-files-in-flight=N`          | Explicit ceiling; automatic remote default is source-owned         |
-| `--max-connections=N`              | Maximum concurrent data connections (default: 100)                 |
-| `--network-profile=PROFILE`        | Buffer sizing: `datacenter` (default) or `internet`                |
+| Flag                               | Description                                                                              |
+| ---------------------------------- | ---------------------------------------------------------------------------------------- |
+| `--rcpd-path=PATH`                 | Override rcpd binary path on remote hosts                                                |
+| `--auto-deploy-rcpd`               | Automatically deploy rcpd to remote hosts                                                |
+| `--remote-copy-conn-timeout-sec=N` | Remote setup, deployment-idle, and connection timeout (default: 15; 60 with auto-deploy) |
+| `--remote-keepalive-sec=N`         | Dead-peer detection budget, 0 disables (default: 120)                                    |
+| `--port-ranges=RANGES`             | Restrict TCP to specific ports (e.g., "8000-8999")                                       |
+| `--max-files-in-flight=N`          | Explicit ceiling; automatic remote default is source-owned                               |
+| `--max-connections=N`              | Maximum concurrent data connections (default: 100)                                       |
+| `--network-profile=PROFILE`        | Buffer sizing: `datacenter` (default) or `internet`                                      |
 
 For a remote copy, let `F` be the logical file-work ceiling and `M` be `--max-connections`; the
 effective stream count is `E = min(F, M)`, or `E = M` for the legacy explicit-unlimited policy. The
@@ -537,12 +563,13 @@ remains master-authoritative. Pending capacity is `E × --pending-writes-multipl
 or that product above Tokio's semaphore maximum are rejected rather than reaching semaphore
 construction.
 
-Explicit limits can be checked before remote `~` expansion. Automatic limits cannot be known there:
-the source resolves and validates them before its readiness record and before destination spawn.
-Each endpoint separately applies its local soft-RLIMIT descriptor safety when admitting file-like
-work. A file limit reduced by the connection ceiling, an explicitly requested connection ceiling
-reduced by `F`, or an explicit descriptor clamp produces a default-visible notice naming requested
-and effective values. The ordinary automatic/default intersection remains quiet. Profiling and
+Explicit limits can be checked before remote `~` expansion. For automatic limits, the master
+validates the configured connection upper bound before remote side effects; the source resolves and
+validates the actual capacity before its readiness record and before destination spawn. Each
+endpoint separately applies its local soft-RLIMIT descriptor safety when admitting file-like work. A
+file limit reduced by the connection ceiling, an explicitly requested connection ceiling reduced by
+`F`, or an explicit descriptor clamp produces a default-visible notice naming requested and
+effective values. The ordinary automatic/default intersection remains quiet. Profiling and
 Tokio-console artifact announcements likewise use the tracing notice target and reach master output
 only after the daemon readiness handshake. Pre-tracing configuration refusals use the same
 `RCP_ERROR` startup record; otherwise captured startup stdout and stderr are attached to handshake

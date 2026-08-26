@@ -404,9 +404,9 @@ Manual deployment is still supported and may be preferred for:
 **Configuration options:**
 
 - `--port-ranges` - restrict TCP data ports to specific ranges (e.g., "8000-8999")
-- `--remote-copy-conn-timeout-sec` - remote SSH setup, tilde-expansion HOME lookup, version-probe,
-  daemon-readiness, and TCP connection timeout in seconds (default: 15; 60 with
-  `--auto-deploy-rcpd`)
+- `--remote-copy-conn-timeout-sec` - remote SSH setup, tilde-expansion HOME lookup, discovery,
+  version-probe, deployment-readiness/write-idle, daemon-readiness, and TCP connection timeout in
+  seconds (default: 15; 60 with `--auto-deploy-rcpd`; deployment verification gets at least 60)
 - `--remote-keepalive-sec` - liveness budget for every rcp TCP connection in seconds, 0 disables
   (default: 120); idle connections everywhere, unacknowledged data on control connections only
 
@@ -770,13 +770,14 @@ effective stream count in its first stderr readiness record; the master connects
 starting the destination with the same negotiated values. This source-first readiness contract is
 wire revision 4.
 
-Explicit limits are validated before remote `~` expansion. Automatic limits are resolved and
-validated by the source before it announces readiness; effective-stream and pending capacities above
-Tokio's semaphore maximum are rejected. If either explicitly requested file or connection ceiling is
-clamped by the other ceiling, or an explicit file limit is clamped by descriptor safety, a
-default-visible notice names the requested and effective values. The ordinary automatic/default
-intersection remains quiet. To raise remote parallelism above the source's CPU-derived file-work
-default, raise both ceilings explicitly:
+Explicit limits are validated before remote `~` expansion. For automatic limits, the master
+validates the configured connection upper bound before remote side effects, then the source resolves
+and validates its actual CPU-selected capacity before it announces readiness; effective-stream and
+pending capacities above Tokio's semaphore maximum are rejected. If either explicitly requested file
+or connection ceiling is clamped by the other ceiling, or an explicit file limit is clamped by
+descriptor safety, a default-visible notice names the requested and effective values. The ordinary
+automatic/default intersection remains quiet. To raise remote parallelism above the source's
+CPU-derived file-work default, raise both ceilings explicitly:
 
 ```bash
 # Increase for many small files on high-bandwidth links

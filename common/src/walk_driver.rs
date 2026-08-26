@@ -1548,6 +1548,7 @@ mod tests {
 
         struct FailEarlyClassificationVisitor {
             filter: FilterSettings,
+            leaf_started: Arc<std::sync::atomic::AtomicBool>,
         }
 
         impl WalkVisitor for FailEarlyClassificationVisitor {
@@ -1582,6 +1583,7 @@ mod tests {
                 _parent_ctx: &TaskDropContext,
                 _leaf: AdmittedLeaf,
             ) -> Result<CountSummary, OperationError<CountSummary>> {
+                self.leaf_started.store(true, Ordering::SeqCst);
                 std::future::pending().await
             }
 
@@ -2437,7 +2439,11 @@ mod tests {
             );
             let mut filter = FilterSettings::default();
             filter.add_exclude("protected/")?;
-            let visitor = Arc::new(FailEarlyClassificationVisitor { filter });
+            let leaf_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let visitor = Arc::new(FailEarlyClassificationVisitor {
+                filter,
+                leaf_started: Arc::clone(&leaf_started),
+            });
             let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
             let dir_ctx = TaskDropContext::root(dropped_tx);
             let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
@@ -2464,6 +2470,10 @@ mod tests {
             }
             dropped.sort_unstable();
             assert!(format!("{:#}", error.source).contains("gone"));
+            assert!(
+                leaf_started.load(Ordering::SeqCst),
+                "the gated sibling did not start before the classification error"
+            );
             assert_eq!(
                 dropped,
                 vec![0, 1],
@@ -2489,7 +2499,11 @@ mod tests {
             );
             let mut filter = FilterSettings::default();
             filter.add_exclude("protected/")?;
-            let visitor = Arc::new(FailEarlyClassificationVisitor { filter });
+            let leaf_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let visitor = Arc::new(FailEarlyClassificationVisitor {
+                filter,
+                leaf_started: Arc::clone(&leaf_started),
+            });
             let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
             let dir_ctx = TaskDropContext::root(dropped_tx);
             let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
@@ -2528,6 +2542,10 @@ mod tests {
             }
             dropped.sort_unstable();
             assert!(format!("{:#}", error.source).contains("gone"));
+            assert!(
+                leaf_started.load(Ordering::SeqCst),
+                "the permanently gated sibling did not start"
+            );
             assert_eq!(
                 created, 3,
                 "the completed error was not reaped directly from the saturated admission wait"

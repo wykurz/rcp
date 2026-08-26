@@ -1855,7 +1855,7 @@ async fn copy_current_regular(
     // the data copy is the data path, not a metadata syscall — it is deliberately NOT wrapped in a
     // congestion probe (matching the old `tokio::fs::copy`), so the large/variable copy latency
     // never pollutes the per-metadata-op controller baseline. backpressure comes from the
-    // OpenFile admission retained by the canonical non-cancellable blocking boundary. the
+    // open-file admission is retained by the canonical non-cancellable blocking boundary. the
     // destination file is returned so it remains live through metadata application, closing the
     // path-based re-open and cancellation-lifetime gaps.
     #[cfg(test)]

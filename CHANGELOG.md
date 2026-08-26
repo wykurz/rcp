@@ -14,16 +14,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `max(std::thread::available_parallelism(), 4)`, including for `filegen`. This is a work ceiling,
   not a process-descriptor count or a guarantee of achieved concurrency. The runtime still applies
   its internal soft-`RLIMIT_NOFILE` descriptor safety ceiling independently to OpenFile and
-  PendingMeta, which have the same effective numerical limit but are not a combined pool.
+  PendingMeta, which have the same effective numerical limit but are not a combined pool. For
+  `filegen`, the legacy `--max-open-files=0` spelling previously disabled admission entirely; it now
+  has the common compatibility meaning of removing the user ceiling while retaining descriptor
+  safety, and emits a deprecation notice.
 
 - Remote automatic file concurrency is now source-owned: the source `rcpd` resolves its local CPU
   default and reports the logical file ceiling `F` plus effective stream count
   `E = min(F, --max-connections)` in its readiness record; the destination is then started with
   those exact values. Explicit `--max-files-in-flight=N` and legacy unlimited input remain
   master-authoritative. Effective-stream and pending-task capacities above Tokio's semaphore maximum
-  are rejected without panic. Explicit capacity is validated before remote `~` expansion; automatic
-  capacity is necessarily validated by the source before readiness and before the destination is
-  spawned. Each endpoint still applies descriptor safety locally.
+  are rejected without panic. Explicit capacity is validated before remote `~` expansion. For
+  automatic policy, the master validates the configured connection upper bound before remote side
+  effects; the source validates its actual CPU-selected capacity before readiness and before the
+  destination is spawned. Each endpoint still applies descriptor safety locally.
 
 - Remote startup now prepares same-host source/destination daemons once, starts and connects the
   source before constructing the destination, and reserves the first successful daemon stderr line
@@ -33,28 +37,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   remains quiet. Local `rcpd --protocol-version` probes are bounded at two seconds and capture only
   bounded diagnostics; remote probes, including post-deployment verification and the single-daemon
   startup API, use `--remote-copy-conn-timeout-sec` (15 seconds normally and 60 seconds with
-  auto-deployment). Local timeout cleanup also has a one-second reap grace before an owned
-  background reaper takes over.
+  auto-deployment). Every read-only remote bootstrap command — HOME lookup, executable checks, PATH
+  discovery, and version probes — uses that required deadline, so a blocked filesystem lookup cannot
+  stall endpoint preparation indefinitely. The timeout applies independently to each stage.
+  Deployment waits for a bounded `RCP_DEPLOY_READY` marker after the remote shell has installed its
+  cleanup trap and opened the staging file, then applies an idle timeout to each payload write; it
+  does not impose a total transfer-time cap. Post-EOF verification has a bounded stage of at least
+  60 seconds. On peer cancellation, the transfer gets a bounded grace before its local SSH-channel
+  task is aborted and joined. Old-version cleanup is also bounded. Local candidate execution happens
+  behind a fixed-shell child so a stalled candidate filesystem remains inside the two-second probe
+  deadline.
 
 - SSH multiplex masters now remain owned foreground processes; command-line overrides disable both
-  `ForkAfterAuthentication` and `ControlPersist` even when SSH configuration enables them.
+  `ForkAfterAuthentication` and `ControlPersist` even when SSH configuration enables them. The
+  configured SSH executable is resolved inside a known-shell child, and subsequent commands use the
+  native multiplex protocol over the retained control socket instead of synchronously spawning a
+  fresh local `ssh`; the configured deadline can therefore cancel every local exec-channel setup.
   Cancellation or the configured remote setup deadline terminates the actual connecting process. The
-  final successful-session owner signals it immediately, removes its private control directory
-  synchronously, and reaps it on an OS cleanup thread that remains safe during runtime shutdown.
-  Remote tilde expansion and daemon readiness reads use that same configured deadline; readiness
-  records larger than 64 KiB are rejected. Daemon configuration refusals discovered before tracing
-  use the structured `RCP_ERROR` startup record, and unstructured startup failures retain captured
-  stdout/stderr in the error chain. The source tracing receiver starts before destination bring-up
-  and is drained on later startup failures, preserving queued source notices beside the destination
-  error. Source connection failures also wait for daemon cleanup. Daemon completion joins bounded
-  stdout/stderr collectors, and deployment drains bounded diagnostics while preferring the remote
-  failure over a secondary stdin-shutdown error. Explicit connection requests clamped by the source
-  file ceiling now produce a default-visible notice; legacy file-limit notices preserve the
-  `--max-open-files` spelling the user supplied.
+  final successful-session owner signals it immediately, then moves process reaping and private
+  control-directory removal to a tracked OS cleanup thread that remains safe during runtime
+  shutdown. The CLI gives all such workers a bounded join before process exit. Control-directory
+  selection tries runtime, temporary, state, and home locations before reporting that no safe
+  Unix-socket path is available. Remote daemon SSH exec-channel creation and readiness reads use
+  that same configured deadline; readiness records larger than 64 KiB are rejected. Daemon
+  configuration refusals discovered before tracing use the structured `RCP_ERROR` startup record,
+  and unstructured startup failures retain captured stdout/stderr in the error chain. The source
+  tracing receiver starts before destination bring-up and is drained on later startup failures,
+  preserving queued source notices beside the destination error. Source connection failures also
+  wait for daemon cleanup. Daemon completion joins bounded stdout/stderr collectors, and deployment
+  drains bounded diagnostics while preferring the remote failure over a secondary stdin-shutdown
+  error. Explicit connection requests clamped by the source file ceiling now produce a
+  default-visible notice; legacy file-limit notices preserve the `--max-open-files` spelling the
+  user supplied.
 
 - `remote::TcpConfig` now contains transport settings only. Its pre-existing remote-capacity fields
   and builders moved out; validated file/stream capacities are represented by
-  `ResolvedRemoteConcurrency`.
+  `ResolvedRemoteConcurrency`. The published-but-internal `rcp-tools-remote` support API also makes
+  `find_local_rcpd_binary` asynchronous so candidates can be version-probed, and `deploy_rcpd` now
+  accepts a cancellation token. These are intentional breaking changes; repository callers use the
+  context-aware implementations directly rather than branch-only compatibility shims.
 
 - Local recursive copy, remove, chmod, and rlink walks now bound descriptor-heavy leaf work on wide
   or slow trees, preventing `EMFILE` (Too many open files) failures from unbounded leaf fan-out. On
