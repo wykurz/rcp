@@ -138,9 +138,9 @@ pub struct ProtocolVersion {
    ```bash
    rcpd --protocol-version
    ```
-   Returns JSON with version information. The probe has a two-second deadline; timeout errors retain
-   the affected host in their error chain, and auto-deployment may recover by publishing a
-   compatible local candidate.
+   Returns JSON with version information. Remote probes use the `--remote-copy-conn-timeout-sec`
+   deadline; timeout errors retain the affected host in their error chain, and auto-deployment may
+   recover by publishing a compatible local candidate.
 
 2. **Compare versions**:
    - Policy: Exact semantic version match required
@@ -199,10 +199,10 @@ The `--auto-deploy-rcpd` flag enables automatic transfer and installation of rcp
 2. **Transfer binary to a temp file**:
    - Read local rcpd binary
    - Compute SHA-256 checksum
-   - Base64 encode and transfer via SSH stdin
-   - Set permissions to 700 (user-only execute)
+   - Start one remote shell transaction with an `EXIT` trap that owns temp cleanup
+   - Base64 encode and transfer via SSH stdin, then set permissions to 700 (user-only execute)
 
-3. **Verify, then publish**:
+3. **Verify, then publish in that transaction**:
    - Verify SHA-256 checksum **of the temp file** (a mismatch removes it, publishing nothing)
    - Atomic rename to the final location
    - Re-run a bounded `--protocol-version` probe on the published remote path before spawning it
@@ -212,14 +212,23 @@ For distinct hosts, the first preparation failure cancels its peer while preserv
 error. SSH setup, discovery, HOME lookup, transfer verification, publication, and cleanup are
 observed through bounded foreground waits; a still-blocked task retains its local child/session in
 the background instead of holding up the failing endpoint indefinitely. The fixed two-second local
-and remote version-probe deadline remains the exception because that deadline is part of binary
-compatibility discovery.
+version-probe deadline and configurable remote version-probe deadline remain exceptions because
+those deadlines are part of binary compatibility discovery.
+
+The SSH multiplex master runs as a retained foreground `ssh -M -N` process. Command-line
+`ForkAfterAuthentication=no` and `ControlPersist=no` overrides prevent user or system SSH
+configuration from backgrounding it. Cancelling setup terminates that actual process. On success,
+one cloneable managed owner carries the multiplex session and foreground child through daemon
+startup and execution; final teardown signals the master immediately and reaps it on a dedicated OS
+thread, remaining safe after the Tokio runtime has begun shutting down.
 
 Cancellation during staging closes stdin but does not assume that disconnecting SSH terminates the
-remote shell. A retained owner drains the staging pipes and waits for the child, even if its bounded
-foreground grace expires. Temp removal gets its own prompt bounded attempt, and the owner retries it
-after the child eventually exits. Pair return therefore does not guarantee remote process
-termination or temp removal; a surviving unique dotfile is inert and never reused.
+remote shell. A retained owner drains the transaction pipes and waits for the child, even if its
+bounded foreground grace expires. The remote shell installs its `EXIT` cleanup trap before creating
+the temp file, so the writer itself removes that path after cancellation, transfer failure, checksum
+mismatch, or handled termination. Pair return does not guarantee that the remote transaction has
+already exited; a unique dotfile surviving an unhandled remote termination is inert and never
+reused.
 
 ### Transfer Mechanism
 
@@ -227,19 +236,28 @@ Binary transfer uses base64 encoding over SSH, where `{unique}` is `{pid}-{rando
 the deploying process:
 
 ```bash
-# transfer
+cleanup() { rm -f ~/.cache/rcp/bin/.rcpd-{version}.tmp.{unique}; }
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 mkdir -p ~/.cache/rcp/bin && \
 base64 -d > ~/.cache/rcp/bin/.rcpd-{version}.tmp.{unique} && \
-chmod 700 ~/.cache/rcp/bin/.rcpd-{version}.tmp.{unique}
-# verify (sha256sum on the temp file), then publish
-mv -f ~/.cache/rcp/bin/.rcpd-{version}.tmp.{unique} ~/.cache/rcp/bin/rcpd-{version}
+chmod 700 ~/.cache/rcp/bin/.rcpd-{version}.tmp.{unique} && \
+actual_checksum=$(sha256sum ~/.cache/rcp/bin/.rcpd-{version}.tmp.{unique}) && \
+actual_checksum=${actual_checksum%% *} && \
+test "$actual_checksum" = "{expected_checksum}" && \
+mv -fT ~/.cache/rcp/bin/.rcpd-{version}.tmp.{unique} ~/.cache/rcp/bin/rcpd-{version}
 ```
+
+Automatic deployment targets Linux and relies on the GNU/BusyBox forms of `base64 -d`, `sha256sum`,
+and `mv -T`. The `-T` publication guard makes an existing directory at the final cache path fail
+closed instead of receiving the staged file as a child.
 
 **Why base64**:
 
-- Universal availability (POSIX standard)
-- No external dependencies (no scp/rsync needed)
-- Works with restricted shells
+- Broad availability in the GNU/BusyBox Linux userlands targeted by automatic deployment
+- No separate transfer program such as scp or rsync
+- Works through a non-interactive `sh` when the required `base64`, `sha256sum`, and `mv` commands
+  are allowed
 
 ### Atomicity and Safety
 
@@ -251,14 +269,19 @@ collide on one file.
 **Verify before publish**: the checksum is taken on the temp file, so a corrupt or truncated
 transfer is never reachable under the name other processes execute.
 
-**Atomic rename**: `mv -f` is atomic on POSIX filesystems. Binary is either fully present or not
-present.
+**Crash durability**: same-directory rename provides atomic visibility to concurrent processes, but
+deployment does not fsync the staged file or cache directory. Whether a completed publication
+survives a host crash or power loss therefore follows the remote filesystem's durability guarantees.
+
+**Atomic rename**: Linux GNU/BusyBox `mv -fT` performs a same-directory rename and refuses to treat
+an existing directory target as a destination directory. The binary is either fully published or not
+published.
 
 **Race condition handling**:
 
-- Multiple concurrent deployments: Each uses unique temp file, final `mv` is atomic
-- Interrupted deployment: Cleanup is attempted, but a temp file may remain (harmless); the final
-  file is unaffected
+- Multiple concurrent deployments: Each uses a unique temp file; the final `mv -fT` is atomic
+- Interrupted deployment: The transaction's `EXIT`/signal traps clean ordinary failures. An
+  unhandled remote termination can leave a private, inert temp file; the final file is unaffected
 - Reading during deployment: Reader sees old or new inode, never corruption
 
 ### Caching
@@ -338,7 +361,9 @@ Please try again or check network connectivity.
 
 **Handling**: SSH library returns the endpoint error. For a distinct-host copy the master cancels
 peer preparation, gives its currently owned work a bounded grace, and then displays the original
-error even if that peer remains blocked in a retained background owner.
+error even if that peer remains blocked in a retained background owner. A cancelled SSH connect
+terminates the retained foreground multiplex master, and successful session teardown uses the same
+off-runtime ownership path.
 
 #### rcpd Binary Not Found
 
@@ -413,6 +438,7 @@ failed to connect to <addr>
 | Timeout              | Default                             | Configuration                    |
 | -------------------- | ----------------------------------- | -------------------------------- |
 | SSH connection       | ~30s                                | SSH config                       |
+| Remote version probe | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
 | Master → rcpd        | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
 | Destination → Source | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
 | Dead-peer detection  | 120s (0 disables)                   | `--remote-keepalive-sec`         |
@@ -490,16 +516,16 @@ cargo build --target x86_64-unknown-linux-gnu
 
 ### rcp Flags for Remote Operations
 
-| Flag                               | Description                                                    |
-| ---------------------------------- | -------------------------------------------------------------- |
-| `--rcpd-path=PATH`                 | Override rcpd binary path on remote hosts                      |
-| `--auto-deploy-rcpd`               | Automatically deploy rcpd to remote hosts                      |
-| `--remote-copy-conn-timeout-sec=N` | Connection timeout (default: 15; 60 with `--auto-deploy-rcpd`) |
-| `--remote-keepalive-sec=N`         | Dead-peer detection budget, 0 disables (default: 120)          |
-| `--port-ranges=RANGES`             | Restrict TCP to specific ports (e.g., "8000-8999")             |
-| `--max-files-in-flight=N`          | Explicit ceiling; automatic remote default is source-owned     |
-| `--max-connections=N`              | Maximum concurrent data connections (default: 100)             |
-| `--network-profile=PROFILE`        | Buffer sizing: `datacenter` (default) or `internet`            |
+| Flag                               | Description                                                        |
+| ---------------------------------- | ------------------------------------------------------------------ |
+| `--rcpd-path=PATH`                 | Override rcpd binary path on remote hosts                          |
+| `--auto-deploy-rcpd`               | Automatically deploy rcpd to remote hosts                          |
+| `--remote-copy-conn-timeout-sec=N` | Remote probe/connection timeout (default: 15; 60 with auto-deploy) |
+| `--remote-keepalive-sec=N`         | Dead-peer detection budget, 0 disables (default: 120)              |
+| `--port-ranges=RANGES`             | Restrict TCP to specific ports (e.g., "8000-8999")                 |
+| `--max-files-in-flight=N`          | Explicit ceiling; automatic remote default is source-owned         |
+| `--max-connections=N`              | Maximum concurrent data connections (default: 100)                 |
+| `--network-profile=PROFILE`        | Buffer sizing: `datacenter` (default) or `internet`                |
 
 For a remote copy, let `F` be the logical file-work ceiling and `M` be `--max-connections`; the
 effective stream count is `E = min(F, M)`, or `E = M` for the legacy explicit-unlimited policy. The
@@ -511,10 +537,13 @@ construction.
 Explicit limits can be checked before remote `~` expansion. Automatic limits cannot be known there:
 the source resolves and validates them before its readiness record and before destination spawn.
 Each endpoint separately applies its local soft-RLIMIT descriptor safety when admitting file-like
-work. Explicit connection or descriptor clamps produce a default-visible notice naming requested and
-effective values; automatic clamps are verbose-only. Profiling and Tokio-console artifact
-announcements likewise use the tracing notice target and reach master output only after the daemon
-readiness handshake. These readiness and internal spawn-contract changes are wire revision 4.
+work. A file limit reduced by the connection ceiling, an explicitly requested connection ceiling
+reduced by `F`, or an explicit descriptor clamp produces a default-visible notice naming requested
+and effective values. The ordinary automatic/default intersection remains quiet. Profiling and
+Tokio-console artifact announcements likewise use the tracing notice target and reach master output
+only after the daemon readiness handshake. Pre-tracing configuration refusals use the same
+`RCP_ERROR` startup record; otherwise captured startup stdout and stderr are attached to handshake
+errors. These readiness and internal spawn-contract changes are wire revision 4.
 
 ### Network Profiles
 

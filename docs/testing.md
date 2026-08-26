@@ -376,7 +376,7 @@ Chaos tests run separately from regular Docker tests in CI (see
 
 - Kill rcpd early (before connections established)
 - Kill rcpd mid-transfer (tests TCP failure detection)
-- Pause rcpd (SIGSTOP) to simulate hangs - verifies timeout behavior
+- Blackhole the source after startup - verifies transport liveness timeout behavior
 - Master killed - verifies rcpd cleanup via stdin watchdog
 
 **I/O chaos tests** (`docker_chaos_io.rs`):

@@ -440,6 +440,7 @@ pub enum RcpdFilesInFlight {
     Automatic,
     ResolvedAutomatic(std::num::NonZeroUsize),
     Explicit(common::ConcurrencyLimit),
+    DeprecatedMaxOpenFiles(common::ConcurrencyLimit),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -541,6 +542,12 @@ impl RcpdConfig {
             }
             RcpdFilesInFlight::Explicit(common::ConcurrencyLimit::Unlimited) => {
                 args.push("--explicit-unlimited-files-in-flight".to_string());
+            }
+            RcpdFilesInFlight::DeprecatedMaxOpenFiles(value) => {
+                args.push(format!(
+                    "--forwarded-legacy-files-in-flight={}",
+                    value.semaphore_capacity()
+                ));
             }
         }
         if self.dereference {
@@ -1117,14 +1124,30 @@ mod tests {
     }
 
     #[test]
-    fn to_args_preserves_legacy_unlimited_files_in_flight() {
+    fn to_args_preserves_legacy_finite_files_in_flight() {
         let mut config = minimal_rcpd_config();
-        config.files_in_flight = RcpdFilesInFlight::Explicit(common::ConcurrencyLimit::Unlimited);
+        config.files_in_flight = RcpdFilesInFlight::DeprecatedMaxOpenFiles(
+            common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(7).unwrap()),
+        );
         let args = config.to_args();
         assert!(
             args.iter()
-                .any(|arg| arg == "--explicit-unlimited-files-in-flight")
+                .any(|arg| arg == "--forwarded-legacy-files-in-flight=7")
         );
+        assert!(!args.iter().any(|arg| arg.starts_with("--max-open-files")));
+    }
+
+    #[test]
+    fn to_args_preserves_legacy_unlimited_files_in_flight() {
+        let mut config = minimal_rcpd_config();
+        config.files_in_flight =
+            RcpdFilesInFlight::DeprecatedMaxOpenFiles(common::ConcurrencyLimit::Unlimited);
+        let args = config.to_args();
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--forwarded-legacy-files-in-flight=0")
+        );
+        assert!(!args.iter().any(|arg| arg.starts_with("--max-open-files")));
     }
 
     #[test]

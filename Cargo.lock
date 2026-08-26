@@ -1844,6 +1844,7 @@ dependencies = [
  "sha2",
  "socket2",
  "strum",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-util",

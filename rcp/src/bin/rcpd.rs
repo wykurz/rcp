@@ -109,7 +109,8 @@ struct Args {
         conflicts_with_all = [
             "max_files_in_flight",
             "max_open_files",
-            "explicit_unlimited_files_in_flight"
+            "explicit_unlimited_files_in_flight",
+            "forwarded_legacy_files_in_flight"
         ]
     )]
     resolved_automatic_files_in_flight: Option<std::num::NonZeroUsize>,
@@ -120,10 +121,24 @@ struct Args {
         conflicts_with_all = [
             "max_files_in_flight",
             "max_open_files",
-            "resolved_automatic_files_in_flight"
+            "resolved_automatic_files_in_flight",
+            "forwarded_legacy_files_in_flight"
         ]
     )]
     explicit_unlimited_files_in_flight: bool,
+
+    #[arg(
+        long,
+        hide = true,
+        value_name = "N",
+        conflicts_with_all = [
+            "max_files_in_flight",
+            "max_open_files",
+            "resolved_automatic_files_in_flight",
+            "explicit_unlimited_files_in_flight"
+        ]
+    )]
+    forwarded_legacy_files_in_flight: Option<usize>,
 
     // Remote copy options
     /// IP address to bind TCP server to (set by master, internal use only)
@@ -201,7 +216,7 @@ struct Args {
     /// CPU-derived file default, increase both ceilings.
     #[arg(
         long,
-        default_value = "100",
+        default_value_t = std::num::NonZeroUsize::new(remote::DEFAULT_MAX_CONNECTIONS).unwrap(),
         value_name = "N",
         value_parser = common::cli::parse_positive_usize,
         help_heading = "Remote copy options"
@@ -213,7 +228,9 @@ struct Args {
     /// Pending capacity is effective data streams × pending-writes-multiplier.
     #[arg(
         long,
-        default_value = "4",
+        default_value_t = std::num::NonZeroUsize::new(
+            remote::DEFAULT_PENDING_WRITES_MULTIPLIER
+        ).unwrap(),
         value_name = "N",
         value_parser = common::cli::parse_positive_usize,
         help_heading = "Remote copy options"
@@ -271,6 +288,8 @@ impl Args {
             common::ResolvedFilesInFlight::automatic_with(value)
         } else if self.explicit_unlimited_files_in_flight {
             common::ResolvedFilesInFlight::unlimited()
+        } else if let Some(value) = self.forwarded_legacy_files_in_flight {
+            common::ResolvedFilesInFlight::forwarded_legacy(value)
         } else {
             self.common.resolve_files_in_flight()
         }
@@ -287,14 +306,12 @@ impl Args {
     }
     /// Build the remote TCP config from CLI args. Shared by the listener setup in `async_main`
     /// and the source/destination operations in `run_operation`.
-    fn to_tcp_config(&self, concurrency: remote::ResolvedRemoteConcurrency) -> remote::TcpConfig {
+    fn to_tcp_config(&self) -> remote::TcpConfig {
         remote::TcpConfig {
             port_ranges: self.port_ranges.clone(),
             conn_timeout_sec: self.remote_copy_conn_timeout_sec,
             network_profile: self.network_profile,
             buffer_size: self.buffer_size,
-            max_connections: concurrency.max_connections().get(),
-            pending_writes_multiplier: self.pending_writes_multiplier.get(),
             keepalive_sec: self.remote_keepalive_sec,
         }
     }
@@ -606,10 +623,10 @@ async fn async_main(
             .ok(); // ignore if already installed
     }
     // build TCP config for listener creation
-    let tcp_config = args.to_tcp_config(concurrency);
+    let tcp_config = args.to_tcp_config();
     tracing::info!(
         "Effective remote connection count: {}",
-        tcp_config.max_connections
+        concurrency.max_connections()
     );
     // generate TLS certificate and create server config (if encryption enabled)
     let (cert_key, tls_acceptor) = if !args.no_encryption {
@@ -865,13 +882,10 @@ async fn async_main(
 }
 
 fn exit_with_startup_refusal(diagnostic: &str, code: i32) -> ! {
-    let one_line = diagnostic
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    eprintln!("{}{one_line}", remote::RCPD_STARTUP_ERROR_PREFIX);
+    eprintln!(
+        "{}",
+        common::format_startup_diagnostic(Some(remote::RCPD_STARTUP_ERROR_PREFIX), diagnostic)
+    );
     std::process::exit(code);
 }
 
@@ -926,7 +940,8 @@ fn main() -> Result<(), anyhow::Error> {
         filename
     });
     // rcpd never prints a user-facing summary (results stream to master).
-    let output = args.common.output_config(args.quiet, false);
+    let mut output = args.common.output_config(args.quiet, false);
+    output.startup_error_prefix = Some(remote::RCPD_STARTUP_ERROR_PREFIX);
     let runtime = args.common.runtime_config();
     let throttle = args
         .common
@@ -987,7 +1002,7 @@ mod tests {
             common::ConcurrencyLimit::Unlimited => panic!("automatic policy must be finite"),
         };
         let concurrency = args.resolve_remote_concurrency(files_in_flight).unwrap();
-        assert_eq!(args.to_tcp_config(concurrency).max_connections, expected);
+        assert_eq!(concurrency.max_connections().get(), expected);
     }
 
     #[test]
@@ -1007,10 +1022,41 @@ mod tests {
             .resolve_remote_concurrency(automatic_limit)
             .unwrap();
         assert_eq!(
-            direct.to_tcp_config(direct_concurrency).max_connections,
-            resolved_automatic
-                .to_tcp_config(automatic_concurrency)
-                .max_connections
+            direct_concurrency.max_connections(),
+            automatic_concurrency.max_connections()
         );
+    }
+
+    #[test]
+    fn forwarded_legacy_finite_retains_provenance_without_a_duplicate_warning() {
+        let args = daemon_args(&["--forwarded-legacy-files-in-flight=7"]);
+        let files_in_flight = args.resolve_files_in_flight();
+        assert_eq!(
+            files_in_flight.limit(),
+            common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(7).unwrap())
+        );
+        assert_eq!(
+            files_in_flight.source(),
+            common::FilesInFlightSource::DeprecatedMaxOpenFiles
+        );
+        let throttle = args
+            .common
+            .throttle_config(files_in_flight, args.chunk_size);
+        assert_eq!(throttle.deprecated_max_open_files_warning(), None);
+    }
+
+    #[test]
+    fn forwarded_legacy_unlimited_retains_provenance_without_a_duplicate_warning() {
+        let args = daemon_args(&["--forwarded-legacy-files-in-flight=0"]);
+        let files_in_flight = args.resolve_files_in_flight();
+        assert_eq!(files_in_flight.limit(), common::ConcurrencyLimit::Unlimited);
+        assert_eq!(
+            files_in_flight.source(),
+            common::FilesInFlightSource::DeprecatedMaxOpenFiles
+        );
+        let throttle = args
+            .common
+            .throttle_config(files_in_flight, args.chunk_size);
+        assert_eq!(throttle.deprecated_max_open_files_warning(), None);
     }
 }

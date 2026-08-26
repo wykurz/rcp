@@ -42,6 +42,7 @@ pub enum FilesInFlightSource {
 pub struct ResolvedFilesInFlight {
     limit: ConcurrencyLimit,
     source: FilesInFlightSource,
+    warn_deprecated_max_open_files: bool,
 }
 
 fn default_files_in_flight_from(available: Option<NonZeroUsize>) -> NonZeroUsize {
@@ -63,6 +64,7 @@ impl ResolvedFilesInFlight {
         Self {
             limit: ConcurrencyLimit::Limited(value),
             source: FilesInFlightSource::Automatic,
+            warn_deprecated_max_open_files: false,
         }
     }
 
@@ -70,6 +72,7 @@ impl ResolvedFilesInFlight {
         Self {
             limit: ConcurrencyLimit::Limited(value),
             source: FilesInFlightSource::Explicit,
+            warn_deprecated_max_open_files: false,
         }
     }
 
@@ -77,14 +80,24 @@ impl ResolvedFilesInFlight {
         Self {
             limit: ConcurrencyLimit::Unlimited,
             source: FilesInFlightSource::Explicit,
+            warn_deprecated_max_open_files: false,
         }
     }
 
     pub fn legacy(value: usize) -> Self {
+        Self::legacy_with_warning(value, true)
+    }
+
+    pub fn forwarded_legacy(value: usize) -> Self {
+        Self::legacy_with_warning(value, false)
+    }
+
+    fn legacy_with_warning(value: usize, warn_deprecated_max_open_files: bool) -> Self {
         Self {
             limit: NonZeroUsize::new(value)
                 .map_or(ConcurrencyLimit::Unlimited, ConcurrencyLimit::Limited),
             source: FilesInFlightSource::DeprecatedMaxOpenFiles,
+            warn_deprecated_max_open_files,
         }
     }
 
@@ -206,7 +219,7 @@ pub const AUTO_META_MIN_OPS_THROTTLE: usize = 10;
 impl ThrottleConfig {
     #[must_use]
     pub fn deprecated_max_open_files_warning(&self) -> Option<&'static str> {
-        if self.files_in_flight.source() != FilesInFlightSource::DeprecatedMaxOpenFiles {
+        if !self.files_in_flight.warn_deprecated_max_open_files {
             return None;
         }
         match self.files_in_flight.limit() {
@@ -371,6 +384,8 @@ pub struct OutputConfig {
     /// When true, `run()` will not print text runtime stats after the summary.
     /// Used when the summary itself includes runtime stats (e.g. JSON format).
     pub suppress_runtime_stats: bool,
+    /// Prefix pre-tracing configuration failures with a machine-readable startup record.
+    pub startup_error_prefix: Option<&'static str>,
 }
 
 /// Warnings and adjustments for dry-run mode.
@@ -546,6 +561,39 @@ mod files_in_flight_policy_tests {
             ConcurrencyLimit::Limited(NonZeroUsize::new(12).unwrap())
         );
         assert_eq!(limit.source(), FilesInFlightSource::Automatic);
+    }
+
+    #[test]
+    fn forwarded_legacy_finite_retains_origin_without_a_duplicate_warning() {
+        let files_in_flight = ResolvedFilesInFlight::forwarded_legacy(7);
+        let throttle = ThrottleConfig {
+            files_in_flight,
+            ..ThrottleConfig::default()
+        };
+        assert_eq!(
+            files_in_flight.limit(),
+            ConcurrencyLimit::Limited(NonZeroUsize::new(7).unwrap())
+        );
+        assert_eq!(
+            files_in_flight.source(),
+            FilesInFlightSource::DeprecatedMaxOpenFiles
+        );
+        assert_eq!(throttle.deprecated_max_open_files_warning(), None);
+    }
+
+    #[test]
+    fn forwarded_legacy_unlimited_retains_origin_without_a_duplicate_warning() {
+        let files_in_flight = ResolvedFilesInFlight::forwarded_legacy(0);
+        let throttle = ThrottleConfig {
+            files_in_flight,
+            ..ThrottleConfig::default()
+        };
+        assert_eq!(files_in_flight.limit(), ConcurrencyLimit::Unlimited);
+        assert_eq!(
+            files_in_flight.source(),
+            FilesInFlightSource::DeprecatedMaxOpenFiles
+        );
+        assert_eq!(throttle.deprecated_max_open_files_warning(), None);
     }
 }
 

@@ -251,6 +251,27 @@ struct AdmissionPools {
     pending_meta: semaphore::Semaphore,
 }
 
+/// An admission-pool capacity that Tokio's semaphore cannot represent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionCapacityError {
+    pool: &'static str,
+    capacity: usize,
+}
+
+impl std::fmt::Display for AdmissionCapacityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} admission capacity {} exceeds the Tokio semaphore maximum {}",
+            self.pool,
+            self.capacity,
+            tokio::sync::Semaphore::MAX_PERMITS,
+        )
+    }
+}
+
+impl std::error::Error for AdmissionCapacityError {}
+
 impl AdmissionPools {
     fn new() -> Self {
         Self {
@@ -262,6 +283,20 @@ impl AdmissionPools {
     fn setup(&self, open_file: usize, pending_meta: usize) {
         self.open_file.setup(open_file);
         self.pending_meta.setup(pending_meta);
+    }
+
+    fn try_setup(
+        &self,
+        open_file: usize,
+        pending_meta: usize,
+    ) -> Result<(), AdmissionCapacityError> {
+        for (pool, capacity) in [("OpenFile", open_file), ("PendingMeta", pending_meta)] {
+            if capacity > tokio::sync::Semaphore::MAX_PERMITS {
+                return Err(AdmissionCapacityError { pool, capacity });
+            }
+        }
+        self.setup(open_file, pending_meta);
+        Ok(())
     }
 
     async fn open_file_permit(&self) -> OpenFileGuard {
@@ -315,13 +350,28 @@ pub fn set_admission_limits(open_file: usize, pending_meta: usize) {
     ADMISSION_POOLS.setup(open_file, pending_meta);
 }
 
+/// Configure both admission pools after checking Tokio's semaphore capacity limit.
+///
+/// Both capacities are validated before either pool is changed, so an error leaves the current
+/// admission configuration intact. Pass `0` to disable either cap.
+pub fn try_set_admission_limits(
+    open_file: usize,
+    pending_meta: usize,
+) -> Result<(), AdmissionCapacityError> {
+    ADMISSION_POOLS.try_setup(open_file, pending_meta)
+}
+
+fn set_compatibility_admission_limit(pools: &AdmissionPools, max_open_files: usize) {
+    pools.setup(max_open_files, max_open_files);
+}
+
 /// Compatibility wrapper that assigns the same capacity to both admission pools.
 #[deprecated(
     since = "0.39.0",
     note = "use set_admission_limits; zero still means unlimited"
 )]
 pub fn set_max_open_files(max_open_files: usize) {
-    set_admission_limits(max_open_files, max_open_files);
+    set_compatibility_admission_limit(&ADMISSION_POOLS, max_open_files);
 }
 
 /// A cloneable, non-owning reference to one already-acquired fd-admission permit.
@@ -537,6 +587,28 @@ mod tests {
     mod max_files_in_flight_tests {
         use super::*;
 
+        #[test]
+        fn checked_setup_rejects_oversized_capacity_without_mutating_either_pool() {
+            let pools = AdmissionPools::new();
+            pools.setup(2, 3);
+
+            assert!(
+                pools
+                    .try_setup(tokio::sync::Semaphore::MAX_PERMITS + 1, 4)
+                    .is_err()
+            );
+            assert_eq!(pools.open_file.current_limit(), 2);
+            assert_eq!(pools.pending_meta.current_limit(), 3);
+
+            assert!(
+                pools
+                    .try_setup(4, tokio::sync::Semaphore::MAX_PERMITS + 1)
+                    .is_err()
+            );
+            assert_eq!(pools.open_file.current_limit(), 2);
+            assert_eq!(pools.pending_meta.current_limit(), 3);
+        }
+
         #[tokio::test]
         async fn unequal_pool_capacities_stop_at_their_own_boundaries() {
             let pools = AdmissionPools::new();
@@ -610,7 +682,7 @@ mod tests {
         #[tokio::test]
         async fn compatibility_wrapper_assigns_the_same_capacity_to_both_pools() {
             let pools = AdmissionPools::new();
-            pools.setup(1, 1);
+            set_compatibility_admission_limit(&pools, 1);
             let first_open_file = pools.open_file_permit().await;
             let first_pending_meta = pools.pending_meta_permit().await;
             assert!(

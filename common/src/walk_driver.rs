@@ -1504,9 +1504,8 @@ mod tests {
         Ok(())
     }
 
-    /// Driver-level deadlock regression. The module name carries the
-    /// `max_files_in_flight` substring so nextest's serial test-group isolates this
-    /// process-wide throttle mutation (see `.config/nextest.toml`).
+    /// Driver-level deadlock regressions. Each test scopes process-wide admission changes with an
+    /// `AdmissionLimit` guard.
     mod max_files_in_flight_tests {
         use super::*;
         use anyhow::Context;
@@ -1549,7 +1548,6 @@ mod tests {
 
         struct FailEarlyClassificationVisitor {
             filter: FilterSettings,
-            leaf_started: Arc<std::sync::atomic::AtomicBool>,
         }
 
         impl WalkVisitor for FailEarlyClassificationVisitor {
@@ -1584,7 +1582,6 @@ mod tests {
                 _parent_ctx: &TaskDropContext,
                 _leaf: AdmittedLeaf,
             ) -> Result<CountSummary, OperationError<CountSummary>> {
-                self.leaf_started.store(true, Ordering::SeqCst);
                 std::future::pending().await
             }
 
@@ -2424,7 +2421,8 @@ mod tests {
             Ok(())
         }
 
-        /// Fail-early classification errors cancel and fully drop every sibling task capture.
+        /// Fail-early classification errors cancel and fully drop every sibling task capture,
+        /// whether the runtime had polled that sibling yet or not.
         #[tokio::test(flavor = "current_thread")]
         async fn fail_early_classification_error_aborts_and_quiesces_siblings() -> anyhow::Result<()>
         {
@@ -2439,11 +2437,7 @@ mod tests {
             );
             let mut filter = FilterSettings::default();
             filter.add_exclude("protected/")?;
-            let leaf_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let visitor = Arc::new(FailEarlyClassificationVisitor {
-                filter,
-                leaf_started: Arc::clone(&leaf_started),
-            });
+            let visitor = Arc::new(FailEarlyClassificationVisitor { filter });
             let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
             let dir_ctx = TaskDropContext::root(dropped_tx);
             let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
@@ -2470,10 +2464,6 @@ mod tests {
             }
             dropped.sort_unstable();
             assert!(format!("{:#}", error.source).contains("gone"));
-            assert!(
-                leaf_started.load(Ordering::SeqCst),
-                "the gated sibling did not start before the classification error"
-            );
             assert_eq!(
                 dropped,
                 vec![0, 1],
@@ -2499,17 +2489,15 @@ mod tests {
             );
             let mut filter = FilterSettings::default();
             filter.add_exclude("protected/")?;
-            let leaf_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let visitor = Arc::new(FailEarlyClassificationVisitor {
-                filter,
-                leaf_started: Arc::clone(&leaf_started),
-            });
+            let visitor = Arc::new(FailEarlyClassificationVisitor { filter });
             let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
             let dir_ctx = TaskDropContext::root(dropped_tx);
             let parent_cx = root_cx(Arc::clone(&dir), OsStr::new("root"), root);
 
-            // every existing leaf enters the visitor's permanently pending future. No gate is
-            // released: only reaping `gone` and cancelling its siblings can make this return.
+            // the first two entries reserve both permits before their tasks need to be polled, so
+            // constructing the third child reaches a saturated admission wait. Only reaping
+            // `gone` and cancelling its siblings can make this return; consuming the released
+            // permit instead would advance far enough to construct the fourth child.
             let error = admission
                 .run_with_timeout(
                     Duration::from_secs(3),
@@ -2540,13 +2528,9 @@ mod tests {
             }
             dropped.sort_unstable();
             assert!(format!("{:#}", error.source).contains("gone"));
-            assert!(
-                leaf_started.load(Ordering::SeqCst),
-                "the permanently gated sibling did not start"
-            );
-            assert!(
-                created > 2,
-                "the fixture did not reach scheduling beyond the admission capacity"
+            assert_eq!(
+                created, 3,
+                "the completed error was not reaped directly from the saturated admission wait"
             );
             assert_eq!(
                 dropped,

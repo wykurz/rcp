@@ -202,9 +202,10 @@ struct Args {
     #[arg(long, value_name = "RANGES", help_heading = "Remote copy options")]
     port_ranges: Option<String>,
 
-    /// Connection timeout for remote copy operations in seconds
+    /// Connection timeout for remote setup and copy operations in seconds
     ///
-    /// Applies to: rcpd→master connection, destination→source connection.
+    /// Applies to: remote rcpd version probes, rcpd→master connection,
+    /// destination→source connection.
     /// Default: 15s normally, 60s when --auto-deploy-rcpd is enabled (to account
     /// for sequential binary deployment to multiple hosts).
     #[arg(
@@ -265,12 +266,11 @@ struct Args {
     /// default, increase both ceilings.
     #[arg(
         long,
-        default_value = "100",
         value_name = "N",
         value_parser = common::cli::parse_positive_usize,
         help_heading = "Remote copy options"
     )]
-    max_connections: std::num::NonZeroUsize,
+    max_connections: Option<std::num::NonZeroUsize>,
 
     /// Multiplier for pending file writes (default: 4)
     ///
@@ -278,7 +278,9 @@ struct Args {
     /// more files to be queued but use more memory when the destination is slow.
     #[arg(
         long,
-        default_value = "4",
+        default_value_t = std::num::NonZeroUsize::new(
+            remote::DEFAULT_PENDING_WRITES_MULTIPLIER
+        ).unwrap(),
         value_name = "N",
         value_parser = common::cli::parse_positive_usize,
         help_heading = "Remote copy options"
@@ -451,7 +453,51 @@ fn rcpd_closed_quietly(role: &str, host: &str, expected: &str) -> String {
 struct MasterRemoteConfigs {
     tcp: remote::TcpConfig,
     rcpd: remote::protocol::RcpdConfig,
-    stream_clamp_notice: Option<(std::num::NonZeroUsize, std::num::NonZeroUsize)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionCeilingOrigin {
+    Default,
+    Explicit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConnectionCeiling {
+    value: std::num::NonZeroUsize,
+    origin: ConnectionCeilingOrigin,
+}
+
+impl ConnectionCeiling {
+    fn from_arg(value: Option<std::num::NonZeroUsize>) -> Self {
+        match value {
+            Some(value) => Self {
+                value,
+                origin: ConnectionCeilingOrigin::Explicit,
+            },
+            None => Self {
+                value: std::num::NonZeroUsize::new(remote::DEFAULT_MAX_CONNECTIONS)
+                    .expect("the default connection ceiling is nonzero"),
+                origin: ConnectionCeilingOrigin::Default,
+            },
+        }
+    }
+
+    const fn value(self) -> std::num::NonZeroUsize {
+        self.value
+    }
+
+    const fn is_explicit(self) -> bool {
+        matches!(self.origin, ConnectionCeilingOrigin::Explicit)
+    }
+
+    fn description(self) -> String {
+        match self.origin {
+            ConnectionCeilingOrigin::Default => {
+                format!("the default connection ceiling of {}", self.value)
+            }
+            ConnectionCeilingOrigin::Explicit => format!("--max-connections={}", self.value),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -460,10 +506,54 @@ struct MasterRemoteRequest {
     rcpd: remote::protocol::RcpdConfig,
     filter: Option<common::filter::FilterSettings>,
     files_in_flight: common::ResolvedFilesInFlight,
-    configured_connections: std::num::NonZeroUsize,
+    connection_ceiling: ConnectionCeiling,
     pending_writes_multiplier: std::num::NonZeroUsize,
     resolved_explicit: Option<remote::ResolvedRemoteConcurrency>,
-    stream_clamp_notice: Option<(std::num::NonZeroUsize, std::num::NonZeroUsize)>,
+}
+
+fn remote_stream_clamp_notice(
+    files_in_flight: common::ResolvedFilesInFlight,
+    source_files_in_flight: common::ConcurrencyLimit,
+    connection_ceiling: ConnectionCeiling,
+    effective_connections: std::num::NonZeroUsize,
+) -> Option<String> {
+    let file_limit = match files_in_flight.source() {
+        common::FilesInFlightSource::Automatic => source_files_in_flight,
+        common::FilesInFlightSource::Explicit
+        | common::FilesInFlightSource::DeprecatedMaxOpenFiles => files_in_flight.limit(),
+    };
+    let common::ConcurrencyLimit::Limited(file_limit) = file_limit else {
+        return None;
+    };
+    if file_limit > effective_connections {
+        let option = match files_in_flight.source() {
+            common::FilesInFlightSource::DeprecatedMaxOpenFiles => "--max-open-files",
+            common::FilesInFlightSource::Explicit => "--max-files-in-flight",
+            common::FilesInFlightSource::Automatic => return None,
+        };
+        let connection_ceiling = connection_ceiling.description();
+        return Some(format!(
+            "Requested {option}={file_limit}, but {connection_ceiling} reduced remote data streams to {effective_connections}"
+        ));
+    }
+    if !connection_ceiling.is_explicit() || connection_ceiling.value() <= effective_connections {
+        return None;
+    }
+    let file_ceiling = match files_in_flight.source() {
+        common::FilesInFlightSource::Automatic => {
+            format!("the source's automatic file ceiling of {file_limit}")
+        }
+        common::FilesInFlightSource::Explicit => {
+            format!("--max-files-in-flight={file_limit}")
+        }
+        common::FilesInFlightSource::DeprecatedMaxOpenFiles => {
+            format!("--max-open-files={file_limit}")
+        }
+    };
+    let connection_ceiling = connection_ceiling.description();
+    Some(format!(
+        "Requested {connection_ceiling}, but {file_ceiling} reduced remote data streams to {effective_connections}"
+    ))
 }
 
 fn build_master_remote_request(
@@ -485,7 +575,8 @@ fn build_master_remote_request(
         remote::port_ranges::PortRanges::parse(ranges)
             .context("invalid --port-ranges configuration")?;
     }
-    let configured_connections = args.max_connections;
+    let connection_ceiling = ConnectionCeiling::from_arg(args.max_connections);
+    let configured_connections = connection_ceiling.value();
     let resolved_explicit = (!matches!(
         files_in_flight.source(),
         common::FilesInFlightSource::Automatic
@@ -498,22 +589,11 @@ fn build_master_remote_request(
         )
     })
     .transpose()?;
-    let stream_clamp_notice =
-        resolved_explicit.and_then(|resolved| match files_in_flight.limit() {
-            common::ConcurrencyLimit::Limited(requested)
-                if resolved.max_connections() < requested =>
-            {
-                Some((requested, resolved.max_connections()))
-            }
-            _ => None,
-        });
     let tcp = remote::TcpConfig {
         port_ranges: args.port_ranges.clone(),
         conn_timeout_sec: args.remote_copy_conn_timeout_sec,
         network_profile: args.network_profile,
         buffer_size: args.remote_copy_buffer_size.map(|b| b.0 as usize),
-        max_connections: configured_connections.get(),
-        pending_writes_multiplier: args.pending_writes_multiplier.get(),
         keepalive_sec: args.remote_keepalive_sec,
     };
     let rcpd = remote::protocol::RcpdConfig {
@@ -586,10 +666,9 @@ fn build_master_remote_request(
         rcpd,
         filter,
         files_in_flight,
-        configured_connections,
+        connection_ceiling,
         pending_writes_multiplier: args.pending_writes_multiplier,
         resolved_explicit,
-        stream_clamp_notice,
     })
 }
 
@@ -598,17 +677,28 @@ fn endpoint_config(
     files_in_flight: remote::protocol::RcpdFilesInFlight,
     concurrency: Option<remote::ResolvedRemoteConcurrency>,
 ) -> MasterRemoteConfigs {
-    let mut tcp = request.tcp.clone();
+    let tcp = request.tcp.clone();
     let mut rcpd = request.rcpd.clone();
     rcpd.files_in_flight = files_in_flight;
     if let Some(concurrency) = concurrency {
-        tcp.max_connections = concurrency.max_connections().get();
         rcpd.max_connections = concurrency.max_connections().get();
     }
-    MasterRemoteConfigs {
-        tcp,
-        rcpd,
-        stream_clamp_notice: request.stream_clamp_notice,
+    MasterRemoteConfigs { tcp, rcpd }
+}
+
+fn master_authoritative_rcpd_files_in_flight(
+    files_in_flight: common::ResolvedFilesInFlight,
+) -> remote::protocol::RcpdFilesInFlight {
+    match files_in_flight.source() {
+        common::FilesInFlightSource::Explicit => {
+            remote::protocol::RcpdFilesInFlight::Explicit(files_in_flight.limit())
+        }
+        common::FilesInFlightSource::DeprecatedMaxOpenFiles => {
+            remote::protocol::RcpdFilesInFlight::DeprecatedMaxOpenFiles(files_in_flight.limit())
+        }
+        common::FilesInFlightSource::Automatic => {
+            unreachable!("an automatic file ceiling is not master-authoritative")
+        }
     }
 }
 
@@ -618,7 +708,7 @@ fn build_source_remote_config(
     match request.resolved_explicit {
         Some(concurrency) => Ok(endpoint_config(
             request,
-            remote::protocol::RcpdFilesInFlight::Explicit(request.files_in_flight.limit()),
+            master_authoritative_rcpd_files_in_flight(request.files_in_flight),
             Some(concurrency),
         )),
         None => Ok(endpoint_config(
@@ -635,7 +725,7 @@ fn build_destination_remote_config(
 ) -> anyhow::Result<MasterRemoteConfigs> {
     let concurrency = remote::resolve_remote_concurrency(
         source.files_in_flight,
-        request.configured_connections,
+        request.connection_ceiling.value(),
         request.pending_writes_multiplier,
     )?;
     if concurrency.max_connections() != source.max_connections {
@@ -663,7 +753,7 @@ fn build_destination_remote_config(
                     request.files_in_flight.limit()
                 );
             }
-            remote::protocol::RcpdFilesInFlight::Explicit(request.files_in_flight.limit())
+            master_authoritative_rcpd_files_in_flight(request.files_in_flight)
         }
     };
     Ok(endpoint_config(request, files_in_flight, Some(concurrency)))
@@ -685,6 +775,49 @@ fn validate_destination_readiness(
         );
     }
     Ok(())
+}
+
+fn spawn_tracing_receiver(
+    recv_stream: remote::streams::BoxedRecvStream,
+    rcpd_type: remote::tracelog::RcpdType,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(error) = remote::tracelog::run_receiver(recv_stream, rcpd_type).await {
+            tracing::debug!("{rcpd_type} tracing receiver ended: {error:#}");
+        }
+    })
+}
+
+async fn finish_tracing_receiver(
+    mut task: tokio::task::JoinHandle<()>,
+    rcpd_type: remote::tracelog::RcpdType,
+) {
+    const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    match tokio::time::timeout(DRAIN_GRACE, &mut task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::debug!("{rcpd_type} tracing receiver task failed: {error:#}");
+        }
+        Err(_) => {
+            tracing::debug!("{rcpd_type} tracing receiver did not finish during drain grace");
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+async fn wait_for_rcpd_processes(rcpd_processes: Vec<remote::RcpdProcess>, report_failures: bool) {
+    for rcpd in rcpd_processes {
+        if let Err(error) = remote::wait_for_rcpd_process(rcpd).await {
+            if report_failures {
+                tracing::error!("Failed to wait for rcpd process: {error:#}");
+            } else {
+                tracing::debug!("rcpd process failed while unwinding startup: {error:#}");
+            }
+        }
+    }
+    tracing::info!("All rcpd processes finished");
 }
 
 #[cfg(test)]
@@ -709,21 +842,18 @@ async fn run_rcpd_master(
     tracing::debug!("running rcpd src/dst");
     let mut rcpd_processes: Vec<remote::RcpdProcess> = vec![];
     let source_config = build_source_remote_config(&request)?;
-    if let Some((files_in_flight, max_connections)) = source_config.stream_clamp_notice {
-        tracing::warn!(
-            target: common::NOTICE_TARGET,
-            "Requested --max-files-in-flight={files_in_flight}, but --max-connections={max_connections} reduced remote data streams to {max_connections}"
-        );
-    }
     let source_bind_ip = extract_bind_ip_from_host(&src.session().host);
     let same_session = src.session() == dst.session();
-    let (prepared_source, prepared_destination) = remote::prepare_rcpd_endpoints(
-        src.session(),
-        dst.session(),
-        args.rcpd_path.as_deref(),
-        args.auto_deploy_rcpd,
-    )
-    .await?;
+    let version_probe_timeout = std::time::Duration::from_secs(request.tcp.conn_timeout_sec);
+    let (prepared_source, prepared_destination) =
+        remote::prepare_rcpd_endpoints_with_probe_timeout(
+            src.session(),
+            dst.session(),
+            args.rcpd_path.as_deref(),
+            args.auto_deploy_rcpd,
+            version_probe_timeout,
+        )
+        .await?;
 
     let source_rcpd = {
         let _span = tracing::trace_span!(
@@ -801,154 +931,198 @@ async fn run_rcpd_master(
     }
     // connect to source rcpd (control + tracing)
     tracing::info!("Connecting to source rcpd...");
-    let (mut source_send_stream, mut source_recv_stream) = connect_to_rcpd(
-        &source_conn_info,
-        master_cert.as_ref(),
-        &source_config.tcp,
-        "source control",
-    )
-    .await?;
-    let (source_tracing_send, source_tracing_recv) = connect_to_rcpd(
-        &source_conn_info,
-        master_cert.as_ref(),
-        &source_config.tcp,
-        "source tracing",
-    )
-    .await?;
-    drop(source_tracing_send); // we only receive on tracing connection
-
-    let destination_config = build_destination_remote_config(&request, &source_conn_info)?;
-    tracing::info!(
-        "Effective remote connection count: {}",
-        source_conn_info.max_connections
-    );
-    let destination_bind_ip = same_session.then_some(source_bind_ip.as_deref()).flatten();
-    let destination_rcpd = {
-        let _span = tracing::trace_span!(
-            "start_rcpd",
-            host = %dst.session().host,
-            role = ?remote::protocol::RcpdRole::Destination
+    let source_setup = async {
+        let (source_send_stream, source_recv_stream) = connect_to_rcpd(
+            &source_conn_info,
+            master_cert.as_ref(),
+            &source_config.tcp,
+            "source control",
         )
-        .entered();
-        prepared_destination
-            .spawn(
-                &destination_config.rcpd,
-                destination_bind_ip,
-                remote::protocol::RcpdRole::Destination,
+        .await?;
+        let (source_tracing_send, source_tracing_recv) = connect_to_rcpd(
+            &source_conn_info,
+            master_cert.as_ref(),
+            &source_config.tcp,
+            "source tracing",
+        )
+        .await?;
+        drop(source_tracing_send); // we only receive on tracing connection
+        anyhow::Ok((source_send_stream, source_recv_stream, source_tracing_recv))
+    }
+    .await;
+    let (mut source_send_stream, mut source_recv_stream, source_tracing_recv) = match source_setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            wait_for_rcpd_processes(rcpd_processes, false).await;
+            return Err(error);
+        }
+    };
+    // Start draining immediately. Source startup notices are already queued by this point and must
+    // remain visible even if any part of destination bring-up fails.
+    let source_tracing_task =
+        spawn_tracing_receiver(source_tracing_recv, remote::tracelog::RcpdType::Source);
+
+    let destination_setup = async {
+        let destination_config = build_destination_remote_config(&request, &source_conn_info)?;
+        if let Some(notice) = remote_stream_clamp_notice(
+            request.files_in_flight,
+            source_conn_info.files_in_flight,
+            request.connection_ceiling,
+            source_conn_info.max_connections,
+        ) {
+            tracing::warn!(target: common::NOTICE_TARGET, "{notice}");
+        }
+        tracing::info!(
+            "Effective remote connection count: {}",
+            source_conn_info.max_connections
+        );
+        let destination_bind_ip = same_session.then_some(source_bind_ip.as_deref()).flatten();
+        let destination_rcpd = {
+            let _span = tracing::trace_span!(
+                "start_rcpd",
+                host = %dst.session().host,
+                role = ?remote::protocol::RcpdRole::Destination
             )
-            .await?
-    };
-    let destination_conn_info = destination_rcpd.conn_info.clone();
-    validate_destination_readiness(&source_conn_info, &destination_conn_info)?;
-    rcpd_processes.push(destination_rcpd);
-    tracing::info!(
-        "Destination rcpd at {} (encryption={})",
-        destination_conn_info.addr,
-        destination_conn_info.fingerprint.is_some()
-    );
+            .entered();
+            prepared_destination
+                .spawn(
+                    &destination_config.rcpd,
+                    destination_bind_ip,
+                    remote::protocol::RcpdRole::Destination,
+                )
+                .await?
+        };
+        let destination_conn_info = destination_rcpd.conn_info.clone();
+        // Retain process ownership before validation or connection work introduces another exit.
+        rcpd_processes.push(destination_rcpd);
+        validate_destination_readiness(&source_conn_info, &destination_conn_info)?;
+        tracing::info!(
+            "Destination rcpd at {} (encryption={})",
+            destination_conn_info.addr,
+            destination_conn_info.fingerprint.is_some()
+        );
 
-    // connect to destination rcpd (control + tracing)
-    tracing::info!("Connecting to destination rcpd...");
-    let (mut dest_send_stream, mut dest_recv_stream) = connect_to_rcpd(
-        &destination_conn_info,
-        master_cert.as_ref(),
-        &destination_config.tcp,
-        "dest control",
-    )
-    .await?;
-    let (dest_tracing_send, dest_tracing_recv) = connect_to_rcpd(
-        &destination_conn_info,
-        master_cert.as_ref(),
-        &destination_config.tcp,
-        "dest tracing",
-    )
-    .await?;
-    drop(dest_tracing_send); // we only receive on tracing connection
-    tracing::info!("Connected to all rcpd processes");
-    // spawn tracing receiver tasks to process progress/log messages from rcpd
-    let source_tracing_task = tokio::spawn(async move {
-        if let Err(e) =
-            remote::tracelog::run_receiver(source_tracing_recv, remote::tracelog::RcpdType::Source)
-                .await
-        {
-            tracing::debug!("Source tracing receiver ended: {e:#}");
-        }
-    });
-    let dest_tracing_task = tokio::spawn(async move {
-        if let Err(e) = remote::tracelog::run_receiver(
-            dest_tracing_recv,
-            remote::tracelog::RcpdType::Destination,
+        // connect to destination rcpd (control + tracing)
+        tracing::info!("Connecting to destination rcpd...");
+        let (dest_send_stream, dest_recv_stream) = connect_to_rcpd(
+            &destination_conn_info,
+            master_cert.as_ref(),
+            &destination_config.tcp,
+            "dest control",
         )
-        .await
+        .await?;
+        let (dest_tracing_send, dest_tracing_recv) = connect_to_rcpd(
+            &destination_conn_info,
+            master_cert.as_ref(),
+            &destination_config.tcp,
+            "dest tracing",
+        )
+        .await?;
+        drop(dest_tracing_send); // we only receive on tracing connection
+        anyhow::Ok((
+            destination_conn_info,
+            dest_send_stream,
+            dest_recv_stream,
+            dest_tracing_recv,
+        ))
+    }
+    .await;
+    let (destination_conn_info, mut dest_send_stream, mut dest_recv_stream, dest_tracing_recv) =
+        match destination_setup {
+            Ok(setup) => setup,
+            Err(error) => {
+                let _ = source_send_stream.close().await;
+                drop(source_recv_stream);
+                wait_for_rcpd_processes(rcpd_processes, false).await;
+                finish_tracing_receiver(source_tracing_task, remote::tracelog::RcpdType::Source)
+                    .await;
+                return Err(error);
+            }
+        };
+    tracing::info!("Connected to all rcpd processes");
+    let dest_tracing_task =
+        spawn_tracing_receiver(dest_tracing_recv, remote::tracelog::RcpdType::Destination);
+    let operation_result = async {
+        let filter = request.filter;
+        // send MasterHello to source rcpd (include dest fingerprint for mutual TLS)
         {
-            tracing::debug!("Destination tracing receiver ended: {e:#}");
+            let _span = tracing::trace_span!("send_master_hello_to_source").entered();
+            source_send_stream
+                .send_control_message(&remote::protocol::MasterHello::Source {
+                    src: src.path().to_path_buf(),
+                    dst: dst.path().to_path_buf(),
+                    dest_cert_fingerprint: destination_conn_info.fingerprint,
+                    filter,
+                    dry_run: args.dry_run,
+                    // derived from the SAME `preserve` the destination is handed below, so what
+                    // the source reads and what the destination applies cannot drift apart.
+                    capture: remote::protocol::ExtendedMetadataCapture::for_preserve(preserve),
+                })
+                .await?;
         }
-    });
-    let filter = request.filter;
-    // send MasterHello to source rcpd (include dest fingerprint for mutual TLS)
-    {
-        let _span = tracing::trace_span!("send_master_hello_to_source").entered();
-        source_send_stream
-            .send_control_message(&remote::protocol::MasterHello::Source {
-                src: src.path().to_path_buf(),
-                dst: dst.path().to_path_buf(),
-                dest_cert_fingerprint: destination_conn_info.fingerprint,
-                filter,
-                dry_run: args.dry_run,
-                // derived from the SAME `preserve` the destination is handed below, so what the
-                // source reads and what the destination applies cannot drift apart.
-                capture: remote::protocol::ExtendedMetadataCapture::for_preserve(preserve),
-            })
-            .await?;
+        tracing::debug!("Waiting for source rcpd to send hello");
+        let source_hello = {
+            let _span = tracing::trace_span!("recv_source_hello").entered();
+            // built once and used by BOTH arms, so the two cannot drift into describing the same
+            // event differently — which is the whole point of reporting them alike.
+            let went_quiet = rcpd_went_quiet("source", &src.session().host, "send its hello");
+            let closed_quietly =
+                rcpd_closed_quietly("source", &src.session().host, "send its hello");
+            source_recv_stream
+                .recv_object::<remote::protocol::SourceMasterHello>()
+                .await
+                .with_context(|| went_quiet)?
+                .ok_or_else(|| anyhow!(closed_quietly))?
+        };
+        // send MasterHello to destination rcpd (include source fingerprint for mutual TLS)
+        {
+            let _span = tracing::trace_span!("send_master_hello_to_dest").entered();
+            dest_send_stream
+                .send_control_message(&remote::protocol::MasterHello::Destination {
+                    source_control_addr: source_hello.control_addr,
+                    source_data_addr: source_hello.data_addr,
+                    server_name: source_hello.server_name.clone(),
+                    preserve: *preserve,
+                    source_cert_fingerprint: source_conn_info.fingerprint,
+                })
+                .await?;
+        }
+        tracing::info!("Forwarded source connection info to destination");
+        let source_result = {
+            let _span = tracing::trace_span!("wait_for_source_result").entered();
+            let went_quiet = rcpd_went_quiet("source", &src.session().host, "report a result");
+            let closed_quietly =
+                rcpd_closed_quietly("source", &src.session().host, "report a result");
+            source_recv_stream
+                .recv_object::<remote::protocol::RcpdResult>()
+                .await
+                .with_context(|| went_quiet)?
+                .ok_or_else(|| anyhow!(closed_quietly))?
+        };
+        let dest_result = {
+            let _span = tracing::trace_span!("wait_for_dest_result").entered();
+            let went_quiet = rcpd_went_quiet("destination", &dst.session().host, "report a result");
+            let closed_quietly =
+                rcpd_closed_quietly("destination", &dst.session().host, "report a result");
+            dest_recv_stream
+                .recv_object::<remote::protocol::RcpdResult>()
+                .await
+                .with_context(|| went_quiet)?
+                .ok_or_else(|| anyhow!(closed_quietly))?
+        };
+        anyhow::Ok((source_result, dest_result))
     }
-    tracing::debug!("Waiting for source rcpd to send hello");
-    let source_hello = {
-        let _span = tracing::trace_span!("recv_source_hello").entered();
-        // built once and used by BOTH arms, so the two cannot drift into describing the same event
-        // differently — which is the whole point of reporting them alike.
-        let went_quiet = rcpd_went_quiet("source", &src.session().host, "send its hello");
-        let closed_quietly = rcpd_closed_quietly("source", &src.session().host, "send its hello");
-        source_recv_stream
-            .recv_object::<remote::protocol::SourceMasterHello>()
-            .await
-            .with_context(|| went_quiet)?
-            .ok_or_else(|| anyhow!(closed_quietly))?
-    };
-    // send MasterHello to destination rcpd (include source fingerprint for mutual TLS)
-    {
-        let _span = tracing::trace_span!("send_master_hello_to_dest").entered();
-        dest_send_stream
-            .send_control_message(&remote::protocol::MasterHello::Destination {
-                source_control_addr: source_hello.control_addr,
-                source_data_addr: source_hello.data_addr,
-                server_name: source_hello.server_name.clone(),
-                preserve: *preserve,
-                source_cert_fingerprint: source_conn_info.fingerprint,
-            })
-            .await?;
-    }
-    tracing::info!("Forwarded source connection info to destination");
-    let source_result = {
-        let _span = tracing::trace_span!("wait_for_source_result").entered();
-        let went_quiet = rcpd_went_quiet("source", &src.session().host, "report a result");
-        let closed_quietly = rcpd_closed_quietly("source", &src.session().host, "report a result");
-        source_recv_stream
-            .recv_object::<remote::protocol::RcpdResult>()
-            .await
-            .with_context(|| went_quiet)?
-            .ok_or_else(|| anyhow!(closed_quietly))?
-    };
-    let dest_result = {
-        let _span = tracing::trace_span!("wait_for_dest_result").entered();
-        let went_quiet = rcpd_went_quiet("destination", &dst.session().host, "report a result");
-        let closed_quietly =
-            rcpd_closed_quietly("destination", &dst.session().host, "report a result");
-        dest_recv_stream
-            .recv_object::<remote::protocol::RcpdResult>()
-            .await
-            .with_context(|| went_quiet)?
-            .ok_or_else(|| anyhow!(closed_quietly))?
-    };
+    .await;
+
+    let _ = source_send_stream.close().await;
+    let _ = dest_send_stream.close().await;
+    drop(source_recv_stream);
+    drop(dest_recv_stream);
+    wait_for_rcpd_processes(rcpd_processes, true).await;
+    finish_tracing_receiver(source_tracing_task, remote::tracelog::RcpdType::Source).await;
+    finish_tracing_receiver(dest_tracing_task, remote::tracelog::RcpdType::Destination).await;
+
+    let (source_result, dest_result) = operation_result?;
     tracing::debug!("Received RcpdResult from both source and destination rcpds");
     // check for failures and collect error details + runtime stats
     let mut errors = Vec::new();
@@ -999,19 +1173,6 @@ async fn run_rcpd_master(
         dest_host: dst.session().host.clone(),
         dest_stats: dest_runtime_stats,
     });
-    // close streams
-    source_send_stream.close().await.ok();
-    dest_send_stream.close().await.ok();
-    // abort tracing tasks - they'll end when the rcpd processes close their connections
-    source_tracing_task.abort();
-    dest_tracing_task.abort();
-    // wait for rcpd processes to fully exit and capture any error output
-    for rcpd in rcpd_processes {
-        if let Err(e) = remote::wait_for_rcpd_process(rcpd.child).await {
-            tracing::error!("Failed to wait for rcpd process: {e:#}");
-        }
-    }
-    tracing::info!("All rcpd processes finished");
     // merge source and destination summaries:
     // - in dry-run mode the source does all the counting (destination is idle)
     // - in normal mode the destination is authoritative for copy/create/unchanged/remove
@@ -1603,6 +1764,8 @@ mod tests {
         let request =
             build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
                 .unwrap();
+        assert_eq!(request.connection_ceiling.value().get(), 100);
+        assert!(!request.connection_ceiling.is_explicit());
         let source = build_source_remote_config(&request).unwrap();
         let spawn_args = source.rcpd.to_args();
         assert!(!spawn_args.iter().any(|arg| arg.contains("files-in-flight")));
@@ -1611,6 +1774,7 @@ mod tests {
                 .iter()
                 .any(|arg| arg.starts_with("--max-open-files"))
         );
+        assert!(spawn_args.iter().any(|arg| arg == "--max-connections=100"));
     }
 
     #[test]
@@ -1642,6 +1806,7 @@ mod tests {
             None,
         )
         .unwrap();
+        assert!(request.connection_ceiling.is_explicit());
         let source = build_source_remote_config(&request).unwrap();
         let source_readiness = readiness(
             common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(64).unwrap()),
@@ -1660,7 +1825,34 @@ mod tests {
     }
 
     #[test]
-    fn master_legacy_unlimited_uses_internal_unlimited_without_deprecated_daemon_input() {
+    fn master_legacy_finite_preserves_provenance_for_both_daemons() {
+        let args = master_args(&["--max-connections=100", "--max-open-files=7"]);
+        let request =
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::legacy(7), None)
+                .unwrap();
+        let source = build_source_remote_config(&request).unwrap();
+        let source_readiness = readiness(
+            common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(7).unwrap()),
+            7,
+        );
+        let destination = build_destination_remote_config(&request, &source_readiness).unwrap();
+        for config in [&source.rcpd, &destination.rcpd] {
+            let spawn_args = config.to_args();
+            assert!(
+                spawn_args
+                    .iter()
+                    .any(|arg| arg == "--forwarded-legacy-files-in-flight=7")
+            );
+            assert!(
+                !spawn_args
+                    .iter()
+                    .any(|arg| arg.starts_with("--max-open-files"))
+            );
+        }
+    }
+
+    #[test]
+    fn master_legacy_unlimited_preserves_provenance_for_both_daemons() {
         let args = master_args(&["--max-connections=100", "--max-open-files=0"]);
         let request =
             build_master_remote_request(&args, common::ResolvedFilesInFlight::legacy(0), None)
@@ -1673,7 +1865,7 @@ mod tests {
             assert!(
                 spawn_args
                     .iter()
-                    .any(|arg| arg == "--explicit-unlimited-files-in-flight")
+                    .any(|arg| arg == "--forwarded-legacy-files-in-flight=0")
             );
             assert!(spawn_args.iter().any(|arg| arg == "--max-connections=100"));
             assert!(
@@ -1779,7 +1971,6 @@ mod tests {
         let files_in_flight =
             common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(3).unwrap());
         let configs = build_master_remote_configs(&args, files_in_flight, None).unwrap();
-        assert_eq!(configs.tcp.max_connections, 3);
         let source_args = configs.rcpd.clone().to_args();
         let destination_args = configs.rcpd.to_args();
         assert!(source_args.iter().any(|arg| arg == "--max-connections=3"));
@@ -1814,13 +2005,87 @@ mod tests {
         let files_in_flight =
             common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(200).unwrap());
         let configs = build_master_remote_configs(&args, files_in_flight, None).unwrap();
-        assert_eq!(configs.tcp.max_connections, 100);
+        let effective = std::num::NonZeroUsize::new(configs.rcpd.max_connections).unwrap();
         assert_eq!(
-            configs.stream_clamp_notice,
-            Some((
-                std::num::NonZeroUsize::new(200).unwrap(),
-                std::num::NonZeroUsize::new(100).unwrap()
-            ))
+            remote_stream_clamp_notice(
+                files_in_flight,
+                files_in_flight.limit(),
+                ConnectionCeiling::from_arg(std::num::NonZeroUsize::new(100)),
+                effective,
+            )
+            .as_deref(),
+            Some(
+                "Requested --max-files-in-flight=200, but --max-connections=100 reduced remote data streams to 100"
+            )
+        );
+    }
+
+    #[test]
+    fn master_default_connection_clamp_names_the_default_ceiling() {
+        let args = master_args(&[]);
+        let files_in_flight =
+            common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(200).unwrap());
+        let configs = build_master_remote_configs(&args, files_in_flight, None).unwrap();
+        let request = build_master_remote_request(&args, files_in_flight, None).unwrap();
+        let effective = std::num::NonZeroUsize::new(configs.rcpd.max_connections).unwrap();
+        assert_eq!(
+            remote_stream_clamp_notice(
+                files_in_flight,
+                files_in_flight.limit(),
+                request.connection_ceiling,
+                effective,
+            )
+            .as_deref(),
+            Some(
+                "Requested --max-files-in-flight=200, but the default connection ceiling of 100 reduced remote data streams to 100"
+            )
+        );
+    }
+
+    #[test]
+    fn explicit_connection_clamp_names_the_source_automatic_file_ceiling() {
+        let notice = remote_stream_clamp_notice(
+            common::ResolvedFilesInFlight::automatic_with(std::num::NonZeroUsize::new(64).unwrap()),
+            common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(4).unwrap()),
+            ConnectionCeiling::from_arg(std::num::NonZeroUsize::new(200)),
+            std::num::NonZeroUsize::new(4).unwrap(),
+        );
+        assert_eq!(
+            notice.as_deref(),
+            Some(
+                "Requested --max-connections=200, but the source's automatic file ceiling of 4 reduced remote data streams to 4"
+            )
+        );
+    }
+
+    #[test]
+    fn automatic_default_connection_intersection_stays_quiet() {
+        assert_eq!(
+            remote_stream_clamp_notice(
+                common::ResolvedFilesInFlight::automatic_with(
+                    std::num::NonZeroUsize::new(64).unwrap(),
+                ),
+                common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(4).unwrap()),
+                ConnectionCeiling::from_arg(None),
+                std::num::NonZeroUsize::new(4).unwrap(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_file_limit_clamp_preserves_the_deprecated_option_name() {
+        let notice = remote_stream_clamp_notice(
+            common::ResolvedFilesInFlight::legacy(200),
+            common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(200).unwrap()),
+            ConnectionCeiling::from_arg(std::num::NonZeroUsize::new(100)),
+            std::num::NonZeroUsize::new(100).unwrap(),
+        );
+        assert_eq!(
+            notice.as_deref(),
+            Some(
+                "Requested --max-open-files=200, but --max-connections=100 reduced remote data streams to 100"
+            )
         );
     }
 }

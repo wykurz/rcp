@@ -146,6 +146,80 @@ fn direct_rcpd_automatic_capacity_failure_uses_stderr_startup_record() {
     );
 }
 
+#[test]
+fn direct_rcpd_histogram_target_failure_uses_stderr_startup_record() {
+    let target = tempfile::tempdir().unwrap();
+    let target_arg = format!("--auto-meta-histogram-log={}", target.path().display());
+    let output = rcpd()
+        .args(["--role=source", "--no-encryption", &target_arg])
+        .output()
+        .expect("rcpd histogram target refusal must complete");
+    assert!(
+        !output.status.success(),
+        "invalid histogram target must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("RCP_ERROR "),
+        "startup refusal must own the first stderr record: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("is a directory; expected a file path"),
+        "startup record must retain the histogram target cause: {stderr:?}"
+    );
+}
+
+fn assert_direct_rcpd_tracing_target_failure(options: &[&str], expected_cause: &str) {
+    let output = rcpd()
+        .args(["--role=source", "--no-encryption"])
+        .args(options)
+        .output()
+        .expect("rcpd tracing target refusal must complete");
+    assert!(!output.status.success(), "invalid tracing target must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("RCP_ERROR "),
+        "startup refusal must own the first stderr record: {stderr:?}"
+    );
+    assert!(
+        stderr.contains(expected_cause),
+        "startup record must retain the tracing target cause: {stderr:?}"
+    );
+}
+
+#[test]
+fn direct_rcpd_debug_log_target_failure_uses_stderr_startup_record() {
+    let target = tempfile::tempdir().unwrap();
+    let prefix = target.path().join("missing").join("rcpd-log");
+    assert_direct_rcpd_tracing_target_failure(
+        &[&format!("--debug-log-prefix={}", prefix.display())],
+        "failed to create debug log file",
+    );
+}
+
+#[test]
+fn direct_rcpd_chrome_trace_target_failure_uses_stderr_startup_record() {
+    let target = tempfile::tempdir().unwrap();
+    let prefix = target.path().join("missing").join("trace");
+    assert_direct_rcpd_tracing_target_failure(
+        &[&format!("--chrome-trace={}", prefix.display())],
+        "failed to create Chrome trace file",
+    );
+}
+
+#[test]
+fn direct_rcpd_invalid_profile_level_uses_stderr_startup_record() {
+    let target = tempfile::tempdir().unwrap();
+    let prefix = target.path().join("trace");
+    assert_direct_rcpd_tracing_target_failure(
+        &[
+            &format!("--chrome-trace={}", prefix.display()),
+            "--profile-level=invalid",
+        ],
+        "Invalid --profile-level 'invalid'",
+    );
+}
+
 fn assert_direct_rcpd_readiness_first(extra: &[String]) -> std::process::Output {
     use std::io::BufRead;
 

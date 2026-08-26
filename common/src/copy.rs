@@ -6599,11 +6599,10 @@ mod copy_tests {
                     .await?;
                 }
             }
-            // Saturate the OpenFile pool: if rm shared this pool, every
-            // outer copy task would hold its single permit and the inner rm
-            // recursion would block forever.
+            // saturate the OpenFile pool: if rm shared it, the outer copy tasks would hold every
+            // permit and their inner rm recursions would block forever.
             let admission = testutils::AdmissionLimit::new().await;
-            admission.set_files_in_flight(1);
+            admission.set_files_in_flight(2);
             let summary = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(30),

@@ -596,6 +596,31 @@ fn render_panel_from_registry() -> String {
     histogram_panel::render_histogram_panel(&units)
 }
 
+/// Format one pre-tracing diagnostic, optionally as a machine-readable startup record.
+#[must_use]
+pub fn format_startup_diagnostic(prefix: Option<&str>, diagnostic: &str) -> String {
+    let one_line = diagnostic
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{}{one_line}", prefix.unwrap_or_default())
+}
+
+fn print_startup_configuration_error(
+    startup_error_prefix: Option<&str>,
+    error: &impl std::fmt::Display,
+) {
+    eprintln!(
+        "{}",
+        format_startup_diagnostic(
+            startup_error_prefix,
+            &format!("Configuration error: {error:#}"),
+        )
+    );
+}
+
 #[instrument(skip(func))] // "func" is not Debug printable
 pub fn run<Fut, Summary, Error>(
     progress: Option<ProgressSettings>,
@@ -615,31 +640,45 @@ where
     // (for remote master operations, PROGRESS is otherwise only accessed at the end in
     // print_runtime_stats(), leading to near-zero walltime)
     let _ = get_progress();
-    if let Err(e) = throttle_config.validate() {
-        eprintln!("Configuration error: {e}");
-        return None;
-    }
     let OutputConfig {
         quiet,
         verbose,
         print_summary,
         suppress_runtime_stats,
+        startup_error_prefix,
     } = output;
+    if let Err(error) = throttle_config.validate() {
+        print_startup_configuration_error(startup_error_prefix, &error);
+        return None;
+    }
     // tracing guards must outlive the runtime so chrome/flame traces flush
     // extract trace_identifier before install_tracing_subscriber consumes tracing_config
     let trace_identifier = tracing_config.trace_identifier.clone();
-    if let Err(e) =
+    if let Err(error) =
         runtime_setup::validate_histogram_log_target(&throttle_config, &trace_identifier)
     {
-        eprintln!("Configuration error: {e}");
+        print_startup_configuration_error(startup_error_prefix, &error);
         return None;
     }
-    let _tracing_guards = runtime_setup::install_tracing_subscriber(quiet, verbose, tracing_config);
+    let _tracing_guards =
+        match runtime_setup::install_tracing_subscriber(quiet, verbose, tracing_config) {
+            Ok(guards) => guards,
+            Err(error) => {
+                print_startup_configuration_error(startup_error_prefix, &error);
+                return None;
+            }
+        };
     if let Some(warning) = throttle_config.deprecated_max_open_files_warning() {
         tracing::warn!(target: NOTICE_TARGET, "{warning}");
     }
     let res = {
-        let runtime = runtime_setup::build_tokio_runtime(&runtime_config, &throttle_config);
+        let runtime = match runtime_setup::build_tokio_runtime(&runtime_config, &throttle_config) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                print_startup_configuration_error(startup_error_prefix, &error);
+                return None;
+            }
+        };
         runtime_setup::spawn_throttle_replenishers(&runtime, &throttle_config, &trace_identifier);
         let res = {
             let _progress_tracker = progress.map(|settings| {

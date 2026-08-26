@@ -122,9 +122,89 @@ compile_error!("tokio_unstable cfg must be enabled; see .cargo/config.toml");
 use anyhow::{Context, anyhow};
 use tracing::instrument;
 
-const REMOTE_RCPD_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const DEFAULT_REMOTE_RCPD_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const FAILED_RCPD_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const RCPD_OUTPUT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 const PREPARATION_OWNED_WORK_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+const SSH_MASTER_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+const DIAGNOSTIC_CAPTURE_LIMIT: usize = 64 * 1024;
+
+#[derive(Default)]
+pub(crate) struct CapturedOutput {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) truncated: bool,
+    pub(crate) read_error: Option<std::io::Error>,
+}
+
+impl CapturedOutput {
+    pub(crate) fn rendered(&self) -> String {
+        let body = String::from_utf8_lossy(&self.bytes);
+        let truncation = self.truncated.then(|| {
+            format!(
+                "[output truncated to the last {} bytes]\n",
+                self.bytes.len()
+            )
+        });
+        let read_error = self
+            .read_error
+            .as_ref()
+            .map(|error| format!("\n[output read failed: {error:#}]"));
+        format!(
+            "{}{}{}",
+            truncation.as_deref().unwrap_or_default(),
+            body,
+            read_error.as_deref().unwrap_or_default()
+        )
+    }
+}
+
+fn retain_bounded_tail(output: &mut Vec<u8>, input: &[u8], limit: usize) -> bool {
+    if input.is_empty() {
+        return false;
+    }
+    if limit == 0 {
+        return true;
+    }
+    if input.len() >= limit {
+        let truncated = !output.is_empty() || input.len() > limit;
+        output.clear();
+        output.extend_from_slice(&input[input.len() - limit..]);
+        return truncated;
+    }
+    let overflow = output
+        .len()
+        .saturating_add(input.len())
+        .saturating_sub(limit);
+    if overflow > 0 {
+        output.drain(..overflow);
+    }
+    output.extend_from_slice(input);
+    overflow > 0
+}
+
+pub(crate) async fn drain_bounded_output<R>(mut reader: R, limit: usize) -> CapturedOutput
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut output = CapturedOutput::default();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(bytes_read) => {
+                output.truncated |=
+                    retain_bounded_tail(&mut output.bytes, &chunk[..bytes_read], limit);
+            }
+            Err(error) => {
+                output.read_error = Some(error);
+                break;
+            }
+        }
+    }
+    output
+}
 
 /// Prefix for an intentional daemon refusal in place of a readiness record.
 pub const RCPD_STARTUP_ERROR_PREFIX: &str = "RCP_ERROR ";
@@ -146,39 +226,147 @@ pub(crate) struct PreparationContext {
     cancellation: tokio_util::sync::CancellationToken,
 }
 
-/// Owns a just-established session until preparation either commits it or abandons it.
-///
-/// `openssh::Session::drop` synchronously invokes `ssh -O exit`; running that destructor on a
-/// cancelled preparation future would put an unbounded subprocess wait back on the coordinator's
-/// Tokio worker. Error paths therefore hand the last reference to the blocking pool.
-struct PreparingSshSession {
-    session: Option<std::sync::Arc<openssh::Session>>,
+/// Moves a potentially blocking destructor onto an executor independent of Tokio.
+struct DeferredDrop<T: Send + 'static> {
+    value: Option<T>,
+    thread_name: &'static str,
 }
 
-impl PreparingSshSession {
-    fn new(session: std::sync::Arc<openssh::Session>) -> Self {
+impl<T: Send + 'static> DeferredDrop<T> {
+    fn new(value: T, thread_name: &'static str) -> Self {
         Self {
-            session: Some(session),
+            value: Some(value),
+            thread_name,
         }
-    }
-
-    fn session(&self) -> &std::sync::Arc<openssh::Session> {
-        self.session
-            .as_ref()
-            .expect("preparation session is present")
-    }
-
-    fn into_inner(mut self) -> std::sync::Arc<openssh::Session> {
-        self.session.take().expect("preparation session is present")
     }
 }
 
-impl Drop for PreparingSshSession {
+impl<T: Send + 'static> Drop for DeferredDrop<T> {
     fn drop(&mut self) {
-        if let Some(session) = self.session.take() {
-            tokio::task::spawn_blocking(move || drop(session));
+        let Some(value) = self.value.take() else {
+            return;
+        };
+        // Keep a recoverable copy of the ownership slot until thread creation succeeds. If the OS
+        // cannot create a cleanup thread, leaking is safer than running an unbounded destructor on
+        // a Tokio worker or panicking from Drop.
+        let value = std::sync::Arc::new(std::sync::Mutex::new(Some(value)));
+        let worker_value = value.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name(self.thread_name.to_string())
+            .spawn(move || {
+                drop(
+                    worker_value
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take(),
+                );
+            })
+        {
+            tracing::error!("failed to start deferred cleanup thread: {error:#}");
+            let leaked = value
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            std::mem::forget(leaked);
         }
     }
+}
+
+struct SshMasterReaper {
+    launcher: Option<tokio::process::Child>,
+    control_path: Option<Box<std::path::Path>>,
+}
+
+impl Drop for SshMasterReaper {
+    fn drop(&mut self) {
+        if let Some(launcher) = self.launcher.as_mut() {
+            let deadline = std::time::Instant::now() + SSH_MASTER_REAP_GRACE;
+            loop {
+                match launcher.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+        if let Some(control_path) = self.control_path.as_deref()
+            && let Some(control_dir) = control_path.parent()
+        {
+            let _ = std::fs::remove_dir_all(control_dir);
+        }
+    }
+}
+
+struct ManagedSshSessionInner {
+    session: Option<openssh::Session>,
+    launcher: Option<tokio::process::Child>,
+}
+
+impl Drop for ManagedSshSessionInner {
+    fn drop(&mut self) {
+        // Detaching suppresses openssh's synchronous `ssh -O exit` destructor. Signal the actual
+        // retained master before returning from Drop so process exit cannot outrun cleanup; only
+        // bounded reaping and directory removal are deferred off the Tokio worker.
+        let control_path = self
+            .session
+            .take()
+            .map(openssh::Session::detach)
+            .map(|(control_path, _log_path)| control_path);
+        if let Some(launcher) = self.launcher.as_mut()
+            && let Err(error) = launcher.start_kill()
+        {
+            tracing::debug!("failed to terminate SSH multiplex master: {error:#}");
+        }
+        let reaper = SshMasterReaper {
+            launcher: self.launcher.take(),
+            control_path,
+        };
+        drop(DeferredDrop::new(reaper, "rcp-ssh-cleanup"));
+    }
+}
+
+/// Cloneable session ownership whose final drop cannot block or depend on Tokio still running.
+#[derive(Clone)]
+pub(crate) struct ManagedSshSession(std::sync::Arc<ManagedSshSessionInner>);
+
+impl std::fmt::Debug for ManagedSshSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedSshSession")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedSshSession {
+    fn new(session: openssh::Session, launcher: tokio::process::Child) -> Self {
+        Self(std::sync::Arc::new(ManagedSshSessionInner {
+            session: Some(session),
+            launcher: Some(launcher),
+        }))
+    }
+}
+
+impl std::ops::Deref for ManagedSshSession {
+    type Target = openssh::Session;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .session
+            .as_ref()
+            .expect("managed SSH session is present before final drop")
+    }
+}
+
+pub(crate) trait SshSessionOwner:
+    Clone + std::ops::Deref<Target = openssh::Session> + Send + Sync + 'static
+{
+}
+
+impl<T> SshSessionOwner for T where
+    T: Clone + std::ops::Deref<Target = openssh::Session> + Send + Sync + 'static
+{
 }
 
 impl PreparationContext {
@@ -241,9 +429,37 @@ impl PreparationContext {
         }
     }
 
+    /// Await owned work whose in-progress process is safe and necessary to abort on cancellation.
+    async fn run_abortable<T>(
+        &self,
+        mut task: tokio::task::JoinHandle<anyhow::Result<T>>,
+        operation: &'static str,
+    ) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+    {
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => {
+                task.abort();
+                match task.await {
+                    Err(error) if error.is_cancelled() => {
+                        tracing::debug!("aborted {operation} after peer cancellation");
+                    }
+                    Ok(Ok(_)) => tracing::debug!("{operation} completed as cancellation arrived"),
+                    Ok(Err(error)) => tracing::debug!("{operation} failed as cancellation arrived: {error:#}"),
+                    Err(error) => tracing::debug!("{operation} owner task failed during cancellation: {error:#}"),
+                }
+                Err(Self::cancellation_error())
+            }
+            result = &mut task => result
+                .with_context(|| format!("{operation} owner task failed"))?,
+        }
+    }
+
     /// Run a remote command in an owned task so cancellation cannot orphan its local SSH child.
-    fn remote_output_task(
-        mut command: openssh::OwningCommand<std::sync::Arc<openssh::Session>>,
+    fn remote_output_task<S: SshSessionOwner>(
+        mut command: openssh::OwningCommand<S>,
         operation: String,
     ) -> tokio::task::JoinHandle<anyhow::Result<std::process::Output>> {
         tokio::spawn(async move {
@@ -254,9 +470,9 @@ impl PreparationContext {
         })
     }
 
-    async fn remote_output(
+    async fn remote_output<S: SshSessionOwner>(
         &self,
-        command: openssh::OwningCommand<std::sync::Arc<openssh::Session>>,
+        command: openssh::OwningCommand<S>,
         operation: &'static str,
     ) -> anyhow::Result<std::process::Output> {
         let task = Self::remote_output_task(command, operation.to_string());
@@ -269,9 +485,9 @@ impl PreparationContext {
     /// On deadline the local SSH channel is explicitly aborted. The remote command may outlive
     /// that channel, which is why this is reserved for probes whose hard deadline is itself part
     /// of the protocol contract, never for staging ownership.
-    async fn remote_output_with_deadline(
+    async fn remote_output_with_deadline<S: SshSessionOwner>(
         &self,
-        command: openssh::OwningCommand<std::sync::Arc<openssh::Session>>,
+        command: openssh::OwningCommand<S>,
         operation: &str,
         deadline: std::time::Duration,
     ) -> anyhow::Result<std::process::Output> {
@@ -290,7 +506,10 @@ impl PreparationContext {
                 Err(elapsed) => {
                     task.abort();
                     Err(elapsed).with_context(|| {
-                        format!("{operation} within {}", humantime::format_duration(deadline))
+                        format!(
+                            "{operation} timed out after {}",
+                            humantime::format_duration(deadline)
+                        )
                     })
                 }
             },
@@ -377,16 +596,15 @@ pub struct TcpConfig {
     pub network_profile: NetworkProfile,
     /// Buffer size for file transfers (defaults to profile-specific value)
     pub buffer_size: Option<usize>,
-    /// Maximum concurrent connections in the pool
-    pub max_connections: usize,
-    /// Multiplier for pending file writes (max pending = max_connections × multiplier)
-    pub pending_writes_multiplier: usize,
     /// Liveness budget for every rcp TCP connection (seconds), 0 disables it.
     /// See [`configure_tcp_socket`].
     pub keepalive_sec: u64,
 }
 
-/// Default multiplier for pending writes (4× max_connections)
+/// Default ceiling for concurrent remote data connections.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 100;
+
+/// Default multiplier for pending writes (4× max_connections).
 pub const DEFAULT_PENDING_WRITES_MULTIPLIER: usize = 4;
 
 /// Default liveness budget for an rcp TCP connection (seconds).
@@ -474,8 +692,6 @@ impl Default for TcpConfig {
             conn_timeout_sec: 15,
             network_profile: NetworkProfile::default(),
             buffer_size: None,
-            max_connections: 100,
-            pending_writes_multiplier: DEFAULT_PENDING_WRITES_MULTIPLIER,
             keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
         }
     }
@@ -504,16 +720,6 @@ impl TcpConfig {
         self.buffer_size = Some(size);
         self
     }
-    /// Set maximum concurrent connections
-    pub fn with_max_connections(mut self, max: usize) -> Self {
-        self.max_connections = max;
-        self
-    }
-    /// Set pending writes multiplier
-    pub fn with_pending_writes_multiplier(mut self, multiplier: usize) -> Self {
-        self.pending_writes_multiplier = multiplier;
-        self
-    }
     /// Set the connection liveness budget (0 disables it)
     pub fn with_keepalive_sec(mut self, keepalive_sec: u64) -> Self {
         self.keepalive_sec = keepalive_sec;
@@ -523,20 +729,6 @@ impl TcpConfig {
     pub fn effective_buffer_size(&self) -> usize {
         self.buffer_size
             .unwrap_or_else(|| self.network_profile.default_remote_copy_buffer_size())
-    }
-    /// Return the pending-file task capacity after validating its raw public fields.
-    pub fn max_pending_files(&self) -> anyhow::Result<usize> {
-        let max_connections = std::num::NonZeroUsize::new(self.max_connections)
-            .context("max connections must be nonzero")?;
-        let multiplier = std::num::NonZeroUsize::new(self.pending_writes_multiplier)
-            .context("pending writes multiplier must be nonzero")?;
-        Ok(resolve_remote_concurrency(
-            common::ConcurrencyLimit::Unlimited,
-            max_connections,
-            multiplier,
-        )?
-        .max_pending_files()
-        .get())
     }
 }
 
@@ -563,32 +755,93 @@ pub use common::is_localhost;
 async fn setup_ssh_session(
     session: &SshSession,
     preparation: &PreparationContext,
-) -> anyhow::Result<PreparingSshSession> {
-    let host = session.host.as_str();
-    let destination = match (session.user.as_deref(), session.port) {
-        (Some(user), Some(port)) => format!("ssh://{user}@{host}:{port}"),
-        (None, Some(port)) => format!("ssh://{}:{}", session.host, port),
-        (Some(user), None) => format!("ssh://{user}@{host}"),
-        (None, None) => format!("ssh://{host}"),
-    };
-    tracing::debug!("Connecting to SSH destination: {}", destination);
-    let mut builder = openssh::SessionBuilder::default();
-    builder.known_hosts_check(openssh::KnownHosts::Accept);
-    if let Some(dir) = ssh_control_directory() {
-        tracing::debug!("Using SSH control directory: {}", dir.display());
-        builder.control_directory(dir);
-    }
+) -> anyhow::Result<ManagedSshSession> {
+    setup_ssh_session_with_program(session, preparation, std::path::Path::new("ssh")).await
+}
+
+async fn setup_ssh_session_with_program(
+    session: &SshSession,
+    preparation: &PreparationContext,
+    ssh_program: &std::path::Path,
+) -> anyhow::Result<ManagedSshSession> {
+    let session = session.clone();
+    let control_dir = ssh_control_directory().context("no usable SSH control directory found")?;
+    let ssh_program = ssh_program.to_path_buf();
     let connect = tokio::spawn(async move {
-        Ok(PreparingSshSession::new(std::sync::Arc::new(
-            builder
-                .connect(destination)
-                .await
-                .context("Failed to establish SSH connection")?,
-        )))
+        launch_ssh_master(&session, &control_dir, &ssh_program)
+            .await
+            .context("Failed to establish SSH connection")
     });
     preparation
-        .run_owned(connect, PREPARATION_OWNED_WORK_GRACE, "SSH session setup")
+        .run_abortable(connect, "SSH session setup")
         .await
+}
+
+/// Launch and retain the foreground OpenSSH multiplex master.
+async fn launch_ssh_master(
+    session: &SshSession,
+    control_dir: &std::path::Path,
+    ssh_program: &std::path::Path,
+) -> anyhow::Result<ManagedSshSession> {
+    tracing::debug!("Connecting to SSH destination: {}", session.host);
+    let mut temp = tempfile::Builder::new();
+    temp.prefix(".ssh-connection");
+    tracing::debug!("Using SSH control directory: {}", control_dir.display());
+    let directory = temp
+        .tempdir_in(control_dir)
+        .context("failed to create SSH control directory")?;
+    let log = directory.path().join("log");
+    let mut launcher = tokio::process::Command::new(ssh_program);
+    launcher
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .arg("-E")
+        .arg(&log)
+        .arg("-S")
+        .arg(directory.path().join("master"))
+        .arg("-M")
+        .arg("-N")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("ForkAfterAuthentication=no")
+        .arg("-o")
+        .arg("ControlPersist=no");
+    if let Some(port) = session.port {
+        launcher.arg("-p").arg(port.to_string());
+    }
+    if let Some(user) = session.user.as_deref() {
+        launcher.arg("-l").arg(user);
+    }
+    let mut launcher = launcher
+        .arg(&session.host)
+        .spawn()
+        .context("failed to launch SSH multiplex master")?;
+    let control_path = directory.path().join("master");
+    loop {
+        if let Some(status) = launcher
+            .try_wait()
+            .context("failed to inspect SSH multiplex master")?
+        {
+            let diagnostic = std::fs::read_to_string(&log).unwrap_or_default();
+            anyhow::bail!(
+                "SSH multiplex master exited with {status}: {}",
+                diagnostic.trim()
+            );
+        }
+        if control_path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    Ok(ManagedSshSession::new(
+        openssh::Session::new_process_mux(directory),
+        launcher,
+    ))
 }
 
 /// Where to put the SSH connection-multiplexing socket.
@@ -615,11 +868,11 @@ async fn setup_ssh_session(
 /// Falling through to 2 and 3 is the point rather than a nicety: the environments named above as
 /// motivation -- containers, CI runners, `su` sessions -- are exactly the ones that tend NOT to set
 /// `$XDG_RUNTIME_DIR`, so stopping at step 1 would have left the intended beneficiaries on the very
-/// `$HOME`-derived path this exists to avoid. The socket directory itself is created by `openssh`
-/// through `tempfile`, which makes it mode 0700, so a shared `/tmp` parent is still private.
+/// `$HOME`-derived path this exists to avoid. The launcher creates the socket directory through
+/// `tempfile`, which makes it mode 0700, so a shared `/tmp` parent is still private.
 ///
-/// Returns `None` only when nothing is usable, leaving the library's own default in place rather
-/// than forcing a location known to be broken.
+/// Returns `None` only when none of the candidates can safely hold a control socket; callers then
+/// fail before launching SSH rather than selecting a path known to be broken.
 fn ssh_control_directory() -> Option<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::with_capacity(3);
     if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -638,7 +891,7 @@ const SUN_PATH_MAX: usize = 108;
 
 /// What gets appended to the control directory before the socket finally exists:
 ///
-/// - `/.ssh-connectionXXXXXX` (22) -- the private dir `openssh` makes inside it via `tempfile`
+/// - `/.ssh-connectionXXXXXX` (22) -- the private dir our launcher makes via `tempfile`
 /// - `/master` (7) -- the `ControlPath` itself
 /// - `.XXXXXXXXXXXXXXXX` (17) -- the temporary name ssh(1) creates it under before renaming
 const CONTROL_PATH_SUFFIX: usize = 22 + 7 + 17;
@@ -688,43 +941,73 @@ pub async fn get_remote_home_for_session(
 ) -> anyhow::Result<std::path::PathBuf> {
     let preparation = PreparationContext::uncancelled();
     let ssh_session = setup_ssh_session(session, &preparation).await?;
-    let home = get_remote_home_with_context(ssh_session.session(), &preparation).await?;
+    let home = get_remote_home_with_context(&ssh_session, &preparation).await?;
     Ok(std::path::PathBuf::from(home))
 }
 
-#[instrument]
-pub async fn wait_for_rcpd_process(
-    process: openssh::Child<std::sync::Arc<openssh::Session>>,
-) -> anyhow::Result<()> {
-    tracing::info!("Waiting on rcpd server on: {:?}", process);
-    // wait for process to exit with a timeout and capture output
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        process.wait_with_output(),
-    )
-    .await
-    .context("Timeout waiting for rcpd process to exit")?
-    .context("Failed to wait for rcpd process")?;
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::error!(
-            "rcpd command failed on remote host, status code: {:?}\nstdout:\n{}\nstderr:\n{}",
-            output.status.code(),
-            stdout,
-            stderr
-        );
+#[instrument(skip(process))]
+pub async fn wait_for_rcpd_process(process: RcpdProcess) -> anyhow::Result<()> {
+    let RcpdProcess {
+        child,
+        conn_info: _,
+        stderr_drain,
+        stdout_drain,
+    } = process;
+    tracing::info!("Waiting on rcpd server on: {:?}", child);
+    // Closing the child's stdin is the daemon watchdog signal. Always join the output collectors,
+    // even when waiting fails, so teardown neither detaches tasks nor loses bounded diagnostics.
+    let wait = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
+    let (stderr, stdout) = tokio::join!(
+        finish_rcpd_output_drain(stderr_drain, "stderr"),
+        finish_optional_rcpd_output_drain(stdout_drain, "stdout"),
+    );
+    let status = wait
+        .context("Timeout waiting for rcpd process to exit")?
+        .context("Failed to wait for rcpd process")?;
+    if !status.success() {
         return Err(anyhow!(
-            "rcpd command failed on remote host, status code: {:?}",
-            output.status.code(),
+            "rcpd command failed on remote host, status code: {:?}\nstdout:\n{}\nstderr:\n{}",
+            status.code(),
+            stdout.rendered(),
+            stderr.rendered()
         ));
     }
-    // log stderr even on success if there's any output (might contain warnings)
-    if !output.stderr.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::debug!("rcpd stderr output:\n{}", stderr);
+    for (stream, output) in [("stdout", stdout), ("stderr", stderr)] {
+        if !output.bytes.is_empty() || output.truncated || output.read_error.is_some() {
+            // rcp-error-log-allow: output is already-rendered remote output, not an error chain
+            tracing::debug!("rcpd {stream} output:\n{}", output.rendered());
+        }
     }
     Ok(())
+}
+
+async fn finish_rcpd_output_drain(
+    mut task: tokio::task::JoinHandle<CapturedOutput>,
+    stream: &'static str,
+) -> CapturedOutput {
+    match tokio::time::timeout(RCPD_OUTPUT_DRAIN_GRACE, &mut task).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            tracing::debug!("rcpd {stream} collector task failed: {error:#}");
+            CapturedOutput::default()
+        }
+        Err(_) => {
+            tracing::debug!("rcpd {stream} collector did not finish during drain grace");
+            task.abort();
+            let _ = task.await;
+            CapturedOutput::default()
+        }
+    }
+}
+
+async fn finish_optional_rcpd_output_drain(
+    task: Option<tokio::task::JoinHandle<CapturedOutput>>,
+    stream: &'static str,
+) -> CapturedOutput {
+    match task {
+        Some(task) => finish_rcpd_output_drain(task, stream).await,
+        None => CapturedOutput::default(),
+    }
 }
 
 /// Escape a string for safe use in POSIX shell single quotes
@@ -755,8 +1038,8 @@ pub async fn get_remote_home(session: &std::sync::Arc<openssh::Session>) -> anyh
     get_remote_home_with_context(session, &PreparationContext::uncancelled()).await
 }
 
-async fn get_remote_home_with_context(
-    session: &std::sync::Arc<openssh::Session>,
+async fn get_remote_home_with_context<S: SshSessionOwner>(
+    session: &S,
     preparation: &PreparationContext,
 ) -> anyhow::Result<String> {
     if let Ok(home_override) = std::env::var("RCP_REMOTE_HOME_OVERRIDE")
@@ -764,7 +1047,7 @@ async fn get_remote_home_with_context(
     {
         return Ok(home_override);
     }
-    let mut command = session.clone().arc_command("sh");
+    let mut command = openssh::Session::to_command(session.clone(), "sh");
     command.arg("-c").arg("echo \"${HOME:?HOME not set}\"");
     let output = preparation
         .remote_output(command, "remote HOME lookup")
@@ -851,19 +1134,19 @@ trait DiscoverySession {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>;
 }
 
-struct RealDiscoverySession<'a> {
-    session: &'a std::sync::Arc<openssh::Session>,
+struct RealDiscoverySession<'a, S> {
+    session: &'a S,
     preparation: &'a PreparationContext,
 }
 
-impl<'a> DiscoverySession for RealDiscoverySession<'a> {
+impl<S: SshSessionOwner> DiscoverySession for RealDiscoverySession<'_, S> {
     fn test_executable<'b>(
         &'b self,
         path: &'b str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'b>>
     {
         Box::pin(async move {
-            let mut command = self.session.clone().arc_command("sh");
+            let mut command = openssh::Session::to_command(self.session.clone(), "sh");
             command
                 .arg("-c")
                 .arg(format!("test -x {}", shell_escape(path)));
@@ -881,7 +1164,7 @@ impl<'a> DiscoverySession for RealDiscoverySession<'a> {
         Box<dyn std::future::Future<Output = anyhow::Result<Option<String>>> + Send + 'b>,
     > {
         Box::pin(async move {
-            let mut command = self.session.clone().arc_command("which");
+            let mut command = openssh::Session::to_command(self.session.clone(), "which");
             command.arg(binary);
             let output = self
                 .preparation
@@ -916,8 +1199,8 @@ impl<'a> DiscoverySession for RealDiscoverySession<'a> {
 /// only be used as a fallback after checking user-installed locations.
 ///
 /// Returns the path to rcpd if found, otherwise an error
-async fn discover_rcpd_path(
-    session: &std::sync::Arc<openssh::Session>,
+async fn discover_rcpd_path<S: SshSessionOwner>(
+    session: &S,
     explicit_path: Option<&str>,
     preparation: &PreparationContext,
 ) -> anyhow::Result<String> {
@@ -1021,39 +1304,47 @@ async fn discover_rcpd_path_internal<S: DiscoverySession + ?Sized>(
 ///
 /// Combines discovery and version checking into one function for cleaner error handling.
 /// Returns the path to a compatible rcpd if found, or an error describing the problem.
-async fn try_discover_and_check_version(
-    session: &std::sync::Arc<openssh::Session>,
+async fn try_discover_and_check_version<S: SshSessionOwner>(
+    session: &S,
     explicit_path: Option<&str>,
     remote_host: &str,
     preparation: &PreparationContext,
+    version_probe_timeout: std::time::Duration,
 ) -> anyhow::Result<String> {
     // discover rcpd binary on remote host
     let rcpd_path = discover_rcpd_path(session, explicit_path, preparation).await?;
     // check version compatibility
-    check_rcpd_version(session, &rcpd_path, remote_host, preparation).await?;
+    check_rcpd_version(
+        session,
+        &rcpd_path,
+        remote_host,
+        preparation,
+        version_probe_timeout,
+    )
+    .await?;
     Ok(rcpd_path)
 }
 
 /// Check version compatibility between local rcp and remote rcpd
 ///
 /// Returns Ok if versions are compatible, Err with detailed message if not
-async fn check_rcpd_version(
-    session: &std::sync::Arc<openssh::Session>,
+async fn check_rcpd_version<S: SshSessionOwner>(
+    session: &S,
     rcpd_path: &str,
     remote_host: &str,
     preparation: &PreparationContext,
+    version_probe_timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     let local_version = common::version::ProtocolVersion::current();
 
     tracing::debug!("Checking rcpd version on remote host: {}", remote_host);
 
     // run rcpd --protocol-version on remote (call binary directly, no shell)
-    let mut command = session.clone().arc_command(rcpd_path.to_string());
+    let mut command = openssh::Session::to_command(session.clone(), rcpd_path.to_string());
     command.arg("--protocol-version");
-    let operation =
-        format!("rcpd on remote host '{remote_host}' did not complete --protocol-version");
+    let operation = format!("rcpd --protocol-version probe on remote host '{remote_host}'");
     let output = preparation
-        .remote_output_with_deadline(command, &operation, REMOTE_RCPD_VERSION_TIMEOUT)
+        .remote_output_with_deadline(command, &operation, version_probe_timeout)
         .await?;
 
     if !output.status.success() {
@@ -1106,26 +1397,6 @@ async fn check_rcpd_version(
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-async fn run_remote_version_probe<F>(
-    remote_host: &str,
-    probe: F,
-    probe_timeout: std::time::Duration,
-) -> anyhow::Result<std::process::Output>
-where
-    F: std::future::Future<Output = anyhow::Result<std::process::Output>>,
-{
-    match tokio::time::timeout(probe_timeout, probe).await {
-        Ok(output) => output,
-        Err(elapsed) => Err(elapsed).with_context(|| {
-            format!(
-                "rcpd on remote host '{remote_host}' did not complete --protocol-version within {}",
-                humantime::format_duration(probe_timeout)
-            )
-        }),
-    }
 }
 
 /// Connection info received from rcpd after it starts listening.
@@ -1249,18 +1520,18 @@ fn parse_rcpd_startup_record(line: &str) -> anyhow::Result<RcpdConnectionInfo> {
 /// Result of starting an rcpd process.
 pub struct RcpdProcess {
     /// SSH child process handle
-    pub child: openssh::Child<std::sync::Arc<openssh::Session>>,
+    child: openssh::Child<ManagedSshSession>,
     /// Connection info (address and optional fingerprint)
     pub conn_info: RcpdConnectionInfo,
-    /// Handle for stderr drain task (keeps pipe alive and captures diagnostics)
-    _stderr_drain: tokio::task::JoinHandle<()>,
-    /// Handle for stdout drain task (keeps pipe alive and captures diagnostics)
-    _stdout_drain: Option<tokio::task::JoinHandle<()>>,
+    /// Handle for the bounded stderr collector.
+    stderr_drain: tokio::task::JoinHandle<CapturedOutput>,
+    /// Handle for the bounded stdout collector.
+    stdout_drain: Option<tokio::task::JoinHandle<CapturedOutput>>,
 }
 
 #[derive(Clone)]
 pub struct PreparedRcpd {
-    session: std::sync::Arc<openssh::Session>,
+    session: ManagedSshSession,
     rcpd_path: String,
     remote: SshSession,
 }
@@ -1286,13 +1557,44 @@ pub async fn prepare_rcpd_endpoints(
     explicit_rcpd_path: Option<&str>,
     auto_deploy_rcpd: bool,
 ) -> anyhow::Result<(PreparedRcpd, PreparedRcpd)> {
+    prepare_rcpd_endpoints_with_probe_timeout(
+        source,
+        destination,
+        explicit_rcpd_path,
+        auto_deploy_rcpd,
+        DEFAULT_REMOTE_RCPD_VERSION_TIMEOUT,
+    )
+    .await
+}
+
+/// Prepare two endpoints with a caller-selected remote version-probe timeout.
+pub async fn prepare_rcpd_endpoints_with_probe_timeout(
+    source: &SshSession,
+    destination: &SshSession,
+    explicit_rcpd_path: Option<&str>,
+    auto_deploy_rcpd: bool,
+    version_probe_timeout: std::time::Duration,
+) -> anyhow::Result<(PreparedRcpd, PreparedRcpd)> {
     if source == destination {
-        let prepared = prepare_rcpd(source, explicit_rcpd_path, auto_deploy_rcpd).await?;
+        let prepared = prepare_rcpd_with_context(
+            source,
+            explicit_rcpd_path,
+            auto_deploy_rcpd,
+            PreparationContext::uncancelled(),
+            version_probe_timeout,
+        )
+        .await?;
         return Ok((prepared.clone(), prepared));
     }
     join_remote_preparations(
         |preparation| {
-            prepare_rcpd_with_context(source, explicit_rcpd_path, auto_deploy_rcpd, preparation)
+            prepare_rcpd_with_context(
+                source,
+                explicit_rcpd_path,
+                auto_deploy_rcpd,
+                preparation,
+                version_probe_timeout,
+            )
         },
         |preparation| {
             prepare_rcpd_with_context(
@@ -1300,6 +1602,7 @@ pub async fn prepare_rcpd_endpoints(
                 explicit_rcpd_path,
                 auto_deploy_rcpd,
                 preparation,
+                version_probe_timeout,
             )
         },
     )
@@ -1337,8 +1640,8 @@ where
     ) -> Option<anyhow::Error> {
         match result {
             Ok(value) => {
-                // a prepared endpoint can own the last openssh Session reference, whose Drop
-                // synchronously waits for `ssh -O exit`; keep that destructor off the coordinator
+                // successful preparation values are generic and may own blocking destructors; keep
+                // their disposal off the endpoint coordinator
                 tokio::task::spawn_blocking(move || drop(value));
                 None
             }
@@ -1418,6 +1721,7 @@ pub async fn prepare_rcpd_with_cancellation(
         explicit_rcpd_path,
         auto_deploy_rcpd,
         PreparationContext::new(cancellation),
+        DEFAULT_REMOTE_RCPD_VERSION_TIMEOUT,
     )
     .await
 }
@@ -1428,15 +1732,17 @@ async fn prepare_rcpd_with_context(
     explicit_rcpd_path: Option<&str>,
     auto_deploy_rcpd: bool,
     preparation: PreparationContext,
+    version_probe_timeout: std::time::Duration,
 ) -> anyhow::Result<PreparedRcpd> {
     tracing::info!("Preparing rcpd server on: {:?}", session);
     let remote_host = &session.host;
     let ssh_session = setup_ssh_session(session, &preparation).await?;
     let rcpd_path = match try_discover_and_check_version(
-        ssh_session.session(),
+        &ssh_session,
         explicit_rcpd_path,
         remote_host,
         &preparation,
+        version_probe_timeout,
     )
     .await
     {
@@ -1453,7 +1759,7 @@ async fn prepare_rcpd_with_context(
             tracing::info!("Found local rcpd binary at {}", local_rcpd.display());
             let local_version = common::version::ProtocolVersion::current();
             let deployed_path = deploy::deploy_rcpd_with_context(
-                ssh_session.session(),
+                &ssh_session,
                 &local_rcpd,
                 &local_version.cache_tag(),
                 remote_host,
@@ -1462,19 +1768,18 @@ async fn prepare_rcpd_with_context(
             .await
             .context("failed to deploy rcpd to remote host")?;
             check_rcpd_version(
-                ssh_session.session(),
+                &ssh_session,
                 &deployed_path,
                 remote_host,
                 &preparation,
+                version_probe_timeout,
             )
             .await
             .with_context(|| {
                 format!("deployed rcpd at {deployed_path} failed compatibility verification")
             })?;
             tracing::info!("Successfully deployed rcpd to {deployed_path}");
-            match deploy::cleanup_old_versions_with_context(ssh_session.session(), 3, &preparation)
-                .await
-            {
+            match deploy::cleanup_old_versions_with_context(&ssh_session, 3, &preparation).await {
                 Ok(()) => {}
                 Err(_) if preparation.cancellation.is_cancelled() => {
                     return Err(PreparationContext::cancellation_error());
@@ -1488,7 +1793,7 @@ async fn prepare_rcpd_with_context(
     };
     preparation.ensure_active()?;
     Ok(PreparedRcpd {
-        session: ssh_session.into_inner(),
+        session: ssh_session,
         rcpd_path,
         remote: session.clone(),
     })
@@ -1504,10 +1809,18 @@ pub async fn start_rcpd(
     bind_ip: Option<&str>,
     role: protocol::RcpdRole,
 ) -> anyhow::Result<RcpdProcess> {
-    prepare_rcpd(session, explicit_rcpd_path, auto_deploy_rcpd)
-        .await?
-        .spawn(rcpd_config, bind_ip, role)
-        .await
+    let version_probe_timeout =
+        std::time::Duration::from_secs(rcpd_config.remote_copy_conn_timeout_sec);
+    prepare_rcpd_with_context(
+        session,
+        explicit_rcpd_path,
+        auto_deploy_rcpd,
+        PreparationContext::uncancelled(),
+        version_probe_timeout,
+    )
+    .await?
+    .spawn(rcpd_config, bind_ip, role)
+    .await
 }
 
 impl PreparedRcpd {
@@ -1524,7 +1837,7 @@ impl PreparedRcpd {
         // run rcpd command remotely
         let rcpd_args = rcpd_config.to_args();
         tracing::debug!("rcpd arguments: {:?}", rcpd_args);
-        let mut cmd = self.session.clone().arc_command(&self.rcpd_path);
+        let mut cmd = openssh::Session::to_command(self.session.clone(), &self.rcpd_path);
         cmd.arg("--role").arg(role.to_string()).args(rcpd_args);
         // add bind-ip if explicitly provided
         if let Some(ip) = bind_ip {
@@ -1542,9 +1855,13 @@ impl PreparedRcpd {
         // (rcpd uses stderr for the protocol line because stdout is reserved for logs per convention;
         // rcpd doesn't display progress bars locally - it sends progress data over the network)
         // format: "RCP_TLS <addr> <fingerprint> <F> <E>" or "RCP_TCP <addr> <F> <E>"
+        let Some(stderr) = child.stderr().take() else {
+            let error = anyhow::anyhow!("rcpd stderr not available");
+            let diagnostic = reap_failed_rcpd(child, &session.host, None).await;
+            return Err(attach_startup_diagnostic(error, diagnostic));
+        };
+        let mut stderr_reader = tokio::io::BufReader::new(stderr);
         let startup = async {
-            let stderr = child.stderr().take().context("rcpd stderr not available")?;
-            let mut stderr_reader = tokio::io::BufReader::new(stderr);
             let mut line = String::new();
             let bytes_read = stderr_reader
                 .read_line(&mut line)
@@ -1555,66 +1872,26 @@ impl PreparedRcpd {
             }
             let line = line.trim().to_string();
             tracing::debug!("rcpd connection line: {}", line);
-            let conn_info = parse_rcpd_startup_record(&line)?;
-            anyhow::Ok((conn_info, stderr_reader))
+            parse_rcpd_startup_record(&line)
         }
         .await;
-        let (conn_info, mut stderr_reader) = match startup {
-            Ok(startup) => startup,
+        let conn_info = match startup {
+            Ok(conn_info) => conn_info,
             Err(error) => {
-                reap_failed_rcpd(child, &session.host).await;
-                return Err(error);
+                let diagnostic = reap_failed_rcpd(child, &session.host, Some(stderr_reader)).await;
+                return Err(attach_startup_diagnostic(error, diagnostic));
             }
         };
-        // spawn background task to drain remaining stderr to prevent SIGPIPE and capture diagnostics
-        // we store the JoinHandle to keep the task alive for the lifetime of RcpdProcess
-        let host_stderr = session.host.clone();
-        let stderr_drain = tokio::spawn(async move {
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match stderr_reader.read_line(&mut line).await {
-                    Ok(0) => break, // EOF
-                    Ok(_) => {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() {
-                            tracing::debug!(host = %host_stderr, "rcpd stderr: {}", trimmed);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(host = %host_stderr, "rcpd stderr read error: {:#}", e);
-                        break;
-                    }
-                }
-            }
-        });
-        // spawn background task to drain stdout (rcpd logs go here)
-        // we store the JoinHandle to keep the task alive for the lifetime of RcpdProcess
-        let stdout_drain = if let Some(stdout) = child.stdout().take() {
-            let host_stdout = session.host.clone();
-            let mut stdout_reader = tokio::io::BufReader::new(stdout);
-            Some(tokio::spawn(async move {
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match stdout_reader.read_line(&mut line).await {
-                        Ok(0) => break, // EOF
-                        Ok(_) => {
-                            let trimmed = line.trim();
-                            if !trimmed.is_empty() {
-                                tracing::debug!(host = %host_stdout, "rcpd stdout: {}", trimmed);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!(host = %host_stdout, "rcpd stdout read error: {:#}", e);
-                            break;
-                        }
-                    }
-                }
-            }))
-        } else {
-            None
-        };
+        // drain both streams concurrently so the daemon cannot block on a full pipe; retain only a
+        // bounded tail for completion diagnostics
+        let stderr_drain = tokio::spawn(drain_bounded_output(
+            stderr_reader,
+            DIAGNOSTIC_CAPTURE_LIMIT,
+        ));
+        let stdout_drain = child
+            .stdout()
+            .take()
+            .map(|stdout| tokio::spawn(drain_bounded_output(stdout, DIAGNOSTIC_CAPTURE_LIMIT)));
         tracing::info!(
             "rcpd listening on {} (encryption={})",
             conn_info.addr,
@@ -1623,31 +1900,78 @@ impl PreparedRcpd {
         Ok(RcpdProcess {
             child,
             conn_info,
-            _stderr_drain: stderr_drain,
-            _stdout_drain: stdout_drain,
+            stderr_drain,
+            stdout_drain,
         })
     }
 }
 
-async fn reap_failed_rcpd(child: openssh::Child<std::sync::Arc<openssh::Session>>, host: &str) {
+fn attach_startup_diagnostic(error: anyhow::Error, diagnostic: Option<String>) -> anyhow::Error {
+    match diagnostic {
+        Some(diagnostic) => error.context(format!("rcpd startup output: {diagnostic}")),
+        None => error,
+    }
+}
+
+async fn reap_failed_rcpd(
+    mut child: openssh::Child<ManagedSshSession>,
+    host: &str,
+    stderr_reader: Option<tokio::io::BufReader<openssh::ChildStderr>>,
+) -> Option<String> {
     let host = host.to_string();
-    let mut reaper = tokio::spawn(async move { child.wait_with_output().await });
+    let stdout_reader = child.stdout().take();
+    let mut reaper = tokio::spawn(async move {
+        let stdout = async move {
+            match stdout_reader {
+                Some(stdout) => drain_bounded_output(stdout, DIAGNOSTIC_CAPTURE_LIMIT).await,
+                None => CapturedOutput::default(),
+            }
+        };
+        let stderr = async move {
+            match stderr_reader {
+                Some(stderr) => drain_bounded_output(stderr, DIAGNOSTIC_CAPTURE_LIMIT).await,
+                None => CapturedOutput::default(),
+            }
+        };
+        let (status, stdout, stderr) = tokio::join!(child.wait(), stdout, stderr);
+        anyhow::Ok((status?, stdout, stderr))
+    });
     match tokio::time::timeout(FAILED_RCPD_REAP_GRACE, &mut reaper).await {
-        Ok(Ok(Ok(output))) => tracing::debug!(
-            host,
-            status = ?output.status.code(),
-            "reaped rcpd after failed startup"
-        ),
+        Ok(Ok(Ok((status, stdout, stderr)))) => {
+            tracing::debug!(
+                host,
+                status = ?status.code(),
+                "reaped rcpd after failed startup"
+            );
+            format_failed_rcpd_output(stdout.rendered().as_bytes(), &stderr.rendered())
+        }
         Ok(Ok(Err(error))) => {
-            tracing::debug!(host, "failed to reap rcpd after startup error: {error:#}")
+            tracing::debug!(host, "failed to reap rcpd after startup error: {error:#}");
+            None
         }
         Ok(Err(error)) => {
-            tracing::debug!(host, "rcpd startup reaper task failed: {error:#}")
+            tracing::debug!(host, "rcpd startup reaper task failed: {error:#}");
+            None
         }
-        Err(_) => tracing::debug!(
-            host,
-            "rcpd did not exit within the startup cleanup grace; background reaper retained ownership"
-        ),
+        Err(_) => {
+            tracing::debug!(
+                host,
+                "rcpd did not exit within the startup cleanup grace; background reaper retained ownership"
+            );
+            None
+        }
+    }
+}
+
+fn format_failed_rcpd_output(stdout: &[u8], stderr: &str) -> Option<String> {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stdout = common::format_startup_diagnostic(None, stdout.trim());
+    let stderr = common::format_startup_diagnostic(None, stderr.trim());
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(format!("stdout: {stdout}")),
+        (true, false) => Some(format!("stderr: {stderr}")),
+        (false, false) => Some(format!("stdout: {stdout}; stderr: {stderr}")),
     }
 }
 
@@ -2268,28 +2592,54 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn version_probe_timeout_retains_the_elapsed_source() {
-        let started = std::time::Instant::now();
-        let error = run_remote_version_probe(
-            "example.test",
-            std::future::pending::<anyhow::Result<std::process::Output>>(),
-            std::time::Duration::from_secs(2),
+    async fn test_remote_start_rcpd_uses_configured_version_probe_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "rcp-configured-probe-timeout-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let script = directory.join("rcpd");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  exec sleep 30\nfi\nexit 99\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            start_rcpd(
+                &test_rcpd_config(),
+                &SshSession::local(),
+                Some(script.to_str().unwrap()),
+                false,
+                None,
+                protocol::RcpdRole::Source,
+            ),
         )
         .await
-        .unwrap_err();
+        .expect("the configured one-second probe deadline was not honored");
+        let error = match result {
+            Ok(_) => panic!("the hanging version probe unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        let error = format!("{error:#}");
         assert!(
-            error
-                .to_string()
-                .contains("did not complete --protocol-version within 2s")
+            error.contains("timed out after 1s"),
+            "configured deadline missing from probe error: {error}"
         );
-        assert!(error.chain().count() >= 2);
-        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn prepared_rcpd_spawns_both_roles_after_one_preparation() {
+    async fn test_remote_prepared_rcpd_spawns_both_roles_after_one_preparation() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = std::env::temp_dir().join(format!(
@@ -2323,14 +2673,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "probe\n");
-        wait_for_rcpd_process(source.child).await.unwrap();
-        wait_for_rcpd_process(destination.child).await.unwrap();
+        wait_for_rcpd_process(source).await.unwrap();
+        wait_for_rcpd_process(destination).await.unwrap();
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn failed_rcpd_bootstrap_reaps_child_before_returning() {
+    async fn test_remote_wait_for_rcpd_process_retains_daemon_diagnostics() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "rcp-rcpd-diagnostics-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let script = directory.join("rcpd");
+        let version = common::version::ProtocolVersion::current()
+            .to_json()
+            .unwrap();
+        let contents = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\nprintf '%s\\n' 'RCP_TCP 127.0.0.1:1234 4 4' >&2\nprintf '%s\\n' 'daemon stdout detail'\nprintf '%s\\n' 'daemon stderr detail' >&2\nexit 42\n",
+            shell_escape(&version),
+        );
+        std::fs::write(&script, contents).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prepared = prepare_rcpd(&SshSession::local(), Some(script.to_str().unwrap()), false)
+            .await
+            .unwrap();
+        let process = prepared
+            .spawn(&test_rcpd_config(), None, protocol::RcpdRole::Source)
+            .await
+            .unwrap();
+        let error = wait_for_rcpd_process(process).await.unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("daemon stdout detail"),
+            "stdout diagnostic missing: {error}"
+        );
+        assert!(
+            error.contains("daemon stderr detail"),
+            "stderr diagnostic missing: {error}"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remote_failed_rcpd_bootstrap_reaps_child_before_returning() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = std::env::temp_dir().join(format!(
@@ -2346,7 +2738,7 @@ mod tests {
             .to_json()
             .unwrap();
         let contents = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\nif [ \"$2\" = source ]; then\n  printf '%s\\n' 'RCP_ERROR pending file capacity test refusal' >&2\n  marker={}\nelse\n  printf '%s\\n' 'not a readiness record' >&2\n  marker={}\nfi\ncat >/dev/null\nprintf 'exited\\n' > \"$marker\"\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--protocol-version\" ]; then\n  printf '%s\\n' {}\n  exit 0\nfi\nif [ \"$2\" = source ]; then\n  printf '%s\\n' 'RCP_ERROR pending file capacity test refusal' >&2\n  marker={}\nelse\n  printf '%s\\n' 'not a readiness record' >&2\n  printf '%s\\n' 'destination listener bind failed'\n  marker={}\nfi\ncat >/dev/null\nprintf 'exited\\n' > \"$marker\"\n",
             shell_escape(&version),
             shell_escape(source_exit.to_str().unwrap()),
             shell_escape(destination_exit.to_str().unwrap()),
@@ -2381,15 +2773,169 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            malformed
-                .to_string()
-                .contains("unexpected output from rcpd")
+            format!("{malformed:#}").contains("unexpected output from rcpd"),
+            "unexpected startup error: {malformed:#}"
+        );
+        assert!(
+            format!("{malformed:#}").contains("destination listener bind failed"),
+            "startup output must retain the daemon's failure: {malformed:#}"
         );
         assert_eq!(
             std::fs::read_to_string(&destination_exit).unwrap(),
             "exited\n"
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_remote_cancelled_ssh_setup_terminates_its_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "rcp-ssh-launcher-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let launcher = directory.join("ssh");
+        let pid_file = directory.join("pid");
+        let args_file = directory.join("args");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > {}\ncase \" $* \" in *\" ForkAfterAuthentication=no \"*) no_fork=yes ;; esac\ncase \" $* \" in *\" ControlPersist=no \"*) no_persist=yes ;; esac\nif [ \"$no_fork\" != yes ] || [ \"$no_persist\" != yes ]; then\n  setsid sh -c 'trap \"\" HUP TERM; printf \"%s\\n\" \"$$\" > \"$1\"; exec sleep 30' sh {} &\n  while [ ! -s {} ]; do sleep 0.01; done\n  sleep 0.2\n  exit 0\nfi\nprintf '%s\\n' \"$$\" > {}\nexec sleep 30\n",
+                shell_escape(args_file.to_str().unwrap()),
+                shell_escape(pid_file.to_str().unwrap()),
+                shell_escape(pid_file.to_str().unwrap()),
+                shell_escape(pid_file.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let session = SshSession::local();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let preparation = PreparationContext::new(cancellation.clone());
+        let setup = tokio::spawn(async move {
+            setup_ssh_session_with_program(&session, &preparation, &launcher).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !pid_file.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fake SSH launcher must start");
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let process = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
+        assert!(process.exists(), "fake SSH launcher must still be running");
+        cancellation.cancel();
+        let error = match setup.await.unwrap() {
+            Ok(_) => panic!("cancelled SSH setup unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("cancelled because peer preparation failed")
+        );
+        let arguments = std::fs::read_to_string(&args_file).unwrap();
+        assert!(
+            arguments.contains("ForkAfterAuthentication=no")
+                && arguments.contains("ControlPersist=no"),
+            "launcher must override SSH config that could background the owned master: {arguments}"
+        );
+        let terminated = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while process_is_running(&process) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if terminated.is_err() {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", pid.trim()])
+                .status();
+            panic!("cancelling SSH setup left its forked master running");
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_remote_managed_ssh_drop_terminates_master_without_a_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "rcp-managed-ssh-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let launcher = directory.join("ssh");
+        let pid_file = directory.join("pid");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nsocket=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -S ]; then\n    shift\n    socket=$1\n  fi\n  shift\ndone\nprintf '%s\\n' \"$$\" > {}\n: > \"$socket\"\nexec sleep 30\n",
+                shell_escape(pid_file.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let managed = runtime
+            .block_on(setup_ssh_session_with_program(
+                &SshSession::local(),
+                &PreparationContext::uncancelled(),
+                &launcher,
+            ))
+            .unwrap();
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let process = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
+        assert!(process_is_running(&process));
+        runtime.shutdown_timeout(std::time::Duration::from_millis(100));
+
+        drop(managed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while process_is_running(&process) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if process_is_running(&process) {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", pid.trim()])
+                .status();
+            panic!("dropping the managed session did not terminate its SSH master");
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_running(process: &std::path::Path) -> bool {
+        let Ok(status) = std::fs::read_to_string(process.join("status")) else {
+            return false;
+        };
+        !status.lines().any(|line| line.starts_with("State:\tZ"))
+    }
+
+    #[test]
+    fn failed_rcpd_output_keeps_both_captured_streams() {
+        assert_eq!(
+            format_failed_rcpd_output(b"destination listener bind failed\n", "daemon detail\n"),
+            Some("stdout: destination listener bind failed; stderr: daemon detail".to_string())
+        );
+    }
+
+    #[test]
+    fn bounded_diagnostic_capture_retains_only_the_tail() {
+        let mut output = b"012345".to_vec();
+        assert!(retain_bounded_tail(&mut output, b"6789", 6));
+        assert_eq!(output, b"456789");
+        assert!(retain_bounded_tail(&mut output, b"abcdefgh", 6));
+        assert_eq!(output, b"cdefgh");
     }
 
     #[test]
@@ -2415,45 +2961,23 @@ mod tests {
     }
 
     #[test]
-    fn tcp_config_pending_file_capacity_uses_connections_and_multiplier() {
-        let config = TcpConfig::default()
-            .with_max_connections(3)
-            .with_pending_writes_multiplier(4);
-        assert_eq!(config.max_pending_files().unwrap(), 12);
+    fn remote_concurrency_pending_capacity_uses_connections_and_multiplier() {
+        let concurrency =
+            resolve_remote_concurrency(common::ConcurrencyLimit::Unlimited, nonzero(3), nonzero(4))
+                .unwrap();
+        assert_eq!(concurrency.max_pending_files().get(), 12);
     }
 
     #[test]
-    fn tcp_config_pending_file_capacity_rejects_overflow() {
-        let config = TcpConfig::default()
-            .with_max_connections(usize::MAX)
-            .with_pending_writes_multiplier(2);
-        let error = config.max_pending_files().unwrap_err();
+    fn remote_concurrency_pending_capacity_rejects_overflow() {
+        let error = resolve_remote_concurrency(
+            common::ConcurrencyLimit::Unlimited,
+            nonzero(usize::MAX),
+            nonzero(2),
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("pending file capacity overflow"),
-            "unexpected error: {error:#}"
-        );
-    }
-
-    #[test]
-    fn tcp_config_pending_file_capacity_rejects_zero_connections() {
-        let config = TcpConfig::default().with_max_connections(0);
-        let error = config.max_pending_files().unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("max connections must be nonzero"),
-            "unexpected error: {error:#}"
-        );
-    }
-
-    #[test]
-    fn tcp_config_pending_file_capacity_rejects_zero_multiplier() {
-        let config = TcpConfig::default().with_pending_writes_multiplier(0);
-        let error = config.max_pending_files().unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("pending writes multiplier must be nonzero"),
             "unexpected error: {error:#}"
         );
     }
@@ -2567,6 +3091,43 @@ mod tests {
         fn drop(&mut self) {
             self.release();
         }
+    }
+
+    #[test]
+    fn deferred_drop_is_nonblocking_without_a_tokio_runtime() {
+        let watchdog = std::time::Duration::from_secs(1);
+        let (drop_started, wait_for_drop) = std::sync::mpsc::channel();
+        let (drop_finished, wait_for_drop_finish) = std::sync::mpsc::channel();
+        let (drop_returned, wait_for_return) = std::sync::mpsc::channel();
+        let release = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+        let release_guard = BlockingDropRelease(release.clone());
+        let deferred = DeferredDrop::new(
+            BlockingDrop {
+                started: Some(drop_started),
+                release,
+                finished: Some(drop_finished),
+            },
+            "rcp-test-cleanup",
+        );
+
+        let coordinator = std::thread::spawn(move || {
+            drop(deferred);
+            drop_returned.send(()).unwrap();
+        });
+        wait_for_drop
+            .recv_timeout(watchdog)
+            .expect("deferred destructor must start");
+        let returned_before_destructor = wait_for_return.recv_timeout(watchdog).is_ok();
+        release_guard.release();
+        coordinator.join().unwrap();
+        wait_for_drop_finish
+            .recv_timeout(watchdog)
+            .expect("deferred destructor must finish after release");
+
+        assert!(
+            returned_before_destructor,
+            "dropping the owner must not wait for its blocking destructor"
+        );
     }
 
     #[test]
