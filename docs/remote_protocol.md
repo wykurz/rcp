@@ -81,14 +81,15 @@ binary, then probes that deployed remote path before constructing either role's 
 neither co-location nor a current-looking cache filename is treated as proof that the binary
 implements the current serialized and rcpd spawn contract. For distinct hosts, the first preparation
 failure cooperatively cancels its peer without dropping owned work or replacing the original error.
-SSH control-socket readiness uses the same configured deadline and a cancellation-aware owner. Every
-read-only remote bootstrap command — HOME lookup, executable checks, PATH discovery, and version
-probes — goes through one helper that requires that per-stage timeout; expiry aborts and joins its
-local SSH-channel task. Cleanup is best effort and uses the same bounded helper. Binary deployment
-uses the timeout for its HOME lookup, SSH command, readiness marker, and each payload-write idle
-period, but not as a wall-clock limit on transmitting the binary. Post-EOF checksum verification and
-publication use a bounded stage of at least 60 seconds. On peer cancellation, the transfer gets a
-bounded grace to close stdin and finish before its local SSH-channel task is aborted and joined.
+SSH control-socket readiness uses the same configured deadline and one cancellation-aware filesystem
+worker for its whole polling lifetime. Every read-only remote bootstrap command — HOME lookup,
+executable checks, PATH discovery, and version probes — goes through one helper that requires that
+per-stage timeout; expiry aborts and joins its local SSH-channel task. Cleanup is best effort and
+uses the same bounded helper. Binary deployment uses the timeout for its HOME lookup, SSH command,
+readiness marker, and each payload-write idle period, but not as a wall-clock limit on transmitting
+the binary. Post-EOF checksum verification and publication use a bounded stage of at least 60
+seconds. On peer cancellation, the transfer gets a bounded grace to close stdin and finish before
+its local SSH-channel task is aborted and joined.
 
 The SSH multiplex master runs as a retained foreground `ssh -M -N` process; explicit
 `ForkAfterAuthentication=no` and `ControlPersist=no` command-line overrides prevent user or system
@@ -96,14 +97,16 @@ SSH configuration from forking it away from its owner. Cancelling setup aborts t
 `kill_on_drop` terminates the actual connecting process. The configured SSH executable is resolved
 inside a known-local shell child. After setup, commands open channels with the native OpenSSH
 multiplex protocol over the retained control socket rather than synchronously spawning another local
-`ssh`, so their configured deadline also covers exec-channel creation. A cloneable managed session
-keeps both the multiplex session and foreground child together through prepared and running daemon
-states. Whichever clone is dropped last releases the resumed native-mux handle without asking it to
-shut down the externally owned master, then signals that master before returning. Process reaping
-and private control-directory removal move together to a tracked OS thread, so neither can block or
-depend on a Tokio runtime that may already be shutting down. Before process exit, the CLI gives all
-completed-session cleanup workers a bounded join; a filesystem operation still blocked after that
-grace is abandoned with the process.
+`ssh`, so their configured deadline also covers exec-channel creation. A preparation guard owns the
+foreground child and private control directory together until success transfers both to a cloneable
+managed session through prepared and running daemon states. Whichever owner exits signals the master
+before returning. Process reaping and directory removal move together to a worker in the command's
+cleanup scope, so neither can block or depend on a Tokio runtime that may already be shutting down.
+Nested cleanup runs inside its parent worker, and separate invocations cannot drain one another's
+workers. Before process exit, the CLI closes that scope and gives the whole worker group one bounded
+join; a filesystem operation still blocked after that grace is abandoned with the process. Daemon
+waits run concurrently across endpoints while tracing receivers stay live, then any remaining
+receiver tasks share one final drain deadline.
 
 Deployment stages, verifies, and publishes through one remote `sh` transaction. Before anything can
 create the unique temp path, that shell installs an `EXIT` trap which removes it. After directory

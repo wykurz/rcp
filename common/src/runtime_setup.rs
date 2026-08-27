@@ -533,7 +533,11 @@ fn descriptor_clamp_diagnostic(
 }
 
 fn configure_leaf_admission_limit(capacity: ConcurrencyLimit) -> anyhow::Result<()> {
-    throttle::try_set_admission_limits(capacity.semaphore_capacity(), capacity.semaphore_capacity())
+    let capacity = match capacity {
+        ConcurrencyLimit::Unlimited => None,
+        ConcurrencyLimit::Limited(value) => Some(value),
+    };
+    throttle::try_set_admission_limits(capacity)
         .context("failed to configure runtime file admission")
 }
 
@@ -628,22 +632,29 @@ mod default_leaf_operation_limit_tests {
 
     #[test]
     fn reserves_descriptor_headroom_for_each_leaf_operation() {
-        assert_eq!(descriptor_admission_limit(100).semaphore_capacity(), 16);
-        assert_eq!(descriptor_admission_limit(4096).semaphore_capacity(), 655);
         assert_eq!(
-            descriptor_admission_limit(1_000_000).semaphore_capacity(),
-            4096
+            descriptor_admission_limit(100),
+            ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(16).unwrap())
         );
         assert_eq!(
-            descriptor_admission_limit(u64::MAX).semaphore_capacity(),
-            4096
+            descriptor_admission_limit(4096),
+            ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(655).unwrap())
+        );
+        assert_eq!(
+            descriptor_admission_limit(1_000_000),
+            ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(4096).unwrap())
+        );
+        assert_eq!(
+            descriptor_admission_limit(u64::MAX),
+            ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(4096).unwrap())
         );
     }
 
     #[test]
     fn keeps_a_small_nonzero_limit_live() {
-        assert_eq!(descriptor_admission_limit(1).semaphore_capacity(), 1);
-        assert_eq!(descriptor_admission_limit(4).semaphore_capacity(), 1);
+        let one = ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(1).unwrap());
+        assert_eq!(descriptor_admission_limit(1), one);
+        assert_eq!(descriptor_admission_limit(4), one);
         assert_eq!(descriptor_admission_limit(0), ConcurrencyLimit::Unlimited);
     }
 
@@ -792,7 +803,7 @@ mod default_leaf_operation_limit_tests {
             old_open_file,
             old_pending_meta,
         ));
-        throttle::set_admission_limits(0, 0);
+        throttle::set_admission_limits(None);
         println!("{UNLIMITED_FILE_CEILING_CHILD_SUCCESS}");
     }
 
@@ -903,7 +914,7 @@ mod default_leaf_operation_limit_tests {
             })
             .expect("derived admission boundary must complete within its watchdog");
         drop((open_files, pending_meta));
-        throttle::set_admission_limits(0, 0);
+        throttle::set_admission_limits(None);
         println!("{RLIMIT_CHILD_SUCCESS}");
     }
 }

@@ -545,10 +545,11 @@ impl RcpdConfig {
                 args.push("--explicit-unlimited-files-in-flight".to_string());
             }
             RcpdFilesInFlight::DeprecatedMaxOpenFiles(value) => {
-                args.push(format!(
-                    "--forwarded-legacy-files-in-flight={}",
-                    value.semaphore_capacity()
-                ));
+                let value = match value {
+                    common::ConcurrencyLimit::Unlimited => 0,
+                    common::ConcurrencyLimit::Limited(value) => value.get(),
+                };
+                args.push(format!("--forwarded-legacy-files-in-flight={value}"));
             }
         }
         if self.dereference {

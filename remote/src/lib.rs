@@ -131,26 +131,248 @@ const SSH_CLEANUP_JOIN_GRACE: std::time::Duration = std::time::Duration::from_se
 const DIAGNOSTIC_CAPTURE_LIMIT: usize = 64 * 1024;
 const RCPD_STARTUP_RECORD_LIMIT: usize = 64 * 1024;
 
-static DEFERRED_CLEANUP_THREADS: std::sync::LazyLock<
-    std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
-> = std::sync::LazyLock::new(Default::default);
+std::thread_local! {
+    static ACTIVE_REMOTE_CLEANUP_SCOPES: std::cell::RefCell<Vec<usize>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
 
-fn register_cleanup_worker(worker: std::thread::JoinHandle<()>) {
-    let mut workers = DEFERRED_CLEANUP_THREADS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut index = 0;
-    while index < workers.len() {
-        if workers[index].is_finished() {
-            let finished = workers.swap_remove(index);
-            if let Err(error) = finished.join() {
-                tracing::debug!("deferred cleanup worker panicked: {error:?}");
-            }
-        } else {
-            index += 1;
+struct CleanupWorkers {
+    accepting: bool,
+    pending: usize,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Default for CleanupWorkers {
+    fn default() -> Self {
+        Self {
+            accepting: true,
+            pending: 0,
+            threads: Vec::new(),
         }
     }
-    workers.push(worker);
+}
+
+#[derive(Default)]
+struct CleanupState {
+    workers: std::sync::Mutex<CleanupWorkers>,
+    changed: std::sync::Condvar,
+}
+
+/// Owns all blocking cleanup work started by one rcp invocation.
+#[derive(Clone, Default)]
+pub struct RemoteCleanup(std::sync::Arc<CleanupState>);
+
+impl std::fmt::Debug for RemoteCleanup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteCleanup")
+            .finish_non_exhaustive()
+    }
+}
+
+struct CleanupWorkerContext {
+    scope_id: usize,
+}
+
+impl CleanupWorkerContext {
+    fn enter(cleanup: &RemoteCleanup) -> Self {
+        let scope_id = cleanup.scope_id();
+        ACTIVE_REMOTE_CLEANUP_SCOPES.with(|scopes| scopes.borrow_mut().push(scope_id));
+        Self { scope_id }
+    }
+}
+
+impl Drop for CleanupWorkerContext {
+    fn drop(&mut self) {
+        ACTIVE_REMOTE_CLEANUP_SCOPES.with(|scopes| {
+            let removed = scopes.borrow_mut().pop();
+            debug_assert_eq!(removed, Some(self.scope_id));
+        });
+    }
+}
+
+struct CleanupWorkerCompletion(RemoteCleanup);
+
+impl Drop for CleanupWorkerCompletion {
+    fn drop(&mut self) {
+        let mut workers = self
+            .0
+            .0
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        workers.pending = workers
+            .pending
+            .checked_sub(1)
+            .expect("cleanup worker completion matches a pending worker");
+        self.0.0.changed.notify_all();
+    }
+}
+
+impl RemoteCleanup {
+    /// Create an empty cleanup scope for one command invocation.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn scope_id(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.0) as usize
+    }
+
+    fn is_current_worker(&self) -> bool {
+        let scope_id = self.scope_id();
+        ACTIVE_REMOTE_CLEANUP_SCOPES.with(|scopes| scopes.borrow().contains(&scope_id))
+    }
+
+    fn spawn<F>(&self, thread_name: &'static str, operation: F) -> std::io::Result<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        // preserve the closure until the OS confirms thread creation. Dropping it after a spawn
+        // failure could run the blocking destructor this mechanism exists to isolate.
+        let operation = std::sync::Arc::new(std::sync::Mutex::new(Some(operation)));
+        let worker_operation = operation.clone();
+        let cleanup = self.clone();
+        let mut workers = self
+            .0
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !workers.accepting {
+            let leaked = operation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            std::mem::forget(leaked);
+            return Err(std::io::Error::other(
+                "remote cleanup scope is already finishing",
+            ));
+        }
+        workers.pending += 1;
+        match std::thread::Builder::new()
+            .name(thread_name.to_string())
+            .spawn(move || {
+                let _completion = CleanupWorkerCompletion(cleanup.clone());
+                let _context = CleanupWorkerContext::enter(&cleanup);
+                if let Some(operation) = worker_operation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    operation();
+                }
+            }) {
+            Ok(worker) => {
+                workers.threads.push(worker);
+                Ok(())
+            }
+            Err(error) => {
+                workers.pending -= 1;
+                self.0.changed.notify_all();
+                let leaked = operation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                std::mem::forget(leaked);
+                Err(error)
+            }
+        }
+    }
+
+    fn defer_drop<T>(&self, value: T, thread_name: &'static str)
+    where
+        T: Send + 'static,
+    {
+        if self.is_current_worker() {
+            drop(value);
+            return;
+        }
+        if let Err(error) = self.spawn(thread_name, move || drop(value)) {
+            tracing::error!("failed to start deferred cleanup thread: {error:#}");
+        }
+    }
+
+    /// Wait for this invocation's deferred cleanup without serially resetting its time budget.
+    pub fn finish(self) {
+        self.finish_with_grace(SSH_CLEANUP_JOIN_GRACE);
+    }
+
+    fn finish_with_grace(&self, grace: std::time::Duration) {
+        let deadline = std::time::Instant::now() + grace;
+        let mut workers = self
+            .0
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        workers.accepting = false;
+        while workers.pending > 0 {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let (next, _) = self
+                .0
+                .changed
+                .wait_timeout(workers, deadline.saturating_duration_since(now))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            workers = next;
+        }
+        let pending = workers.pending;
+        let completed = if pending == 0 {
+            std::mem::take(&mut workers.threads)
+        } else {
+            let mut completed = Vec::new();
+            let mut still_running = Vec::new();
+            for worker in std::mem::take(&mut workers.threads) {
+                if worker.is_finished() {
+                    completed.push(worker);
+                } else {
+                    still_running.push(worker);
+                }
+            }
+            workers.threads = still_running;
+            completed
+        };
+        drop(workers);
+        for worker in completed {
+            if let Err(error) = worker.join() {
+                tracing::debug!("deferred remote cleanup worker panicked: {error:?}");
+            }
+        }
+        if pending > 0 {
+            tracing::debug!(
+                "{pending} deferred remote cleanup worker(s) did not finish within {}; abandoning them at process exit",
+                humantime::format_duration(grace)
+            );
+        }
+    }
+}
+
+/// Owns a Tokio task and aborts it if its supervising future is cancelled.
+pub struct AbortOnDropTask<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortOnDropTask<T> {
+    /// Retain a task under cancellation-safe ownership.
+    pub fn new(task: tokio::task::JoinHandle<T>) -> Self {
+        Self(task)
+    }
+
+    /// Await the retained task without giving up abort-on-drop ownership.
+    pub async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
+        (&mut self.0).await
+    }
+
+    /// Request cancellation of the retained task.
+    pub fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[derive(Default)]
@@ -248,124 +470,12 @@ impl std::error::Error for PeerPreparationCancelled {}
 #[derive(Clone)]
 pub(crate) struct PreparationContext {
     cancellation: tokio_util::sync::CancellationToken,
-}
-
-/// Moves a potentially blocking destructor onto an executor independent of Tokio.
-struct DeferredDrop<T: Send + 'static> {
-    value: Option<T>,
-    thread_name: &'static str,
-}
-
-impl<T: Send + 'static> DeferredDrop<T> {
-    fn new(value: T, thread_name: &'static str) -> Self {
-        Self {
-            value: Some(value),
-            thread_name,
-        }
-    }
-}
-
-impl<T: Send + 'static> Drop for DeferredDrop<T> {
-    fn drop(&mut self) {
-        let Some(value) = self.value.take() else {
-            return;
-        };
-        // keep a recoverable copy of the ownership slot until thread creation succeeds. If the OS
-        // cannot create a cleanup thread, leaking is safer than running an unbounded destructor on
-        // a Tokio worker or panicking from Drop.
-        let value = std::sync::Arc::new(std::sync::Mutex::new(Some(value)));
-        let worker_value = value.clone();
-        match std::thread::Builder::new()
-            .name(self.thread_name.to_string())
-            .spawn(move || {
-                drop(
-                    worker_value
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take(),
-                );
-            }) {
-            Ok(worker) => register_cleanup_worker(worker),
-            Err(error) => {
-                tracing::error!("failed to start deferred cleanup thread: {error:#}");
-                let leaked = value
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                std::mem::forget(leaked);
-            }
-        }
-    }
+    cleanup: RemoteCleanup,
 }
 
 struct SshMasterReaper {
     launcher: Option<tokio::process::Child>,
     control_directory: Option<std::path::PathBuf>,
-}
-
-fn defer_ssh_cleanup(value: SshMasterReaper) {
-    // retain ownership until thread creation succeeds. If the OS cannot create the cleanup worker,
-    // leaking is safer than running filesystem teardown on a Tokio worker or panicking from Drop.
-    let value = std::sync::Arc::new(std::sync::Mutex::new(Some(value)));
-    let worker_value = value.clone();
-    match std::thread::Builder::new()
-        .name("rcp-ssh-cleanup".to_string())
-        .spawn(move || {
-            drop(
-                worker_value
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take(),
-            );
-        }) {
-        Ok(worker) => register_cleanup_worker(worker),
-        Err(error) => {
-            tracing::error!("failed to start deferred SSH cleanup thread: {error:#}");
-            let leaked = value
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            std::mem::forget(leaked);
-        }
-    }
-}
-
-/// Give all deferred remote cleanup workers a bounded join before process exit.
-///
-/// Session and raced-result `Drop` remain nonblocking and runtime-independent. The CLI calls this
-/// after its Tokio runtime has shut down so nested SSH cleanup and ordinary control-directory removal
-/// cannot be outrun by process exit; a genuinely stuck filesystem is still abandoned after the
-/// bounded grace.
-pub fn finish_pending_remote_cleanup() {
-    let deadline = std::time::Instant::now() + SSH_CLEANUP_JOIN_GRACE;
-    loop {
-        let workers = std::mem::take(
-            &mut *DEFERRED_CLEANUP_THREADS
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        if workers.is_empty() {
-            return;
-        }
-        for worker in workers {
-            while !worker.is_finished() && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            if worker.is_finished() {
-                if let Err(error) = worker.join() {
-                    tracing::debug!("deferred remote cleanup worker panicked: {error:?}");
-                }
-            } else {
-                tracing::debug!(
-                    "deferred remote cleanup did not finish within {}; abandoning it at process exit",
-                    humantime::format_duration(SSH_CLEANUP_JOIN_GRACE)
-                );
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return;
-        }
-    }
 }
 
 impl Drop for SshMasterReaper {
@@ -393,35 +503,68 @@ impl Drop for SshMasterReaper {
     }
 }
 
-struct PreparingControlDirectory(Option<std::path::PathBuf>);
+struct PreparingSshMaster {
+    launcher: Option<tokio::process::Child>,
+    control_directory: Option<std::path::PathBuf>,
+    cleanup: RemoteCleanup,
+}
 
-impl PreparingControlDirectory {
-    fn new(path: std::path::PathBuf) -> Self {
-        Self(Some(path))
+impl PreparingSshMaster {
+    fn new(control_directory: std::path::PathBuf, cleanup: RemoteCleanup) -> Self {
+        Self {
+            launcher: None,
+            control_directory: Some(control_directory),
+            cleanup,
+        }
     }
 
-    fn path(&self) -> &std::path::Path {
-        self.0
+    fn control_directory(&self) -> &std::path::Path {
+        self.control_directory
             .as_deref()
             .expect("preparing SSH control directory remains owned")
     }
 
-    fn take(&mut self) -> std::path::PathBuf {
-        self.0
+    fn retain_launcher(&mut self, launcher: tokio::process::Child) {
+        debug_assert!(self.launcher.is_none());
+        self.launcher = Some(launcher);
+    }
+
+    fn launcher_mut(&mut self) -> &mut tokio::process::Child {
+        self.launcher
+            .as_mut()
+            .expect("preparing SSH master retains its launcher")
+    }
+
+    fn into_managed(mut self, session: openssh::Session) -> ManagedSshSession {
+        let launcher = self
+            .launcher
             .take()
-            .expect("prepared SSH session takes its control directory once")
+            .expect("prepared SSH session takes its launcher once");
+        let control_directory = self
+            .control_directory
+            .take()
+            .expect("prepared SSH session takes its control directory once");
+        ManagedSshSession::new(session, launcher, control_directory, self.cleanup.clone())
     }
 }
 
-impl Drop for PreparingControlDirectory {
+impl Drop for PreparingSshMaster {
     fn drop(&mut self) {
-        let Some(control_directory) = self.0.take() else {
+        if let Some(launcher) = self.launcher.as_mut()
+            && let Err(error) = launcher.start_kill()
+        {
+            tracing::debug!("failed to terminate preparing SSH multiplex master: {error:#}");
+        }
+        if self.launcher.is_none() && self.control_directory.is_none() {
             return;
-        };
-        defer_ssh_cleanup(SshMasterReaper {
-            launcher: None,
-            control_directory: Some(control_directory),
-        });
+        }
+        self.cleanup.defer_drop(
+            SshMasterReaper {
+                launcher: self.launcher.take(),
+                control_directory: self.control_directory.take(),
+            },
+            "rcp-ssh-cleanup",
+        );
     }
 }
 
@@ -429,6 +572,7 @@ struct ManagedSshSessionInner {
     session: Option<openssh::Session>,
     launcher: Option<tokio::process::Child>,
     control_directory: Option<std::path::PathBuf>,
+    cleanup: RemoteCleanup,
 }
 
 impl Drop for ManagedSshSessionInner {
@@ -442,10 +586,13 @@ impl Drop for ManagedSshSessionInner {
         {
             tracing::debug!("failed to terminate SSH multiplex master: {error:#}");
         }
-        defer_ssh_cleanup(SshMasterReaper {
-            launcher: self.launcher.take(),
-            control_directory: self.control_directory.take(),
-        });
+        self.cleanup.defer_drop(
+            SshMasterReaper {
+                launcher: self.launcher.take(),
+                control_directory: self.control_directory.take(),
+            },
+            "rcp-ssh-cleanup",
+        );
     }
 }
 
@@ -466,12 +613,18 @@ impl ManagedSshSession {
         session: openssh::Session,
         launcher: tokio::process::Child,
         control_directory: std::path::PathBuf,
+        cleanup: RemoteCleanup,
     ) -> Self {
         Self(std::sync::Arc::new(ManagedSshSessionInner {
             session: Some(session),
             launcher: Some(launcher),
             control_directory: Some(control_directory),
+            cleanup,
         }))
+    }
+
+    fn cleanup(&self) -> RemoteCleanup {
+        self.0.cleanup.clone()
     }
 }
 
@@ -497,12 +650,15 @@ impl<T> SshSessionOwner for T where
 }
 
 impl PreparationContext {
-    fn new(cancellation: tokio_util::sync::CancellationToken) -> Self {
-        Self { cancellation }
+    fn new(cancellation: tokio_util::sync::CancellationToken, cleanup: RemoteCleanup) -> Self {
+        Self {
+            cancellation,
+            cleanup,
+        }
     }
 
-    fn uncancelled() -> Self {
-        Self::new(tokio_util::sync::CancellationToken::new())
+    fn uncancelled(cleanup: RemoteCleanup) -> Self {
+        Self::new(tokio_util::sync::CancellationToken::new(), cleanup)
     }
 
     fn cancellation_error() -> anyhow::Error {
@@ -517,6 +673,7 @@ impl PreparationContext {
     }
 
     async fn finish_or_abort_owned_during_grace<T>(
+        &self,
         task: &mut tokio::task::JoinHandle<anyhow::Result<T>>,
         grace: std::time::Duration,
         operation: &'static str,
@@ -526,7 +683,7 @@ impl PreparationContext {
         match tokio::time::timeout(grace, &mut *task).await {
             Ok(Ok(Ok(value))) => {
                 tracing::debug!("{operation} completed during cancellation grace");
-                drop(DeferredDrop::new(value, "rcp-owned-result-dispose"));
+                self.cleanup.defer_drop(value, "rcp-owned-result-dispose");
             }
             Ok(Ok(Err(error))) => {
                 tracing::debug!("{operation} failed during cancellation grace: {error:#}");
@@ -542,7 +699,7 @@ impl PreparationContext {
                     }
                     Ok(Ok(value)) => {
                         tracing::debug!("{operation} completed as cancellation grace elapsed");
-                        drop(DeferredDrop::new(value, "rcp-owned-result-dispose"));
+                        self.cleanup.defer_drop(value, "rcp-owned-result-dispose");
                     }
                     Ok(Err(error)) => tracing::debug!(
                         "{operation} failed as cancellation grace elapsed: {error:#}"
@@ -580,7 +737,7 @@ impl PreparationContext {
         tokio::select! {
             biased;
             () = self.cancellation.cancelled() => {
-                Self::finish_or_abort_owned_during_grace(&mut task, grace, operation).await;
+                self.finish_or_abort_owned_during_grace(&mut task, grace, operation).await;
                 Err(Self::cancellation_error())
             }
             result = &mut task => result
@@ -590,6 +747,7 @@ impl PreparationContext {
 
     /// Await owned work whose process must be aborted on cancellation or bootstrap timeout.
     async fn abort_and_join_owned<T>(
+        &self,
         task: &mut tokio::task::JoinHandle<anyhow::Result<T>>,
         operation: &str,
         reason: &str,
@@ -603,7 +761,7 @@ impl PreparationContext {
             }
             Ok(Ok(value)) => {
                 tracing::debug!("{operation} completed as {reason} arrived");
-                drop(DeferredDrop::new(value, "rcp-owned-result-dispose"));
+                self.cleanup.defer_drop(value, "rcp-owned-result-dispose");
             }
             Ok(Err(error)) => {
                 tracing::debug!("{operation} failed as {reason} arrived: {error:#}");
@@ -626,7 +784,7 @@ impl PreparationContext {
         tokio::select! {
             biased;
             () = self.cancellation.cancelled() => {
-                Self::abort_and_join_owned(&mut task, operation, "peer cancellation").await;
+                self.abort_and_join_owned(&mut task, operation, "peer cancellation").await;
                 Err(Self::cancellation_error())
             }
             result = deadline.wait(operation, &mut task) => {
@@ -634,7 +792,7 @@ impl PreparationContext {
                     Ok(result) => result
                         .with_context(|| format!("{operation} owner task failed"))?,
                     Err(error) => {
-                        Self::abort_and_join_owned(&mut task, operation, "its bootstrap deadline")
+                        self.abort_and_join_owned(&mut task, operation, "its bootstrap deadline")
                             .await;
                         Err(error)
                     }
@@ -757,7 +915,7 @@ impl BootstrapDeadline {
     }
 }
 
-pub mod deploy;
+mod deploy;
 pub mod port_ranges;
 pub mod protocol;
 pub mod streams;
@@ -1009,12 +1167,14 @@ async fn setup_ssh_session_with_program(
 ) -> anyhow::Result<ManagedSshSession> {
     let session = session.clone();
     let ssh_program = ssh_program.to_path_buf();
+    let cleanup = preparation.cleanup.clone();
     let connect = tokio::spawn(async move {
-        let control_dir = run_disposable_blocking("rcp-ssh-control-select", || {
-            ssh_control_directory().context("no usable SSH control directory found")
-        })
-        .await?;
-        launch_ssh_master(&session, &control_dir, &ssh_program)
+        let control_dir =
+            run_disposable_blocking(cleanup.clone(), "rcp-ssh-control-select", || {
+                ssh_control_directory().context("no usable SSH control directory found")
+            })
+            .await?;
+        launch_ssh_master(&session, &control_dir, &ssh_program, cleanup)
             .await
             .context("Failed to establish SSH connection")
     });
@@ -1028,22 +1188,53 @@ async fn setup_ssh_session_with_program(
 /// The caller may abandon the receiver at a bootstrap deadline without waiting for an uninterruptible
 /// filesystem syscall. These probes launch no process, and a value produced after abandonment is
 /// dropped on the worker thread.
-async fn run_disposable_blocking<T, F>(thread_name: &'static str, operation: F) -> anyhow::Result<T>
+async fn run_disposable_blocking<T, F>(
+    cleanup: RemoteCleanup,
+    thread_name: &'static str,
+    operation: F,
+) -> anyhow::Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    let worker = std::thread::Builder::new()
-        .name(thread_name.to_string())
-        .spawn(move || {
+    cleanup
+        .spawn(thread_name, move || {
             let _ = result_tx.send(operation());
         })
         .with_context(|| format!("failed to start {thread_name} worker"))?;
-    register_cleanup_worker(worker);
     result_rx
         .await
         .with_context(|| format!("{thread_name} worker exited without a result"))?
+}
+
+struct StopSocketProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopSocketProbe {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+async fn wait_for_ssh_control_socket<F>(
+    cleanup: &RemoteCleanup,
+    mut inspect: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> anyhow::Result<bool> + Send + 'static,
+{
+    let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _stop_on_exit = StopSocketProbe(stopped.clone());
+    run_disposable_blocking(cleanup.clone(), "rcp-ssh-control-inspect", move || {
+        while !stopped.load(std::sync::atomic::Ordering::Acquire) {
+            if inspect()? {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Launch and retain the foreground OpenSSH multiplex master.
@@ -1062,11 +1253,12 @@ async fn launch_ssh_master(
     session: &SshSession,
     control_dir: &std::path::Path,
     ssh_program: &std::path::Path,
+    cleanup: RemoteCleanup,
 ) -> anyhow::Result<ManagedSshSession> {
     tracing::debug!("Connecting to SSH destination: {}", session.host);
     tracing::debug!("Using SSH control directory: {}", control_dir.display());
     let control_dir = control_dir.to_path_buf();
-    let directory = run_disposable_blocking("rcp-ssh-control-create", move || {
+    let directory = run_disposable_blocking(cleanup.clone(), "rcp-ssh-control-create", move || {
         let mut temp = tempfile::Builder::new();
         temp.prefix(".ssh-connection");
         temp.tempdir_in(control_dir)
@@ -1075,9 +1267,9 @@ async fn launch_ssh_master(
     .await?;
     // persist the TempDir only after the disposable worker returned it. If that wait is abandoned,
     // tempfile cleanup stays on the worker; after persistence every exit is guarded below.
-    let mut directory = PreparingControlDirectory::new(directory.keep());
-    let log = directory.path().join("log");
-    let control_path = directory.path().join("master");
+    let mut preparing = PreparingSshMaster::new(directory.keep(), cleanup.clone());
+    let log = preparing.control_directory().join("log");
+    let control_path = preparing.control_directory().join("master");
     let mut launcher = ssh_master_launcher_command(ssh_program);
     launcher
         .kill_on_drop(true)
@@ -1104,43 +1296,46 @@ async fn launch_ssh_master(
     if let Some(user) = session.user.as_deref() {
         launcher.arg("-l").arg(user);
     }
-    let mut launcher = launcher
+    let launcher = launcher
         .arg(&session.host)
         .spawn()
         .context("failed to launch SSH multiplex master")?;
-    loop {
-        if let Some(status) = launcher
-            .try_wait()
-            .context("failed to inspect SSH multiplex master")?
-        {
-            let diagnostic_path = log.clone();
-            let diagnostic = run_disposable_blocking("rcp-ssh-log-read", move || {
-                Ok(std::fs::read_to_string(diagnostic_path).unwrap_or_default())
-            })
-            .await?;
-            anyhow::bail!(
-                "SSH multiplex master exited with {status}: {}",
-                diagnostic.trim()
-            );
-        }
+    preparing.retain_launcher(launcher);
+    {
         let socket_path = control_path.clone();
-        let socket_ready = run_disposable_blocking("rcp-ssh-control-inspect", move || {
+        let socket_ready = wait_for_ssh_control_socket(&cleanup, move || {
             socket_path
                 .try_exists()
                 .context("failed to inspect SSH multiplex control socket")
-        })
-        .await?;
-        if socket_ready {
-            break;
+        });
+        tokio::pin!(socket_ready);
+        tokio::select! {
+            biased;
+            status = preparing.launcher_mut().wait() => {
+                let status = status.context("failed to wait for SSH multiplex master")?;
+                let diagnostic_path = log.clone();
+                let diagnostic = run_disposable_blocking(
+                    cleanup.clone(),
+                    "rcp-ssh-log-read",
+                    move || Ok(std::fs::read_to_string(diagnostic_path).unwrap_or_default()),
+                )
+                .await?;
+                anyhow::bail!(
+                    "SSH multiplex master exited with {status}: {}",
+                    diagnostic.trim()
+                );
+            }
+            result = &mut socket_ready => {
+                result?;
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     // use the native multiplex client so every remote command opens the retained control socket
     // directly. The process backend synchronously spawns a fresh local `ssh` executable for each
     // command, which would create an uninterruptible pre-deadline PATH/exec window.
     let session =
         openssh::Session::resume_mux(control_path.into_boxed_path(), Some(log.into_boxed_path()));
-    Ok(ManagedSshSession::new(session, launcher, directory.take()))
+    Ok(preparing.into_managed(session))
 }
 
 /// Where to put the SSH connection-multiplexing socket.
@@ -1255,20 +1450,14 @@ fn control_dir_is_usable(dir: &std::path::Path) -> bool {
     }
 }
 
-#[instrument]
-pub async fn get_remote_home_for_session(
-    session: &SshSession,
-) -> anyhow::Result<std::path::PathBuf> {
-    get_remote_home_for_session_with_timeout(session, DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT).await
-}
-
 /// Retrieve a remote home directory with a caller-selected bootstrap timeout.
-#[instrument]
+#[instrument(skip(cleanup))]
 pub async fn get_remote_home_for_session_with_timeout(
     session: &SshSession,
+    cleanup: &RemoteCleanup,
     bootstrap_timeout: std::time::Duration,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let preparation = PreparationContext::uncancelled();
+    let preparation = PreparationContext::uncancelled(cleanup.clone());
     let deadline = BootstrapDeadline::new(bootstrap_timeout);
     let ssh_session = setup_ssh_session(session, &preparation, deadline).await?;
     let home = get_remote_home_with_context(&ssh_session, &preparation, deadline).await?;
@@ -1276,13 +1465,16 @@ pub async fn get_remote_home_for_session_with_timeout(
 }
 
 #[instrument(skip(process))]
-pub async fn wait_for_rcpd_process(process: RcpdProcess) -> anyhow::Result<()> {
-    let RcpdProcess {
-        child,
-        conn_info: _,
-        stderr_drain,
-        stdout_drain,
-    } = process;
+pub async fn wait_for_rcpd_process(mut process: RcpdProcess) -> anyhow::Result<()> {
+    let child = process
+        .child
+        .take()
+        .expect("an owned rcpd process retains its child until wait");
+    let stderr_drain = process
+        .stderr_drain
+        .take()
+        .expect("an owned rcpd process retains its stderr collector until wait");
+    let stdout_drain = process.stdout_drain.take();
     tracing::info!("Waiting on rcpd server on: {:?}", child);
     // closing the child's stdin is the daemon watchdog signal. Always join the output collectors,
     // even when waiting fails, so teardown neither detaches tasks nor loses bounded diagnostics.
@@ -1312,10 +1504,10 @@ pub async fn wait_for_rcpd_process(process: RcpdProcess) -> anyhow::Result<()> {
 }
 
 async fn finish_rcpd_output_drain(
-    mut task: tokio::task::JoinHandle<CapturedOutput>,
+    mut task: AbortOnDropTask<CapturedOutput>,
     stream: &'static str,
 ) -> CapturedOutput {
-    match tokio::time::timeout(RCPD_OUTPUT_DRAIN_GRACE, &mut task).await {
+    match tokio::time::timeout(RCPD_OUTPUT_DRAIN_GRACE, task.join()).await {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
             tracing::debug!("rcpd {stream} collector task failed: {error:#}");
@@ -1324,14 +1516,14 @@ async fn finish_rcpd_output_drain(
         Err(_) => {
             tracing::debug!("rcpd {stream} collector did not finish during drain grace");
             task.abort();
-            let _ = task.await;
+            let _ = task.join().await;
             CapturedOutput::default()
         }
     }
 }
 
 async fn finish_optional_rcpd_output_drain(
-    task: Option<tokio::task::JoinHandle<CapturedOutput>>,
+    task: Option<AbortOnDropTask<CapturedOutput>>,
     stream: &'static str,
 ) -> CapturedOutput {
     match task {
@@ -1364,15 +1556,6 @@ pub(crate) fn shell_escape(s: &str) -> String {
 /// # Errors
 ///
 /// Returns an error if HOME is not set or is empty
-pub async fn get_remote_home(session: &std::sync::Arc<openssh::Session>) -> anyhow::Result<String> {
-    get_remote_home_with_context(
-        session,
-        &PreparationContext::uncancelled(),
-        BootstrapDeadline::new(DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT),
-    )
-    .await
-}
-
 #[derive(Debug)]
 struct RemoteHomeUnavailable(String);
 
@@ -1938,15 +2121,17 @@ where
 }
 
 /// Result of starting an rcpd process.
+///
+/// Dropping it closes the SSH child channel and aborts both owned output collectors.
 pub struct RcpdProcess {
     /// SSH child process handle
-    child: openssh::Child<ManagedSshSession>,
+    child: Option<openssh::Child<ManagedSshSession>>,
     /// Connection info (address and optional fingerprint)
     pub conn_info: RcpdConnectionInfo,
     /// Handle for the bounded stderr collector.
-    stderr_drain: tokio::task::JoinHandle<CapturedOutput>,
+    stderr_drain: Option<AbortOnDropTask<CapturedOutput>>,
     /// Handle for the bounded stdout collector.
-    stdout_drain: Option<tokio::task::JoinHandle<CapturedOutput>>,
+    stdout_drain: Option<AbortOnDropTask<CapturedOutput>>,
 }
 
 #[derive(Clone)]
@@ -1960,12 +2145,14 @@ pub async fn prepare_rcpd(
     session: &SshSession,
     explicit_rcpd_path: Option<&str>,
     auto_deploy_rcpd: bool,
+    cleanup: &RemoteCleanup,
 ) -> anyhow::Result<PreparedRcpd> {
     prepare_rcpd_with_cancellation(
         session,
         explicit_rcpd_path,
         auto_deploy_rcpd,
         tokio_util::sync::CancellationToken::new(),
+        cleanup,
     )
     .await
 }
@@ -1976,12 +2163,14 @@ pub async fn prepare_rcpd_endpoints(
     destination: &SshSession,
     explicit_rcpd_path: Option<&str>,
     auto_deploy_rcpd: bool,
+    cleanup: &RemoteCleanup,
 ) -> anyhow::Result<(PreparedRcpd, PreparedRcpd)> {
     prepare_rcpd_endpoints_with_timeout(
         source,
         destination,
         explicit_rcpd_path,
         auto_deploy_rcpd,
+        cleanup,
         DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
     )
     .await
@@ -1993,6 +2182,7 @@ pub async fn prepare_rcpd_endpoints_with_timeout(
     destination: &SshSession,
     explicit_rcpd_path: Option<&str>,
     auto_deploy_rcpd: bool,
+    cleanup: &RemoteCleanup,
     bootstrap_timeout: std::time::Duration,
 ) -> anyhow::Result<(PreparedRcpd, PreparedRcpd)> {
     if source == destination {
@@ -2000,13 +2190,14 @@ pub async fn prepare_rcpd_endpoints_with_timeout(
             source,
             explicit_rcpd_path,
             auto_deploy_rcpd,
-            PreparationContext::uncancelled(),
+            PreparationContext::uncancelled(cleanup.clone()),
             bootstrap_timeout,
         )
         .await?;
         return Ok((prepared.clone(), prepared));
     }
     join_remote_preparations(
+        cleanup,
         |preparation| {
             prepare_rcpd_with_context(
                 source,
@@ -2041,6 +2232,7 @@ pub(crate) async fn join_remote_preparations<
     S,
     D,
 >(
+    cleanup: &RemoteCleanup,
     source: Source,
     destination: Destination,
 ) -> anyhow::Result<(S, D)>
@@ -2056,13 +2248,14 @@ where
     const DESTINATION: u8 = 2;
 
     fn take_error_and_defer_success<T: Send + 'static>(
+        cleanup: &RemoteCleanup,
         result: anyhow::Result<T>,
     ) -> Option<anyhow::Error> {
         match result {
             Ok(value) => {
                 // successful preparation values are generic and may own blocking destructors; keep
                 // their disposal off the endpoint coordinator and independent of Tokio shutdown
-                drop(DeferredDrop::new(value, "rcp-preparation-dispose"));
+                cleanup.defer_drop(value, "rcp-preparation-dispose");
                 None
             }
             Err(error) => Some(error),
@@ -2100,13 +2293,13 @@ where
     let first_failure = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
     let source_preparation = prepare(
         source,
-        PreparationContext::new(cancellation.clone()),
+        PreparationContext::new(cancellation.clone(), cleanup.clone()),
         first_failure.clone(),
         SOURCE,
     );
     let destination_preparation = prepare(
         destination,
-        PreparationContext::new(cancellation),
+        PreparationContext::new(cancellation, cleanup.clone()),
         first_failure.clone(),
         DESTINATION,
     );
@@ -2114,8 +2307,8 @@ where
     match (source, destination) {
         (Ok(source), Ok(destination)) => Ok((source, destination)),
         (source, destination) => {
-            let source_error = take_error_and_defer_success(source);
-            let destination_error = take_error_and_defer_success(destination);
+            let source_error = take_error_and_defer_success(cleanup, source);
+            let destination_error = take_error_and_defer_success(cleanup, destination);
             match (
                 first_failure.load(std::sync::atomic::Ordering::SeqCst),
                 source_error,
@@ -2129,18 +2322,19 @@ where
     }
 }
 
-#[instrument(skip(cancellation))]
+#[instrument(skip(cancellation, cleanup))]
 pub async fn prepare_rcpd_with_cancellation(
     session: &SshSession,
     explicit_rcpd_path: Option<&str>,
     auto_deploy_rcpd: bool,
     cancellation: tokio_util::sync::CancellationToken,
+    cleanup: &RemoteCleanup,
 ) -> anyhow::Result<PreparedRcpd> {
     prepare_rcpd_with_context(
         session,
         explicit_rcpd_path,
         auto_deploy_rcpd,
-        PreparationContext::new(cancellation),
+        PreparationContext::new(cancellation, cleanup.clone()),
         DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
     )
     .await
@@ -2233,7 +2427,7 @@ async fn prepare_rcpd_with_context(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[instrument]
+#[instrument(skip(cleanup))]
 pub async fn start_rcpd(
     rcpd_config: &protocol::RcpdConfig,
     session: &SshSession,
@@ -2241,6 +2435,7 @@ pub async fn start_rcpd(
     auto_deploy_rcpd: bool,
     bind_ip: Option<&str>,
     role: protocol::RcpdRole,
+    cleanup: &RemoteCleanup,
 ) -> anyhow::Result<RcpdProcess> {
     let bootstrap_timeout =
         std::time::Duration::from_secs(rcpd_config.remote_copy_conn_timeout_sec);
@@ -2248,7 +2443,7 @@ pub async fn start_rcpd(
         session,
         explicit_rcpd_path,
         auto_deploy_rcpd,
-        PreparationContext::uncancelled(),
+        PreparationContext::uncancelled(cleanup.clone()),
         bootstrap_timeout,
     )
     .await?
@@ -2290,7 +2485,7 @@ impl PreparedRcpd {
         ));
         let spawn =
             tokio::spawn(async move { cmd.spawn().await.context("Failed to spawn rcpd command") });
-        let mut child = PreparationContext::uncancelled()
+        let mut child = PreparationContext::uncancelled(self.session.cleanup())
             .run_abortable_with_deadline(spawn, "spawning rcpd command", startup_deadline)
             .await?;
         // read connection info from rcpd's stderr
@@ -2318,23 +2513,25 @@ impl PreparedRcpd {
         };
         // drain both streams concurrently so the daemon cannot block on a full pipe; retain only a
         // bounded tail for completion diagnostics
-        let stderr_drain = tokio::spawn(drain_bounded_output(
+        let stderr_drain = AbortOnDropTask::new(tokio::spawn(drain_bounded_output(
             stderr_reader,
             DIAGNOSTIC_CAPTURE_LIMIT,
-        ));
-        let stdout_drain = child
-            .stdout()
-            .take()
-            .map(|stdout| tokio::spawn(drain_bounded_output(stdout, DIAGNOSTIC_CAPTURE_LIMIT)));
+        )));
+        let stdout_drain = child.stdout().take().map(|stdout| {
+            AbortOnDropTask::new(tokio::spawn(drain_bounded_output(
+                stdout,
+                DIAGNOSTIC_CAPTURE_LIMIT,
+            )))
+        });
         tracing::info!(
             "rcpd listening on {} (encryption={})",
             conn_info.addr,
             conn_info.fingerprint.is_some()
         );
         Ok(RcpdProcess {
-            child,
+            child: Some(child),
             conn_info,
-            stderr_drain,
+            stderr_drain: Some(stderr_drain),
             stdout_drain,
         })
     }
@@ -3054,7 +3251,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_remote_command_output_uses_required_bootstrap_deadline() {
-        let preparation = PreparationContext::uncancelled();
+        let cleanup = RemoteCleanup::new();
+        let preparation = PreparationContext::uncancelled(cleanup.clone());
         let session = setup_ssh_session(
             &SshSession::local(),
             &preparation,
@@ -3079,11 +3277,14 @@ mod tests {
             format!("{error:#}").contains("remote discovery probe timed out after 100ms"),
             "configured deadline missing from remote-command error: {error:#}"
         );
+        drop(preparation);
+        cleanup.finish();
     }
 
     #[tokio::test]
     async fn test_remote_home_lookup_uses_required_bootstrap_deadline() {
-        let preparation = PreparationContext::uncancelled();
+        let cleanup = RemoteCleanup::new();
+        let preparation = PreparationContext::uncancelled(cleanup.clone());
         let session = setup_ssh_session(
             &SshSession::local(),
             &preparation,
@@ -3108,12 +3309,15 @@ mod tests {
             format!("{error:#}").contains("remote HOME lookup timed out after 100ms"),
             "configured deadline missing from HOME lookup error: {error:#}"
         );
+        drop(preparation);
+        cleanup.finish();
     }
 
     #[tokio::test]
     async fn test_remote_cancelled_command_output_is_bounded() {
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let preparation = PreparationContext::new(cancellation.clone());
+        let cleanup = RemoteCleanup::new();
+        let preparation = PreparationContext::new(cancellation.clone(), cleanup.clone());
         let session = setup_ssh_session(
             &SshSession::local(),
             &preparation,
@@ -3139,6 +3343,8 @@ mod tests {
         .await
         .expect("peer cancellation did not bound the remote command");
         cancel.await.unwrap();
+        drop(preparation);
+        cleanup.finish();
         let error = result.expect_err("the cancelled remote command unexpectedly completed");
         assert!(
             format!("{error:#}")
@@ -3165,6 +3371,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cleanup = RemoteCleanup::new();
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(8),
@@ -3175,6 +3382,7 @@ mod tests {
                 false,
                 None,
                 protocol::RcpdRole::Source,
+                &cleanup,
             ),
         )
         .await
@@ -3189,6 +3397,7 @@ mod tests {
             "configured deadline missing from probe error: {error}"
         );
 
+        cleanup.finish();
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3210,9 +3419,15 @@ mod tests {
         );
         std::fs::write(&script, contents).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let prepared = prepare_rcpd(&SshSession::local(), Some(script.to_str().unwrap()), false)
-            .await
-            .unwrap();
+        let cleanup = RemoteCleanup::new();
+        let prepared = prepare_rcpd(
+            &SshSession::local(),
+            Some(script.to_str().unwrap()),
+            false,
+            &cleanup,
+        )
+        .await
+        .unwrap();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             prepared.spawn(&test_rcpd_config(), None, protocol::RcpdRole::Source),
@@ -3228,6 +3443,8 @@ mod tests {
             "configured deadline missing from readiness error: {error}"
         );
         assert_eq!(std::fs::read_to_string(daemon_exit).unwrap(), "exited\n");
+        drop(prepared);
+        cleanup.finish();
     }
 
     #[cfg(unix)]
@@ -3246,9 +3463,15 @@ mod tests {
         );
         std::fs::write(&script, contents).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let prepared = prepare_rcpd(&SshSession::local(), Some(script.to_str().unwrap()), false)
-            .await
-            .unwrap();
+        let cleanup = RemoteCleanup::new();
+        let prepared = prepare_rcpd(
+            &SshSession::local(),
+            Some(script.to_str().unwrap()),
+            false,
+            &cleanup,
+        )
+        .await
+        .unwrap();
         let mut config = test_rcpd_config();
         config.remote_copy_conn_timeout_sec = 5;
         let result = tokio::time::timeout(
@@ -3265,6 +3488,8 @@ mod tests {
             error.contains("readiness record exceeds"),
             "oversized readiness error omitted the size limit: {error}"
         );
+        drop(prepared);
+        cleanup.finish();
     }
 
     #[cfg(unix)]
@@ -3291,9 +3516,15 @@ mod tests {
         std::fs::write(&script, contents).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let config = test_rcpd_config();
-        let prepared = prepare_rcpd(&SshSession::local(), Some(script.to_str().unwrap()), false)
-            .await
-            .unwrap();
+        let cleanup = RemoteCleanup::new();
+        let prepared = prepare_rcpd(
+            &SshSession::local(),
+            Some(script.to_str().unwrap()),
+            false,
+            &cleanup,
+        )
+        .await
+        .unwrap();
         let source = prepared
             .spawn(&config, None, protocol::RcpdRole::Source)
             .await
@@ -3305,6 +3536,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "probe\n");
         wait_for_rcpd_process(source).await.unwrap();
         wait_for_rcpd_process(destination).await.unwrap();
+        drop(prepared);
+        cleanup.finish();
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3330,9 +3563,15 @@ mod tests {
         std::fs::write(&script, contents).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let prepared = prepare_rcpd(&SshSession::local(), Some(script.to_str().unwrap()), false)
-            .await
-            .unwrap();
+        let cleanup = RemoteCleanup::new();
+        let prepared = prepare_rcpd(
+            &SshSession::local(),
+            Some(script.to_str().unwrap()),
+            false,
+            &cleanup,
+        )
+        .await
+        .unwrap();
         let process = prepared
             .spawn(&test_rcpd_config(), None, protocol::RcpdRole::Source)
             .await
@@ -3347,6 +3586,8 @@ mod tests {
             error.contains("daemon stderr detail"),
             "stderr diagnostic missing: {error}"
         );
+        drop(prepared);
+        cleanup.finish();
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3375,9 +3616,15 @@ mod tests {
         );
         std::fs::write(&script, contents).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let prepared = prepare_rcpd(&SshSession::local(), Some(script.to_str().unwrap()), false)
-            .await
-            .unwrap();
+        let cleanup = RemoteCleanup::new();
+        let prepared = prepare_rcpd(
+            &SshSession::local(),
+            Some(script.to_str().unwrap()),
+            false,
+            &cleanup,
+        )
+        .await
+        .unwrap();
         let config = test_rcpd_config();
 
         let refusal = match prepared
@@ -3414,6 +3661,8 @@ mod tests {
             std::fs::read_to_string(&destination_exit).unwrap(),
             "exited\n"
         );
+        drop(prepared);
+        cleanup.finish();
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3445,7 +3694,8 @@ mod tests {
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
         let session = SshSession::local();
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let preparation = PreparationContext::new(cancellation.clone());
+        let cleanup = RemoteCleanup::new();
+        let preparation = PreparationContext::new(cancellation.clone(), cleanup.clone());
         let setup = tokio::spawn(async move {
             setup_ssh_session_with_program(
                 &session,
@@ -3468,6 +3718,11 @@ mod tests {
         let pid = std::fs::read_to_string(&pid_file).unwrap();
         let process = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
         assert!(process.exists(), "fake SSH launcher must still be running");
+        let start_time = linux_process_start_time(&process)
+            .expect("fake SSH launcher must expose a process identity");
+        let arguments = std::fs::read_to_string(&args_file).unwrap();
+        let control_directory = ssh_control_directory_from_arguments(&arguments);
+        assert!(control_directory.exists());
         cancellation.cancel();
         let error = match setup.await.unwrap() {
             Ok(_) => panic!("cancelled SSH setup unexpectedly succeeded"),
@@ -3478,24 +3733,22 @@ mod tests {
                 .to_string()
                 .contains("cancelled because peer preparation failed")
         );
-        let arguments = std::fs::read_to_string(&args_file).unwrap();
         assert!(
             arguments.contains("ForkAfterAuthentication=no")
                 && arguments.contains("ControlPersist=no"),
             "launcher must override SSH config that could background the owned master: {arguments}"
         );
-        let terminated = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while process_is_running(&process) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        if terminated.is_err() {
+        cleanup.finish();
+        if !wait_for_process_identity_to_disappear(&process, &start_time).await {
             let _ = std::process::Command::new("kill")
                 .args(["-KILL", pid.trim()])
                 .status();
-            panic!("cancelling SSH setup left its forked master running");
+            panic!("cancelling SSH setup left its launcher unreaped");
         }
+        assert!(
+            !control_directory.exists(),
+            "cancelled SSH setup must remove its private control directory"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3524,17 +3777,20 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let launcher = directory.path().join("ssh");
         let pid_file = directory.path().join("pid");
+        let args_file = directory.path().join("args");
         std::fs::write(
             &launcher,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$$\" > {}\nexec sleep 30\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > {}\nprintf '%s\\n' \"$$\" > {}\nexec sleep 30\n",
+                shell_escape(args_file.to_str().unwrap()),
                 shell_escape(pid_file.to_str().unwrap()),
             ),
         )
         .unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
         let session = SshSession::local();
-        let preparation = PreparationContext::uncancelled();
+        let cleanup = RemoteCleanup::new();
+        let preparation = PreparationContext::uncancelled(cleanup.clone());
         let mut setup = tokio::spawn(async move {
             setup_ssh_session_with_program(
                 &session,
@@ -3556,6 +3812,11 @@ mod tests {
         .expect("fake SSH launcher must start");
         let pid = std::fs::read_to_string(&pid_file).unwrap();
         let process = std::path::PathBuf::from(format!("/proc/{}", pid.trim()));
+        let start_time = linux_process_start_time(&process)
+            .expect("fake SSH launcher must expose a process identity");
+        let arguments = std::fs::read_to_string(&args_file).unwrap();
+        let control_directory = ssh_control_directory_from_arguments(&arguments);
+        assert!(control_directory.exists());
         let result = match tokio::time::timeout(std::time::Duration::from_secs(2), &mut setup).await
         {
             Ok(result) => result.unwrap(),
@@ -3576,18 +3837,17 @@ mod tests {
             error.contains("SSH session setup timed out after 500ms"),
             "configured deadline missing from SSH setup error: {error}"
         );
-        let terminated = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while process_is_running(&process) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        if terminated.is_err() {
+        cleanup.finish();
+        if !wait_for_process_identity_to_disappear(&process, &start_time).await {
             let _ = std::process::Command::new("kill")
                 .args(["-KILL", pid.trim()])
                 .status();
-            panic!("timed-out SSH setup must terminate its launcher");
+            panic!("timed-out SSH setup must reap its launcher");
         }
+        assert!(
+            !control_directory.exists(),
+            "timed-out SSH setup must remove its private control directory"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -3619,10 +3879,12 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let cleanup = RemoteCleanup::new();
+        let preparation = PreparationContext::uncancelled(cleanup.clone());
         let managed = runtime
             .block_on(setup_ssh_session_with_program(
                 &SshSession::local(),
-                &PreparationContext::uncancelled(),
+                &preparation,
                 &launcher,
                 BootstrapDeadline::new(DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT),
             ))
@@ -3637,7 +3899,8 @@ mod tests {
         runtime.shutdown_timeout(std::time::Duration::from_millis(100));
 
         drop(managed);
-        finish_pending_remote_cleanup();
+        drop(preparation);
+        cleanup.finish();
         if process_is_running(&process) {
             let _ = std::process::Command::new("kill")
                 .args(["-KILL", pid.trim()])
@@ -3659,6 +3922,44 @@ mod tests {
         !status.lines().any(|line| line.starts_with("State:\tZ"))
     }
 
+    #[cfg(target_os = "linux")]
+    fn linux_process_start_time(process: &std::path::Path) -> Option<String> {
+        let stat = std::fs::read_to_string(process.join("stat")).ok()?;
+        let (_, fields) = stat.rsplit_once(") ")?;
+        fields.split_whitespace().nth(19).map(str::to_string)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_process_identity_to_disappear(
+        process: &std::path::Path,
+        start_time: &str,
+    ) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while linux_process_start_time(process).as_deref() == Some(start_time) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ssh_control_directory_from_arguments(arguments: &str) -> std::path::PathBuf {
+        let mut arguments = arguments.split_whitespace();
+        while let Some(argument) = arguments.next() {
+            if argument == "-S" {
+                let socket = arguments
+                    .next()
+                    .expect("SSH -S must be followed by its socket path");
+                return std::path::Path::new(socket)
+                    .parent()
+                    .expect("SSH control socket must have a parent directory")
+                    .to_path_buf();
+            }
+        }
+        panic!("SSH launcher arguments are missing -S: {arguments:?}");
+    }
+
     #[test]
     fn failed_rcpd_output_keeps_both_captured_streams() {
         assert_eq!(
@@ -3674,6 +3975,41 @@ mod tests {
         assert_eq!(output, b"456789");
         assert!(retain_bounded_tail(&mut output, b"abcdefgh", 6));
         assert_eq!(output, b"cdefgh");
+    }
+
+    #[tokio::test]
+    async fn cancelling_output_drain_aborts_its_collector() {
+        struct NotifyDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for NotifyDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let collector = tokio::spawn(async move {
+            let _notify_drop = NotifyDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<CapturedOutput>().await
+        });
+        started_rx.await.unwrap();
+        let drain = tokio::spawn(finish_rcpd_output_drain(
+            AbortOnDropTask::new(collector),
+            "test",
+        ));
+        tokio::task::yield_now().await;
+
+        drain.abort();
+        let _ = drain.await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("cancelling output drain must abort its collector")
+            .unwrap();
     }
 
     #[test]
@@ -3846,23 +4182,22 @@ mod tests {
 
     #[test]
     fn deferred_drop_is_nonblocking_without_a_tokio_runtime() {
+        let cleanup = RemoteCleanup::new();
         let watchdog = std::time::Duration::from_secs(1);
         let (drop_started, wait_for_drop) = std::sync::mpsc::channel();
         let (drop_finished, wait_for_drop_finish) = std::sync::mpsc::channel();
         let (drop_returned, wait_for_return) = std::sync::mpsc::channel();
         let release = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
         let release_guard = BlockingDropRelease(release.clone());
-        let deferred = DeferredDrop::new(
-            BlockingDrop {
-                started: Some(drop_started),
-                release,
-                finished: Some(drop_finished),
-            },
-            "rcp-test-cleanup",
-        );
+        let blocking_drop = BlockingDrop {
+            started: Some(drop_started),
+            release,
+            finished: Some(drop_finished),
+        };
+        let cleanup_for_drop = cleanup.clone();
 
         let coordinator = std::thread::spawn(move || {
-            drop(deferred);
+            cleanup_for_drop.defer_drop(blocking_drop, "rcp-test-cleanup");
             drop_returned.send(()).unwrap();
         });
         wait_for_drop
@@ -3879,43 +4214,155 @@ mod tests {
             returned_before_destructor,
             "dropping the owner must not wait for its blocking destructor"
         );
+        cleanup.finish();
     }
 
     #[test]
-    fn cleanup_barrier_drains_nested_ssh_cleanup_workers() {
-        struct EnqueueSshCleanup(std::path::PathBuf);
+    fn cleanup_scope_drains_nested_cleanup_in_its_parent_worker() {
+        struct EnqueueSshCleanup {
+            cleanup: RemoteCleanup,
+            control_directory: std::path::PathBuf,
+        }
 
         impl Drop for EnqueueSshCleanup {
             fn drop(&mut self) {
-                defer_ssh_cleanup(SshMasterReaper {
-                    launcher: None,
-                    control_directory: Some(self.0.clone()),
-                });
+                self.cleanup.defer_drop(
+                    SshMasterReaper {
+                        launcher: None,
+                        control_directory: Some(self.control_directory.clone()),
+                    },
+                    "rcp-test-nested-ssh-cleanup",
+                );
             }
         }
 
+        let cleanup = RemoteCleanup::new();
         let root = tempfile::tempdir().unwrap();
         let control_directory = root.path().join("control");
         std::fs::create_dir(&control_directory).unwrap();
 
-        drop(DeferredDrop::new(
-            EnqueueSshCleanup(control_directory.clone()),
+        cleanup.defer_drop(
+            EnqueueSshCleanup {
+                cleanup: cleanup.clone(),
+                control_directory: control_directory.clone(),
+            },
             "rcp-test-nested-cleanup",
-        ));
-        finish_pending_remote_cleanup();
+        );
+        cleanup.finish();
 
         assert!(
             !control_directory.exists(),
-            "the barrier must join an outer deferred owner and the SSH cleanup it registers"
+            "the scope must finish nested SSH cleanup before its parent worker completes"
+        );
+    }
+
+    #[test]
+    fn cleanup_scopes_do_not_drain_each_others_workers() {
+        fn blocked_cleanup(
+            cleanup: &RemoteCleanup,
+        ) -> (
+            std::sync::mpsc::Receiver<()>,
+            std::sync::Arc<(Mutex<bool>, Condvar)>,
+        ) {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let release = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+            let worker_release = release.clone();
+            cleanup
+                .spawn("rcp-test-isolated-cleanup", move || {
+                    started_tx.send(()).unwrap();
+                    let (released, release_changed) = &*worker_release;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = release_changed.wait(released).unwrap();
+                    }
+                })
+                .unwrap();
+            (started_rx, release)
+        }
+
+        let cleanup_a = RemoteCleanup::new();
+        let cleanup_b = RemoteCleanup::new();
+        let (started_a, release_a) = blocked_cleanup(&cleanup_a);
+        let (started_b, release_b) = blocked_cleanup(&cleanup_b);
+        started_a
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        started_b
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let (finished_a_tx, finished_a_rx) = std::sync::mpsc::channel();
+        let finish_a = std::thread::spawn(move || {
+            cleanup_a.finish();
+            finished_a_tx.send(()).unwrap();
+        });
+        let (released, release_changed) = &*release_a;
+        *released.lock().unwrap() = true;
+        release_changed.notify_all();
+        finished_a_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("finishing one scope must not wait for another scope's worker");
+        finish_a.join().unwrap();
+
+        let (released, release_changed) = &*release_b;
+        *released.lock().unwrap() = true;
+        release_changed.notify_all();
+        cleanup_b.finish();
+    }
+
+    #[test]
+    fn panicking_cleanup_worker_still_completes_its_scope() {
+        let cleanup = RemoteCleanup::new();
+        cleanup
+            .spawn("rcp-test-panicking-cleanup", || panic!("cleanup panic"))
+            .unwrap();
+
+        cleanup.finish_with_grace(SSH_CLEANUP_JOIN_GRACE);
+
+        let workers = cleanup
+            .0
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(workers.pending, 0);
+        assert!(workers.threads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ssh_socket_readiness_reuses_one_worker() {
+        let cleanup = RemoteCleanup::new();
+        let thread_ids = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let observed_ids = thread_ids.clone();
+        let mut probes = 0;
+        wait_for_ssh_control_socket(&cleanup, move || {
+            observed_ids
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            probes += 1;
+            Ok(probes == 4)
+        })
+        .await
+        .unwrap();
+        cleanup.finish();
+
+        let thread_ids = thread_ids.lock().unwrap();
+        assert_eq!(thread_ids.len(), 4);
+        assert!(
+            thread_ids
+                .iter()
+                .all(|thread_id| *thread_id == thread_ids[0])
         );
     }
 
     #[tokio::test]
     async fn cleanup_barrier_joins_an_abandoned_disposable_worker() {
+        let cleanup = RemoteCleanup::new();
         let release = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
         let worker_release = release.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let operation = tokio::spawn(run_disposable_blocking(
+            cleanup.clone(),
             "rcp-test-disposable-cleanup",
             move || {
                 let _ = started_tx.send(());
@@ -3938,7 +4385,7 @@ mod tests {
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let barrier = std::thread::spawn(move || {
             barrier_started_tx.send(()).unwrap();
-            finish_pending_remote_cleanup();
+            cleanup.finish();
             finished_tx.send(()).unwrap();
         });
         barrier_started_rx
@@ -3975,11 +4422,13 @@ mod tests {
         let (result_ready, wait_for_result) = std::sync::mpsc::channel();
 
         let coordinator = std::thread::spawn(move || {
+            let cleanup = RemoteCleanup::new();
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             let result = runtime.block_on(join_remote_preparations(
+                &cleanup,
                 move |_preparation| async move {
                     success_ready.send(()).unwrap();
                     anyhow::Ok(successful_peer)
@@ -3991,6 +4440,7 @@ mod tests {
             ));
             let _ = result_ready.send(result);
             runtime.shutdown_timeout(watchdog);
+            cleanup.finish();
         });
 
         let drop_started_result = wait_for_drop.recv_timeout(watchdog);
@@ -4038,7 +4488,8 @@ mod tests {
         }
 
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let preparation = PreparationContext::new(cancellation.clone());
+        let cleanup = RemoteCleanup::new();
+        let preparation = PreparationContext::new(cancellation.clone(), cleanup.clone());
         let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let active_in_owner = active.clone();
         let (started, owner_started) = tokio::sync::oneshot::channel();
@@ -4069,11 +4520,14 @@ mod tests {
             !active.load(std::sync::atomic::Ordering::SeqCst),
             "the transaction owner must be dropped before cancellation returns"
         );
+        drop(preparation);
+        cleanup.finish();
     }
 
     #[tokio::test]
     async fn owned_transaction_error_propagates_without_cancellation_grace() {
-        let preparation = PreparationContext::uncancelled();
+        let cleanup = RemoteCleanup::new();
+        let preparation = PreparationContext::uncancelled(cleanup.clone());
         let owner = tokio::spawn(async { Err::<(), _>(anyhow::anyhow!("owned failure")) });
         let started = std::time::Instant::now();
 
@@ -4094,6 +4548,8 @@ mod tests {
             format!("{error:#}").contains("owned failure"),
             "owner error missing from chain: {error:#}"
         );
+        drop(preparation);
+        cleanup.finish();
     }
 
     #[tokio::test]

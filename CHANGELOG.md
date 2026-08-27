@@ -48,18 +48,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   behind a fixed-shell child so a stalled candidate filesystem remains inside the two-second probe
   deadline.
 
+- Local auto-deployment candidate probes now observe peer-preparation cancellation before, during,
+  and after each version check, using the same pipe-close, kill, and reap cleanup as a timeout
+  without rejecting the candidate and falling through. Auto-deployment targets Linux because its
+  fail-closed publication relies on GNU/BusyBox `mv -T`; stock macOS and BSD remote hosts need a
+  matching `rcpd` installed manually.
+
 - SSH multiplex masters now remain owned foreground processes; command-line overrides disable both
   `ForkAfterAuthentication` and `ControlPersist` even when SSH configuration enables them. The
   configured SSH executable is resolved inside a known-shell child, and subsequent commands use the
   native multiplex protocol over the retained control socket instead of synchronously spawning a
   fresh local `ssh`; the configured deadline can therefore cancel every local exec-channel setup.
-  Cancellation or the configured remote setup deadline terminates the actual connecting process. The
-  final successful-session owner signals it immediately, then moves process reaping and private
-  control-directory removal to a tracked OS cleanup thread that remains safe during runtime
-  shutdown. The CLI gives all such workers a bounded join before process exit. Control-directory
-  selection tries runtime, temporary, state, and home locations before reporting that no safe
-  Unix-socket path is available. Remote daemon SSH exec-channel creation and readiness reads use
-  that same configured deadline; readiness records larger than 64 KiB are rejected. Daemon
+  Cancellation or the configured remote setup deadline terminates the actual connecting process. A
+  preparation guard owns that launcher and its private control directory together until it transfers
+  both to the successful-session owner; either exit signals the process immediately, then moves
+  reaping and directory removal to a per-invocation cleanup scope that remains safe during runtime
+  shutdown. Nested cleanup remains in its parent worker, independent invocations cannot drain one
+  another's workers, and the CLI gives the whole scope one bounded join before process exit. SSH
+  control-socket readiness uses one disposable filesystem worker for its polling lifetime rather
+  than creating a thread per poll. Daemon waits run concurrently across endpoints while tracing
+  receivers remain live; any receiver tasks left afterward share one final drain deadline.
+  Control-directory selection tries runtime, temporary, state, and home locations before reporting
+  that no safe Unix-socket path is available. Remote daemon SSH exec-channel creation and readiness
+  reads use that same configured deadline; readiness records larger than 64 KiB are rejected. Daemon
   configuration refusals discovered before tracing use the structured `RCP_ERROR` startup record,
   and unstructured startup failures retain captured stdout/stderr in the error chain. The source
   tracing receiver starts before destination bring-up and is drained on later startup failures,
@@ -72,10 +83,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `remote::TcpConfig` now contains transport settings only. Its pre-existing remote-capacity fields
   and builders moved out; validated file/stream capacities are represented by
-  `ResolvedRemoteConcurrency`. The published-but-internal `rcp-tools-remote` support API also makes
-  `find_local_rcpd_binary` asynchronous so candidates can be version-probed, and `deploy_rcpd` now
-  accepts a cancellation token. These are intentional breaking changes; repository callers use the
-  context-aware implementations directly rather than branch-only compatibility shims.
+  `ResolvedRemoteConcurrency`. The published-but-internal deployment module and its zero-caller
+  convenience wrappers are no longer public; repository callers use the cancellation- and
+  cleanup-aware implementation directly. These are intentional breaking changes to an internal
+  support crate. The internal `rcp-tools-throttle` API likewise removes the zero-caller
+  `set_max_open_files` compatibility wrapper; `set_admission_limits` now takes one typed optional
+  capacity and applies it to both independent admission pools.
 
 - Local recursive copy, remove, chmod, and rlink walks now bound descriptor-heavy leaf work on wide
   or slow trees, preventing `EMFILE` (Too many open files) failures from unbounded leaf fan-out. On

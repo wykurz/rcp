@@ -21,14 +21,6 @@ impl ConcurrencyLimit {
             }
         }
     }
-
-    #[must_use]
-    pub const fn semaphore_capacity(self) -> usize {
-        match self {
-            Self::Unlimited => 0,
-            Self::Limited(value) => value.get(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -528,11 +520,6 @@ mod files_in_flight_policy_tests {
             ConcurrencyLimit::Unlimited.meet(ConcurrencyLimit::Unlimited),
             ConcurrencyLimit::Unlimited,
         );
-    }
-
-    #[test]
-    fn unlimited_uses_the_zero_semaphore_sentinel() {
-        assert_eq!(ConcurrencyLimit::Unlimited.semaphore_capacity(), 0);
     }
 
     #[test]

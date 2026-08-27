@@ -907,7 +907,13 @@ fn main() -> Result<(), anyhow::Error> {
         return Ok(());
     }
 
-    let args = Args::parse();
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(error) if error.use_stderr() => {
+            exit_with_startup_refusal(&error.to_string(), error.exit_code());
+        }
+        Err(error) => error.exit(),
+    };
     let files_in_flight = args.resolve_files_in_flight();
     let concurrency = match args.resolve_remote_concurrency(files_in_flight) {
         Ok(concurrency) => concurrency,

@@ -214,7 +214,9 @@ and version probes — uses the configured remote bootstrap deadline and aborts 
 on expiry. The timeout is applied independently to each stage. Cleanup uses the same bounded helper.
 Binary deployment uses it for command setup, readiness, and each payload-write idle period, but not
 as a wall-clock limit on transmitting the binary; post-EOF verification gets at least 60 seconds.
-Local version probes use their separate fixed two-second deadline.
+Local version probes use their separate fixed two-second deadline. Peer cancellation interrupts
+either candidate probe and uses the same pipe-close, kill, and reap path as its timeout;
+cancellation is returned rather than treated as a rejected candidate.
 
 The SSH multiplex master runs as a retained foreground `ssh -M -N` process. Command-line
 `ForkAfterAuthentication=no` and `ControlPersist=no` overrides prevent user or system SSH
@@ -222,11 +224,15 @@ configuration from backgrounding it. Cancelling setup or reaching the configured
 deadline terminates that actual process. The configured SSH executable is resolved inside a
 known-local shell child. Once the master is ready, rcp opens exec channels through OpenSSH's native
 multiplex protocol over the retained control socket; it does not synchronously find and spawn a new
-local `ssh` process for each remote command. On success, one cloneable managed owner carries the
-multiplex session and foreground child through daemon startup and execution; final teardown signals
-the master and moves both directory removal and process reaping to a tracked OS thread, remaining
-safe after the Tokio runtime has begun shutting down. The CLI gives those workers a bounded join
-before process exit.
+local `ssh` process for each remote command. One disposable filesystem worker polls for
+control-socket readiness throughout setup. A preparation guard owns the foreground child and private
+control directory together until success transfers both to one cloneable managed owner through
+daemon startup and execution. Either exit signals the master and moves directory removal and process
+reaping into the invocation's cleanup scope, remaining safe after the Tokio runtime has begun
+shutting down. Nested cleanup stays in its parent worker, independent invocations cannot drain each
+other's workers, and the CLI gives the whole scope one bounded join before process exit. Daemon
+waits run concurrently across endpoints while tracing receivers remain live; any receiver tasks left
+afterward share one final drain deadline, so endpoint count does not multiply the teardown grace.
 
 Cancellation during staging closes stdin and gives the local SSH-channel task a bounded grace to
 drain the transaction pipes and wait for the child. If it remains blocked, the task is aborted and

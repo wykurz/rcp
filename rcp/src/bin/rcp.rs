@@ -789,21 +789,22 @@ fn validate_destination_readiness(
 fn spawn_tracing_receiver(
     recv_stream: remote::streams::BoxedRecvStream,
     rcpd_type: remote::tracelog::RcpdType,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> remote::AbortOnDropTask<()> {
+    remote::AbortOnDropTask::new(tokio::spawn(async move {
         if let Err(error) = remote::tracelog::run_receiver(recv_stream, rcpd_type).await {
             tracing::debug!("{rcpd_type} tracing receiver ended: {error:#}");
         }
-    })
+    }))
 }
 
-async fn finish_tracing_receiver(
-    mut task: tokio::task::JoinHandle<()>,
-    rcpd_type: remote::tracelog::RcpdType,
-) {
-    const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const TRACING_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-    match tokio::time::timeout(DRAIN_GRACE, &mut task).await {
+async fn finish_tracing_receiver(
+    mut task: remote::AbortOnDropTask<()>,
+    rcpd_type: remote::tracelog::RcpdType,
+    deadline: tokio::time::Instant,
+) {
+    match tokio::time::timeout_at(deadline, task.join()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             tracing::debug!("{rcpd_type} tracing receiver task failed: {error:#}");
@@ -811,14 +812,32 @@ async fn finish_tracing_receiver(
         Err(_) => {
             tracing::debug!("{rcpd_type} tracing receiver did not finish during drain grace");
             task.abort();
-            let _ = task.await;
+            let _ = task.join().await;
         }
     }
 }
 
+async fn finish_tracing_receivers(
+    receivers: Vec<(remote::AbortOnDropTask<()>, remote::tracelog::RcpdType)>,
+) {
+    let deadline = tokio::time::Instant::now() + TRACING_DRAIN_GRACE;
+    futures::future::join_all(
+        receivers
+            .into_iter()
+            .map(|(task, rcpd_type)| finish_tracing_receiver(task, rcpd_type, deadline)),
+    )
+    .await;
+}
+
 async fn wait_for_rcpd_processes(rcpd_processes: Vec<remote::RcpdProcess>, report_failures: bool) {
-    for rcpd in rcpd_processes {
-        if let Err(error) = remote::wait_for_rcpd_process(rcpd).await {
+    let results = futures::future::join_all(
+        rcpd_processes
+            .into_iter()
+            .map(remote::wait_for_rcpd_process),
+    )
+    .await;
+    for result in results {
+        if let Err(error) = result {
             if report_failures {
                 tracing::error!("Failed to wait for rcpd process: {error:#}");
             } else {
@@ -827,6 +846,56 @@ async fn wait_for_rcpd_processes(rcpd_processes: Vec<remote::RcpdProcess>, repor
         }
     }
     tracing::info!("All rcpd processes finished");
+}
+
+async fn finish_remote_teardown<F>(
+    process_wait: F,
+    tracing_receivers: Vec<(remote::AbortOnDropTask<()>, remote::tracelog::RcpdType)>,
+) where
+    F: std::future::Future<Output = ()>,
+{
+    // rcpd can spend several seconds flushing its tracing sender before exit. Keep receivers live
+    // while every daemon finishes, then give all receiver tasks one shared final drain deadline.
+    process_wait.await;
+    finish_tracing_receivers(tracing_receivers).await;
+}
+
+#[derive(Default)]
+struct RemoteTeardown {
+    processes: Vec<remote::RcpdProcess>,
+    tracing_receivers: Vec<(remote::AbortOnDropTask<()>, remote::tracelog::RcpdType)>,
+}
+
+impl RemoteTeardown {
+    fn retain_process(&mut self, process: remote::RcpdProcess) {
+        self.processes.push(process);
+    }
+
+    fn retain_tracing_receiver(
+        &mut self,
+        task: remote::AbortOnDropTask<()>,
+        rcpd_type: remote::tracelog::RcpdType,
+    ) {
+        self.tracing_receivers.push((task, rcpd_type));
+    }
+
+    async fn finish(mut self, report_process_failures: bool) {
+        finish_remote_teardown(
+            wait_for_rcpd_processes(std::mem::take(&mut self.processes), report_process_failures),
+            std::mem::take(&mut self.tracing_receivers),
+        )
+        .await;
+    }
+}
+
+impl Drop for RemoteTeardown {
+    fn drop(&mut self) {
+        // graceful exits consume both collections in finish(). Cancellation or panic still aborts
+        // receiver tasks; dropping RcpdProcess closes daemon channels and aborts its collectors.
+        for (task, _) in self.tracing_receivers.drain(..) {
+            task.abort();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -847,9 +916,10 @@ async fn run_rcpd_master(
     dst: &path::RemotePath,
     request: MasterRemoteRequest,
     master_cert: Option<remote::tls::CertifiedKey>,
+    cleanup: &remote::RemoteCleanup,
 ) -> anyhow::Result<common::copy::Summary> {
     tracing::debug!("running rcpd src/dst");
-    let mut rcpd_processes: Vec<remote::RcpdProcess> = vec![];
+    let mut teardown = RemoteTeardown::default();
     let source_config = build_source_remote_config(&request);
     let source_bind_ip = extract_bind_ip_from_host(&src.session().host);
     let same_session = src.session() == dst.session();
@@ -859,6 +929,7 @@ async fn run_rcpd_master(
         dst.session(),
         args.rcpd_path.as_deref(),
         args.auto_deploy_rcpd,
+        cleanup,
         bootstrap_timeout,
     )
     .await?;
@@ -879,7 +950,7 @@ async fn run_rcpd_master(
             .await?
     };
     let source_conn_info = source_rcpd.conn_info.clone();
-    rcpd_processes.push(source_rcpd);
+    teardown.retain_process(source_rcpd);
     tracing::info!(
         "Source rcpd at {} (encryption={})",
         source_conn_info.addr,
@@ -961,14 +1032,16 @@ async fn run_rcpd_master(
     let (mut source_send_stream, mut source_recv_stream, source_tracing_recv) = match source_setup {
         Ok(setup) => setup,
         Err(error) => {
-            wait_for_rcpd_processes(rcpd_processes, false).await;
+            teardown.finish(false).await;
             return Err(error);
         }
     };
     // start draining immediately. Source startup notices are already queued by this point and must
     // remain visible even if any part of destination bring-up fails.
-    let source_tracing_task =
-        spawn_tracing_receiver(source_tracing_recv, remote::tracelog::RcpdType::Source);
+    teardown.retain_tracing_receiver(
+        spawn_tracing_receiver(source_tracing_recv, remote::tracelog::RcpdType::Source),
+        remote::tracelog::RcpdType::Source,
+    );
 
     let destination_setup = async {
         let destination_config = build_destination_remote_config(&request, &source_conn_info)?;
@@ -1002,7 +1075,7 @@ async fn run_rcpd_master(
         };
         let destination_conn_info = destination_rcpd.conn_info.clone();
         // retain process ownership before validation or connection work introduces another exit.
-        rcpd_processes.push(destination_rcpd);
+        teardown.retain_process(destination_rcpd);
         validate_destination_readiness(&source_conn_info, &destination_conn_info)?;
         tracing::info!(
             "Destination rcpd at {} (encryption={})",
@@ -1041,15 +1114,15 @@ async fn run_rcpd_master(
             Err(error) => {
                 let _ = source_send_stream.close().await;
                 drop(source_recv_stream);
-                wait_for_rcpd_processes(rcpd_processes, false).await;
-                finish_tracing_receiver(source_tracing_task, remote::tracelog::RcpdType::Source)
-                    .await;
+                teardown.finish(false).await;
                 return Err(error);
             }
         };
     tracing::info!("Connected to all rcpd processes");
-    let dest_tracing_task =
-        spawn_tracing_receiver(dest_tracing_recv, remote::tracelog::RcpdType::Destination);
+    teardown.retain_tracing_receiver(
+        spawn_tracing_receiver(dest_tracing_recv, remote::tracelog::RcpdType::Destination),
+        remote::tracelog::RcpdType::Destination,
+    );
     let operation_result = async {
         let filter = request.filter;
         // send MasterHello to source rcpd (include dest fingerprint for mutual TLS)
@@ -1126,9 +1199,7 @@ async fn run_rcpd_master(
     let _ = dest_send_stream.close().await;
     drop(source_recv_stream);
     drop(dest_recv_stream);
-    wait_for_rcpd_processes(rcpd_processes, true).await;
-    finish_tracing_receiver(source_tracing_task, remote::tracelog::RcpdType::Source).await;
-    finish_tracing_receiver(dest_tracing_task, remote::tracelog::RcpdType::Destination).await;
+    teardown.finish(true).await;
 
     let (source_result, dest_result) = operation_result?;
     tracing::debug!("Received RcpdResult from both source and destination rcpds");
@@ -1231,6 +1302,7 @@ async fn run_rcpd_master(
 async fn async_main(
     args: Args,
     files_in_flight: common::ResolvedFilesInFlight,
+    cleanup: remote::RemoteCleanup,
 ) -> anyhow::Result<common::copy::Summary> {
     if args.paths.len() < 2 {
         return Err(anyhow!(
@@ -1352,6 +1424,7 @@ async fn async_main(
         if same_session && (remote_src.needs_remote_home() || remote_dst.needs_remote_home()) {
             let home = remote::get_remote_home_for_session_with_timeout(
                 remote_src.session(),
+                &cleanup,
                 remote_home_timeout,
             )
             .await?;
@@ -1361,6 +1434,7 @@ async fn async_main(
             if remote_src.needs_remote_home() {
                 let home = remote::get_remote_home_for_session_with_timeout(
                     remote_src.session(),
+                    &cleanup,
                     remote_home_timeout,
                 )
                 .await?;
@@ -1369,6 +1443,7 @@ async fn async_main(
             if remote_dst.needs_remote_home() {
                 let home = remote::get_remote_home_for_session_with_timeout(
                     remote_dst.session(),
+                    &cleanup,
                     remote_home_timeout,
                 )
                 .await?;
@@ -1389,6 +1464,7 @@ async fn async_main(
             &remote_dst,
             request,
             master_cert,
+            &cleanup,
         )
         .await
         {
@@ -1690,9 +1766,11 @@ fn main() -> Result<(), anyhow::Error> {
         )
     });
     let is_dry_run = dry_run_warnings.is_some();
+    let remote_cleanup = remote::RemoteCleanup::new();
     let func = {
         let args = args.clone();
-        move || async_main(args, files_in_flight)
+        let remote_cleanup = remote_cleanup.clone();
+        move || async_main(args, files_in_flight, remote_cleanup)
     };
     let output = args
         .common
@@ -1747,7 +1825,7 @@ fn main() -> Result<(), anyhow::Error> {
         None
     };
     let res = common::run(progress, output, runtime, throttle, tracing, func);
-    remote::finish_pending_remote_cleanup();
+    remote_cleanup.finish();
     if let Some(warnings) = dry_run_warnings {
         warnings.print();
     }
@@ -1760,6 +1838,115 @@ fn main() -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn tracing_receivers_share_one_teardown_deadline() {
+        let receivers = vec![
+            (
+                remote::AbortOnDropTask::new(tokio::spawn(std::future::pending())),
+                remote::tracelog::RcpdType::Source,
+            ),
+            (
+                remote::AbortOnDropTask::new(tokio::spawn(std::future::pending())),
+                remote::tracelog::RcpdType::Destination,
+            ),
+        ];
+        let started = tokio::time::Instant::now();
+
+        finish_tracing_receivers(receivers).await;
+
+        assert_eq!(started.elapsed(), TRACING_DRAIN_GRACE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tracing_receivers_remain_live_until_processes_finish() {
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        let receiver = remote::AbortOnDropTask::new(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            let _ = completed_tx.send(());
+        }));
+        let process_wait = async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        };
+        let started = tokio::time::Instant::now();
+
+        finish_remote_teardown(
+            process_wait,
+            vec![(receiver, remote::tracelog::RcpdType::Source)],
+        )
+        .await;
+
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
+        completed_rx
+            .await
+            .expect("receiver must remain live while the daemon is still finishing");
+    }
+
+    #[tokio::test]
+    async fn dropping_remote_teardown_aborts_retained_receivers() {
+        struct NotifyDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for NotifyDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let receiver = remote::AbortOnDropTask::new(tokio::spawn(async move {
+            let _notify_drop = NotifyDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.unwrap();
+        let mut teardown = RemoteTeardown::default();
+        teardown.retain_tracing_receiver(receiver, remote::tracelog::RcpdType::Source);
+
+        drop(teardown);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("teardown drop must abort retained tracing receivers")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_remote_teardown_aborts_owned_receivers() {
+        struct NotifyDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for NotifyDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let receiver = remote::AbortOnDropTask::new(tokio::spawn(async move {
+            let _notify_drop = NotifyDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.unwrap();
+        let teardown = tokio::spawn(finish_remote_teardown(
+            std::future::pending(),
+            vec![(receiver, remote::tracelog::RcpdType::Source)],
+        ));
+        tokio::task::yield_now().await;
+
+        teardown.abort();
+        let _ = teardown.await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("cancelling teardown must abort receivers it already took")
+            .unwrap();
+    }
 
     fn master_args(extra: &[&str]) -> Args {
         let mut argv = vec!["rcp"];
@@ -1930,7 +2117,9 @@ mod tests {
         ])
         .unwrap();
         let files_in_flight = args.common.resolve_files_in_flight();
-        let error = async_main(args, files_in_flight).await.unwrap_err();
+        let error = async_main(args, files_in_flight, remote::RemoteCleanup::new())
+            .await
+            .unwrap_err();
         assert!(
             error.to_string().contains("pending file capacity"),
             "capacity validation must precede remote HOME lookup: {error:#}"
