@@ -389,7 +389,7 @@ When auto-deployment is enabled:
 - `rcp` finds the local `rcpd` binary (same directory or PATH)
 - Local `rcpd --protocol-version` probes have a two-second deadline, while remote probes use the
   configurable remote connection timeout, so a hanging candidate can fall back to deployment; local
-  timeout cleanup gets a bounded one-second reap grace
+  timeout cleanup is retained and reaped by the invocation cleanup supervisor
 - Deploys it to `~/.cache/rcp/bin/rcpd-{version}` on remote hosts via SSH
 - Verifies integrity using SHA-256 checksums
 - Keeps the last 3 versions and cleans up older ones
@@ -776,11 +776,12 @@ wire revision 4.
 Explicit limits are validated before remote `~` expansion. For automatic limits, the master
 validates the configured connection upper bound before remote side effects, then the source resolves
 and validates its actual CPU-selected capacity before it announces readiness; effective-stream and
-pending capacities above Tokio's semaphore maximum are rejected. If either explicitly requested file
-or connection ceiling is clamped by the other ceiling, or an explicit file limit is clamped by
-descriptor safety, a default-visible notice names the requested and effective values. The ordinary
-automatic/default intersection remains quiet. To raise remote parallelism above the source's
-CPU-derived file-work default, raise both ceilings explicitly:
+pending capacities above Tokio's semaphore maximum are rejected. A default-visible notice names the
+requested and effective values when an explicit file ceiling is reduced by the connection ceiling,
+an automatic file ceiling is reduced by an explicit connection ceiling, an explicit connection
+ceiling is reduced by the source file ceiling, or an explicit file limit is reduced by descriptor
+safety. The ordinary automatic/default intersection remains quiet. To raise remote parallelism above
+the source's CPU-derived file-work default, raise both ceilings explicitly:
 
 ```bash
 # Increase for many small files on high-bandwidth links

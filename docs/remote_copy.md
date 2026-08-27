@@ -193,8 +193,8 @@ The `--auto-deploy-rcpd` flag enables automatic transfer and installation of rcp
 1. **Find local rcpd binary**:
    - Check same directory as rcp with a bounded `--protocol-version` probe
    - Fall back to later candidates such as PATH when an earlier candidate is missing, unusable, or
-     incompatible; a timed-out probe has its pipes closed, receives a kill request, and gets a
-     one-second reap grace before an owned background reaper permits fallback
+     incompatible; a timed-out probe has its pipes closed, receives a kill request, and is queued to
+     the invocation cleanup supervisor for reaping while discovery continues
 
 2. **Transfer binary to a temp file**:
    - Read local rcpd binary
@@ -211,12 +211,14 @@ The `--auto-deploy-rcpd` flag enables automatic transfer and installation of rcp
 For distinct hosts, the first preparation failure cancels its peer while preserving the first real
 error. Every read-only remote bootstrap command — HOME lookup, executable checks, PATH discovery,
 and version probes — uses the configured remote bootstrap deadline and aborts its local SSH channel
-on expiry. The timeout is applied independently to each stage. Cleanup uses the same bounded helper.
-Binary deployment uses it for command setup, readiness, and each payload-write idle period, but not
-as a wall-clock limit on transmitting the binary; post-EOF verification gets at least 60 seconds.
-Local version probes use their separate fixed two-second deadline. Peer cancellation interrupts
-either candidate probe and uses the same pipe-close, kill, and reap path as its timeout;
-cancellation is returned rather than treated as a rejected candidate.
+on expiry. The timeout is applied independently to each stage. Remote cache cleanup uses the same
+bounded helper. Binary deployment uses it for command setup, readiness, and each payload-write idle
+period, but not as a wall-clock limit on transmitting the binary; post-EOF verification gets at
+least 60 seconds. Local version probes use their separate fixed two-second deadline. Peer
+cancellation interrupts either candidate probe and uses the same pipe-close, kill, and reap path as
+its timeout; cancellation is returned rather than treated as a rejected candidate. Once termination
+is requested, the prestarted invocation cleanup supervisor owns process reaping; it does not depend
+on a Tokio task surviving runtime shutdown.
 
 The SSH multiplex master runs as a retained foreground `ssh -M -N` process. Command-line
 `ForkAfterAuthentication=no` and `ControlPersist=no` overrides prevent user or system SSH
@@ -227,12 +229,15 @@ multiplex protocol over the retained control socket; it does not synchronously f
 local `ssh` process for each remote command. One disposable filesystem worker polls for
 control-socket readiness throughout setup. A preparation guard owns the foreground child and private
 control directory together until success transfers both to one cloneable managed owner through
-daemon startup and execution. Either exit signals the master and moves directory removal and process
-reaping into the invocation's cleanup scope, remaining safe after the Tokio runtime has begun
-shutting down. Nested cleanup stays in its parent worker, independent invocations cannot drain each
-other's workers, and the CLI gives the whole scope one bounded join before process exit. Daemon
-waits run concurrently across endpoints while tracing receivers remain live; any receiver tasks left
-afterward share one final drain deadline, so endpoint count does not multiply the teardown grace.
+daemon startup and execution. The cleanup supervisor is created before any remote resource is
+accepted. Either exit signals the master and queues process reaping; the control directory is
+removed only after that child is confirmed exited. Nested cleanup stays in its parent worker,
+independent invocations cannot drain each other's workers, and the CLI uses one bounded budget to
+wait for the last resource owner and all work it queued. Daemon waits run concurrently across
+endpoints while tracing receivers remain live; any receiver tasks left afterward share one final
+drain deadline, so endpoint count does not multiply the teardown grace. At debug verbosity, raw
+daemon stdout/stderr is forwarded as it arrives while a bounded tail is retained for nonzero-exit
+diagnostics.
 
 Cancellation during staging closes stdin and gives the local SSH-channel task a bounded grace to
 drain the transaction pipes and wait for the child. If it remains blocked, the task is aborted and

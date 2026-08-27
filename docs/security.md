@@ -166,6 +166,15 @@ User
 2. **SSH infrastructure**: SSH keys, known_hosts, and SSH daemon security
 3. **Remote hosts**: Hosts accessible via SSH are trusted to run rcpd
 
+### Local Deployment Candidates
+
+When `--auto-deploy-rcpd` needs a local binary, rcp runs `--protocol-version` on candidates beside
+the running `rcp` binary and then on the user's `PATH` to verify protocol compatibility before
+deployment. Those locations are therefore trusted local code sources: a candidate is executed with
+the invoking user's privileges. The two-second probe timeout is a liveness bound for a stalled
+candidate, not a sandbox or a mitigation for candidate side effects. Environments with stricter
+local execution controls should use a trusted installation location or deploy rcpd manually.
+
 ### What We Protect Against
 
 - **Network eavesdropping**: All data encrypted

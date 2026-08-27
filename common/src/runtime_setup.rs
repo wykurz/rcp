@@ -541,6 +541,40 @@ fn configure_leaf_admission_limit(capacity: ConcurrencyLimit) -> anyhow::Result<
         .context("failed to configure runtime file admission")
 }
 
+fn configure_file_admission(
+    throttle: &ThrottleConfig,
+    get_soft_limit: impl FnOnce() -> Result<u64, std::io::Error>,
+    configure_limit: impl FnOnce(ConcurrencyLimit) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if !throttle.apply_files_in_flight {
+        return Ok(());
+    }
+    let soft_limit = get_soft_limit().context(
+        "failed to query rlimit; --max-files-in-flight controls performance but cannot bypass descriptor safety",
+    )?;
+    let descriptor_limit = descriptor_admission_limit(soft_limit);
+    let leaf_capacity = resolve_leaf_capacity(throttle.files_in_flight.limit(), descriptor_limit);
+    tracing::info!(
+        "Resolved file admission: file_ceiling={:?}, source={:?}, descriptor_ceiling={:?}, open_file={:?}, pending_meta={:?}",
+        throttle.files_in_flight.limit(),
+        throttle.files_in_flight.source(),
+        descriptor_limit,
+        leaf_capacity,
+        leaf_capacity,
+    );
+    if let Some(diagnostic) = descriptor_clamp_diagnostic(throttle.files_in_flight, leaf_capacity) {
+        match diagnostic.visibility {
+            DescriptorClampVisibility::Notice => {
+                tracing::warn!(target: NOTICE_TARGET, "{}", diagnostic.message);
+            }
+            DescriptorClampVisibility::Verbose => {
+                tracing::info!("{}", diagnostic.message);
+            }
+        }
+    }
+    configure_limit(leaf_capacity)
+}
+
 /// Build a multi-threaded tokio runtime configured per `runtime`, and apply the
 /// file-like work and descriptor-safe admission limits from `throttle`.
 pub(crate) fn build_tokio_runtime(
@@ -555,39 +589,12 @@ pub(crate) fn build_tokio_runtime(
     if runtime.max_blocking_threads > 0 {
         builder.max_blocking_threads(runtime.max_blocking_threads);
     }
-    let soft_limit = get_soft_open_file_limit().context(
-        "failed to query rlimit; --max-files-in-flight controls performance but cannot bypass descriptor safety",
-    )?;
-    let descriptor_limit = descriptor_admission_limit(soft_limit);
-    let file_limit = if throttle.apply_files_in_flight {
-        throttle.files_in_flight.limit()
-    } else {
-        ConcurrencyLimit::Unlimited
-    };
-    let leaf_capacity = resolve_leaf_capacity(file_limit, descriptor_limit);
-    tracing::info!(
-        "Resolved file admission: file_ceiling={:?}, source={:?}, descriptor_ceiling={:?}, open_file={:?}, pending_meta={:?}",
-        throttle.files_in_flight.limit(),
-        throttle.files_in_flight.source(),
-        descriptor_limit,
-        leaf_capacity,
-        leaf_capacity,
-    );
-    if throttle.apply_files_in_flight
-        && let Some(diagnostic) =
-            descriptor_clamp_diagnostic(throttle.files_in_flight, leaf_capacity)
-    {
-        match diagnostic.visibility {
-            DescriptorClampVisibility::Notice => {
-                tracing::warn!(target: NOTICE_TARGET, "{}", diagnostic.message);
-            }
-            DescriptorClampVisibility::Verbose => {
-                tracing::info!("{}", diagnostic.message);
-            }
-        }
-    }
     let runtime = builder.build().context("failed to create Tokio runtime")?;
-    configure_leaf_admission_limit(leaf_capacity)?;
+    configure_file_admission(
+        throttle,
+        get_soft_open_file_limit,
+        configure_leaf_admission_limit,
+    )?;
     Ok(runtime)
 }
 
@@ -721,6 +728,36 @@ mod default_leaf_operation_limit_tests {
                 .downcast_ref::<throttle::AdmissionCapacityError>()
                 .is_some(),
             "runtime setup must preserve the typed throttle error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn disabled_file_admission_does_not_query_or_configure_limits() {
+        let throttle = ThrottleConfig {
+            apply_files_in_flight: false,
+            ..ThrottleConfig::default()
+        };
+        let mut queried = false;
+        let mut configured = false;
+        configure_file_admission(
+            &throttle,
+            || {
+                queried = true;
+                Err(std::io::Error::other(
+                    "disabled admission must not query rlimit",
+                ))
+            },
+            |_| {
+                configured = true;
+                Ok(())
+            },
+        )
+        .expect("disabled file admission must not touch runtime admission state");
+
+        assert!(!queried, "disabled file admission queried rlimit");
+        assert!(
+            !configured,
+            "disabled file admission reconfigured throttle pools"
         );
     }
 

@@ -17,7 +17,7 @@ echo "🔍 Checking for anyhow::Error::msg() usage..."
 VIOLATIONS_FOUND=0
 
 # Directories to check
-SEARCH_DIRS="common/src rcp/src rlink/src rrm/src rcmp/src filegen/src"
+SEARCH_DIRS="common/src congestion/src filegen/src rchm/src rcmp/src rcp/src remote/src rlink/src rrm/src throttle/src"
 
 # Detect usages outside of comments
 check_file() {
