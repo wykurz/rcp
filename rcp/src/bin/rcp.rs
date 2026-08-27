@@ -531,7 +531,15 @@ fn remote_stream_clamp_notice(
         let option = match files_in_flight.source() {
             common::FilesInFlightSource::DeprecatedMaxOpenFiles => "--max-open-files",
             common::FilesInFlightSource::Explicit => "--max-files-in-flight",
-            common::FilesInFlightSource::Automatic => return None,
+            common::FilesInFlightSource::Automatic => {
+                if !connection_ceiling.is_explicit() {
+                    return None;
+                }
+                return Some(format!(
+                    "The source's automatic file ceiling of {file_limit} was reduced to {effective_connections} remote data streams by {}",
+                    connection_ceiling.description()
+                ));
+            }
         };
         let connection_ceiling = connection_ceiling.description();
         return Some(format!(
@@ -1302,7 +1310,7 @@ async fn run_rcpd_master(
 async fn async_main(
     args: Args,
     files_in_flight: common::ResolvedFilesInFlight,
-    cleanup: remote::RemoteCleanup,
+    cleanup: Option<remote::RemoteCleanup>,
 ) -> anyhow::Result<common::copy::Summary> {
     if args.paths.len() < 2 {
         return Err(anyhow!(
@@ -1398,6 +1406,9 @@ async fn async_main(
     };
     tracing::debug!("preserve settings: {:?}", &preserve);
     if let Some((mut remote_src, mut remote_dst)) = remote_src_dst {
+        let cleanup = cleanup
+            .as_ref()
+            .expect("remote operations start with a cleanup supervisor");
         // install rustls crypto provider (ring) before any TLS operations
         rustls::crypto::ring::default_provider()
             .install_default()
@@ -1424,7 +1435,7 @@ async fn async_main(
         if same_session && (remote_src.needs_remote_home() || remote_dst.needs_remote_home()) {
             let home = remote::get_remote_home_for_session_with_timeout(
                 remote_src.session(),
-                &cleanup,
+                cleanup,
                 remote_home_timeout,
             )
             .await?;
@@ -1434,7 +1445,7 @@ async fn async_main(
             if remote_src.needs_remote_home() {
                 let home = remote::get_remote_home_for_session_with_timeout(
                     remote_src.session(),
-                    &cleanup,
+                    cleanup,
                     remote_home_timeout,
                 )
                 .await?;
@@ -1443,7 +1454,7 @@ async fn async_main(
             if remote_dst.needs_remote_home() {
                 let home = remote::get_remote_home_for_session_with_timeout(
                     remote_dst.session(),
-                    &cleanup,
+                    cleanup,
                     remote_home_timeout,
                 )
                 .await?;
@@ -1464,7 +1475,7 @@ async fn async_main(
             &remote_dst,
             request,
             master_cert,
-            &cleanup,
+            cleanup,
         )
         .await
         {
@@ -1766,7 +1777,10 @@ fn main() -> Result<(), anyhow::Error> {
         )
     });
     let is_dry_run = dry_run_warnings.is_some();
-    let remote_cleanup = remote::RemoteCleanup::new();
+    let remote_cleanup = is_remote_operation
+        .then(remote::RemoteCleanup::new)
+        .transpose()
+        .context("failed to start remote cleanup supervisor")?;
     let func = {
         let args = args.clone();
         let remote_cleanup = remote_cleanup.clone();
@@ -1825,7 +1839,9 @@ fn main() -> Result<(), anyhow::Error> {
         None
     };
     let res = common::run(progress, output, runtime, throttle, tracing, func);
-    remote_cleanup.finish();
+    if let Some(remote_cleanup) = remote_cleanup {
+        remote_cleanup.finish();
+    }
     if let Some(warnings) = dry_run_warnings {
         warnings.print();
     }
@@ -2117,9 +2133,13 @@ mod tests {
         ])
         .unwrap();
         let files_in_flight = args.common.resolve_files_in_flight();
-        let error = async_main(args, files_in_flight, remote::RemoteCleanup::new())
-            .await
-            .unwrap_err();
+        let error = async_main(
+            args,
+            files_in_flight,
+            Some(remote::RemoteCleanup::new().unwrap()),
+        )
+        .await
+        .unwrap_err();
         assert!(
             error.to_string().contains("pending file capacity"),
             "capacity validation must precede remote HOME lookup: {error:#}"
@@ -2228,10 +2248,11 @@ mod tests {
 
     #[test]
     fn master_rejects_pending_capacity_overflow_before_spawn() {
-        let max_connections = usize::MAX.to_string();
+        let max_connections = tokio::sync::Semaphore::MAX_PERMITS.to_string();
+        let pending_writes_multiplier = usize::MAX.to_string();
         let args = master_args(&[
             &format!("--max-connections={max_connections}"),
-            "--pending-writes-multiplier=2",
+            &format!("--pending-writes-multiplier={pending_writes_multiplier}"),
             "--max-open-files=0",
         ]);
         let error =
@@ -2314,6 +2335,22 @@ mod tests {
                 std::num::NonZeroUsize::new(4).unwrap(),
             ),
             None
+        );
+    }
+
+    #[test]
+    fn explicit_connection_ceiling_reports_automatic_file_limit_clamp() {
+        let notice = remote_stream_clamp_notice(
+            common::ResolvedFilesInFlight::automatic_with(std::num::NonZeroUsize::new(64).unwrap()),
+            common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(64).unwrap()),
+            ConnectionCeiling::from_arg(std::num::NonZeroUsize::new(16)),
+            std::num::NonZeroUsize::new(16).unwrap(),
+        );
+        assert_eq!(
+            notice.as_deref(),
+            Some(
+                "The source's automatic file ceiling of 64 was reduced to 16 remote data streams by --max-connections=16"
+            )
         );
     }
 

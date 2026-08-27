@@ -61,25 +61,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fresh local `ssh`; the configured deadline can therefore cancel every local exec-channel setup.
   Cancellation or the configured remote setup deadline terminates the actual connecting process. A
   preparation guard owns that launcher and its private control directory together until it transfers
-  both to the successful-session owner; either exit signals the process immediately, then moves
-  reaping and directory removal to a per-invocation cleanup scope that remains safe during runtime
-  shutdown. Nested cleanup remains in its parent worker, independent invocations cannot drain one
-  another's workers, and the CLI gives the whole scope one bounded join before process exit. SSH
-  control-socket readiness uses one disposable filesystem worker for its polling lifetime rather
-  than creating a thread per poll. Daemon waits run concurrently across endpoints while tracing
-  receivers remain live; any receiver tasks left afterward share one final drain deadline.
-  Control-directory selection tries runtime, temporary, state, and home locations before reporting
-  that no safe Unix-socket path is available. Remote daemon SSH exec-channel creation and readiness
-  reads use that same configured deadline; readiness records larger than 64 KiB are rejected. Daemon
-  configuration refusals discovered before tracing use the structured `RCP_ERROR` startup record,
-  and unstructured startup failures retain captured stdout/stderr in the error chain. The source
-  tracing receiver starts before destination bring-up and is drained on later startup failures,
-  preserving queued source notices beside the destination error. Source connection failures also
-  wait for daemon cleanup. Daemon completion joins bounded stdout/stderr collectors, and deployment
-  drains bounded diagnostics while preferring the remote failure over a secondary stdin-shutdown
-  error. Explicit connection requests clamped by the source file ceiling now produce a
-  default-visible notice; legacy file-limit notices preserve the `--max-open-files` spelling the
-  user supplied.
+  both to the successful-session owner. A cleanup supervisor is started before any remote resource
+  is accepted; either exit signals the process immediately and queues reaping there, and the control
+  directory is removed only after the process is confirmed exited. Local candidate reaping uses the
+  same scope rather than a detach-on-timeout Tokio task. Nested cleanup remains in its parent
+  worker, independent invocations cannot drain one another's workers, and the CLI gives the scope
+  one bounded budget for its final resource owner and queued jobs. SSH control-socket readiness uses
+  one disposable filesystem worker for its polling lifetime rather than creating a thread per poll.
+  Daemon waits run concurrently across endpoints while tracing receivers remain live; any receiver
+  tasks left afterward share one final drain deadline. Control-directory selection tries runtime,
+  temporary, state, and home locations before reporting that no safe Unix-socket path is available.
+  Remote daemon SSH exec-channel creation and readiness reads use that same configured deadline;
+  readiness records larger than 64 KiB are rejected. Daemon configuration refusals discovered before
+  tracing use the structured `RCP_ERROR` startup record, and unstructured startup failures retain
+  captured stdout/stderr in the error chain. The source tracing receiver starts before destination
+  bring-up and is drained on later startup failures, preserving queued source notices beside the
+  destination error. Source connection failures also wait for daemon cleanup. Daemon stdout/stderr
+  is forwarded live at debug verbosity while a bounded tail is retained and joined for completion
+  diagnostics; deployment likewise drains bounded diagnostics while preferring the remote failure
+  over a secondary stdin-shutdown error. An explicit connection request clamped by the source file
+  ceiling, or an automatic source file ceiling clamped by an explicit connection request, now
+  produces a default-visible notice; legacy file-limit notices preserve the `--max-open-files`
+  spelling the user supplied.
 
 - `remote::TcpConfig` now contains transport settings only. Its pre-existing remote-capacity fields
   and builders moved out; validated file/stream capacities are represented by

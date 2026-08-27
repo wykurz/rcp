@@ -105,7 +105,6 @@ use std::process::{Output, Stdio};
 use std::time::Duration;
 
 const LOCAL_RCPD_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
-const LOCAL_RCPD_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 const REMOTE_STAGING_OWNER_GRACE: Duration = Duration::from_secs(1);
 const REMOTE_STAGING_FINALIZATION_MINIMUM: Duration = Duration::from_secs(60);
 const DEPLOYMENT_READY_RECORD: &str = "RCP_DEPLOY_READY";
@@ -118,21 +117,16 @@ const TRANSFER_HINTS: &str = "\
     - Permission denied creating $HOME/.cache/rcp/bin\n\
     - base64 command not available on remote host";
 
-/// Build an error message for a failed stdin write during binary transfer.
+/// Build diagnostic context for a failed stdin write during binary transfer.
 ///
-/// When writing base64 data to the remote SSH process fails (typically a broken
-/// pipe because the remote command exited early), this formats the error to
-/// include remote stderr (which reveals the actual cause) and the exit status.
-fn format_write_error(
-    write_err: &dyn std::fmt::Display,
-    stderr_data: &[u8],
-    status: &dyn std::fmt::Display,
-) -> String {
+/// The original write error remains the source in the error chain. This context adds remote stderr
+/// when available, or the exit status when stderr is empty.
+fn format_write_error_context(stderr_data: &[u8], status: &dyn std::fmt::Display) -> String {
     let stderr = String::from_utf8_lossy(stderr_data);
     let stderr = stderr.trim();
     if stderr.is_empty() {
         format!(
-            "failed to write base64 data to remote stdin: {write_err:#}\n\
+            "failed to write base64 data to remote stdin\n\
             \n\
             remote command exited with status: {status}\n\
             remote stderr was empty\n\
@@ -141,7 +135,7 @@ fn format_write_error(
         )
     } else {
         format!(
-            "failed to write base64 data to remote stdin: {write_err:#}\n\
+            "failed to write base64 data to remote stdin\n\
             \n\
             remote stderr: {stderr}\n\
             \n\
@@ -157,10 +151,8 @@ fn validate_transfer_completion(
     status: &std::process::ExitStatus,
 ) -> anyhow::Result<()> {
     if let Some(Err(write_error)) = write_result {
-        anyhow::bail!(
-            "{}",
-            format_write_error(&write_error, stderr_data.rendered().as_bytes(), status)
-        );
+        let context = format_write_error_context(stderr_data.rendered().as_bytes(), status);
+        return Err(write_error.context(context));
     }
 
     if !status.success() {
@@ -491,28 +483,11 @@ async fn run_local_version_probe(
                 );
             }
             let candidate = path.to_path_buf();
-            let cleanup = cleanup_with_deadline(
-                async move {
-                    if let Err(error) = child.wait().await {
-                        tracing::debug!(
-                            "failed to reap interrupted local rcpd candidate {}: {error:#}",
-                            candidate.display()
-                        );
-                    }
-                },
-                LOCAL_RCPD_CLEANUP_GRACE,
-            )
-            .await;
-            match cleanup {
-                CleanupOutcome::Completed | CleanupOutcome::TaskFailed => {}
-                CleanupOutcome::TimedOut => {
-                    tracing::debug!(
-                        "local rcpd candidate {} did not reap within {}; background reaper retained ownership",
-                        path.display(),
-                        humantime::format_duration(LOCAL_RCPD_CLEANUP_GRACE)
-                    );
-                }
-            }
+            preparation
+                .cleanup
+                .defer("rcp-local-candidate-reap", move || {
+                    reap_interrupted_local_candidate(child, &candidate);
+                });
             match interrupted {
                 LocalProbeOutcome::Cancelled => {
                     Err(crate::PreparationContext::cancellation_error())
@@ -525,6 +500,22 @@ async fn run_local_version_probe(
                     )
                 }),
                 LocalProbeOutcome::Completed(_) => unreachable!("handled above"),
+            }
+        }
+    }
+}
+
+fn reap_interrupted_local_candidate(mut child: tokio::process::Child, candidate: &std::path::Path) {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                tracing::debug!(
+                    "failed to reap interrupted local rcpd candidate {}: {error:#}",
+                    candidate.display()
+                );
+                break;
             }
         }
     }
@@ -555,27 +546,6 @@ fn finish_local_probe_capture(
         Ok(output.rendered().into_bytes())
     } else {
         Ok(output.bytes)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CleanupOutcome {
-    Completed,
-    TaskFailed,
-    TimedOut,
-}
-
-async fn cleanup_with_deadline<F>(cleanup: F, grace: Duration) -> CleanupOutcome
-where
-    F: std::future::Future<Output = ()> + Send + 'static,
-{
-    match tokio::time::timeout(grace, tokio::spawn(cleanup)).await {
-        Ok(Ok(())) => CleanupOutcome::Completed,
-        Ok(Err(error)) => {
-            tracing::debug!("cleanup task failed: {error:#}");
-            CleanupOutcome::TaskFailed
-        }
-        Err(_) => CleanupOutcome::TimedOut,
     }
 }
 
@@ -1039,10 +1009,9 @@ where
         line.extend_from_slice(&available[..take]);
         reader.consume(take);
         if newline.is_some() {
-            let record = std::str::from_utf8(&line)
-                .context("remote deployment readiness output is not valid UTF-8")?
-                .trim_end_matches(['\r', '\n']);
-            if record == DEPLOYMENT_READY_RECORD {
+            let record = line.strip_suffix(b"\n").unwrap_or(&line);
+            let record = record.strip_suffix(b"\r").unwrap_or(record);
+            if record == DEPLOYMENT_READY_RECORD.as_bytes() {
                 return Ok(preamble);
             }
             preamble.extend_from_slice(&line);
@@ -1215,7 +1184,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn same_directory_version_probe_stops_and_reaps_on_peer_cancellation() {
+    async fn cleanup_scope_reaps_same_directory_probe_after_peer_cancellation() {
         let test_dir = TestDirectory::new();
         let pid_file = test_dir.0.join("candidate.pid");
         let fifo = test_dir.fifo("candidate.fifo");
@@ -1230,7 +1199,7 @@ mod tests {
         let current_exe = test_dir.0.join("rcp");
         assert_eq!(current_exe.parent(), candidate.parent());
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let cleanup = crate::RemoteCleanup::new();
+        let cleanup = crate::RemoteCleanup::new().unwrap();
         let preparation = crate::PreparationContext::new(cancellation.clone(), cleanup.clone());
         let discovery = tokio::spawn(async move {
             find_local_rcpd_binary_with_context_from_current_exe(&preparation, Some(current_exe))
@@ -1266,15 +1235,15 @@ mod tests {
                 .contains("cancelled because peer preparation failed"),
             "unexpected cancellation error: {error:#}"
         );
-        wait_for_process_identity_to_be_reaped(&pid, &candidate_start_time).await;
         cleanup.finish();
+        wait_for_process_identity_to_be_reaped(&pid, &candidate_start_time).await;
     }
 
     #[test]
     fn final_local_candidate_failure_preserves_peer_cancellation() {
         let cancellation = tokio_util::sync::CancellationToken::new();
         cancellation.cancel();
-        let cleanup = crate::RemoteCleanup::new();
+        let cleanup = crate::RemoteCleanup::new().unwrap();
         let preparation = crate::PreparationContext::new(cancellation, cleanup.clone());
 
         let searched_paths = ["PATH: /test/rcpd".to_string()];
@@ -1296,7 +1265,7 @@ mod tests {
         let test_dir = TestDirectory::new();
         let hanging = test_dir.script("hanging-rcpd", "#!/bin/sh\n(sleep 2) &\nexit 0\n");
         let local_version = common::version::ProtocolVersion::current();
-        let cleanup = crate::RemoteCleanup::new();
+        let cleanup = crate::RemoteCleanup::new().unwrap();
         let preparation = crate::PreparationContext::uncancelled(cleanup.clone());
         let compatible = test_dir.script(
             "compatible-rcpd",
@@ -1354,7 +1323,7 @@ mod tests {
             "#!/bin/sh\nprintf '%s\\n' 'candidate refused version probe' >&2\nexit 7\n",
         );
         let local_version = common::version::ProtocolVersion::current();
-        let cleanup = crate::RemoteCleanup::new();
+        let cleanup = crate::RemoteCleanup::new().unwrap();
         let preparation = crate::PreparationContext::uncancelled(cleanup.clone());
         let error = check_local_rcpd_version(
             &preparation,
@@ -1385,7 +1354,7 @@ mod tests {
                 crate::DIAGNOSTIC_CAPTURE_LIMIT + 1
             ),
         );
-        let cleanup = crate::RemoteCleanup::new();
+        let cleanup = crate::RemoteCleanup::new().unwrap();
         let preparation = crate::PreparationContext::uncancelled(cleanup.clone());
 
         let error = run_local_version_probe(&preparation, &candidate, Duration::from_secs(2))
@@ -1413,7 +1382,7 @@ mod tests {
                 crate::DIAGNOSTIC_CAPTURE_LIMIT + 1
             ),
         );
-        let cleanup = crate::RemoteCleanup::new();
+        let cleanup = crate::RemoteCleanup::new().unwrap();
         let preparation = crate::PreparationContext::uncancelled(cleanup.clone());
 
         let output = run_local_version_probe(&preparation, &candidate, Duration::from_secs(2))
@@ -1433,31 +1402,11 @@ mod tests {
         cleanup.finish();
     }
 
-    #[tokio::test]
-    async fn version_probe_pending_cleanup_returns_after_its_grace_period() {
-        let started = std::time::Instant::now();
-        let completed =
-            cleanup_with_deadline(std::future::pending::<()>(), Duration::from_millis(20)).await;
-        assert_eq!(completed, CleanupOutcome::TimedOut);
-        assert!(started.elapsed() < Duration::from_secs(1));
-    }
-
-    #[tokio::test]
-    async fn panicking_cleanup_is_not_reported_as_completion() {
-        let completed = cleanup_with_deadline(
-            async { panic!("test cleanup panic") },
-            Duration::from_secs(1),
-        )
-        .await;
-
-        assert_eq!(completed, CleanupOutcome::TaskFailed);
-    }
-
     #[test]
     fn path_discovery_failure_preserves_peer_cancellation() {
         let cancellation = tokio_util::sync::CancellationToken::new();
         cancellation.cancel();
-        let cleanup = crate::RemoteCleanup::new();
+        let cleanup = crate::RemoteCleanup::new().unwrap();
         let preparation = crate::PreparationContext::new(cancellation, cleanup.clone());
         let mut searched_paths = Vec::new();
 
@@ -1491,6 +1440,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining, "post-marker output\n");
+    }
+
+    #[tokio::test]
+    async fn deployment_readiness_retains_non_utf8_stdout_preamble() {
+        let input = b"\xffremote banner\nRCP_DEPLOY_READY\n";
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+
+        let preamble = read_deployment_readiness(&mut reader).await.unwrap();
+
+        assert_eq!(preamble, b"\xffremote banner\n");
     }
 
     #[tokio::test]
@@ -1815,11 +1774,9 @@ mod tests {
     }
 
     #[test]
-    fn write_error_with_stderr_includes_remote_output() {
-        let err = std::io::Error::from_raw_os_error(32); // EPIPE
+    fn write_error_context_with_stderr_includes_remote_output() {
         let stderr = b"mkdir: cannot create directory: Permission denied";
-        let msg = format_write_error(&err, stderr, &"exited with 1");
-        assert!(msg.contains("Broken pipe"), "should contain write error");
+        let msg = format_write_error_context(stderr, &"exited with 1");
         assert!(
             msg.contains("Permission denied"),
             "should contain remote stderr"
@@ -1836,11 +1793,9 @@ mod tests {
     }
 
     #[test]
-    fn write_error_without_stderr_includes_exit_status() {
-        let err = std::io::Error::from_raw_os_error(32);
+    fn write_error_context_without_stderr_includes_exit_status() {
         let stderr = b"";
-        let msg = format_write_error(&err, stderr, &"exited with 126");
-        assert!(msg.contains("Broken pipe"), "should contain write error");
+        let msg = format_write_error_context(stderr, &"exited with 126");
         assert!(
             msg.contains("remote command exited with status: exited with 126"),
             "should contain exit status"
@@ -1856,15 +1811,55 @@ mod tests {
     }
 
     #[test]
-    fn write_error_trims_whitespace_only_stderr() {
-        let err = std::io::Error::from_raw_os_error(32);
+    fn write_error_context_trims_whitespace_only_stderr() {
         let stderr = b"  \n\t  ";
-        let msg = format_write_error(&err, stderr, &"exited with 1");
+        let msg = format_write_error_context(stderr, &"exited with 1");
         // whitespace-only stderr should be treated as empty
         assert!(
             msg.contains("remote stderr was empty"),
             "whitespace-only stderr should be treated as empty"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn payload_write_failure_preserves_its_source_and_diagnostics() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let stderr = crate::CapturedOutput {
+            bytes: b"base64: invalid input\n".to_vec(),
+            ..crate::CapturedOutput::default()
+        };
+        let error = validate_transfer_completion(
+            Some(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "sentinel payload write failure",
+            )
+            .into())),
+            None,
+            &stderr,
+            &std::process::ExitStatus::from_raw(1 << 8),
+        )
+        .unwrap_err();
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("sentinel payload write failure"),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("sentinel payload write failure").count(),
+            1,
+            "payload write cause was rendered more than once: {rendered}"
+        );
+        assert!(rendered.contains("base64: invalid input"), "{rendered}");
+        assert!(rendered.contains(TRANSFER_HINTS), "{rendered}");
+        let source = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .expect("payload write source must remain in the error chain");
+        assert_eq!(source.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(source.to_string(), "sentinel payload write failure");
     }
 
     #[cfg(unix)]

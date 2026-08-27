@@ -71,25 +71,25 @@ readiness record, typed internal spawn arguments, and source-first bootstrap con
 normal remote discovery at both boundaries. The master runs `--protocol-version` on each local
 candidate in search order (beside `rcp`, then `PATH`) and continues to later candidates when one is
 stale, stalls its two-second version probe, or is otherwise unusable. A timed-out local candidate
-has its pipes released and receives a kill request; reaping gets a one-second grace, after which an
-owned, runtime-scoped background reaper permits the search to continue without immediately losing
-child ownership. Remote version probes, including post-deployment verification, use the initiating
-`rcp` process's `--remote-copy-conn-timeout-sec` deadline so slow-but-healthy hosts can be given an
-appropriate budget without allowing a hanging SSH channel to block fallback indefinitely. The master
-names the cache target with the accepted version's compatibility tag, transfers and publishes the
-binary, then probes that deployed remote path before constructing either role's spawn command. Thus
-neither co-location nor a current-looking cache filename is treated as proof that the binary
-implements the current serialized and rcpd spawn contract. For distinct hosts, the first preparation
-failure cooperatively cancels its peer without dropping owned work or replacing the original error.
-SSH control-socket readiness uses the same configured deadline and one cancellation-aware filesystem
-worker for its whole polling lifetime. Every read-only remote bootstrap command — HOME lookup,
-executable checks, PATH discovery, and version probes — goes through one helper that requires that
-per-stage timeout; expiry aborts and joins its local SSH-channel task. Cleanup is best effort and
-uses the same bounded helper. Binary deployment uses the timeout for its HOME lookup, SSH command,
-readiness marker, and each payload-write idle period, but not as a wall-clock limit on transmitting
-the binary. Post-EOF checksum verification and publication use a bounded stage of at least 60
-seconds. On peer cancellation, the transfer gets a bounded grace to close stdin and finish before
-its local SSH-channel task is aborted and joined.
+has its pipes released and receives a kill request; the invocation cleanup supervisor retains child
+ownership and reaps it while the search continues. Remote version probes, including post-deployment
+verification, use the initiating `rcp` process's `--remote-copy-conn-timeout-sec` deadline so
+slow-but-healthy hosts can be given an appropriate budget without allowing a hanging SSH channel to
+block fallback indefinitely. The master names the cache target with the accepted version's
+compatibility tag, transfers and publishes the binary, then probes that deployed remote path before
+constructing either role's spawn command. Thus neither co-location nor a current-looking cache
+filename is treated as proof that the binary implements the current serialized and rcpd spawn
+contract. For distinct hosts, the first preparation failure cooperatively cancels its peer without
+dropping owned work or replacing the original error. SSH control-socket readiness uses the same
+configured deadline and one cancellation-aware filesystem worker for its whole polling lifetime.
+Every read-only remote bootstrap command — HOME lookup, executable checks, PATH discovery, and
+version probes — goes through one helper that requires that per-stage timeout; expiry aborts and
+joins its local SSH-channel task. Remote cache cleanup is best effort and uses the same bounded
+helper. Binary deployment uses the timeout for its HOME lookup, SSH command, readiness marker, and
+each payload-write idle period, but not as a wall-clock limit on transmitting the binary. Post-EOF
+checksum verification and publication use a bounded stage of at least 60 seconds. On peer
+cancellation, the transfer gets a bounded grace to close stdin and finish before its local
+SSH-channel task is aborted and joined.
 
 The SSH multiplex master runs as a retained foreground `ssh -M -N` process; explicit
 `ForkAfterAuthentication=no` and `ControlPersist=no` command-line overrides prevent user or system
@@ -100,13 +100,14 @@ multiplex protocol over the retained control socket rather than synchronously sp
 `ssh`, so their configured deadline also covers exec-channel creation. A preparation guard owns the
 foreground child and private control directory together until success transfers both to a cloneable
 managed session through prepared and running daemon states. Whichever owner exits signals the master
-before returning. Process reaping and directory removal move together to a worker in the command's
-cleanup scope, so neither can block or depend on a Tokio runtime that may already be shutting down.
+before returning. The cleanup supervisor is created before any remote resource is accepted. Process
+reaping is queued there, so it cannot block or depend on a Tokio runtime that may already be
+shutting down; the control directory is removed only after the retained child is confirmed exited.
 Nested cleanup runs inside its parent worker, and separate invocations cannot drain one another's
-workers. Before process exit, the CLI closes that scope and gives the whole worker group one bounded
-join; a filesystem operation still blocked after that grace is abandoned with the process. Daemon
-waits run concurrently across endpoints while tracing receivers stay live, then any remaining
-receiver tasks share one final drain deadline.
+workers. Before process exit, the CLI gives the scope one bounded budget to wait for its last
+resource owner and every cleanup job; a filesystem operation still blocked after that grace is
+abandoned with the process. Daemon waits run concurrently across endpoints while tracing receivers
+stay live, then any remaining receiver tasks share one final drain deadline.
 
 Deployment stages, verifies, and publishes through one remote `sh` transaction. Before anything can
 create the unique temp path, that shell installs an `EXIT` trap which removes it. After directory
@@ -133,17 +134,19 @@ installed. The master treats that typed record as a nested failure cause, closes
 gives an owned reaper a bounded grace before returning; if the grace expires, the detached reaper
 retains child ownership while the runtime remains active. If startup fails without a typed record,
 captured stdout and remaining stderr are attached to the handshake error. Arbitrary stderr remains
-an invalid readiness record. After readiness, bounded stdout/stderr collectors are joined on daemon
-completion, so a nonzero exit retains diagnostics without allowing unbounded output to grow in
-memory or leaving collector tasks detached. An explicit `F` reduced by `M`, an explicit `M` reduced
-by the source's `F`, or an explicit limit reduced by endpoint descriptor safety produces a notice
-naming the requested and effective values. The ordinary automatic/default intersection remains
-quiet. The master retains the source process before attempting its control/tracing connections and
-waits for daemon cleanup if either connection fails. It starts the source tracing receiver as soon
-as its tracing connection is established, before destination configuration or startup. Every later
-startup and protocol exit closes the control streams, waits for owned daemon processes, and gives
-tracing receivers a bounded drain, so already-queued source notices remain visible alongside a
-destination failure rather than being dropped during unwinding.
+an invalid readiness record. After readiness, stdout/stderr collectors forward raw daemon output at
+debug verbosity as it arrives and retain only a bounded tail. They are joined on daemon completion,
+so a nonzero exit keeps diagnostics without allowing unbounded output to grow in memory or leaving
+collector tasks detached. An explicit `F` reduced by `M`, an automatic `F` reduced by an explicit
+`M`, an explicit `M` reduced by the source's `F`, or an explicit limit reduced by endpoint
+descriptor safety produces a notice naming the requested and effective values. The ordinary
+automatic/default intersection remains quiet. The master retains the source process before
+attempting its control/tracing connections and waits for daemon cleanup if either connection fails.
+It starts the source tracing receiver as soon as its tracing connection is established, before
+destination configuration or startup. Every later startup and protocol exit closes the control
+streams, waits for owned daemon processes, and gives tracing receivers a bounded drain, so
+already-queued source notices remain visible alongside a destination failure rather than being
+dropped during unwinding.
 
 ### 1.3 Connection Topology
 
