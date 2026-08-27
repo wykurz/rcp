@@ -22,7 +22,8 @@ impl AdmissionLimit {
 
     /// Sets the shared file-in-flight limits.
     pub fn set_files_in_flight(&self, files_in_flight: usize) {
-        throttle::set_admission_limits(files_in_flight, files_in_flight);
+        let files_in_flight = std::num::NonZeroUsize::new(files_in_flight);
+        throttle::set_admission_limits(files_in_flight);
     }
 
     /// Sets one metadata operation's in-flight limit.
@@ -66,7 +67,7 @@ impl Drop for AdmissionLimit {
 }
 
 fn reset_admission_limits() {
-    throttle::set_admission_limits(0, 0);
+    throttle::set_admission_limits(None);
     for side in throttle::Side::ALL {
         for op in throttle::MetadataOp::ALL {
             throttle::set_max_ops_in_flight(throttle::Resource::meta(side, op), 0);

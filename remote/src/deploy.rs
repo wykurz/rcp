@@ -102,7 +102,6 @@
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
-use std::sync::Arc;
 use std::time::Duration;
 
 const LOCAL_RCPD_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -112,24 +111,6 @@ const REMOTE_STAGING_FINALIZATION_MINIMUM: Duration = Duration::from_secs(60);
 const DEPLOYMENT_READY_RECORD: &str = "RCP_DEPLOY_READY";
 const DEPLOYMENT_READY_OUTPUT_LIMIT: usize = 4096;
 const DEPLOYMENT_WRITE_CHUNK_SIZE: usize = 64 * 1024;
-
-struct AbortOnDropTask<T>(tokio::task::JoinHandle<T>);
-
-impl<T> AbortOnDropTask<T> {
-    fn new(task: tokio::task::JoinHandle<T>) -> Self {
-        Self(task)
-    }
-
-    async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
-        (&mut self.0).await
-    }
-}
-
-impl<T> Drop for AbortOnDropTask<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
 
 const TRANSFER_HINTS: &str = "\
     This may indicate:\n\
@@ -216,6 +197,23 @@ fn reconcile_transfer_finish<T>(
     }
 }
 
+fn path_discovery_result(
+    preparation: &crate::PreparationContext,
+    result: anyhow::Result<Output>,
+    searched_paths: &mut Vec<String>,
+) -> anyhow::Result<Option<Output>> {
+    match result {
+        Ok(output) => Ok(Some(output)),
+        Err(error) => {
+            // a peer cancellation is part of the preparation result, not a missing PATH entry
+            preparation.ensure_active()?;
+            tracing::debug!("local rcpd PATH discovery failed: {error:#}");
+            searched_paths.push(format!("PATH discovery failed: {error:#}"));
+            Ok(None)
+        }
+    }
+}
+
 /// Find local static rcpd binary suitable for deployment
 ///
 /// Searches in the following order:
@@ -235,30 +233,18 @@ fn reconcile_transfer_finish<T>(
 /// # Errors
 ///
 /// Returns an error if no compatible binary is found
-pub async fn find_local_rcpd_binary() -> anyhow::Result<PathBuf> {
-    find_local_rcpd_binary_with_context(&crate::PreparationContext::uncancelled()).await
-}
-
-fn path_discovery_result(
-    preparation: &crate::PreparationContext,
-    result: anyhow::Result<Output>,
-    searched_paths: &mut Vec<String>,
-) -> anyhow::Result<Option<Output>> {
-    match result {
-        Ok(output) => Ok(Some(output)),
-        Err(error) => {
-            // a peer cancellation is part of the preparation result, not a missing PATH entry
-            preparation.ensure_active()?;
-            tracing::debug!("local rcpd PATH discovery failed: {error:#}");
-            searched_paths.push(format!("PATH discovery failed: {error:#}"));
-            Ok(None)
-        }
-    }
-}
-
 pub(crate) async fn find_local_rcpd_binary_with_context(
     preparation: &crate::PreparationContext,
 ) -> anyhow::Result<PathBuf> {
+    find_local_rcpd_binary_with_context_from_current_exe(preparation, std::env::current_exe().ok())
+        .await
+}
+
+async fn find_local_rcpd_binary_with_context_from_current_exe(
+    preparation: &crate::PreparationContext,
+    current_exe: Option<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    preparation.ensure_active()?;
     let mut searched_paths = Vec::new();
     let local_version = common::version::ProtocolVersion::current();
 
@@ -266,7 +252,7 @@ pub(crate) async fn find_local_rcpd_binary_with_context(
     // this normally finds the same build (debug/release) as the running rcp and covers development
     // builds where rcp and rcpd are both in target/. Compatibility is still verified: co-location
     // is a search preference, not proof that two independently replaced files match.
-    if let Ok(current_exe) = std::env::current_exe()
+    if let Some(current_exe) = current_exe
         && let Some(bin_dir) = current_exe.parent()
     {
         let path = bin_dir.join("rcpd");
@@ -274,12 +260,21 @@ pub(crate) async fn find_local_rcpd_binary_with_context(
         // the probe owns a fixed local shell child and has its own hard two-second deadline plus
         // bounded reap funnel. Executing the candidate happens in that child, so a stalled candidate
         // path is a rejection and cannot prevent the PATH fallback.
-        match check_local_rcpd_version(&path, &local_version, LOCAL_RCPD_VERSION_TIMEOUT).await {
+        match check_local_rcpd_version(
+            preparation,
+            &path,
+            &local_version,
+            LOCAL_RCPD_VERSION_TIMEOUT,
+        )
+        .await
+        {
             Ok(()) => {
+                preparation.ensure_active()?;
                 tracing::info!("Found compatible local rcpd binary at {}", path.display());
                 return Ok(path);
             }
             Err(error) => {
+                preparation.ensure_active()?;
                 tracing::warn!(
                     "skipping local rcpd candidate {}: {:#}",
                     path.display(),
@@ -323,9 +318,16 @@ pub(crate) async fn find_local_rcpd_binary_with_context(
             let path = PathBuf::from(path_str);
             searched_paths.push(format!("PATH: {}", path.display()));
             // keep child ownership inside the probe's fixed-deadline termination/reap funnel.
-            match check_local_rcpd_version(&path, &local_version, LOCAL_RCPD_VERSION_TIMEOUT).await
+            match check_local_rcpd_version(
+                preparation,
+                &path,
+                &local_version,
+                LOCAL_RCPD_VERSION_TIMEOUT,
+            )
+            .await
             {
                 Ok(()) => {
+                    preparation.ensure_active()?;
                     tracing::info!(
                         "Found compatible local rcpd binary in PATH: {}",
                         path.display()
@@ -333,6 +335,7 @@ pub(crate) async fn find_local_rcpd_binary_with_context(
                     return Ok(path);
                 }
                 Err(error) => {
+                    preparation.ensure_active()?;
                     tracing::warn!(
                         "skipping local rcpd candidate {}: {:#}",
                         path.display(),
@@ -344,6 +347,14 @@ pub(crate) async fn find_local_rcpd_binary_with_context(
         }
     }
 
+    final_local_candidate_failure(preparation, &searched_paths)
+}
+
+fn final_local_candidate_failure(
+    preparation: &crate::PreparationContext,
+    searched_paths: &[String],
+) -> anyhow::Result<PathBuf> {
+    preparation.ensure_active()?;
     anyhow::bail!(
         "no compatible local rcpd binary found for deployment\n\
         \n\
@@ -364,11 +375,12 @@ pub(crate) async fn find_local_rcpd_binary_with_context(
 
 /// Verify that one local deployment candidate implements the master's protocol contract.
 async fn check_local_rcpd_version(
+    preparation: &crate::PreparationContext,
     path: &Path,
     local_version: &common::version::ProtocolVersion,
     probe_timeout: Duration,
 ) -> anyhow::Result<()> {
-    let output = run_local_version_probe(path, probe_timeout).await?;
+    let output = run_local_version_probe(preparation, path, probe_timeout).await?;
     if !output.status.success() {
         anyhow::bail!(
             "local rcpd candidate {} failed to run --protocol-version with status {:?}: {}",
@@ -393,11 +405,23 @@ async fn check_local_rcpd_version(
             local_version
         );
     }
+    preparation.ensure_active()?;
     Ok(())
 }
 
+enum LocalProbeOutcome {
+    Completed(anyhow::Result<Output>),
+    Cancelled,
+    TimedOut(tokio::time::error::Elapsed),
+}
+
 /// Run one version probe without blocking a Tokio worker or trusting pipe EOF indefinitely.
-async fn run_local_version_probe(path: &Path, probe_timeout: Duration) -> anyhow::Result<Output> {
+async fn run_local_version_probe(
+    preparation: &crate::PreparationContext,
+    path: &Path,
+    probe_timeout: Duration,
+) -> anyhow::Result<Output> {
+    preparation.ensure_active()?;
     // launch a known-local shell first, then exec the candidate in that child. Spawning the
     // candidate path directly makes the parent's spawn call wait for exec(2); a path on a stalled
     // network filesystem could therefore block the Tokio worker before the probe timer starts.
@@ -442,16 +466,27 @@ async fn run_local_version_probe(path: &Path, probe_timeout: Duration) -> anyhow
         })
     };
 
-    match tokio::time::timeout(probe_timeout, collect_output).await {
-        Ok(output) => output,
-        Err(elapsed) => {
+    let outcome = tokio::select! {
+        biased;
+        () = preparation.cancellation.cancelled() => LocalProbeOutcome::Cancelled,
+        result = tokio::time::timeout(probe_timeout, collect_output) => match result {
+            Ok(output) => LocalProbeOutcome::Completed(output),
+            Err(elapsed) => LocalProbeOutcome::TimedOut(elapsed),
+        },
+    };
+    match outcome {
+        LocalProbeOutcome::Completed(output) => {
+            preparation.ensure_active()?;
+            output
+        }
+        interrupted => {
             // dropping both read ends before termination prevents a descendant which inherited the
             // candidate's pipes from extending the probe lifetime after the candidate has exited.
             drop(stdout);
             drop(stderr);
             if let Err(error) = child.start_kill() {
                 tracing::debug!(
-                    "failed to request termination of timed-out local rcpd candidate {}: {error:#}",
+                    "failed to request termination of interrupted local rcpd candidate {}: {error:#}",
                     path.display()
                 );
             }
@@ -460,7 +495,7 @@ async fn run_local_version_probe(path: &Path, probe_timeout: Duration) -> anyhow
                 async move {
                     if let Err(error) = child.wait().await {
                         tracing::debug!(
-                            "failed to reap timed-out local rcpd candidate {}: {error:#}",
+                            "failed to reap interrupted local rcpd candidate {}: {error:#}",
                             candidate.display()
                         );
                     }
@@ -478,13 +513,19 @@ async fn run_local_version_probe(path: &Path, probe_timeout: Duration) -> anyhow
                     );
                 }
             }
-            Err(elapsed).with_context(|| {
-                format!(
-                    "local rcpd candidate {} did not complete --protocol-version within {}",
-                    path.display(),
-                    humantime::format_duration(probe_timeout)
-                )
-            })
+            match interrupted {
+                LocalProbeOutcome::Cancelled => {
+                    Err(crate::PreparationContext::cancellation_error())
+                }
+                LocalProbeOutcome::TimedOut(elapsed) => Err(elapsed).with_context(|| {
+                    format!(
+                        "local rcpd candidate {} did not complete --protocol-version within {}",
+                        path.display(),
+                        humantime::format_duration(probe_timeout)
+                    )
+                }),
+                LocalProbeOutcome::Completed(_) => unreachable!("handled above"),
+            }
         }
     }
 }
@@ -550,7 +591,8 @@ where
 /// * `local_rcpd_path` - Path to the local static rcpd binary to deploy
 /// * `version` - Semantic version string for the binary
 /// * `remote_host` - Hostname for logging/error messages
-/// * `cancellation` - Peer-preparation cancellation signal
+/// * `preparation` - Cancellation and cleanup context for endpoint preparation
+/// * `bootstrap_timeout` - Timeout applied independently to each remote bootstrap stage
 ///
 /// # Returns
 ///
@@ -563,24 +605,6 @@ where
 /// - Remote directory creation fails
 /// - Transfer fails
 /// - Checksum verification fails
-pub async fn deploy_rcpd(
-    session: &Arc<openssh::Session>,
-    local_rcpd_path: &std::path::Path,
-    version: &str,
-    remote_host: &str,
-    cancellation: &tokio_util::sync::CancellationToken,
-) -> anyhow::Result<String> {
-    deploy_rcpd_with_context(
-        session,
-        local_rcpd_path,
-        version,
-        remote_host,
-        &crate::PreparationContext::new(cancellation.clone()),
-        crate::DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
-    )
-    .await
-}
-
 pub(crate) async fn deploy_rcpd_with_context<S: crate::SshSessionOwner>(
     session: &S,
     local_rcpd_path: &std::path::Path,
@@ -815,7 +839,7 @@ async fn transfer_binary_base64<S: crate::SshSessionOwner>(
 
     // collect stderr before waiting for readiness. Failures in mkdir, opening the staging file, or
     // shell startup happen before the marker and must retain their remote diagnostic.
-    let stderr_drain = AbortOnDropTask::new(tokio::spawn(crate::drain_bounded_output(
+    let stderr_drain = crate::AbortOnDropTask::new(tokio::spawn(crate::drain_bounded_output(
         stderr,
         crate::DIAGNOSTIC_CAPTURE_LIMIT,
     )));
@@ -946,7 +970,7 @@ where
 }
 
 async fn finish_deployment_stderr(
-    mut task: AbortOnDropTask<crate::CapturedOutput>,
+    mut task: crate::AbortOnDropTask<crate::CapturedOutput>,
 ) -> crate::CapturedOutput {
     match tokio::time::timeout(REMOTE_STAGING_OWNER_GRACE, task.join()).await {
         Ok(Ok(output)) => output,
@@ -1042,23 +1066,12 @@ fn compute_sha256(data: &[u8]) -> Vec<u8> {
 ///
 /// * `session` - SSH session to the remote host
 /// * `keep_count` - Number of recent versions to keep (default: 3)
+/// * `preparation` - Cancellation and cleanup context for endpoint preparation
+/// * `bootstrap_timeout` - Deadline for the remote cleanup command
 ///
 /// # Errors
 ///
 /// Returns an error if the cleanup command fails (but this is not fatal)
-pub async fn cleanup_old_versions(
-    session: &Arc<openssh::Session>,
-    keep_count: usize,
-) -> anyhow::Result<()> {
-    cleanup_old_versions_with_context(
-        session,
-        keep_count,
-        &crate::PreparationContext::uncancelled(),
-        crate::DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
-    )
-    .await
-}
-
 pub(crate) async fn cleanup_old_versions_with_context<S: crate::SshSessionOwner>(
     session: &S,
     keep_count: usize,
@@ -1146,6 +1159,17 @@ mod tests {
                 .expect("failed to make version-probe script executable");
             path
         }
+
+        #[cfg(target_os = "linux")]
+        fn fifo(&self, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            let status = std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .expect("failed to run mkfifo for version-probe test");
+            assert!(status.success(), "mkfifo failed with {status}");
+            path
+        }
     }
 
     #[cfg(unix)]
@@ -1155,12 +1179,125 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn process_start_time(pid: &str) -> std::io::Result<Option<String>> {
+        let stat = match std::fs::read_to_string(Path::new("/proc").join(pid).join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let (_, fields) = stat.rsplit_once(") ").ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid /proc stat record")
+        })?;
+        let start_time = fields.split_whitespace().nth(19).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing process start time in /proc stat record",
+            )
+        })?;
+        Ok(Some(start_time.to_string()))
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_process_identity_to_be_reaped(pid: &str, start_time: &str) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match process_start_time(pid).expect("failed to inspect candidate process") {
+                    None => break,
+                    Some(current) if current != start_time => break,
+                    Some(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                }
+            }
+        })
+        .await
+        .expect("cancelled candidate process identity was not reaped");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn same_directory_version_probe_stops_and_reaps_on_peer_cancellation() {
+        let test_dir = TestDirectory::new();
+        let pid_file = test_dir.0.join("candidate.pid");
+        let fifo = test_dir.fifo("candidate.fifo");
+        let candidate = test_dir.script(
+            "rcpd",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > {}\nexec 3< {}\n",
+                crate::shell_escape(&pid_file.to_string_lossy()),
+                crate::shell_escape(&fifo.to_string_lossy()),
+            ),
+        );
+        let current_exe = test_dir.0.join("rcp");
+        assert_eq!(current_exe.parent(), candidate.parent());
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cleanup = crate::RemoteCleanup::new();
+        let preparation = crate::PreparationContext::new(cancellation.clone(), cleanup.clone());
+        let discovery = tokio::spawn(async move {
+            find_local_rcpd_binary_with_context_from_current_exe(&preparation, Some(current_exe))
+                .await
+        });
+        let (pid, candidate_start_time) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = tokio::fs::read_to_string(&pid_file).await {
+                    let pid = pid.trim();
+                    if !pid.is_empty()
+                        && let Some(start_time) =
+                            process_start_time(pid).expect("failed to inspect candidate process")
+                    {
+                        break (pid.to_string(), start_time);
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking candidate did not start");
+
+        cancellation.cancel();
+        let error = tokio::time::timeout(Duration::from_millis(1500), discovery)
+            .await
+            .expect("candidate discovery ignored peer cancellation")
+            .expect("candidate discovery task panicked")
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cancelled because peer preparation failed"),
+            "unexpected cancellation error: {error:#}"
+        );
+        wait_for_process_identity_to_be_reaped(&pid, &candidate_start_time).await;
+        cleanup.finish();
+    }
+
+    #[test]
+    fn final_local_candidate_failure_preserves_peer_cancellation() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let cleanup = crate::RemoteCleanup::new();
+        let preparation = crate::PreparationContext::new(cancellation, cleanup.clone());
+
+        let searched_paths = ["PATH: /test/rcpd".to_string()];
+        let error = final_local_candidate_failure(&preparation, &searched_paths).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cancelled because peer preparation failed"),
+            "final candidate rejection swallowed peer cancellation: {error:#}"
+        );
+        drop(preparation);
+        cleanup.finish();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn version_probe_timeout_falls_back_after_descendant_keeps_pipes_open() {
         let test_dir = TestDirectory::new();
         let hanging = test_dir.script("hanging-rcpd", "#!/bin/sh\n(sleep 2) &\nexit 0\n");
         let local_version = common::version::ProtocolVersion::current();
+        let cleanup = crate::RemoteCleanup::new();
+        let preparation = crate::PreparationContext::uncancelled(cleanup.clone());
         let compatible = test_dir.script(
             "compatible-rcpd",
             &format!(
@@ -1176,7 +1313,14 @@ mod tests {
         let (selected, rejections) = tokio::time::timeout(Duration::from_secs(3), async {
             let mut rejections = Vec::new();
             for (candidate, probe_timeout) in candidates {
-                match check_local_rcpd_version(candidate, &local_version, probe_timeout).await {
+                match check_local_rcpd_version(
+                    &preparation,
+                    candidate,
+                    &local_version,
+                    probe_timeout,
+                )
+                .await
+                {
                     Ok(()) => return (Some(candidate.to_path_buf()), rejections),
                     Err(error) => rejections.push(error),
                 }
@@ -1197,6 +1341,8 @@ mod tests {
             rejections[0].chain().count() >= 2,
             "timeout rejection must preserve the elapsed source error"
         );
+        drop(preparation);
+        cleanup.finish();
     }
 
     #[cfg(unix)]
@@ -1208,15 +1354,24 @@ mod tests {
             "#!/bin/sh\nprintf '%s\\n' 'candidate refused version probe' >&2\nexit 7\n",
         );
         let local_version = common::version::ProtocolVersion::current();
-        let error = check_local_rcpd_version(&candidate, &local_version, Duration::from_secs(2))
-            .await
-            .unwrap_err();
+        let cleanup = crate::RemoteCleanup::new();
+        let preparation = crate::PreparationContext::uncancelled(cleanup.clone());
+        let error = check_local_rcpd_version(
+            &preparation,
+            &candidate,
+            &local_version,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("failed to run --protocol-version with status Some(7)"),
             "unexpected probe error: {error:#}"
         );
+        drop(preparation);
+        cleanup.finish();
     }
 
     #[cfg(unix)]
@@ -1230,8 +1385,10 @@ mod tests {
                 crate::DIAGNOSTIC_CAPTURE_LIMIT + 1
             ),
         );
+        let cleanup = crate::RemoteCleanup::new();
+        let preparation = crate::PreparationContext::uncancelled(cleanup.clone());
 
-        let error = run_local_version_probe(&candidate, Duration::from_secs(2))
+        let error = run_local_version_probe(&preparation, &candidate, Duration::from_secs(2))
             .await
             .unwrap_err();
 
@@ -1241,6 +1398,8 @@ mod tests {
                 .contains("--protocol-version stdout exceeded the capture limit"),
             "unexpected probe error: {error:#}"
         );
+        drop(preparation);
+        cleanup.finish();
     }
 
     #[cfg(unix)]
@@ -1254,8 +1413,10 @@ mod tests {
                 crate::DIAGNOSTIC_CAPTURE_LIMIT + 1
             ),
         );
+        let cleanup = crate::RemoteCleanup::new();
+        let preparation = crate::PreparationContext::uncancelled(cleanup.clone());
 
-        let output = run_local_version_probe(&candidate, Duration::from_secs(2))
+        let output = run_local_version_probe(&preparation, &candidate, Duration::from_secs(2))
             .await
             .unwrap();
 
@@ -1268,6 +1429,8 @@ mod tests {
             String::from_utf8_lossy(&output.stderr).contains("output truncated"),
             "truncated diagnostic needs an explicit marker"
         );
+        drop(preparation);
+        cleanup.finish();
     }
 
     #[tokio::test]
@@ -1294,7 +1457,8 @@ mod tests {
     fn path_discovery_failure_preserves_peer_cancellation() {
         let cancellation = tokio_util::sync::CancellationToken::new();
         cancellation.cancel();
-        let preparation = crate::PreparationContext::new(cancellation);
+        let cleanup = crate::RemoteCleanup::new();
+        let preparation = crate::PreparationContext::new(cancellation, cleanup.clone());
         let mut searched_paths = Vec::new();
 
         let error = path_discovery_result(
@@ -1310,6 +1474,8 @@ mod tests {
                 .contains("cancelled because peer preparation failed")
         );
         assert!(searched_paths.is_empty());
+        drop(preparation);
+        cleanup.finish();
     }
 
     #[tokio::test]

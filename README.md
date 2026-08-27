@@ -395,6 +395,9 @@ When auto-deployment is enabled:
 - Keeps the last 3 versions and cleans up older ones
 - Reuses deployed binaries for subsequent operations (cached until version changes)
 
+Auto-deployment targets Linux because fail-closed publication relies on GNU/BusyBox `mv -T`. Stock
+macOS and BSD remote hosts need a matching `rcpd` installed manually.
+
 Manual deployment is still supported and may be preferred for:
 
 - Air-gapped environments where auto-deployment is not feasible

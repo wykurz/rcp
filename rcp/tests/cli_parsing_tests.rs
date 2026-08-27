@@ -42,6 +42,34 @@ fn rcpd_parses_positive_max_files_in_flight_before_help() {
         .stderr(predicates::str::contains("at least 1"));
 }
 
+#[test]
+fn rcpd_cli_validation_failure_is_a_single_typed_startup_refusal() {
+    let output = rcpd()
+        .args(["--role=source", "--max-files-in-flight=0"])
+        .output()
+        .expect("rcpd validation failure must complete");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "validation must exit with Clap's code"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<_> = stderr.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "startup refusal must be one stderr line: {stderr:?}"
+    );
+    assert!(
+        lines[0].starts_with("RCP_ERROR "),
+        "startup refusal must be typed: {stderr:?}"
+    );
+    assert!(
+        lines[0].contains("value must be at least 1"),
+        "startup refusal must retain the validation reason: {stderr:?}"
+    );
+}
+
 fn assert_effective_remote_parallelism_help(command: &mut Command) {
     let output = command
         .arg("--help")

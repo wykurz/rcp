@@ -752,10 +752,9 @@ fn reset_process_throttle_state() {
         }
     }
     throttle::disable_ops_throttle();
-    // Without these resets, a second run() in the same process inherits
-    // the previous run's file-admission caps and iops-throttle. setup(0)
-    // disables the semaphores, so the next run sees a clean slate and can
-    // either configure fresh values or leave either admission pool unlimited.
-    throttle::set_admission_limits(0, 0);
+    // without these resets, a second run() in the same process inherits the previous run's
+    // file-admission caps and iops-throttle. `None` disables the admission semaphores, so the next
+    // run sees a clean slate and can either configure a fresh value or leave admission unlimited.
+    throttle::set_admission_limits(None);
     throttle::init_iops_tokens(0);
 }
