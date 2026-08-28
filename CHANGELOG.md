@@ -181,6 +181,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   arguments, or emit an obsolete readiness record. Builds now advertise `0.39.0+w6`, and a cached
   `rcpd-0.39.0-w5` is no longer resolved.
 
+### Fixed
+
+- Bracketed IPv6 remote operands such as `user@[2001:db8::1]:/src` now pass the bare address to the
+  retained OpenSSH multiplex master. OpenSSH's direct argv interface treats the brackets as literal
+  hostname characters rather than IPv6 delimiters, so retaining them made every such remote setup
+  fail during name resolution. This is a master-side SSH-launch fix and does not change the rcpd
+  wire protocol.
+
 ## [0.38.0] - 2026-08-05
 
 ### Added

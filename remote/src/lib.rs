@@ -1626,6 +1626,25 @@ impl SshSession {
             port: None,
         }
     }
+
+    /// Return the host spelling accepted by OpenSSH's direct argv interface.
+    fn openssh_host(&self) -> &str {
+        let Some(host) = self
+            .host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+        else {
+            return &self.host;
+        };
+        let address = match host.split_once('%') {
+            Some((_, "")) => return &self.host,
+            Some((address, _scope_id)) => address,
+            None => host,
+        };
+        address
+            .parse::<std::net::Ipv6Addr>()
+            .map_or(&self.host, |_| host)
+    }
 }
 
 // re-export is_localhost from common for convenience
@@ -1780,7 +1799,7 @@ async fn launch_ssh_master(
         launcher.arg("-l").arg(user);
     }
     let launcher = launcher
-        .arg(&session.host)
+        .arg(session.openssh_host())
         .spawn()
         .context("failed to launch SSH multiplex master")?;
     preparing.retain_launcher(launcher);
@@ -4354,6 +4373,81 @@ mod tests {
                 std::ffi::OsStr::new("/stalled/path/ssh"),
             ]
         );
+    }
+
+    #[test]
+    fn openssh_host_strips_only_ipv6_operand_brackets() {
+        for (host, expected) in [
+            ("[2001:db8::1]", "2001:db8::1"),
+            ("[fe80::1%eth0]", "fe80::1%eth0"),
+            ("host.example", "host.example"),
+            ("[host.example]", "[host.example]"),
+            ("[host:name]", "[host:name]"),
+            ("[fe80::1%]", "[fe80::1%]"),
+            ("[2001:db8::1", "[2001:db8::1"),
+        ] {
+            let session = SshSession {
+                user: None,
+                host: host.to_string(),
+                port: None,
+            };
+            assert_eq!(session.openssh_host(), expected, "unexpected host: {host}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_remote_ssh_setup_passes_bare_ipv6_host_to_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let launcher = directory.path().join("ssh");
+        let args_file = directory.path().join("args");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > {}\nsocket=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -S ]; then\n    shift\n    socket=$1\n  fi\n  shift\ndone\n: > \"$socket\"\nexec sleep 30\n",
+                shell_escape(args_file.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cleanup = RemoteCleanup::new().unwrap();
+        let preparation = PreparationContext::uncancelled(cleanup.clone());
+        let managed = setup_ssh_session_with_program(
+            &SshSession {
+                user: Some("remote-user".to_string()),
+                host: "[2001:db8::1]".to_string(),
+                port: Some(2222),
+            },
+            &preparation,
+            &launcher,
+            BootstrapDeadline::new(DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT),
+        )
+        .await
+        .unwrap();
+
+        let arguments = std::fs::read_to_string(&args_file).unwrap();
+        let arguments = arguments.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(
+            arguments.last().copied(),
+            Some("2001:db8::1"),
+            "the direct OpenSSH argv must not retain operand-syntax brackets: {arguments:?}"
+        );
+        assert!(
+            arguments.windows(2).any(|pair| pair == ["-p", "2222"]),
+            "the IPv6 normalization must retain the SSH port: {arguments:?}"
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["-l", "remote-user"]),
+            "the IPv6 normalization must retain the SSH user: {arguments:?}"
+        );
+
+        drop(managed);
+        drop(preparation);
+        cleanup.finish();
     }
 
     #[cfg(target_os = "linux")]
