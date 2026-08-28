@@ -70,19 +70,19 @@ impl ResolvedFilesInFlight {
     }
 
     pub const fn explicit(value: NonZeroUsize) -> Self {
+        Self::explicit_limit(ConcurrencyLimit::Limited(value))
+    }
+
+    pub const fn explicit_limit(limit: ConcurrencyLimit) -> Self {
         Self {
-            limit: ConcurrencyLimit::Limited(value),
+            limit,
             source: FilesInFlightSource::Explicit,
             warn_deprecated_max_open_files: false,
         }
     }
 
     pub const fn unlimited() -> Self {
-        Self {
-            limit: ConcurrencyLimit::Unlimited,
-            source: FilesInFlightSource::Explicit,
-            warn_deprecated_max_open_files: false,
-        }
+        Self::explicit_limit(ConcurrencyLimit::Unlimited)
     }
 
     pub fn legacy(value: usize) -> Self {
@@ -225,7 +225,7 @@ impl ThrottleConfig {
         }
         match self.files_in_flight.limit() {
             ConcurrencyLimit::Unlimited => Some(
-                "--max-open-files=0 is deprecated; use --max-files-in-flight instead. It removes the user ceiling but no longer disables descriptor safety.",
+                "--max-open-files=0 is deprecated; use --max-files-in-flight=unlimited instead. It removes the user ceiling but no longer disables descriptor safety.",
             ),
             ConcurrencyLimit::Limited(_) => {
                 Some("--max-open-files is deprecated; use --max-files-in-flight instead.")

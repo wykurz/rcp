@@ -646,6 +646,41 @@ fn test_remote_legacy_unlimited_warns_once_from_initiating_rcp() {
 }
 
 #[test]
+fn test_remote_explicit_unlimited_uses_connection_ceiling_without_deprecation() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("explicit_unlimited.txt");
+    let dst_file = dst_dir.path().join("explicit_unlimited.txt");
+    create_test_file(&src_file, "explicit unlimited", 0o644);
+    let src_remote = format!("localhost:{}", src_file.display());
+    let dst_remote = format!("localhost:{}", dst_file.display());
+    let logs = tempfile::tempdir().unwrap();
+    let log_prefix = logs.path().join("rcpd");
+    let log_arg = format!("--rcpd-debug-log-prefix={}", log_prefix.display());
+    let output = run_rcp_with_args(&[
+        "--max-files-in-flight=unlimited",
+        "--max-connections=3",
+        &log_arg,
+        &src_remote,
+        &dst_remote,
+    ]);
+    print_command_output(&output);
+    assert!(
+        output.status.success(),
+        "explicit-unlimited remote copy failed"
+    );
+    assert_eq!(get_file_content(&dst_file), "explicit unlimited");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let deprecated_option = "--max-open-files";
+    assert!(
+        !stdout.contains(deprecated_option) && !stderr.contains(deprecated_option),
+        "the canonical unlimited spelling must not emit a deprecation warning"
+    );
+    assert_two_rcpd_logs_report_connection_count(logs.path(), 3);
+}
+
+#[test]
 fn test_remote_chrome_trace_dry_run_forwards_daemon_artifact_notices() {
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();

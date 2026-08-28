@@ -12,7 +12,7 @@
 //!   error output), so its help text differs from the other tools.
 
 /// Shared help for the file-like operation concurrency setting.
-pub const FILES_IN_FLIGHT_HELP: &str = "Maximum concurrent file-like operations. Local automatic defaults resolve from available CPU parallelism on this host, with a floor of 4. Explicit values must be at least 1. This applies to file copy, link, comparison, removal, chmod, and generation work; lower internal safety ceilings may apply.";
+pub const FILES_IN_FLIGHT_HELP: &str = "Maximum concurrent file-like operations. Local automatic defaults resolve from available CPU parallelism on this host, with a floor of 4. Use a positive integer for a finite ceiling or 'unlimited' to remove the user ceiling; lower internal safety ceilings may still apply. This applies to file copy, link, comparison, removal, chmod, and generation work.";
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct CommonArgs {
@@ -55,11 +55,11 @@ pub struct CommonArgs {
     )]
     pub iops_throttle: usize,
     /// Maximum concurrent file-like operations.
-    #[arg(long, value_name = "N", value_parser = parse_positive_usize,
+    #[arg(long, value_name = "N|unlimited", value_parser = parse_files_in_flight_limit,
           help = FILES_IN_FLIGHT_HELP,
           help_heading = "Performance & throttling",
           conflicts_with = "max_open_files")]
-    pub max_files_in_flight: Option<std::num::NonZeroUsize>,
+    pub max_files_in_flight: Option<crate::ConcurrencyLimit>,
     #[arg(
         long,
         value_name = "N",
@@ -232,7 +232,7 @@ impl CommonArgs {
     #[must_use]
     pub fn resolve_files_in_flight(&self) -> crate::ResolvedFilesInFlight {
         match (self.max_files_in_flight, self.max_open_files) {
-            (Some(value), None) => crate::ResolvedFilesInFlight::explicit(value),
+            (Some(value), None) => crate::ResolvedFilesInFlight::explicit_limit(value),
             (None, Some(value)) => crate::ResolvedFilesInFlight::legacy(value),
             (None, None) => crate::ResolvedFilesInFlight::automatic(),
             (Some(_), Some(_)) => unreachable!("clap rejects conflicting file limits"),
@@ -336,6 +336,13 @@ pub fn parse_positive_usize(value: &str) -> Result<std::num::NonZeroUsize, Strin
     std::num::NonZeroUsize::new(value).ok_or_else(|| "value must be at least 1".to_string())
 }
 
+pub fn parse_files_in_flight_limit(value: &str) -> Result<crate::ConcurrencyLimit, String> {
+    if value == "unlimited" {
+        return Ok(crate::ConcurrencyLimit::Unlimited);
+    }
+    parse_positive_usize(value).map(crate::ConcurrencyLimit::Limited)
+}
+
 pub fn parse_positive_u64(value: &str) -> Result<u64, String> {
     let value = value.parse::<u64>().map_err(|error| error.to_string())?;
     (value > 0)
@@ -364,6 +371,15 @@ mod implies_tests {
         assert_eq!(
             explicit,
             crate::ResolvedFilesInFlight::explicit(NonZeroUsize::new(1).unwrap())
+        );
+        let explicit_unlimited =
+            TestCli::try_parse_from(["test", "--max-files-in-flight=unlimited"])
+                .expect("explicit unlimited max-files-in-flight must parse")
+                .common
+                .resolve_files_in_flight();
+        assert_eq!(
+            explicit_unlimited,
+            crate::ResolvedFilesInFlight::unlimited()
         );
         let automatic = TestCli::try_parse_from(["test"])
             .expect("omitted max-files-in-flight must parse")
