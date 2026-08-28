@@ -207,12 +207,13 @@ struct Args {
     /// Applies to: remote SSH setup, binary discovery, tilde-expansion HOME lookup, rcpd version
     /// probes, deployment readiness/write-idle periods, daemon readiness, rcpd→master connection,
     /// and destination→source connection. It does not cap total deployment transfer time;
-    /// post-transfer verification gets at least 60 seconds.
+    /// post-transfer verification gets at least 60 seconds. Must be at least 1.
     /// Default: 15s normally, 60s when --auto-deploy-rcpd is enabled (to account
     /// for sequential binary deployment to multiple hosts).
     #[arg(
         long,
         value_name = "N",
+        value_parser = common::cli::parse_positive_u64,
         default_value = "15",
         default_value_if("auto_deploy_rcpd", "true", "60"),
         help_heading = "Remote copy options"
@@ -502,33 +503,84 @@ impl ConnectionCeiling {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum MasterAuthoritativeFilesInFlight {
+    Explicit,
+    Deprecated,
+}
+
+impl MasterAuthoritativeFilesInFlight {
+    fn source(self) -> common::FilesInFlightSource {
+        match self {
+            Self::Explicit => common::FilesInFlightSource::Explicit,
+            Self::Deprecated => common::FilesInFlightSource::DeprecatedMaxOpenFiles,
+        }
+    }
+
+    fn to_rcpd(self, limit: common::ConcurrencyLimit) -> remote::protocol::RcpdFilesInFlight {
+        match self {
+            Self::Explicit => match limit {
+                common::ConcurrencyLimit::Limited(value) => {
+                    remote::protocol::RcpdFilesInFlight::Explicit(value)
+                }
+                common::ConcurrencyLimit::Unlimited => {
+                    unreachable!("an explicit master file limit is always finite")
+                }
+            },
+            Self::Deprecated => remote::protocol::RcpdFilesInFlight::DeprecatedMaxOpenFiles(limit),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RemoteConcurrencyPolicy {
+    Automatic,
+    MasterAuthoritative {
+        files_in_flight: MasterAuthoritativeFilesInFlight,
+        concurrency: remote::ResolvedRemoteConcurrency,
+    },
+}
+
+impl RemoteConcurrencyPolicy {
+    fn notice_file_limit(
+        self,
+        source_files_in_flight: common::ConcurrencyLimit,
+    ) -> (common::FilesInFlightSource, common::ConcurrencyLimit) {
+        match self {
+            Self::Automatic => (
+                common::FilesInFlightSource::Automatic,
+                source_files_in_flight,
+            ),
+            Self::MasterAuthoritative {
+                files_in_flight,
+                concurrency,
+            } => (files_in_flight.source(), concurrency.files_in_flight()),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct MasterRemoteRequest {
     tcp: remote::TcpConfig,
     rcpd: remote::protocol::RcpdConfig,
     filter: Option<common::filter::FilterSettings>,
-    files_in_flight: common::ResolvedFilesInFlight,
     connection_ceiling: ConnectionCeiling,
     pending_writes_multiplier: std::num::NonZeroUsize,
-    resolved_explicit: Option<remote::ResolvedRemoteConcurrency>,
+    concurrency_policy: RemoteConcurrencyPolicy,
 }
 
 fn remote_stream_clamp_notice(
-    files_in_flight: common::ResolvedFilesInFlight,
+    policy: RemoteConcurrencyPolicy,
     source_files_in_flight: common::ConcurrencyLimit,
     connection_ceiling: ConnectionCeiling,
     effective_connections: std::num::NonZeroUsize,
 ) -> Option<String> {
-    let file_limit = match files_in_flight.source() {
-        common::FilesInFlightSource::Automatic => source_files_in_flight,
-        common::FilesInFlightSource::Explicit
-        | common::FilesInFlightSource::DeprecatedMaxOpenFiles => files_in_flight.limit(),
-    };
+    let (source, file_limit) = policy.notice_file_limit(source_files_in_flight);
     let common::ConcurrencyLimit::Limited(file_limit) = file_limit else {
         return None;
     };
     if file_limit > effective_connections {
-        let option = match files_in_flight.source() {
+        let option = match source {
             common::FilesInFlightSource::DeprecatedMaxOpenFiles => "--max-open-files",
             common::FilesInFlightSource::Explicit => "--max-files-in-flight",
             common::FilesInFlightSource::Automatic => {
@@ -549,7 +601,7 @@ fn remote_stream_clamp_notice(
     if !connection_ceiling.is_explicit() || connection_ceiling.value() <= effective_connections {
         return None;
     }
-    let file_ceiling = match files_in_flight.source() {
+    let file_ceiling = match source {
         common::FilesInFlightSource::Automatic => {
             format!("the source's automatic file ceiling of {file_limit}")
         }
@@ -587,7 +639,7 @@ fn build_master_remote_request(
     }
     let connection_ceiling = ConnectionCeiling::from_arg(args.max_connections);
     let configured_connections = connection_ceiling.value();
-    let resolved_explicit = match files_in_flight.source() {
+    let concurrency_policy = match files_in_flight.source() {
         common::FilesInFlightSource::Automatic => {
             // validate the configured connection upper bound before remote side effects. The source
             // still selects its CPU-based file ceiling, but any capacity it reports at or below this
@@ -597,15 +649,30 @@ fn build_master_remote_request(
                 configured_connections,
                 args.pending_writes_multiplier,
             )?;
-            None
+            RemoteConcurrencyPolicy::Automatic
         }
-        common::FilesInFlightSource::Explicit
-        | common::FilesInFlightSource::DeprecatedMaxOpenFiles => {
-            Some(remote::resolve_remote_concurrency(
-                files_in_flight.limit(),
-                configured_connections,
-                args.pending_writes_multiplier,
-            )?)
+        common::FilesInFlightSource::Explicit => {
+            let common::ConcurrencyLimit::Limited(limit) = files_in_flight.limit() else {
+                anyhow::bail!("an explicit --max-files-in-flight limit must be finite")
+            };
+            RemoteConcurrencyPolicy::MasterAuthoritative {
+                files_in_flight: MasterAuthoritativeFilesInFlight::Explicit,
+                concurrency: remote::resolve_remote_concurrency(
+                    common::ConcurrencyLimit::Limited(limit),
+                    configured_connections,
+                    args.pending_writes_multiplier,
+                )?,
+            }
+        }
+        common::FilesInFlightSource::DeprecatedMaxOpenFiles => {
+            RemoteConcurrencyPolicy::MasterAuthoritative {
+                files_in_flight: MasterAuthoritativeFilesInFlight::Deprecated,
+                concurrency: remote::resolve_remote_concurrency(
+                    files_in_flight.limit(),
+                    configured_connections,
+                    args.pending_writes_multiplier,
+                )?,
+            }
         }
     };
     let tcp = remote::TcpConfig {
@@ -684,10 +751,9 @@ fn build_master_remote_request(
         tcp,
         rcpd,
         filter,
-        files_in_flight,
         connection_ceiling,
         pending_writes_multiplier: args.pending_writes_multiplier,
-        resolved_explicit,
+        concurrency_policy,
     })
 }
 
@@ -705,30 +771,17 @@ fn endpoint_config(
     MasterRemoteConfigs { tcp, rcpd }
 }
 
-fn master_authoritative_rcpd_files_in_flight(
-    files_in_flight: common::ResolvedFilesInFlight,
-) -> remote::protocol::RcpdFilesInFlight {
-    match files_in_flight.source() {
-        common::FilesInFlightSource::Explicit => {
-            remote::protocol::RcpdFilesInFlight::Explicit(files_in_flight.limit())
-        }
-        common::FilesInFlightSource::DeprecatedMaxOpenFiles => {
-            remote::protocol::RcpdFilesInFlight::DeprecatedMaxOpenFiles(files_in_flight.limit())
-        }
-        common::FilesInFlightSource::Automatic => {
-            unreachable!("an automatic file ceiling is not master-authoritative")
-        }
-    }
-}
-
 fn build_source_remote_config(request: &MasterRemoteRequest) -> MasterRemoteConfigs {
-    match request.resolved_explicit {
-        Some(concurrency) => endpoint_config(
+    match request.concurrency_policy {
+        RemoteConcurrencyPolicy::MasterAuthoritative {
+            files_in_flight,
+            concurrency,
+        } => endpoint_config(
             request,
-            master_authoritative_rcpd_files_in_flight(request.files_in_flight),
+            files_in_flight.to_rcpd(concurrency.files_in_flight()),
             Some(concurrency),
         ),
-        None => endpoint_config(
+        RemoteConcurrencyPolicy::Automatic => endpoint_config(
             request,
             remote::protocol::RcpdFilesInFlight::Automatic,
             None,
@@ -740,37 +793,52 @@ fn build_destination_remote_config(
     request: &MasterRemoteRequest,
     source: &remote::RcpdConnectionInfo,
 ) -> anyhow::Result<MasterRemoteConfigs> {
-    let concurrency = remote::resolve_remote_concurrency(
-        source.files_in_flight,
-        request.connection_ceiling.value(),
-        request.pending_writes_multiplier,
-    )?;
-    if concurrency.max_connections() != source.max_connections {
-        anyhow::bail!(
-            "source rcpd reported {} effective streams, expected {} from its file and connection ceilings",
-            source.max_connections,
-            concurrency.max_connections()
-        );
-    }
-    let files_in_flight = match request.files_in_flight.source() {
-        common::FilesInFlightSource::Automatic => match source.files_in_flight {
-            common::ConcurrencyLimit::Limited(value) => {
-                remote::protocol::RcpdFilesInFlight::ResolvedAutomatic(value)
-            }
-            common::ConcurrencyLimit::Unlimited => {
-                anyhow::bail!("an automatic source rcpd reported an unlimited file ceiling")
-            }
-        },
-        common::FilesInFlightSource::Explicit
-        | common::FilesInFlightSource::DeprecatedMaxOpenFiles => {
-            if source.files_in_flight != request.files_in_flight.limit() {
+    let (concurrency, files_in_flight) = match request.concurrency_policy {
+        RemoteConcurrencyPolicy::Automatic => {
+            let concurrency = remote::resolve_remote_concurrency(
+                source.files_in_flight,
+                request.connection_ceiling.value(),
+                request.pending_writes_multiplier,
+            )?;
+            if concurrency.max_connections() != source.max_connections {
                 anyhow::bail!(
-                    "source rcpd reported file ceiling {:?}, expected {:?}",
-                    source.files_in_flight,
-                    request.files_in_flight.limit()
+                    "source rcpd reported {} effective streams, expected {} from its source-owned file and connection ceilings",
+                    source.max_connections,
+                    concurrency.max_connections()
                 );
             }
-            master_authoritative_rcpd_files_in_flight(request.files_in_flight)
+            let files_in_flight = match source.files_in_flight {
+                common::ConcurrencyLimit::Limited(value) => {
+                    remote::protocol::RcpdFilesInFlight::ResolvedAutomatic(value)
+                }
+                common::ConcurrencyLimit::Unlimited => {
+                    anyhow::bail!("an automatic source rcpd reported an unlimited file ceiling")
+                }
+            };
+            (concurrency, files_in_flight)
+        }
+        RemoteConcurrencyPolicy::MasterAuthoritative {
+            files_in_flight,
+            concurrency,
+        } => {
+            if source.files_in_flight != concurrency.files_in_flight() {
+                anyhow::bail!(
+                    "source rcpd reported file ceiling {}, expected {}",
+                    source.files_in_flight,
+                    concurrency.files_in_flight()
+                );
+            }
+            if concurrency.max_connections() != source.max_connections {
+                anyhow::bail!(
+                    "source rcpd reported {} effective streams, expected the master-authoritative value {}",
+                    source.max_connections,
+                    concurrency.max_connections()
+                );
+            }
+            (
+                concurrency,
+                files_in_flight.to_rcpd(concurrency.files_in_flight()),
+            )
         }
     };
     Ok(endpoint_config(request, files_in_flight, Some(concurrency)))
@@ -784,7 +852,7 @@ fn validate_destination_readiness(
         || destination.max_connections != source.max_connections
     {
         anyhow::bail!(
-            "destination rcpd reported file/stream limits {:?}/{}, but source negotiated {:?}/{}",
+            "destination rcpd reported file/stream limits {}/{}, but source negotiated {}/{}",
             destination.files_in_flight,
             destination.max_connections,
             source.files_in_flight,
@@ -904,16 +972,6 @@ impl Drop for RemoteTeardown {
             task.abort();
         }
     }
-}
-
-#[cfg(test)]
-fn build_master_remote_configs(
-    args: &Args,
-    files_in_flight: common::ResolvedFilesInFlight,
-    master_cert_fingerprint: Option<remote::protocol::CertFingerprint>,
-) -> anyhow::Result<MasterRemoteConfigs> {
-    let request = build_master_remote_request(args, files_in_flight, master_cert_fingerprint)?;
-    Ok(build_source_remote_config(&request))
 }
 
 #[instrument(skip(master_cert))]
@@ -1054,7 +1112,7 @@ async fn run_rcpd_master(
     let destination_setup = async {
         let destination_config = build_destination_remote_config(&request, &source_conn_info)?;
         if let Some(notice) = remote_stream_clamp_notice(
-            request.files_in_flight,
+            request.concurrency_policy,
             source_conn_info.files_in_flight,
             request.connection_ceiling,
             source_conn_info.max_connections,
@@ -2050,6 +2108,26 @@ mod tests {
     }
 
     #[test]
+    fn master_reports_master_authoritative_source_file_mismatch() {
+        let args = master_args(&["--max-connections=100"]);
+        let request = build_master_remote_request(
+            &args,
+            common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(64).unwrap()),
+            None,
+        )
+        .unwrap();
+        let source_readiness = readiness(common::ConcurrencyLimit::Unlimited, 64);
+        let error = build_destination_remote_config(&request, &source_readiness)
+            .expect_err("the source must report the master-authoritative file ceiling");
+        assert!(
+            error
+                .to_string()
+                .contains("source rcpd reported file ceiling unlimited, expected 64"),
+            "unexpected source-readiness error: {error:#}"
+        );
+    }
+
+    #[test]
     fn master_legacy_finite_preserves_provenance_for_both_daemons() {
         let args = master_args(&["--max-connections=100", "--max-open-files=7"]);
         let request =
@@ -2230,23 +2308,6 @@ mod tests {
     }
 
     #[test]
-    fn master_propagates_one_effective_connection_count_to_both_daemons() {
-        let args = master_args(&["--max-connections=12"]);
-        let files_in_flight =
-            common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(3).unwrap());
-        let configs = build_master_remote_configs(&args, files_in_flight, None).unwrap();
-        let source_args = configs.rcpd.clone().to_args();
-        let destination_args = configs.rcpd.to_args();
-        assert!(source_args.iter().any(|arg| arg == "--max-connections=3"));
-        assert!(
-            destination_args
-                .iter()
-                .any(|arg| arg == "--max-connections=3")
-        );
-        assert_eq!(source_args, destination_args);
-    }
-
-    #[test]
     fn master_rejects_pending_capacity_overflow_before_spawn() {
         let max_connections = tokio::sync::Semaphore::MAX_PERMITS.to_string();
         let pending_writes_multiplier = usize::MAX.to_string();
@@ -2255,9 +2316,8 @@ mod tests {
             &format!("--pending-writes-multiplier={pending_writes_multiplier}"),
             "--max-open-files=0",
         ]);
-        let error =
-            build_master_remote_configs(&args, common::ResolvedFilesInFlight::unlimited(), None)
-                .unwrap_err();
+        let error = build_master_remote_request(&args, args.common.resolve_files_in_flight(), None)
+            .unwrap_err();
         assert!(
             error.to_string().contains("pending file capacity overflow"),
             "unexpected error: {error:#}"
@@ -2269,13 +2329,14 @@ mod tests {
         let args = master_args(&["--max-connections=100"]);
         let files_in_flight =
             common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(200).unwrap());
-        let configs = build_master_remote_configs(&args, files_in_flight, None).unwrap();
-        let effective = std::num::NonZeroUsize::new(configs.rcpd.max_connections).unwrap();
+        let request = build_master_remote_request(&args, files_in_flight, None).unwrap();
+        let source = build_source_remote_config(&request);
+        let effective = std::num::NonZeroUsize::new(source.rcpd.max_connections).unwrap();
         assert_eq!(
             remote_stream_clamp_notice(
-                files_in_flight,
+                request.concurrency_policy,
                 files_in_flight.limit(),
-                ConnectionCeiling::from_arg(std::num::NonZeroUsize::new(100)),
+                request.connection_ceiling,
                 effective,
             )
             .as_deref(),
@@ -2290,12 +2351,12 @@ mod tests {
         let args = master_args(&[]);
         let files_in_flight =
             common::ResolvedFilesInFlight::explicit(std::num::NonZeroUsize::new(200).unwrap());
-        let configs = build_master_remote_configs(&args, files_in_flight, None).unwrap();
         let request = build_master_remote_request(&args, files_in_flight, None).unwrap();
-        let effective = std::num::NonZeroUsize::new(configs.rcpd.max_connections).unwrap();
+        let source = build_source_remote_config(&request);
+        let effective = std::num::NonZeroUsize::new(source.rcpd.max_connections).unwrap();
         assert_eq!(
             remote_stream_clamp_notice(
-                files_in_flight,
+                request.concurrency_policy,
                 files_in_flight.limit(),
                 request.connection_ceiling,
                 effective,
@@ -2309,10 +2370,14 @@ mod tests {
 
     #[test]
     fn explicit_connection_clamp_names_the_source_automatic_file_ceiling() {
+        let args = master_args(&["--max-connections=200"]);
+        let request =
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
+                .unwrap();
         let notice = remote_stream_clamp_notice(
-            common::ResolvedFilesInFlight::automatic_with(std::num::NonZeroUsize::new(64).unwrap()),
+            request.concurrency_policy,
             common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(4).unwrap()),
-            ConnectionCeiling::from_arg(std::num::NonZeroUsize::new(200)),
+            request.connection_ceiling,
             std::num::NonZeroUsize::new(4).unwrap(),
         );
         assert_eq!(
@@ -2325,13 +2390,15 @@ mod tests {
 
     #[test]
     fn automatic_default_connection_intersection_stays_quiet() {
+        let args = master_args(&[]);
+        let request =
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
+                .unwrap();
         assert_eq!(
             remote_stream_clamp_notice(
-                common::ResolvedFilesInFlight::automatic_with(
-                    std::num::NonZeroUsize::new(64).unwrap(),
-                ),
+                request.concurrency_policy,
                 common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(4).unwrap()),
-                ConnectionCeiling::from_arg(None),
+                request.connection_ceiling,
                 std::num::NonZeroUsize::new(4).unwrap(),
             ),
             None
@@ -2340,10 +2407,14 @@ mod tests {
 
     #[test]
     fn explicit_connection_ceiling_reports_automatic_file_limit_clamp() {
+        let args = master_args(&["--max-connections=16"]);
+        let request =
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::automatic(), None)
+                .unwrap();
         let notice = remote_stream_clamp_notice(
-            common::ResolvedFilesInFlight::automatic_with(std::num::NonZeroUsize::new(64).unwrap()),
+            request.concurrency_policy,
             common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(64).unwrap()),
-            ConnectionCeiling::from_arg(std::num::NonZeroUsize::new(16)),
+            request.connection_ceiling,
             std::num::NonZeroUsize::new(16).unwrap(),
         );
         assert_eq!(
@@ -2356,10 +2427,13 @@ mod tests {
 
     #[test]
     fn legacy_file_limit_clamp_preserves_the_deprecated_option_name() {
+        let args = master_args(&["--max-open-files=200", "--max-connections=100"]);
+        let files_in_flight = common::ResolvedFilesInFlight::legacy(200);
+        let request = build_master_remote_request(&args, files_in_flight, None).unwrap();
         let notice = remote_stream_clamp_notice(
-            common::ResolvedFilesInFlight::legacy(200),
-            common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(200).unwrap()),
-            ConnectionCeiling::from_arg(std::num::NonZeroUsize::new(100)),
+            request.concurrency_policy,
+            files_in_flight.limit(),
+            request.connection_ceiling,
             std::num::NonZeroUsize::new(100).unwrap(),
         );
         assert_eq!(

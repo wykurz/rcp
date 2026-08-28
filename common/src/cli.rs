@@ -12,7 +12,7 @@
 //!   error output), so its help text differs from the other tools.
 
 /// Shared help for the file-like operation concurrency setting.
-pub const FILES_IN_FLIGHT_HELP: &str = "Maximum concurrent file-like operations. The default is the available CPU parallelism with a floor of 4. Explicit values must be at least 1. This applies to file copy, link, comparison, removal, chmod, and generation work; lower internal safety ceilings may apply.";
+pub const FILES_IN_FLIGHT_HELP: &str = "Maximum concurrent file-like operations. Local automatic defaults resolve from available CPU parallelism on the initiating host, with a floor of 4. Remote automatic defaults resolve on the source rcpd and are adopted by the destination. Explicit values must be at least 1. This applies to file copy, link, comparison, removal, chmod, and generation work; lower internal safety ceilings may apply.";
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct CommonArgs {
@@ -334,6 +334,13 @@ impl CommonArgs {
 pub fn parse_positive_usize(value: &str) -> Result<std::num::NonZeroUsize, String> {
     let value = value.parse::<usize>().map_err(|error| error.to_string())?;
     std::num::NonZeroUsize::new(value).ok_or_else(|| "value must be at least 1".to_string())
+}
+
+pub fn parse_positive_u64(value: &str) -> Result<u64, String> {
+    let value = value.parse::<u64>().map_err(|error| error.to_string())?;
+    (value > 0)
+        .then_some(value)
+        .ok_or_else(|| "value must be at least 1".to_string())
 }
 
 #[cfg(test)]

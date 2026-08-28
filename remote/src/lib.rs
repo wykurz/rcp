@@ -56,7 +56,10 @@
 //!
 //! ```rust,no_run
 //! # async fn example() -> anyhow::Result<()> {
-//! let config = remote::TcpConfig::default().with_port_ranges("8000-8999");
+//! let config = remote::TcpConfig {
+//!     port_ranges: Some("8000-8999".to_string()),
+//!     ..remote::TcpConfig::default()
+//! };
 //! let listener = remote::create_tcp_control_listener(&config, None).await?;
 //! # Ok(())
 //! # }
@@ -122,24 +125,33 @@ compile_error!("tokio_unstable cfg must be enabled; see .cargo/config.toml");
 use anyhow::{Context, anyhow};
 use tracing::instrument;
 
-pub(crate) const DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(15);
+#[cfg(test)]
+const DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const FAILED_RCPD_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 const RCPD_OUTPUT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-const SSH_CLEANUP_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+const REMOTE_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+const CLEANUP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 const DIAGNOSTIC_CAPTURE_LIMIT: usize = 64 * 1024;
 const RCPD_STARTUP_RECORD_LIMIT: usize = 64 * 1024;
+pub(crate) const RCPD_PATH_DISCOVERY_SCRIPT: &str = "command -v \"$1\"";
 
 std::thread_local! {
-    static ACTIVE_REMOTE_CLEANUP_SCOPES: std::cell::RefCell<Vec<usize>> = const {
+    static ACTIVE_REMOTE_CLEANUP_SCOPES: std::cell::RefCell<Vec<ActiveCleanupScope>> = const {
         std::cell::RefCell::new(Vec::new())
     };
+}
+
+#[derive(Clone)]
+struct ActiveCleanupScope {
+    scope_id: usize,
+    budget: CleanupBudget,
 }
 
 struct CleanupWorkers {
     owners: usize,
     pending: usize,
     threads: Vec<std::thread::JoinHandle<()>>,
+    finish_deadline: Option<std::time::Instant>,
 }
 
 impl Default for CleanupWorkers {
@@ -148,6 +160,7 @@ impl Default for CleanupWorkers {
             owners: 1,
             pending: 0,
             threads: Vec::new(),
+            finish_deadline: None,
         }
     }
 }
@@ -161,7 +174,59 @@ struct CleanupState {
 
 struct CleanupJob {
     thread_name: &'static str,
-    operation: Box<dyn FnOnce() + Send + 'static>,
+    deadline: std::time::Instant,
+    operation: CleanupOperation,
+}
+
+enum CleanupOperation {
+    Bounded(Box<dyn FnOnce(CleanupBudget) + Send + 'static>),
+    Disposable(Box<dyn FnOnce() + Send + 'static>),
+}
+
+/// Mandatory liveness budget supplied by the cleanup scope to cooperative waits.
+#[derive(Clone)]
+pub(crate) struct CleanupBudget {
+    state: std::sync::Arc<CleanupState>,
+    job_deadline: std::time::Instant,
+}
+
+impl CleanupBudget {
+    #[cfg(test)]
+    fn for_job(state: std::sync::Arc<CleanupState>, grace: std::time::Duration) -> Self {
+        Self {
+            state,
+            job_deadline: std::time::Instant::now() + grace,
+        }
+    }
+
+    fn effective_deadline(&self, workers: &CleanupWorkers) -> std::time::Instant {
+        workers
+            .finish_deadline
+            .map_or(self.job_deadline, |deadline| {
+                std::cmp::min(self.job_deadline, deadline)
+            })
+    }
+
+    fn wait_for_next_poll(&self) -> bool {
+        let workers = self
+            .state
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        let deadline = self.effective_deadline(&workers);
+        if now >= deadline {
+            return false;
+        }
+        let wait = std::cmp::min(CLEANUP_POLL_INTERVAL, deadline.duration_since(now));
+        drop(
+            self.state
+                .changed
+                .wait_timeout(workers, wait)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        true
+    }
 }
 
 /// Owns all blocking cleanup work started by one rcp invocation.
@@ -222,9 +287,13 @@ struct CleanupWorkerContext {
 }
 
 impl CleanupWorkerContext {
-    fn enter(state: &std::sync::Arc<CleanupState>) -> Self {
+    fn enter(state: &std::sync::Arc<CleanupState>, budget: CleanupBudget) -> Self {
         let scope_id = std::sync::Arc::as_ptr(state) as usize;
-        ACTIVE_REMOTE_CLEANUP_SCOPES.with(|scopes| scopes.borrow_mut().push(scope_id));
+        ACTIVE_REMOTE_CLEANUP_SCOPES.with(|scopes| {
+            scopes
+                .borrow_mut()
+                .push(ActiveCleanupScope { scope_id, budget });
+        });
         Self { scope_id }
     }
 }
@@ -233,7 +302,7 @@ impl Drop for CleanupWorkerContext {
     fn drop(&mut self) {
         ACTIVE_REMOTE_CLEANUP_SCOPES.with(|scopes| {
             let removed = scopes.borrow_mut().pop();
-            debug_assert_eq!(removed, Some(self.scope_id));
+            debug_assert_eq!(removed.map(|scope| scope.scope_id), Some(self.scope_id));
         });
     }
 }
@@ -281,7 +350,9 @@ impl RemoteCleanup {
         let supervisor_state = state.clone();
         let supervisor = start_supervisor(Box::new(move || {
             while let Ok(job) = receiver.recv() {
-                supervisor_state.start_cleanup_job(job);
+                supervisor_state
+                    .start_cleanup_job(job, WorkerSpawnFallback::RunInSupervisor)
+                    .expect("the cleanup supervisor owns its worker-spawn fallback");
             }
         }))?;
         *state
@@ -298,15 +369,19 @@ impl RemoteCleanup {
         std::sync::Arc::as_ptr(&self.state) as usize
     }
 
-    fn is_current_worker(&self) -> bool {
+    fn current_budget(&self) -> Option<CleanupBudget> {
         let scope_id = self.scope_id();
-        ACTIVE_REMOTE_CLEANUP_SCOPES.with(|scopes| scopes.borrow().contains(&scope_id))
+        ACTIVE_REMOTE_CLEANUP_SCOPES.with(|scopes| {
+            scopes
+                .borrow()
+                .iter()
+                .rev()
+                .find(|scope| scope.scope_id == scope_id)
+                .map(|scope| scope.budget.clone())
+        })
     }
 
-    fn spawn<F>(&self, thread_name: &'static str, operation: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
+    fn submit(&self, job: CleanupJob) -> std::io::Result<()> {
         let mut workers = self
             .state
             .workers
@@ -317,94 +392,146 @@ impl RemoteCleanup {
             .checked_add(1)
             .expect("cleanup worker count overflow");
         drop(workers);
-        let job = CleanupJob {
-            thread_name,
-            operation: Box::new(operation),
-        };
-        if let Err(error) = self
+        match self
             .sender
             .as_ref()
             .expect("a live cleanup owner retains its supervisor sender")
             .send(job)
         {
-            tracing::error!(
-                "remote cleanup supervisor stopped unexpectedly; running deferred cleanup inline"
-            );
-            self.state.run_cleanup_job(error.0);
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::error!(
+                    "remote cleanup supervisor stopped unexpectedly; starting an isolated fallback worker"
+                );
+                self.state
+                    .start_cleanup_job(error.0, WorkerSpawnFallback::Abandon)
+            }
         }
+    }
+
+    fn submit_disposable<F>(&self, thread_name: &'static str, operation: F) -> std::io::Result<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.submit(CleanupJob {
+            thread_name,
+            deadline: std::time::Instant::now() + REMOTE_CLEANUP_GRACE,
+            operation: CleanupOperation::Disposable(Box::new(operation)),
+        })
+    }
+
+    fn submit_bounded<F>(&self, thread_name: &'static str, operation: F) -> std::io::Result<()>
+    where
+        F: FnOnce(CleanupBudget) + Send + 'static,
+    {
+        self.submit(CleanupJob {
+            thread_name,
+            deadline: std::time::Instant::now() + REMOTE_CLEANUP_GRACE,
+            operation: CleanupOperation::Bounded(Box::new(operation)),
+        })
     }
 
     fn defer_drop<T>(&self, value: T, thread_name: &'static str)
     where
         T: Send + 'static,
     {
-        if self.is_current_worker() {
+        if self.current_budget().is_some() {
             drop(value);
             return;
         }
-        self.spawn(thread_name, move || drop(value));
+        if let Err(error) = self.submit_disposable(thread_name, move || drop(value)) {
+            tracing::error!("failed to start deferred cleanup worker: {error:#}");
+        }
     }
 
-    fn defer<F>(&self, thread_name: &'static str, operation: F)
+    fn defer_bounded<F>(&self, thread_name: &'static str, operation: F)
     where
-        F: FnOnce() + Send + 'static,
+        F: FnOnce(CleanupBudget) + Send + 'static,
     {
-        if self.is_current_worker() {
-            operation();
+        if let Some(budget) = self.current_budget() {
+            operation(budget);
             return;
         }
-        self.spawn(thread_name, operation);
+        if let Err(error) = self.submit_bounded(thread_name, operation) {
+            tracing::error!("failed to start bounded cleanup worker: {error:#}");
+        }
     }
 
     /// Wait for this invocation's remaining owners and cleanup jobs under one shared time budget.
     pub fn finish(self) {
-        self.finish_with_grace(SSH_CLEANUP_JOIN_GRACE);
+        let _supervisor_joined = self.finish_with_grace(REMOTE_CLEANUP_GRACE);
     }
 
-    fn finish_with_grace(mut self, grace: std::time::Duration) {
+    fn finish_with_grace(mut self, grace: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + grace;
         let state = self.state.clone();
         let mut workers = state
             .workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while workers.owners > 1 || workers.pending > 0 {
+        workers.finish_deadline = Some(
+            workers
+                .finish_deadline
+                .map_or(deadline, |current| std::cmp::min(current, deadline)),
+        );
+        state.changed.notify_all();
+        drop(workers);
+        // this owner cannot submit more work. Closing its sender before waiting lets an otherwise
+        // idle supervisor retire concurrently with workers instead of starting after grace expires.
+        drop(self.sender.take());
+        let mut workers = state
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while workers.owners > 1
+            || workers.pending > 0
+            || workers.threads.iter().any(|worker| !worker.is_finished())
+            || state
+                .supervisor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|supervisor| !supervisor.is_finished())
+        {
             let now = std::time::Instant::now();
             if now >= deadline {
                 break;
             }
+            // pending completion is signaled just before the OS marks its JoinHandle finished.
+            // poll that final transition under the same deadline rather than performing an
+            // unbounded join or detaching an almost-finished worker.
+            let wait = std::cmp::min(
+                CLEANUP_POLL_INTERVAL,
+                deadline.saturating_duration_since(now),
+            );
             let (next, _) = state
                 .changed
-                .wait_timeout(workers, deadline.saturating_duration_since(now))
+                .wait_timeout(workers, wait)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             workers = next;
         }
         let remaining_owners = workers.owners.saturating_sub(1);
         let pending = workers.pending;
-        let completed = if pending == 0 {
-            std::mem::take(&mut workers.threads)
-        } else {
-            let mut completed = Vec::new();
-            let mut still_running = Vec::new();
-            for worker in std::mem::take(&mut workers.threads) {
-                if worker.is_finished() {
-                    completed.push(worker);
-                } else {
-                    still_running.push(worker);
-                }
+        let mut completed = Vec::new();
+        let mut still_running = Vec::new();
+        for worker in std::mem::take(&mut workers.threads) {
+            if worker.is_finished() {
+                completed.push(worker);
+            } else {
+                still_running.push(worker);
             }
-            workers.threads = still_running;
-            completed
-        };
+        }
+        let unfinished_workers = still_running.len();
+        workers.threads = still_running;
         drop(workers);
         for worker in completed {
             if let Err(error) = worker.join() {
                 tracing::debug!("deferred remote cleanup worker panicked: {error:?}");
             }
         }
-        if pending > 0 {
+        if pending > 0 || unfinished_workers > 0 {
             tracing::debug!(
-                "{pending} deferred remote cleanup worker(s) did not finish within {}; abandoning them at process exit",
+                "{pending} deferred remote cleanup job(s) and {unfinished_workers} worker thread(s) did not finish within {}; abandoning them at process exit",
                 humantime::format_duration(grace)
             );
         }
@@ -414,54 +541,54 @@ impl RemoteCleanup {
                 humantime::format_duration(grace)
             );
         }
-        drop(self.sender.take());
-        Self::finish_supervisor(&state, deadline);
-    }
-
-    fn finish_supervisor(state: &std::sync::Arc<CleanupState>, deadline: std::time::Instant) {
-        let supervisor = loop {
-            let mut supervisor = state
-                .supervisor
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if supervisor
-                .as_ref()
-                .is_some_and(std::thread::JoinHandle::is_finished)
-            {
-                break supervisor.take();
+        let supervisor = state
+            .supervisor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        match supervisor {
+            Some(supervisor) if supervisor.is_finished() => {
+                if let Err(error) = supervisor.join() {
+                    tracing::debug!("remote cleanup supervisor panicked: {error:?}");
+                }
+                true
             }
-            drop(supervisor);
-            if std::time::Instant::now() >= deadline {
+            Some(_) => {
                 tracing::debug!(
-                    "remote cleanup supervisor did not finish within its operation cleanup grace"
+                    "remote cleanup supervisor did not finish within its shared cleanup grace"
                 );
-                return;
+                false
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
-        if let Some(supervisor) = supervisor
-            && let Err(error) = supervisor.join()
-        {
-            tracing::debug!("remote cleanup supervisor panicked: {error:?}");
+            None => true,
         }
     }
 }
 
+#[derive(Clone, Copy)]
+enum WorkerSpawnFallback {
+    RunInSupervisor,
+    Abandon,
+}
+
 impl CleanupState {
-    fn start_cleanup_job(self: &std::sync::Arc<Self>, job: CleanupJob) {
+    fn start_cleanup_job(
+        self: &std::sync::Arc<Self>,
+        job: CleanupJob,
+        fallback: WorkerSpawnFallback,
+    ) -> std::io::Result<()> {
         let thread_name = job.thread_name;
-        // retain the job until the OS confirms worker creation. Unlike the old implementation,
-        // the supervisor can execute this retained job itself if a per-job worker cannot start.
+        // retain the job until the OS confirms worker creation. The start gate lets the handle enter
+        // shared state before the worker can finish, without holding that mutex across thread spawn.
         let job = std::sync::Arc::new(std::sync::Mutex::new(Some(job)));
         let worker_job = job.clone();
         let state = self.clone();
-        let mut workers = self
-            .workers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
         match std::thread::Builder::new()
             .name(thread_name.to_string())
             .spawn(move || {
+                if start_rx.recv().is_err() {
+                    return;
+                }
                 if let Some(job) = worker_job
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -470,26 +597,82 @@ impl CleanupState {
                     state.run_cleanup_job(job);
                 }
             }) {
-            Ok(worker) => workers.threads.push(worker),
+            Ok(worker) => {
+                self.workers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .threads
+                    .push(worker);
+                if start_tx.send(()).is_err() {
+                    let job = job
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                        .expect("a failed worker start signal retains its job");
+                    return self.handle_worker_start_failure(
+                        job,
+                        fallback,
+                        std::io::Error::other("cleanup worker exited before its start signal"),
+                    );
+                }
+                Ok(())
+            }
             Err(error) => {
-                tracing::error!(
-                    "failed to start deferred cleanup worker; running cleanup in its supervisor: {error:#}"
-                );
-                drop(workers);
                 let job = job
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take()
                     .expect("a failed cleanup worker start retains its job");
+                self.handle_worker_start_failure(job, fallback, error)
+            }
+        }
+    }
+
+    fn handle_worker_start_failure(
+        self: &std::sync::Arc<Self>,
+        job: CleanupJob,
+        fallback: WorkerSpawnFallback,
+        error: std::io::Error,
+    ) -> std::io::Result<()> {
+        match fallback {
+            WorkerSpawnFallback::RunInSupervisor => {
+                tracing::error!(
+                    "failed to start deferred cleanup worker; running cleanup in its supervisor: {error:#}"
+                );
                 self.run_cleanup_job(job);
+                Ok(())
+            }
+            WorkerSpawnFallback::Abandon => {
+                tracing::error!(
+                    "failed to start an isolated fallback cleanup worker; leaking the cleanup job for process-exit reclamation: {error:#}"
+                );
+                std::mem::forget(job);
+                let mut workers = self
+                    .workers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                workers.pending = workers
+                    .pending
+                    .checked_sub(1)
+                    .expect("abandoned cleanup matches a pending job");
+                self.changed.notify_all();
+                Err(error)
             }
         }
     }
 
     fn run_cleanup_job(self: &std::sync::Arc<Self>, job: CleanupJob) {
         let _completion = CleanupWorkerCompletion(self.clone());
-        let _context = CleanupWorkerContext::enter(self);
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job.operation)).is_err() {
+        let budget = CleanupBudget {
+            state: self.clone(),
+            job_deadline: job.deadline,
+        };
+        let _context = CleanupWorkerContext::enter(self, budget.clone());
+        let operation = move || match job.operation {
+            CleanupOperation::Bounded(operation) => operation(budget),
+            CleanupOperation::Disposable(operation) => operation(),
+        };
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).is_err() {
             tracing::debug!("deferred remote cleanup job panicked");
         }
     }
@@ -710,24 +893,40 @@ struct SshMasterReaper {
     control_directory: Option<std::path::PathBuf>,
 }
 
+pub(crate) fn poll_process_exit_until_deadline(
+    budget: &CleanupBudget,
+    mut try_wait: impl FnMut() -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    loop {
+        if try_wait()? {
+            return Ok(true);
+        }
+        if !budget.wait_for_next_poll() {
+            return Ok(false);
+        }
+    }
+}
+
 impl SshMasterReaper {
-    fn reap(mut self) {
+    fn reap(mut self, budget: CleanupBudget) {
         let master_exited = if let Some(launcher) = self.launcher.as_mut() {
-            loop {
-                match launcher.try_wait() {
-                    Ok(Some(_)) => break true,
-                    Ok(None) => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(error) => {
-                        tracing::debug!("failed to reap SSH multiplex master: {error:#}");
-                        break false;
-                    }
+            match poll_process_exit_until_deadline(&budget, || {
+                launcher.try_wait().map(|status| status.is_some())
+            }) {
+                Ok(exited) => exited,
+                Err(error) => {
+                    tracing::debug!("failed to reap SSH multiplex master: {error:#}");
+                    false
                 }
             }
         } else {
             true
         };
+        if !master_exited {
+            tracing::debug!(
+                "SSH multiplex master did not exit within its cleanup budget; preserving its control directory"
+            );
+        }
         if master_exited
             && let Some(control_directory) = self.control_directory.as_deref()
             && let Err(error) = std::fs::remove_dir_all(control_directory)
@@ -799,7 +998,8 @@ impl Drop for PreparingSshMaster {
             launcher: self.launcher.take(),
             control_directory: self.control_directory.take(),
         };
-        self.cleanup.defer("rcp-ssh-cleanup", move || reaper.reap());
+        self.cleanup
+            .defer_bounded("rcp-ssh-cleanup", move |budget| reaper.reap(budget));
     }
 }
 
@@ -825,7 +1025,8 @@ impl Drop for ManagedSshSessionInner {
             launcher: self.launcher.take(),
             control_directory: self.control_directory.take(),
         };
-        self.cleanup.defer("rcp-ssh-cleanup", move || reaper.reap());
+        self.cleanup
+            .defer_bounded("rcp-ssh-cleanup", move |budget| reaper.reap(budget));
     }
 }
 
@@ -1304,7 +1505,7 @@ pub fn resolve_remote_concurrency(
 
 /// Intersect the configured data-stream ceiling with the file-work ceiling.
 #[must_use]
-pub fn effective_max_connections(
+fn effective_max_connections(
     files_in_flight: common::ConcurrencyLimit,
     configured: std::num::NonZeroUsize,
 ) -> std::num::NonZeroUsize {
@@ -1329,33 +1530,6 @@ impl Default for TcpConfig {
 }
 
 impl TcpConfig {
-    /// Create TcpConfig with custom timeout values
-    pub fn with_timeout(conn_timeout_sec: u64) -> Self {
-        Self {
-            conn_timeout_sec,
-            ..Self::default()
-        }
-    }
-    /// Set port ranges
-    pub fn with_port_ranges(mut self, ranges: impl Into<String>) -> Self {
-        self.port_ranges = Some(ranges.into());
-        self
-    }
-    /// Set network profile
-    pub fn with_network_profile(mut self, profile: NetworkProfile) -> Self {
-        self.network_profile = profile;
-        self
-    }
-    /// Set buffer size for file transfers
-    pub fn with_buffer_size(mut self, size: usize) -> Self {
-        self.buffer_size = Some(size);
-        self
-    }
-    /// Set the connection liveness budget (0 disables it)
-    pub fn with_keepalive_sec(mut self, keepalive_sec: u64) -> Self {
-        self.keepalive_sec = keepalive_sec;
-        self
-    }
     /// Get the effective buffer size (explicit or profile default)
     pub fn effective_buffer_size(&self) -> usize {
         self.buffer_size
@@ -1431,9 +1605,11 @@ where
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    cleanup.spawn(thread_name, move || {
-        let _ = result_tx.send(operation());
-    });
+    cleanup
+        .submit_disposable(thread_name, move || {
+            let _ = result_tx.send(operation());
+        })
+        .with_context(|| format!("failed to start {thread_name} worker"))?;
     result_rx
         .await
         .with_context(|| format!("{thread_name} worker exited without a result"))?
@@ -1660,7 +1836,7 @@ fn control_dir_is_usable(dir: &std::path::Path) -> bool {
         );
         return false;
     }
-    // Probe rather than inspect the mode: ownership, ACLs and read-only mounts all decide this,
+    // probe rather than inspect the mode: ownership, ACLs and read-only mounts all decide this,
     // and creating a directory is exactly what `openssh` is about to do anyway.
     match tempfile::Builder::new()
         .prefix(".rcp-control-probe-")
@@ -1772,23 +1948,7 @@ pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// Validate and retrieve HOME directory on remote host
-///
-/// Checks that $HOME is set and non-empty on the remote host.
-/// This prevents constructing invalid paths like `/.cache/rcp/bin/rcpd-{version}`
-/// when HOME is not set.
-///
-/// # Arguments
-///
-/// * `session` - SSH session to the remote host
-///
-/// # Returns
-///
-/// The value of $HOME on the remote host
-///
-/// # Errors
-///
-/// Returns an error if HOME is not set or is empty
+/// Marker error used when a remote host has no usable HOME directory.
 #[derive(Debug)]
 struct RemoteHomeUnavailable(String);
 
@@ -1800,6 +1960,14 @@ impl std::fmt::Display for RemoteHomeUnavailable {
 
 impl std::error::Error for RemoteHomeUnavailable {}
 
+/// Validate and retrieve the HOME directory on a remote host.
+///
+/// The lookup rejects an unset or empty HOME so callers cannot accidentally construct paths such
+/// as `/.cache/rcp/bin/rcpd-{version}`.
+///
+/// # Errors
+///
+/// Returns an error when the lookup fails or HOME is unset or empty.
 async fn get_remote_home_with_context<S: SshSessionOwner>(
     session: &S,
     preparation: &PreparationContext,
@@ -1832,7 +2000,7 @@ async fn run_remote_home_probe<S: SshSessionOwner>(
             \n\
             stderr: {}\n\
             \n\
-            The HOME environment variable is required for rcpd deployment and discovery.\n\
+            The HOME environment variable is required for remote ~ expansion and rcpd deployment.\n\
             Please ensure your SSH configuration preserves environment variables.",
             stderr
         ))));
@@ -1844,7 +2012,7 @@ async fn run_remote_home_probe<S: SshSessionOwner>(
         return Err(anyhow::Error::new(RemoteHomeUnavailable(
             "HOME environment variable is empty on remote host\n\
             \n\
-            The HOME environment variable is required for rcpd deployment and discovery.\n\
+            The HOME environment variable is required for remote ~ expansion and rcpd deployment.\n\
             Please ensure your SSH configuration sets HOME correctly."
                 .to_string(),
         )));
@@ -1895,7 +2063,7 @@ trait DiscoverySession {
         &'a self,
         path: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>;
-    fn which<'a>(
+    fn find_in_path<'a>(
         &'a self,
         binary: &'a str,
     ) -> std::pin::Pin<
@@ -1932,15 +2100,19 @@ impl<S: SshSessionOwner> DiscoverySession for RealDiscoverySession<'_, S> {
             Ok(output.status.success())
         })
     }
-    fn which<'b>(
+    fn find_in_path<'b>(
         &'b self,
         binary: &'b str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<Option<String>>> + Send + 'b>,
     > {
         Box::pin(async move {
-            let mut command = openssh::Session::to_command(self.session.clone(), "which");
-            command.arg(binary);
+            let mut command = openssh::Session::to_command(self.session.clone(), "sh");
+            command
+                .arg("-c")
+                .arg(RCPD_PATH_DISCOVERY_SCRIPT)
+                .arg("rcp-path-discovery")
+                .arg(binary);
             let output = self
                 .preparation
                 .remote_output(command, "remote PATH discovery", self.deadline)
@@ -1975,7 +2147,7 @@ impl<S: SshSessionOwner> DiscoverySession for RealDiscoverySession<'_, S> {
 /// Searches in the following order:
 /// 1. Explicit path (if provided)
 /// 2. Same directory as local rcp binary
-/// 3. PATH (via `which rcpd`)
+/// 3. PATH (via the shell's `command -v rcpd`)
 /// 4. Deployed cache directory (~/.cache/rcp/bin/rcpd-{version})
 ///
 /// The cache is checked last as it contains auto-deployed binaries and should
@@ -2031,7 +2203,7 @@ async fn discover_rcpd_path_internal<S: DiscoverySession + ?Sized>(
     }
     // try PATH
     tracing::debug!("Trying to find rcpd in PATH");
-    if let Some(path) = session.which("rcpd").await? {
+    if let Some(path) = session.find_in_path("rcpd").await? {
         tracing::info!("Found rcpd in PATH: {}", path);
         return Ok(path);
     }
@@ -2055,17 +2227,11 @@ async fn discover_rcpd_path_internal<S: DiscoverySession + ?Sized>(
     // build error message with what we searched
     let mut searched = vec![];
     searched.push("- Same directory as local rcp binary".to_string());
-    searched.push("- PATH (via 'which rcpd')".to_string());
+    searched.push("- PATH (via 'command -v rcpd')".to_string());
     if let Some(path) = cache_path.as_ref() {
         searched.push(format!("- Deployed cache: {}", path));
     } else {
         searched.push("- Deployed cache: (skipped, HOME not set)".to_string());
-    }
-    if let Some(path) = explicit_path {
-        searched.insert(
-            0,
-            format!("- Explicit path: {} (not found or not executable)", path),
-        );
     }
     Err(anyhow::anyhow!(
         "rcpd binary not found on remote host\n\
@@ -2233,7 +2399,7 @@ pub fn format_rcpd_readiness(
 }
 
 /// Parse the version-sensitive first stderr record emitted by rcpd.
-pub fn parse_rcpd_readiness(line: &str) -> anyhow::Result<RcpdConnectionInfo> {
+fn parse_rcpd_readiness(line: &str) -> anyhow::Result<RcpdConnectionInfo> {
     fn parse_files_in_flight(token: &str) -> anyhow::Result<common::ConcurrencyLimit> {
         if token == "unlimited" {
             return Ok(common::ConcurrencyLimit::Unlimited);
@@ -2372,41 +2538,6 @@ pub struct PreparedRcpd {
     session: ManagedSshSession,
     rcpd_path: String,
     remote: SshSession,
-}
-
-pub async fn prepare_rcpd(
-    session: &SshSession,
-    explicit_rcpd_path: Option<&str>,
-    auto_deploy_rcpd: bool,
-    cleanup: &RemoteCleanup,
-) -> anyhow::Result<PreparedRcpd> {
-    prepare_rcpd_with_cancellation(
-        session,
-        explicit_rcpd_path,
-        auto_deploy_rcpd,
-        tokio_util::sync::CancellationToken::new(),
-        cleanup,
-    )
-    .await
-}
-
-/// Prepare two endpoint sessions, sharing one result for a same-session copy.
-pub async fn prepare_rcpd_endpoints(
-    source: &SshSession,
-    destination: &SshSession,
-    explicit_rcpd_path: Option<&str>,
-    auto_deploy_rcpd: bool,
-    cleanup: &RemoteCleanup,
-) -> anyhow::Result<(PreparedRcpd, PreparedRcpd)> {
-    prepare_rcpd_endpoints_with_timeout(
-        source,
-        destination,
-        explicit_rcpd_path,
-        auto_deploy_rcpd,
-        cleanup,
-        DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
-    )
-    .await
 }
 
 /// Prepare two endpoints with a caller-selected remote bootstrap timeout.
@@ -2555,24 +2686,6 @@ where
     }
 }
 
-#[instrument(skip(cancellation, cleanup))]
-pub async fn prepare_rcpd_with_cancellation(
-    session: &SshSession,
-    explicit_rcpd_path: Option<&str>,
-    auto_deploy_rcpd: bool,
-    cancellation: tokio_util::sync::CancellationToken,
-    cleanup: &RemoteCleanup,
-) -> anyhow::Result<PreparedRcpd> {
-    prepare_rcpd_with_context(
-        session,
-        explicit_rcpd_path,
-        auto_deploy_rcpd,
-        PreparationContext::new(cancellation, cleanup.clone()),
-        DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
-    )
-    .await
-}
-
 #[instrument(skip(preparation))]
 async fn prepare_rcpd_with_context(
     session: &SshSession,
@@ -2657,31 +2770,6 @@ async fn prepare_rcpd_with_context(
         rcpd_path,
         remote: session.clone(),
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-#[instrument(skip(cleanup))]
-pub async fn start_rcpd(
-    rcpd_config: &protocol::RcpdConfig,
-    session: &SshSession,
-    explicit_rcpd_path: Option<&str>,
-    auto_deploy_rcpd: bool,
-    bind_ip: Option<&str>,
-    role: protocol::RcpdRole,
-    cleanup: &RemoteCleanup,
-) -> anyhow::Result<RcpdProcess> {
-    let bootstrap_timeout =
-        std::time::Duration::from_secs(rcpd_config.remote_copy_conn_timeout_sec);
-    prepare_rcpd_with_context(
-        session,
-        explicit_rcpd_path,
-        auto_deploy_rcpd,
-        PreparationContext::uncancelled(cleanup.clone()),
-        bootstrap_timeout,
-    )
-    .await?
-    .spawn(rcpd_config, bind_ip, role)
-    .await
 }
 
 impl PreparedRcpd {
@@ -2784,9 +2872,8 @@ async fn reap_failed_rcpd(
     host: &str,
     stderr_reader: Option<tokio::io::BufReader<openssh::ChildStderr>>,
 ) -> Option<String> {
-    let host = host.to_string();
     let stdout_reader = child.stdout().take();
-    let mut reaper = tokio::spawn(async move {
+    let reaper = async move {
         let stdout = async move {
             match stdout_reader {
                 Some(stdout) => drain_bounded_output(stdout, DIAGNOSTIC_CAPTURE_LIMIT).await,
@@ -2801,9 +2888,9 @@ async fn reap_failed_rcpd(
         };
         let (status, stdout, stderr) = tokio::join!(child.wait(), stdout, stderr);
         anyhow::Ok((status?, stdout, stderr))
-    });
-    match tokio::time::timeout(FAILED_RCPD_REAP_GRACE, &mut reaper).await {
-        Ok(Ok(Ok((status, stdout, stderr)))) => {
+    };
+    match tokio::time::timeout(FAILED_RCPD_REAP_GRACE, reaper).await {
+        Ok(Ok((status, stdout, stderr))) => {
             tracing::debug!(
                 host,
                 status = ?status.code(),
@@ -2811,18 +2898,14 @@ async fn reap_failed_rcpd(
             );
             format_failed_rcpd_output(stdout.rendered().as_bytes(), &stderr.rendered())
         }
-        Ok(Ok(Err(error))) => {
-            tracing::debug!(host, "failed to reap rcpd after startup error: {error:#}");
-            None
-        }
         Ok(Err(error)) => {
-            tracing::debug!(host, "rcpd startup reaper task failed: {error:#}");
+            tracing::debug!(host, "failed to reap rcpd after startup error: {error:#}");
             None
         }
         Err(_) => {
             tracing::debug!(
                 host,
-                "rcpd did not exit within the startup cleanup grace; background reaper retained ownership while the runtime remains active"
+                "rcpd did not exit within the startup cleanup grace; released its SSH child and output pipes"
             );
             None
         }
@@ -2842,7 +2925,7 @@ fn format_failed_rcpd_output(stdout: &[u8], stderr: &str) -> Option<String> {
 }
 
 // ============================================================================
-// IP address detection
+// ip address detection
 // ============================================================================
 
 fn get_local_ip(explicit_bind_ip: Option<&str>) -> anyhow::Result<std::net::IpAddr> {
@@ -3038,7 +3121,7 @@ pub fn get_random_server_name() -> String {
 }
 
 // ============================================================================
-// TCP server and client functions
+// tcp server and client functions
 // ============================================================================
 
 /// Create a TCP listener for control connections
@@ -3350,9 +3433,7 @@ mod tests {
             fail_early: false,
             max_workers: 0,
             max_blocking_threads: 0,
-            files_in_flight: protocol::RcpdFilesInFlight::Explicit(
-                common::ConcurrencyLimit::Limited(nonzero(4)),
-            ),
+            files_in_flight: protocol::RcpdFilesInFlight::Explicit(nonzero(4)),
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,
@@ -3386,6 +3467,166 @@ mod tests {
             encryption: false,
             master_cert_fingerprint: None,
         }
+    }
+
+    async fn prepare_test_rcpd(
+        session: &SshSession,
+        explicit_rcpd_path: Option<&str>,
+        auto_deploy_rcpd: bool,
+        cleanup: &RemoteCleanup,
+    ) -> anyhow::Result<PreparedRcpd> {
+        prepare_rcpd_with_context(
+            session,
+            explicit_rcpd_path,
+            auto_deploy_rcpd,
+            PreparationContext::uncancelled(cleanup.clone()),
+            DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
+        )
+        .await
+    }
+
+    #[cfg(target_os = "linux")]
+    struct KillTestProcessOnDrop {
+        pid: String,
+        process: std::path::PathBuf,
+        start_time: String,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl KillTestProcessOnDrop {
+        fn new(pid: String) -> Self {
+            let process = std::path::PathBuf::from(format!("/proc/{pid}"));
+            let start_time = linux_process_start_time(&process)
+                .expect("failed-rcpd test process must expose a stable identity");
+            Self {
+                pid,
+                process,
+                start_time,
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for KillTestProcessOnDrop {
+        fn drop(&mut self) {
+            if linux_process_start_time(&self.process).as_ref() == Some(&self.start_time) {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", self.pid.as_str()])
+                    .status();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn spawn_failed_rcpd_that_never_exits(
+        session: &ManagedSshSession,
+        directory: &std::path::Path,
+    ) -> (
+        openssh::Child<ManagedSshSession>,
+        tokio::io::BufReader<openssh::ChildStderr>,
+        KillTestProcessOnDrop,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncBufReadExt;
+
+        let script = directory.join("failed-rcpd");
+        let process_pid = directory.join("process-pid");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > {}\nprintf '%s\\n' 'not a readiness record' >&2\nexec sleep 30\n",
+                shell_escape(process_pid.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = openssh::Session::to_command(session.clone(), script.to_str().unwrap());
+        command
+            .stdin(openssh::Stdio::piped())
+            .stdout(openssh::Stdio::piped())
+            .stderr(openssh::Stdio::piped());
+        let mut child = command.spawn().await.unwrap();
+        let stderr = child.stderr().take().unwrap();
+        let mut stderr_reader = tokio::io::BufReader::new(stderr);
+        let mut readiness = String::new();
+        stderr_reader.read_line(&mut readiness).await.unwrap();
+        assert_eq!(readiness, "not a readiness record\n");
+        let pid = std::fs::read_to_string(process_pid).unwrap();
+        let guard = KillTestProcessOnDrop::new(pid.trim().to_string());
+        (child, stderr_reader, guard)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_remote_failed_rcpd_reap_timeout_releases_child_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let cleanup = RemoteCleanup::new().unwrap();
+        let preparation = PreparationContext::uncancelled(cleanup.clone());
+        let session = setup_ssh_session(
+            &SshSession::local(),
+            &preparation,
+            BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .expect("localhost SSH must be available");
+        let weak_session = std::sync::Arc::downgrade(&session.0);
+        let (child, stderr_reader, _process) =
+            spawn_failed_rcpd_that_never_exits(&session, directory.path()).await;
+
+        let diagnostic = reap_failed_rcpd(child, "localhost", Some(stderr_reader)).await;
+        assert!(diagnostic.is_none());
+        drop(session);
+        drop(preparation);
+
+        assert!(
+            weak_session.upgrade().is_none(),
+            "an expired failed-rcpd reap must release its child and managed SSH session"
+        );
+        cleanup.finish();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_remote_cancelled_failed_rcpd_reap_releases_child_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let cleanup = RemoteCleanup::new().unwrap();
+        let preparation = PreparationContext::uncancelled(cleanup.clone());
+        let session = setup_ssh_session(
+            &SshSession::local(),
+            &preparation,
+            BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .expect("localhost SSH must be available");
+        let weak_session = std::sync::Arc::downgrade(&session.0);
+        let (child, stderr_reader, _process) =
+            spawn_failed_rcpd_that_never_exits(&session, directory.path()).await;
+        let (first_poll_tx, first_poll_rx) = tokio::sync::oneshot::channel();
+        let reaper = tokio::spawn(async move {
+            let mut reaper = Box::pin(reap_failed_rcpd(child, "localhost", Some(stderr_reader)));
+            let mut first_poll_tx = Some(first_poll_tx);
+            std::future::poll_fn(move |context| {
+                let result = std::future::Future::poll(reaper.as_mut(), context);
+                if let Some(first_poll_tx) = first_poll_tx.take() {
+                    let _ = first_poll_tx.send(());
+                }
+                result
+            })
+            .await
+        });
+        first_poll_rx.await.unwrap();
+
+        reaper.abort();
+        let error = reaper.await.unwrap_err();
+        assert!(error.is_cancelled());
+        drop(session);
+        drop(preparation);
+
+        assert!(
+            weak_session.upgrade().is_none(),
+            "cancelling a failed-rcpd reap must release its child and managed SSH session"
+        );
+        cleanup.finish();
     }
 
     #[test]
@@ -3608,18 +3849,19 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let cleanup = RemoteCleanup::new().unwrap();
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            start_rcpd(
-                &test_rcpd_config(),
+        let config = test_rcpd_config();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            prepare_rcpd_with_context(
                 &SshSession::local(),
                 Some(script.to_str().unwrap()),
                 false,
-                None,
-                protocol::RcpdRole::Source,
-                &cleanup,
-            ),
-        )
+                PreparationContext::uncancelled(cleanup.clone()),
+                std::time::Duration::from_secs(config.remote_copy_conn_timeout_sec),
+            )
+            .await?
+            .spawn(&config, None, protocol::RcpdRole::Source)
+            .await
+        })
         .await
         .expect("the configured one-second probe deadline was not honored");
         let error = match result {
@@ -3655,7 +3897,7 @@ mod tests {
         std::fs::write(&script, contents).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let cleanup = RemoteCleanup::new().unwrap();
-        let prepared = prepare_rcpd(
+        let prepared = prepare_test_rcpd(
             &SshSession::local(),
             Some(script.to_str().unwrap()),
             false,
@@ -3699,7 +3941,7 @@ mod tests {
         std::fs::write(&script, contents).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let cleanup = RemoteCleanup::new().unwrap();
-        let prepared = prepare_rcpd(
+        let prepared = prepare_test_rcpd(
             &SshSession::local(),
             Some(script.to_str().unwrap()),
             false,
@@ -3752,7 +3994,7 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let config = test_rcpd_config();
         let cleanup = RemoteCleanup::new().unwrap();
-        let prepared = prepare_rcpd(
+        let prepared = prepare_test_rcpd(
             &SshSession::local(),
             Some(script.to_str().unwrap()),
             false,
@@ -3799,7 +4041,7 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let cleanup = RemoteCleanup::new().unwrap();
-        let prepared = prepare_rcpd(
+        let prepared = prepare_test_rcpd(
             &SshSession::local(),
             Some(script.to_str().unwrap()),
             false,
@@ -3852,7 +4094,7 @@ mod tests {
         std::fs::write(&script, contents).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let cleanup = RemoteCleanup::new().unwrap();
-        let prepared = prepare_rcpd(
+        let prepared = prepare_test_rcpd(
             &SshSession::local(),
             Some(script.to_str().unwrap()),
             false,
@@ -4365,7 +4607,7 @@ mod tests {
 
     struct MockDiscoverySession {
         test_responses: HashMap<String, bool>,
-        which_response: Option<String>,
+        path_response: Option<String>,
         home_response: Result<Option<String>, String>,
         calls: Mutex<Vec<String>>,
     }
@@ -4374,7 +4616,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 test_responses: HashMap::new(),
-                which_response: None,
+                path_response: None,
                 home_response: Ok(None),
                 calls: Mutex::new(Vec::new()),
             }
@@ -4394,8 +4636,8 @@ mod tests {
             self.home_response = Err(error.to_string());
             self
         }
-        fn with_which(mut self, path: Option<&str>) -> Self {
-            self.which_response = path.map(|p| p.to_string());
+        fn with_path(mut self, path: Option<&str>) -> Self {
+            self.path_response = path.map(|p| p.to_string());
             self
         }
         fn set_test_response(&mut self, path: &str, exists: bool) {
@@ -4416,14 +4658,14 @@ mod tests {
             let exists = self.test_responses.get(path).copied().unwrap_or(false);
             Box::pin(async move { Ok(exists) })
         }
-        fn which<'a>(
+        fn find_in_path<'a>(
             &'a self,
             binary: &'a str,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = anyhow::Result<Option<String>>> + Send + 'a>,
         > {
-            self.calls.lock().unwrap().push(format!("which:{}", binary));
-            let result = self.which_response.clone();
+            self.calls.lock().unwrap().push(format!("path:{}", binary));
+            let result = self.path_response.clone();
             Box::pin(async move { Ok(result) })
         }
         fn remote_home<'a>(
@@ -4525,6 +4767,179 @@ mod tests {
     }
 
     #[test]
+    fn stopped_supervisor_never_runs_cleanup_on_the_submitter() {
+        let (supervisor_stopped_tx, supervisor_stopped_rx) = std::sync::mpsc::channel();
+        let cleanup = RemoteCleanup::try_new_with(move |_operation| {
+            std::thread::Builder::new()
+                .name("rcp-test-stopped-cleanup-supervisor".to_string())
+                .spawn(move || {
+                    supervisor_stopped_tx.send(()).unwrap();
+                })
+        })
+        .unwrap();
+        supervisor_stopped_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("test supervisor must stop before submission");
+        let stopped_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !cleanup
+            .state
+            .supervisor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            assert!(
+                std::time::Instant::now() < stopped_deadline,
+                "test supervisor did not finish after reporting shutdown"
+            );
+            std::thread::yield_now();
+        }
+        let submitter = std::thread::current().id();
+        let (executed_tx, executed_rx) = std::sync::mpsc::channel();
+
+        cleanup.defer_bounded("rcp-test-supervisor-fallback", move |_budget| {
+            executed_tx.send(std::thread::current().id()).unwrap();
+        });
+
+        let executor = executed_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("fallback cleanup must execute");
+        assert_ne!(
+            executor, submitter,
+            "a stopped supervisor must not move blocking cleanup onto its submitter"
+        );
+        cleanup.finish();
+    }
+
+    #[test]
+    fn cleanup_grace_also_retires_the_supervisor() {
+        let cleanup = RemoteCleanup::new().unwrap();
+        let state = cleanup.state.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let release = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_release = release.clone();
+        cleanup
+            .submit_disposable("rcp-test-blocked-cleanup", move || {
+                started_tx.send(()).unwrap();
+                let (released, release_changed) = &*worker_release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = release_changed.wait(released).unwrap();
+                }
+            })
+            .unwrap();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("cleanup worker must start");
+
+        let supervisor_joined = cleanup.finish_with_grace(std::time::Duration::from_millis(250));
+
+        assert!(
+            state
+                .supervisor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "the supervisor handle must leave shared state within the same cleanup grace"
+        );
+        assert!(
+            supervisor_joined,
+            "the cleanup supervisor itself must be joined within the shared cleanup grace"
+        );
+        let (released, release_changed) = &*release;
+        *released.lock().unwrap() = true;
+        release_changed.notify_all();
+    }
+
+    #[test]
+    fn cleanup_grace_never_joins_a_still_running_supervisor() {
+        let (operation_finished_tx, operation_finished_rx) = std::sync::mpsc::channel();
+        let release = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+        let supervisor_release = release.clone();
+        let cleanup = RemoteCleanup::try_new_with(move |operation| {
+            std::thread::Builder::new()
+                .name("rcp-test-blocked-supervisor-exit".to_string())
+                .spawn(move || {
+                    operation();
+                    operation_finished_tx.send(()).unwrap();
+                    let (released, release_changed) = &*supervisor_release;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = release_changed.wait(released).unwrap();
+                    }
+                })
+        })
+        .unwrap();
+
+        let supervisor_joined = cleanup.finish_with_grace(std::time::Duration::from_millis(20));
+
+        operation_finished_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the supervisor operation must finish before the wrapper remains blocked");
+        assert!(
+            !supervisor_joined,
+            "a supervisor wrapper still running after the deadline must be detached"
+        );
+        let (released, release_changed) = &*release;
+        *released.lock().unwrap() = true;
+        release_changed.notify_all();
+    }
+
+    #[test]
+    fn cleanup_finish_deadline_shortens_an_active_job_budget() {
+        let cleanup = RemoteCleanup::new().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        cleanup.defer_bounded("rcp-test-shared-cleanup-deadline", move |budget| {
+            started_tx.send(()).unwrap();
+            let started = std::time::Instant::now();
+            let exited = poll_process_exit_until_deadline(&budget, || Ok(false)).unwrap();
+            finished_tx.send((exited, started.elapsed())).unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("bounded cleanup must start before publishing the finish deadline");
+
+        cleanup.finish_with_grace(std::time::Duration::from_millis(20));
+
+        let (exited, elapsed) = finished_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the shared finish deadline must wake and stop the cleanup worker");
+        assert!(!exited, "a process that never exited must remain unreaped");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the per-job cleanup deadline ignored the shorter shared finish deadline"
+        );
+    }
+
+    #[test]
+    fn process_polling_stops_at_its_cleanup_budget() {
+        let cleanup = RemoteCleanup::new().unwrap();
+        let budget =
+            CleanupBudget::for_job(cleanup.state.clone(), std::time::Duration::from_millis(20));
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let started = std::time::Instant::now();
+
+        let reaped = poll_process_exit_until_deadline(&budget, || {
+            polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(false)
+        })
+        .unwrap();
+
+        assert!(
+            !reaped,
+            "a process still running at the deadline is unreaped"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "cleanup process polling exceeded its mandatory budget"
+        );
+        assert!(polls.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+        cleanup.finish();
+    }
+
+    #[test]
     fn dropping_last_cleanup_owner_still_drains_queued_work() {
         let start_supervisor = std::sync::Arc::new(std::sync::Barrier::new(2));
         let supervisor_gate = start_supervisor.clone();
@@ -4538,7 +4953,7 @@ mod tests {
         })
         .unwrap();
         let (executed_tx, executed_rx) = std::sync::mpsc::channel();
-        cleanup.defer("rcp-test-drop-cleanup", move || {
+        cleanup.defer_bounded("rcp-test-drop-cleanup", move |_budget| {
             executed_tx.send(()).unwrap();
         });
 
@@ -4564,7 +4979,9 @@ mod tests {
             launcher: Some(launcher),
             control_directory: Some(control_directory.clone()),
         };
-        let worker = std::thread::spawn(move || reaper.reap());
+        let cleanup = RemoteCleanup::new().unwrap();
+        let budget = CleanupBudget::for_job(cleanup.state.clone(), REMOTE_CLEANUP_GRACE);
+        let worker = std::thread::spawn(move || reaper.reap(budget));
 
         std::thread::sleep(std::time::Duration::from_millis(1_100));
         assert!(
@@ -4577,6 +4994,33 @@ mod tests {
             !control_directory.exists(),
             "the control directory must be removed after the SSH master exits"
         );
+        cleanup.finish();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ssh_control_directory_survives_reap_budget_expiry() {
+        let root = tempfile::tempdir().unwrap();
+        let control_directory = root.path().join("control");
+        std::fs::create_dir(&control_directory).unwrap();
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "sleep 2"]).kill_on_drop(true);
+        let launcher = command.spawn().unwrap();
+        let reaper = SshMasterReaper {
+            launcher: Some(launcher),
+            control_directory: Some(control_directory.clone()),
+        };
+        let cleanup = RemoteCleanup::new().unwrap();
+        let budget =
+            CleanupBudget::for_job(cleanup.state.clone(), std::time::Duration::from_millis(20));
+
+        reaper.reap(budget);
+
+        assert!(
+            control_directory.exists(),
+            "an unconfirmed process exit must not remove its live control directory"
+        );
+        cleanup.finish();
     }
 
     #[test]
@@ -4593,7 +5037,9 @@ mod tests {
                     control_directory: Some(self.control_directory.clone()),
                 };
                 self.cleanup
-                    .defer("rcp-test-nested-ssh-cleanup", move || reaper.reap());
+                    .defer_bounded("rcp-test-nested-ssh-cleanup", move |budget| {
+                        reaper.reap(budget);
+                    });
             }
         }
 
@@ -4628,14 +5074,16 @@ mod tests {
             let (started_tx, started_rx) = std::sync::mpsc::channel();
             let release = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
             let worker_release = release.clone();
-            cleanup.spawn("rcp-test-isolated-cleanup", move || {
-                started_tx.send(()).unwrap();
-                let (released, release_changed) = &*worker_release;
-                let mut released = released.lock().unwrap();
-                while !*released {
-                    released = release_changed.wait(released).unwrap();
-                }
-            });
+            cleanup
+                .submit_disposable("rcp-test-isolated-cleanup", move || {
+                    started_tx.send(()).unwrap();
+                    let (released, release_changed) = &*worker_release;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = release_changed.wait(released).unwrap();
+                    }
+                })
+                .unwrap();
             (started_rx, release)
         }
 
@@ -4692,14 +5140,16 @@ mod tests {
         let release_guard = BlockingDropRelease(release.clone());
         let worker_release = release.clone();
         let (job_started_tx, job_started_rx) = std::sync::mpsc::channel();
-        last_owner.spawn("rcp-test-last-owner-cleanup", move || {
-            job_started_tx.send(()).unwrap();
-            let (released, release_changed) = &*worker_release;
-            let mut released = released.lock().unwrap();
-            while !*released {
-                released = release_changed.wait(released).unwrap();
-            }
-        });
+        last_owner
+            .submit_disposable("rcp-test-last-owner-cleanup", move || {
+                job_started_tx.send(()).unwrap();
+                let (released, release_changed) = &*worker_release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = release_changed.wait(released).unwrap();
+                }
+            })
+            .unwrap();
         job_started_rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("last-owner cleanup must start");
@@ -4722,9 +5172,11 @@ mod tests {
     fn panicking_cleanup_worker_still_completes_its_scope() {
         let cleanup = RemoteCleanup::new().unwrap();
         let state = cleanup.state.clone();
-        cleanup.spawn("rcp-test-panicking-cleanup", || panic!("cleanup panic"));
+        cleanup
+            .submit_disposable("rcp-test-panicking-cleanup", || panic!("cleanup panic"))
+            .unwrap();
 
-        cleanup.finish_with_grace(SSH_CLEANUP_JOIN_GRACE);
+        cleanup.finish_with_grace(REMOTE_CLEANUP_GRACE);
 
         let workers = state
             .workers
@@ -4997,21 +5449,48 @@ mod tests {
 
     #[tokio::test]
     async fn discover_rcpd_falls_back_to_path_after_same_dir() {
-        let mut session = MockDiscoverySession::new().with_which(Some("/usr/bin/rcpd"));
+        let mut session = MockDiscoverySession::new().with_path(Some("/usr/bin/rcpd"));
         session.set_test_response("/custom/bin/rcpd", false);
         let path =
             discover_rcpd_path_internal(&session, None, Some(PathBuf::from("/custom/bin/rcp")))
                 .await
                 .expect("should find in PATH after same dir miss");
         assert_eq!(path, "/usr/bin/rcpd");
-        assert_eq!(session.calls(), vec!["test:/custom/bin/rcpd", "which:rcpd"]);
+        assert_eq!(session.calls(), vec!["test:/custom/bin/rcpd", "path:rcpd"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_path_discovery_script_does_not_require_external_which() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let candidate = directory.path().join("rcpd");
+        std::fs::write(&candidate, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                RCPD_PATH_DISCOVERY_SCRIPT,
+                "rcp-path-discovery",
+                "rcpd",
+            ])
+            .env("PATH", directory.path())
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            candidate.to_str().unwrap()
+        );
     }
 
     #[tokio::test]
     async fn discover_rcpd_uses_cache_last() {
         let mut session = MockDiscoverySession::new()
             .with_home(Some("/home/rcp"))
-            .with_which(None);
+            .with_path(None);
         session.set_test_response("/custom/bin/rcpd", false);
         let local_version = common::version::ProtocolVersion::current();
         let cache_path = format!(
@@ -5028,7 +5507,7 @@ mod tests {
             session.calls(),
             vec![
                 "test:/custom/bin/rcpd".to_string(),
-                "which:rcpd".to_string(),
+                "path:rcpd".to_string(),
                 "home".to_string(),
                 format!("test:{cache_path}")
             ]
@@ -5037,7 +5516,7 @@ mod tests {
 
     #[tokio::test]
     async fn discover_rcpd_reports_home_missing_in_error() {
-        let mut session = MockDiscoverySession::new().with_which(None);
+        let mut session = MockDiscoverySession::new().with_path(None);
         session.set_test_response("/custom/bin/rcpd", false);
         let err =
             discover_rcpd_path_internal(&session, None, Some(PathBuf::from("/custom/bin/rcp")))
@@ -5050,14 +5529,14 @@ mod tests {
         );
         assert_eq!(
             session.calls(),
-            vec!["test:/custom/bin/rcpd", "which:rcpd", "home"]
+            vec!["test:/custom/bin/rcpd", "path:rcpd", "home"]
         );
     }
 
     #[tokio::test]
     async fn discover_rcpd_propagates_home_lookup_failure() {
         let mut session = MockDiscoverySession::new()
-            .with_which(None)
+            .with_path(None)
             .with_home_error("sentinel HOME lookup timeout");
         session.set_test_response("/custom/bin/rcpd", false);
 
@@ -5072,7 +5551,7 @@ mod tests {
         );
         assert_eq!(
             session.calls(),
-            vec!["test:/custom/bin/rcpd", "which:rcpd", "home"]
+            vec!["test:/custom/bin/rcpd", "path:rcpd", "home"]
         );
     }
 
@@ -5236,7 +5715,7 @@ mod tests {
         (client.unwrap(), accepted.unwrap().0)
     }
 
-    // The options are read back with getsockopt rather than trusted: a wrong constant, a value the
+    // the options are read back with getsockopt rather than trusted: a wrong constant, a value the
     // kernel rejects, or a call that a socket2 feature gate silently compiled out would otherwise
     // leave the connection with no liveness detection at all and nothing to show for it.
     #[tokio::test]
@@ -5348,7 +5827,7 @@ mod tests {
         );
     }
 
-    // A data connection must NOT get TCP_USER_TIMEOUT: the destination stops reading for the whole
+    // a data connection must NOT get TCP_USER_TIMEOUT: the destination stops reading for the whole
     // of its per-file iops reservation, and the user timeout would abort that live-but-silent peer
     // — failing a copy that used to merely run slow. Keepalive stays on, so an IDLE data connection
     // to a vanished host is still caught.
@@ -5384,7 +5863,7 @@ mod tests {
         assert!(stream.nodelay().unwrap());
     }
 
-    // Absolute sizes are not assertable — the kernel doubles the request and clamps it to
+    // absolute sizes are not assertable — the kernel doubles the request and clamps it to
     // net.core.{r,w}mem_max — but a THIRD, untouched socket from the same host pins the baseline,
     // so the comparison fails if the sizing calls are removed. Comparing the two profiles to each
     // other cannot: they collapse to equality whenever both clamp to the same maximum.
@@ -5405,14 +5884,14 @@ mod tests {
             socket2::SockRef::from(&internet),
             socket2::SockRef::from(&untouched),
         );
-        // What is (and is not) assertable across kernels: an explicit SO_SNDBUF/SO_RCVBUF is
-        // CLAMPED to `wmem_max`/`rmem_max`, and on hosts whose sysctls leave those at the default
+        // what is (and is not) assertable across kernels: an explicit SO_SNDBUF/SO_RCVBUF is
+        // clamped to `wmem_max`/`rmem_max`, and on hosts whose sysctls leave those at the default
         // (~208 KiB) while TCP auto-tuning grows untouched sockets into megabytes — GitHub's
         // runners measure 425984 configured vs 2626560 untouched — the configured size sits BELOW
         // the untouched default no matter what this code does. So "configured > default" is a
         // property of the host, not of configure_tcp_socket, and is deliberately NOT asserted.
-        // What the code does guarantee: both profiles issue a set (asserted as ordering below —
-        // Datacenter requests 8x Internet, so wherever the clamp permits any distinction the
+        // what the code does guarantee: both profiles issue a set (asserted as ordering below —
+        // datacenter requests 8x Internet, so wherever the clamp permits any distinction the
         // ordering holds, and equality is exactly the fully-clamped case), and the sizes are sane.
         for (name, sock) in [("datacenter", &dc), ("internet", &net)] {
             assert!(

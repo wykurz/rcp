@@ -214,8 +214,9 @@ pub fn generate_trace_filename(prefix: &str, identifier: &str, extension: &str) 
 ///
 /// **The bar for putting an event here** is that it is advice about the INVOCATION — constant in
 /// volume however large the tree, and actionable by changing the command line. A per-entry event
-/// does not qualify, however important it looks. Today there is exactly one notice: the
-/// source-root ACL notice in [`crate::safedir`].
+/// does not qualify, however important it looks. Current notices cover source-root ACL heuristics,
+/// deprecated options, explicit concurrency clamps, profiling artifacts, and startup safety
+/// fallbacks.
 ///
 /// Three things hold, deliberately:
 ///
@@ -225,9 +226,8 @@ pub fn generate_trace_filename(prefix: &str, identifier: &str, extension: &str) 
 ///   and replaces any directive for the same target, exactly as the `tokio` / `quinn` / `rustls` /
 ///   `h2` directives and the verbosity level itself already do. `RUST_LOG` still raises verbosity
 ///   for targets this filter does not name.
-/// - It is a `warn!` and not an `error!`: the copy succeeds and its exit code is unchanged. A
-///   notice is advice, and the ACL one is a heuristic besides — the same tree copied one level
-///   deeper would not produce it, so failing on it would read as capricious.
+/// - It is a `warn!` and not an `error!`: the operation can still succeed and its exit code is
+///   unchanged. A notice is advice; some notices also describe heuristics rather than failures.
 pub const NOTICE_TARGET: &str = "rcp::notice";
 
 /// Build the verbose-level [`tracing_subscriber::EnvFilter`] used by every
@@ -436,16 +436,13 @@ pub(crate) fn install_tracing_subscriber(
 /// workflows, not a hard process-wide ceiling: recursive directories and process support
 /// descriptors are outside leaf admission. A nonzero soft limit gets at least one operation so very
 /// small test/container limits do not silently disable backpressure.
-fn descriptor_admission_limit(soft_limit: u64) -> ConcurrencyLimit {
-    if soft_limit == 0 {
-        return ConcurrencyLimit::Unlimited;
-    }
+fn descriptor_admission_limit(soft_limit: std::num::NonZeroU64) -> ConcurrencyLimit {
     const OPEN_FILE_DESCRIPTOR_UNITS: u64 = 4;
     const OVERLAPPING_PENDING_META_DESCRIPTOR_UNITS: u64 = 1;
     const DESCRIPTOR_UNITS_PER_OPERATION: u64 =
         OPEN_FILE_DESCRIPTOR_UNITS + OVERLAPPING_PENDING_META_DESCRIPTOR_UNITS;
     const MAX_LEAF_OPERATIONS_PER_POOL: u64 = 4096;
-    let descriptor_budget = soft_limit.saturating_mul(8) / 10;
+    let descriptor_budget = soft_limit.get().saturating_mul(8) / 10;
     let leaf_operation_limit = std::cmp::min(
         (descriptor_budget / DESCRIPTOR_UNITS_PER_OPERATION).max(1),
         MAX_LEAF_OPERATIONS_PER_POOL,
@@ -491,7 +488,7 @@ fn descriptor_clamp_diagnostic(
         (crate::FilesInFlightSource::Automatic, requested) => DescriptorClampDiagnostic {
             visibility: DescriptorClampVisibility::Verbose,
             message: format!(
-                "Automatic file admission was reduced by descriptor safety: requested={requested:?}, effective={:?}",
+                "Automatic file admission was reduced by descriptor safety: requested={requested}, effective={}",
                 ConcurrencyLimit::Limited(effective),
             ),
         },
@@ -549,10 +546,39 @@ fn configure_file_admission(
     if !throttle.apply_files_in_flight {
         return Ok(());
     }
-    let soft_limit = get_soft_limit().context(
-        "failed to query rlimit; --max-files-in-flight controls performance but cannot bypass descriptor safety",
-    )?;
-    let descriptor_limit = descriptor_admission_limit(soft_limit);
+    let descriptor_limit = match get_soft_limit() {
+        Ok(soft_limit) => {
+            descriptor_admission_limit(std::num::NonZeroU64::new(soft_limit).context(
+                "soft RLIMIT_NOFILE is zero; descriptor-safe file admission is impossible",
+            )?)
+        }
+        Err(error) => match (
+            throttle.files_in_flight.source(),
+            throttle.files_in_flight.limit(),
+        ) {
+            (
+                source @ (crate::FilesInFlightSource::Explicit
+                | crate::FilesInFlightSource::DeprecatedMaxOpenFiles),
+                ConcurrencyLimit::Limited(limit),
+            ) => {
+                let option = match source {
+                    crate::FilesInFlightSource::Explicit => "--max-files-in-flight",
+                    crate::FilesInFlightSource::DeprecatedMaxOpenFiles => "--max-open-files",
+                    crate::FilesInFlightSource::Automatic => unreachable!("matched above"),
+                };
+                tracing::warn!(
+                    target: NOTICE_TARGET,
+                    "Failed to query RLIMIT_NOFILE; using {option}={limit} as the endpoint file-admission ceiling without an independent descriptor-safety ceiling: {error:#}"
+                );
+                ConcurrencyLimit::Unlimited
+            }
+            _ => {
+                return Err(error).context(
+                    "failed to query rlimit; automatic or unlimited file admission requires descriptor safety",
+                );
+            }
+        },
+    };
     let leaf_capacity = resolve_leaf_capacity(throttle.files_in_flight.limit(), descriptor_limit);
     tracing::info!(
         "Resolved file admission: file_ceiling={:?}, source={:?}, descriptor_ceiling={:?}, open_file={:?}, pending_meta={:?}",
@@ -602,6 +628,36 @@ pub(crate) fn build_tokio_runtime(
 mod default_leaf_operation_limit_tests {
     use super::*;
 
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedLogWriter(self.0.clone())
+        }
+    }
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
     #[cfg(target_os = "linux")]
     const RLIMIT_CHILD_MARKER: &str = "RCP_TEST_RUNTIME_SETUP_RLIMIT_CHILD";
     #[cfg(target_os = "linux")]
@@ -639,20 +695,21 @@ mod default_leaf_operation_limit_tests {
 
     #[test]
     fn reserves_descriptor_headroom_for_each_leaf_operation() {
+        let nonzero = |value| std::num::NonZeroU64::new(value).unwrap();
         assert_eq!(
-            descriptor_admission_limit(100),
+            descriptor_admission_limit(nonzero(100)),
             ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(16).unwrap())
         );
         assert_eq!(
-            descriptor_admission_limit(4096),
+            descriptor_admission_limit(nonzero(4096)),
             ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(655).unwrap())
         );
         assert_eq!(
-            descriptor_admission_limit(1_000_000),
+            descriptor_admission_limit(nonzero(1_000_000)),
             ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(4096).unwrap())
         );
         assert_eq!(
-            descriptor_admission_limit(u64::MAX),
+            descriptor_admission_limit(nonzero(u64::MAX)),
             ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(4096).unwrap())
         );
     }
@@ -660,9 +717,14 @@ mod default_leaf_operation_limit_tests {
     #[test]
     fn keeps_a_small_nonzero_limit_live() {
         let one = ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(1).unwrap());
-        assert_eq!(descriptor_admission_limit(1), one);
-        assert_eq!(descriptor_admission_limit(4), one);
-        assert_eq!(descriptor_admission_limit(0), ConcurrencyLimit::Unlimited);
+        assert_eq!(
+            descriptor_admission_limit(std::num::NonZeroU64::new(1).unwrap()),
+            one
+        );
+        assert_eq!(
+            descriptor_admission_limit(std::num::NonZeroU64::new(4).unwrap()),
+            one
+        );
     }
 
     #[test]
@@ -709,7 +771,7 @@ mod default_leaf_operation_limit_tests {
             ),
             Some(DescriptorClampDiagnostic {
                 visibility: DescriptorClampVisibility::Verbose,
-                message: "Automatic file admission was reduced by descriptor safety: requested=Limited(8), effective=Limited(4)".to_string(),
+                message: "Automatic file admission was reduced by descriptor safety: requested=8, effective=4".to_string(),
             })
         );
     }
@@ -759,6 +821,129 @@ mod default_leaf_operation_limit_tests {
             !configured,
             "disabled file admission reconfigured throttle pools"
         );
+    }
+
+    #[test]
+    fn finite_user_file_limits_recover_from_rlimit_query_failure() {
+        let eight = std::num::NonZeroUsize::new(8).unwrap();
+        let expected = ConcurrencyLimit::Limited(eight);
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_target(true)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for files_in_flight in [
+                crate::ResolvedFilesInFlight::explicit(eight),
+                crate::ResolvedFilesInFlight::forwarded_legacy(eight.get()),
+            ] {
+                let throttle = ThrottleConfig {
+                    files_in_flight,
+                    ..ThrottleConfig::default()
+                };
+                let mut configured = None;
+
+                configure_file_admission(
+                    &throttle,
+                    || Err(std::io::Error::other("sentinel rlimit failure")),
+                    |capacity| {
+                        configured = Some(capacity);
+                        Ok(())
+                    },
+                )
+                .expect("a finite user ceiling must remain usable when getrlimit fails");
+
+                assert_eq!(configured, Some(expected));
+            }
+        });
+
+        let logs = captured.contents();
+        for option in ["--max-files-in-flight=8", "--max-open-files=8"] {
+            assert!(
+                logs.lines().any(|line| {
+                    line.contains(" WARN ")
+                        && line.contains("rcp::notice")
+                        && line.contains(option)
+                        && line.contains("sentinel rlimit failure")
+                }),
+                "missing default-visible rlimit fallback notice for {option}: {logs}"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_file_limit_does_not_bypass_rlimit_query_failure() {
+        let mut configured = false;
+        let error = configure_file_admission(
+            &ThrottleConfig::default(),
+            || Err(std::io::Error::other("sentinel rlimit failure")),
+            |_| {
+                configured = true;
+                Ok(())
+            },
+        )
+        .expect_err("an automatic ceiling must retain descriptor-safety validation");
+
+        assert!(error.to_string().contains("failed to query rlimit"));
+        assert!(
+            !configured,
+            "failed automatic validation configured admission"
+        );
+    }
+
+    #[test]
+    fn unlimited_file_limit_does_not_bypass_rlimit_query_failure() {
+        let throttle = ThrottleConfig {
+            files_in_flight: crate::ResolvedFilesInFlight::forwarded_legacy(0),
+            ..ThrottleConfig::default()
+        };
+        let mut configured = false;
+        let error = configure_file_admission(
+            &throttle,
+            || Err(std::io::Error::other("sentinel rlimit failure")),
+            |_| {
+                configured = true;
+                Ok(())
+            },
+        )
+        .expect_err("an unlimited ceiling must retain descriptor-safety validation");
+
+        assert!(error.to_string().contains("failed to query rlimit"));
+        assert!(
+            !configured,
+            "failed unlimited validation configured admission"
+        );
+    }
+
+    #[test]
+    fn zero_soft_descriptor_limit_fails_closed_for_every_file_policy() {
+        let eight = std::num::NonZeroUsize::new(8).unwrap();
+        for files_in_flight in [
+            crate::ResolvedFilesInFlight::automatic_with(eight),
+            crate::ResolvedFilesInFlight::explicit(eight),
+            crate::ResolvedFilesInFlight::forwarded_legacy(0),
+        ] {
+            let throttle = ThrottleConfig {
+                files_in_flight,
+                ..ThrottleConfig::default()
+            };
+            let mut configured = false;
+            let error = configure_file_admission(
+                &throttle,
+                || Ok(0),
+                |_| {
+                    configured = true;
+                    Ok(())
+                },
+            )
+            .expect_err("a zero soft descriptor limit must fail closed");
+
+            assert!(error.to_string().contains("soft RLIMIT_NOFILE is zero"));
+            assert!(!configured, "zero descriptor safety configured admission");
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -45,9 +45,10 @@ the flag.
 
 **Source-owned file-work ceiling:** Let `F` be the logical file ceiling, `M` the configured
 `--max-connections`, and `E = min(F, M)`. When `--max-files-in-flight` is omitted, the source `rcpd`
-selects `F` from its own CPU availability; the source readiness record makes that decision
-authoritative for the destination. An explicit finite `F` remains master-authoritative and becomes
-`--max-files-in-flight=N` on both roles. Finite and unlimited legacy input use a hidden typed
+selects `F = max(std::thread::available_parallelism(), 4)` on the source host; the source readiness
+record makes that decision authoritative for the destination. An explicit finite `F` remains
+master-authoritative and becomes `--max-files-in-flight=N` on both roles; the daemon spawn type
+cannot represent an explicit unlimited value. Finite and unlimited legacy input use a hidden typed
 forwarding argument, never the deprecated spelling; this preserves `--max-open-files` provenance for
 clamp notices without repeating its deprecation warning. Legacy unlimited yields `E = M`. The
 automatic destination uses a hidden resolved-automatic argument that preserves automatic provenance
@@ -59,7 +60,9 @@ validated before remote-home expansion or SSH. For automatic capacity, the maste
 configured connection upper bound before remote side effects; the source resolves and validates the
 actual CPU-selected capacity before it announces readiness and before destination spawn.
 `MasterHello` and data-message schemas remain unchanged. Wire revision 4 protects the extended
-readiness record, typed internal spawn arguments, and source-first bootstrap contract.
+readiness record, typed internal spawn arguments, and source-first bootstrap contract. Wire revision
+5 protects the final daemon CLI contract: removing the unreachable explicit-unlimited override and
+requiring a positive remote-copy connection timeout.
 
 **Special Case - Same Host Copies:** When source and destination are on the same host, the master:
 
@@ -69,27 +72,32 @@ readiness record, typed internal spawn arguments, and source-first bootstrap con
 
 **Auto-deployment compatibility:** Auto-deployment applies the same exact compatibility policy as
 normal remote discovery at both boundaries. The master runs `--protocol-version` on each local
-candidate in search order (beside `rcp`, then `PATH`) and continues to later candidates when one is
-stale, stalls its two-second version probe, or is otherwise unusable. A timed-out local candidate
-has its pipes released and receives a kill request; the invocation cleanup supervisor retains child
-ownership and reaps it while the search continues. Remote version probes, including post-deployment
-verification, use the initiating `rcp` process's `--remote-copy-conn-timeout-sec` deadline so
-slow-but-healthy hosts can be given an appropriate budget without allowing a hanging SSH channel to
-block fallback indefinitely. The master names the cache target with the accepted version's
-compatibility tag, transfers and publishes the binary, then probes that deployed remote path before
-constructing either role's spawn command. Thus neither co-location nor a current-looking cache
-filename is treated as proof that the binary implements the current serialized and rcpd spawn
-contract. For distinct hosts, the first preparation failure cooperatively cancels its peer without
-dropping owned work or replacing the original error. SSH control-socket readiness uses the same
-configured deadline and one cancellation-aware filesystem worker for its whole polling lifetime.
-Every read-only remote bootstrap command — HOME lookup, executable checks, PATH discovery, and
-version probes — goes through one helper that requires that per-stage timeout; expiry aborts and
-joins its local SSH-channel task. Remote cache cleanup is best effort and uses the same bounded
-helper. Binary deployment uses the timeout for its HOME lookup, SSH command, readiness marker, and
-each payload-write idle period, but not as a wall-clock limit on transmitting the binary. Post-EOF
-checksum verification and publication use a bounded stage of at least 60 seconds. On peer
-cancellation, the transfer gets a bounded grace to close stdin and finish before its local
-SSH-channel task is aborted and joined.
+candidate in search order (beside `rcp`, then the local shell's POSIX `command -v rcpd`) and
+continues to later candidates when one is stale, stalls its two-second version probe, or is
+otherwise unusable. An ordinary local PATH miss is retained in the final searched-candidates
+diagnostic. A timed-out local candidate has its pipes released and receives a kill request; the
+invocation cleanup supervisor retains child ownership and reaps it while the search continues. The
+selected local deployment payload is read on a cleanup-owned disposable OS worker under the same
+configured bootstrap deadline and peer cancellation. A blocked filesystem syscall can finish later
+on that worker, but it cannot retain Tokio runtime or remote-resource ownership. Remote discovery
+uses the remote shell's `command -v rcpd` rather than an external `which`. Remote version probes,
+including post-deployment verification, use the initiating `rcp` process's
+`--remote-copy-conn-timeout-sec` deadline so slow-but-healthy hosts can be given an appropriate
+budget without allowing a hanging SSH channel to block fallback indefinitely. The master names the
+cache target with the accepted version's compatibility tag, transfers and publishes the binary, then
+probes that deployed remote path before constructing either role's spawn command. Thus neither
+co-location nor a current-looking cache filename is treated as proof that the binary implements the
+current serialized and rcpd spawn contract. For distinct hosts, the first preparation failure
+cooperatively cancels its peer without dropping owned work or replacing the original error. SSH
+control-socket readiness uses the same configured deadline and one cancellation-aware filesystem
+worker for its whole polling lifetime. Every read-only remote bootstrap command — HOME lookup,
+executable checks, PATH discovery, and version probes — goes through one helper that requires that
+per-stage timeout; expiry aborts and joins its local SSH-channel task. Remote cache cleanup is best
+effort and uses the same bounded helper. Binary deployment uses the timeout for its HOME lookup, SSH
+command, readiness marker, and each payload-write idle period, but not as a wall-clock limit on
+transmitting the binary. Post-EOF checksum verification and publication use a bounded stage of at
+least 60 seconds. On peer cancellation, the transfer gets a bounded grace to close stdin and finish
+before its local SSH-channel task is aborted and joined.
 
 The SSH multiplex master runs as a retained foreground `ssh -M -N` process; explicit
 `ForkAfterAuthentication=no` and `ControlPersist=no` command-line overrides prevent user or system
@@ -102,12 +110,25 @@ foreground child and private control directory together until success transfers 
 managed session through prepared and running daemon states. Whichever owner exits signals the master
 before returning. The cleanup supervisor is created before any remote resource is accepted. Process
 reaping is queued there, so it cannot block or depend on a Tokio runtime that may already be
-shutting down; the control directory is removed only after the retained child is confirmed exited.
-Nested cleanup runs inside its parent worker, and separate invocations cannot drain one another's
-workers. Before process exit, the CLI gives the scope one bounded budget to wait for its last
-resource owner and every cleanup job; a filesystem operation still blocked after that grace is
-abandoned with the process. Daemon waits run concurrently across endpoints while tracing receivers
-stay live, then any remaining receiver tasks share one final drain deadline.
+shutting down. The supervisor normally dispatches blocking cleanup to a worker; worker-creation
+failure runs the job on the supervisor rather than the original resource-owning submitter. A failed
+supervisor channel tries an isolated worker and, if no worker can be created, leaks the job so the
+OS reclaims its owned resources at process exit. Every reaper for an SSH master or an interrupted
+local candidate must receive the cleanup scope's typed budget; its effective deadline is the earlier
+of its per-job deadline and the invocation's shared final deadline. The common poll helper therefore
+cannot spin forever on a child that never becomes reapable. The control directory is removed only
+after the retained master is confirmed exited; expiry preserves it rather than deleting the socket
+from under a possibly-live master. Nested cleanup runs inside its parent cleanup worker, and
+separate invocations cannot drain one another's workers. Before process exit, the CLI gives the
+scope one bounded budget to wait for its last resource owner, supervisor, and every cleanup job;
+work still blocked after that grace is abandoned with the process. Daemon waits run concurrently
+across endpoints while tracing receivers stay live, then any remaining receiver tasks share one
+final drain deadline.
+
+Normal daemon discovery does not require `HOME`: when it is absent, the deployed-cache candidate is
+skipped and same-directory/PATH discovery continues. Remote `~` expansion and deployment into the
+cache do require a usable `HOME`, so those operations fail with a targeted diagnostic instead of
+constructing a path under `/`.
 
 Deployment stages, verifies, and publishes through one remote `sh` transaction. Before anything can
 create the unique temp path, that shell installs an `EXIT` trap which removes it. After directory
@@ -131,14 +152,15 @@ tracing queues daemon notices until the master connects, so they reach master ou
 becoming readiness preamble. An intentional fatal startup refusal instead emits one
 `RCP_ERROR <diagnostic>` record and exits, including configuration failures found before tracing is
 installed. The master treats that typed record as a nested failure cause, closes its stdin, and
-gives an owned reaper a bounded grace before returning; if the grace expires, the detached reaper
-retains child ownership while the runtime remains active. If startup fails without a typed record,
-captured stdout and remaining stderr are attached to the handshake error. Arbitrary stderr remains
-an invalid readiness record. After readiness, stdout/stderr collectors forward raw daemon output at
-debug verbosity as it arrives and retain only a bounded tail. They are joined on daemon completion,
-so a nonzero exit keeps diagnostics without allowing unbounded output to grow in memory or leaving
-collector tasks detached. An explicit `F` reduced by `M`, an automatic `F` reduced by an explicit
-`M`, an explicit `M` reduced by the source's `F`, or an explicit limit reduced by endpoint
+gives a directly owned reaper a bounded grace before returning. The SSH child and both output drains
+remain lexically inside that timeout future, so grace expiry or caller cancellation drops them and
+releases the managed session instead of detaching ownership. If startup fails without a typed
+record, captured stdout and remaining stderr are attached to the handshake error. Arbitrary stderr
+remains an invalid readiness record. After readiness, stdout/stderr collectors forward raw daemon
+output at debug verbosity as it arrives and retain only a bounded tail. They are joined on daemon
+completion, so a nonzero exit keeps diagnostics without allowing unbounded output to grow in memory
+or leaving collector tasks detached. An explicit `F` reduced by `M`, an automatic `F` reduced by an
+explicit `M`, an explicit `M` reduced by the source's `F`, or an explicit limit reduced by endpoint
 descriptor safety produces a notice naming the requested and effective values. The ordinary
 automatic/default intersection remains quiet. The master retains the source process before
 attempting its control/tracing connections and waits for daemon cleanup if either connection fails.
@@ -1341,13 +1363,17 @@ multiplier):**
 - `--pending-writes-multiplier=N`: Pending capacity is effective streams × this multiplier (default:
   4).
 - `--max-files-in-flight=N`: Set an explicit, master-authoritative ceiling for file-like work on
-  both rcpds. When omitted, the source chooses available CPU parallelism with a floor of four and
+  both rcpds. When omitted, the source chooses `max(std::thread::available_parallelism(), 4)` and
   the destination adopts that source-selected value. The same ceiling also clamps data streams,
   while unlimited legacy input leaves `--max-connections` as their ceiling. Each endpoint separately
   intersects the file ceiling with its own unchanged current soft `RLIMIT_NOFILE` descriptor-safety
   heuristic (80% / five modeled units, capped at 4096) for its local OpenFile and PendingMeta
   admission. Those local pools remain independent and are not wire state. The hidden forwarded
-  legacy value `0` removes only the user ceiling; descriptor safety remains active.
+  legacy value `0` removes only the user ceiling; descriptor safety remains active. If the
+  `RLIMIT_NOFILE` query itself fails, a finite user-supplied limit is used as the sole endpoint
+  admission ceiling with a notice. Automatic or unlimited admission fails closed because it has no
+  independent finite bound. A successful query returning a zero soft limit fails closed for every
+  policy.
 
 The multiplier ensures work is always queued when connections become available, avoiding idle time
 between file transfers.
@@ -1437,8 +1463,8 @@ destination drains it.
 
 Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
 
-- `--remote-copy-conn-timeout-sec=N` (default: 15; 60 with auto-deployment) - Timeout for SSH
-  session setup, remote binary discovery, tilde-expansion HOME lookup, remote version probes,
+- `--remote-copy-conn-timeout-sec=N` (`N >= 1`; default: 15; 60 with auto-deployment) - Timeout for
+  SSH session setup, remote binary discovery, tilde-expansion HOME lookup, remote version probes,
   deployment command/readiness, each deployment payload-write idle period, cleanup commands, daemon
   SSH exec/readiness, and TCP connection setup; it does not cap total binary-transfer duration, and
   post-EOF deployment verification gets at least 60 seconds
@@ -1448,8 +1474,8 @@ Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
 - `--max-connections=N` (default: 100) - Separately configurable data-connection ceiling; effective
   streams are `min(max-files-in-flight, max-connections)`
 - `--max-files-in-flight=N` - Explicit master-authoritative file-work ceiling; when omitted, the
-  source resolves the automatic ceiling and the destination adopts it. Finite values also clamp
-  effective data connections, while legacy unlimited input does not
+  source resolves `max(std::thread::available_parallelism(), 4)` and the destination adopts it.
+  Finite values also clamp effective data connections, while legacy unlimited input does not
 - `--pending-writes-multiplier=N` (default: 4) - Pending capacity is effective streams × this
   multiplier, checked before pending file tasks are admitted
 - `--network-profile=PROFILE` (default: datacenter) - Buffer sizing profile
@@ -1465,7 +1491,8 @@ its actual product before readiness, and the master gives the destination the sa
 rejects a mismatch in destination readiness. A directly launched daemon validates before announcing
 its listener. This configuration travels only in version-sensitive rcpd spawn arguments and
 readiness: no `MasterHello` or data-message field changed. Compatibility revision 4 protects this
-contract.
+contract. Revision 5 protects the final daemon CLI contract: removal of its unreachable
+explicit-unlimited override and rejection of a zero remote-copy connection timeout.
 
 ### 8.2 Network Profiles
 

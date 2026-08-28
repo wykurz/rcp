@@ -23,6 +23,15 @@ impl ConcurrencyLimit {
     }
 }
 
+impl std::fmt::Display for ConcurrencyLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unlimited => formatter.write_str("unlimited"),
+            Self::Limited(value) => value.fmt(formatter),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FilesInFlightSource {
     Automatic,
@@ -520,6 +529,13 @@ mod files_in_flight_policy_tests {
             ConcurrencyLimit::Unlimited.meet(ConcurrencyLimit::Unlimited),
             ConcurrencyLimit::Unlimited,
         );
+    }
+
+    #[test]
+    fn concurrency_limit_display_is_operator_friendly() {
+        let eight = ConcurrencyLimit::Limited(NonZeroUsize::new(8).unwrap());
+        assert_eq!(eight.to_string(), "8");
+        assert_eq!(ConcurrencyLimit::Unlimited.to_string(), "unlimited");
     }
 
     #[test]

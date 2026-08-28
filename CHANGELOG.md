@@ -12,22 +12,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `--max-files-in-flight=N` now caps applicable file-like work across the tools. Explicit values are
   positive (including `1`); when omitted, the common default is
   `max(std::thread::available_parallelism(), 4)`, including for `filegen`. This is a work ceiling,
-  not a process-descriptor count or a guarantee of achieved concurrency. The runtime still applies
-  its internal soft-`RLIMIT_NOFILE` descriptor safety ceiling independently to OpenFile and
-  PendingMeta, which have the same effective numerical limit but are not a combined pool. For
-  `filegen`, the legacy `--max-open-files=0` spelling previously disabled admission entirely; it now
-  has the common compatibility meaning of removing the user ceiling while retaining descriptor
-  safety, and emits a deprecation notice.
+  not a process-descriptor count or a guarantee of achieved concurrency. When `RLIMIT_NOFILE` is
+  available, the runtime still applies its descriptor-safety ceiling independently to OpenFile and
+  PendingMeta, which have the same effective numerical limit but are not a combined pool. If the
+  query fails, a finite user-supplied limit remains usable as the sole admission ceiling and emits a
+  default-visible notice; automatic and unlimited admission still fail closed. A successfully
+  queried zero soft limit fails closed for every policy. For `filegen`, the legacy
+  `--max-open-files=0` spelling previously disabled admission entirely; it now has the common
+  compatibility meaning of removing the user ceiling while retaining descriptor safety, and emits a
+  deprecation notice.
 
-- Remote automatic file concurrency is now source-owned: the source `rcpd` resolves its local CPU
-  default and reports the logical file ceiling `F` plus effective stream count
-  `E = min(F, --max-connections)` in its readiness record; the destination is then started with
-  those exact values. Explicit `--max-files-in-flight=N` and legacy unlimited input remain
-  master-authoritative. Effective-stream and pending-task capacities above Tokio's semaphore maximum
-  are rejected without panic. Explicit capacity is validated before remote `~` expansion. For
-  automatic policy, the master validates the configured connection upper bound before remote side
-  effects; the source validates its actual CPU-selected capacity before readiness and before the
-  destination is spawned. Each endpoint still applies descriptor safety locally.
+- Remote automatic file concurrency is now source-owned: the source `rcpd` resolves
+  `F = max(std::thread::available_parallelism(), 4)` from its own CPU availability and reports that
+  logical file ceiling plus effective stream count `E = min(F, --max-connections)` in its readiness
+  record; the destination is then started with those exact values. Explicit
+  `--max-files-in-flight=N` and legacy `--max-open-files` inputs remain master-authoritative.
+  Effective-stream and pending-task capacities above Tokio's semaphore maximum are rejected without
+  panic. Explicit capacity is validated before remote `~` expansion. For automatic policy, the
+  master validates the configured connection upper bound before remote side effects; the source
+  validates its actual CPU-selected capacity before readiness and before the destination is spawned.
+  Each endpoint still applies descriptor safety locally. The daemon spawn configuration now makes
+  explicit file limits finite by type; unlimited admission is carried only with legacy provenance,
+  and the unreachable daemon-only `--explicit-unlimited-files-in-flight` argument was removed.
 
 - Remote startup now prepares same-host source/destination daemons once, starts and connects the
   source before constructing the destination, and reserves the first successful daemon stderr line
@@ -35,24 +41,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and explicit clamp announcements flow through the default-visible `rcp::notice` tracing target;
   explicit stream or descriptor clamps warn, while the ordinary automatic/default intersection
   remains quiet. Local `rcpd --protocol-version` probes are bounded at two seconds and capture only
-  bounded diagnostics; remote probes, including post-deployment verification and the single-daemon
-  startup API, use `--remote-copy-conn-timeout-sec` (15 seconds normally and 60 seconds with
-  auto-deployment). Every read-only remote bootstrap command — HOME lookup, executable checks, PATH
-  discovery, and version probes — uses that required deadline, so a blocked filesystem lookup cannot
-  stall endpoint preparation indefinitely. The timeout applies independently to each stage.
-  Deployment waits for a bounded `RCP_DEPLOY_READY` marker after the remote shell has installed its
-  cleanup trap and opened the staging file, then applies an idle timeout to each payload write; it
-  does not impose a total transfer-time cap. Post-EOF verification has a bounded stage of at least
-  60 seconds. On peer cancellation, the transfer gets a bounded grace before its local SSH-channel
-  task is aborted and joined. Old-version cleanup is also bounded. Local candidate execution happens
-  behind a fixed-shell child so a stalled candidate filesystem remains inside the two-second probe
-  deadline.
+  bounded diagnostics; remote probes, including post-deployment verification, use
+  `--remote-copy-conn-timeout-sec` (15 seconds normally and 60 seconds with auto-deployment); zero
+  is rejected because every bootstrap stage requires a real deadline. Every read-only remote
+  bootstrap command — HOME lookup, executable checks, PATH discovery, and version probes — uses that
+  required deadline, so a blocked filesystem lookup cannot stall endpoint preparation indefinitely.
+  The timeout applies independently to each stage. Remote and local PATH discovery use the shell's
+  POSIX `command -v` rather than the external `which`; an ordinary local PATH miss is retained in
+  the deployment-candidate diagnostic. An absent remote `HOME` skips deployed-cache discovery but
+  still fails remote `~` expansion or deployment, which require a home directory. Deployment waits
+  for a bounded `RCP_DEPLOY_READY` marker after the remote shell has installed its cleanup trap and
+  opened the staging file, then applies an idle timeout to each payload write; it does not impose a
+  total transfer-time cap. Post-EOF verification has a bounded stage of at least 60 seconds. On peer
+  cancellation, the transfer gets a bounded grace before its local SSH-channel task is aborted and
+  joined. Old-version cleanup is also bounded. Local candidate execution happens behind a
+  fixed-shell child so a stalled candidate filesystem remains inside the two-second probe deadline.
 
 - Local auto-deployment candidate probes now observe peer-preparation cancellation before, during,
   and after each version check, using the same pipe-close, kill, and reap cleanup as a timeout
   without rejecting the candidate and falling through. Auto-deployment targets Linux because its
   fail-closed publication relies on GNU/BusyBox `mv -T`; stock macOS and BSD remote hosts need a
-  matching `rcpd` installed manually.
+  matching `rcpd` installed manually. Reading the selected local deployment payload now uses a
+  cleanup-owned disposable OS worker under the configured bootstrap deadline and peer cancellation,
+  so a blocked local filesystem cannot retain Tokio runtime or remote-resource ownership.
 
 - SSH multiplex masters now remain owned foreground processes; command-line overrides disable both
   `ForkAfterAuthentication` and `ControlPersist` even when SSH configuration enables them. The
@@ -63,18 +74,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   preparation guard owns that launcher and its private control directory together until it transfers
   both to the successful-session owner. A cleanup supervisor is started before any remote resource
   is accepted; either exit signals the process immediately and queues reaping there, and the control
-  directory is removed only after the process is confirmed exited. Local candidate reaping uses the
-  same scope rather than a detach-on-timeout Tokio task. Nested cleanup remains in its parent
-  worker, independent invocations cannot drain one another's workers, and the CLI gives the scope
-  one bounded budget for its final resource owner and queued jobs. SSH control-socket readiness uses
-  one disposable filesystem worker for its polling lifetime rather than creating a thread per poll.
-  Daemon waits run concurrently across endpoints while tracing receivers remain live; any receiver
-  tasks left afterward share one final drain deadline. Control-directory selection tries runtime,
-  temporary, state, and home locations before reporting that no safe Unix-socket path is available.
-  Remote daemon SSH exec-channel creation and readiness reads use that same configured deadline;
-  readiness records larger than 64 KiB are rejected. Daemon configuration refusals discovered before
-  tracing use the structured `RCP_ERROR` startup record, and unstructured startup failures retain
-  captured stdout/stderr in the error chain. The source tracing receiver starts before destination
+  directory is removed only after the process is confirmed exited. Reapers for SSH masters and
+  interrupted local candidates now require the cleanup scope's typed budget, whose deadline is the
+  earlier of the per-job deadline and the invocation's shared final deadline. A child that never
+  becomes reapable therefore cannot leave a cleanup thread polling forever; an unconfirmed SSH
+  master keeps its control directory when that budget expires. Cleanup never falls back to the
+  original resource-owning submitter: worker-spawn failure stays on the supervisor, while a failed
+  supervisor channel tries an isolated worker before leaking the job for process-exit reclamation.
+  Nested cleanup remains in its parent worker, independent invocations cannot drain one another's
+  workers, and the CLI gives the scope one bounded budget for its final resource owner, supervisor,
+  and queued jobs. SSH control-socket readiness uses one disposable filesystem worker for its
+  polling lifetime rather than creating a thread per poll. Daemon waits run concurrently across
+  endpoints while tracing receivers remain live; any receiver tasks left afterward share one final
+  drain deadline. Control-directory selection tries runtime, temporary, state, and home locations
+  before reporting that no safe Unix-socket path is available. Remote daemon SSH exec-channel
+  creation and readiness reads use that same configured deadline; readiness records larger than 64
+  KiB are rejected. Daemon configuration refusals discovered before tracing use the structured
+  `RCP_ERROR` startup record, and unstructured startup failures retain captured stdout/stderr in the
+  error chain. Failed-startup reaping now keeps the SSH child and both output drains lexically
+  inside its bounded timeout future, so grace expiry or caller cancellation releases the managed
+  session instead of detaching ownership. The source tracing receiver starts before destination
   bring-up and is drained on later startup failures, preserving queued source notices beside the
   destination error. Source connection failures also wait for daemon cleanup. Daemon stdout/stderr
   is forwarded live at debug verbosity while a bounded tail is retained and joined for completion
@@ -84,14 +103,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   produces a default-visible notice; legacy file-limit notices preserve the `--max-open-files`
   spelling the user supplied.
 
-- `remote::TcpConfig` now contains transport settings only. Its pre-existing remote-capacity fields
-  and builders moved out; validated file/stream capacities are represented by
-  `ResolvedRemoteConcurrency`. The published-but-internal deployment module and its zero-caller
-  convenience wrappers are no longer public; repository callers use the cancellation- and
-  cleanup-aware implementation directly. These are intentional breaking changes to an internal
-  support crate. The internal `rcp-tools-throttle` API likewise removes the zero-caller
-  `set_max_open_files` compatibility wrapper; `set_admission_limits` now takes one typed optional
-  capacity and applies it to both independent admission pools.
+- `remote::TcpConfig` now contains transport settings only; validated file/stream capacities are
+  represented by `ResolvedRemoteConcurrency`. Its fluent setters were removed, and callers
+  initialize the public fields from `TcpConfig::default()` instead. The deployment module is
+  private, and all zero-caller top-level prepare/start convenience wrappers were removed. Repository
+  callers use the cancellation-, timeout-, and cleanup-aware endpoint implementation directly. These
+  are intentional breaking changes to an internal support crate. The internal `rcp-tools-throttle`
+  API likewise removes the zero-caller `set_max_open_files` compatibility wrapper;
+  `set_admission_limits` now takes one typed optional capacity and applies it to both independent
+  admission pools.
 
 - Local recursive copy, remove, chmod, and rlink walks now bound descriptor-heavy leaf work on wide
   or slow trees, preventing `EMFILE` (Too many open files) failures from unbounded leaf fan-out. On
@@ -138,15 +158,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   since its CLI default is `all` rather than the shipped default; `rlink --preserve-settings=none`
   goes quiet like everything else that asked for nothing.
 
-- `WIRE_REVISION` is now 4. Revision 2 remains the historical wire-schema change: carrying the
+- `WIRE_REVISION` is now 5. Revision 2 remains the historical wire-schema change: carrying the
   arming flag to a remote source added a field to `MasterHello::Source`'s `capture`, which reshaped
   the hello. Revision 3 protected the first version-sensitive rcpd file-limit spawn contract;
   revision 4 protects source-owned negotiation, typed internal override arguments, and readiness
-  records that now carry `F` and `E`. Neither revision 3 nor 4 changes serialized message schemas.
-  Without the revision bumps, a stale same-version `rcpd` (on `PATH` or in the deploy cache) could
-  pass compatibility and then misdecode the hello, receive unsupported spawn arguments, or emit an
-  obsolete readiness record. Builds now advertise `0.39.0+w4`, and a cached `rcpd-0.39.0-w3` is no
-  longer resolved.
+  records that now carry `F` and `E`. Revision 5 protects the final daemon CLI contract: the
+  unreachable `--explicit-unlimited-files-in-flight` argument was removed and
+  `--remote-copy-conn-timeout-sec=0` is now rejected. Revisions 3–5 do not change serialized message
+  schemas. Without the revision bumps, a stale same-version `rcpd` (on `PATH` or in the deploy
+  cache) could pass compatibility and then misdecode the hello, receive unsupported spawn arguments,
+  or emit an obsolete readiness record. Builds now advertise `0.39.0+w5`, and a cached
+  `rcpd-0.39.0-w4` is no longer resolved.
 
 ## [0.38.0] - 2026-08-05
 
