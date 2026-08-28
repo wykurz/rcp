@@ -43,6 +43,39 @@ fn rcpd_parses_positive_max_files_in_flight_before_help() {
 }
 
 #[test]
+fn rcp_rejects_zero_remote_copy_timeout_before_help() {
+    rcp()
+        .args(["--remote-copy-conn-timeout-sec=0", "--help"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("at least 1"));
+}
+
+#[test]
+fn rcpd_rejects_zero_remote_copy_timeout_before_help() {
+    rcpd()
+        .args(["--remote-copy-conn-timeout-sec=0", "--help"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("at least 1"));
+}
+
+#[test]
+fn rcpd_rejects_removed_explicit_unlimited_internal_flag() {
+    rcpd()
+        .args([
+            "--role=source",
+            "--explicit-unlimited-files-in-flight",
+            "--help",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "unexpected argument '--explicit-unlimited-files-in-flight'",
+        ));
+}
+
+#[test]
 fn rcpd_cli_validation_failure_is_a_single_typed_startup_refusal() {
     let output = rcpd()
         .args(["--role=source", "--max-files-in-flight=0"])
@@ -88,6 +121,16 @@ fn assert_effective_remote_parallelism_help(command: &mut Command) {
     assert!(
         help.contains("Maximum concurrent data connections (default: 100)"),
         "help must retain the configured connection ceiling and its default: {help}"
+    );
+    assert!(
+        help.contains(
+            "Local automatic defaults resolve from available CPU parallelism on the initiating host"
+        ),
+        "help must identify where local automatic limits resolve: {help}"
+    );
+    assert!(
+        help.contains("Remote automatic defaults resolve on the source rcpd and are adopted by the destination"),
+        "help must identify where remote automatic limits resolve: {help}"
     );
 }
 

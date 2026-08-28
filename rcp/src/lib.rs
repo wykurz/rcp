@@ -41,6 +41,7 @@
 //! When using remote paths, `rcp` automatically:
 //! - Starts `rcpd` daemons on remote hosts via SSH
 //! - Transfers data directly between source and destination (not through the master)
+//! - Resolves automatic file concurrency on the source `rcpd` and has the destination adopt it
 //!
 //! **Requirements for remote copying:**
 //! - SSH access to remote hosts (uses your SSH config and keys)
@@ -98,14 +99,16 @@
 //!
 //! - `--ops-throttle`: Limit operations per second
 //! - `--iops-throttle`: Limit I/O operations per second
-//! - `--max-files-in-flight`: Cap applicable file-like work (default: max(available CPUs, 4))
+//! - `--max-files-in-flight`: Cap applicable file-like work. Local automatic defaults resolve on
+//!   the initiating host; remote defaults resolve on the source `rcpd` and are adopted by the
+//!   destination (each with a floor of 4)
 //! - `--max-workers`: Control number of worker threads
 //!
 //! ## Remote Copy Configuration
 //!
 //! - `--port-ranges`: Restrict TCP data ports to specific ranges (e.g., "8000-8999")
-//! - `--remote-copy-conn-timeout-sec`: Remote version-probe and connection timeout in seconds
-//!   (default: 15; 60 with `--auto-deploy-rcpd`)
+//! - `--remote-copy-conn-timeout-sec`: Positive timeout for bounded remote bootstrap stages and
+//!   TCP connections (default: 15; 60 with `--auto-deploy-rcpd`)
 //! - `--remote-keepalive-sec`: Liveness budget for every rcp TCP connection in seconds, 0 disables (default: 120).
 //!   Keepalive on every connection; `TCP_USER_TIMEOUT` on control connections only
 //!

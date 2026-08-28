@@ -206,6 +206,20 @@ fn path_discovery_result(
     }
 }
 
+fn path_candidate_from_output(output: Output, searched_paths: &mut Vec<String>) -> Option<PathBuf> {
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout);
+        let path = path.trim();
+        if !path.is_empty() {
+            let path = PathBuf::from(path);
+            searched_paths.push(format!("PATH: {}", path.display()));
+            return Some(path);
+        }
+    }
+    searched_paths.push("PATH (via 'command -v rcpd'): not found".to_string());
+    None
+}
+
 /// Find local static rcpd binary suitable for deployment
 ///
 /// Searches in the following order:
@@ -279,21 +293,26 @@ async fn find_local_rcpd_binary_with_context_from_current_exe(
 
     // try PATH (covers cargo install, nixpkgs, and other system installations)
     tracing::debug!("Trying to find rcpd in PATH");
-    let which = tokio::spawn(async {
+    let path_lookup = tokio::spawn(async {
         // keep PATH traversal in a known-local shell child. Spawning `which` by name would perform
         // the same potentially stalled PATH lookup in the parent's synchronous spawn call.
         tokio::process::Command::new("/bin/sh")
-            .args(["-c", "command -v rcpd"])
+            .args([
+                "-c",
+                crate::RCPD_PATH_DISCOVERY_SCRIPT,
+                "rcp-path-discovery",
+                "rcpd",
+            ])
             .kill_on_drop(true)
             .output()
             .await
             .context("failed to run local rcpd PATH discovery")
     });
-    let which_output = path_discovery_result(
+    let path_output = path_discovery_result(
         preparation,
         preparation
             .run_abortable_with_deadline(
-                which,
+                path_lookup,
                 "local rcpd PATH discovery",
                 crate::BootstrapDeadline::new(LOCAL_RCPD_VERSION_TIMEOUT),
             )
@@ -301,40 +320,34 @@ async fn find_local_rcpd_binary_with_context_from_current_exe(
         &mut searched_paths,
     )?;
 
-    if let Some(output) = which_output
-        && output.status.success()
+    if let Some(path) =
+        path_output.and_then(|output| path_candidate_from_output(output, &mut searched_paths))
     {
-        let path_str = String::from_utf8_lossy(&output.stdout);
-        let path_str = path_str.trim();
-        if !path_str.is_empty() {
-            let path = PathBuf::from(path_str);
-            searched_paths.push(format!("PATH: {}", path.display()));
-            // keep child ownership inside the probe's fixed-deadline termination/reap funnel.
-            match check_local_rcpd_version(
-                preparation,
-                &path,
-                &local_version,
-                LOCAL_RCPD_VERSION_TIMEOUT,
-            )
-            .await
-            {
-                Ok(()) => {
-                    preparation.ensure_active()?;
-                    tracing::info!(
-                        "Found compatible local rcpd binary in PATH: {}",
-                        path.display()
-                    );
-                    return Ok(path);
-                }
-                Err(error) => {
-                    preparation.ensure_active()?;
-                    tracing::warn!(
-                        "skipping local rcpd candidate {}: {:#}",
-                        path.display(),
-                        &error
-                    );
-                    searched_paths.push(format!("  rejected {}: {error:#}", path.display()));
-                }
+        // keep child ownership inside the probe's fixed-deadline termination/reap funnel.
+        match check_local_rcpd_version(
+            preparation,
+            &path,
+            &local_version,
+            LOCAL_RCPD_VERSION_TIMEOUT,
+        )
+        .await
+        {
+            Ok(()) => {
+                preparation.ensure_active()?;
+                tracing::info!(
+                    "Found compatible local rcpd binary in PATH: {}",
+                    path.display()
+                );
+                return Ok(path);
+            }
+            Err(error) => {
+                preparation.ensure_active()?;
+                tracing::warn!(
+                    "skipping local rcpd candidate {}: {:#}",
+                    path.display(),
+                    &error
+                );
+                searched_paths.push(format!("  rejected {}: {error:#}", path.display()));
             }
         }
     }
@@ -485,8 +498,8 @@ async fn run_local_version_probe(
             let candidate = path.to_path_buf();
             preparation
                 .cleanup
-                .defer("rcp-local-candidate-reap", move || {
-                    reap_interrupted_local_candidate(child, &candidate);
+                .defer_bounded("rcp-local-candidate-reap", move |budget| {
+                    reap_interrupted_local_candidate(child, &candidate, budget);
                 });
             match interrupted {
                 LocalProbeOutcome::Cancelled => {
@@ -505,18 +518,24 @@ async fn run_local_version_probe(
     }
 }
 
-fn reap_interrupted_local_candidate(mut child: tokio::process::Child, candidate: &std::path::Path) {
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(error) => {
-                tracing::debug!(
-                    "failed to reap interrupted local rcpd candidate {}: {error:#}",
-                    candidate.display()
-                );
-                break;
-            }
+fn reap_interrupted_local_candidate(
+    mut child: tokio::process::Child,
+    candidate: &std::path::Path,
+    budget: crate::CleanupBudget,
+) {
+    match crate::poll_process_exit_until_deadline(&budget, || {
+        child.try_wait().map(|status| status.is_some())
+    }) {
+        Ok(true) => {}
+        Ok(false) => tracing::debug!(
+            "interrupted local rcpd candidate {} did not exit within its cleanup budget",
+            candidate.display()
+        ),
+        Err(error) => {
+            tracing::debug!(
+                "failed to reap interrupted local rcpd candidate {}: {error:#}",
+                candidate.display()
+            );
         }
     }
 }
@@ -547,6 +566,25 @@ fn finish_local_probe_capture(
     } else {
         Ok(output.bytes)
     }
+}
+
+async fn run_deployment_binary_read<T, F>(
+    preparation: &crate::PreparationContext,
+    deadline: crate::BootstrapDeadline,
+    operation: F,
+) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    let read = crate::run_disposable_blocking(
+        preparation.cleanup.clone(),
+        "rcp-deployment-binary-read",
+        operation,
+    );
+    deadline
+        .run("local rcpd deployment binary read", preparation.run(read))
+        .await
 }
 
 /// Deploy rcpd binary to remote host
@@ -591,17 +629,22 @@ pub(crate) async fn deploy_rcpd_with_context<S: crate::SshSessionOwner>(
 
     preparation.ensure_active()?;
 
-    // read local binary
-    let binary = preparation
-        .run(async {
-            tokio::fs::read(local_rcpd_path).await.with_context(|| {
+    // read the local binary outside Tokio's blocking pool so a stuck filesystem syscall cannot
+    // stall runtime shutdown after bootstrap abandons it
+    let local_rcpd_path_owned = local_rcpd_path.to_path_buf();
+    let binary = run_deployment_binary_read(
+        preparation,
+        crate::BootstrapDeadline::new(bootstrap_timeout),
+        move || {
+            std::fs::read(&local_rcpd_path_owned).with_context(|| {
                 format!(
                     "failed to read local rcpd binary from {}",
-                    local_rcpd_path.display()
+                    local_rcpd_path_owned.display()
                 )
             })
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     tracing::info!(
         "Read local rcpd binary ({} bytes) from {}",
@@ -1423,6 +1466,128 @@ mod tests {
                 .contains("cancelled because peer preparation failed")
         );
         assert!(searched_paths.is_empty());
+        drop(preparation);
+        cleanup.finish();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_path_discovery_records_an_ordinary_miss() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let mut searched_paths = Vec::new();
+
+        let candidate = path_candidate_from_output(output, &mut searched_paths);
+
+        assert_eq!(candidate, None);
+        assert_eq!(searched_paths, ["PATH (via 'command -v rcpd'): not found"]);
+    }
+
+    #[derive(Debug)]
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(signal) = self.0.take() {
+                let _ = signal.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_binary_read_deadline_drops_a_late_result_on_its_worker() {
+        let cleanup = crate::RemoteCleanup::new().unwrap();
+        let preparation = crate::PreparationContext::uncancelled(cleanup.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let read = run_deployment_binary_read(
+            &preparation,
+            crate::BootstrapDeadline::new(Duration::from_millis(20)),
+            move || {
+                let _ = started_tx.send(());
+                release_rx
+                    .recv()
+                    .expect("test must release the blocked deployment read");
+                Ok(DropSignal(Some(dropped_tx)))
+            },
+        );
+        let (started, result) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(1), started_rx),
+            tokio::time::timeout(Duration::from_secs(1), read),
+        );
+        started
+            .expect("deployment read worker did not start")
+            .expect("deployment read worker dropped its start signal");
+        let error = result
+            .expect("blocked deployment read ignored its bootstrap deadline")
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("local rcpd deployment binary read timed out after 20ms"),
+            "unexpected deployment-read deadline error: {error:#}"
+        );
+        release_tx
+            .send(())
+            .expect("blocked deployment read worker exited early");
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("late deployment read result was not dropped")
+            .expect("late deployment read result dropped its signal unexpectedly");
+        drop(preparation);
+        cleanup.finish();
+    }
+
+    #[tokio::test]
+    async fn deployment_binary_read_observes_peer_cancellation() {
+        let cleanup = crate::RemoteCleanup::new().unwrap();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let preparation = crate::PreparationContext::new(cancellation.clone(), cleanup.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let read = run_deployment_binary_read(
+            &preparation,
+            crate::BootstrapDeadline::new(Duration::from_secs(5)),
+            move || {
+                let _ = started_tx.send(());
+                release_rx
+                    .recv()
+                    .expect("test must release the blocked deployment read");
+                Ok(DropSignal(Some(dropped_tx)))
+            },
+        );
+        let cancel_after_start = async move {
+            tokio::time::timeout(Duration::from_secs(1), started_rx)
+                .await
+                .expect("deployment read worker did not start")
+                .expect("deployment read worker dropped its start signal");
+            cancellation.cancel();
+        };
+        let (_, result) = tokio::join!(
+            cancel_after_start,
+            tokio::time::timeout(Duration::from_secs(1), read),
+        );
+        let error = result
+            .expect("blocked deployment read ignored peer cancellation")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cancelled because peer preparation failed"),
+            "unexpected deployment-read cancellation error: {error:#}"
+        );
+        release_tx
+            .send(())
+            .expect("blocked deployment read worker exited early");
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("late deployment read result was not dropped")
+            .expect("late deployment read result dropped its signal unexpectedly");
         drop(preparation);
         cleanup.finish();
     }

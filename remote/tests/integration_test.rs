@@ -23,7 +23,10 @@ fn test_remote_port_binding_with_ranges() -> Result<()> {
 #[tokio::test]
 async fn test_remote_tcp_listener_creation_with_port_ranges() -> Result<()> {
     // test TCP listener creation with port ranges
-    let config = remote::TcpConfig::default().with_port_ranges("21000-21999");
+    let config = remote::TcpConfig {
+        port_ranges: Some("21000-21999".to_string()),
+        ..remote::TcpConfig::default()
+    };
     let listener = remote::create_tcp_control_listener(&config, None).await?;
     let addr = listener.local_addr()?;
     // verify the port is within our specified range
@@ -38,7 +41,10 @@ async fn test_remote_tcp_listener_creation_with_port_ranges() -> Result<()> {
 #[tokio::test]
 async fn test_remote_tcp_data_listener_creation_with_port_ranges() -> Result<()> {
     // test TCP data listener creation with port ranges
-    let config = remote::TcpConfig::default().with_port_ranges("22000-22999");
+    let config = remote::TcpConfig {
+        port_ranges: Some("22000-22999".to_string()),
+        ..remote::TcpConfig::default()
+    };
     let listener = remote::create_tcp_data_listener(&config, None).await?;
     let addr = listener.local_addr()?;
     // verify the port is within our specified range
@@ -74,7 +80,10 @@ fn test_remote_multiple_port_ranges() -> Result<()> {
 #[tokio::test]
 async fn test_remote_tcp_listener_address_resolution() -> Result<()> {
     // test that we can get an externally-routable address from a TCP listener
-    let config = remote::TcpConfig::default().with_port_ranges("16000-16999");
+    let config = remote::TcpConfig {
+        port_ranges: Some("16000-16999".to_string()),
+        ..remote::TcpConfig::default()
+    };
     let listener = remote::create_tcp_control_listener(&config, None).await?;
     let addr = remote::get_tcp_listener_addr(&listener, None)?;
     // the address should have our local IP (not 0.0.0.0)
@@ -110,8 +119,11 @@ async fn test_remote_tcp_connect_with_timeout() -> Result<()> {
         Ok::<_, std::io::Error>(())
     });
     // connect to the server
-    let stream =
-        remote::connect_tcp_control(server_addr, &remote::TcpConfig::with_timeout(5)).await?;
+    let config = remote::TcpConfig {
+        conn_timeout_sec: 5,
+        ..remote::TcpConfig::default()
+    };
+    let stream = remote::connect_tcp_control(server_addr, &config).await?;
     assert!(stream.nodelay()?, "TCP_NODELAY should be set");
     // wait for accept to complete
     accept_handle.await??;

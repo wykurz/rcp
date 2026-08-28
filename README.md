@@ -313,13 +313,18 @@ Two complementary mechanisms: **static caps** that you set once based on budget 
     the initiating `rcp`
   - this is a ceiling on applicable work, not a literal count of process descriptors or a promise
     that the workload will achieve that much parallelism
-  - the runtime independently intersects that ceiling with its soft-`RLIMIT_NOFILE` safety ceiling
-    for each of two pools: OpenFile for fd-bearing leaf work and PendingMeta for spawned metadata
-    work. The pools receive the same effective numerical ceiling, but are not a combined total;
-    recursive directory, network socket, and process-support descriptors remain outside them
+  - the runtime normally intersects that ceiling with its soft-`RLIMIT_NOFILE` safety ceiling for
+    each of two pools: OpenFile for fd-bearing leaf work and PendingMeta for spawned metadata work.
+    The pools receive the same effective numerical ceiling, but are not a combined total; recursive
+    directory, network socket, and process-support descriptors remain outside them
+  - if querying `RLIMIT_NOFILE` fails, a finite value explicitly supplied through either flag
+    remains usable as the sole ceiling and produces a visible warning. Automatic and unlimited
+    admission still fail because they have no independent descriptor-safety bound. A successful
+    query returning a zero soft limit fails closed for every policy
   - during one compatibility release, the hidden `--max-open-files=N` spelling remains accepted and
     warns. It conflicts with the new name; positive values map to the new ceiling, while legacy `0`
-    removes only the user ceiling and leaves descriptor safety in effect
+    removes only the user ceiling and leaves descriptor safety in effect; it therefore cannot
+    recover from an `RLIMIT_NOFILE` query failure
 
 ### Adaptive metadata throttling (`--auto-meta-throttle`)
 
@@ -771,7 +776,8 @@ separately configurable ceiling with a default of 100; pending capacity is that 
 count times `--pending-writes-multiplier`. The source reports its resolved logical file limit and
 effective stream count in its first stderr readiness record; the master connects to it before
 starting the destination with the same negotiated values. This source-first readiness contract is
-wire revision 4.
+wire revision 4. Wire revision 5 protects the final daemon CLI contract: the unreachable
+explicit-unlimited override was removed and the remote-copy connection timeout must be positive.
 
 Explicit limits are validated before remote `~` expansion. For automatic limits, the master
 validates the configured connection upper bound before remote side effects, then the source resolves

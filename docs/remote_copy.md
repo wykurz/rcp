@@ -82,7 +82,7 @@ Discovery checks locations in this order:
    - Path derived from `std::env::current_exe()`
 
 3. **PATH**
-   - Uses `which rcpd` on remote host
+   - Uses the shell's POSIX `command -v rcpd` on the remote host
    - Respects user's PATH configuration
    - Indicates intentional installation (e.g., `cargo install`)
 
@@ -99,7 +99,7 @@ rcpd binary not found on remote host
 
 Searched in:
 - Same directory as local rcp binary
-- PATH (via 'which rcpd')
+- PATH (via 'command -v rcpd')
 - Deployed cache: ~/.cache/rcp/bin/rcpd-0.36.0
 
 Options:
@@ -115,6 +115,10 @@ If `HOME` is not set on the remote host:
 - Cache directory check is skipped
 - Discovery continues with same-directory and PATH checks
 - Error message indicates cache was skipped
+
+`HOME` is required only when rcp must expand a remote `~` operand or deploy into the remote cache.
+An absent `HOME` does not prevent the executable and PATH checks above, but auto-deployment cannot
+proceed if those checks do not find a compatible daemon.
 
 ## Version Checking
 
@@ -192,9 +196,10 @@ The `--auto-deploy-rcpd` flag enables automatic transfer and installation of rcp
 
 1. **Find local rcpd binary**:
    - Check same directory as rcp with a bounded `--protocol-version` probe
-   - Fall back to later candidates such as PATH when an earlier candidate is missing, unusable, or
-     incompatible; a timed-out probe has its pipes closed, receives a kill request, and is queued to
-     the invocation cleanup supervisor for reaping while discovery continues
+   - Use the local shell's POSIX `command -v rcpd` for the PATH candidate
+   - Fall back to later candidates when an earlier candidate is missing, unusable, or incompatible;
+     a timed-out probe has its pipes closed, receives a kill request, and is queued to the
+     invocation cleanup supervisor for reaping while discovery continues
 
 2. **Transfer binary to a temp file**:
    - Read local rcpd binary
@@ -231,13 +236,23 @@ control-socket readiness throughout setup. A preparation guard owns the foregrou
 control directory together until success transfers both to one cloneable managed owner through
 daemon startup and execution. The cleanup supervisor is created before any remote resource is
 accepted. Either exit signals the master and queues process reaping; the control directory is
-removed only after that child is confirmed exited. Nested cleanup stays in its parent worker,
-independent invocations cannot drain each other's workers, and the CLI uses one bounded budget to
-wait for the last resource owner and all work it queued. Daemon waits run concurrently across
-endpoints while tracing receivers remain live; any receiver tasks left afterward share one final
-drain deadline, so endpoint count does not multiply the teardown grace. At debug verbosity, raw
-daemon stdout/stderr is forwarded as it arrives while a bounded tail is retained for nonzero-exit
-diagnostics.
+removed only after that child is confirmed exited. Every process poll that reaps an SSH master or an
+interrupted local candidate receives a mandatory cleanup budget. That budget combines its per-job
+deadline with the invocation's shared final deadline, so a child that never becomes reapable cannot
+leave a cleanup thread polling forever. If an SSH master has not exited when the budget expires, its
+private control directory is deliberately preserved rather than removed from under a possibly-live
+process.
+
+The supervisor normally dispatches blocking cleanup to a worker. Worker-creation failure runs the
+job on the supervisor, not on the original resource-owning submitter. If the supervisor channel has
+already failed, submission tries an isolated worker and, if no worker can be created, leaks the job
+so the OS reclaims its owned resources at process exit. Nested cleanup deliberately stays in its
+parent cleanup worker, independent invocations cannot drain each other's workers, and the CLI uses
+one bounded budget to wait for the last resource owner, supervisor, and all work it queued. Daemon
+waits run concurrently across endpoints while tracing receivers remain live; any receiver tasks left
+afterward share one final drain deadline, so endpoint count does not multiply the teardown grace. At
+debug verbosity, raw daemon stdout/stderr is forwarded as it arrives while a bounded tail is
+retained for nonzero-exit diagnostics.
 
 Cancellation during staging closes stdin and gives the local SSH-channel task a bounded grace to
 drain the transaction pipes and wait for the child. If it remains blocked, the task is aborted and
@@ -326,6 +341,7 @@ no compatible local rcpd binary found for deployment
 
 Searched in:
 - Same directory: /path/to/rcp/rcpd
+- PATH (via 'command -v rcpd'): not found
 
 To use auto-deployment, ensure rcpd is available:
 - cargo install rcp-tools-rcp (installs to ~/.cargo/bin)
@@ -333,10 +349,9 @@ To use auto-deployment, ensure rcpd is available:
 - or build with: cargo build --release --bin rcpd
 ```
 
-(A `PATH:` line is added when `command -v rcpd` resolves a local deployment candidate. An
-incompatible candidate remains in the list with its rejection reason; a compatible one is deployed.
-When `command -v` finds nothing, no `PATH:` line is shown — hence the common not-found output lists
-only the same-directory candidate.)
+(A successful `command -v rcpd` adds the resolved `PATH:` candidate. An incompatible candidate
+remains in the list with its rejection reason; a compatible one is deployed. An ordinary PATH miss
+is listed explicitly as shown above, while failure to run PATH discovery is listed with that error.)
 
 **Checksum mismatch**:
 
@@ -470,6 +485,7 @@ failed to connect to <addr>
 | Remote binary discovery    | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
 | Tilde HOME lookup          | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
 | Remote version probe       | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
+| Local deployment read      | 60s with `--auto-deploy-rcpd`       | `--remote-copy-conn-timeout-sec` |
 | Deployment setup/readiness | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
 | Deployment write idle      | 15s (60s with `--auto-deploy-rcpd`) | `--remote-copy-conn-timeout-sec` |
 | Deployment verification    | At least 60s                        | `--remote-copy-conn-timeout-sec` |
@@ -556,35 +572,41 @@ cargo build --target x86_64-unknown-linux-gnu
 
 ### rcp Flags for Remote Operations
 
-| Flag                               | Description                                                                              |
-| ---------------------------------- | ---------------------------------------------------------------------------------------- |
-| `--rcpd-path=PATH`                 | Override rcpd binary path on remote hosts                                                |
-| `--auto-deploy-rcpd`               | Automatically deploy rcpd to remote hosts                                                |
-| `--remote-copy-conn-timeout-sec=N` | Remote setup, deployment-idle, and connection timeout (default: 15; 60 with auto-deploy) |
-| `--remote-keepalive-sec=N`         | Dead-peer detection budget, 0 disables (default: 120)                                    |
-| `--port-ranges=RANGES`             | Restrict TCP to specific ports (e.g., "8000-8999")                                       |
-| `--max-files-in-flight=N`          | Explicit ceiling; automatic remote default is source-owned                               |
-| `--max-connections=N`              | Maximum concurrent data connections (default: 100)                                       |
-| `--network-profile=PROFILE`        | Buffer sizing: `datacenter` (default) or `internet`                                      |
+| Flag                               | Description                                                                                 |
+| ---------------------------------- | ------------------------------------------------------------------------------------------- |
+| `--rcpd-path=PATH`                 | Override rcpd binary path on remote hosts                                                   |
+| `--auto-deploy-rcpd`               | Automatically deploy rcpd to remote hosts                                                   |
+| `--remote-copy-conn-timeout-sec=N` | Positive remote setup/deployment-idle/connection timeout (default: 15; 60 with auto-deploy) |
+| `--remote-keepalive-sec=N`         | Dead-peer detection budget, 0 disables (default: 120)                                       |
+| `--port-ranges=RANGES`             | Restrict TCP to specific ports (e.g., "8000-8999")                                          |
+| `--max-files-in-flight=N`          | Explicit ceiling; automatic `F = max(source CPUs, 4)`                                       |
+| `--max-connections=N`              | Maximum concurrent data connections (default: 100)                                          |
+| `--pending-writes-multiplier=N`    | Pending-task capacity multiplier (default: 4)                                               |
+| `--network-profile=PROFILE`        | Buffer sizing: `datacenter` (default) or `internet`                                         |
 
 For a remote copy, let `F` be the logical file-work ceiling and `M` be `--max-connections`; the
-effective stream count is `E = min(F, M)`, or `E = M` for the legacy explicit-unlimited policy. The
-source owns automatic `F` selection and the destination adopts its reported `F/E`; explicit `F`
-remains master-authoritative. Pending capacity is `E × --pending-writes-multiplier`. Values for `E`
-or that product above Tokio's semaphore maximum are rejected rather than reaching semaphore
-construction.
+effective stream count is `E = min(F, M)`, or `E = M` for the legacy unlimited policy. The source
+selects automatic `F` as `max(std::thread::available_parallelism(), 4)`, and the destination adopts
+its reported `F/E`; explicit `F` remains master-authoritative. Pending capacity is
+`E × --pending-writes-multiplier`. Values for `E` or that product above Tokio's semaphore maximum
+are rejected rather than reaching semaphore construction.
 
 Explicit limits can be checked before remote `~` expansion. For automatic limits, the master
 validates the configured connection upper bound before remote side effects; the source resolves and
 validates the actual capacity before its readiness record and before destination spawn. Each
-endpoint separately applies its local soft-RLIMIT descriptor safety when admitting file-like work. A
-file limit reduced by the connection ceiling, an explicitly requested connection ceiling reduced by
-`F`, or an explicit descriptor clamp produces a default-visible notice naming requested and
-effective values. The ordinary automatic/default intersection remains quiet. Profiling and
-Tokio-console artifact announcements likewise use the tracing notice target and reach master output
-only after the daemon readiness handshake. Pre-tracing configuration refusals use the same
-`RCP_ERROR` startup record; otherwise captured startup stdout and stderr are attached to handshake
-errors. These readiness and internal spawn-contract changes are wire revision 4.
+endpoint separately applies its local soft-RLIMIT descriptor safety when admitting file-like work.
+If that query fails, a finite user-supplied limit becomes the endpoint's sole admission ceiling and
+produces a default-visible notice; automatic or unlimited admission fails instead. A successful
+query returning a zero soft limit fails closed for every policy. A file limit reduced by the
+connection ceiling, an explicitly requested connection ceiling reduced by `F`, or an explicit
+descriptor clamp produces a default-visible notice naming requested and effective values. The
+ordinary automatic/default intersection remains quiet. Profiling and Tokio-console artifact
+announcements likewise use the tracing notice target and reach master output only after the daemon
+readiness handshake. Pre-tracing configuration refusals use the same `RCP_ERROR` startup record;
+otherwise captured startup stdout and stderr are attached to handshake errors. These readiness and
+internal spawn-contract changes are protected by wire revision 4. Wire revision 5 covers the final
+daemon CLI contract: removal of its unreachable explicit-unlimited override and rejection of a zero
+remote-copy connection timeout.
 
 ### Network Profiles
 

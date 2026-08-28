@@ -599,9 +599,12 @@ so the security-relevant invariants each live in exactly one place:
   fd-bearing parent/classification work. Delegated shared-driver and rlink entries either ensure or
   transfer admission before final classification. This statement does not cover every remote rcpd
   parent/root open; remote source and destination have separate protocol-specific setup.
-- **Independent pools and recursive overwrite**: the runtime intersects the file-work ceiling with
-  the internal soft-`RLIMIT_NOFILE` descriptor ceiling independently for the OpenFile and
-  PendingMeta semaphores. Those pools receive the same effective numerical ceiling, not one combined
+- **Independent pools and recursive overwrite**: the runtime normally intersects the file-work
+  ceiling with the internal soft-`RLIMIT_NOFILE` descriptor ceiling independently for the OpenFile
+  and PendingMeta semaphores. If that query fails, only a finite user-supplied ceiling can recover;
+  it becomes the sole admission bound and produces a visible warning. Automatic admission and legacy
+  unlimited admission fail closed instead; a successful query returning a zero soft limit also fails
+  closed for every policy. The pools receive the same effective numerical ceiling, not one combined
   total. Copy/link overwrite leaf work can retain OpenFile admission while recursively invoking rm,
   which draws from PendingMeta. That OpenFile → PendingMeta call is the only direction between those
   descriptor-admission pools; recursive directory handles and process-support descriptors remain

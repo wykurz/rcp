@@ -109,7 +109,6 @@ struct Args {
         conflicts_with_all = [
             "max_files_in_flight",
             "max_open_files",
-            "explicit_unlimited_files_in_flight",
             "forwarded_legacy_files_in_flight"
         ]
     )]
@@ -118,24 +117,11 @@ struct Args {
     #[arg(
         long,
         hide = true,
-        conflicts_with_all = [
-            "max_files_in_flight",
-            "max_open_files",
-            "resolved_automatic_files_in_flight",
-            "forwarded_legacy_files_in_flight"
-        ]
-    )]
-    explicit_unlimited_files_in_flight: bool,
-
-    #[arg(
-        long,
-        hide = true,
         value_name = "N",
         conflicts_with_all = [
             "max_files_in_flight",
             "max_open_files",
-            "resolved_automatic_files_in_flight",
-            "explicit_unlimited_files_in_flight"
+            "resolved_automatic_files_in_flight"
         ]
     )]
     forwarded_legacy_files_in_flight: Option<usize>,
@@ -168,11 +154,12 @@ struct Args {
 
     /// Connection timeout for remote copy operations in seconds
     ///
-    /// Applies to: rcpd→master connection, destination→source connection
+    /// Applies to: rcpd→master connection, destination→source connection. Must be at least 1.
     #[arg(
         long,
         default_value = "15",
         value_name = "N",
+        value_parser = common::cli::parse_positive_u64,
         help_heading = "Remote copy options"
     )]
     remote_copy_conn_timeout_sec: u64,
@@ -286,8 +273,6 @@ impl Args {
     fn resolve_files_in_flight(&self) -> common::ResolvedFilesInFlight {
         if let Some(value) = self.resolved_automatic_files_in_flight {
             common::ResolvedFilesInFlight::automatic_with(value)
-        } else if self.explicit_unlimited_files_in_flight {
-            common::ResolvedFilesInFlight::unlimited()
         } else if let Some(value) = self.forwarded_legacy_files_in_flight {
             common::ResolvedFilesInFlight::forwarded_legacy(value)
         } else {
