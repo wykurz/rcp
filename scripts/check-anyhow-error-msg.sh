@@ -16,8 +16,22 @@ echo "🔍 Checking for anyhow::Error::msg() usage..."
 
 VIOLATIONS_FOUND=0
 
-# Directories to check
-SEARCH_DIRS="common/src congestion/src filegen/src rchm/src rcmp/src rcp/src remote/src rlink/src rrm/src throttle/src"
+# resolve paths relative to this script, not the caller's current directory. CI invokes this from
+# the workspace root, but a linter that reports success after a different invocation scans nothing
+# is actively misleading.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+# directories to check. An array preserves a caller-supplied path containing whitespace.
+if [ "$#" -gt 0 ]; then
+    SEARCH_DIRS=("$@")
+else
+    SEARCH_DIRS=(
+        common/src congestion/src filegen/src rchm/src rcmp/src rcp/src remote/src rlink/src
+        rrm/src throttle/src
+    )
+fi
 
 # Detect usages outside of comments
 check_file() {
@@ -70,9 +84,21 @@ check_file() {
 }
 
 # Find all uses of anyhow::Error::msg outside comments
-for dir in $SEARCH_DIRS; do
+SCANNED_ANY=0
+SCANNED_FILES=0
+FILE_LIST="$(mktemp)"
+trap 'rm -f "$FILE_LIST"' EXIT
+
+for dir in "${SEARCH_DIRS[@]}"; do
     if [ -d "$dir" ]; then
-        while IFS= read -r file; do
+        SCANNED_ANY=1
+        : > "$FILE_LIST"
+        if ! find "$dir" -name "*.rs" -type f -print0 > "$FILE_LIST"; then
+            echo -e "${RED}ERROR: failed to enumerate Rust files under: $dir${NC}"
+            exit 1
+        fi
+        while IFS= read -r -d '' file; do
+            SCANNED_FILES=$((SCANNED_FILES + 1))
             # awk's own failure — a syntax error in the program above, an unreadable file — produces
             # empty output, which is indistinguishable from a clean file, so the check would report
             # success for a scan that never ran. Fatal rather than counted as a violation: a linter
@@ -90,9 +116,20 @@ for dir in $SEARCH_DIRS; do
                 done <<< "$matches"
                 VIOLATIONS_FOUND=1
             fi
-        done < <(find "$dir" -name "*.rs" -type f)
+        done < "$FILE_LIST"
     fi
 done
+
+if [ "$SCANNED_ANY" -ne 1 ]; then
+    echo -e "${RED}ERROR: none of the requested directories exist, so nothing was checked:${NC}"
+    printf '  %s\n' "${SEARCH_DIRS[@]}"
+    exit 1
+fi
+
+if [ "$SCANNED_FILES" -eq 0 ]; then
+    echo -e "${RED}ERROR: no Rust files were found, so nothing was checked.${NC}"
+    exit 1
+fi
 
 if [ $VIOLATIONS_FOUND -eq 1 ]; then
     echo ""

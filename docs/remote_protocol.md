@@ -118,12 +118,15 @@ local candidate must receive the cleanup scope's typed budget; its effective dea
 of its per-job deadline and the invocation's shared final deadline. The common poll helper therefore
 cannot spin forever on a child that never becomes reapable. The control directory is removed only
 after the retained master is confirmed exited; expiry preserves it rather than deleting the socket
-from under a possibly-live master. Nested cleanup runs inside its parent cleanup worker, and
-separate invocations cannot drain one another's workers. Before process exit, the CLI gives the
-scope one bounded budget to wait for its last resource owner, supervisor, and every cleanup job;
-work still blocked after that grace is abandoned with the process. Daemon waits run concurrently
-across endpoints while tracing receivers stay live, then any remaining receiver tasks share one
-final drain deadline.
+from under a possibly-live master. The master threads actual local operand roots through remote-HOME
+lookup and endpoint preparation; canonical control-directory candidates inside those trees are
+rejected, while remote-to-remote copies do not infer an exclusion from the working directory. The
+filesystem root cannot exclude candidates because every absolute socket path lies beneath it. Nested
+cleanup runs inside its parent cleanup worker, and separate invocations cannot drain one another's
+workers. Before process exit, the CLI gives the scope one bounded budget to wait for its last
+resource owner, supervisor, and every cleanup job; work still blocked after that grace is abandoned
+with the process. Daemon waits run concurrently across endpoints while tracing receivers stay live,
+then any remaining receiver tasks share one final drain deadline.
 
 Normal daemon discovery does not require `HOME`: when it is absent, the deployed-cache candidate is
 skipped and same-directory/PATH discovery continues. Remote `~` expansion and deployment into the
@@ -1527,6 +1530,11 @@ and the source↔destination control reads behave the same way, so all three pro
 `--remote-keepalive-sec=N` is the budget for noticing this. It arms two options, and **which ones
 apply depends on what the connection carries** — the entry point takes a `ConnectionKind` (`Control`
 or `Data`) precisely so each call site declares that:
+
+This is not an overall operation deadline. A live host whose userspace `rcpd` is stopped or wedged
+can still have its kernel acknowledge TCP keepalives and zero-window probes, so neither keepalive
+nor `TCP_USER_TIMEOUT` necessarily fires. The master can consequently remain waiting for an
+`RcpdResult`; use external supervision when an absolute copy deadline is required.
 
 |                                                                                  | control connections                                         | data connections                         |
 | -------------------------------------------------------------------------------- | ----------------------------------------------------------- | ---------------------------------------- |

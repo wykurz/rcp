@@ -265,7 +265,8 @@ struct Args {
     ///
     /// This separately configurable ceiling defaults to 100. Effective data streams are
     /// min(--max-files-in-flight, --max-connections). Higher values allow more parallel file
-    /// transfers but use more resources. To raise remote parallelism above the CPU-derived file
+    /// transfers but use more resources. Remote automatic limits resolve on the source rcpd and
+    /// are adopted by the destination. To raise remote parallelism above the CPU-derived file
     /// default, increase both ceilings.
     #[arg(
         long,
@@ -876,7 +877,7 @@ fn spawn_tracing_receiver(
 const TRACING_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 async fn finish_tracing_receiver(
-    mut task: remote::AbortOnDropTask<()>,
+    task: remote::AbortOnDropTask<()>,
     rcpd_type: remote::tracelog::RcpdType,
     deadline: tokio::time::Instant,
 ) {
@@ -887,8 +888,6 @@ async fn finish_tracing_receiver(
         }
         Err(_) => {
             tracing::debug!("{rcpd_type} tracing receiver did not finish during drain grace");
-            task.abort();
-            let _ = task.join().await;
         }
     }
 }
@@ -969,22 +968,79 @@ impl Drop for RemoteTeardown {
         // graceful exits consume both collections in finish(). Cancellation or panic still aborts
         // receiver tasks; dropping RcpdProcess closes daemon channels and aborts its collectors.
         for (task, _) in self.tracing_receivers.drain(..) {
-            task.abort();
+            drop(task);
         }
     }
+}
+
+#[derive(Debug)]
+struct RemoteCopyOperands {
+    source: path::RemotePath,
+    destination: path::RemotePath,
+    local_operand_roots: Vec<std::path::PathBuf>,
+}
+
+fn collect_local_operand_roots(
+    sources: &[path::PathType],
+    destination: &path::PathType,
+) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    sources
+        .iter()
+        .chain(std::iter::once(destination))
+        .filter_map(|operand| match operand {
+            path::PathType::Local(path) => Some(path),
+            path::PathType::Remote(_) => None,
+        })
+        .map(|path| path::RemotePath::from_local(path).map(|path| path.path().to_path_buf()))
+        .collect()
+}
+
+fn remote_copy_operands(
+    source: path::PathType,
+    destination: path::PathType,
+    local_operand_roots: Vec<std::path::PathBuf>,
+) -> anyhow::Result<Option<RemoteCopyOperands>> {
+    let operands = match (source, destination) {
+        (path::PathType::Remote(source), path::PathType::Remote(destination)) => {
+            RemoteCopyOperands {
+                source,
+                destination,
+                local_operand_roots,
+            }
+        }
+        (path::PathType::Remote(source), path::PathType::Local(destination)) => {
+            let destination = path::RemotePath::from_local(&destination)?;
+            RemoteCopyOperands {
+                source,
+                destination,
+                local_operand_roots,
+            }
+        }
+        (path::PathType::Local(source), path::PathType::Remote(destination)) => {
+            let source = path::RemotePath::from_local(&source)?;
+            RemoteCopyOperands {
+                source,
+                destination,
+                local_operand_roots,
+            }
+        }
+        (path::PathType::Local(_), path::PathType::Local(_)) => return Ok(None),
+    };
+    Ok(Some(operands))
 }
 
 #[instrument(skip(master_cert))]
 async fn run_rcpd_master(
     args: &Args,
     preserve: &common::preserve::Settings,
-    src: &path::RemotePath,
-    dst: &path::RemotePath,
+    operands: &RemoteCopyOperands,
     request: MasterRemoteRequest,
     master_cert: Option<remote::tls::CertifiedKey>,
     cleanup: &remote::RemoteCleanup,
 ) -> anyhow::Result<common::copy::Summary> {
     tracing::debug!("running rcpd src/dst");
+    let src = &operands.source;
+    let dst = &operands.destination;
     let mut teardown = RemoteTeardown::default();
     let source_config = build_source_remote_config(&request);
     let source_bind_ip = extract_bind_ip_from_host(&src.session().host);
@@ -997,6 +1053,7 @@ async fn run_rcpd_master(
         args.auto_deploy_rcpd,
         cleanup,
         bootstrap_timeout,
+        &operands.local_operand_roots,
     )
     .await?;
 
@@ -1431,22 +1488,14 @@ async fn async_main(
     }
     // if any of the src/dst paths are remote, we'll be using the rcpd
     let remote_src_dst = if has_remote_paths {
+        let local_operand_roots = collect_local_operand_roots(&parsed_srcs, &dst_parsed)?;
         // resolve the destination with trailing-slash logic on the already-parsed paths
         let resolved_dst = path::resolve_destination(&parsed_srcs[0], &dst_parsed, dst_string)?;
-        match (first_src_path_type.clone(), resolved_dst) {
-            (path::PathType::Remote(src_remote), path::PathType::Remote(dst_remote)) => {
-                Some((src_remote, dst_remote))
-            }
-            (path::PathType::Remote(src_remote), path::PathType::Local(dst_local)) => {
-                let dst_remote = path::RemotePath::from_local(&dst_local)?;
-                Some((src_remote, dst_remote))
-            }
-            (path::PathType::Local(src_local), path::PathType::Remote(dst_remote)) => {
-                let src_remote = path::RemotePath::from_local(&src_local)?;
-                Some((src_remote, dst_remote))
-            }
-            (path::PathType::Local(_), path::PathType::Local(_)) => None,
-        }
+        remote_copy_operands(
+            first_src_path_type.clone(),
+            resolved_dst,
+            local_operand_roots,
+        )?
     } else {
         None
     };
@@ -1463,7 +1512,7 @@ async fn async_main(
         common::preserve::preserve_none()
     };
     tracing::debug!("preserve settings: {:?}", &preserve);
-    if let Some((mut remote_src, mut remote_dst)) = remote_src_dst {
+    if let Some(mut operands) = remote_src_dst {
         let cleanup = cleanup
             .as_ref()
             .expect("remote operations start with a cleanup supervisor");
@@ -1488,54 +1537,53 @@ async fn async_main(
             master_cert.as_ref().map(|cert| cert.fingerprint),
         )?;
         let remote_home_timeout = std::time::Duration::from_secs(request.tcp.conn_timeout_sec);
-        // expand remote '~' using remote HOME if needed
-        let same_session = remote_src.session() == remote_dst.session();
-        if same_session && (remote_src.needs_remote_home() || remote_dst.needs_remote_home()) {
-            let home = remote::get_remote_home_for_session_with_timeout(
-                remote_src.session(),
-                cleanup,
-                remote_home_timeout,
-            )
-            .await?;
-            remote_src.apply_remote_home(&home);
-            remote_dst.apply_remote_home(&home);
-        } else {
-            if remote_src.needs_remote_home() {
+        {
+            let remote_src = &mut operands.source;
+            let remote_dst = &mut operands.destination;
+            // expand remote '~' using remote HOME if needed
+            let same_session = remote_src.session() == remote_dst.session();
+            if same_session && (remote_src.needs_remote_home() || remote_dst.needs_remote_home()) {
                 let home = remote::get_remote_home_for_session_with_timeout(
                     remote_src.session(),
                     cleanup,
                     remote_home_timeout,
+                    &operands.local_operand_roots,
                 )
                 .await?;
                 remote_src.apply_remote_home(&home);
-            }
-            if remote_dst.needs_remote_home() {
-                let home = remote::get_remote_home_for_session_with_timeout(
-                    remote_dst.session(),
-                    cleanup,
-                    remote_home_timeout,
-                )
-                .await?;
                 remote_dst.apply_remote_home(&home);
+            } else {
+                if remote_src.needs_remote_home() {
+                    let home = remote::get_remote_home_for_session_with_timeout(
+                        remote_src.session(),
+                        cleanup,
+                        remote_home_timeout,
+                        &operands.local_operand_roots,
+                    )
+                    .await?;
+                    remote_src.apply_remote_home(&home);
+                }
+                if remote_dst.needs_remote_home() {
+                    let home = remote::get_remote_home_for_session_with_timeout(
+                        remote_dst.session(),
+                        cleanup,
+                        remote_home_timeout,
+                        &operands.local_operand_roots,
+                    )
+                    .await?;
+                    remote_dst.apply_remote_home(&home);
+                }
             }
         }
-        if !remote_src.path().is_absolute() || !remote_dst.path().is_absolute() {
+        if !operands.source.path().is_absolute() || !operands.destination.path().is_absolute() {
             return Err(anyhow!(
                 "Remote paths must be absolute after expansion: src={:?}, dst={:?}",
-                remote_src.path(),
-                remote_dst.path()
+                operands.source.path(),
+                operands.destination.path()
             ));
         }
-        return match run_rcpd_master(
-            &args,
-            &preserve,
-            &remote_src,
-            &remote_dst,
-            request,
-            master_cert,
-            cleanup,
-        )
-        .await
+        return match run_rcpd_master(&args, &preserve, &operands, request, master_cert, cleanup)
+            .await
         {
             Ok(summary) => Ok(summary),
             Err(error) => {
@@ -1913,6 +1961,49 @@ fn main() -> Result<(), anyhow::Error> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn ssh_control_exclusions_follow_local_operand_origin() {
+        let remote_source = path::parse_path("host-a:/source").unwrap();
+        let remote_destination = path::parse_path("host-b:/destination").unwrap();
+        let local_source = path::parse_path("/tmp/local-source").unwrap();
+        let local_destination = path::parse_path("/tmp/local-destination").unwrap();
+        let default_localhost = path::parse_path("localhost:/tmp/default-localhost").unwrap();
+        let forced_localhost =
+            path::parse_path_force_remote("localhost:/tmp/forced-localhost").unwrap();
+
+        assert_eq!(
+            collect_local_operand_roots(std::slice::from_ref(&local_source), &remote_destination,)
+                .unwrap(),
+            vec![std::path::PathBuf::from("/tmp/local-source")]
+        );
+        assert_eq!(
+            collect_local_operand_roots(std::slice::from_ref(&remote_source), &local_destination,)
+                .unwrap(),
+            vec![std::path::PathBuf::from("/tmp/local-destination")]
+        );
+        assert!(
+            collect_local_operand_roots(std::slice::from_ref(&remote_source), &remote_destination,)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            collect_local_operand_roots(
+                std::slice::from_ref(&default_localhost),
+                &remote_destination,
+            )
+            .unwrap(),
+            vec![std::path::PathBuf::from("/tmp/default-localhost")]
+        );
+        assert!(
+            collect_local_operand_roots(
+                std::slice::from_ref(&forced_localhost),
+                &remote_destination,
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn tracing_receivers_share_one_teardown_deadline() {
         let receivers = vec![
@@ -1930,6 +2021,33 @@ mod tests {
         finish_tracing_receivers(receivers).await;
 
         assert_eq!(started.elapsed(), TRACING_DRAIN_GRACE);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tracing_receiver_drain_does_not_wait_forever_after_abort() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let receiver = remote::AbortOnDropTask::new(tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        started_rx.await.unwrap();
+
+        let drain = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            finish_tracing_receiver(
+                receiver,
+                remote::tracelog::RcpdType::Source,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+            ),
+        )
+        .await;
+        release_tx.send(()).unwrap();
+
+        assert!(
+            drain.is_ok(),
+            "an uncooperative task must be abandoned after the drain deadline"
+        );
     }
 
     #[tokio::test(start_paused = true)]

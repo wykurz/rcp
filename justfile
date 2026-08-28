@@ -23,6 +23,8 @@ lint:
     @echo "🔍 Checking error logging format..."
     ./scripts/check-error-logging.sh
     @echo "🔍 Checking anyhow::Error::msg usage..."
+    @echo "🔍 Testing the anyhow::Error::msg linter..."
+    ./scripts/test-check-anyhow-error-msg.sh
     ./scripts/check-anyhow-error-msg.sh
     @echo "🔍 Checking rust version consistency..."
     ./scripts/check-rust-version.sh
