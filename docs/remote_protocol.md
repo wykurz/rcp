@@ -103,19 +103,21 @@ The SSH multiplex master runs as a retained foreground `ssh -M -N` process; expl
 `ForkAfterAuthentication=no` and `ControlPersist=no` command-line overrides prevent user or system
 SSH configuration from forking it away from its owner. Cancelling setup aborts that owner and
 `kill_on_drop` terminates the actual connecting process. The configured SSH executable is resolved
-inside a known-local shell child. After setup, commands open channels with the native OpenSSH
-multiplex protocol over the retained control socket rather than synchronously spawning another local
-`ssh`, so their configured deadline also covers exec-channel creation. A preparation guard owns the
-foreground child and private control directory together until success transfers both to a cloneable
-managed session through prepared and running daemon states. Whichever owner exits signals the master
-before returning. The cleanup supervisor is created before any remote resource is accepted. Process
-reaping is queued there, so it cannot block or depend on a Tokio runtime that may already be
-shutting down. The supervisor normally dispatches blocking cleanup to a worker; worker-creation
-failure runs the job on the supervisor rather than the original resource-owning submitter. A failed
-supervisor channel tries an isolated worker and, if no worker can be created, leaks the job so the
-OS reclaims its owned resources at process exit. Every reaper for an SSH master or an interrupted
-local candidate must receive the cleanup scope's typed budget; its effective deadline is the earlier
-of its per-job deadline and the invocation's shared final deadline. The common poll helper therefore
+inside a known-local shell child. Brackets that delimit IPv6 in an rcp operand are removed from the
+direct OpenSSH host argument; leaving them in argv makes OpenSSH resolve the brackets as literal
+hostname characters. After setup, commands open channels with the native OpenSSH multiplex protocol
+over the retained control socket rather than synchronously spawning another local `ssh`, so their
+configured deadline also covers exec-channel creation. A preparation guard owns the foreground child
+and private control directory together until success transfers both to a cloneable managed session
+through prepared and running daemon states. Whichever owner exits signals the master before
+returning. The cleanup supervisor is created before any remote resource is accepted. Process reaping
+is queued there, so it cannot block or depend on a Tokio runtime that may already be shutting down.
+The supervisor normally dispatches blocking cleanup to a worker; worker-creation failure runs the
+job on the supervisor rather than the original resource-owning submitter. A failed supervisor
+channel tries an isolated worker and, if no worker can be created, leaks the job so the OS reclaims
+its owned resources at process exit. Every reaper for an SSH master or an interrupted local
+candidate must receive the cleanup scope's typed budget; its effective deadline is the earlier of
+its per-job deadline and the invocation's shared final deadline. The common poll helper therefore
 cannot spin forever on a child that never becomes reapable. The control directory is removed only
 after the retained master is confirmed exited; expiry preserves it rather than deleting the socket
 from under a possibly-live master. The master threads actual local operand roots through remote-HOME

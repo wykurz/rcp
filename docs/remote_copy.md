@@ -229,19 +229,21 @@ The SSH multiplex master runs as a retained foreground `ssh -M -N` process. Comm
 `ForkAfterAuthentication=no` and `ControlPersist=no` overrides prevent user or system SSH
 configuration from backgrounding it. Cancelling setup or reaching the configured remote setup
 deadline terminates that actual process. The configured SSH executable is resolved inside a
-known-local shell child. Once the master is ready, rcp opens exec channels through OpenSSH's native
-multiplex protocol over the retained control socket; it does not synchronously find and spawn a new
-local `ssh` process for each remote command. One disposable filesystem worker polls for
-control-socket readiness throughout setup. A preparation guard owns the foreground child and private
-control directory together until success transfers both to one cloneable managed owner through
-daemon startup and execution. The cleanup supervisor is created before any remote resource is
-accepted. Either exit signals the master and queues process reaping; the control directory is
-removed only after that child is confirmed exited. Every process poll that reaps an SSH master or an
-interrupted local candidate receives a mandatory cleanup budget. That budget combines its per-job
-deadline with the invocation's shared final deadline, so a child that never becomes reapable cannot
-leave a cleanup thread polling forever. If an SSH master has not exited when the budget expires, its
-private control directory is deliberately preserved rather than removed from under a possibly-live
-process.
+known-local shell child. Brackets that delimit an IPv6 address in an rcp operand (for example,
+`user@[2001:db8::1]:/src`) are removed from the host argument passed to that direct OpenSSH argv;
+OpenSSH otherwise treats them as literal hostname characters. Once the master is ready, rcp opens
+exec channels through OpenSSH's native multiplex protocol over the retained control socket; it does
+not synchronously find and spawn a new local `ssh` process for each remote command. One disposable
+filesystem worker polls for control-socket readiness throughout setup. A preparation guard owns the
+foreground child and private control directory together until success transfers both to one
+cloneable managed owner through daemon startup and execution. The cleanup supervisor is created
+before any remote resource is accepted. Either exit signals the master and queues process reaping;
+the control directory is removed only after that child is confirmed exited. Every process poll that
+reaps an SSH master or an interrupted local candidate receives a mandatory cleanup budget. That
+budget combines its per-job deadline with the invocation's shared final deadline, so a child that
+never becomes reapable cannot leave a cleanup thread polling forever. If an SSH master has not
+exited when the budget expires, its private control directory is deliberately preserved rather than
+removed from under a possibly-live process.
 
 The master carries the actual local operand roots through both remote-HOME lookup and endpoint
 preparation. Control-directory candidates are canonicalized and rejected only when they lie inside
