@@ -6,10 +6,15 @@
 use assert_cmd::Command;
 
 #[test]
-fn parses_positive_max_files_in_flight_before_help() {
+fn parses_finite_and_unlimited_max_files_in_flight_before_help() {
     Command::cargo_bin("rcmp")
         .unwrap()
         .args(["--max-files-in-flight=1", "--help"])
+        .assert()
+        .success();
+    Command::cargo_bin("rcmp")
+        .unwrap()
+        .args(["--max-files-in-flight=unlimited", "--help"])
         .assert()
         .success();
     Command::cargo_bin("rcmp")

@@ -101,7 +101,7 @@
 //! - `--iops-throttle`: Limit I/O operations per second
 //! - `--max-files-in-flight`: Cap applicable file-like work. Local automatic defaults resolve on
 //!   the initiating host; remote defaults resolve on the source `rcpd` and are adopted by the
-//!   destination (each with a floor of 4)
+//!   destination (each with a floor of 4). Use `unlimited` to remove the user ceiling
 //! - `--max-workers`: Control number of worker threads
 //!
 //! ## Remote Copy Configuration

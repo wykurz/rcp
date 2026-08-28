@@ -305,12 +305,12 @@ Two complementary mechanisms: **static caps** that you set once based on budget 
 - set `--iops-throttle` to limit the maximum number of I/O operations per second
   - MUST be used with `--chunk-size`, which is used to calculate I/O operations per file
 
-- set `--max-files-in-flight=N` to cap applicable file-like copy, link, comparison, removal, chmod,
-  and generation work
-  - explicit `N` must be positive; `1` is valid and `0` is rejected. When omitted, the default is
-    `max(std::thread::available_parallelism(), 4)`. For a remote copy, the **source** `rcpd`
-    computes that automatic default from the source host; an explicit value remains controlled by
-    the initiating `rcp`
+- set `--max-files-in-flight=N|unlimited` to control applicable file-like copy, link, comparison,
+  removal, chmod, and generation work
+  - a positive `N` sets a finite ceiling; `unlimited` removes the user ceiling, while numeric `0` is
+    rejected. When omitted, the default is `max(std::thread::available_parallelism(), 4)`. For a
+    remote copy, the **source** `rcpd` computes that automatic default from the source host; an
+    explicit value remains controlled by the initiating `rcp`
   - this is a ceiling on applicable work, not a literal count of process descriptors or a promise
     that the workload will achieve that much parallelism
   - the runtime normally intersects that ceiling with its soft-`RLIMIT_NOFILE` safety ceiling for
@@ -323,8 +323,8 @@ Two complementary mechanisms: **static caps** that you set once based on budget 
     query returning a zero soft limit fails closed for every policy
   - during one compatibility release, the hidden `--max-open-files=N` spelling remains accepted and
     warns. It conflicts with the new name; positive values map to the new ceiling, while legacy `0`
-    removes only the user ceiling and leaves descriptor safety in effect; it therefore cannot
-    recover from an `RLIMIT_NOFILE` query failure
+    maps to `--max-files-in-flight=unlimited`, removing only the user ceiling and leaving descriptor
+    safety in effect; it therefore cannot recover from an `RLIMIT_NOFILE` query failure
 
 ### Adaptive metadata throttling (`--auto-meta-throttle`)
 
@@ -778,6 +778,7 @@ effective stream count in its first stderr readiness record; the master connects
 starting the destination with the same negotiated values. This source-first readiness contract is
 wire revision 4. Wire revision 5 protects the final daemon CLI contract: the unreachable
 explicit-unlimited override was removed and the remote-copy connection timeout must be positive.
+Wire revision 6 adds the public `--max-files-in-flight=unlimited` daemon spawn spelling.
 
 Explicit limits are validated before remote `~` expansion. For automatic limits, the master
 validates the configured connection upper bound before remote side effects, then the source resolves

@@ -520,14 +520,7 @@ impl MasterAuthoritativeFilesInFlight {
 
     fn to_rcpd(self, limit: common::ConcurrencyLimit) -> remote::protocol::RcpdFilesInFlight {
         match self {
-            Self::Explicit => match limit {
-                common::ConcurrencyLimit::Limited(value) => {
-                    remote::protocol::RcpdFilesInFlight::Explicit(value)
-                }
-                common::ConcurrencyLimit::Unlimited => {
-                    unreachable!("an explicit master file limit is always finite")
-                }
-            },
+            Self::Explicit => remote::protocol::RcpdFilesInFlight::Explicit(limit),
             Self::Deprecated => remote::protocol::RcpdFilesInFlight::DeprecatedMaxOpenFiles(limit),
         }
     }
@@ -652,19 +645,14 @@ fn build_master_remote_request(
             )?;
             RemoteConcurrencyPolicy::Automatic
         }
-        common::FilesInFlightSource::Explicit => {
-            let common::ConcurrencyLimit::Limited(limit) = files_in_flight.limit() else {
-                anyhow::bail!("an explicit --max-files-in-flight limit must be finite")
-            };
-            RemoteConcurrencyPolicy::MasterAuthoritative {
-                files_in_flight: MasterAuthoritativeFilesInFlight::Explicit,
-                concurrency: remote::resolve_remote_concurrency(
-                    common::ConcurrencyLimit::Limited(limit),
-                    configured_connections,
-                    args.pending_writes_multiplier,
-                )?,
-            }
-        }
+        common::FilesInFlightSource::Explicit => RemoteConcurrencyPolicy::MasterAuthoritative {
+            files_in_flight: MasterAuthoritativeFilesInFlight::Explicit,
+            concurrency: remote::resolve_remote_concurrency(
+                files_in_flight.limit(),
+                configured_connections,
+                args.pending_writes_multiplier,
+            )?,
+        },
         common::FilesInFlightSource::DeprecatedMaxOpenFiles => {
             RemoteConcurrencyPolicy::MasterAuthoritative {
                 files_in_flight: MasterAuthoritativeFilesInFlight::Deprecated,
@@ -2222,6 +2210,31 @@ mod tests {
                     .any(|arg| arg == "--max-files-in-flight=64")
             );
             assert!(spawn_args.iter().any(|arg| arg == "--max-connections=64"));
+        }
+    }
+
+    #[test]
+    fn master_explicit_unlimited_configures_both_endpoints_identically() {
+        let args = master_args(&["--max-files-in-flight=unlimited", "--max-connections=3"]);
+        let request =
+            build_master_remote_request(&args, common::ResolvedFilesInFlight::unlimited(), None)
+                .expect("explicit unlimited file admission must be valid remotely");
+        let source = build_source_remote_config(&request);
+        let source_readiness = readiness(common::ConcurrencyLimit::Unlimited, 3);
+        let destination = build_destination_remote_config(&request, &source_readiness).unwrap();
+        for config in [&source.rcpd, &destination.rcpd] {
+            let spawn_args = config.to_args();
+            assert!(
+                spawn_args
+                    .iter()
+                    .any(|arg| arg == "--max-files-in-flight=unlimited")
+            );
+            assert!(spawn_args.iter().any(|arg| arg == "--max-connections=3"));
+            assert!(
+                !spawn_args
+                    .iter()
+                    .any(|arg| arg.starts_with("--forwarded-legacy-files-in-flight"))
+            );
         }
     }
 

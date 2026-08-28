@@ -589,16 +589,16 @@ cargo build --target x86_64-unknown-linux-gnu
 | `--remote-copy-conn-timeout-sec=N` | Positive remote setup/deployment-idle/connection timeout (default: 15; 60 with auto-deploy) |
 | `--remote-keepalive-sec=N`         | Dead-peer detection budget, 0 disables (default: 120)                                       |
 | `--port-ranges=RANGES`             | Restrict TCP to specific ports (e.g., "8000-8999")                                          |
-| `--max-files-in-flight=N`          | Explicit ceiling; automatic `F = max(source CPUs, 4)`                                       |
+| `--max-files-in-flight=LIMIT`      | Positive `N` or `unlimited`; automatic `F = max(source CPUs, 4)`                            |
 | `--max-connections=N`              | Maximum concurrent data connections (default: 100)                                          |
 | `--pending-writes-multiplier=N`    | Pending-task capacity multiplier (default: 4)                                               |
 | `--network-profile=PROFILE`        | Buffer sizing: `datacenter` (default) or `internet`                                         |
 
 For a remote copy, let `F` be the logical file-work ceiling and `M` be `--max-connections`; the
-effective stream count is `E = min(F, M)`, or `E = M` for the legacy unlimited policy. The source
-selects automatic `F` as `max(std::thread::available_parallelism(), 4)`, and the destination adopts
-its reported `F/E`; explicit `F` remains master-authoritative. Pending capacity is
-`E × --pending-writes-multiplier`. Values for `E` or that product above Tokio's semaphore maximum
+effective stream count is `E = min(F, M)`, or `E = M` for an explicit or legacy unlimited policy.
+The source selects automatic `F` as `max(std::thread::available_parallelism(), 4)`, and the
+destination adopts its reported `F/E`; explicit `F` remains master-authoritative. Pending capacity
+is `E × --pending-writes-multiplier`. Values for `E` or that product above Tokio's semaphore maximum
 are rejected rather than reaching semaphore construction.
 
 Explicit limits can be checked before remote `~` expansion. For automatic limits, the master
@@ -616,7 +616,8 @@ readiness handshake. Pre-tracing configuration refusals use the same `RCP_ERROR`
 otherwise captured startup stdout and stderr are attached to handshake errors. These readiness and
 internal spawn-contract changes are protected by wire revision 4. Wire revision 5 covers the final
 daemon CLI contract: removal of its unreachable explicit-unlimited override and rejection of a zero
-remote-copy connection timeout.
+remote-copy connection timeout. Wire revision 6 adds the public `--max-files-in-flight=unlimited`
+daemon spawn spelling.
 
 ### Network Profiles
 

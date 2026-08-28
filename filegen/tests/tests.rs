@@ -5,10 +5,15 @@ fn check_filegen_help() {
 }
 
 #[test]
-fn parses_positive_max_files_in_flight_before_help() {
+fn parses_finite_and_unlimited_max_files_in_flight_before_help() {
     assert_cmd::Command::cargo_bin("filegen")
         .unwrap()
         .args(["--max-files-in-flight=1", "--help"])
+        .assert()
+        .success();
+    assert_cmd::Command::cargo_bin("filegen")
+        .unwrap()
+        .args(["--max-files-in-flight=unlimited", "--help"])
         .assert()
         .success();
     let output = assert_cmd::Command::cargo_bin("filegen")

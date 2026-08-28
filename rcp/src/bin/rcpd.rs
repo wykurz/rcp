@@ -1020,6 +1020,21 @@ mod tests {
     }
 
     #[test]
+    fn direct_daemon_accepts_explicit_unlimited_file_admission() {
+        let args = daemon_args(&["--max-files-in-flight=unlimited"]);
+        let files_in_flight = args.resolve_files_in_flight();
+        assert_eq!(files_in_flight.limit(), common::ConcurrencyLimit::Unlimited);
+        assert_eq!(
+            files_in_flight.source(),
+            common::FilesInFlightSource::Explicit
+        );
+        let throttle = args
+            .common
+            .throttle_config(files_in_flight, args.chunk_size);
+        assert_eq!(throttle.deprecated_max_open_files_warning(), None);
+    }
+
+    #[test]
     fn forwarded_legacy_finite_retains_provenance_without_a_duplicate_warning() {
         let args = daemon_args(&["--forwarded-legacy-files-in-flight=7"]);
         let files_in_flight = args.resolve_files_in_flight();

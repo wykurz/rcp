@@ -9,8 +9,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- `--max-files-in-flight=N` now caps applicable file-like work across the tools. Explicit values are
-  positive (including `1`); when omitted, the common default is
+- `--max-files-in-flight=N|unlimited` now controls applicable file-like work across the tools. A
+  positive value (including `1`) sets a finite ceiling, `unlimited` removes the user ceiling, and
+  numeric `0` is rejected; when omitted, the common default is
   `max(std::thread::available_parallelism(), 4)`, including for `filegen`. This is a work ceiling,
   not a process-descriptor count or a guarantee of achieved concurrency. When `RLIMIT_NOFILE` is
   available, the runtime still applies its descriptor-safety ceiling independently to OpenFile and
@@ -26,14 +27,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `F = max(std::thread::available_parallelism(), 4)` from its own CPU availability and reports that
   logical file ceiling plus effective stream count `E = min(F, --max-connections)` in its readiness
   record; the destination is then started with those exact values. Explicit
-  `--max-files-in-flight=N` and legacy `--max-open-files` inputs remain master-authoritative.
-  Effective-stream and pending-task capacities above Tokio's semaphore maximum are rejected without
-  panic. Explicit capacity is validated before remote `~` expansion. For automatic policy, the
-  master validates the configured connection upper bound before remote side effects; the source
-  validates its actual CPU-selected capacity before readiness and before the destination is spawned.
-  Each endpoint still applies descriptor safety locally. The daemon spawn configuration now makes
-  explicit file limits finite by type; unlimited admission is carried only with legacy provenance,
-  and the unreachable daemon-only `--explicit-unlimited-files-in-flight` argument was removed.
+  `--max-files-in-flight=N|unlimited` and legacy `--max-open-files` inputs remain
+  master-authoritative. Effective-stream and pending-task capacities above Tokio's semaphore maximum
+  are rejected without panic. Explicit capacity is validated before remote `~` expansion. For
+  automatic policy, the master validates the configured connection upper bound before remote side
+  effects; the source validates its actual CPU-selected capacity before readiness and before the
+  destination is spawned. Each endpoint still applies descriptor safety locally. Explicit unlimited
+  admission is carried through the public `--max-files-in-flight=unlimited` daemon argument; legacy
+  unlimited retains separate provenance through its hidden forwarding argument, and the unreachable
+  daemon-only `--explicit-unlimited-files-in-flight` argument remains removed.
 
 - Remote startup now prepares same-host source/destination daemons once, starts and connects the
   source before constructing the destination, and reserves the first successful daemon stderr line
@@ -166,17 +168,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   since its CLI default is `all` rather than the shipped default; `rlink --preserve-settings=none`
   goes quiet like everything else that asked for nothing.
 
-- `WIRE_REVISION` is now 5. Revision 2 remains the historical wire-schema change: carrying the
+- `WIRE_REVISION` is now 6. Revision 2 remains the historical wire-schema change: carrying the
   arming flag to a remote source added a field to `MasterHello::Source`'s `capture`, which reshaped
   the hello. Revision 3 protected the first version-sensitive rcpd file-limit spawn contract;
   revision 4 protects source-owned negotiation, typed internal override arguments, and readiness
   records that now carry `F` and `E`. Revision 5 protects the final daemon CLI contract: the
   unreachable `--explicit-unlimited-files-in-flight` argument was removed and
-  `--remote-copy-conn-timeout-sec=0` is now rejected. Revisions 3–5 do not change serialized message
-  schemas. Without the revision bumps, a stale same-version `rcpd` (on `PATH` or in the deploy
-  cache) could pass compatibility and then misdecode the hello, receive unsupported spawn arguments,
-  or emit an obsolete readiness record. Builds now advertise `0.39.0+w5`, and a cached
-  `rcpd-0.39.0-w4` is no longer resolved.
+  `--remote-copy-conn-timeout-sec=0` is now rejected. Revision 6 adds the public
+  `--max-files-in-flight=unlimited` daemon spawn spelling. Revisions 3–6 do not change serialized
+  message schemas. Without the revision bumps, a stale same-version `rcpd` (on `PATH` or in the
+  deploy cache) could pass compatibility and then misdecode the hello, receive unsupported spawn
+  arguments, or emit an obsolete readiness record. Builds now advertise `0.39.0+w6`, and a cached
+  `rcpd-0.39.0-w5` is no longer resolved.
 
 ## [0.38.0] - 2026-08-05
 

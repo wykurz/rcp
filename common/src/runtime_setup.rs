@@ -521,7 +521,7 @@ fn descriptor_clamp_diagnostic(
             DescriptorClampDiagnostic {
                 visibility: DescriptorClampVisibility::Notice,
                 message: format!(
-                    "Configured unlimited file admission, but descriptor safety reduced endpoint file admission to {effective}"
+                    "Requested unlimited file admission with --max-files-in-flight=unlimited, but descriptor safety reduced endpoint file admission to {effective}"
                 ),
             }
         }
@@ -763,6 +763,13 @@ mod default_leaf_operation_limit_tests {
             Some(DescriptorClampDiagnostic {
                 visibility: DescriptorClampVisibility::Notice,
                 message: "Requested unlimited file admission with --max-open-files=0, but descriptor safety reduced endpoint file admission to 4".to_string(),
+            })
+        );
+        assert_eq!(
+            descriptor_clamp_diagnostic(crate::ResolvedFilesInFlight::unlimited(), effective),
+            Some(DescriptorClampDiagnostic {
+                visibility: DescriptorClampVisibility::Notice,
+                message: "Requested unlimited file admission with --max-files-in-flight=unlimited, but descriptor safety reduced endpoint file admission to 4".to_string(),
             })
         );
         assert_eq!(

@@ -3541,7 +3541,9 @@ mod tests {
             fail_early: false,
             max_workers: 0,
             max_blocking_threads: 0,
-            files_in_flight: protocol::RcpdFilesInFlight::Explicit(nonzero(4)),
+            files_in_flight: protocol::RcpdFilesInFlight::Explicit(
+                common::ConcurrencyLimit::Limited(nonzero(4)),
+            ),
             ops_throttle: 0,
             iops_throttle: 0,
             chunk_size: 0,

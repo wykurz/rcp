@@ -7,6 +7,7 @@
 //! Breaking changes here indicate potential issues for existing users.
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 
 fn rcp() -> Command {
     Command::cargo_bin("rcp").unwrap()
@@ -17,9 +18,13 @@ fn rcpd() -> Command {
 }
 
 #[test]
-fn rcp_parses_positive_max_files_in_flight_before_help() {
+fn rcp_parses_finite_and_unlimited_max_files_in_flight_before_help() {
     rcp()
         .args(["--max-files-in-flight=1", "--help"])
+        .assert()
+        .success();
+    rcp()
+        .args(["--max-files-in-flight=unlimited", "--help"])
         .assert()
         .success();
     rcp()
@@ -30,9 +35,13 @@ fn rcp_parses_positive_max_files_in_flight_before_help() {
 }
 
 #[test]
-fn rcpd_parses_positive_max_files_in_flight_before_help() {
+fn rcpd_parses_finite_and_unlimited_max_files_in_flight_before_help() {
     rcpd()
         .args(["--max-files-in-flight=1", "--help"])
+        .assert()
+        .success();
+    rcpd()
+        .args(["--max-files-in-flight=unlimited", "--help"])
         .assert()
         .success();
     rcpd()
@@ -170,7 +179,10 @@ fn legacy_max_open_files_warns_for_local_copies() {
         ])
         .assert()
         .success()
-        .stdout(predicates::str::contains("descriptor safety"));
+        .stdout(
+            predicates::str::contains("descriptor safety")
+                .and(predicates::str::contains("--max-files-in-flight=unlimited")),
+        );
 }
 
 #[test]
@@ -190,6 +202,11 @@ fn max_file_limit_names_conflict() {
 #[test]
 fn test_remote_direct_rcpd_legacy_warning_leaves_connection_record_on_stderr() {
     assert_direct_rcpd_readiness_first(&["--max-open-files=0".to_string()]);
+}
+
+#[test]
+fn test_remote_direct_rcpd_accepts_explicit_unlimited_file_admission() {
+    assert_direct_rcpd_readiness_first(&["--max-files-in-flight=unlimited".to_string()]);
 }
 
 #[test]

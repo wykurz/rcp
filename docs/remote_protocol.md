@@ -46,13 +46,12 @@ the flag.
 **Source-owned file-work ceiling:** Let `F` be the logical file ceiling, `M` the configured
 `--max-connections`, and `E = min(F, M)`. When `--max-files-in-flight` is omitted, the source `rcpd`
 selects `F = max(std::thread::available_parallelism(), 4)` on the source host; the source readiness
-record makes that decision authoritative for the destination. An explicit finite `F` remains
-master-authoritative and becomes `--max-files-in-flight=N` on both roles; the daemon spawn type
-cannot represent an explicit unlimited value. Finite and unlimited legacy input use a hidden typed
-forwarding argument, never the deprecated spelling; this preserves `--max-open-files` provenance for
-clamp notices without repeating its deprecation warning. Legacy unlimited yields `E = M`. The
-automatic destination uses a hidden resolved-automatic argument that preserves automatic provenance
-while carrying source `F`.
+record makes that decision authoritative for the destination. An explicit `F` remains
+master-authoritative and becomes `--max-files-in-flight=N|unlimited` on both roles. Finite and
+unlimited legacy input use a hidden typed forwarding argument, never the deprecated spelling; this
+preserves `--max-open-files` provenance for clamp notices without repeating its deprecation warning.
+Explicit or legacy unlimited yields `E = M`. The automatic destination uses a hidden
+resolved-automatic argument that preserves automatic provenance while carrying source `F`.
 
 The resolved `E` and pending capacity `P = E × pending-writes-multiplier` use checked arithmetic,
 must be nonzero, and must not exceed `tokio::sync::Semaphore::MAX_PERMITS`. Explicit capacity can be
@@ -61,8 +60,9 @@ configured connection upper bound before remote side effects; the source resolve
 actual CPU-selected capacity before it announces readiness and before destination spawn.
 `MasterHello` and data-message schemas remain unchanged. Wire revision 4 protects the extended
 readiness record, typed internal spawn arguments, and source-first bootstrap contract. Wire revision
-5 protects the final daemon CLI contract: removing the unreachable explicit-unlimited override and
-requiring a positive remote-copy connection timeout.
+5 protects removal of the unreachable explicit-unlimited override and the positive remote-copy
+connection timeout. Wire revision 6 protects the public `--max-files-in-flight=unlimited` daemon
+spawn spelling.
 
 **Special Case - Same Host Copies:** When source and destination are on the same host, the master:
 
@@ -1365,14 +1365,15 @@ multiplier):**
   streams are `min(max-files-in-flight, max-connections)`.
 - `--pending-writes-multiplier=N`: Pending capacity is effective streams × this multiplier (default:
   4).
-- `--max-files-in-flight=N`: Set an explicit, master-authoritative ceiling for file-like work on
-  both rcpds. When omitted, the source chooses `max(std::thread::available_parallelism(), 4)` and
-  the destination adopts that source-selected value. The same ceiling also clamps data streams,
-  while unlimited legacy input leaves `--max-connections` as their ceiling. Each endpoint separately
-  intersects the file ceiling with its own unchanged current soft `RLIMIT_NOFILE` descriptor-safety
-  heuristic (80% / five modeled units, capped at 4096) for its local OpenFile and PendingMeta
-  admission. Those local pools remain independent and are not wire state. The hidden forwarded
-  legacy value `0` removes only the user ceiling; descriptor safety remains active. If the
+- `--max-files-in-flight=N|unlimited`: Set an explicit, master-authoritative policy for file-like
+  work on both rcpds. A positive `N` sets a finite ceiling; `unlimited` removes the user ceiling.
+  When omitted, the source chooses `max(std::thread::available_parallelism(), 4)` and the
+  destination adopts that source-selected value. A finite ceiling also clamps data streams, while
+  explicit or legacy unlimited input leaves `--max-connections` as their ceiling. Each endpoint
+  separately intersects the file ceiling with its own unchanged current soft `RLIMIT_NOFILE`
+  descriptor-safety heuristic (80% / five modeled units, capped at 4096) for its local OpenFile and
+  PendingMeta admission. Those local pools remain independent and are not wire state. The hidden
+  forwarded legacy value `0` removes only the user ceiling; descriptor safety remains active. If the
   `RLIMIT_NOFILE` query itself fails, a finite user-supplied limit is used as the sole endpoint
   admission ceiling with a notice. Automatic or unlimited admission fails closed because it has no
   independent finite bound. A successful query returning a zero soft limit fails closed for every
@@ -1476,9 +1477,10 @@ Both `rcp` and `rcpd` accept CLI arguments for TCP connection behavior:
 - `--port-ranges=RANGES` (optional) - Restrict TCP to specific port ranges (e.g., "8000-8999")
 - `--max-connections=N` (default: 100) - Separately configurable data-connection ceiling; effective
   streams are `min(max-files-in-flight, max-connections)`
-- `--max-files-in-flight=N` - Explicit master-authoritative file-work ceiling; when omitted, the
-  source resolves `max(std::thread::available_parallelism(), 4)` and the destination adopts it.
-  Finite values also clamp effective data connections, while legacy unlimited input does not
+- `--max-files-in-flight=N|unlimited` - Explicit master-authoritative file-work policy; a positive
+  `N` sets a finite ceiling and `unlimited` removes the user ceiling. When omitted, the source
+  resolves `max(std::thread::available_parallelism(), 4)` and the destination adopts it. Finite
+  values also clamp effective data connections, while explicit or legacy unlimited input does not
 - `--pending-writes-multiplier=N` (default: 4) - Pending capacity is effective streams × this
   multiplier, checked before pending file tasks are admitted
 - `--network-profile=PROFILE` (default: datacenter) - Buffer sizing profile
