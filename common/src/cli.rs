@@ -12,7 +12,7 @@
 //!   error output), so its help text differs from the other tools.
 
 /// Shared help for the file-like operation concurrency setting.
-pub const FILES_IN_FLIGHT_HELP: &str = "Maximum concurrent file-like operations. Local automatic defaults resolve from available CPU parallelism on the initiating host, with a floor of 4. Remote automatic defaults resolve on the source rcpd and are adopted by the destination. Explicit values must be at least 1. This applies to file copy, link, comparison, removal, chmod, and generation work; lower internal safety ceilings may apply.";
+pub const FILES_IN_FLIGHT_HELP: &str = "Maximum concurrent file-like operations. Local automatic defaults resolve from available CPU parallelism on this host, with a floor of 4. Explicit values must be at least 1. This applies to file copy, link, comparison, removal, chmod, and generation work; lower internal safety ceilings may apply.";
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct CommonArgs {
@@ -395,6 +395,20 @@ mod implies_tests {
         assert!(
             TestCli::try_parse_from(["test", "--max-files-in-flight=1", "--max-open-files=1",])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn max_files_in_flight_help_stays_local_to_shared_tools() {
+        let help = TestCli::try_parse_from(["test", "--help"])
+            .expect_err("help must stop clap parsing")
+            .to_string();
+        assert!(help.contains(
+            "Local automatic defaults resolve from available CPU parallelism on this host"
+        ));
+        assert!(
+            !help.contains("source rcpd"),
+            "shared CLI help must not describe remote negotiation: {help}"
         );
     }
 

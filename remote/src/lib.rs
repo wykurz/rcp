@@ -151,7 +151,8 @@ struct CleanupWorkers {
     owners: usize,
     pending: usize,
     threads: Vec<std::thread::JoinHandle<()>>,
-    finish_deadline: Option<std::time::Instant>,
+    next_job_id: u64,
+    finalizations: Vec<CleanupFinalization>,
 }
 
 impl Default for CleanupWorkers {
@@ -160,9 +161,26 @@ impl Default for CleanupWorkers {
             owners: 1,
             pending: 0,
             threads: Vec::new(),
-            finish_deadline: None,
+            next_job_id: 0,
+            finalizations: Vec::new(),
         }
     }
+}
+
+impl CleanupWorkers {
+    fn allocate_job_id(&mut self) -> u64 {
+        let job_id = self.next_job_id;
+        self.next_job_id = self
+            .next_job_id
+            .checked_add(1)
+            .expect("cleanup job id overflow");
+        job_id
+    }
+}
+
+struct CleanupFinalization {
+    cutoff_job_id: u64,
+    deadline: std::time::Instant,
 }
 
 #[derive(Default)]
@@ -178,6 +196,11 @@ struct CleanupJob {
     operation: CleanupOperation,
 }
 
+struct ScheduledCleanupJob {
+    id: u64,
+    job: CleanupJob,
+}
+
 enum CleanupOperation {
     Bounded(Box<dyn FnOnce(CleanupBudget) + Send + 'static>),
     Disposable(Box<dyn FnOnce() + Send + 'static>),
@@ -187,23 +210,32 @@ enum CleanupOperation {
 #[derive(Clone)]
 pub(crate) struct CleanupBudget {
     state: std::sync::Arc<CleanupState>,
+    job_id: u64,
     job_deadline: std::time::Instant,
 }
 
 impl CleanupBudget {
     #[cfg(test)]
     fn for_job(state: std::sync::Arc<CleanupState>, grace: std::time::Duration) -> Self {
+        let job_id = state
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .allocate_job_id();
         Self {
             state,
+            job_id,
             job_deadline: std::time::Instant::now() + grace,
         }
     }
 
     fn effective_deadline(&self, workers: &CleanupWorkers) -> std::time::Instant {
         workers
-            .finish_deadline
-            .map_or(self.job_deadline, |deadline| {
-                std::cmp::min(self.job_deadline, deadline)
+            .finalizations
+            .iter()
+            .filter(|finalization| self.job_id < finalization.cutoff_job_id)
+            .fold(self.job_deadline, |deadline, finalization| {
+                std::cmp::min(deadline, finalization.deadline)
             })
     }
 
@@ -232,7 +264,7 @@ impl CleanupBudget {
 /// Owns all blocking cleanup work started by one rcp invocation.
 pub struct RemoteCleanup {
     state: std::sync::Arc<CleanupState>,
-    sender: Option<std::sync::mpsc::Sender<CleanupJob>>,
+    sender: Option<std::sync::mpsc::Sender<ScheduledCleanupJob>>,
 }
 
 impl Clone for RemoteCleanup {
@@ -391,7 +423,9 @@ impl RemoteCleanup {
             .pending
             .checked_add(1)
             .expect("cleanup worker count overflow");
+        let job_id = workers.allocate_job_id();
         drop(workers);
+        let job = ScheduledCleanupJob { id: job_id, job };
         match self
             .sender
             .as_ref()
@@ -469,11 +503,11 @@ impl RemoteCleanup {
             .workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        workers.finish_deadline = Some(
-            workers
-                .finish_deadline
-                .map_or(deadline, |current| std::cmp::min(current, deadline)),
-        );
+        let cutoff_job_id = workers.next_job_id;
+        workers.finalizations.push(CleanupFinalization {
+            cutoff_job_id,
+            deadline,
+        });
         state.changed.notify_all();
         drop(workers);
         // this owner cannot submit more work. Closing its sender before waiting lets an otherwise
@@ -573,10 +607,10 @@ enum WorkerSpawnFallback {
 impl CleanupState {
     fn start_cleanup_job(
         self: &std::sync::Arc<Self>,
-        job: CleanupJob,
+        job: ScheduledCleanupJob,
         fallback: WorkerSpawnFallback,
     ) -> std::io::Result<()> {
-        let thread_name = job.thread_name;
+        let thread_name = job.job.thread_name;
         // retain the job until the OS confirms worker creation. The start gate lets the handle enter
         // shared state before the worker can finish, without holding that mutex across thread spawn.
         let job = std::sync::Arc::new(std::sync::Mutex::new(Some(job)));
@@ -630,7 +664,7 @@ impl CleanupState {
 
     fn handle_worker_start_failure(
         self: &std::sync::Arc<Self>,
-        job: CleanupJob,
+        job: ScheduledCleanupJob,
         fallback: WorkerSpawnFallback,
         error: std::io::Error,
     ) -> std::io::Result<()> {
@@ -661,14 +695,15 @@ impl CleanupState {
         }
     }
 
-    fn run_cleanup_job(self: &std::sync::Arc<Self>, job: CleanupJob) {
+    fn run_cleanup_job(self: &std::sync::Arc<Self>, scheduled: ScheduledCleanupJob) {
         let _completion = CleanupWorkerCompletion(self.clone());
         let budget = CleanupBudget {
             state: self.clone(),
-            job_deadline: job.deadline,
+            job_id: scheduled.id,
+            job_deadline: scheduled.job.deadline,
         };
         let _context = CleanupWorkerContext::enter(self, budget.clone());
-        let operation = move || match job.operation {
+        let operation = move || match scheduled.job.operation {
             CleanupOperation::Bounded(operation) => operation(budget),
             CleanupOperation::Disposable(operation) => operation(),
         };
@@ -687,14 +722,21 @@ impl<T> AbortOnDropTask<T> {
         Self(task)
     }
 
-    /// Await the retained task without giving up abort-on-drop ownership.
-    pub async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
+    /// Await and consume the retained task.
+    pub async fn join(mut self) -> Result<T, tokio::task::JoinError> {
         (&mut self.0).await
     }
 
-    /// Request cancellation of the retained task.
-    pub fn abort(&self) {
+    async fn wait(&mut self) -> Result<T, tokio::task::JoinError> {
+        (&mut self.0).await
+    }
+
+    fn abort(&self) {
         self.0.abort();
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0.is_finished()
     }
 }
 
@@ -886,6 +928,7 @@ impl std::error::Error for PeerPreparationCancelled {}
 pub(crate) struct PreparationContext {
     cancellation: tokio_util::sync::CancellationToken,
     cleanup: RemoteCleanup,
+    control_directory_exclusions: std::sync::Arc<[std::path::PathBuf]>,
 }
 
 struct SshMasterReaper {
@@ -907,34 +950,44 @@ pub(crate) fn poll_process_exit_until_deadline(
     }
 }
 
+fn reap_process_and_control_directory(
+    budget: &CleanupBudget,
+    control_directory: Option<&std::path::Path>,
+    try_wait: impl FnMut() -> std::io::Result<bool>,
+) {
+    let master_exited = match poll_process_exit_until_deadline(budget, try_wait) {
+        Ok(exited) => exited,
+        Err(error) => {
+            tracing::debug!("failed to reap SSH multiplex master: {error:#}");
+            false
+        }
+    };
+    if !master_exited {
+        tracing::debug!(
+            "SSH multiplex master did not exit within its cleanup budget; preserving its control directory"
+        );
+    }
+    if master_exited
+        && let Some(control_directory) = control_directory
+        && let Err(error) = std::fs::remove_dir_all(control_directory)
+    {
+        tracing::debug!(
+            "failed to remove SSH control directory {}: {error:#}",
+            control_directory.display()
+        );
+    }
+}
+
 impl SshMasterReaper {
     fn reap(mut self, budget: CleanupBudget) {
-        let master_exited = if let Some(launcher) = self.launcher.as_mut() {
-            match poll_process_exit_until_deadline(&budget, || {
+        if let Some(launcher) = self.launcher.as_mut() {
+            reap_process_and_control_directory(&budget, self.control_directory.as_deref(), || {
                 launcher.try_wait().map(|status| status.is_some())
-            }) {
-                Ok(exited) => exited,
-                Err(error) => {
-                    tracing::debug!("failed to reap SSH multiplex master: {error:#}");
-                    false
-                }
-            }
+            });
         } else {
-            true
-        };
-        if !master_exited {
-            tracing::debug!(
-                "SSH multiplex master did not exit within its cleanup budget; preserving its control directory"
-            );
-        }
-        if master_exited
-            && let Some(control_directory) = self.control_directory.as_deref()
-            && let Err(error) = std::fs::remove_dir_all(control_directory)
-        {
-            tracing::debug!(
-                "failed to remove SSH control directory {}: {error:#}",
-                control_directory.display()
-            );
+            reap_process_and_control_directory(&budget, self.control_directory.as_deref(), || {
+                Ok(true)
+            });
         }
     }
 }
@@ -1088,11 +1141,20 @@ impl PreparationContext {
         Self {
             cancellation,
             cleanup,
+            control_directory_exclusions: Vec::new().into(),
         }
     }
 
     fn uncancelled(cleanup: RemoteCleanup) -> Self {
         Self::new(tokio_util::sync::CancellationToken::new(), cleanup)
+    }
+
+    fn with_control_directory_exclusions(
+        mut self,
+        exclusions: std::sync::Arc<[std::path::PathBuf]>,
+    ) -> Self {
+        self.control_directory_exclusions = exclusions;
+        self
     }
 
     fn cancellation_error() -> anyhow::Error {
@@ -1106,42 +1168,47 @@ impl PreparationContext {
         Ok(())
     }
 
+    fn record_owned_completion<T>(
+        cleanup: &RemoteCleanup,
+        result: Result<anyhow::Result<T>, tokio::task::JoinError>,
+        operation: &str,
+        timing: &str,
+    ) where
+        T: Send + 'static,
+    {
+        match result {
+            Ok(Ok(value)) => {
+                tracing::debug!("{operation} completed {timing}");
+                cleanup.defer_drop(value, "rcp-owned-result-dispose");
+            }
+            Ok(Err(error)) => {
+                tracing::debug!("{operation} failed {timing}: {error:#}");
+            }
+            Err(error) => {
+                tracing::debug!("{operation} owner task failed {timing}: {error:#}");
+            }
+        }
+    }
+
     async fn finish_or_abort_owned_during_grace<T>(
         &self,
-        task: &mut tokio::task::JoinHandle<anyhow::Result<T>>,
+        mut task: AbortOnDropTask<anyhow::Result<T>>,
         grace: std::time::Duration,
         operation: &'static str,
     ) where
         T: Send + 'static,
     {
-        match tokio::time::timeout(grace, &mut *task).await {
-            Ok(Ok(Ok(value))) => {
-                tracing::debug!("{operation} completed during cancellation grace");
-                self.cleanup.defer_drop(value, "rcp-owned-result-dispose");
+        match tokio::time::timeout(grace, task.wait()).await {
+            Ok(result) => {
+                Self::record_owned_completion(
+                    &self.cleanup,
+                    result,
+                    operation,
+                    "during cancellation grace",
+                );
             }
-            Ok(Ok(Err(error))) => {
-                tracing::debug!("{operation} failed during cancellation grace: {error:#}");
-            }
-            Ok(Err(error)) => tracing::debug!(
-                "{operation} owner task failed during cancellation grace: {error:#}"
-            ),
             Err(_) => {
-                task.abort();
-                match task.await {
-                    Err(error) if error.is_cancelled() => {
-                        tracing::debug!("aborted {operation} after cancellation grace");
-                    }
-                    Ok(Ok(value)) => {
-                        tracing::debug!("{operation} completed as cancellation grace elapsed");
-                        self.cleanup.defer_drop(value, "rcp-owned-result-dispose");
-                    }
-                    Ok(Err(error)) => tracing::debug!(
-                        "{operation} failed as cancellation grace elapsed: {error:#}"
-                    ),
-                    Err(error) => tracing::debug!(
-                        "{operation} owner task failed as cancellation grace elapsed: {error:#}"
-                    ),
-                }
+                self.abort_owned(task, operation, "cancellation grace");
             }
         }
     }
@@ -1161,73 +1228,80 @@ impl PreparationContext {
     /// Await a transaction with no wall-clock deadline, closing its local owner after cancellation.
     pub(crate) async fn run_cancellation_owned_transaction<T>(
         &self,
-        mut task: tokio::task::JoinHandle<anyhow::Result<T>>,
+        task: tokio::task::JoinHandle<anyhow::Result<T>>,
         grace: std::time::Duration,
         operation: &'static str,
     ) -> anyhow::Result<T>
     where
         T: Send + 'static,
     {
+        let mut task = AbortOnDropTask::new(task);
         tokio::select! {
             biased;
             () = self.cancellation.cancelled() => {
-                self.finish_or_abort_owned_during_grace(&mut task, grace, operation).await;
+                self.finish_or_abort_owned_during_grace(task, grace, operation).await;
                 Err(Self::cancellation_error())
             }
-            result = &mut task => result
+            result = task.wait() => result
                 .with_context(|| format!("{operation} owner task failed"))?,
         }
     }
 
-    /// Await owned work whose process must be aborted on cancellation or bootstrap timeout.
-    async fn abort_and_join_owned<T>(
+    fn abort_owned<T>(
         &self,
-        task: &mut tokio::task::JoinHandle<anyhow::Result<T>>,
+        task: AbortOnDropTask<anyhow::Result<T>>,
         operation: &str,
         reason: &str,
     ) where
         T: Send + 'static,
     {
         task.abort();
-        match task.await {
-            Err(error) if error.is_cancelled() => {
-                tracing::debug!("aborted {operation} after {reason}");
+        let cleanup = self.cleanup.clone();
+        let result_cleanup = cleanup.clone();
+        let operation = operation.to_string();
+        let reason = reason.to_string();
+        let completion_timing = format!("as {reason} arrived");
+        cleanup.defer_bounded("rcp-owned-task-reap", move |budget| {
+            while !task.is_finished() {
+                if !budget.wait_for_next_poll() {
+                    tracing::debug!(
+                        "{operation} owner task did not finish after {reason} within its cleanup budget"
+                    );
+                    return;
+                }
             }
-            Ok(Ok(value)) => {
-                tracing::debug!("{operation} completed as {reason} arrived");
-                self.cleanup.defer_drop(value, "rcp-owned-result-dispose");
-            }
-            Ok(Err(error)) => {
-                tracing::debug!("{operation} failed as {reason} arrived: {error:#}");
-            }
-            Err(error) => {
-                tracing::debug!("{operation} owner task failed as {reason} arrived: {error:#}");
-            }
-        }
+            let result = futures::executor::block_on(task.join());
+            Self::record_owned_completion(
+                &result_cleanup,
+                result,
+                &operation,
+                &completion_timing,
+            );
+        });
     }
 
     async fn run_abortable_with_deadline<T>(
         &self,
-        mut task: tokio::task::JoinHandle<anyhow::Result<T>>,
+        task: tokio::task::JoinHandle<anyhow::Result<T>>,
         operation: &str,
         deadline: BootstrapDeadline,
     ) -> anyhow::Result<T>
     where
         T: Send + 'static,
     {
+        let mut task = AbortOnDropTask::new(task);
         tokio::select! {
             biased;
             () = self.cancellation.cancelled() => {
-                self.abort_and_join_owned(&mut task, operation, "peer cancellation").await;
+                self.abort_owned(task, operation, "peer cancellation");
                 Err(Self::cancellation_error())
             }
-            result = deadline.wait(operation, &mut task) => {
+            result = deadline.wait(operation, task.wait()) => {
                 match result {
                     Ok(result) => result
                         .with_context(|| format!("{operation} owner task failed"))?,
                     Err(error) => {
-                        self.abort_and_join_owned(&mut task, operation, "its bootstrap deadline")
-                            .await;
+                        self.abort_owned(task, operation, "its bootstrap deadline");
                         Err(error)
                     }
                 }
@@ -1575,10 +1649,12 @@ async fn setup_ssh_session_with_program(
     let session = session.clone();
     let ssh_program = ssh_program.to_path_buf();
     let cleanup = preparation.cleanup.clone();
+    let control_directory_exclusions = preparation.control_directory_exclusions.clone();
     let connect = tokio::spawn(async move {
         let control_dir =
-            run_disposable_blocking(cleanup.clone(), "rcp-ssh-control-select", || {
-                ssh_control_directory().context("no usable SSH control directory found")
+            run_disposable_blocking(cleanup.clone(), "rcp-ssh-control-select", move || {
+                ssh_control_directory(&control_directory_exclusions)
+                    .context("no usable SSH control directory found outside local copy operands")
             })
             .await?;
         launch_ssh_master(&session, &control_dir, &ssh_program, cleanup)
@@ -1767,36 +1843,63 @@ async fn launch_ssh_master(
 /// 3. `/tmp` -- for when `TMPDIR` itself points somewhere long or unusable.
 /// 4. `$XDG_STATE_HOME` -- the first location used by `openssh`'s own default.
 /// 5. `$HOME` -- a shorter final fallback when the state directory is absent or unusable.
-/// 6. The current directory -- `openssh`'s own last resort when no state directory is available.
 ///
 /// Falling through the list is the point rather than a nicety: the environments named above as
 /// motivation -- containers, CI runners, `su` sessions -- are exactly the ones that tend NOT to set
 /// `$XDG_RUNTIME_DIR`, so stopping at step 1 would have left the intended beneficiaries on the very
 /// `$HOME`-derived path this exists to avoid. The state candidate preserves the library's first
-/// fallback, while the shorter home/current-directory alternatives remain available when its
-/// `.local/state` path would be unusable. The launcher creates the socket directory through
-/// `tempfile`, which makes it mode 0700, so a shared parent is still private.
+/// fallback, while the shorter home alternative remains available when its `.local/state` path
+/// would be unusable. The launcher creates the socket directory through `tempfile`, which makes it
+/// mode 0700, so a shared parent is still private. Candidates inside a canonical local operand are
+/// deliberately excluded: an unreapable SSH master requires its private directory to survive until
+/// process exit, so that directory must not appear inside a copied tree. Remote-only operands impose
+/// no such exclusion, regardless of the master's working directory. The filesystem root is also
+/// omitted because no absolute socket candidate could otherwise be selected.
 ///
 /// Returns `None` only when none of the candidates can safely hold a control socket; callers then
 /// fail before launching SSH rather than selecting a path known to be broken.
-fn ssh_control_directory() -> Option<std::path::PathBuf> {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::with_capacity(6);
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        candidates.push(runtime_dir.into());
-    }
-    candidates.push(std::env::temp_dir());
-    candidates.push(std::path::PathBuf::from("/tmp"));
-    if let Some(state_dir) = std::env::var_os("XDG_STATE_HOME") {
-        candidates.push(state_dir.into());
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(home.into());
-    }
-    if let Ok(current_dir) = std::env::current_dir() {
-        candidates.push(current_dir);
-    }
+fn ssh_control_directory(excluded_roots: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    select_ssh_control_directory_from_environment(
+        std::env::var_os("XDG_RUNTIME_DIR").map(Into::into),
+        std::env::temp_dir(),
+        std::path::PathBuf::from("/tmp"),
+        std::env::var_os("XDG_STATE_HOME").map(Into::into),
+        std::env::var_os("HOME").map(Into::into),
+        excluded_roots,
+    )
+}
 
-    select_ssh_control_directory(candidates)
+fn select_ssh_control_directory_from_environment(
+    runtime_dir: Option<std::path::PathBuf>,
+    temp_dir: std::path::PathBuf,
+    system_temp_dir: std::path::PathBuf,
+    state_dir: Option<std::path::PathBuf>,
+    home: Option<std::path::PathBuf>,
+    excluded_roots: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::with_capacity(5);
+    candidates.extend(runtime_dir);
+    candidates.push(temp_dir);
+    candidates.push(system_temp_dir);
+    candidates.extend(state_dir);
+    candidates.extend(home);
+    let excluded_roots: Vec<_> = excluded_roots
+        .iter()
+        .filter_map(|path| {
+            std::fs::canonicalize(path)
+                .ok()
+                .or_else(|| std::path::absolute(path).ok())
+        })
+        .filter(|path| path.parent().is_some())
+        .collect();
+    select_ssh_control_directory(candidates.into_iter().filter(|candidate| {
+        excluded_roots.is_empty()
+            || std::fs::canonicalize(candidate).is_ok_and(|candidate| {
+                excluded_roots
+                    .iter()
+                    .all(|excluded_root| !candidate.starts_with(excluded_root))
+            })
+    }))
 }
 
 fn select_ssh_control_directory(
@@ -1858,13 +1961,15 @@ fn control_dir_is_usable(dir: &std::path::Path) -> bool {
 }
 
 /// Retrieve a remote home directory with a caller-selected bootstrap timeout.
-#[instrument(skip(cleanup))]
+#[instrument(skip(cleanup, local_operand_roots))]
 pub async fn get_remote_home_for_session_with_timeout(
     session: &SshSession,
     cleanup: &RemoteCleanup,
     bootstrap_timeout: std::time::Duration,
+    local_operand_roots: &[std::path::PathBuf],
 ) -> anyhow::Result<std::path::PathBuf> {
-    let preparation = PreparationContext::uncancelled(cleanup.clone());
+    let preparation = PreparationContext::uncancelled(cleanup.clone())
+        .with_control_directory_exclusions(local_operand_roots.to_vec().into());
     let deadline = BootstrapDeadline::new(bootstrap_timeout);
     let ssh_session = setup_ssh_session(session, &preparation, deadline).await?;
     let home = get_remote_home_with_context(&ssh_session, &preparation, deadline).await?;
@@ -1913,7 +2018,7 @@ pub async fn wait_for_rcpd_process(mut process: RcpdProcess) -> anyhow::Result<(
 }
 
 async fn finish_rcpd_output_drain(
-    mut task: AbortOnDropTask<CapturedOutput>,
+    task: AbortOnDropTask<CapturedOutput>,
     stream: &'static str,
 ) -> CapturedOutput {
     match tokio::time::timeout(RCPD_OUTPUT_DRAIN_GRACE, task.join()).await {
@@ -1924,8 +2029,6 @@ async fn finish_rcpd_output_drain(
         }
         Err(_) => {
             tracing::debug!("rcpd {stream} collector did not finish during drain grace");
-            task.abort();
-            let _ = task.join().await;
             CapturedOutput::default()
         }
     }
@@ -2548,35 +2651,40 @@ pub async fn prepare_rcpd_endpoints_with_timeout(
     auto_deploy_rcpd: bool,
     cleanup: &RemoteCleanup,
     bootstrap_timeout: std::time::Duration,
+    local_operand_roots: &[std::path::PathBuf],
 ) -> anyhow::Result<(PreparedRcpd, PreparedRcpd)> {
+    let control_directory_exclusions: std::sync::Arc<[std::path::PathBuf]> =
+        local_operand_roots.to_vec().into();
     if source == destination {
         let prepared = prepare_rcpd_with_context(
             source,
             explicit_rcpd_path,
             auto_deploy_rcpd,
-            PreparationContext::uncancelled(cleanup.clone()),
+            PreparationContext::uncancelled(cleanup.clone())
+                .with_control_directory_exclusions(control_directory_exclusions),
             bootstrap_timeout,
         )
         .await?;
         return Ok((prepared.clone(), prepared));
     }
+    let source_control_directory_exclusions = control_directory_exclusions.clone();
     join_remote_preparations(
         cleanup,
-        |preparation| {
+        move |preparation| {
             prepare_rcpd_with_context(
                 source,
                 explicit_rcpd_path,
                 auto_deploy_rcpd,
-                preparation,
+                preparation.with_control_directory_exclusions(source_control_directory_exclusions),
                 bootstrap_timeout,
             )
         },
-        |preparation| {
+        move |preparation| {
             prepare_rcpd_with_context(
                 destination,
                 explicit_rcpd_path,
                 auto_deploy_rcpd,
-                preparation,
+                preparation.with_control_directory_exclusions(control_directory_exclusions),
                 bootstrap_timeout,
             )
         },
@@ -4545,6 +4653,110 @@ mod tests {
     }
 
     #[test]
+    fn control_directory_selection_stays_outside_a_local_operand_tree() {
+        let local_operand = tempfile::tempdir().unwrap();
+        let nested_temp = local_operand.path().join("tmp");
+        std::fs::create_dir(&nested_temp).unwrap();
+        let missing_system_temp = local_operand.path().join("missing-system-temp");
+
+        assert_eq!(
+            select_ssh_control_directory_from_environment(
+                None,
+                nested_temp,
+                missing_system_temp,
+                None,
+                None,
+                &[local_operand.path().to_path_buf()],
+            ),
+            None,
+            "a usable directory inside a local operand is not an SSH artifact fallback"
+        );
+    }
+
+    #[test]
+    fn control_directory_selection_without_local_operands_accepts_an_absolute_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            select_ssh_control_directory_from_environment(
+                None,
+                temp.path().to_path_buf(),
+                temp.path().to_path_buf(),
+                None,
+                None,
+                &[],
+            ),
+            Some(temp.path().to_path_buf()),
+            "remote-to-remote copies have no local operand tree to exclude"
+        );
+    }
+
+    #[test]
+    fn control_directory_selection_accepts_an_ancestor_of_a_local_operand() {
+        let candidate = tempfile::tempdir().unwrap();
+        let local_operand = candidate.path().join("copy-source");
+        std::fs::create_dir(&local_operand).unwrap();
+
+        assert_eq!(
+            select_ssh_control_directory_from_environment(
+                None,
+                candidate.path().to_path_buf(),
+                candidate.path().to_path_buf(),
+                None,
+                None,
+                &[local_operand],
+            ),
+            Some(candidate.path().to_path_buf()),
+            "a private sibling in the candidate directory is outside the copied subtree"
+        );
+    }
+
+    #[test]
+    fn control_directory_selection_does_not_exclude_the_filesystem_root() {
+        let temp = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            select_ssh_control_directory_from_environment(
+                None,
+                temp.path().to_path_buf(),
+                temp.path().to_path_buf(),
+                None,
+                None,
+                &[std::path::PathBuf::from("/")],
+            ),
+            Some(temp.path().to_path_buf()),
+            "the root operand cannot exclude every absolute socket candidate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_directory_selection_resolves_aliases_into_a_local_operand_tree() {
+        use std::os::unix::fs::symlink;
+
+        let local_operand = tempfile::tempdir().unwrap();
+        let nested_temp = local_operand.path().join("tmp");
+        std::fs::create_dir(&nested_temp).unwrap();
+        let aliases = tempfile::tempdir().unwrap();
+        let nested_alias = aliases.path().join("tmp-alias");
+        symlink(&nested_temp, &nested_alias).unwrap();
+        let missing_system_temp = aliases.path().join("missing-system-temp");
+
+        assert_eq!(
+            select_ssh_control_directory_from_environment(
+                None,
+                nested_alias,
+                missing_system_temp,
+                None,
+                None,
+                &[local_operand.path().to_path_buf()],
+            ),
+            None,
+            "a path alias into a local operand is not an SSH artifact fallback"
+        );
+    }
+
+    #[test]
     fn tcp_config_effective_connections_meet_finite_file_ceiling() {
         let configured = nonzero(8);
         for (files_in_flight, expected) in [(3, 3), (8, 8), (12, 8)] {
@@ -4914,6 +5126,26 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_submitted_after_finish_gets_a_fresh_job_budget() {
+        let cleanup = RemoteCleanup::new().unwrap();
+        let later_owner = cleanup.clone();
+
+        cleanup.finish_with_grace(std::time::Duration::from_millis(20));
+
+        let (waited_tx, waited_rx) = std::sync::mpsc::channel();
+        later_owner.defer_bounded("rcp-test-late-cleanup-budget", move |budget| {
+            waited_tx.send(budget.wait_for_next_poll()).unwrap();
+        });
+        assert!(
+            waited_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("cleanup submitted by a remaining owner must run"),
+            "an earlier owner's expired finish deadline must not poison a later cleanup job"
+        );
+        later_owner.finish();
+    }
+
+    #[test]
     fn process_polling_stops_at_its_cleanup_budget() {
         let cleanup = RemoteCleanup::new().unwrap();
         let budget =
@@ -4965,30 +5197,37 @@ mod tests {
             .expect("the supervisor must retain queued cleanup after its final owner drops");
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn ssh_control_directory_waits_for_master_exit() {
+    #[test]
+    fn ssh_control_directory_waits_for_master_exit() {
         let root = tempfile::tempdir().unwrap();
         let control_directory = root.path().join("control");
         std::fs::create_dir(&control_directory).unwrap();
-        let launcher = tokio::process::Command::new("sh")
-            .args(["-c", "sleep 2"])
-            .spawn()
-            .unwrap();
-        let reaper = SshMasterReaper {
-            launcher: Some(launcher),
-            control_directory: Some(control_directory.clone()),
-        };
         let cleanup = RemoteCleanup::new().unwrap();
         let budget = CleanupBudget::for_job(cleanup.state.clone(), REMOTE_CLEANUP_GRACE);
-        let worker = std::thread::spawn(move || reaper.reap(budget));
+        let (polled_tx, polled_rx) = std::sync::mpsc::channel();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let worker_control_directory = control_directory.clone();
+        let worker = std::thread::spawn(move || {
+            reap_process_and_control_directory(
+                &budget,
+                Some(&worker_control_directory),
+                move || {
+                    polled_tx.send(()).unwrap();
+                    exit_rx.recv().unwrap();
+                    Ok(true)
+                },
+            );
+        });
 
-        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        polled_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the reaper must inspect the process before changing the directory");
         assert!(
             control_directory.exists(),
             "the control directory must outlive a still-running SSH master"
         );
 
+        exit_tx.send(()).unwrap();
         worker.join().unwrap();
         assert!(
             !control_directory.exists(),
@@ -5336,12 +5575,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_transaction_aborts_owner_before_return() {
-        struct ActiveOwner(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    async fn cancelled_transaction_reaps_a_cooperative_owner() {
+        struct ActiveOwner {
+            active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            dropped: Option<tokio::sync::oneshot::Sender<()>>,
+        }
 
         impl Drop for ActiveOwner {
             fn drop(&mut self) {
-                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+                self.active
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                if let Some(dropped) = self.dropped.take() {
+                    let _ = dropped.send(());
+                }
             }
         }
 
@@ -5351,9 +5597,13 @@ mod tests {
         let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let active_in_owner = active.clone();
         let (started, owner_started) = tokio::sync::oneshot::channel();
+        let (dropped, owner_dropped) = tokio::sync::oneshot::channel();
         let owner = tokio::spawn(async move {
             active_in_owner.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _active_owner = ActiveOwner(active_in_owner);
+            let _active_owner = ActiveOwner {
+                active: active_in_owner,
+                dropped: Some(dropped),
+            };
             started.send(()).unwrap();
             std::future::pending::<anyhow::Result<()>>().await
         });
@@ -5374,10 +5624,104 @@ mod tests {
                 .contains("rcpd preparation cancelled because peer preparation failed"),
             "peer cancellation missing from owned-transaction error: {error:#}"
         );
+        tokio::time::timeout(std::time::Duration::from_secs(1), owner_dropped)
+            .await
+            .expect("the cleanup funnel must reap a cooperative cancelled owner")
+            .unwrap();
         assert!(
             !active.load(std::sync::atomic::Ordering::SeqCst),
-            "the transaction owner must be dropped before cancellation returns"
+            "the cleanup funnel must drop the transaction owner"
         );
+        drop(preparation);
+        cleanup.finish();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_transaction_returns_after_grace_for_an_uncooperative_owner() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cleanup = RemoteCleanup::new().unwrap();
+        let preparation = PreparationContext::new(cancellation.clone(), cleanup.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let owner = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            anyhow::Ok(())
+        });
+        started_rx.await.unwrap();
+        cancellation.cancel();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            preparation.run_cancellation_owned_transaction(
+                owner,
+                std::time::Duration::from_millis(20),
+                "test uncooperative transaction",
+            ),
+        )
+        .await;
+        release_tx.send(()).unwrap();
+
+        let error = result
+            .expect("cancellation must not await an uncooperative owner after its grace")
+            .expect_err("the cancelled transaction must fail");
+        assert!(error.downcast_ref::<PeerPreparationCancelled>().is_some());
+        drop(preparation);
+        cleanup.finish();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bootstrap_deadline_reaps_a_raced_result_off_the_runtime_worker() {
+        #[derive(Debug)]
+        struct DropThreadReporter(Option<tokio::sync::oneshot::Sender<String>>);
+
+        impl Drop for DropThreadReporter {
+            fn drop(&mut self) {
+                if let Some(dropped) = self.0.take() {
+                    let thread_name = std::thread::current()
+                        .name()
+                        .unwrap_or("unnamed")
+                        .to_string();
+                    let _ = dropped.send(thread_name);
+                }
+            }
+        }
+
+        let cleanup = RemoteCleanup::new().unwrap();
+        let preparation = PreparationContext::uncancelled(cleanup.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            anyhow::Ok(DropThreadReporter(Some(dropped_tx)))
+        });
+        started_rx.await.unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            preparation.run_abortable_with_deadline(
+                owner,
+                "test uncooperative bootstrap",
+                BootstrapDeadline::new(std::time::Duration::from_millis(20)),
+            ),
+        )
+        .await;
+        release_tx.send(()).unwrap();
+
+        let error = result
+            .expect("a bootstrap deadline must not await an uncooperative owner")
+            .expect_err("the expired bootstrap operation must fail");
+        assert!(
+            format!("{error:#}").contains("test uncooperative bootstrap timed out"),
+            "bootstrap timeout missing from error: {error:#}"
+        );
+        let drop_thread = tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("the cleanup funnel must retain and dispose the raced owner result")
+            .unwrap();
+        assert_eq!(drop_thread, "rcp-owned-task-reap");
         drop(preparation);
         cleanup.finish();
     }

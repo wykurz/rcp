@@ -124,13 +124,15 @@ fn assert_effective_remote_parallelism_help(command: &mut Command) {
     );
     assert!(
         help.contains(
-            "Local automatic defaults resolve from available CPU parallelism on the initiating host"
+            "Local automatic defaults resolve from available CPU parallelism on this host"
         ),
         "help must identify where local automatic limits resolve: {help}"
     );
     assert!(
-        help.contains("Remote automatic defaults resolve on the source rcpd and are adopted by the destination"),
-        "help must identify where remote automatic limits resolve: {help}"
+        help.contains(
+            "Remote automatic limits resolve on the source rcpd and are adopted by the destination."
+        ),
+        "remote help must identify where automatic limits resolve: {help}"
     );
 }
 

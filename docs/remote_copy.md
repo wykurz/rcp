@@ -243,6 +243,13 @@ leave a cleanup thread polling forever. If an SSH master has not exited when the
 private control directory is deliberately preserved rather than removed from under a possibly-live
 process.
 
+The master carries the actual local operand roots through both remote-HOME lookup and endpoint
+preparation. Control-directory candidates are canonicalized and rejected only when they lie inside
+one of those copied trees, including through a `TMPDIR` or other path alias. Remote-to-remote copies
+have no local exclusions, so launching them with `/` as the working directory still permits normal
+runtime and temporary locations. The filesystem root itself cannot be an exclusion because every
+absolute Unix-socket path lies beneath it.
+
 The supervisor normally dispatches blocking cleanup to a worker. Worker-creation failure runs the
 job on the supervisor, not on the original resource-owning submitter. If the supervisor channel has
 already failed, submission tries an isolated worker and, if no worker can be created, leaks the job
@@ -502,6 +509,9 @@ cleanup command may finish independently.
 Dead-peer detection covers idle connections everywhere, and unacknowledged data on control
 connections only — a data transfer to a vanished host still falls back to the kernel's
 retransmission limit (~15 min). See [remote_protocol.md](remote_protocol.md#84-connection-liveness).
+It is not an overall copy deadline: a stopped or wedged `rcpd` can leave its host kernel responsive
+to TCP probes indefinitely. Use an external supervisor such as `timeout` when an absolute operation
+deadline is required.
 
 Example:
 

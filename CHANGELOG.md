@@ -54,8 +54,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   opened the staging file, then applies an idle timeout to each payload write; it does not impose a
   total transfer-time cap. Post-EOF verification has a bounded stage of at least 60 seconds. On peer
   cancellation, the transfer gets a bounded grace before its local SSH-channel task is aborted and
-  joined. Old-version cleanup is also bounded. Local candidate execution happens behind a
-  fixed-shell child so a stalled candidate filesystem remains inside the two-second probe deadline.
+  transferred to the typed cleanup scope; the endpoint coordinator never awaits an uncooperative
+  owner without a bound, while a raced successful result is still disposed off its Tokio worker.
+  Old-version cleanup is also bounded. Local candidate execution happens behind a fixed-shell child
+  so a stalled candidate filesystem remains inside the two-second probe deadline.
 
 - Local auto-deployment candidate probes now observe peer-preparation cancellation before, during,
   and after each version check, using the same pipe-close, kill, and reap cleanup as a timeout
@@ -75,33 +77,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   both to the successful-session owner. A cleanup supervisor is started before any remote resource
   is accepted; either exit signals the process immediately and queues reaping there, and the control
   directory is removed only after the process is confirmed exited. Reapers for SSH masters and
-  interrupted local candidates now require the cleanup scope's typed budget, whose deadline is the
-  earlier of the per-job deadline and the invocation's shared final deadline. A child that never
-  becomes reapable therefore cannot leave a cleanup thread polling forever; an unconfirmed SSH
-  master keeps its control directory when that budget expires. Cleanup never falls back to the
-  original resource-owning submitter: worker-spawn failure stays on the supervisor, while a failed
-  supervisor channel tries an isolated worker before leaking the job for process-exit reclamation.
-  Nested cleanup remains in its parent worker, independent invocations cannot drain one another's
-  workers, and the CLI gives the scope one bounded budget for its final resource owner, supervisor,
-  and queued jobs. SSH control-socket readiness uses one disposable filesystem worker for its
-  polling lifetime rather than creating a thread per poll. Daemon waits run concurrently across
-  endpoints while tracing receivers remain live; any receiver tasks left afterward share one final
-  drain deadline. Control-directory selection tries runtime, temporary, state, and home locations
-  before reporting that no safe Unix-socket path is available. Remote daemon SSH exec-channel
-  creation and readiness reads use that same configured deadline; readiness records larger than 64
-  KiB are rejected. Daemon configuration refusals discovered before tracing use the structured
-  `RCP_ERROR` startup record, and unstructured startup failures retain captured stdout/stderr in the
-  error chain. Failed-startup reaping now keeps the SSH child and both output drains lexically
-  inside its bounded timeout future, so grace expiry or caller cancellation releases the managed
-  session instead of detaching ownership. The source tracing receiver starts before destination
-  bring-up and is drained on later startup failures, preserving queued source notices beside the
-  destination error. Source connection failures also wait for daemon cleanup. Daemon stdout/stderr
-  is forwarded live at debug verbosity while a bounded tail is retained and joined for completion
-  diagnostics; deployment likewise drains bounded diagnostics while preferring the remote failure
-  over a secondary stdin-shutdown error. An explicit connection request clamped by the source file
-  ceiling, or an automatic source file ceiling clamped by an explicit connection request, now
-  produces a default-visible notice; legacy file-limit notices preserve the `--max-open-files`
-  spelling the user supplied.
+  interrupted local candidates now require the cleanup scope's typed budget. Finalization shortens
+  only jobs submitted before it began; a later job from another live cleanup owner receives a fresh
+  budget instead of inheriting an expired deadline. A child that never becomes reapable therefore
+  cannot leave a cleanup thread polling forever; an unconfirmed SSH master keeps its control
+  directory when that budget expires. Cleanup never falls back to the original resource-owning
+  submitter: worker-spawn failure stays on the supervisor, while a failed supervisor channel tries
+  an isolated worker before leaking the job for process-exit reclamation. Nested cleanup remains in
+  its parent worker, independent invocations cannot drain one another's workers, and the CLI gives
+  the scope one bounded budget for its final resource owner, supervisor, and queued jobs. SSH
+  control-socket readiness uses one disposable filesystem worker for its polling lifetime rather
+  than creating a thread per poll. Daemon waits run concurrently across endpoints while tracing
+  receivers remain live; any receiver tasks left afterward share one final drain deadline.
+  Control-directory selection tries runtime, temporary, state, and home locations before reporting
+  that no safe Unix-socket path is available. Remote daemon SSH exec-channel creation and readiness
+  reads use that same configured deadline; readiness records larger than 64 KiB are rejected. The
+  master threads the actual local operand roots through both remote-HOME lookup and endpoint
+  preparation, so control-directory selection rejects canonical temporary-directory aliases inside a
+  copied tree without treating the process working directory as an operand. Remote-to-remote copies
+  therefore retain normal runtime and temporary candidates even when launched from `/`; the
+  filesystem root itself is the sole non-excluding operand because every absolute candidate lies
+  beneath it. Daemon configuration refusals discovered before tracing use the structured `RCP_ERROR`
+  startup record, and unstructured startup failures retain captured stdout/stderr in the error
+  chain. Failed-startup reaping now keeps the SSH child and both output drains lexically inside its
+  bounded timeout future, so grace expiry or caller cancellation releases the managed session
+  instead of detaching ownership. The source tracing receiver starts before destination bring-up and
+  is drained on later startup failures, preserving queued source notices beside the destination
+  error. Source connection failures also wait for daemon cleanup. Daemon stdout/stderr is forwarded
+  live at debug verbosity while a bounded tail is retained and joined for completion diagnostics;
+  deployment likewise drains bounded diagnostics while preferring the remote failure over a
+  secondary stdin-shutdown error. An explicit connection request clamped by the source file ceiling,
+  or an automatic source file ceiling clamped by an explicit connection request, now produces a
+  default-visible notice; legacy file-limit notices preserve the `--max-open-files` spelling the
+  user supplied.
 
 - `remote::TcpConfig` now contains transport settings only; validated file/stream capacities are
   represented by `ResolvedRemoteConcurrency`. Its fluent setters were removed, and callers

@@ -901,7 +901,6 @@ async fn transfer_binary_base64<S: crate::SshSessionOwner>(
     let shutdown_stdin = matches!(write_result, Some(Ok(())));
     let finish_deadline = deadline.at_least(REMOTE_STAGING_FINALIZATION_MINIMUM);
     let finish = tokio::spawn(async move {
-        let mut stderr_drain = stderr_drain;
         finish_deadline
             .run("remote deployment verification", async move {
                 let shutdown_result = if shutdown_stdin {
@@ -983,7 +982,7 @@ where
 }
 
 async fn finish_deployment_stderr(
-    mut task: crate::AbortOnDropTask<crate::CapturedOutput>,
+    task: crate::AbortOnDropTask<crate::CapturedOutput>,
 ) -> crate::CapturedOutput {
     match tokio::time::timeout(REMOTE_STAGING_OWNER_GRACE, task.join()).await {
         Ok(Ok(output)) => output,

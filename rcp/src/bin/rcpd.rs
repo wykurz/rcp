@@ -199,7 +199,8 @@ struct Args {
     /// Maximum concurrent data connections (default: 100)
     ///
     /// This separately configurable ceiling defaults to 100. Effective data streams are
-    /// min(--max-files-in-flight, --max-connections). To raise remote parallelism above the
+    /// min(--max-files-in-flight, --max-connections). Remote automatic limits resolve on the
+    /// source rcpd and are adopted by the destination. To raise remote parallelism above the
     /// CPU-derived file default, increase both ceilings.
     #[arg(
         long,

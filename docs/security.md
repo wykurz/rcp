@@ -85,13 +85,17 @@ Each rcpd:
   1. Generates ephemeral self-signed certificate
   2. Computes fingerprint: SHA256(cert.to_der())
   3. Creates TLS server listener (requires a client cert matching --master-cert-fp)
-  4. Outputs to stderr: "RCP_TLS <addr> <hex_fingerprint>"
+  4. Outputs to stderr: "RCP_TLS <addr> <hex_fingerprint> <F> <E>"
 
 PHASE 2: Master → rcpd Connection
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Master reads from SSH stderr for each rcpd:
-  - Parses "RCP_TLS <addr> <fingerprint>"
+  - Parses "RCP_TLS <addr> <fingerprint> <F> <E>"
   - Fingerprint received via trusted SSH channel!
+
+`F` is the negotiated logical file-work ceiling and `E` is the effective data-stream ceiling. They
+carry performance policy, not secret material; the TLS fingerprint remains the value authenticated
+through the SSH channel.
 
 Master connects TO rcpd as TLS client (control connection, then tracing connection):
   1. TLS handshake (rcpd is server)
@@ -240,20 +244,22 @@ the legitimate master does. Certificate fingerprint verification prevents an att
 4. **Attacker's certificate has wrong fingerprint** - handshake rejected, no authenticated session
    is established (confidentiality and integrity are preserved)
 
-**Availability caveat**: this protects authenticity, not availability. None of the listeners bound
-the TLS handshake duration, and each awaits handshakes serially, so an attacker who can reach a
-listening port before the legitimate peer can deny service:
+**Availability caveat**: this protects authenticity, not availability. Every TLS handshake is
+bounded by `--remote-copy-conn-timeout-sec`, so a peer that establishes TCP and then stalls can only
+occupy a sequential accept loop until that deadline. A failed master-facing or source-control
+handshake is still fatal to its daemon, however, so an attacker who can reach a listening port can
+still deny service by initiating a bad or deliberately stalled handshake:
 
 - **Master-facing listeners (rcpd):** accept the two master connections one at a time and treat a
   failed handshake as fatal — a wrong-certificate attempt aborts rcpd, and a client that stalls
-  mid-handshake blocks it.
+  mid-handshake delays it until the configured deadline.
 - **Source↔destination listeners (source rcpd):** the control listener likewise propagates a failed
   handshake as fatal; the data listener logs and continues on failure, but a peer that stalls
-  mid-handshake still blocks the accept loop.
+  mid-handshake delays its sequential accept loop until the configured deadline.
 
 Reaching these ports requires network access to the (typically trusted) source/destination hosts;
-restrict it with `--port-ranges` plus firewall rules. Bounding each handshake with a timeout and
-tolerating failed attempts is a planned hardening.
+restrict it with `--port-ranges` plus firewall rules. Tolerating failed master-facing and
+source-control handshakes without aborting their daemons remains a future hardening.
 
 ### Cipher Suites
 
