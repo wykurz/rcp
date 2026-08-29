@@ -473,12 +473,19 @@ Specific invariants enforced:
 - On overwrite paths, a `recheck` verifies that the `(dev, ino)` of the entry matches the originally
   classified handle before performing the unlink.
 - Before recursively removing a directory, `rrm` verifies that the opened descent handle is still
-  the walked inode. It rechecks the final name against that same inode immediately before the
-  fd-relative `rmdir`. After a successful `rmdir`, a zero link count on the pinned walked-directory
-  fd proves that inode was removed; a nonzero count fails closed because a final-name replacement
-  was removed instead. Filesystems that make a just-unlinked pinned descriptor unqueryable with
-  `ENOENT` or `ESTALE` are accepted only as a weaker, logged removed-but-unqueryable outcome after
-  that contained `rmdir` succeeds; any other post-`rmdir` stat error remains a hard failure.
+  the walked inode. At the final removal boundary it rechecks the name and performs `rmdir` relative
+  to the pinned parent fd. This prevents symlink or cross-parent redirection, but cannot eliminate
+  an unavoidable final-component race: a process with the access needed to replace an entry in that
+  parent can substitute another empty directory after the check and before the syscall. `rmdir`
+  still removes only the empty directory at that name. Once it succeeds, removal is final; a later
+  `fstat` or directory link count cannot undo the mutation and is not portable evidence across
+  filesystems, so `rrm` performs no post-`rmdir` probe. This bound is unchanged under
+  `--require-toctou-safe`, which strengthens operand resolution and contains mutation to held
+  parents rather than promising atomic name identity across separate syscalls. If `rrm` temporarily
+  changes a directory to `0o700`, it restores the original mode through the pinned inode only when
+  filtering deliberately retains that directory (an include traversal, time-filter skip, or expected
+  `ENOTEMPTY` while filtering). Operation errors, cancellation, identity-check failures, and
+  unexpected `rmdir` failures do not attempt metadata rollback for a removal already in progress.
 - Directory names passed to any `*at()` call are validated to be single path components (no `/`,
   `.`, `..`).
 - **Source payload and metadata come from the same fd (read-side fidelity).** For each copied or

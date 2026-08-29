@@ -21,35 +21,6 @@ use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, fchownat, linkat, symlinkat, 
 
 use crate::walk::EntryKind;
 
-/// The result of checking a pinned directory after a successful by-name `rmdir`.
-///
-/// This is crate-private because only `rm` needs to interpret the proof. A zero link count proves
-/// that the pinned inode was removed; a nonzero count proves that a concurrent rename left it
-/// linked elsewhere. Some filesystems make a just-unlinked descriptor unqueryable, so `ENOENT` and
-/// `ESTALE` are accepted as a weaker removal result only after the contained `rmdir` succeeded.
-#[derive(Debug)]
-pub(crate) enum PostRmdirFstatOutcome {
-    /// The pinned inode's link count is zero, proving removal.
-    Unlinked,
-    /// The pinned inode remains linked, proving a same-name replacement race.
-    StillLinked { link_count: u64 },
-    /// The successful removal made the pinned descriptor unqueryable.
-    UnqueryableAfterSuccess(nix::errno::Errno),
-    /// The post-removal fstat failed for a reason unrelated to removal.
-    Error(nix::errno::Errno),
-}
-
-fn classify_post_rmdir_fstat(result: Result<u64, nix::errno::Errno>) -> PostRmdirFstatOutcome {
-    match result {
-        Ok(0) => PostRmdirFstatOutcome::Unlinked,
-        Ok(link_count) => PostRmdirFstatOutcome::StillLinked { link_count },
-        Err(errno @ (nix::errno::Errno::ENOENT | nix::errno::Errno::ESTALE)) => {
-            PostRmdirFstatOutcome::UnqueryableAfterSuccess(errno)
-        }
-        Err(errno) => PostRmdirFstatOutcome::Error(errno),
-    }
-}
-
 // ── Destination creation modes ───────────────────────────────────────────────
 
 /// The mode a destination FILE is created with, before it has any contents.
@@ -642,24 +613,6 @@ impl Dir {
         run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
             let st = fstat(dir.as_fd()).map_err(nix_to_io)?;
             Ok(FileMeta::from_stat(&st))
-        })
-        .await
-    }
-
-    /// Classify the outcome of `fstat` on this directory after a successful by-name `rmdir`.
-    ///
-    /// A zero link count proves removal even while this fd keeps the inode alive. A nonzero count
-    /// proves that a by-name `rmdir` raced with a rename and removed a replacement instead. Some
-    /// filesystems make a just-unlinked descriptor unqueryable, which is reported distinctly so
-    /// callers can accept that weaker proof only after a successful contained `rmdir`. Gated as
-    /// `Stat` on this directory's congestion side.
-    pub(crate) async fn post_rmdir_fstat_outcome(&self) -> std::io::Result<PostRmdirFstatOutcome> {
-        let dir = self.fd.clone();
-        let side = self.side;
-        run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
-            Ok(classify_post_rmdir_fstat(
-                fstat(dir.as_fd()).map(|st| st.st_nlink),
-            ))
         })
         .await
     }
@@ -2744,36 +2697,6 @@ pub(crate) async fn chmod_via_proc_fd(
     .await
 }
 
-/// Synchronous, ungated chmod of the EXACT inode an `O_PATH` `fd` pins, via its
-/// `/proc/self/fd/N` magic symlink — the blocking-`Drop` counterpart of
-/// [`chmod_via_proc_fd`].
-///
-/// `fd` must reference an `O_PATH` handle (the only fd kind `rm`'s relax path
-/// holds). The same inode-exactness argument applies: the open fd keeps the
-/// pinned inode alive, so `/proc/self/fd/N` resolves to that inode regardless of
-/// any concurrent rename/symlink swap of the original name — there is no path
-/// re-resolution to redirect, so this is race-safe even on a directory whose own
-/// mode is being restored. Works on a `0000`-mode directory we own (it authorizes
-/// against ownership, not the path's mode).
-///
-/// This is deliberately not gated through the congestion controller or the
-/// blocking pool: it runs from a synchronous `Drop` (which cannot `.await`) as a
-/// one-shot best-effort cleanup — a single `fchmodat` whose cost is negligible.
-/// Requires `/proc` mounted (same precondition as [`chmod_via_proc_fd`]).
-pub(crate) fn chmod_via_proc_fd_sync(fd: BorrowedFd<'_>, mode: u32) -> std::io::Result<()> {
-    let proc_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
-    // FollowSymlink: the /proc entry is a magic symlink that must be dereferenced
-    // to reach the pinned inode (NoFollowSymlink would chmod the magic link
-    // itself, a silent no-op).
-    nix::sys::stat::fchmodat(
-        AT_FDCWD,
-        proc_path.as_str(),
-        Mode::from_bits_truncate(mode),
-        nix::sys::stat::FchmodatFlags::FollowSymlink,
-    )
-    .map_err(nix_to_io)
-}
-
 /// Read full [`std::fs::Metadata`] for the exact inode an `O_PATH` [`Handle`] pins,
 /// via the `/proc/self/fd/N` magic symlink.
 ///
@@ -4501,55 +4424,6 @@ mod tests {
             "expected ENOTDIR for regular file, got {err:#}"
         );
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn pinned_directory_reports_when_its_inode_is_unlinked() -> anyhow::Result<()> {
-        let tmp = testutils::setup_test_dir().await?;
-        let root =
-            Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
-        tokio::fs::create_dir(tmp.join("foo/empty_sub")).await?;
-        let pinned = root.open_dir(OsStr::new("empty_sub")).await?;
-        assert!(
-            matches!(
-                pinned.post_rmdir_fstat_outcome().await?,
-                PostRmdirFstatOutcome::StillLinked { .. }
-            ),
-            "a linked directory was reported unlinked"
-        );
-        root.rmdir_at(OsStr::new("empty_sub")).await?;
-        assert!(
-            matches!(
-                pinned.post_rmdir_fstat_outcome().await?,
-                PostRmdirFstatOutcome::Unlinked
-            ),
-            "the pinned directory retained a link after successful rmdir"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn post_rmdir_fstat_classifies_pinned_inode_outcomes() {
-        assert!(matches!(
-            classify_post_rmdir_fstat(Ok(0)),
-            PostRmdirFstatOutcome::Unlinked
-        ));
-        assert!(matches!(
-            classify_post_rmdir_fstat(Ok(1)),
-            PostRmdirFstatOutcome::StillLinked { link_count: 1 }
-        ));
-        assert!(matches!(
-            classify_post_rmdir_fstat(Err(nix::errno::Errno::ENOENT)),
-            PostRmdirFstatOutcome::UnqueryableAfterSuccess(nix::errno::Errno::ENOENT)
-        ));
-        assert!(matches!(
-            classify_post_rmdir_fstat(Err(nix::errno::Errno::ESTALE)),
-            PostRmdirFstatOutcome::UnqueryableAfterSuccess(nix::errno::Errno::ESTALE)
-        ));
-        assert!(matches!(
-            classify_post_rmdir_fstat(Err(nix::errno::Errno::EIO)),
-            PostRmdirFstatOutcome::Error(nix::errno::Errno::EIO)
-        ));
     }
 
     // symlink_at: creates a symlink and returns a Handle with kind Symlink;
