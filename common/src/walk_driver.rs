@@ -312,8 +312,8 @@ pub enum DirAction<Sum, Ctx, State> {
         /// level without the driver knowing a second tree exists.
         child_ctx: Ctx,
         /// Tool state threaded from `dir_pre` to `dir_post` in the same task
-        /// (copy's `we_created` + dst handle for metadata; rm's `RelaxedDirGuard` +
-        /// snapshot; chmod's `()`).
+        /// (copy's `we_created` + dst handle for metadata; rm's relaxed-directory state + snapshot;
+        /// chmod's `()`).
         state: State,
     },
 }
@@ -459,8 +459,8 @@ pub trait WalkVisitor: Send + Sync + 'static {
     ///
     /// chmod applies the pre-order mode change here (unless deferred) and opens
     /// the dir; copy resolves the destination directory (mkdir/overwrite/skip) and
-    /// puts it in the child context; rm snapshots metadata and arms its
-    /// `RelaxedDirGuard`.
+    /// puts it in the child context; rm snapshots metadata and records any temporary
+    /// permission relaxation for filter-retention handling.
     fn dir_pre(
         &self,
         cx: &EntryCx,
@@ -486,9 +486,10 @@ pub trait WalkVisitor: Send + Sync + 'static {
     /// destructive `--delete` prune) and then return the combined error.
     ///
     /// copy applies directory metadata, empty-dir cleanup, and `--delete` prune;
-    /// chmod applies the deferred post-order change; rm runs the time filter, the
-    /// `rmdir`, and defuses its guard. A visitor that wants the historical
-    /// "finalize only on full success" behavior simply propagates the `Err`.
+    /// chmod applies the deferred post-order change; rm runs the time filter, restores a
+    /// temporary mode only when filtering retains the directory, or performs `rmdir`. A visitor
+    /// that wants the historical "finalize only on full success" behavior simply propagates the
+    /// `Err`.
     fn dir_post(
         &self,
         cx: &EntryCx,

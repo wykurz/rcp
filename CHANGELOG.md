@@ -151,10 +151,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   retained. With fail-early, the traversal stops after reporting only work completed before the
   failed entry.
 
-- Recursive removal now verifies the walked directory before descent and again before `rmdir`. After
-  a successful removal, a zero link count proves the pinned inode was unlinked; filesystems that
-  instead report `ENOENT` or `ESTALE` are accepted as a logged removed-but-unqueryable outcome. A
-  nonzero link count or any other error still fails closed.
+- Recursive removal now verifies the walked directory before descent and again immediately before
+  its fd-relative `rmdir`. The syscall is contained to the held parent and can remove only the empty
+  directory at the final name, but it cannot eliminate the final-component race in which that name
+  is replaced after the check. Once `rmdir` succeeds, removal is final; `rrm` no longer probes the
+  walked fd's link count after the mutation, avoiding false failures from stale or non-portable
+  directory link metadata. A temporary `0o700` mode is restored through the pinned directory fd only
+  when filters deliberately retain the directory. Operation errors, cancellation, identity-check
+  failures, and unexpected `rmdir` failures do not attempt metadata rollback.
 
 - The source-root ACL notice now fires only when the run **asked** for the fidelity a dropped ACL
   would undermine: `--preserve`/`--preserve-settings` requesting anything beyond the shipped
