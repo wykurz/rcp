@@ -214,7 +214,7 @@ pub fn generate_trace_filename(prefix: &str, identifier: &str, extension: &str) 
 ///
 /// **The bar for putting an event here** is that it is advice about the INVOCATION — constant in
 /// volume however large the tree, and actionable by changing the command line. A per-entry event
-/// does not qualify, however important it looks. Current notices cover ACL-preservation settings,
+/// does not qualify, however important it looks. Current notices cover source-root ACL heuristics,
 /// deprecated options, explicit concurrency clamps, profiling artifacts, and startup safety
 /// fallbacks.
 ///
@@ -427,19 +427,17 @@ pub(crate) fn install_tracing_subscriber(
 
 /// Derive a conservative leaf-operation count from the process descriptor limit.
 ///
-/// Local copy/link can overlap three OpenFile descriptors: source classification plus source and
-/// destination data during transfer, or source classification plus destination data and its
-/// blocking-metadata duplicate after the source data fd has been dropped. Recursive overwrite
-/// removal can concurrently use one classification descriptor per PendingMeta permit. Dividing an
-/// 80%-of-soft-`RLIMIT_NOFILE` budget by those four overlapping units gives the same admission count
-/// to each independent pool. Metadata-only tools can transiently hold two descriptors per
-/// PendingMeta operation, but do not use the three-descriptor OpenFile path concurrently. This is a
-/// heuristic for shipped tool workflows, not a hard process-wide ceiling: permission-relaxed and
-/// recursive directory handles can remain outside leaf admission, as can process support
-/// infrastructure. A nonzero soft limit gets at least one operation so very small test/container
-/// limits do not silently disable backpressure.
+/// Local copy/link can overlap three known OpenFile descriptors during overwrite (source
+/// classification, destination planning, and source data); the model reserves a fourth unit as
+/// headroom for transient support use. Recursive rm/delete work can overlap one PendingMeta
+/// classification descriptor. Dividing an 80%-of-soft-`RLIMIT_NOFILE` budget by those five units
+/// gives the same admission count to each pool. Metadata-only tools can transiently hold two
+/// descriptors per PendingMeta operation, but do not use the OpenFile path concurrently. This is a
+/// heuristic for shipped tool workflows, not a hard process-wide ceiling: recursive directories and
+/// process support descriptors are outside leaf admission. A nonzero soft limit gets at least one
+/// operation so very small test/container limits do not silently disable backpressure.
 fn descriptor_admission_limit(soft_limit: std::num::NonZeroU64) -> ConcurrencyLimit {
-    const OPEN_FILE_DESCRIPTOR_UNITS: u64 = 3;
+    const OPEN_FILE_DESCRIPTOR_UNITS: u64 = 4;
     const OVERLAPPING_PENDING_META_DESCRIPTOR_UNITS: u64 = 1;
     const DESCRIPTOR_UNITS_PER_OPERATION: u64 =
         OPEN_FILE_DESCRIPTOR_UNITS + OVERLAPPING_PENDING_META_DESCRIPTOR_UNITS;
@@ -700,11 +698,11 @@ mod default_leaf_operation_limit_tests {
         let nonzero = |value| std::num::NonZeroU64::new(value).unwrap();
         assert_eq!(
             descriptor_admission_limit(nonzero(100)),
-            ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(20).unwrap())
+            ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(16).unwrap())
         );
         assert_eq!(
             descriptor_admission_limit(nonzero(4096)),
-            ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(819).unwrap())
+            ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(655).unwrap())
         );
         assert_eq!(
             descriptor_admission_limit(nonzero(1_000_000)),
@@ -1113,13 +1111,12 @@ mod default_leaf_operation_limit_tests {
         let (open_files, pending_meta) = runtime
             .block_on(async {
                 tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                    const EXPECTED_ADMISSION_LIMIT: usize = 51;
-                    let mut open_files = Vec::with_capacity(EXPECTED_ADMISSION_LIMIT);
-                    let mut pending_meta = Vec::with_capacity(EXPECTED_ADMISSION_LIMIT);
-                    for _ in 0..EXPECTED_ADMISSION_LIMIT {
+                    let mut open_files = Vec::with_capacity(40);
+                    let mut pending_meta = Vec::with_capacity(40);
+                    for _ in 0..40 {
                         open_files.push(throttle::open_file_permit().await);
                     }
-                    for _ in 0..EXPECTED_ADMISSION_LIMIT {
+                    for _ in 0..40 {
                         pending_meta.push(throttle::pending_meta_permit().await);
                     }
                     assert!(
@@ -1129,7 +1126,7 @@ mod default_leaf_operation_limit_tests {
                         )
                         .await
                         .is_err(),
-                        "the 52nd OpenFile acquisition must wait at the derived limit"
+                        "the 41st OpenFile acquisition must wait at the derived limit"
                     );
                     assert!(
                         tokio::time::timeout(
@@ -1138,7 +1135,7 @@ mod default_leaf_operation_limit_tests {
                         )
                         .await
                         .is_err(),
-                        "the 52nd PendingMeta acquisition must wait at the derived limit"
+                        "the 41st PendingMeta acquisition must wait at the derived limit"
                     );
                     (open_files, pending_meta)
                 })
@@ -1168,7 +1165,6 @@ pub(crate) fn spawn_throttle_replenishers(
     runtime: &tokio::runtime::Runtime,
     throttle: &ThrottleConfig,
     trace_identifier: &str,
-    histogram_log_file: Option<std::fs::File>,
 ) {
     fn get_replenish_interval(replenish: usize) -> (usize, std::time::Duration) {
         let mut replenish = replenish;
@@ -1210,7 +1206,7 @@ pub(crate) fn spawn_throttle_replenishers(
             runtime,
             auto,
             throttle.histogram_enabled,
-            histogram_log_file,
+            throttle.histogram_log_path.clone(),
             throttle.histogram_interval,
             trace_identifier,
         );
@@ -1222,7 +1218,7 @@ pub(crate) fn spawn_throttle_replenishers(
 /// chrome_trace_prefix convention so master and rcpds don't collide on
 /// localhost runs.
 ///
-/// Handles three edge cases consistently with the startup preparer:
+/// Handles three edge cases consistently with the validator:
 /// - bare filename (`foo.hdr`): parent → `.`
 /// - no extension (`foo`): extension → `hdr`
 /// - no stem (`.hidden`): stem → `auto-meta`
@@ -1249,19 +1245,28 @@ fn resolve_log_path(path: &std::path::Path, trace_identifier: &str) -> std::path
     parent.join(name)
 }
 
-/// Open the resolved histogram log once and return the file that the logger will write.
+/// Verify the resolved histogram log path can actually be opened for
+/// writing. Called from [`run`] before any work begins so a typo or
+/// permission issue surfaces as a configuration error rather than a
+/// silent warning at runtime.
 ///
-/// Called before the runtime starts so path and permission failures remain startup errors. The
-/// returned descriptor stays bound to this exact file through the logger's lifetime; no later
-/// pathname re-open can be redirected to a replacement. `O_NOFOLLOW` rejects a symlink in the
-/// final component at the authoritative open.
-pub(crate) fn prepare_histogram_log_file(
+/// The check creates+truncates the file (matching what the logger
+/// task does later) so it catches "exists as a directory", "exists
+/// as an unwritable file", and most permission issues. The logger's
+/// own open later in startup will reuse the same path; the double-
+/// open is harmless (the logger truncates again).
+pub(crate) fn validate_histogram_log_target(
     throttle: &ThrottleConfig,
     trace_identifier: &str,
-) -> Result<Option<std::fs::File>, String> {
+) -> Result<(), String> {
     let Some(path) = &throttle.histogram_log_path else {
-        return Ok(None);
+        return Ok(());
     };
+    if path.is_dir() {
+        return Err(format!(
+            "--auto-meta-histogram-log {path:?} is a directory; expected a file path",
+        ));
+    }
     if path.file_name().is_none() {
         return Err(format!(
             "--auto-meta-histogram-log {path:?} has no filename component",
@@ -1276,7 +1281,7 @@ pub(crate) fn prepare_histogram_log_file(
         open_options.custom_flags(libc::O_NOFOLLOW);
     }
     match open_options.open(&resolved) {
-        Ok(file) => Ok(Some(file)),
+        Ok(_) => Ok(()),
         Err(err) => {
             // ELOOP from O_NOFOLLOW reads as "too many levels of symbolic links"
             // — make it explicit that this rejection is intentional security.
@@ -1426,14 +1431,20 @@ fn spawn_auto_meta_throttle(
     runtime: &tokio::runtime::Runtime,
     auto: AutoMetaThrottleConfig,
     histogram_enabled: bool,
-    histogram_log_file: Option<std::fs::File>,
+    histogram_log_path: Option<std::path::PathBuf>,
     histogram_interval: std::time::Duration,
     trace_identifier: &str,
 ) {
     let initial_cwnd = auto
         .initial_cwnd
         .clamp(auto.min_cwnd.max(1), auto.max_cwnd.max(1));
-    let histogram_active = histogram_enabled || histogram_log_file.is_some();
+    let histogram_active = histogram_enabled || histogram_log_path.is_some();
+    // Per-tool log path: each rcpd / master writes to its own file by
+    // suffixing trace_identifier on the user-supplied path, mirroring
+    // chrome_trace_prefix's convention.
+    let resolved_log_path = histogram_log_path
+        .as_ref()
+        .map(|p| resolve_log_path(p, trace_identifier));
 
     // Build receivers + accumulators in parallel arrays so we can pass
     // each accumulator both to a ControlUnit and to a LoggerUnit.
@@ -1553,7 +1564,7 @@ fn spawn_auto_meta_throttle(
         let handle = runtime.spawn(histogram_logger::run_logger(
             histogram_logger::LoggerConfig {
                 interval: histogram_interval,
-                log_file: histogram_log_file,
+                log_path: resolved_log_path,
                 header,
                 progress_source: Some(progress_source),
             },
@@ -1756,7 +1767,7 @@ mod resolve_log_path_tests {
 }
 
 #[cfg(test)]
-mod prepare_histogram_log_file_tests {
+mod validate_histogram_log_target_tests {
     use super::*;
 
     fn throttle_with_log_path(path: Option<std::path::PathBuf>) -> ThrottleConfig {
@@ -1770,20 +1781,14 @@ mod prepare_histogram_log_file_tests {
     #[test]
     fn no_log_path_is_ok() {
         let throttle = throttle_with_log_path(None);
-        assert!(
-            prepare_histogram_log_file(&throttle, "rcp")
-                .unwrap()
-                .is_none()
-        );
+        assert!(validate_histogram_log_target(&throttle, "rcp").is_ok());
     }
 
     #[test]
     fn writable_resolved_path_is_ok() {
         let dir = tempfile::tempdir().unwrap();
         let throttle = throttle_with_log_path(Some(dir.path().join("foo.hdr")));
-        let file = prepare_histogram_log_file(&throttle, "rcp").unwrap();
-        assert!(file.is_some());
-        assert!(dir.path().join("foo.rcp.hdr").is_file());
+        assert!(validate_histogram_log_target(&throttle, "rcp").is_ok());
     }
 
     #[test]
@@ -1794,7 +1799,7 @@ mod prepare_histogram_log_file_tests {
         let blocker = dir.path().join("foo.rcp.hdr");
         std::fs::create_dir(&blocker).unwrap();
         let throttle = throttle_with_log_path(Some(dir.path().join("foo.hdr")));
-        let err = prepare_histogram_log_file(&throttle, "rcp").unwrap_err();
+        let err = validate_histogram_log_target(&throttle, "rcp").unwrap_err();
         assert!(
             err.contains("histogram-log") && err.contains("foo.rcp.hdr"),
             "got: {err}",
@@ -1804,16 +1809,27 @@ mod prepare_histogram_log_file_tests {
     #[test]
     fn resolved_path_in_missing_parent_is_rejected() {
         let throttle = throttle_with_log_path(Some("/nonexistent-dir-67890/foo.hdr".into()));
-        let err = prepare_histogram_log_file(&throttle, "rcp").unwrap_err();
+        let err = validate_histogram_log_target(&throttle, "rcp").unwrap_err();
         assert!(err.contains("histogram-log"), "got: {err}");
+    }
+
+    #[test]
+    fn log_path_pointing_at_existing_directory_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let throttle = throttle_with_log_path(Some(dir.path().to_path_buf()));
+        let err = validate_histogram_log_target(&throttle, "rcp").unwrap_err();
+        assert!(err.contains("directory"), "got: {err}");
     }
 
     #[test]
     fn log_path_with_no_filename_is_rejected() {
         // PathBuf::from("/") has parent() == None and file_name() == None.
         let throttle = throttle_with_log_path(Some(std::path::PathBuf::from("/")));
-        let err = prepare_histogram_log_file(&throttle, "rcp").unwrap_err();
-        assert!(err.contains("filename"), "got: {err}");
+        let err = validate_histogram_log_target(&throttle, "rcp").unwrap_err();
+        assert!(
+            err.contains("filename") || err.contains("directory"),
+            "got: {err}",
+        );
     }
 
     #[test]
@@ -1831,7 +1847,7 @@ mod prepare_histogram_log_file_tests {
         let resolved_path = dir.path().join("foo.rcp.hdr");
         std::os::unix::fs::symlink(&target, &resolved_path).unwrap();
         let throttle = throttle_with_log_path(Some(dir.path().join("foo.hdr")));
-        let err = prepare_histogram_log_file(&throttle, "rcp").unwrap_err();
+        let err = validate_histogram_log_target(&throttle, "rcp").unwrap_err();
         assert!(
             err.contains("symlink") || err.contains("ELOOP") || err.contains("Too many levels"),
             "got: {err}",
@@ -1839,57 +1855,5 @@ mod prepare_histogram_log_file_tests {
         // Victim file content is preserved (the truncating open never reached it).
         let preserved = std::fs::read(&target).unwrap();
         assert_eq!(preserved, b"do not clobber");
-    }
-
-    #[tokio::test]
-    async fn logger_writes_through_the_prepared_file_without_reopening_its_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let requested = dir.path().join("foo.hdr");
-        let throttle = throttle_with_log_path(Some(requested.clone()));
-        let log_file = prepare_histogram_log_file(&throttle, "rcp")
-            .unwrap()
-            .expect("configured log path must return its opened file");
-
-        let resolved = dir.path().join("foo.rcp.hdr");
-        let prepared = dir.path().join("prepared.hdr");
-        std::fs::rename(&resolved, &prepared).unwrap();
-        std::fs::write(&resolved, b"replacement must stay untouched").unwrap();
-
-        let auto = AutoMetaThrottleConfig {
-            initial_cwnd: 1,
-            min_cwnd: 1,
-            max_cwnd: 4,
-            alpha: 1.3,
-            beta: 1.8,
-            increase_step: 1,
-            decrease_step: 1,
-            baseline_percentile: 0.1,
-            current_percentile: 0.5,
-            long_window: std::time::Duration::from_secs(10),
-            short_window: std::time::Duration::from_secs(1),
-            tick_interval: std::time::Duration::from_millis(50),
-        };
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let config = histogram_logger::LoggerConfig {
-            interval: std::time::Duration::from_millis(10),
-            log_file: Some(log_file),
-            header: build_histogram_header(&auto, "rcp", std::time::Duration::from_millis(10)),
-            progress_source: None,
-        };
-        let handle = tokio::spawn(histogram_logger::run_logger(config, Vec::new(), cancel_rx));
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        cancel_tx.send(true).unwrap();
-        handle.await.unwrap();
-
-        assert_eq!(
-            std::fs::read(&resolved).unwrap(),
-            b"replacement must stay untouched",
-            "the logger reopened and truncated the replaced pathname"
-        );
-        let prepared_bytes = std::fs::read(&prepared).unwrap();
-        assert!(
-            prepared_bytes.starts_with(b"RCP-AUTOMETA-HIST-V2\n"),
-            "the file prepared at startup did not receive the log header"
-        );
     }
 }

@@ -745,7 +745,7 @@ async fn async_main(
         // correctness requirement rather than tidiness. `run_operation` owns the
         // `DirectoryTracker`, whose `pending_directories` holds a
         // `common::safedir::ReusedDirLock` for every destination directory
-        // with a live `--require-toctou-safe` lockdown. Each of those
+        // currently locked down under `--require-toctou-safe`. Each of those
         // guards holds the ONLY copy of that directory's original default ACL —
         // the lockdown removed it from the filesystem — and puts it back in its
         // `Drop`. `process::exit` does not unwind, so exiting from inside this
@@ -761,6 +761,8 @@ async fn async_main(
         // the tracker — before `main` exits 1. The guards fire during that
         // runtime drop rather than racing it.
         //
+        // The older comment here said there was no point cleaning up because the
+        // master is dead. That predates the lockdown; there is a point now.
         let result_committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let operation = run_operation(
             args.clone(),
@@ -800,7 +802,7 @@ async fn async_main(
                 } else {
                 // stdin closed - master disconnected. Wind down through the normal
                 // return path (see CANCEL SAFETY above) rather than exiting here,
-                // so armed reused-directory lockdowns restore their default ACL state.
+                // so armed reused-directory lockdowns restore their ACLs.
                 tracing::error!(
                     "Master (rcp) disconnected - stdin closed. \
                      This usually means the master process was killed or the SSH connection was terminated. \

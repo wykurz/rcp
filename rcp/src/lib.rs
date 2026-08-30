@@ -69,12 +69,11 @@
 //! Unlike `cp`, `rcp` uses unambiguous path semantics:
 //!
 //! - **Without trailing slash**: Path is treated as the final destination name
-//!   - `rcp A/B C/D` → materializes `C/D`
+//!   - `rcp A/B C/D` → creates `C/D` (fails if exists)
 //! - **With trailing slash**: Path is treated as a directory to copy into
-//!   - `rcp A/B C/D/` → materializes `C/D/B`
+//!   - `rcp A/B C/D/` → creates `C/D/B` (fails if exists)
 //!
-//! Compatible existing directories are reused and merged. Use `--overwrite` to replace conflicting
-//! existing files, symlinks, or other entry kinds.
+//! Use `--overwrite` to allow overwriting existing destinations.
 //!
 //! ## Metadata Preservation
 //!

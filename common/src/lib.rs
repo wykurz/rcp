@@ -654,14 +654,12 @@ where
     // tracing guards must outlive the runtime so chrome/flame traces flush
     // extract trace_identifier before install_tracing_subscriber consumes tracing_config
     let trace_identifier = tracing_config.trace_identifier.clone();
-    let histogram_log_file =
-        match runtime_setup::prepare_histogram_log_file(&throttle_config, &trace_identifier) {
-            Ok(file) => file,
-            Err(error) => {
-                print_startup_configuration_error(startup_error_prefix, &error);
-                return None;
-            }
-        };
+    if let Err(error) =
+        runtime_setup::validate_histogram_log_target(&throttle_config, &trace_identifier)
+    {
+        print_startup_configuration_error(startup_error_prefix, &error);
+        return None;
+    }
     let _tracing_guards =
         match runtime_setup::install_tracing_subscriber(quiet, verbose, tracing_config) {
             Ok(guards) => guards,
@@ -681,12 +679,7 @@ where
                 return None;
             }
         };
-        runtime_setup::spawn_throttle_replenishers(
-            &runtime,
-            &throttle_config,
-            &trace_identifier,
-            histogram_log_file,
-        );
+        runtime_setup::spawn_throttle_replenishers(&runtime, &throttle_config, &trace_identifier);
         let res = {
             let _progress_tracker = progress.map(|settings| {
                 tracing::debug!("Requesting progress updates {settings:?}");

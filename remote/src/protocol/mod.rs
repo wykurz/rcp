@@ -69,15 +69,16 @@ pub const DEFAULT_OVERWRITE_MANIFEST_MAX_ENTRIES: usize = 5_000_000;
 /// the destination reproduces by REMOVING the attribute — not by leaving whatever it inherited
 /// (see [`common::safedir::apply_acls_fd`]). `Unknown` says the wire carries no ACL information at
 /// all: either the master never asked ([`ExtendedMetadataCapture`]), or the source COULD NOT read
-/// them (a committed directory that failed to open, whose copy is already recorded as an error).
-/// `Unknown` authorizes no source-derived ACL set or clear; destination mode application and strict
-/// reused-directory lockdown can still affect ACL state. Keeping that state distinct from
-/// `Captured` prevents an unavailable source ACL from becoming an authoritative clear.
+/// them (a committed directory that failed to open, whose copy is already recorded as an error) —
+/// and the destination must leave the destination entry's ACLs alone. Collapsing the two (the
+/// previous shape, a pair of bare `Option`s) turned that source-side read failure into an
+/// authoritative clear, permanently stripping a reused destination directory's access and default
+/// ACLs on a copy that was already failing.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum WireAcls {
-    /// No ACL information: not captured, or unreadable at the source. This authorizes no
-    /// source-derived ACL set or clear. A strict-mode reused directory's original default ACL is
-    /// restored by the lockdown guard, and mode application can still affect its access ACL mask.
+    /// No ACL information: not captured, or unreadable at the source. The destination must not
+    /// touch the destination entry's ACLs (for a strict-mode locked reused directory, its
+    /// original default ACL is restored by the lockdown guard).
     Unknown,
     /// Read from the source entry (its own fd on the hardened walk; by path under `-L`):
     /// authoritative, including the "has none" case.
@@ -117,8 +118,8 @@ impl Metadata {
     ///
     /// This is a builder rather than a field the [`From`] impls fill because neither of them has an
     /// fd to read from: every site that SHOULD carry ACLs is therefore a visible call, and a site
-    /// that does not stays [`WireAcls::Unknown`] — which authorizes no source-derived ACL set or
-    /// clear.
+    /// that does not stays [`WireAcls::Unknown`] — which the destination reads as "leave the
+    /// destination's ACLs alone", never as a clear.
     #[must_use]
     pub fn with_acls(mut self, acls: &common::safedir::Acls) -> Self {
         self.acls = WireAcls::Captured {
@@ -129,7 +130,8 @@ impl Metadata {
     }
 
     /// The ACLs this wire metadata carries, in the shape the destination applier takes — or
-    /// `None` when they are [`WireAcls::Unknown`] and authorize no source-derived ACL set or clear.
+    /// `None` when they are [`WireAcls::Unknown`] and the destination must not touch the
+    /// destination entry's ACLs.
     ///
     /// A `Some` holding all-`None` fields means "the source had no ACL", which is a request to
     /// CLEAR, not to leave the destination alone. That is safe to hand the applier because the
@@ -200,7 +202,7 @@ impl From<&std::fs::Metadata> for Metadata {
     /// path would answer from whatever inode the name resolves to now rather than the one this
     /// snapshot describes. Call sites that should carry ACLs add them with
     /// [`Metadata::with_acls`]; a site that cannot (the source failed to read them) correctly
-    /// leaves them `Unknown`, which authorizes no source-derived ACL set or clear.
+    /// leaves them `Unknown`, which the destination reads as "do not touch", never as a clear.
     fn from(metadata: &std::fs::Metadata) -> Self {
         Metadata {
             mode: metadata.mode(),
@@ -709,12 +711,14 @@ pub struct TracingHello {
 /// TLS certificate fingerprint (SHA-256 of DER-encoded certificate).
 pub type CertFingerprint = [u8; 32];
 
-/// What extended metadata the source must read and which ACL-preservation notice it may emit.
+/// What EXTENDED metadata the SOURCE must read, beyond the `stat` it already does.
 ///
-/// The first two fields authorize per-entry reads whose bytes are sent. The historical
-/// `root_acl_notice` field carries only a settings-derived arming bit for a conditional warning; it
-/// authorizes no filesystem read. With both per-entry fields false, the source issues no ACL xattr
-/// read, including under `--require-toctou-safe`.
+/// Two of the three fields are per-entry reads whose bytes are sent; the third buys one read on the
+/// ROOT whose only product is a log line. All three answer the same question — what may the source
+/// spend an xattr syscall on — so with every field false the source issues none, EXCEPT under
+/// `--require-toctou-safe`: that flag arms the root notice from the source's own mirrored copy of
+/// it rather than from here, so a strict run still pays the one root `listxattr` on an all-false
+/// capture. Nothing per-entry is reachable that way — only `file_acl`/`dir_acl` open that door.
 ///
 /// Carried in [`MasterHello::Source`] because the source otherwise has no way to know: only
 /// [`MasterHello::Destination`] carries `preserve`, so without this the source would have to probe
@@ -733,12 +737,13 @@ pub struct ExtendedMetadataCapture {
     pub file_acl: bool,
     /// Read each source DIRECTORY's access AND default ACLs.
     pub dir_acl: bool,
-    /// Arm a one-per-process notice that the selected settings may omit source ACLs (see
-    /// [`common::safedir::AclPreservationNotice`]).
+    /// Probe the source ROOT once for a POSIX ACL, so the source can say that this copy will not
+    /// carry it across (see [`common::safedir::RootAclNotice`]).
     ///
-    /// This historical wire-field name is retained for schema compatibility. The bit is independent
-    /// of the two read flags: it is armed when the master's `preserve` asks for metadata fidelity at
-    /// all, and disarmed by preserve-none. No source entry is inspected for the notice.
+    /// Independent of the two above: it is armed by the master's `preserve` asking for metadata
+    /// fidelity AT ALL, and disarmed by a copy that asked for none — the reads above are armed by
+    /// `preserve` asking for `acl` specifically, which is the case where there is nothing to warn
+    /// about. A run at the shipped default sets all three to false and the source touches no xattr.
     pub root_acl_notice: bool,
 }
 
@@ -760,12 +765,12 @@ impl ExtendedMetadataCapture {
     }
 }
 
-impl From<ExtendedMetadataCapture> for common::safedir::AclPreservationNotice {
+impl From<ExtendedMetadataCapture> for common::safedir::RootAclNotice {
     /// The source's view of the notice, reassembled from what crossed the wire.
     ///
     /// `--require-toctou-safe` is absent here on purpose: it reaches the source `rcpd` as its own
-    /// mirrored flag and is read from process-global strict state, so it arms the source-side notice
-    /// without travelling twice.
+    /// mirrored flag and is read from the process-global strict state, so it arms the notice on the
+    /// host that actually runs the probe rather than travelling twice.
     fn from(capture: ExtendedMetadataCapture) -> Self {
         Self {
             wanted: capture.root_acl_notice,
@@ -966,9 +971,9 @@ mod tests {
     #[test]
     fn metadata_built_from_a_stat_snapshot_carries_unknown_acls() {
         // neither `From` impl has an fd to probe, so both must leave the ACLs Unknown rather than
-        // guess — a site that should carry ACLs makes a visible `with_acls` call instead. unknown
-        // authorizes no source-derived ACL set or clear; only a visible capture may produce the
-        // all-`None` CLEAR request.
+        // guess — a site that should carry ACLs makes a visible `with_acls` call instead. Unknown
+        // tells the destination to leave the destination entry's ACLs alone; only a visible
+        // capture may produce the all-`None` CLEAR request.
         let meta = Metadata::from(&std::fs::metadata(".").unwrap());
         assert_eq!(meta.captured_acls(), None);
     }
@@ -994,8 +999,8 @@ mod tests {
             ExtendedMetadataCapture {
                 file_acl: true,
                 dir_acl: true,
-                // armed by the run asking for preservation, but the per-kind flags above leave the
-                // notice nothing to report once both kinds are carried across
+                // armed by the run asking for preservation, but the per-kind flags above then turn
+                // the probe away: there is nothing to warn about once both kinds are carried across
                 root_acl_notice: true,
             }
         );
@@ -1007,7 +1012,8 @@ mod tests {
                 root_acl_notice: true,
             },
             "`all` deliberately excludes ACLs, so it must not make the source pay the per-entry \
-             read — but it did ask for metadata fidelity, so the settings notice is due"
+             read — but it DID ask for metadata fidelity, so the one root probe behind the notice \
+             is exactly the case the notice exists for"
         );
         let mut file_only = common::preserve::preserve_none();
         file_only.file.acl = true;
@@ -1023,7 +1029,8 @@ mod tests {
 
     #[test]
     fn a_copy_asking_for_no_preservation_makes_the_source_read_nothing() {
-        // a remote copy left at the shipped default must not make the source touch an xattr
+        // the whole point of the notice gate: a remote copy left at the shipped default must not
+        // make the source touch a single xattr, root probe included
         assert_eq!(
             ExtendedMetadataCapture::for_preserve(&common::preserve::preserve_none()),
             ExtendedMetadataCapture::default(),
@@ -1033,15 +1040,15 @@ mod tests {
     #[test]
     fn the_notice_the_source_reassembles_matches_the_capture_it_came_from() {
         // the source has no `preserve` of its own, so the notice it acts on is rebuilt from the
-        // wire; a field crossed over here would silence or misdirect the notice on the far host
+        // wire; a field crossed over here would silence or misdirect the probe on the far host
         let capture = ExtendedMetadataCapture {
             file_acl: true,
             dir_acl: false,
             root_acl_notice: true,
         };
         assert_eq!(
-            common::safedir::AclPreservationNotice::from(capture),
-            common::safedir::AclPreservationNotice {
+            common::safedir::RootAclNotice::from(capture),
+            common::safedir::RootAclNotice {
                 wanted: true,
                 file_acl_preserved: true,
                 dir_acl_preserved: false,

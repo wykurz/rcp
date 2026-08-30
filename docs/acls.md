@@ -3,7 +3,7 @@
 This document is the single home for how the RCP tools handle POSIX.1e access control lists: what
 `--preserve-settings=all+acl` does, why ACLs are opt-in rather than part of `all`, the two
 independent ways a copy can end up **more permissive than its source**, and what
-`--require-toctou-safe` guarantees and excludes. It covers `rcp` (local and remote) and `rlink`.
+`--require-toctou-safe` does and does not fix. It covers `rcp` (local and remote) and `rlink`.
 
 If you only read one thing: **`--preserve-settings=all` does not preserve ACLs**, and on a
 destination tree that has default ACLs a copy can gain permissions its source never granted. Use
@@ -16,7 +16,7 @@ destination tree that has default ACLs a copy can gain permissions its source ne
 - [Who pays to contain inheritance](#who-pays-to-contain-inheritance)
 - [Why `acl` is opt-in](#why-acl-is-opt-in)
 - [The CLI surface](#the-cli-surface)
-- [The ACL-preservation settings notice](#the-acl-preservation-settings-notice)
+- [The source-root warning](#the-source-root-warning)
 - [How ACLs are applied, and why the order matters](#how-acls-are-applied-and-why-the-order-matters)
 - [Failure rules](#failure-rules)
 - [Carry the bytes verbatim](#carry-the-bytes-verbatim)
@@ -72,7 +72,8 @@ through a different window. Two consequences run through the whole design:
 
 ## Two ways a copy widens
 
-Both cases are reproducible on ext4. They are independent; closing one does not close the other.
+Both were reproduced on ext4 while this was designed. They are independent; closing one does not
+close the other.
 
 ### 1. The source's ACL is dropped
 
@@ -89,7 +90,8 @@ carrying this ACL cannot have any other mode — so there is no mode for rcp to 
 mode-diff to notice. The destination is more permissive purely because an entry is missing, and a
 reader who expects the mode to have moved will go looking for the bug in the wrong place.
 
-This is a **fidelity** gap, not a race. Requesting `acl` closes it.
+This is the reported bug, and it is a **fidelity** gap present in every copy — not a race. `acl`
+closes it.
 
 ### 2. The destination tree's default ACL is inherited
 
@@ -142,13 +144,12 @@ all, with no per-file work.
 
 The "2 syscalls" is the cost for a directory rcp **creates** — one `fremovexattr` per ACL inside the
 creation call. A **reused** directory costs more, because its own ACL has to survive the copy: a
-`flistxattr`, an `fgetxattr` only when a default ACL is present, and a conditional remove and
-conditional final set for that attribute. The lockdown requests only the default ACL, so a present
-access ACL adds no `fgetxattr`. This work remains per-directory, and files beneath it pay nothing.
-One narrow exception remains: a file created **directly in the ambient operand parent** (a direct
-file operand's destination, the one directory rcp neither creates nor locks down) pays a single
-`fremovexattr` inside its create, because no directory-level strip ran there. That is one syscall
-per *operand*, not per file of a tree.
+`listxattr` plus an `fgetxattr` to snapshot the default ACL and an `fremovexattr` to strip it at
+lockdown, then an `fsetxattr` to put it back at finalize. Still per-directory, and still nothing per
+file — with one narrow exception: a file created **directly in the ambient operand parent** (a
+direct file operand's destination, the one directory rcp neither creates nor locks down) pays a
+single `fremovexattr` inside its create, because no directory-level strip ever ran there. That is
+one syscall per *operand*, not per file of a tree.
 
 ## Why `acl` is opt-in
 
@@ -161,17 +162,16 @@ every entry. Measured on ext4, 20k files, best of 3:
 | `getxattr(system.posix_acl_access)` → `ENODATA` | 1057     |
 | `listxattr`                                     | 591      |
 
-ACL preservation performs one `flistxattr` per entry. File reads duplicate the held fd so blocking
-work can own it; directory reads share the already-owned directory fd. It then performs one
-`fgetxattr` for each requested ACL attribute actually present: at most one for a file and two for a
-directory. A size race or an attribute larger than the stack buffer can require a retry. Against the
-handful of metadata operations a copy already pays per entry, this is material across a tree of
-millions and is paid even when no entry has an ACL. That is why `all` excludes ACLs and `all+acl`
-opts in.
+So ACL preservation adds one syscall of roughly `stat`'s cost to every file, and two to every
+directory (which has both an access and a default ACL). Against the handful of metadata ops a copy
+already pays per entry — a copied file costs about half a dozen — that is a fifth to a third more
+metadata work, not a doubling. Small per entry; not small across a tree of millions, and paid by
+every user of the flag whether or not a single entry turns out to have an ACL. That is why `all`
+excludes ACLs and `all+acl` opts in.
 
-The read probe is `listxattr`-first because `listxattr` is materially cheaper than a `getxattr` that
-misses, and misses are the overwhelming majority. A `getxattr` is issued only for a requested name
-the list actually contained.
+The read probe is therefore `listxattr`-first: `listxattr` is materially cheaper than a `getxattr`
+that misses, and misses are the overwhelming majority. A `getxattr` is issued only for a name the
+list actually contained.
 
 Every ACL syscall — read and write — is routed through the same metadata gate as `stat`, `chmod` and
 `utimens`, so it is rate-limited, counts against the congestion window and feeds the latency probe
@@ -194,10 +194,10 @@ rcp --preserve-settings="f:uid,gid,time,acl,7777 d:uid,gid,time,acl,7777 l:uid,g
 ```
 
 **Preset grammar.** A string is a preset if and only if its first `+`-separated token is `all` or
-`none`; each remaining token is a modifier, and `acl` is the only recognized modifier. An unknown
+`none`; each remaining token is a modifier, of which `acl` is currently the only one. An unknown
 modifier is an error naming the valid set, and repeats are idempotent (`all+acl+acl` is `all+acl`).
-Any string whose first `+`-token is not `all` or `none` is parsed by the per-type DSL, where `+` is
-an ordinary character.
+Any string whose first `+`-token is not `all` or `none` falls through to the per-type DSL exactly as
+before, so `+` remains an ordinary character there and no existing settings string changed meaning.
 
 `none+acl` is legal and means "copy ACLs but not ownership or timestamps". Odd but coherent, and
 special-casing it would be arbitrary.
@@ -213,39 +213,38 @@ of quiet lie this feature exists to remove:
   and remain the default: the ACL carries no setuid/setgid/sticky, so the two are orthogonal.
   `all+acl` (mask `0o7777`) and a bare `f:acl` (default mask `0o0777`) both pass.
 
-## The ACL-preservation settings notice
+## The source-root warning
 
-`all` does not include ACLs, so a run that asks for metadata fidelity without asking for `acl` emits
-one conditional notice:
+`all` not preserving ACLs is only defensible if a user who has not read this page finds out. So one
+`listxattr` on the **source root** per run — a constant, free at any tree size — warns once when the
+root carries an ACL while `acl` is not requested, **provided the run asked for metadata fidelity in
+the first place**:
 
 ```
-WARN This copy does not preserve POSIX ACLs for files and directories. If such source entries carry
-     ACLs, the destination may become more permissive. Use `--preserve-settings=all+acl`.
+WARN Source root "/data/project" carries a POSIX ACL that this copy will NOT preserve
+     (`--preserve-settings` does not request `acl`), so the destination may end up more permissive
+     than its source. Use `--preserve-settings=all+acl`. Only the root was checked - entries beneath
+     it may carry ACLs this says nothing about.
 ```
 
-The notice is derived entirely from the resolved settings. It does not inspect the source root or
-any other entry and therefore adds no filesystem syscall. A point-in-time root observation would say
-nothing about descendants and an attacker could change the observed ACL immediately before or after
-it. That opportunistic observation would not improve the guarantee, so it does not justify either
-the runtime cost or the complexity.
-
-Under `--require-toctou-safe` the notice also explains that strict mode prevents inherited
-destination ACLs but does not carry source ACLs across. See
+Under `--require-toctou-safe` the same probe, at the same cost, carries a sharper message: strict
+mode contains inherited destination ACLs but does **not** preserve the source's, so the copy can
+still end up more permissive than what it copied — see
 [the two flags close different bugs](#the-two-flags-close-different-bugs).
 
 ### What arms it
 
-Two settings arm the notice independently:
+The notice is armed by the run **asking** for the fidelity a dropped ACL would undermine, not by an
+ACL merely existing. Two things arm it, independently:
 
-- The resolved `--preserve`/`--preserve-settings` requests anything beyond the preserve-none
-  baseline — `all`, a bare `f:uid`, a `7777` mode mask, or any other metadata fidelity.
-- `--require-toctou-safe`, whatever the preserve settings say. It is a request about permissions in
-  its own right and receives the strict wording above.
+- The resolved `--preserve`/`--preserve-settings` requesting anything beyond the shipped default —
+  `all`, a bare `f:uid`, a `7777` mode mask, anything.
+- `--require-toctou-safe`, whatever the preserve settings say. It is a request about permissions on
+  its own, and it is where a user is most likely to assume the source's ACLs came along; it gets the
+  sharper wording above.
 
-The notice names each supported entry kind whose ACLs may be omitted. Preserving `f:acl` alone still
-warns about directories; preserving `d:acl` alone still warns about files. A hard-linked rlink file
-already shares the source inode and therefore its ACL, so rlink treats that file case as safe
-without writing through the link. Directory ACLs can still be omitted and remain worth mentioning.
+Everything else is silent, probe included — a copy that did not ask pays nothing at all, not even
+the one `listxattr`:
 
 | Invocation                                | Notice                          |
 | ----------------------------------------- | ------------------------------- |
@@ -257,23 +256,79 @@ without writing through the link. Directory ACLs can still be omitted and remain
 | `rcp --preserve-settings=all+acl src dst` | silent — the ACLs are preserved |
 | `rlink src dst`                           | warns — rlink defaults to `all` |
 
-A bare `rcp` is silent because it reproduces the source's `rwx` bits like `cp` and makes no broader
-metadata-fidelity claim: uid, gid, timestamps, and special mode bits are also omitted without a
-notice. `rlink` defaults to `all`, so a bare rlink has made that claim. Resolved preserve-none
-settings, including the equivalent `f:0777 d:0777`, silence the notice in either tool.
+The reason a bare `rcp` is silent is consistency about what the default claims. Left alone, rcp
+reproduces the source's `rwx` bits like `cp` and nothing else: uid, gid, timestamps and the
+setuid/setgid/sticky bits are all dropped without a word. A run that makes no claim about the
+destination's metadata does not need advice about one more attribute it also does not carry, and
+singling ACLs out there would be the one loud omission among several silent ones. Ask for anything —
+that is the claim — and the advice becomes worth printing.
 
-The notice fires at most **once per process**, independent of tree size and operand scheduling. It
-is printed at the **default verbosity** through the dedicated `rcp::notice` tracing target; other
-warnings still require `-v`. `--quiet` suppresses it along with all other output. The built-in
-target directive is applied after `RUST_LOG`, so `RUST_LOG` cannot suppress it.
+`rlink` sits on the other side of the same rule rather than being an exception to it: its default
+**is** `all`, because metadata fidelity is what the tool is for, so a bare `rlink` has asked. Only
+`rlink --preserve-settings=none` (or settings that resolve back to the shipped default) turns the
+notice off there.
 
-On a remote copy the source `rcpd` derives and emits the notice from settings sent over the wire;
-the master re-emits it on `rcp::notice`, prefixed `remote::source::`. This is source-side advice,
-but no source filesystem observation is performed.
+The gate reads the RESOLVED settings, and the baseline it compares against is the **shipped
+default** (`preserve_none`) — not whatever the tool would have used had you passed nothing. So
+`--preserve-settings=none` and its longhand spelling `f:0777 d:0777` are equivalent to each other
+and both silent, in either tool. There is no separate "was the flag typed" bit.
 
-The event is a `warn!`, not an `error!`, and does not affect the copy's exit code. It states a
-possibility implied by the requested settings. When ACL preservation is requested, an unreadable
-source ACL or a destination that cannot store it is an operation error instead.
+The two baselines coincide for `rcp`, whose CLI default *is* the shipped default, so there passing
+nothing and passing `none` behave alike. They do not coincide for `rlink`, whose CLI default is
+`all`: `rlink src dst` warns while `rlink --preserve-settings='f:0777 d:0777' src dst` is silent.
+Nothing special-cases the tool — the two invocations resolve to different settings.
+
+**This is a heuristic, not a guarantee.** A root without an ACL says nothing about its children, and
+the probe deliberately does not walk: probing enough entries to be sure *is* the per-entry cost that
+made `acl` opt-in. Two more limits worth knowing:
+
+- It fires at most **once per process** — first probe wins. The budget is claimed as late as
+  possible, after the root's kind and the per-kind settings are known, so a root that could not have
+  warned (a symlink, or a kind whose ACLs are being preserved) does not consume it. But **which**
+  root wins is not ordered: a multi-operand run copies its operands concurrently, so with several
+  eligible roots the one that gets there first is whichever the scheduler ran first, and a root that
+  would have warned can be silenced by one that had nothing to say. The cap exists to bound a
+  `--dereference` walk, which re-enters the copy entry point per resolved symlink; making it
+  per-operand instead is a larger change than the cap is worth.
+- It consults the setting for the root's own kind, so `f:acl` does not silence a warning about a
+  directory root. The root is classified `O_NOFOLLOW`, so a symlink root is skipped — a symlink has
+  no ACL, and under `-L`, where its target does the copying, the target is not probed either.
+
+For `rlink` the probe covers **directory** roots only. A hard-linked destination file *is* the
+source inode, so its ACL cannot be dropped — and must never be written through, which is why `f:acl`
+applies only on rlink's real copy path (see [Tool coverage](#tool-coverage)).
+
+### Where the notice shows up
+
+It is printed at the **default verbosity** — no `-v` needed. That is the whole point: a user who
+does not know `all` excludes ACLs is exactly the user who will not think to ask for more output.
+
+It gets there without making anything else noisier. The notice carries its own tracing target,
+`rcp::notice`, and that target has its own `warn` directive; a target directive is more specific
+than the global level, so it wins for this one target and nothing more. Raising the global default
+to `warn` instead would have unmuted every other `warn!` in the tools, 14 of which sit in per-entry
+paths (`Skipping directory {:?} - ancestor failed to create` and friends), so a single failed
+subtree would print thousands of lines. Every other warning still needs `-v`.
+
+On a **remote** copy the probe runs on the source `rcpd`, where the root is. The notice keeps its
+target across the wire — the master re-emits forwarded notices on `rcp::notice` rather than on the
+blanket `remote` target — so it renders at the default verbosity there too, prefixed
+`remote::source::` like any other forwarded line. Both ends need the directive: without it the
+source `rcpd`, itself running at the default verbosity, would not even send the notice.
+
+Turning it off:
+
+- **`--quiet`** suppresses it, along with all other output. That is the supported way.
+- **`RUST_LOG` cannot.** Like the tools' other built-in directives (`tokio`, `quinn`, `rustls`,
+  `h2`, and the verbosity level itself), the `rcp::notice` directive is applied *after* `RUST_LOG`
+  is read and takes precedence for that target. `RUST_LOG` still raises verbosity for targets rcp
+  does not name — `RUST_LOG=common=debug` works as before.
+
+It is a `warn!` and not an `error!`, and the copy's exit code is unchanged. Failing on it would be
+wrong: the probe sees only the root, so the same tree copied one level deeper would not trigger it,
+and a failure on a signal that arbitrary reads as capricious. Where rcp *does* fail — a destination
+that cannot hold the ACL, or a source ACL it cannot read — the user asked for `acl` and rcp could
+not deliver it. Here they did not ask.
 
 ## How ACLs are applied, and why the order matters
 
@@ -328,17 +383,16 @@ Both directions refuse to leave a destination whose permission state is neither 
 knowably safe. They are symmetric, and the second is the one that surprises people.
 
 **A destination that cannot HOLD the source's ACL fails the entry.** `EOPNOTSUPP` on a *set* is an
-error, not a shrug: the destination would be more permissive than its source, which violates
-permission fidelity. By contrast `EOPNOTSUPP` or `ENODATA` on a *remove* is success — there is
-nothing to clear, so nothing can have widened.
+error, not a shrug: the destination would be more permissive than its source, which is the bug being
+fixed. By contrast `EOPNOTSUPP` or `ENODATA` on a *remove* is success — there is nothing to clear,
+so nothing can have widened.
 
 **An ACL-read failure on the SOURCE fails the entry; it never degrades.** This is the single most
 important thing to internalise before touching this code. "Degrade gracefully — carry on without the
 ACL" is the instinctive choice and it is **wrong here**, because absent ACLs are not "no
 information", they are an instruction to **CLEAR**. A transient `EMFILE` would therefore *strip* the
 destination's existing ACLs, including a directory's **default** ACL, which then governs everything
-created beneath it afterwards. That can be more destructive than the source-fidelity failure
-described above.
+created beneath it afterwards. That is worse than the original bug.
 
 **Failing must be accounted, or a remote copy hangs.** A source-side entry that fails before its
 message is sent leaves the destination waiting for an entry that never arrives, so it never sends
@@ -355,51 +409,48 @@ through unchanged sidesteps this entirely: those bytes were already validated by
 The on-disk format is defined little-endian (`__le16`/`__le32`), so it is portable across hosts
 as-is, and the destination kernel validates on `fsetxattr`.
 
-Code that *constructs* an ACL — id remapping, a synthesized entry — must sort canonically or it will
-fail at `fsetxattr`.
+Any future code that *constructs* an ACL — id remapping, a synthesized entry — must sort canonically
+or it will fail at `fsetxattr`.
 
 ## Remote copies
 
-The wire carries the same opaque bytes. `protocol::Metadata` has an `acls: WireAcls` field — an enum
-distinguishing `Captured { access, default }` (authoritative, including the "has none" case) from
-`Unknown` (no ACL information at all: capture off, or the source could not read them) — and
-`MasterHello::Source` has a
-`capture: ExtendedMetadataCapture { file_acl, dir_acl, root_acl_notice }` field so the source knows
-whether to read ACLs at all. Without it the source — which is told `preserve` by nobody — would have
-to read them unconditionally, landing the per-entry cost on every remote copy including ones that do
-not want ACLs. The first two flags drive the per-entry reads. The historically named
-`root_acl_notice` field is only the settings bit for the syscall-free
-[ACL-preservation notice](#the-acl-preservation-settings-notice); it never populates a `Metadata`.
+The wire carries the same opaque bytes: `protocol::Metadata` gained an `acls: WireAcls` field — an
+enum distinguishing `Captured { access, default }` (authoritative, including the "has none" case)
+from `Unknown` (no ACL information at all: capture off, or the source could not read them) — and
+`MasterHello::Source` gained a
+`capture: ExtendedMetadataCapture { file_acl, dir_acl,
+root_acl_notice }` field so the source knows
+whether to probe at all. Without it the source — which is told `preserve` by nobody — would have to
+probe unconditionally, landing the per-entry cost on every remote copy including ones that do not
+want ACLs. The first two flags drive the per-entry reads; `root_acl_notice` only arms the
+one-per-run [source-root notice](#the-source-root-warning) and never populates a `Metadata`.
 
 [remote_protocol.md §2.5](remote_protocol.md) is the authority: which messages carry which ACL, why
-a `Captured` `None` means CLEAR while `Unknown` authorizes no source-derived ACL set or clear, and
-how a failed read is accounted. Mode application and strict reused-directory lockdown can still
-affect destination ACL state. Do not duplicate the protocol details here.
+a `Captured` `None` means CLEAR while `Unknown` means the destination's ACLs are left untouched, and
+how a failed read is accounted. Do not duplicate it here.
 
-One case is worth naming because a false authoritative absence is destructive. The remote
+One case is worth naming because getting it wrong would have been actively destructive. The remote
 `--dereference` (`-L`) directory walk does not retain its transient enumeration descriptor for the
 later ACL capture, so it cannot read the ACL from the fd whose contents it enumerated. Reporting "no
-ACL" would instruct the destination to CLEAR rather than merely omit the source ACL. That walk opens
-the directory by path instead, after enumeration succeeds. This is the same concession `-L` makes
-elsewhere (it is documented as not TOCTOU-hardened), and avoids silently stripping the destination.
+ACL" would not merely have failed to carry the source's ACLs — an authoritative absence is an
+instruction to CLEAR, so it would have **stripped the destination's**. So that walk opens the
+directory by path instead, after enumeration succeeds. That is the same concession `-L` already
+makes everywhere else (it is documented as not TOCTOU-hardened), and it is the honest answer rather
+than a silently destructive one.
 
 ## `--require-toctou-safe` containment
 
 The invariant:
 
-> Under `--require-toctou-safe`, no destination entry that rcp **creates and successfully
-> completes** carries an ACL entry that did not come from its source. Every destination directory
-> rcp creates or reuses is prevented from passing an inherited ACL on — and in the one directory rcp
-> writes into without creating or reusing it (the ambient parent of a direct operand), the created
-> entry itself is scrubbed instead.
+> Under `--require-toctou-safe`, no destination entry that rcp **creates** carries an ACL entry that
+> did not come from its source. Every destination directory rcp creates or reuses is prevented from
+> passing an inherited ACL on — and in the one directory rcp writes into without creating or reusing
+> it (the ambient parent of a direct operand), the created entry itself is scrubbed instead.
 
-Both "creates" and "successfully completes" are load-bearing. A create whose ACL cannot be sanitized
-fails before rcp writes children/data or applies final metadata; its best-effort slot cleanup can
-also fail. A **reused** directory was already there and is outside the created-entry invariant: it
-keeps its access ACL present but masked during lockdown. At successful finalize, `d:acl` replaces or
-clears both ACLs according to the source; without `d:acl`, the destination access ACL remains and
-its original default ACL is restored. The invariant is about what the copy creates successfully, not
-about scrubbing a destination tree or promising rollback after a failed create.
+The "that rcp creates" is load-bearing, not throat-clearing. A **reused** directory is one that was
+already there, and rcp was not asked to change it: it keeps its own access ACL throughout, and the
+default ACL it had before the copy is put back at the end. The invariant is about what the copy
+*writes*, not about scrubbing a destination tree.
 
 One directory kind is left: the **ambient operand parent** — the pre-existing directory a *direct*
 operand is written into (`rcp file.txt existing-dir/`), which rcp neither creates nor reuses as a
@@ -409,25 +460,17 @@ copy destination. rcp does write there — exactly one entry — so containment 
 `system.posix_acl_access` and `system.posix_acl_default` all run inside **one blocking closure**,
 which either is reclaimed before it starts or runs to completion after it wins the start/cancel
 race. No cancellation (a `--fail-early` sibling abort dropping the future) can therefore abandon a
-created directory between those steps. If the re-open or strip fails, the closure attempts one
-unconditional `rmdir` of the current slot through the pinned parent, then reports the original
-error. This is slot cleanup, not an exact-inode check: it can remove a compatible empty replacement,
-while an incompatible or populated replacement and any cleanup error leave the slot occupied. A
-surviving directory created by rcp remains copier-owned at `0o700`, with inherited access entries
-masked off; rcp neither descends into it nor widens it. This statement relies on the strict-mode
-parent write-control and single-writer preconditions: the ambient parent is caller-trusted, and each
-nested parent is already owner-only or locked down, so a protected actor cannot substitute a
-compatible directory between `mkdirat` and the re-open. The re-open is not an inode-identity proof.
-Two ACL syscalls per successful directory and **none per file** beneath one: stripping the default
-ACL stops the inheritance chain for the whole subtree.
+created-but-unsanitized directory, and a directory whose open or strip fails is removed
+(best-effort, it is empty) rather than left carrying inherited ACLs an indistinguishable rerun would
+then faithfully "restore". Two syscalls per directory and **none per file** beneath one: stripping
+the default ACL stops the inheritance chain for the whole subtree.
 
 **Reused directories.** The lockdown that restricts a reused destination directory to `0o700` for
 the copy's duration already neuters its *access* ACL (the `chmod` rewrites `MASK`), but a `chmod`
 does not touch a **default** ACL, so children created during the copy would still inherit it. The
 lockdown therefore also **snapshots and removes the default ACL** for the copy's duration and puts
-it back at finalize when `d:acl` is off. Its access ACL is not stripped: the lockdown masks it, then
-ordinary directory metadata application either leaves it in place (`d:acl` off) or replaces/clears
-it from the source (`d:acl` on).
+it back at finalize. Its access ACL is deliberately left alone: rcp was not asked to change a
+directory that already existed.
 
 **Direct files in the ambient parent.** A file created there has no sanitized directory above it, so
 `create_file` removes the inherited access ACL **inside the creation closure** (files carry no
@@ -435,24 +478,20 @@ default ACL, so one attribute suffices). Without it the inherited entries sit in
 owner-only create mode — and the final chmod to the source mode re-derives `ACL_MASK` from the group
 bits and activates them: a strict copy of a plain `0640` file would grant a named user effective
 read access its source never did. Files created beneath rcp-created or locked directories skip this
-(the chain was already broken above them), so the cost is per direct operand, not per file. If the
-strip fails, the closure attempts one unconditional unlink of the current slot through the pinned
-parent and returns the strip error. A compatible non-directory replacement can be removed; a
-directory or failed cleanup can remain. The file rcp created contains no copied data, stays at
-`0o600` with inherited entries masked off, and is never widened.
+(the chain was already broken above them), so the cost is per direct operand, not per file.
 
 At finalize a locked directory's default ACL is resolved through the lockdown guard, one of two
 ways: with `d:acl` on, the **source's** default ACL is installed (nothing to write when the source
 has none — the lockdown already left the directory bare, which is the correct end state); otherwise
 the snapshot is restored (nothing to do when there was none). The guard stays **armed** through
-every remaining fallible step and cancellation point up to the successful return, so a cancelled or
-failed finalize rolls back rather than keeping the source's ACL — and armed even when the directory
-originally had no default ACL, because the rollback then means *removing* whatever a partial
-finalize installed, not leaving it. Every finalize write to the guarded attribute is **serialized
-against the guard's rollback**. A write still queued when its waiter is dropped is reclaimed before
-it starts, but one already taken by a blocking worker cannot be cancelled; without serialization,
-that write could land *after* the `Drop` rollback and silently undo it. A write that finds the guard
-already disarmed is skipped instead.
+every remaining fallible step — including the final re-stat verification and every cancellation
+point up to the successful return, so a cancelled or verify-rejected finalize rolls back rather than
+keeping the source's ACL — and armed even when the directory originally had no default ACL, because
+the rollback then means *removing* whatever a partial finalize installed, not leaving it. Every
+finalize write to the guarded attribute is **serialized against the guard's rollback**. A write
+still queued when its waiter is dropped is reclaimed before it starts, but one already taken by a
+blocking worker cannot be cancelled; without serialization, that write could land *after* the `Drop`
+rollback and silently undo it. A write that finds the guard already disarmed is skipped instead.
 
 Restoring a snapshot runs **first**, unwinding the lockdown in the reverse of the order it was
 applied — ACL removed last, so restored first; then the owner; then the mode. Two reasons, neither
@@ -466,10 +505,12 @@ of them about the mode:
   path is required to treat as an error rather than produce.
 
 The restore does not compete with the finalize `chmod` for the widening slot, because only a
-**default** ACL is restored and a default ACL is mode-neutral. Any implementation that also restores
-an *access* ACL must perform that restore before the chmod: the snapshot's `USER_OBJ`/`MASK`/`OTHER`
-agree with the directory's original mode, not the source's, so a later restore would install the
-wrong rwx bits.
+**default** ACL is ever restored and a default ACL is mode-neutral. That is a consequence of the
+lockdown having narrowed to the default ACL alone; it was not always true. While the lockdown also
+stripped the *access* ACL, the restore had to precede the chmod for a third reason — the snapshot's
+`USER_OBJ`/`MASK`/`OTHER` agree with the directory's *original* mode, not the source's, so a late
+restore would install the wrong rwx bits and the finalize re-stat would reject the copy. Anything
+that reintroduces an access-ACL restore here inherits that constraint.
 
 Failing to *strip* at lockdown time with `EOPNOTSUPP` is tolerated (a filesystem without ACL support
 cannot have had one). Failing to *restore* at finalize is an error: the directory would permanently
@@ -509,9 +550,10 @@ because the create mode leaves the mask empty — but present); under strict mod
 all.
 
 This is deliberately **not** implemented as an implication. The flags are orthogonal — containment
-against races versus fidelity to the source — and auto-enabling `acl` would impose the per-entry ACL
-read on a flag people reach for a different reason, while silently overriding an explicit
-`--preserve-settings=none`. It remains a recommendation and a settings-derived notice.
+against races versus fidelity to the source — and auto-enabling `acl` would impose the per-entry
+probe on a flag people reach for a different reason, while silently overriding an explicit
+`--preserve-settings=none`. It is a recommendation, and — when the root probe has evidence for it —
+a warning.
 
 ## Tool coverage
 
@@ -534,14 +576,17 @@ chooses which directory's mode and ownership to apply.
 
 **`--overwrite` skips ACL-only differences.** A file that compares equal under `--overwrite-compare`
 (default `size,mtime`) is not transferred and keeps its old ACL. This is the same shape as `mode`,
-which the default comparison also ignores. Closing the gap requires an `acl` term in the comparison
-DSL and ACL bytes in the destination manifest.
+which the default comparison also ignores. Closing it means an `acl` term in the compare DSL and ACL
+bytes in the destination manifest; that is a natural follow-up.
 
 **Inherited destination ACLs are not contained on the default path.** Widening direction 2 stands
 for a copy that requests neither `acl` nor `--require-toctou-safe`. This is deliberate: containing
 it costs either the per-entry probe or the per-directory strip, and neither is worth imposing on
 ordinary data movement for what is a privileged-copy concern.
 [Who pays to contain inheritance](#who-pays-to-contain-inheritance) tabulates the alternatives.
+
+**The source-root warning is a heuristic**, with the limits listed
+[above](#the-source-root-warning).
 
 **NFSv4 ACLs are neither handled nor detected.** A source on an NFSv4-ACL filesystem
 (`system.nfs4_acl`) has no `system.posix_acl_access`, so it reads as "no ACL" — and, because absent

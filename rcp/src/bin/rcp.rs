@@ -1624,6 +1624,30 @@ async fn async_main(
                 ));
             }
         };
+        // check for existing destination only when not using trailing slash (single source case)
+        if src_strings.len() == 1 && !dst_string.ends_with('/') && !(args.overwrite || args.delete)
+        {
+            // under strict operand resolution, probe the destination fd-relative (parent opened
+            // openat2 RESOLVE_NO_SYMLINKS) so a symlinked destination prefix fails closed instead
+            // of being followed by a path-based `exists()`. The engine also validates the prefix
+            // up front, so this is only the friendly pre-flight message; keeping it fd-relative
+            // avoids a pre-engine symlink-following existence probe.
+            let dst_exists = if common::safedir::strict_operand_resolution() {
+                common::safedir::strict_probe_dst_kind(&dst_path, common::Side::Destination)
+                    .await
+                    .with_context(|| format!("cannot probe destination {dst_path:?}"))?
+                    .is_some()
+            } else {
+                dst_path.exists()
+            };
+            if dst_exists {
+                return Err(anyhow!(
+                    "Destination path {dst_path:?} already exists! \n\
+                    If you want to copy INTO it, then follow the destination path with a trailing slash (/). Use \
+                    --overwrite if you want to overwrite it"
+                ));
+            }
+        }
         src_dst.push((src_path, dst_path));
     }
     // under --require-toctou-safe, refuse byte-equal duplicate resolved destinations up front — a
@@ -1868,15 +1892,15 @@ fn main() -> Result<(), anyhow::Error> {
         // in remote mode the master runs no metadata controllers — all probes
         // fire inside rcpd on the remote hosts. Clear both histogram fields so
         // that:
-        //   1. The master does not open --auto-meta-histogram-log locally
+        //   1. The master does not validate --auto-meta-histogram-log locally
         //      against a path that may only exist on the remote hosts.
         //   2. The master does not spawn a logger task that would write an empty
         //      header-only log file at <PATH>.rcp-master.<ext> on the master's
         //      filesystem.
         //   3. The master does not spawn accumulators that will never receive a
         //      sample (master has no controllers in remote mode).
-        // the RcpdConfig still carries the original path; each rcpd opens and holds its own log
-        // file locally.
+        // the RcpdConfig still carries the original path; each rcpd validates
+        // and writes its own log locally.
         throttle.histogram_log_path = None;
         throttle.histogram_enabled = false;
     }

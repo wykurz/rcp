@@ -74,11 +74,10 @@ struct DirectoryState {
     announced: bool,
     /// whether to keep this directory if it ends up empty
     keep_if_empty: bool,
-    /// what the lockdown must resolve at completion (original owner + original default ACL state),
-    /// `Some` iff this reused directory was locked down under strict operand resolution (see
+    /// what the lockdown must undo at completion (original owner + original ACLs), `Some` iff this
+    /// reused directory was locked down under strict operand resolution (see
     /// [`common::safedir::lockdown_reused_dir`]); `None` for a freshly created directory, which must
-    /// never be restore-chowned and has no destination ACL state to restore (strict creation also
-    /// strips inherited ACLs)
+    /// never be restore-chowned and whose inherited ACLs were stripped outright at creation
     reused_lock: Option<common::safedir::ReusedDirLock>,
 }
 
@@ -222,9 +221,8 @@ impl DirectoryTracker {
     /// * `was_created` - true if we created this directory, false if it already existed
     /// * `entry_count` - total child entries (files + dirs + symlinks)
     /// * `keep_if_empty` - whether to keep this directory if empty
-    /// * `reused_lock` - what to resolve at completion (original owner + original default ACL
-    ///   state) for a strict-mode locked reused directory (`None` for fresh dirs and the default
-    ///   path)
+    /// * `reused_lock` - what to undo at completion (original owner + original ACLs) for a
+    ///   strict-mode locked reused directory (`None` for fresh dirs and the default path)
     #[allow(clippy::too_many_arguments)]
     pub fn register_directory(
         &mut self,
@@ -478,11 +476,11 @@ impl DirectoryTracker {
         if let Some(metadata) = self.metadata.remove(dst) {
             match own_dir.as_ref() {
                 Some(dir) => {
-                    // for a reused directory locked down under strict mode, resolve the snapshotted
-                    // default ACL and keep the uid at the copier until publishing either the original
-                    // or source uid directly; no intermediate owner differs from the final owner.
-                    // none for fresh dirs.
-                    // the source's access AND default ACLs travel in the stored wire metadata; a
+                    // for a reused directory locked down under strict mode, put back the ACLs the
+                    // lockdown stripped and restore the original owner component-wise, then apply
+                    // source metadata (see set_reused_dir_metadata_fd — no transient window hands the
+                    // directory to a hostile prior owner); None for fresh dirs.
+                    // The source's access AND default ACLs travel in the stored wire metadata; a
                     // `Captured` all-`None` value means the source had none and the destination's
                     // must be CLEARED (see the same note in `destination.rs`). `Unknown` means the
                     // source could not READ them (a committed directory that failed to open — its

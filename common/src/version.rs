@@ -43,8 +43,7 @@ pub struct ProtocolVersion {
 /// tell two 0.38.0-dev builds apart, so a stale same-version `rcpd` (on `PATH` or in the deploy
 /// cache) would otherwise pass compatibility and then fail — or misbehave — mid-copy. Revision 1
 /// covers the 0.38.0-dev `WireAcls` reshape; revision 2 the 0.39.0-dev `ExtendedMetadataCapture`
-/// gaining the historical `root_acl_notice` settings bit; revision 3 covers the first
-/// max-files-in-flight rcpd spawn contract;
+/// gaining `root_acl_notice`; revision 3 covers the first max-files-in-flight rcpd spawn contract;
 /// revision 4 covers source-owned concurrency, its internal overrides, and readiness fields;
 /// revision 5 covers the final daemon CLI contract: removing its unreachable explicit-unlimited
 /// override and requiring a positive remote-copy connection timeout; revision 6 makes the public
