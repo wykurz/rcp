@@ -533,7 +533,7 @@ async fn strict_reuse_rlink_restores_a_reused_dirs_acls() -> anyhow::Result<()> 
 ///
 /// Every iteration must end with the ACL present, whichever of the three outcomes it lands in: the
 /// lockdown never got that far, it completed and the guard was dropped, or it was cancelled between
-/// the two — the case that used to lose them.
+/// removing the ACL and completing lockdown while the guard remained armed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lockdown_reused_dir_never_loses_the_default_acl_when_cancelled() -> anyhow::Result<()> {
     if !common::safedir::openat2_available() {
@@ -572,10 +572,9 @@ async fn lockdown_reused_dir_never_loses_the_default_acl_when_cancelled() -> any
             completed += 1;
         }
         drop(outcome);
-        // let any DETACHED blocking closure land: a `spawn_blocking` already submitted when the
-        // future was dropped still runs, and that is precisely how the ACL used to disappear after
-        // the cancellation rather than during it. Without this wait the assertion could pass by
-        // checking too early.
+        // let any detached blocking closure land: a `spawn_blocking` already submitted when the
+        // future was dropped still runs. Without this wait the assertion could pass before a
+        // post-cancellation ACL operation completes.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let got = get_acl(&dir_path, ACL_DEFAULT);
         assert_eq!(
@@ -797,10 +796,8 @@ async fn create_after_reused_dir_rollback_strips_inherited_acl() -> anyhow::Resu
 /// copier still owns the directory) and then runs several more fallible steps: the owner restore,
 /// the inner metadata applier, and the final re-stat verification. A cancellation landing anywhere
 /// in that tail is a FAILED copy of this directory, and failing toward *unchanged* requires the
-/// guard to still be armed there so its `Drop` rolls the just-installed source ACL back. The guard
-/// used to be disarmed BEFORE the verification: a cancellation at the re-stat await (or an fstat
-/// error, or a verification failure) then skipped the rollback and left the source's default ACL
-/// installed after a failed copy.
+/// guard to remain armed there so its `Drop` rolls the just-installed source ACL back. This includes
+/// cancellation at the re-stat await, an fstat error, or a verification failure.
 ///
 /// Cancellation is driven by POLL COUNT, exactly as in
 /// `lockdown_reused_dir_never_loses_the_default_acl_when_cancelled` (see there for why a

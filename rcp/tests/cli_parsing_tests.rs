@@ -1417,9 +1417,8 @@ fn require_toctou_safe_accepts_localhost_colon_escape_hatch() {
     assert_eq!(std::fs::read(tmp.join("dst/a.txt")).unwrap(), b"hello");
 }
 
-// ── Strict destination-prefix validation (round-5 regression matrix) ──────────
-// Each of these exits 0 on the pre-fix code (the destination prefix was validated
-// only conditionally / after the source filter), and must now fail closed.
+// ── Strict destination-prefix validation ─────────────────────────────────────
+// each case must fail closed even when a source filter bypasses later filesystem work.
 
 /// Helper: a canonicalized tempdir with `real/` (a dir) and `link -> real` (a symlinked prefix).
 #[cfg(target_os = "linux")]

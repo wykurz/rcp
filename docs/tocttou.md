@@ -1,9 +1,8 @@
 # TOCTTOU Vulnerabilities in the RCP tools
 
 This document describes Time-of-Check-Time-of-Use (TOCTTOU) race condition vulnerabilities that
-affect the RCP tools when used with elevated privileges, and documents the hardening that is now
-implemented on Linux. The examples below use `rcp`, but the attack pattern applies to the other
-tools as well.
+affect the RCP tools when used with elevated privileges, and documents the Linux hardening. The
+examples below use `rcp`, but the attack pattern applies to the other tools as well.
 
 ## Table of Contents
 
@@ -36,8 +35,8 @@ than an actor who can modify the paths being traversed.* Root operating on trust
 is outside this threat; the risk arises specifically when a more-privileged run traverses a tree
 that a less-privileged actor can write to.
 
-On Linux, the local and remote default paths are now TOCTOU-hardened — for everything *at or below
-the named root*. The trust of the path *above* the named root is the caller's responsibility;
+On Linux, the local and remote default paths are TOCTOU-hardened — for everything *at or below the
+named root*. The trust of the path *above* the named root is the caller's responsibility;
 `--require-toctou-safe` additionally machine-checks the operand form and enforces symlink-free
 resolution of the whole operand path (see
 [The Linter](#the-linter---toctou-check-and---require-toctou-safe)).
@@ -68,8 +67,8 @@ write to destination → leaks /etc/shadow
 
 ## Attack Scenarios
 
-These scenarios explain the classes of attack the hardening defends against. Each is now defeated on
-Linux for the default (non-`-L`) path.
+These scenarios explain the classes of attack the hardening defends against. The default (non-`-L`)
+Linux path defeats each one.
 
 ### Scenario 1: Symlink Race Attack (Privileged Source Read)
 
@@ -184,66 +183,63 @@ taken from the *same* fd, and metadata is applied through the destination's own 
 re-resolved by path.
 
 **Fidelity holds throughout the copy, not only at the end: destination files are created owner-only
-until their contents are written.** A destination file is created at `0o600` and only widened to the
-source mode by the closing `fchmod`, after the last byte and after every other metadata step — the
-file counterpart of the directory split-chmod below. Creating it at the final mode instead publishes
-the destination's *audience* before its contents exist. At default settings that is an exposure of
-partial contents: the mode mask is `0o0777` (`setuid`/`setgid`/sticky stripped, matching `cp`), so a
-world-readable source yields a world-readable destination from creation onward, and anyone who can
-reach the directory can read however much has landed. No symlink swap is needed — a world-searchable
+until their contents are written.** A destination file is created at `0o600` and widened only after
+the last byte, by the final `fchmod` or access-ACL application — the file counterpart of the
+directory split-chmod below. Creating it at the final mode instead publishes the destination's
+*audience* before its contents exist. At default settings that is an exposure of partial contents:
+the mode mask is `0o0777` (`setuid`/`setgid`/sticky stripped, matching `cp`), so a world-readable
+source yields a world-readable destination from creation onward, and anyone who can reach the
+directory can read however much has landed. No symlink swap is needed — a world-searchable
 destination directory is enough, which is the default for any repeat or incremental
 `rcp --overwrite`. Withholding the owner execute bit is deliberate as well — a half-written
 executable should not be executable.
 
-The escalation case (Scenario 4 above) needs the special bits preserved — `--preserve`, or a
-`--preserve-settings` mask of `7777` — **and** an interrupted copier. Root holds `CAP_FSETID` —
-*"don't clear set-user-ID and set-group-ID mode bits when a file is modified"* — so writing does not
-strip `S_ISUID` from a root copier's destination, and a `SIGKILL`, OOM kill, or crash after the last
-byte left a complete, functional, setuid-root executable whose contents the *source's* owner
-authored. Be precise about which window that is: the **successful** copy was never an exec window on
-Linux, because the destination stays open for writing through metadata application and `execve`
-refuses a file any process holds open for writing with `ETXTBSY`. It is the copier's *death* that
-closes that descriptor and drops the protection, which is exactly when the old creation mode had
-already published a finished-looking setuid binary.
+The escalation case (Scenario 4 above) explains why creation at the final mode is unsafe when
+special bits are preserved (`--preserve`, or a `--preserve-settings` mask of `7777`) and the copier
+is interrupted. Root holds `CAP_FSETID` — *"don't clear set-user-ID and set-group-ID mode bits when
+a file is modified"* — so writing a destination created with the final special-bit mode would not
+strip `S_ISUID`. A `SIGKILL`, OOM kill, or crash after the last byte could then close the write
+descriptor and leave a complete, functional, setuid-root executable whose contents the *source's*
+owner authored. While the descriptor remains open, `execve` refuses the file with `ETXTBSY`;
+owner-only creation ensures interruption cannot publish that executable audience.
 
 This is unconditional, not gated behind `--require-toctou-safe`: a file the copy creates is its own
 new object with no prior user-visible state to preserve, exactly like a fresh directory. The mode is
 not a parameter of the creating call, so no call site can opt out. One consequence is intended: a
-copy that is interrupted, or that fails anywhere before *or during* metadata application, leaves a
-file readable only by its **owner**, at `0o600`. "Owner", not "copier", because the chown runs
-first: a copy that preserves ownership and gets past that step has already handed the file to the
-source's uid, so a later failure leaves it owner-only under *that* uid rather than the copier's. (No
-exposure either way — the source's owner authored the contents and could already read them, and only
-a privileged copier can chown to another uid in the first place — but the file is not necessarily
-one the copier can still read.) That the mode stays `0o600` at all holds at every step because the
-widening `fchmod` runs last: metadata application is chown → utimens → chmod, chown first so it
-cannot clear the `setuid` bit the chmod restores, and chmod last so no later failure can publish the
-final mode on a file the copy is about to report as failed. The most likely instance is a copy that
-preserves ownership whose `fchown` is refused — a non-root copier copying a file owned by someone
-else gets `EPERM` at the first step. The failure is reported and the copy exits non-zero either way,
-and a later run *normally* re-copies the file: the default `--overwrite-compare` is `size,mtime`,
-and a partial file differs in size.
+copy that fails before the final widening step leaves a file readable only by its **owner**. Its
+ordinary permission bits remain `0o600`; the access-ACL branch can first add requested special bits
+with a narrowed `fchmod`, but they are inert because no execute bit is set. An interruption before
+widening has the same result. Cancellation racing the final atomic widening syscall can leave either
+the owner-only state or the correctly widened source audience, never a partially applied or broader
+audience. "Owner", not "copier", because the chown runs first: a copy that preserves ownership and
+gets past that step has already handed the file to the source's uid, so a later failure leaves it
+owner-only under *that* uid rather than the copier's. (No exposure either way — the source's owner
+authored the contents and could already read them, and only a privileged copier can chown to another
+uid in the first place — but the file is not necessarily one the copier can still read.) Every
+fallible preparatory metadata step precedes widening. Without a source access ACL the sequence is
+chown → utimens → final `fchmod`; with one it is chown → utimens → narrowed owner-only `fchmod` →
+final ACL application. The most likely instance is a copy that preserves ownership whose `fchown` is
+refused — a non-root copier copying a file owned by someone else gets `EPERM` at the first step. The
+failure is reported and the copy exits non-zero either way, and a later run *normally* re-copies the
+file: the default `--overwrite-compare` is `size,mtime`, and a partial file differs in size.
 
-That re-copy is not guaranteed, and the exceptions are worth stating precisely, because before this
-change a skipped retry was harmless — a failed metadata application still left the file at its
-correct final mode, whereas now it leaves the destination owner-only until something re-copies it.
-There are two. **A failure at the closing `fchmod`**: the timestamps have already been applied by
-then, so the destination matches its source on both size and mtime and is skipped. Something has to
-run last, and under the previous chown → chmod → utimens order this was the `futimens` failure
-instead; what changed is that the step which can strand a file is now also the step that no longer
-publishes a mode the copy did not finish earning. **The nanosecond concession**: `metadata_equal`
-skips the nanosecond comparison whenever *either* side's `mtime_nsec` is zero, for filesystems that
-do not store sub-second timestamps (`common/src/filecmp.rs`), so even a destination that never
-reached `futimens` — and so carries its own write time — compares **equal** to its source under the
-default `size,mtime` (mode is not compared) exactly when two conditions hold together: that write
-and the source mtime fall in the **same whole second**, **and** the nanosecond field is zero on
-**either** side. Copying a file written in that same second reaches it, as does any source carrying
-a whole-second mtime (`touch -d @<seconds>`, a tar extraction, a reproducible-build epoch) or a
+That re-copy is not guaranteed, and the exceptions are worth stating precisely: a failed metadata
+application can leave the destination owner-only until something re-copies it. There are two. **A
+failure at the final widening step** (`fchmod`, or source access-ACL application): the timestamps
+have already been applied by then, so the destination matches its source on both size and mtime and
+is skipped. The failure both strands the destination owner-only and withholds permissions the copy
+did not finish earning. **The nanosecond concession**: `metadata_equal` skips the nanosecond
+comparison whenever *either* side's `mtime_nsec` is zero, for filesystems that do not store
+sub-second timestamps (`common/src/filecmp.rs`), so even a destination that never reached `futimens`
+— and so carries its own write time — compares **equal** to its source under the default
+`size,mtime` (mode is not compared) exactly when two conditions hold together: that write and the
+source mtime fall in the **same whole second**, **and** the nanosecond field is zero on **either**
+side. Copying a file written in that same second reaches it, as does any source carrying a
+whole-second mtime (`touch -d @<seconds>`, a tar extraction, a reproducible-build epoch) or a
 destination filesystem without sub-second timestamps. Adding the mode to the comparison
-(`--overwrite-compare=size,mtime,mode`) closes both — a stranded destination is `0o600` and its
-source is not — as does removing the destination first. Neither deleting the file on a metadata
-failure nor changing the comparison default is done here: both are behavior changes that need their
-own design.
+(`--overwrite-compare=size,mtime,mode`) detects a stranded permission-widening failure, as does
+removing the destination first. Neither deleting the file on a metadata failure nor changing the
+comparison default is done here: both are behavior changes that need their own design.
 
 One sharp edge of that ordering is *not* transient: `--preserve-settings="f:time,7777"` asks for the
 source's mode but not its ownership, and the `fchown` is issued only when `uid` or `gid` is
@@ -254,10 +250,12 @@ authored. Nothing later narrows it: that is the requested outcome, not a window.
 but preserve both or neither when the source tree is not yours.
 
 **"The named root"** is the final component of the operand path — the file or directory you name. It
-is opened `O_NOFOLLOW` and classified by the `fstat` of that held fd, so a swap of the root *entry
-itself* (within its parent) is caught at open, and everything reachable beneath it is the hardened
-tree. (Corollary: the root's immediate parent need not be non-writable for the guarantee to hold — a
-swap of the root entry there is caught at open.)
+is opened `O_NOFOLLOW` and classified by the `fstat` of that held fd, selecting one object without
+following a symlink; everything reachable beneath a selected directory is the hardened tree.
+Whatever object is present when the no-follow open runs becomes selected; later fd-relative
+operations act on it or fail if its type is unsuitable. The root's immediate parent need not be
+non-writable for containment: a replacement there cannot redirect resolution outside the pinned
+parent.
 
 ### Out of scope — what we deliberately do not promise
 
@@ -325,14 +323,14 @@ by re-stat and fails closed if it did not actually land (a filesystem that repor
 `chown`/`chmod` without honoring it, e.g. CIFS without unix extensions). A reused directory that had
 the setgid bit keeps it through the lockdown — children created during the copy inherit the
 directory's group, and finalize cannot repair the group of a child already created — so the group is
-also pinned to the value captured at classification: taking uid ownership freezes the group (only
-the copier or root can change it now), and if a prior owner raced a `chgrp` into the takeover window
-the copier resets it, so a setgid directory cannot funnel freshly written children into an
-attacker-chosen group. The directory's **default ACL** is snapshotted and removed at the same point,
-for the same reason the mode is restricted: a `chmod` cannot reach it, so children created during
-the copy would otherwise inherit it and be granted access beyond their `mode` (its *access* ACL
-needs no strip — the `fchmod(0o700)` rewrites `ACL_MASK` to `---`, so every named entry grants
-nothing for the duration). At finalize — after all children and any `--delete` prune — the
+also pinned to the value captured at classification: taking uid ownership freezes the group (after
+takeover, only the copier or root can change it), and if a prior owner raced a `chgrp` into the
+takeover window the copier resets it, so a setgid directory cannot funnel freshly written children
+into an attacker-chosen group. The directory's **default ACL** is snapshotted and removed at the
+same point, for the same reason the mode is restricted: a `chmod` cannot reach it, so children
+created during the copy would otherwise inherit it and be granted access beyond their `mode` (its
+*access* ACL needs no strip — the `fchmod(0o700)` rewrites `ACL_MASK` to `---`, so every named entry
+grants nothing for the duration). At finalize — after all children and any `--delete` prune — the
 directory's original owner is restored and the source metadata re-applied (the final owner is the
 source owner for each `--preserve`d component and the original owner otherwise, and the mode is the
 same masked metadata the unhardened copy would apply — the source directory's, or the update tree's
@@ -470,8 +468,10 @@ Specific invariants enforced:
   final — possibly setuid — mode before its contents exist; see
   [Scope of TOCTOU safety](#scope-of-toctou-safety). The file creation mode is a constant rather
   than a parameter of the creating call, so no call site can opt out of it.
-- On overwrite paths, a `recheck` verifies that the `(dev, ino)` of the entry matches the originally
-  classified handle before performing the unlink.
+- On local and remote overwrite paths, removal operates fd-relatively through the pinned parent and
+  never follows a symlink. It removes the final component present at the name when the syscall runs;
+  it does not recheck `(dev, ino)` identity, so exact final-name identity across separate syscalls
+  is outside the guarantee. The mutation remains contained to the pinned parent directory.
 - Before recursively removing a directory, `rrm` verifies that the opened descent handle is still
   the walked inode. At the final removal boundary it rechecks the name and performs `rmdir` relative
   to the pinned parent fd. This prevents symlink or cross-parent redirection, but cannot eliminate
@@ -510,8 +510,8 @@ The operand paths themselves — the one place the fd-based walk still consults 
 - **Lexical form.** Every operand must be absolute and lexically normal: no `.` or `..` components,
   no empty (`//`) segments; a single trailing slash is allowed (it carries copy-into meaning for
   destinations). `realpath` output always qualifies. This makes string-level operand policies
-  (sudoers patterns, wrapper prefix checks) sound — `/vetted/../etc` can no longer pass a
-  `/vetted/*` check.
+  (sudoers patterns, wrapper prefix checks) sound — `/vetted/../etc` cannot pass a `/vetted/*`
+  check.
 - **No-symlink resolution.** Both operand opens switch from plain `openat` to
   `openat2(RESOLVE_NO_SYMLINKS)` (which implies `RESOLVE_NO_MAGICLINKS`), enforced by the kernel at
   the open itself: a symlink in any directory component of the path fails closed with `ELOOP`. This
@@ -521,27 +521,26 @@ The operand paths themselves — the one place the fd-based walk still consults 
   operated on as the link object and never followed (`ELOOP` where the open requires a directory,
   e.g. the `--delete` prune reopen).
 - **Resolved up front, then threaded.** Every operand prefix is validated at the entry of the
-  operation, **before any filter / dry-run / overwrite / `--update` branching** — the same
-  discipline the recursive walk already uses below the named root, now extended up to the operands
-  themselves. A symlinked prefix therefore fails closed before any downstream branch (a filtered-out
-  source root, a trailing-slash or `--overwrite` destination, a plain `--update`, or a `--dry-run`
-  that never touches the destination) can skip validation. The resulting parent fd is normally
-  retained for root-filter classification, existence checks, and the walk. Rlink's optional update
-  root is a documented implementation exception: it performs one up-front strict prefix/existence
-  probe and later opens the update parent again for its fd-relative walk. Both operations
-  independently use `openat2(RESOLVE_NO_SYMLINKS)`, so the second open cannot weaken containment;
-  consolidating them into one retained parent is a follow-up rather than a security dependency.
-  Where a dry run holds no persistent destination fd, the existence probes re-resolve with a
-  decomposed `openat2` (parent open + `O_NOFOLLOW` child), which is atomic and distinguishes an
-  intermediate-prefix symlink (fail closed) from a final component that is merely a symlink or
-  non-directory (a replaceable operand, accepted). The `--delete` prune scan is the one consumer
-  that, in a dry run, reopens the destination directory by its full path (`openat2`
-  `RESOLVE_NO_SYMLINKS`): this path is *below* the named root, which the real run walks fd-relative
-  and would replace or skip as it goes, so a symlink anywhere in it (an intermediate the real run
-  would replace, or a final symlink) yields `ELOOP` and the prune preview is simply skipped —
-  nothing to prune, since the real run creates a fresh directory there and exits successfully. The
-  operand prefix *above* the named root is still validated up front (fatal), so this below-root skip
-  does not weaken the contract; it only keeps the preview consistent with the real run.
+  operation, **before any filter / dry-run / overwrite / `--update` branching**. A symlinked prefix
+  therefore fails closed before any downstream branch (a filtered-out source root, a trailing-slash
+  or `--overwrite` destination, a plain `--update`, or a `--dry-run` that never touches the
+  destination) can skip validation. The resulting parent fd is normally retained for root-filter
+  classification, existence checks, and the walk. Rlink's optional update root is a documented
+  implementation exception: it performs one up-front strict prefix/existence probe and later opens
+  the update parent again for its fd-relative walk. Both operations independently use
+  `openat2(RESOLVE_NO_SYMLINKS)`, so the second open cannot weaken containment; consolidating them
+  into one retained parent is a follow-up rather than a security dependency. Where a dry run holds
+  no persistent destination fd, the existence probes re-resolve with a decomposed `openat2` (parent
+  open + `O_NOFOLLOW` child), which is atomic and distinguishes an intermediate-prefix symlink (fail
+  closed) from a final component that is merely a symlink or non-directory (a replaceable operand,
+  accepted). The `--delete` prune scan is the one consumer that, in a dry run, reopens the
+  destination directory by its full path (`openat2` `RESOLVE_NO_SYMLINKS`): this path is *below* the
+  named root, which the real run walks fd-relative and would replace or skip as it goes, so a
+  symlink anywhere in it (an intermediate the real run would replace, or a final symlink) yields
+  `ELOOP` and the prune preview is simply skipped — nothing to prune, since the real run creates a
+  fresh directory there and exits successfully. The operand prefix *above* the named root is still
+  validated up front (fatal), so this below-root skip does not weaken the contract; it only keeps
+  the preview consistent with the real run.
 - **Remote operands.** The master lints the remote path parts (which must be absolute as written;
   `host:~/x` forms are rejected) and mirrors the flag onto each spawned `rcpd`, which arms the same
   strict resolution for its root opens on the remote host. The source `rcpd` opens the source parent
@@ -627,7 +626,7 @@ so the security-relevant invariants each live in exactly one place:
   terminal hint exclusions can still complete in the producer. Destructive remove/delete filtering
   uses the authoritative kind in its transferred `AdmittedEntry`. None of these paths follows a
   symlink, and an error propagates rather than becoming a cheap non-directory result. The path-based
-  rcmp walk remains a read-only exception: a failed `DirEntry::file_type` currently falls back to
+  rcmp walk remains a read-only exception: a failed `DirEntry::file_type` falls back to
   non-directory for filtering. Making that path fail closed is a follow-up; it does not authorize
   filesystem mutation today.
 - **Copy planning**: after destination-only preflight, local regular-file copies use metadata from
@@ -664,15 +663,15 @@ terminal hint exclusions remain a producer-side fast path.
 The following are fully TOCTOU-hardened on Linux, against both leaf-entry and intermediate-directory
 symlink/path swaps:
 
-| Tool / path                          | Notes                                                                                 |
-| ------------------------------------ | ------------------------------------------------------------------------------------- |
-| `rcp` local copy                     | Files, dirs, symlinks; all overwrite branches                                         |
-| `rlink`                              | Hard-link walk incl. copy delegations                                                 |
-| `rchm`                               | Recursive chmod/chgrp/chown                                                           |
-| `rrm`                                | Recursive remove incl. read-only-dir relax                                            |
-| `--delete` pruning                   | fd-relative prune; enumeration + removal via held dst fd                              |
-| `rcp` remote copy — source side      | Two-pass fd-map: dirs opened `O_NOFOLLOW`, files read fd-relative                     |
-| `rcp` remote copy — destination side | Directory tracker fd-map: dirs created/opened `O_NOFOLLOW`, files written fd-relative |
+| Tool / path                          | Notes                                                                                     |
+| ------------------------------------ | ----------------------------------------------------------------------------------------- |
+| `rcp` local copy                     | Files, dirs, symlinks; all overwrite branches (exact final-name identity is out of scope) |
+| `rlink`                              | Hard-link walk incl. copy delegations                                                     |
+| `rchm`                               | Recursive chmod/chgrp/chown                                                               |
+| `rrm`                                | Recursive remove incl. read-only-dir relax                                                |
+| `--delete` pruning                   | fd-relative prune; enumeration + removal via held dst fd                                  |
+| `rcp` remote copy — source side      | Two-pass fd-map: dirs opened `O_NOFOLLOW`, files read fd-relative                         |
+| `rcp` remote copy — destination side | Directory tracker fd-map: dirs created/opened `O_NOFOLLOW`, files written fd-relative     |
 
 Remote `--delete` is not yet supported and is rejected by rcp before any operation begins.
 
@@ -688,7 +687,7 @@ policy's job — typically by pinning the full path in the rule rather than usin
 
 Under `--require-toctou-safe` the boundary tightens: operands must be absolute and lexically normal,
 and the full operand path — prefix included — is opened `RESOLVE_NO_SYMLINKS`, so the "resolved
-normally" clause above no longer applies; a symlink between the fixed prefix and the named operand
+normally" clause above does not apply; a symlink between the fixed prefix and the named operand
 fails closed instead of being followed. See
 [Strict operand resolution](#strict-operand-resolution---require-toctou-safe).
 
@@ -1015,6 +1014,7 @@ caller-provided option string.
 | `rcmp`                                       | Out of scope (read-only; no mis-permissioning possible)                                                                                                                                                                                                                                       |
 | POSIX ACLs                                   | Source ACLs preserved only with `--preserve-settings=all+acl`; `--require-toctou-safe` contains inherited *destination* ACLs but does not preserve the *source's* — pair the two (see [acls.md](acls.md))                                                                                     |
 | *Which* in-subtree file a swap makes us read | Out of scope — reads are not inode-pinned; a same-directory regular-file swap can change which file is read, but cannot escape the subtree or widen permissions (see [Scope of TOCTOU safety](#scope-of-toctou-safety))                                                                       |
+| *Which* in-parent entry overwrite removes    | Out of scope — overwrite mutates the final name through a pinned parent; a compatible same-name replacement can be removed, but the operation cannot follow it or escape that parent (see [Scope of TOCTOU safety](#scope-of-toctou-safety))                                                  |
 | Prefix trust (path above the named root)     | Caller's responsibility by default; under `--require-toctou-safe`, operands must be absolute + lexically normal and resolve `RESOLVE_NO_SYMLINKS` — a spliced symlink fails closed; prefix-writer renames stay in scope of the caller (see [Scope of TOCTOU safety](#scope-of-toctou-safety)) |
 | `fs.protected_hardlinks=0`                   | **Not defended** (userspace cannot close this gap)                                                                                                                                                                                                                                            |
 

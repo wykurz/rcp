@@ -812,11 +812,10 @@ fn describe_change(cur_mode: u32, cur_uid: u32, cur_gid: u32, plan: &EntryPlan) 
 /// Apply a computed plan to a single entry through the `O_PATH` [`Handle`] we
 /// already hold, never re-resolving the entry by path.
 ///
-/// The handle is pinned to the exact inode (opened `O_NOFOLLOW`), so both syscalls
-/// act on that inode rather than on a name: there is no TOCTOU window and no
-/// `recheck` is needed (unlike copy's name-based overwrite). A concurrent
-/// rename/symlink swap of the directory entry cannot redirect either operation to a
-/// different target.
+/// The handle is pinned to the exact inode (opened `O_NOFOLLOW`), so every syscall acts on that inode
+/// rather than on a name. A concurrent rename or symlink swap of the directory entry cannot redirect
+/// these operations. Copy overwrite has a different contract: its by-name mutation is contained by
+/// a pinned parent but is not bound to the inode classified earlier.
 ///
 /// Syscall choice, normally following the documented chown → chmod ordering:
 /// * **pre-chown chmod** — under the no-set-ID policy, existing set-ID bits are

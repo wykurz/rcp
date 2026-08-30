@@ -153,17 +153,15 @@ impl std::fmt::Display for Summary {
 ///
 /// `dst_dir.hard_link_handle_at` links the EXACT inode `src_handle` pins (via its `O_PATH` fd,
 /// using `linkat(.., "/proc/self/fd/N", .., AT_SYMLINK_FOLLOW)`) rather than re-resolving the
-/// source by name. This closes a TOCTOU window the old by-name `linkat` had: on an actor-writable
-/// source, `name` could be swapped to a different inode (symlink, FIFO, another file) between
-/// classification and the link, so the by-name link would target the replacement while rlink
-/// reported a hard-linked file. Linking the pinned inode means we either hard-link the exact
-/// regular file we classified or fail closed (`ENOENT` when its last link was removed) — never the
-/// swapped-in replacement. `linkat` still refuses to hard-link a directory (`EPERM`).
+/// source by name. On an actor-writable source, `name` can be swapped to a different inode
+/// (symlink, FIFO, another file) after classification; linking the pinned inode ensures rlink either
+/// hard-links the exact classified regular file or fails closed (`ENOENT` when its last link was
+/// removed), never the replacement. `linkat` still refuses to hard-link a directory (`EPERM`).
 ///
 /// On `EEXIST` under `--overwrite`, the existing destination is re-classified through `dst_dir`'s
 /// fd and, if it is an identical hard link (same dev+ino), left as is; otherwise it is removed via
-/// the recheck-guarded [`copy::remove_existing`] and the link is retried — mirroring copy's
-/// fd-relative overwrite branches.
+/// fd-relative [`copy::remove_existing`] and the link is retried — mirroring copy's overwrite
+/// branches.
 ///
 /// No metadata is applied here, and `f:acl` in particular must never reach this path: a hard-linked
 /// destination SHARES the source's inode, so writing an ACL "to the destination" would rewrite the
@@ -208,13 +206,13 @@ async fn hard_link_entry_fd(
                 });
             }
             tracing::info!("'dst' file type changed, removing and hard-linking");
-            // recheck-guarded, fd-relative removal contained to dst_dir (mirrors copy.rs).
+            // fd-relative removal is contained to dst_dir (mirrors copy.rs).
             let rm_summary = copy::remove_existing(
                 prog_track,
                 dst_dir,
                 dst_name,
                 dst_path,
-                &dst_handle,
+                dst_handle.into_removal_snapshot(),
                 &settings.copy_settings,
             )
             .await
@@ -250,9 +248,10 @@ async fn hard_link_entry_fd(
 /// `AT_SYMLINK_FOLLOW`), so the link targets the exact regular file that was classified, even if
 /// its directory entry is concurrently swapped — never a re-resolved name; entries that must be
 /// copied instead of hard-linked are delegated to `copy::copy_child` with the held parent `Dir`s —
-/// no path is re-resolved from a root. This closes the TOCTOU window the old path-based walk had
-/// between classifying an entry and acting on it. `--dereference` is the one exception — copy still
-/// resolves symlinks by path (`canonicalize`) and is not hardened.
+/// no path is re-resolved from a root. The held parents prevent full-path redirection and contain
+/// each by-name operation, while the pinned source handle makes hard-link creation inode-exact.
+/// `--dereference` is the one exception — copy still resolves symlinks by path (`canonicalize`) and
+/// is not hardened.
 #[instrument(skip(prog_track, settings))]
 pub async fn link(
     prog_track: &'static progress::Progress,
@@ -1592,7 +1591,7 @@ async fn delegate_copy(
 
 /// Resolve (create / reuse / overwrite) the destination directory fd-relative, open the source
 /// (and update) directories, then recurse via [`link_dir_contents`]. Mirrors copy's
-/// [`copy::resolve_dst_dir`] for the overwrite branches (recheck-guarded, fd-relative removal).
+/// [`copy::resolve_dst_dir`] for the overwrite branches (fd-relative, parent-contained removal).
 #[allow(clippy::too_many_arguments)]
 async fn link_dir_entry(
     prog_track: &'static progress::Progress,

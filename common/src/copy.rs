@@ -14,7 +14,7 @@ use crate::preserve;
 use crate::progress;
 use crate::rm;
 use crate::rm::{Settings as RmSettings, Summary as RmSummary};
-use crate::safedir::{self, Dir, FileMeta, Handle};
+use crate::safedir::{self, Dir, FileMeta, Handle, RemovalSnapshot};
 use crate::walk::{AdmittedEntry, AdmittedLeaf, EntryAdmission, EntryKind, LeafPermit, PermitKind};
 use crate::walk_driver::{
     DirAction, DirPreResult, EntryCx, ProcessedChildren, WalkVisitor, process_admitted_entry,
@@ -319,8 +319,8 @@ pub async fn copy(
 ///
 /// The local copy walk is fd-based: the source and destination roots are opened relative to
 /// their parent directories and every per-entry operation is performed through
-/// file-descriptor-relative syscalls (see [`crate::safedir`]). This closes the TOCTOU window the
-/// old path-based walk had between classifying an entry and acting on it. `--dereference` is the
+/// file-descriptor-relative syscalls (see [`crate::safedir`]). The held parents prevent full-path
+/// redirection and contain each by-name operation to its intended directory. `--dereference` is the
 /// one exception — it still resolves symlinks by path (`canonicalize`) and is not hardened.
 #[instrument(skip(prog_track, settings, preserve))]
 #[allow(clippy::too_many_arguments)]
@@ -1706,7 +1706,10 @@ async fn copy_file_fd(
                 {
                     return Ok(summary);
                 }
-                (current, FilePlan::Replace(dst_handle))
+                (
+                    current,
+                    FilePlan::Replace(dst_handle.into_removal_snapshot()),
+                )
             }
         };
         return copy_current_regular(
@@ -1780,9 +1783,9 @@ async fn copy_current_regular(
     // replaced: the failure that would most often abandon this copy before any byte exists is behind
     // us. It is not the last one — `create_file` below has its own (EMFILE, ENOSPC, EIO) and waits on
     // the ops-throttle, so a cancellation can still land between the two; see the note above on why
-    // rcp accepts that rather than staging and renaming. `execute_dst_plan` re-checks the planned
-    // entry by inode before unlinking, so the gap since planning fails closed rather than removing
-    // whatever occupies the name now.
+    // rcp accepts that rather than staging and renaming. `execute_dst_plan` removes by name through
+    // the pinned parent; a compatible replacement since planning may be removed, but the operation
+    // cannot escape that directory.
     execute_dst_plan(
         prog_track,
         dst_parent,
@@ -1820,7 +1823,9 @@ async fn copy_current_regular(
                         OverwriteCandidateDecision::Skip(summary) => {
                             return Ok(skip_summary(summary, &copy_summary));
                         }
-                        OverwriteCandidateDecision::Replace => FilePlan::Replace(dst_handle),
+                        OverwriteCandidateDecision::Replace => {
+                            FilePlan::Replace(dst_handle.into_removal_snapshot())
+                        }
                     }
                 }
             };
@@ -2061,7 +2066,7 @@ async fn copy_symlink_fd(
                 dst_parent,
                 dst_name,
                 dst_path,
-                &dst_handle,
+                dst_handle.into_removal_snapshot(),
                 settings,
             )
             .await?;
@@ -2139,16 +2144,12 @@ enum DestinationPreflight {
 enum FilePlan {
     /// Nothing is in the way. Create straight away.
     Vacant,
-    /// An entry is in the way and `--overwrite` says to replace it. Carries the handle it was
-    /// classified through, which [`remove_existing`] re-checks by inode before unlinking — so the
-    /// gap between planning and executing fails closed rather than removing whatever occupies the
-    /// name by then.
-    ///
-    /// Holding the handle across that gap is what makes the recheck sound, not merely convenient:
-    /// its `O_PATH` fd keeps the classified inode alive, so the inode *number* cannot be freed and
-    /// handed to a different file that would then compare equal. The cost is one extra open fd per
-    /// in-flight overwrite, for the duration of the throttle wait and the source open.
-    Replace(Handle),
+    /// An entry is in the way and `--overwrite` says to replace it. Once source-dependent planning
+    /// completes, the lightweight snapshot keeps the planned kind and accounting size without
+    /// holding the classification fd across the throttle wait. Removal is by name through the
+    /// pinned parent, so retaining that fd could not bind the later mutation to the classified
+    /// inode.
+    Replace(RemovalSnapshot),
 }
 
 /// Metadata-dependent decision for an occupied overwrite candidate.
@@ -2177,9 +2178,9 @@ fn skip_summary(skip: Summary, copy_summary: &Summary) -> Summary {
 ///
 /// Split from [`preflight_dst_file`] and [`plan_overwrite_candidate`] deliberately: the caller
 /// settles destination-only outcomes, opens the current source, and reserves throttle capacity
-/// before actually unlinking. When those were one step, a copy that then failed to open its source
-/// had already deleted a destination it could no longer replace. The split buys nothing against
-/// *cancellation* — see [`copy_file_fd`] for why rcp does not chase that.
+/// before actually unlinking. Separating these steps ensures a source-open failure leaves the
+/// existing destination intact. The split buys nothing against *cancellation* — see
+/// [`copy_file_fd`] for why rcp does not chase that.
 async fn execute_dst_plan(
     prog_track: &'static progress::Progress,
     dst_parent: &Arc<Dir>,
@@ -2189,16 +2190,16 @@ async fn execute_dst_plan(
     settings: &Settings,
     copy_summary: &mut Summary,
 ) -> Result<(), Error> {
-    let dst_handle = match plan {
+    let dst_snapshot = match plan {
         FilePlan::Vacant => return Ok(()),
-        FilePlan::Replace(dst_handle) => dst_handle,
+        FilePlan::Replace(dst_snapshot) => dst_snapshot,
     };
     match remove_existing(
         prog_track,
         dst_parent,
         dst_name,
         dst_path,
-        &dst_handle,
+        dst_snapshot,
         settings,
     )
     .await
@@ -2425,7 +2426,7 @@ pub(crate) async fn resolve_dst_dir(
                     dst_parent,
                     name,
                     dst_path,
-                    &dst_handle,
+                    dst_handle.into_removal_snapshot(),
                     settings,
                 )
                 .await?;
@@ -2480,59 +2481,37 @@ pub(crate) async fn resolve_dst_dir(
 ///
 /// # Removal contract
 ///
-/// The entry was already classified into `dst_handle` (via [`Dir::child`]) by the caller. Removal
-/// here is **fd-relative and recheck-guarded**:
+/// The caller retains the entry's planned kind and accounting size in `dst_snapshot`, then releases
+/// its classification fd. Removal is by name through the held `dst_parent` fd:
 ///
-/// 1. [`Dir::recheck`] re-opens `dst_name` and confirms it is STILL the same inode that was
-///    classified (same `dev`/`ino`). If the directory entry was swapped to a different inode
-///    between classification and now — an intermediate-dir-to-symlink swap is the canonical
-///    attack — `recheck` returns `ESTALE` and we fail closed, removing nothing.
-/// 2. The entry is then removed through the held `dst_parent` fd by its kind:
-///    - File / Symlink / Special → [`Dir::unlink_at`] (single entry, never follows a symlink).
-///    - Empty directory → [`Dir::rmdir_at`].
-///    - Non-empty directory → fd-relative recursive [`rm::rm_child`] on the held `dst_parent`
-///      (`O_NOFOLLOW|O_DIRECTORY` descent), the same mechanism the remote destination uses.
+/// - File / Symlink / Special → [`Dir::unlink_at`] (single entry, never follows a symlink).
+/// - Empty directory → [`Dir::rmdir_at`].
+/// - Non-empty directory → fd-relative recursive [`rm::rm_child`] on the held `dst_parent`
+///   (`O_NOFOLLOW|O_DIRECTORY` descent), the same mechanism the remote destination uses.
 ///
-/// Because every removal is fd-relative, it is CONTAINED to the held `dst_parent` directory: even in
-/// the residual window between `recheck` and the removal, a final-component swap could at worst
-/// remove a different inode that currently occupies `dst_name` WITHIN this directory — it can never
-/// escape `dst_parent` into a privileged delete elsewhere (design invariant 6, best-effort). The
-/// non-empty-directory subtree is descended through the parent fd with `O_NOFOLLOW`, so a
-/// directory→symlink swap mid-walk fails closed (ELOOP/ENOTDIR) rather than following the link.
+/// Every removal is contained to `dst_parent`. A final-component replacement can make the
+/// kind-directed syscall fail or make it remove a different entry currently occupying `dst_name`,
+/// but it cannot redirect the operation outside the pinned parent. Re-opening and comparing the
+/// planned inode would add an `openat` and `fstatat` without closing the remaining window between
+/// comparison and mutation, and exact final-component identity is outside the overwrite guarantee.
 pub(crate) async fn remove_existing(
     prog_track: &'static progress::Progress,
     dst_parent: &Arc<Dir>,
     dst_name: &OsStr,
     dst_path: &std::path::Path,
-    dst_handle: &Handle,
+    dst_snapshot: RemovalSnapshot,
     settings: &Settings,
 ) -> Result<RmSummary, Error> {
-    // recheck: confirm the entry is still the same inode we classified. fail closed on a swap.
-    dst_parent
-        .recheck(dst_name, dst_handle)
-        .await
-        .with_context(|| {
-            format!(
-                "destination {:?} changed identity before removal (possible TOCTOU swap)",
-                dst_path
-            )
-        })
-        .map_err(|err| Error::new(err, Default::default()))?;
-    match dst_handle.kind() {
+    match dst_snapshot.kind() {
         EntryKind::File | EntryKind::Symlink | EntryKind::Special => {
-            // capture the removed entry's size before unlinking, to account its bytes (matching the
-            // remote destination's overwrite accounting — see rcp::destination::remove_existing_dst).
-            let removed_size = {
-                use crate::preserve::Metadata as _;
-                dst_handle.meta().size()
-            };
+            let removed_size = dst_snapshot.size();
             // single-entry, fd-relative removal contained to dst_parent; never follows a symlink.
             dst_parent
                 .unlink_at(dst_name)
                 .await
                 .with_context(|| format!("failed removing existing destination {:?}", dst_path))
                 .map_err(|err| Error::new(err, Default::default()))?;
-            let is_symlink = dst_handle.kind() == EntryKind::Symlink;
+            let is_symlink = dst_snapshot.kind() == EntryKind::Symlink;
             if is_symlink {
                 prog_track.symlinks_removed.inc();
             } else {
@@ -2566,9 +2545,9 @@ pub(crate) async fn remove_existing(
                         Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
                     ) =>
                 {
-                    // fd-relative recursive removal of the subtree on the held parent (guarded by
-                    // recheck above): descent uses O_NOFOLLOW, so it cannot be redirected out of
-                    // dst_parent by a concurrent symlink swap. Mirrors the remote destination path.
+                    // fd-relative recursive removal of the subtree on the held parent: descent uses
+                    // O_NOFOLLOW, so a concurrent symlink swap cannot redirect it out of dst_parent.
+                    // Mirrors the remote destination path.
                     rm::rm_child(
                         prog_track,
                         dst_parent,
@@ -3907,11 +3886,10 @@ mod copy_tests {
                 assert_eq!(error.summary.files_copied, 1);
                 assert_eq!(error.summary.symlinks_created, 2);
                 assert_eq!(error.summary.directories_created, 0);
-                // ONE removal, not two: `foo/baz/4.txt` is unreadable, so its copy fails at the
-                // source open — which now happens BEFORE the destination is unlinked, so
-                // `bar/baz/4.txt` survives a copy that could never have replaced it. Removing it
-                // first and discovering the unreadable source afterwards is the data-loss shape
-                // `plan_overwrite_candidate`/`execute_dst_plan` exist to prevent.
+                // one removal, not two: `foo/baz/4.txt` is unreadable, so its copy fails at the
+                // source open before the destination is unlinked. `bar/baz/4.txt` survives a copy
+                // that could never have replaced it, which is the failure-ordering invariant owned
+                // by `plan_overwrite_candidate` and `execute_dst_plan`.
                 assert_eq!(error.summary.rm_summary.files_removed, 1);
                 assert!(
                     output_path.join("baz").join("4.txt").exists(),
@@ -5833,10 +5811,9 @@ mod copy_tests {
         /// A destination SYMLINK is a non-directory to `--ignore-existing`, even when it points at a
         /// directory, so the whole subtree is skipped — and the dry run must predict that.
         ///
-        /// The dry-run probe used to ask `Path::is_dir()`, which FOLLOWS symlinks, so it saw "a
-        /// directory is already there" and reported the subtree as would-be-copied. The real run
-        /// classifies the same entry through the parent's descriptor (`O_NOFOLLOW`), calls it a
-        /// non-directory, and skips it. The prediction contradicted the run it was predicting.
+        /// Dry-run and real execution both classify the final component without following it. A
+        /// path-based `Path::is_dir()` probe would follow the link and incorrectly predict that the
+        /// subtree is copied instead of skipped.
         #[tokio::test]
         #[traced_test]
         async fn dry_run_ignore_existing_reports_dir_behind_a_symlink_as_skipped()
@@ -5892,12 +5869,11 @@ mod copy_tests {
         /// failure rather than predicting a copy the real run cannot perform.
         ///
         /// The unprobeable destination has to be a NESTED one for this to isolate the probe. Sealing
-        /// the destination's own parent would fail the root operand's `open_parent_dir` first, and that
-        /// error is raised with or without this fix — the test would pass while proving nothing (it
-        /// did, the first time it was written). So the destination ROOT is a directory the copy can
-        /// find but not traverse (`0o600` — readable, not searchable), which only the path-based probe
-        /// for the child touches: a dry run creates and opens no destination directories, so nothing
-        /// else in the copy needs to traverse it.
+        /// the destination's own parent would exercise the root operand's `open_parent_dir` instead
+        /// of the child probe. The destination ROOT is therefore a directory the copy can find but
+        /// not traverse (`0o600` — readable, not searchable), which only the path-based child probe
+        /// touches: a dry run creates and opens no destination directories, so nothing else in the
+        /// copy needs to traverse it.
         ///
         /// Skipped for root, which ignores the permission bits this relies on.
         #[tokio::test]
@@ -5914,7 +5890,7 @@ mod copy_tests {
             // EMPTY, deliberately: a file inside it would be caught by the FILE probe
             // ([`dry_run_dst_exists`]) instead, and the test would pass without the directory probe
             // ever mattering. With nothing under `sub`, the directory probe is the only thing that can
-            // notice, which is what makes this test fail without the fix.
+            // notice; it is therefore the only probe capable of observing the EACCES.
             tokio::fs::create_dir(src.join("sub")).await?;
             // the destination root exists but is NOT searchable, so probing `dst/sub` inside it gets
             // EACCES — "could not look", not "nothing is there"
@@ -7015,10 +6991,9 @@ mod copy_tests {
         Ok(())
     }
 
-    // Overwriting an existing regular file goes through the fd-relative + recheck-guarded removal
-    // path: the destination file is removed (counted as a single `files_removed`) and recreated
-    // with the source content. This exercises `remove_existing`'s `unlink_at` branch via the real
-    // fd-based `copy` walk (not the legacy path-based `copy_file`).
+    // overwriting an existing regular file goes through fd-relative removal: the destination file
+    // is removed (counted as a single `files_removed`) and recreated with the source content. This
+    // exercises `remove_existing`'s `unlink_at` branch through the fd-based copy walk.
     #[tokio::test]
     #[traced_test]
     async fn overwrite_regular_file_removes_and_recreates_via_fd() -> Result<(), anyhow::Error> {
@@ -7875,15 +7850,12 @@ mod copy_tests {
         Ok(())
     }
 
-    // Deterministic companion to the racy test above, proving the B1 fix at the contract level: the
-    // non-empty-directory overwrite removal acts through the PINNED parent fd, never by re-resolving
-    // the display path. We open the REAL parent directory as `dst_parent`, classify the real
-    // non-empty child, but pass a `dst_path` whose INTERMEDIATE component is an out-of-tree symlink
-    // (the post-classification redirect a racy attacker would plant). The fd-relative `rm_child`
-    // removes the real child through the held fd and leaves the out-of-tree tree untouched. The old
-    // path-based `rm::rm(dst_path)` would instead re-resolve `dst_path` through the symlink and
-    // delete the out-of-tree subtree — so this test FAILS if the branch is reverted to `rm::rm`
-    // (verified by hand). `recheck` passes because the real child's identity is unchanged.
+    // deterministic companion to the racy test above: non-empty-directory overwrite removal acts
+    // through the pinned parent fd, never by re-resolving the display path. We open the real parent
+    // directory as `dst_parent`, classify its non-empty child, but pass a `dst_path` whose
+    // intermediate component is an out-of-tree symlink. The fd-relative `rm_child` removes the real
+    // child through the held fd and leaves the out-of-tree tree untouched; a path-based
+    // `rm::rm(dst_path)` would follow the display path and delete the out-of-tree subtree.
     #[tokio::test]
     #[traced_test]
     async fn nonempty_dir_overwrite_removal_uses_pinned_fd_not_path() -> Result<(), anyhow::Error> {
@@ -7923,7 +7895,7 @@ mod copy_tests {
             &dst_parent,
             victim_name,
             &stale_dst_path,
-            &dst_handle,
+            dst_handle.into_removal_snapshot(),
             &settings,
         )
         .await?;
@@ -7984,12 +7956,11 @@ mod copy_tests {
         Ok(())
     }
 
-    // the test above pins half the fix (the assert is gone) but not the other half: that a REUSED
-    // directory's children are downgraded to `is_fresh: false` rather than inheriting the caller's
-    // stale belief. that half only becomes observable when a child leaf already conflicts with the
-    // source — with `dst/sub/a.txt` pre-existing here, a leaked `is_fresh == true` would skip the
-    // conflict-check/overwrite block in `copy_file_fd` and fail closed on `create_file`'s `O_EXCL`
-    // with EEXIST instead of overwriting.
+    // a reused directory's children must receive `is_fresh: false` rather than inheriting the
+    // caller's stale belief. This becomes observable when a child leaf already conflicts with the
+    // source: with `dst/sub/a.txt` pre-existing here, a leaked `is_fresh == true` would skip the
+    // conflict-check/overwrite block in `copy_file_fd` and fail on `create_file`'s `O_EXCL` instead
+    // of overwriting.
     #[tokio::test]
     async fn stale_fresh_hint_overwrites_preexisting_file() -> Result<(), anyhow::Error> {
         let tmp = testutils::create_temp_dir().await?;
@@ -8177,12 +8148,10 @@ mod copy_tests {
         Ok(())
     }
 
-    // THE point of splitting planning from execution: a copy that decides to replace the
-    // destination, then fails before it is ready to write one, must leave the destination alone.
-    // An unreadable source reaches `open_file_read` after the plan and before any unlink, which is
-    // exactly the window that used to delete first and discover the problem afterwards. (The same
-    // window covers cancellation and a long `--iops-throttle` wait, neither of which is injectable
-    // here; this is the deterministic member of that family.)
+    // the source must open successfully before the destination is unlinked. an unreadable source
+    // deterministically exercises the interval after planning but before mutation, and must leave
+    // the destination intact. The same ordering covers cancellation and a long `--iops-throttle`
+    // wait, neither of which is injectable here.
     #[tokio::test]
     async fn overwrite_keeps_the_destination_when_the_source_cannot_be_opened()
     -> Result<(), anyhow::Error> {
@@ -8239,7 +8208,7 @@ mod copy_tests {
         let dst_parent =
             Arc::new(Dir::open_root_dir(&tmp, false, congestion::Side::Destination).await?);
         let victim: &OsStr = OsStr::new("victim.txt");
-        let plan = FilePlan::Replace(dst_parent.child(victim).await?);
+        let plan = FilePlan::Replace(dst_parent.child(victim).await?.into_removal_snapshot());
         // as if an earlier removal had already happened in this same copy.
         let mut copy_summary = Summary {
             rm_summary: RmSummary {
@@ -8277,21 +8246,18 @@ mod copy_tests {
         Ok(())
     }
 
-    // the outcome most easily missed: executing the plan can FAIL. The premise of the retry route is
-    // a live competing writer, so the plausible failure is `remove_existing`'s inode recheck — and
-    // it builds its error payload from scratch, unable to see what an earlier removal already did.
-    // Swapping the entry for a different inode between planning and executing reproduces that
-    // deterministically, and is also the swap the recheck exists to catch.
+    // a competing writer may replace the planned entry before execution. overwrite removes the
+    // current contained entry, while its accounting retains the metadata captured during planning.
     #[tokio::test]
-    async fn executing_a_failed_replace_keeps_an_earlier_removal_in_the_totals()
+    async fn executing_a_swapped_replace_removes_the_current_entry_and_keeps_earlier_totals()
     -> Result<(), anyhow::Error> {
         let tmp = testutils::create_temp_dir().await?;
         tokio::fs::write(tmp.join("victim.txt"), "original").await?;
         let dst_parent =
             Arc::new(Dir::open_root_dir(&tmp, false, congestion::Side::Destination).await?);
         let victim: &OsStr = OsStr::new("victim.txt");
-        let plan = FilePlan::Replace(dst_parent.child(victim).await?);
-        // a competing writer swaps in a DIFFERENT inode under the same name after we planned.
+        let plan = FilePlan::Replace(dst_parent.child(victim).await?.into_removal_snapshot());
+        // a competing writer swaps in a different inode under the same name after we planned.
         tokio::fs::remove_file(tmp.join("victim.txt")).await?;
         tokio::fs::write(tmp.join("victim.txt"), "someone else's file").await?;
         let mut copy_summary = Summary {
@@ -8302,7 +8268,7 @@ mod copy_tests {
             },
             ..Default::default()
         };
-        let error = execute_dst_plan(
+        execute_dst_plan(
             &PROGRESS,
             &dst_parent,
             victim,
@@ -8311,25 +8277,52 @@ mod copy_tests {
             &settings_with_delete(None),
             &mut copy_summary,
         )
-        .await
-        .expect_err("a swapped destination must fail closed, not be removed");
-        assert_eq!(error.summary.rm_summary.files_removed, 1);
-        assert_eq!(error.summary.rm_summary.bytes_removed, 10);
-        // failing closed means the swapped-in file is still there: we removed nothing.
-        assert_eq!(
-            tokio::fs::read_to_string(tmp.join("victim.txt")).await?,
-            "someone else's file"
-        );
-        // rebuilt from `err.source`, never from a stringified error: context and root cause survive.
-        let message = format!("{:#}", &error.source);
+        .await?;
+        assert_eq!(copy_summary.rm_summary.files_removed, 2);
+        assert_eq!(copy_summary.rm_summary.bytes_removed, 18);
         assert!(
-            message.contains("changed identity before removal"),
-            "context lost: {message}"
+            !tmp.join("victim.txt").exists(),
+            "overwrite removes the entry currently occupying the contained slot"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executing_a_file_plan_swapped_to_symlink_unlinks_the_link_not_its_target()
+    -> Result<(), anyhow::Error> {
+        let tmp = testutils::create_temp_dir().await?;
+        let dst = tmp.join("dst");
+        tokio::fs::create_dir(&dst).await?;
+        let victim_path = dst.join("victim.txt");
+        let sentinel_path = tmp.join("sentinel.txt");
+        tokio::fs::write(&victim_path, "original").await?;
+        tokio::fs::write(&sentinel_path, "keep me").await?;
+        let dst_parent =
+            Arc::new(Dir::open_root_dir(&dst, false, congestion::Side::Destination).await?);
+        let victim: &OsStr = OsStr::new("victim.txt");
+        let plan = FilePlan::Replace(dst_parent.child(victim).await?.into_removal_snapshot());
+
+        // a competing writer replaces the planned file with a link to an external target.
+        tokio::fs::remove_file(&victim_path).await?;
+        tokio::fs::symlink(&sentinel_path, &victim_path).await?;
+
+        let mut copy_summary = Summary::default();
+        execute_dst_plan(
+            &PROGRESS,
+            &dst_parent,
+            victim,
+            &victim_path,
+            plan,
+            &settings_with_delete(None),
+            &mut copy_summary,
+        )
+        .await?;
+
         assert!(
-            message.contains("Stale file handle"),
-            "root cause lost: {message}"
+            tokio::fs::symlink_metadata(&victim_path).await.is_err(),
+            "overwrite must unlink the replacement symlink"
         );
+        assert_eq!(tokio::fs::read_to_string(&sentinel_path).await?, "keep me");
         Ok(())
     }
 
