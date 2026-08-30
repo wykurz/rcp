@@ -461,10 +461,10 @@ fn filtered_out_root_skips_under_execute_only_parent() {
 
 // ── Strict destination/update-prefix validation (round-5 regression matrix) ───
 
-/// A symlinked DESTINATION prefix fails closed even when the SOURCE root is filtered out.
+/// A filtered source does not validate an unused destination prefix.
 #[cfg(target_os = "linux")]
 #[test]
-fn require_toctou_safe_refuses_symlinked_dst_prefix_when_source_filtered() {
+fn require_toctou_safe_skips_unused_dst_prefix_when_source_filtered() {
     if !common::safedir::openat2_available() {
         return;
     }
@@ -480,16 +480,15 @@ fn require_toctou_safe_refuses_symlinked_dst_prefix_when_source_filtered() {
         .arg(base.join("src"))
         .arg(base.join("link/out"))
         .assert()
-        .failure();
+        .success();
     assert!(!base.join("real/out").exists());
 }
 
-/// A symlinked `--update` prefix fails closed under PLAIN `--update` (no --delete/--update-exclusive)
-/// even when the source root is filtered out — the update prefix is validated up front, before the
-/// source-filter early-return that plain --update would otherwise take.
+/// A symlinked `--update` prefix fails closed when strict dual-root filtering needs to classify it.
+/// This is the authoritative open whose handle informs the joint source/update filter decision.
 #[cfg(target_os = "linux")]
 #[test]
-fn require_toctou_safe_refuses_symlinked_update_prefix_plain_update_filtered_src() {
+fn require_toctou_safe_validates_update_prefix_for_joint_filter() {
     if !common::safedir::openat2_available() {
         return;
     }
@@ -510,8 +509,8 @@ fn require_toctou_safe_refuses_symlinked_update_prefix_plain_update_filtered_src
     assert!(!base.join("dst").exists());
 }
 
-/// A symlinked `--update` prefix fails closed under destructive `--delete` (the up-front strict
-/// update-prefix validation replaces the old path-based existence guard).
+/// A symlinked `--update` prefix fails closed under destructive `--delete`; the authoritative
+/// parent open uses strict operand resolution before any pruning decision.
 #[cfg(target_os = "linux")]
 #[test]
 fn require_toctou_safe_refuses_symlinked_update_prefix_destructive() {

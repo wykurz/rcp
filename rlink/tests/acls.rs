@@ -343,9 +343,9 @@ fn require_toctou_safe_contains_an_inherited_destination_acl() {
     }
 }
 
-/// The marker every form of the source-root notice shares, so a wording change does not silently
+/// The marker every form of the ACL-preservation notice shares, so a wording change does not silently
 /// make the tests below assert nothing.
-const ROOT_NOTICE: &str = "carries a POSIX ACL that this copy will NOT preserve";
+const ACL_NOTICE: &str = "does not preserve POSIX ACLs";
 
 /// Run `rlink` at the DEFAULT verbosity and return everything it wrote. Both streams, because the
 /// log layer writes through the progress bar's writer, which targets stdout.
@@ -367,25 +367,23 @@ fn rlink_log(args: &[&str]) -> String {
     )
 }
 
-/// The source-root ACL notice is armed by the run ASKING for metadata fidelity, and rlink's default
-/// is `all` — fidelity is what the tool is for. So a bare `rlink` warns where a bare `rcp` stays
-/// silent, and only settings that ask for nothing turn it off.
+/// The ACL-preservation notice is armed by a run asking for metadata fidelity, and rlink's default
+/// is `all`. A bare `rlink` therefore warns where a bare `rcp` stays silent; preserve-none turns it
+/// off. The notice is settings-only and does not inspect the source root.
 #[test]
-fn a_bare_rlink_still_reports_a_source_root_acl_it_will_not_preserve() {
+fn a_bare_rlink_reports_that_its_settings_may_omit_directory_acls() {
     let src = tempfile::tempdir().unwrap();
     let dst_parent = tempfile::tempdir().unwrap();
     let src_tree = src.path().join("tree");
     std::fs::create_dir(&src_tree).unwrap();
     write_file(&src_tree.join("f.txt"), "payload", 0o644);
-    set_acl(&src_tree, &denying_acl());
     let log = rlink_log(&[
         src_tree.to_str().unwrap(),
         dst_parent.path().join("bare").to_str().unwrap(),
     ]);
     assert!(
-        log.contains(ROOT_NOTICE),
-        "rlink defaults to preserving everything, so a directory root whose ACL it will not carry \
-         across is exactly what the notice is for:\n{log}"
+        log.contains(ACL_NOTICE) && log.contains("for directories"),
+        "rlink defaults to metadata preservation but does not carry directory ACLs:\n{log}"
     );
     // and settings that ask for nothing switch it off, so the gate is the SETTINGS rather than the
     // tool — otherwise this test would pass with the notice unconditional
@@ -395,7 +393,7 @@ fn a_bare_rlink_still_reports_a_source_root_acl_it_will_not_preserve() {
         dst_parent.path().join("none").to_str().unwrap(),
     ]);
     assert!(
-        !log.contains(ROOT_NOTICE),
+        !log.contains(ACL_NOTICE),
         "`none` asked for no preservation, so the notice is noise about a fidelity this link never \
          claimed:\n{log}"
     );

@@ -112,6 +112,45 @@ fn test_overwrite_fail_without_flag() {
 }
 
 #[test]
+fn compatible_existing_directory_is_merged_without_overwrite() {
+    let (src_dir, dst_dir) = setup_test_env();
+    let src = src_dir.path().join("source");
+    let dst = dst_dir.path().join("destination");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::create_dir(&dst).unwrap();
+    std::fs::write(src.join("source-child"), "new").unwrap();
+    std::fs::write(dst.join("sentinel"), "keep").unwrap();
+
+    assert_cmd::Command::cargo_bin("rcp")
+        .unwrap()
+        .arg(&src)
+        .arg(&dst)
+        .assert()
+        .success();
+
+    assert!(dst.join("sentinel").exists());
+    assert_eq!(get_file_content(&dst.join("source-child")), "new");
+}
+
+#[test]
+fn dry_run_does_not_require_an_exact_destination_to_be_vacant() {
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_file = src_dir.path().join("test.txt");
+    let dst_file = dst_dir.path().join("test.txt");
+    create_test_file(&src_file, "new content", 0o644);
+    create_test_file(&dst_file, "old content", 0o644);
+
+    assert_cmd::Command::cargo_bin("rcp")
+        .unwrap()
+        .args(["--dry-run=brief"])
+        .arg(&src_file)
+        .arg(&dst_file)
+        .assert()
+        .success();
+    assert_eq!(get_file_content(&dst_file), "old content");
+}
+
+#[test]
 fn test_weird_permissions() {
     let (src_dir, dst_dir) = setup_test_env();
     // Test cases for files that can be read (owner has read permission)
@@ -1249,7 +1288,7 @@ fn copies_dot_and_dotdot_source_operands_into_trailing_slash_dest() {
         ("../sub/.", "sub/file.txt"),       // trailing `/.` names the dir itself -> `sub`
     ];
     for (src, expected) in cases {
-        // fresh dest per case (rcp refuses to clobber an existing destination entry)
+        // fresh dest per case so compatible-directory merging cannot retain an earlier case's tree
         std::fs::remove_dir_all(&dest).unwrap();
         std::fs::create_dir(&dest).unwrap();
         let dst_arg = format!("{}/", dest.to_str().unwrap());

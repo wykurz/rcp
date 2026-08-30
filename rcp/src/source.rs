@@ -400,9 +400,9 @@ struct ChildEntry {
 /// operand's final component, so the root file/symlink can be read fd-relative (`O_NOFOLLOW`) — the
 /// same trusted-parent + hardened-final-component model the local copy uses. `open_parent_dir`
 /// follows symlinks in the prefix (the caller's trust responsibility, per docs/tocttou.md), then
-/// the final component is opened/classified `O_NOFOLLOW` below it, so a swap of the root entry in a
-/// writable parent is caught at open. This hardens the remote source root the same way nested
-/// entries are already hardened by the fd-map.
+/// the final component is opened/classified `O_NOFOLLOW` below it. A symlink or incompatible-kind
+/// replacement is rejected by the consumer's open; a compatible replacement can be accepted. This
+/// hardens the remote source root the same way nested entries are hardened by the fd-map.
 async fn open_root_parent(src: &std::path::Path) -> anyhow::Result<(Arc<Dir>, std::ffi::OsString)> {
     let operand = common::walk::split_root_operand(src).await?;
     let parent = Dir::open_parent_dir(&operand.parent, common::Side::Source)
@@ -458,7 +458,12 @@ async fn read_dir_acls_by_path(src: &std::path::Path) -> std::io::Result<common:
         tokio::fs::File::open(src), // rcp-toctou-allow: -L path (dereference, documented not hardened)
     )
     .await?;
-    common::safedir::read_acls_fd(dir.as_fd(), common::Side::Source, true).await
+    common::safedir::read_acls_fd(
+        dir.as_fd(),
+        common::Side::Source,
+        common::safedir::AclCapture::AccessAndDefault,
+    )
+    .await
 }
 
 /// Whether one step of the `-L` Pass-1 walk sent a protocol message accounting for its entry.
@@ -792,16 +797,16 @@ async fn send_pass1_entry(
             }
             error_collector.push(e.into());
             // directory unreadable but we already committed to sending it - send with 0 entries
-            // so destination can still complete. This is also where a ROOT that changed type under
+            // so destination can still complete. this is also where a ROOT that changed type under
             // us lands (`ENOTDIR`), and it is the same answer `send_root_hardened` gives when its
-            // `open_dir` fails. The shared commit funnel records empty contents and owns the same
+            // `open_dir` fails. the shared commit funnel records empty contents and owns the same
             // acknowledgement credit as every other `-L` directory.
-            // ACLs stay UNKNOWN on this one: the directory could not be opened, so there is no fd
-            // to read them from and no honest answer to give. `WireAcls::Unknown` tells the
-            // destination to leave the destination directory's ACLs ALONE (a locked reused
-            // directory gets its original default ACL back from the lockdown guard) — an absence
-            // we never observed must not arrive as an authoritative CLEAR of a reused
-            // destination's ACLs. The entry's copy is already recorded as failed above.
+            // source ACLs stay UNKNOWN because the directory could not be opened, so there is no fd
+            // to read them from and no honest answer to give. `WireAcls::Unknown` authorizes no
+            // source-derived ACL set or clear; a locked reused directory still gets its original
+            // default ACL back from the lockdown guard, and mode application can affect its access
+            // mask. unobserved absence must not arrive as an authoritative CLEAR; the entry's copy
+            // is already recorded as failed above.
             DereferenceDirectoryCommit {
                 src: src.to_path_buf(),
                 dst: dst.to_path_buf(),
@@ -1040,8 +1045,8 @@ async fn send_pass1_entry(
 /// empty directory and ack `DirectoryCreated` for the 0-entry `Directory` sent
 /// here. That ack MUST consume a real map entry, otherwise it hits
 /// [`resolve_pass2_source`]'s fail-closed miss path and spuriously aborts the
-/// copy — the very bug this committed-unreadable-directory case must avoid. So
-/// before sending we register an entry keyed by `src`:
+/// copy, defeating the committed-unreadable-directory fallback. Before sending,
+/// register an entry keyed by `src`:
 /// - `dir: Some(_)` (enumeration failed but the directory fd is held): insert a
 ///   real entry via [`SourceDirMap::insert`] (file_count 0, holds the fd's
 ///   permit). Its `DirectoryCreated` ack consumes it; Pass 2 sends no files.
@@ -1559,21 +1564,11 @@ async fn send_fs_objects_tcp(
             return Err(e.into());
         }
     };
-    // the same constant source-root ACL warning the hardened root gets in `send_root_hardened`.
-    // This walk holds no root handle, so the root is classified through its parent for the probe
-    // alone — `O_NOFOLLOW`, hence a root that is itself a symlink is skipped rather than followed;
-    // that narrows an already-heuristic warning and never widens it. A parent that cannot be opened
-    // is left to the walk below to diagnose.
-    // The guard comes FIRST: `open_root_parent` is a `split_root_operand` plus an `open_parent_dir`
-    // that this walk needs for nothing else, so calling it before asking whether a probe is even
-    // wanted would charge every remote `-L` copy — including `all+acl`, which has nothing to warn
-    // about — for a probe that then declines to run.
-    let notice = common::safedir::RootAclNotice::from(capture);
-    if common::safedir::root_acl_probe_worth_reaching(notice)
-        && let Ok((parent, name)) = open_root_parent(src).await
-    {
-        common::safedir::warn_if_root_acl_unpreserved_at(&parent, &name, src, notice).await;
-    }
+    // warn from settings alone, without opening and classifying the root for an advisory ACL
+    // observation that a concurrent writer could replace immediately.
+    common::safedir::warn_if_acls_may_be_unpreserved(common::safedir::AclPreservationNotice::from(
+        capture,
+    ));
     // determine if we have a root item to send (for DirStructureComplete message)
     // special files (sockets, FIFOs, devices) never produce protocol messages,
     // so they never count as root items regardless of --skip-specials
@@ -1661,13 +1656,13 @@ async fn send_fs_objects_tcp(
     Ok(())
 }
 
-/// Hardened (non-`-L`) root handling: classify the named root ONCE via its trusted parent's fd and
-/// drive `has_root_item`, filtering, wire metadata, and the file/symlink/dir/special dispatch from
-/// that single authoritative snapshot — there is no second path stat. This closes the double-stat
+/// Hardened (non-`-L`) root handling: classify the named root once via its trusted parent's fd and
+/// drive `has_root_item`, filtering, and file/symlink/dir/special dispatch from that snapshot — there
+/// is no second path stat. This closes the double-stat
 /// TOCTOU window where a root *kind* swap (e.g. dir→file) between the `has_root_item` decision and
 /// the dispatch could announce `has_root_item: true` yet send no root message, hanging the
-/// destination. Wire metadata comes from the fd-pinned classification (Guarantee 2) and the file /
-/// symlink reads are fd-relative `O_NOFOLLOW` (Guarantee 1).
+/// destination. Payload metadata comes from the same fd as the file bytes, symlink target, or
+/// directory enumeration (Guarantee 2), and those reads are fd-relative `O_NOFOLLOW` (Guarantee 1).
 #[instrument(skip(error_collector, stream_pool, control_send_stream, source_read))]
 #[allow(clippy::too_many_arguments)]
 async fn send_root_hardened(
@@ -1692,31 +1687,27 @@ async fn send_root_hardened(
         Ok(h) => h,
         Err(e) => {
             tracing::error!("Failed reading metadata from src {src:?}: {e:#}");
-            // root classification failure is fatal (matches the old root stat failure).
+            // root classification failure is fatal because no root protocol message can be sent.
             return Err(e.into());
         }
     };
     let kind = handle.kind();
-    // One `listxattr` on the source ROOT per rcpd run — a constant, not a per-entry probe — warning
-    // that a source root carrying an ACL is about to be copied by settings that drop it. The
-    // warning reaches the user over the existing tracing connection like any other rcpd log line.
-    // It goes through the `/proc/self/fd` form precisely because `handle` is `O_PATH` (see below).
-    common::safedir::warn_if_root_acl_unpreserved(
-        &handle,
-        src,
-        common::safedir::RootAclNotice::from(capture),
-    )
-    .await;
-    // ACLs stay UNKNOWN here: the classify handle's inode is not necessarily the one whose bytes
-    // will be sent (an ACL read from it could describe an inode replaced before copy), so every use
-    // below that needs them re-reads from the real fd it
-    // is about to use — a root FILE from its data fd in `send_file_tcp`, a root DIRECTORY from
+    // the settings-only notice reaches the user over the existing tracing connection and performs
+    // no source-root filesystem probe.
+    common::safedir::warn_if_acls_may_be_unpreserved(common::safedir::AclPreservationNotice::from(
+        capture,
+    ));
+    // source ACLs stay UNKNOWN here because the classify handle's inode is not necessarily the one
+    // whose bytes will be sent (an ACL read from it could describe an inode replaced before copy),
+    // so every use below that needs them reads from the real fd it is about to use — a root FILE
+    // from its data fd in `send_file_tcp`, a root DIRECTORY from
     // the `O_NOFOLLOW` handle the fd-walk opens — and a root SYMLINK has no ACL to carry. The one
     // use that keeps this value is the unopenable-root-directory case, which has no fd to read
-    // from and is already an error; `WireAcls::Unknown` then tells the destination to leave the
-    // (often REUSED) destination root's ACLs alone rather than clearing state the source never
-    // observed.
+    // from and is already an error; `WireAcls::Unknown` authorizes no source-derived ACL set or
+    // clear; mode application and strict reused-directory lockdown can still affect destination
+    // ACL state.
     let meta = remote::protocol::Metadata::from(handle.meta());
+    let mut handle = Some(handle);
     // has_root_item from the authoritative kind: specials never produce a message; otherwise the
     // root-item filter decides (anchored patterns match inside the source, not the root itself).
     let has_root_item = match kind {
@@ -1735,6 +1726,9 @@ async fn send_root_hardened(
     // ── pre-DirStructureComplete: send the root directory tree / symlink (NOT the file) ──
     match kind {
         EntryKind::Dir if has_root_item => {
+            // the directory walk opens its own authoritative O_DIRECTORY fd and carries all later
+            // work through it. The classification handle has no remaining consumer.
+            drop(handle.take());
             // open the dir O_NOFOLLOW from the parent fd and descend via the fd-walk engine. On an
             // open failure (e.g. a swap to a non-dir between classify and open) emit a 0-entry
             // Directory + tombstone so the destination still completes (no hang), mirroring the
@@ -1789,7 +1783,10 @@ async fn send_root_hardened(
             // so a same-name symlink swap can't pair one link's target with another link's
             // owner/timestamps — target and metadata are a faithful pair, matching the file path. A
             // swap to a non-symlink fails the read and is accounted as skipped.
-            match handle.read_symlink(parent.side()).await {
+            let symlink_handle = handle
+                .as_ref()
+                .expect("included root symlink retains its classification handle");
+            match symlink_handle.read_symlink(parent.side()).await {
                 Ok((target, sym_meta)) => {
                     let symlink = remote::protocol::SourceMessage::Symlink {
                         src: src.to_path_buf(),
@@ -1814,8 +1811,10 @@ async fn send_root_hardened(
                     error_collector.push(e);
                 }
             }
+            drop(handle.take());
         }
         EntryKind::Special if !settings.skip_specials => {
+            drop(handle.take());
             let err = anyhow::anyhow!(
                 "copy: {src:?} -> {dst:?} failed, unsupported src file type (special file)"
             );
@@ -1824,12 +1823,17 @@ async fn send_root_hardened(
             return Err(err);
         }
         EntryKind::Special => {
+            drop(handle.take());
             progress().specials_skipped.inc();
         }
         // filtered-out dir/symlink: account the skip. The root file is handled after
         // DirStructureComplete (its data rides the file stream).
         EntryKind::Dir | EntryKind::Symlink => {
+            drop(handle.take());
             kind.inc_skipped(progress());
+        }
+        EntryKind::File if !has_root_item => {
+            drop(handle.take());
         }
         EntryKind::File => {}
     }
@@ -1846,6 +1850,9 @@ async fn send_root_hardened(
         if !has_root_item {
             progress().files_skipped.inc();
         } else {
+            let handle = handle
+                .take()
+                .expect("included root file retains its classification handle");
             let size = handle.meta().size();
             // the data task opens and pins the authoritative file independently through the held
             // parent. close this earlier classification fd before acquiring that region's admission.
@@ -1958,11 +1965,13 @@ async fn send_file_tcp(
         // Folded into `open_result` so a failure takes the same accounted path as a failed open: the
         // header has not been sent, so the destination is still owed exactly one entry for this file.
         let open_result = match open_result {
-            Ok((file, meta)) if capture.file_acl => {
-                common::safedir::read_acls_fd(file.as_fd(), common::Side::Source, false)
-                    .await
-                    .map(|acls| (file, meta, Some(acls)))
-            }
+            Ok((file, meta)) if capture.file_acl => common::safedir::read_acls_fd(
+                file.as_fd(),
+                common::Side::Source,
+                common::safedir::AclCapture::Access,
+            )
+            .await
+            .map(|acls| (file, meta, Some(acls))),
             Ok((file, meta)) => Ok((file, meta, None)),
             Err(e) => Err(e),
         };

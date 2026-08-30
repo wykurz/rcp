@@ -107,7 +107,7 @@ Copy from local machine to remote host and preserve metadata:
 > rcp /local/path host:/remote/path --progress --summary --preserve-settings=all
 ```
 
-(`all+acl` works the same way for a remote copy; the ACL probe runs on the source host.)
+(`all+acl` works the same way for a remote copy; requested ACL reads run on the source host.)
 
 Remote copy with automatic rcpd deployment:
 
@@ -274,15 +274,21 @@ To avoid this confusion, RCP tools:
 
 The following examples illustrate this (*those rules apply to both `rcp` and `rlink`*):
 
-- `rcp A/B C/D` - copy `A/B` into `C/` and name it `D`; if `C/D` exists fail immediately
+- `rcp A/B C/D` - copy `A/B` into `C/` and name it `D`
 - `rcp A/B C/D/` - copy `B` into `D` WITHOUT renaming i.e., the resulting path will be `C/D/B`; if
-  `C/D/B` exists fail immediately
+  `C/D/B` is a compatible directory, merge into it
+
+An existing compatible directory is reused and merged without `--overwrite`. An existing file,
+symlink, or other conflicting entry is rejected by the authoritative engine classification or action
+unless `--overwrite` permits replacement (`--ignore-existing` can skip it). The tools do not perform
+a separate destination-existence preflight.
 
 Using `rcp` it's also possible to copy multiple sources into a single destination, but the
 destination MUST have a trailing slash (`/`):
 
 - `rcp A B C D/` - copy `A`, `B` and `C` into `D` WITHOUT renaming i.e., the resulting paths will be
-  `D/A`, `D/B` and `D/C`; if any of which exist fail immediately
+  `D/A`, `D/B` and `D/C`; compatible directory targets merge, while conflicting existing entries
+  require `--overwrite`
 
 ## Path handling (tilde `~` support)
 

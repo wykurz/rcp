@@ -328,12 +328,16 @@ async fn process_single_file(
         .await
         .map_err(err_needs_drain)?;
     // a skipped file's bytes are already on the wire and must come off it before the next header.
-    if matches!(plan, DstFilePlan::Skip) {
-        drain_file_data(file_recv_stream, file_header.size)
-            .await
-            .map_err(err_corrupted)?;
-        return Ok(());
-    }
+    let dst_snapshot = match plan {
+        DstFilePlan::Vacant => None,
+        DstFilePlan::Skip => {
+            drain_file_data(file_recv_stream, file_header.size)
+                .await
+                .map_err(err_corrupted)?;
+            return Ok(());
+        }
+        DstFilePlan::Replace(dst_snapshot) => Some(dst_snapshot),
+    };
     // logged between deciding and waiting, so it marks the point where this side has committed to a
     // plan but has not yet acted on it — the interval a competing writer can still slip into, and the
     // one a throttle-bound transfer spends all its time in.
@@ -345,14 +349,14 @@ async fn process_single_file(
         ))
         .await;
     // the reservation is held, so the occupied entry can go through the pinned parent.
-    if let DstFilePlan::Replace(dst_snapshot) = &plan {
+    if let Some(dst_snapshot) = dst_snapshot {
         tracing::debug!("destination differs, removing existing entry");
         remove_existing_dst(
             dst_parent,
             dst_name,
             &file_header.dst,
-            *dst_snapshot,
-            settings,
+            dst_snapshot,
+            settings.fail_early,
         )
         .await
         .map_err(err_needs_drain)?;
@@ -375,19 +379,23 @@ async fn process_single_file(
             let plan = plan_dst_file(settings, file_header, dst_parent, dst_name)
                 .await
                 .map_err(err_needs_drain)?;
-            if matches!(plan, DstFilePlan::Skip) {
-                drain_file_data(file_recv_stream, file_header.size)
-                    .await
-                    .map_err(err_corrupted)?;
-                return Ok(());
-            }
-            if let DstFilePlan::Replace(dst_snapshot) = &plan {
+            let dst_snapshot = match plan {
+                DstFilePlan::Vacant => None,
+                DstFilePlan::Skip => {
+                    drain_file_data(file_recv_stream, file_header.size)
+                        .await
+                        .map_err(err_corrupted)?;
+                    return Ok(());
+                }
+                DstFilePlan::Replace(dst_snapshot) => Some(dst_snapshot),
+            };
+            if let Some(dst_snapshot) = dst_snapshot {
                 remove_existing_dst(
                     dst_parent,
                     dst_name,
                     &file_header.dst,
-                    *dst_snapshot,
-                    settings,
+                    dst_snapshot,
+                    settings.fail_early,
                 )
                 .await
                 .map_err(err_needs_drain)?;
@@ -561,79 +569,27 @@ async fn plan_dst_file(
     Ok(DstFilePlan::Replace(dst_handle.into_removal_snapshot()))
 }
 
-/// Remove an existing destination entry (file / symlink / directory) so a fresh entry can take
-/// its place — the destination counterpart of [`common::copy::remove_existing`].
+/// Remove an existing destination entry so a fresh entry can take its place.
 ///
-/// The planned kind selects `unlink_at` for a file, symlink, or special entry and `rmdir_at` or
-/// [`common::rm::rm_child`] for a directory. Every operation is relative to the held `dst_parent`
-/// fd and recursive descent uses `O_NOFOLLOW`, so a concurrent replacement cannot redirect removal
-/// outside the destination tree. Exact final-component identity is not guaranteed: a compatible
-/// replacement may be removed, while an incompatible kind can make the syscall fail.
+/// This thin adapter maps the shared helper's copy error to the remote destination's error type.
+/// The helper owns the slot-removal, containment, and planning-snapshot accounting contract.
 async fn remove_existing_dst(
     dst_parent: &Arc<Dir>,
     dst_name: &OsStr,
     dst_path: &std::path::Path,
     dst_snapshot: RemovalSnapshot,
-    settings: &common::copy::Settings,
-) -> anyhow::Result<()> {
-    let prog = progress();
-    match dst_snapshot.kind() {
-        common::walk::EntryKind::File
-        | common::walk::EntryKind::Symlink
-        | common::walk::EntryKind::Special => {
-            let removed_size = dst_snapshot.size();
-            dst_parent
-                .unlink_at(dst_name)
-                .await
-                .with_context(|| format!("failed removing existing destination {dst_path:?}"))?;
-            let is_symlink = dst_snapshot.kind() == common::walk::EntryKind::Symlink;
-            if is_symlink {
-                prog.symlinks_removed.inc();
-            } else {
-                prog.files_removed.inc();
-                prog.bytes_removed.add(removed_size);
-            }
-            Ok(())
-        }
-        common::walk::EntryKind::Dir => {
-            // fast path: an empty directory removes cleanly via rmdir_at.
-            match dst_parent.rmdir_at(dst_name).await {
-                Ok(()) => {
-                    prog.directories_removed.inc();
-                    Ok(())
-                }
-                // POSIX permits either ENOTEMPTY or EEXIST for a non-empty directory.
-                Err(error)
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
-                    ) =>
-                {
-                    // fd-relative recursive removal of the subtree on the held parent.
-                    common::rm::rm_child(
-                        common::get_progress(),
-                        dst_parent,
-                        dst_name,
-                        dst_path,
-                        &common::rm::Settings {
-                            fail_early: settings.fail_early,
-                            filter: None,
-                            dry_run: None,
-                            time_filter: None,
-                        },
-                    )
-                    .await
-                    .map(|_summary| ())
-                    .map_err(|err| {
-                        err.source
-                            .context(format!("failed removing existing directory {dst_path:?}"))
-                    })
-                }
-                Err(error) => Err(anyhow::Error::new(error)
-                    .context(format!("failed removing existing directory {dst_path:?}"))),
-            }
-        }
-    }
+    fail_early: bool,
+) -> anyhow::Result<common::rm::Summary> {
+    common::copy::remove_existing(
+        common::get_progress(),
+        dst_parent,
+        dst_name,
+        dst_path,
+        dst_snapshot,
+        fail_early,
+    )
+    .await
+    .map_err(|err| err.source)
 }
 
 /// Whether a peer closure at a file-header boundary is benign.
@@ -1016,7 +972,7 @@ enum DirectoryCreateResult {
     /// directory was created by us (new), with its open fd
     Created(Arc<Dir>),
     /// directory already existed (reused), with its open fd and, under strict operand resolution,
-    /// what the lockdown must undo at completion — the original owner and the original ACLs
+    /// what the lockdown must resolve at completion — the original owner and default ACL state
     /// (`None` in the default path — see [`common::safedir::lockdown_reused_dir`])
     AlreadyExisted(Arc<Dir>, Option<common::safedir::ReusedDirLock>),
     /// skipped due to --ignore-existing (destination is not a directory)
@@ -1029,7 +985,7 @@ enum DirectoryCreateResult {
 /// a manifest of pre-existing entries, so the source can skip transferring identical files.
 ///
 /// Returns an empty manifest (no `child()` stats performed) when the entry count exceeds
-/// `max_entries` — the large-directory safeguard: that directory falls back to today's
+/// `max_entries` — the large-directory safeguard: that directory falls back to the full
 /// transfer-and-drain. Entries that cannot be enumerated/stat'd are omitted (conservative: the
 /// source will send them).
 async fn build_existing_manifest(
@@ -1079,28 +1035,51 @@ async fn build_existing_manifest(
     manifest
 }
 
-/// Create a directory fd-relative on the PARENT's held `Dir`, handling overwrite logic.
+fn open_dir_reports_non_directory(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotADirectory
+        || matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTDIR) | Some(libc::ELOOP)
+        )
+}
+
+async fn reuse_existing_directory(
+    dir: Dir,
+    dst: &std::path::Path,
+) -> anyhow::Result<DirectoryCreateResult> {
+    tracing::debug!("destination directory already exists, reusing it");
+    // snapshot and mutate the exact directory selected by this fd. that compatible directory is
+    // authoritative; exact identity relative to an earlier classification is not required.
+    let reused_lock = common::safedir::lockdown_reused_dir(&dir)
+        .await
+        .with_context(|| format!("cannot secure reused destination directory {dst:?}"))?;
+    progress().directories_unchanged.inc();
+    Ok(DirectoryCreateResult::AlreadyExisted(
+        Arc::new(dir),
+        reused_lock,
+    ))
+}
+
+/// Create a directory fd-relative on the parent's held [`Dir`], handling overwrite logic.
 ///
-/// All operations resolve relative to `dst_parent`'s pinned fd: classify an existing entry via
-/// `dst_parent.child(dst_name)`; create via `dst_parent.make_dir(dst_name, mode)` (`mkdirat`);
-/// reuse an existing directory via `dst_parent.open_dir(dst_name)` (`O_NOFOLLOW|O_DIRECTORY` — a
-/// directory→symlink swap fails closed with ELOOP/ENOTDIR); replace a non-directory via
-/// fd-relative [`remove_existing_dst`] then `make_dir`. A privileged destination therefore cannot
-/// be redirected by a concurrent symlink swap of the parent into creating a directory outside the
-/// destination tree. The new directory is created at
+/// All operations resolve relative to `dst_parent`'s pinned fd. Reuse tries
+/// `dst_parent.open_dir(dst_name)` first; that `O_NOFOLLOW|O_DIRECTORY` open is both the type check and
+/// the fd used for lockdown/descent. Only a non-directory result is classified for ignore/overwrite
+/// planning. Replacement uses fd-relative [`remove_existing_dst`] then `make_dir`. A privileged
+/// destination therefore cannot be redirected by a concurrent symlink swap of the parent into
+/// creating a directory outside the destination tree. The new directory is created at
 /// [`common::safedir::DST_DIR_CREATE_MODE`] (writable so children can be populated); its real
 /// source mode is applied later by `complete_directory_single`, mirroring the path-based /
 /// local-copy behavior.
 ///
-/// Returns the result; does NOT increment progress counters — the caller defers the increment
-/// until completion (when it knows whether the directory is kept).
+/// Created-directory accounting is deferred until completion, when the caller knows whether the
+/// directory is kept; reuse and skip accounting happens here.
 async fn create_directory(
     settings: &common::copy::Settings,
     dst_parent: &Arc<Dir>,
     dst_name: &OsStr,
     dst: &std::path::Path,
 ) -> anyhow::Result<DirectoryCreateResult> {
-    let prog = progress();
     match dst_parent
         .make_dir(dst_name, common::safedir::DST_DIR_CREATE_MODE)
         .await
@@ -1111,41 +1090,33 @@ async fn create_directory(
             Ok(DirectoryCreateResult::Created(Arc::new(dir)))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            // something exists at destination - classify it via the parent fd (O_NOFOLLOW).
+            match dst_parent.open_dir(dst_name).await {
+                Ok(dir) => return reuse_existing_directory(dir, dst).await,
+                Err(error) if open_dir_reports_non_directory(&error) => {}
+                Err(error) => {
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("cannot open existing directory {dst:?}")));
+                }
+            }
+            // the type-constrained open found a non-directory. classify only because
+            // ignore/overwrite planning consumes the kind and accounting snapshot. If a concurrent
+            // writer put a directory back, accept the directory selected by one bounded second open.
             let dst_handle = dst_parent
                 .child(dst_name)
                 .await
                 .with_context(|| format!("failed reading metadata from dst: {dst:?}"))?;
             if dst_handle.kind() == common::walk::EntryKind::Dir {
-                // directory already exists - reuse it (no overwrite needed for directories).
-                // open_dir is O_NOFOLLOW|O_DIRECTORY, so a swap to a symlink fails closed here.
-                tracing::debug!("destination directory already exists, reusing it");
                 let dir = dst_parent
                     .open_dir(dst_name)
                     .await
                     .with_context(|| format!("cannot open existing directory {dst:?}"))?;
-                // strict-only lockdown: take over the reused directory, restrict it to 0o700 and
-                // strip both its ACLs for the copy's duration, restoring the original owner and
-                // ACLs at completion (no-op / None in the default path). A recheck, EPERM or ACL
-                // failure propagates as this directory's create error — the caller marks it Failed
-                // (or aborts under --fail-early), so no child is written into an unsecured
-                // directory, nor one whose default ACL children would still inherit.
-                let reused_lock = common::safedir::lockdown_reused_dir(&dir, &dst_handle)
-                    .await
-                    .with_context(|| {
-                        format!("cannot secure reused destination directory {dst:?}")
-                    })?;
-                prog.directories_unchanged.inc();
-                Ok(DirectoryCreateResult::AlreadyExisted(
-                    Arc::new(dir),
-                    reused_lock,
-                ))
+                reuse_existing_directory(dir, dst).await
             } else if settings.ignore_existing {
                 // not a directory but ignore_existing is set - skip the subtree
                 tracing::debug!(
                     "destination exists but is not a directory, skipping subtree (--ignore-existing)"
                 );
-                prog.directories_unchanged.inc();
+                progress().directories_unchanged.inc();
                 Ok(DirectoryCreateResult::Skipped)
             } else if settings.overwrite {
                 // not a directory but overwrite is enabled - remove fd-relatively and create.
@@ -1155,7 +1126,7 @@ async fn create_directory(
                     dst_name,
                     dst,
                     dst_handle.into_removal_snapshot(),
-                    settings,
+                    settings.fail_early,
                 )
                 .await?;
                 let dir = dst_parent
@@ -1179,14 +1150,15 @@ async fn create_directory(
     }
 }
 
-/// Create a symlink fd-relative on the PARENT's held `Dir`, handling overwrite logic, and apply
-/// its metadata through the created link's own pinned handle.
+/// Create a symlink fd-relative on the parent's held `Dir`, handling overwrite logic, and bind
+/// requested metadata to a same-target pinned handle.
 ///
 /// Creation goes through `dst_parent.symlink_at(dst_name, target)` (`symlinkat` relative to the
-/// pinned parent fd), which fails with `EEXIST` on any pre-existing entry (never following it);
-/// the returned handle pins the link inode for race-free metadata application. Overwrite removal
-/// is fd-relative via [`remove_existing_dst`]. A privileged destination therefore cannot be
-/// redirected by a concurrent symlink swap of the parent into creating a link outside the
+/// pinned parent fd), which fails with `EEXIST` on any pre-existing entry and never follows it.
+/// Metadata preservation then opens the current link, validates its immutable target through that
+/// handle, and applies metadata through the same handle; no-preserve creation does not reopen it.
+/// Overwrite removal is fd-relative via [`remove_existing_dst`]. A privileged destination therefore
+/// cannot be redirected by a concurrent symlink swap of the parent into creating a link outside the
 /// destination tree.
 async fn create_symlink(
     settings: &common::copy::Settings,
@@ -1200,15 +1172,11 @@ async fn create_symlink(
     let prog = progress();
     // fast path: the destination slot is empty, create the link directly.
     match dst_parent.symlink_at(dst_name, target).await {
-        Ok(link_handle) => {
-            common::safedir::set_symlink_metadata_fd(
-                preserve,
-                metadata,
-                &link_handle,
-                common::Side::Destination,
-            )
-            .await
-            .with_context(|| format!("failed setting symlink metadata on {dst:?}"))?;
+        Ok(()) => {
+            dst_parent
+                .set_symlink_metadata_at(dst_name, target, preserve, metadata)
+                .await
+                .with_context(|| format!("failed setting symlink metadata on {dst:?}"))?;
             prog.symlinks_created.inc();
             Ok(())
         }
@@ -1224,15 +1192,18 @@ async fn create_symlink(
                 );
             }
             // classify the existing entry through the parent fd (O_NOFOLLOW).
-            let dst_handle = dst_parent
+            let mut dst_handle = dst_parent
                 .child(dst_name)
                 .await
                 .with_context(|| format!("failed reading metadata from dst: {dst:?}"))?;
             if dst_handle.kind() == common::walk::EntryKind::Symlink {
-                let dst_link = dst_parent
-                    .read_link_at(dst_name)
+                // target equality can authorize metadata updates through dst_handle, so read the
+                // target from that same pinned fd. Consuming and returning the handle avoids a dup.
+                let (dst_link, returned_handle) = dst_handle
+                    .read_symlink_owned(common::Side::Destination)
                     .await
                     .with_context(|| format!("failed reading dst symlink: {dst:?}"))?;
+                dst_handle = returned_handle;
                 if *target == dst_link {
                     tracing::debug!(
                         "destination is a symlink and points to the same location as source"
@@ -1273,21 +1244,17 @@ async fn create_symlink(
                 dst_name,
                 dst,
                 dst_handle.into_removal_snapshot(),
-                settings,
+                settings.fail_early,
             )
             .await?;
-            let link_handle = dst_parent
+            dst_parent
                 .symlink_at(dst_name, target)
                 .await
                 .with_context(|| format!("failed creating symlink {dst:?}"))?;
-            common::safedir::set_symlink_metadata_fd(
-                preserve,
-                metadata,
-                &link_handle,
-                common::Side::Destination,
-            )
-            .await
-            .with_context(|| format!("failed setting symlink metadata on {dst:?}"))?;
+            dst_parent
+                .set_symlink_metadata_at(dst_name, target, preserve, metadata)
+                .await
+                .with_context(|| format!("failed setting symlink metadata on {dst:?}"))?;
             prog.symlinks_created.inc();
             Ok(())
         }
@@ -1381,8 +1348,7 @@ async fn process_control_stream(
     // detached writers on the control stream; drained after the loop on the ordinary paths.
     let mut manifest_tasks = tokio::task::JoinSet::new();
     // one manifest build at a time: the task exists to keep the RECEIVE LOOP reading, not to
-    // parallelize builds — a single slot preserves the previous serial build's peak-memory
-    // profile (one manifest Vec in flight)
+    // parallelize builds. a single slot bounds manifest memory to one Vec in flight.
     let manifest_build_slot = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
     while let Some(source_message) = control_recv_stream
         .recv_object::<remote::protocol::SourceMessage>()
@@ -2246,9 +2212,9 @@ mod teardown_tests {
         .await
     }
 
-    /// A CLEAN framed EOF (an empty reader) before completion must be fatal, exactly like a
-    /// transport-level peer closure. This is the arm that previously broke out un-gated and left the
-    /// worker reconnecting into an idle socket while the source waited for `DestinationDone`.
+    /// A clean framed EOF (an empty reader) before completion is fatal, exactly like a
+    /// transport-level peer closure; accepting it would leave the worker reconnecting into an idle
+    /// socket while the source waits for `DestinationDone`.
     #[tokio::test]
     async fn pre_completion_clean_eof_is_fatal() {
         let r = run_over_reader(
@@ -2408,23 +2374,6 @@ mod manifest_tests {
 mod removal_tests {
     use super::*;
 
-    fn settings() -> common::copy::Settings {
-        common::copy::Settings {
-            dereference: false,
-            fail_early: false,
-            overwrite: true,
-            overwrite_compare: Default::default(),
-            overwrite_filter: None,
-            ignore_existing: false,
-            chunk_size: 0,
-            skip_specials: false,
-            remote_copy_buffer_size: 0,
-            filter: None,
-            dry_run: None,
-            delete: None,
-        }
-    }
-
     #[tokio::test]
     async fn overwrite_removes_a_replacement_in_the_contained_destination_slot()
     -> anyhow::Result<()> {
@@ -2440,15 +2389,18 @@ mod removal_tests {
         tokio::fs::remove_file(&victim_path).await?;
         tokio::fs::write(&victim_path, "replacement").await?;
 
-        remove_existing_dst(
+        let summary = remove_existing_dst(
             &dst_parent,
             victim,
             &victim_path,
             planned.into_removal_snapshot(),
-            &settings(),
+            false,
         )
         .await?;
 
+        assert_eq!(summary.files_removed, 1);
+        assert_eq!(summary.bytes_removed, 8);
+        assert_eq!(summary.symlinks_removed, 0);
         assert!(
             !victim_path.exists(),
             "overwrite removes the entry currently occupying the contained slot"

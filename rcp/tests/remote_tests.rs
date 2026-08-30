@@ -8148,9 +8148,9 @@ fn test_remote_require_toctou_safe_copies() {
 /// The remote reused-destination-directory lockdown+restore path, end-to-end over
 /// the real protocol: a `--require-toctou-safe --overwrite` remote copy INTO a
 /// PRE-EXISTING (reused) destination directory locks it down for the copy
-/// (`create_directory`: verify_same_inode → secure_as_copier → 0o700) and restores
-/// it at completion (`complete_directory_single`: chown_to + the tracker threading
-/// through `DirectoryState.reused_lock.restore_owner`). The reused dir starts NON-WRITABLE at
+/// (`create_directory`: open compatible directory → secure_as_copier → 0o700) and restores
+/// final metadata at completion while the tracker threads the optional uid-restore state through
+/// `DirectoryState.reused_lock`. The reused dir starts NON-WRITABLE at
 /// 0o500 (like the local test): without the lockdown (which fchmods it to 0o700) the
 /// copier could not write the child into it, so a successful copy PROVES the lockdown
 /// fired — not a vacuous pass. The source dir is at 0o755; a successful copy must
@@ -8730,7 +8730,7 @@ fn count_rcpd_xattr_syscalls(args: &[&str]) -> Vec<String> {
     lines
 }
 
-/// `--preserve-settings=all` must cost the SOURCE nothing in ACL probes on a remote copy.
+/// `--preserve-settings=all` must cost the source nothing in ACL reads on a remote copy.
 ///
 /// This is the whole reason `MasterHello::Source` carries a capture field: the source is told
 /// `preserve` by nobody (only the destination hello carries it), so without the flag it would have
@@ -8752,20 +8752,11 @@ fn test_remote_acl_off_issues_no_source_probe() {
     let src_remote = format!("localhost:{}", src_tree.to_str().unwrap());
     let traced =
         count_rcpd_xattr_syscalls(&["--preserve-settings=all", &src_remote, &plain_remote]);
-    // exactly ONE ACL syscall for the whole run: the constant source-root probe behind the "this
-    // copy drops the root's ACL" warning. The bound is on the CONSTANT rather than on zero, because
-    // what must never come back is a probe that scales with the tree.
     assert!(
-        traced.len() <= 1,
-        "`all` made the rcpd processes issue {} ACL probe syscall(s) — more than the one constant \
-         source-root probe, so every remote copy that does not want ACLs now pays per entry:\n{}",
+        traced.is_empty(),
+        "`all` made the rcpd processes issue {} ACL read syscall(s), even though ACL capture is \
+         disabled:\n{}",
         traced.len(),
-        traced.join("\n")
-    );
-    assert!(
-        traced.iter().all(|line| line.contains("/proc/self/fd/")),
-        "the ACL syscall `all` issued is not the constant source-root probe (which goes through \
-         the root handle's /proc/self/fd magic symlink):\n{}",
         traced.join("\n")
     );
     // `-L` runs an entirely separate Pass-1 walk with its own directory-ACL gate, so the check
@@ -8780,10 +8771,9 @@ fn test_remote_acl_off_issues_no_source_probe() {
         &deref_remote,
     ]);
     assert!(
-        traced.len() <= 1,
-        "`all --dereference` made the rcpd processes issue {} ACL probe syscall(s) — more than the \
-         one constant source-root probe; the `-L` walk has its own gate and must honor the capture \
-         flag too:\n{}",
+        traced.is_empty(),
+        "`all --dereference` made the rcpd processes issue {} ACL read syscall(s); the `-L` walk \
+         has its own gate and must honor the capture flag too:\n{}",
         traced.len(),
         traced.join("\n")
     );
@@ -8795,8 +8785,7 @@ fn test_remote_acl_off_issues_no_source_probe() {
         count_rcpd_xattr_syscalls(&["--preserve-settings=all+acl", &src_remote, &acl_remote]);
     assert!(
         traced.len() > 1,
-        "`all+acl` issued {} ACL syscall(s) — no more than the constant root probe `all` pays, so \
-         the counter proves nothing about `all`",
+        "`all+acl` issued {} ACL syscall(s), so the counter proves nothing about `all`",
         traced.len()
     );
     assert_eq!(
@@ -8834,16 +8823,16 @@ fn run_rcp_at_default_verbosity(args: &[&str]) -> String {
     )
 }
 
-/// The source-root ACL notice has to survive TWO filters and a wire hop: the root is on the source
-/// host, so the probe runs in the source `rcpd`, whose own filter decides whether the notice is
-/// even sent, and the master's filter then decides whether the forwarded line is rendered.
+/// The source-side ACL settings notice has to survive two filters and a wire hop. The source rcpd's
+/// filter decides whether the notice is sent, and the master's filter decides whether the forwarded
+/// line is rendered.
 ///
 /// A local-only test cannot see any of that — `rcpd` is a child of sshd, and its log lines are
 /// forwarded over a separate connection rather than printed. This runs at the DEFAULT verbosity
 /// deliberately: at `-v` both filters pass everything and the test would hold even with the
 /// dedicated tracing target removed from either end.
 #[test]
-fn test_remote_source_root_acl_warning_reaches_the_master() {
+fn test_remote_acl_settings_notice_reaches_the_master() {
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_tree = src_dir.path().join("tree");
@@ -8858,14 +8847,13 @@ fn test_remote_source_root_acl_warning_reaches_the_master() {
     let log =
         run_rcp_at_default_verbosity(&["--preserve-settings=all", &src_remote, &warned_remote]);
     assert!(
-        log.contains("carries a POSIX ACL that this copy will NOT preserve"),
-        "the source rcpd's root ACL notice never reached the master at the default verbosity, so a \
-         remote user copying a tree whose root carries an ACL is told nothing:\n{log}"
+        log.contains("does not preserve POSIX ACLs"),
+        "the source rcpd's ACL settings notice never reached the master at default verbosity:\n{log}"
     );
     assert!(
         log.contains("remote::source::"),
         "the notice must be tagged as coming from the SOURCE rcpd — if it is being emitted by the \
-         master instead, it is probing the wrong host's filesystem:\n{log}"
+         master instead, the wire notice path is not being exercised:\n{log}"
     );
     // and silent when the copy does preserve them, so this is not just "rcpd logs something"
     let quiet_remote = format!(
@@ -8875,16 +8863,14 @@ fn test_remote_source_root_acl_warning_reaches_the_master() {
     let log =
         run_rcp_at_default_verbosity(&["--preserve-settings=all+acl", &src_remote, &quiet_remote]);
     assert!(
-        !log.contains("carries a POSIX ACL that this copy will NOT preserve"),
-        "warned about an ACL the remote copy is preserving:\n{log}"
+        !log.contains("does not preserve POSIX ACLs"),
+        "warned even though the remote copy preserves all supported ACL kinds:\n{log}"
     );
 }
 
-/// A remote copy that asked for no preservation must cost the source NOTHING for a notice it does
-/// not want: the arming flag rides in `capture`, so getting this wrong on the wire is invisible
-/// locally — the master would stay silent while the source still paid for the probe.
+/// A remote copy that asked for no preservation must neither emit the notice nor read ACL xattrs.
 #[test]
-fn test_remote_copy_without_preserve_settings_issues_no_root_acl_probe() {
+fn test_remote_copy_without_preserve_settings_issues_no_acl_reads() {
     require_local_ssh();
     let (src_dir, dst_dir) = setup_test_env();
     let src_tree = src_dir.path().join("tree");
@@ -8900,7 +8886,7 @@ fn test_remote_copy_without_preserve_settings_issues_no_root_acl_probe() {
     assert!(
         traced.is_empty(),
         "a remote copy at the shipped default made the rcpd processes issue {} ACL syscall(s); it \
-         asked for no preservation, so `capture` should have disarmed the root probe entirely:\n{}",
+         asked for no preservation, so `capture` should have disabled every ACL read:\n{}",
         traced.len(),
         traced.join("\n")
     );
@@ -8913,17 +8899,14 @@ fn test_remote_copy_without_preserve_settings_issues_no_root_acl_probe() {
         ),
     ]);
     assert!(
-        !log.contains("carries a POSIX ACL that this copy will NOT preserve"),
+        !log.contains("does not preserve POSIX ACLs"),
         "a remote copy that asked for no preservation still warned about a dropped ACL:\n{log}"
     );
 }
 
 /// `--require-toctou-safe` arms the notice on the source even when `capture` is all-false, because
-/// it reaches the source `rcpd` as its own mirrored flag rather than through the capture struct.
-///
-/// This is the one case where an all-false `capture` does NOT mean the source touches no xattr, and
-/// it is only observable across the wire: locally the two flags are read from the same process, so
-/// a local test cannot tell "mirrored correctly" from "never needed mirroring".
+/// it reaches the source rcpd as its own mirrored flag. The notice remains settings-only: all-false
+/// capture still authorizes no ACL read.
 #[test]
 fn test_remote_strict_mode_arms_the_root_notice_on_an_all_false_capture() {
     if !common::safedir::openat2_available() {
@@ -8940,17 +8923,31 @@ fn test_remote_strict_mode_arms_the_root_notice_on_an_all_false_capture() {
     create_test_file(&src_tree.join("f.txt"), "payload", 0o644);
     set_acl(&src_tree, ACL_ACCESS, &denying_acl());
     let src_remote = format!("localhost:{}", src_tree.to_str().unwrap());
-    let dst_remote = format!("localhost:{}", dst_base.join("strict").to_str().unwrap());
+    let no_read_remote = format!(
+        "localhost:{}",
+        dst_base.join("strict-no-read").to_str().unwrap()
+    );
+    let traced =
+        count_rcpd_xattr_syscalls(&["--require-toctou-safe", &src_remote, &no_read_remote]);
+    assert!(
+        traced.is_empty(),
+        "strict mode's settings notice performed an ACL read on an all-false capture:\n{}",
+        traced.join("\n")
+    );
+    let dst_remote = format!(
+        "localhost:{}",
+        dst_base.join("strict-notice").to_str().unwrap()
+    );
     // no --preserve-settings at all, so the master sends `capture` all-false
     let log = run_rcp_at_default_verbosity(&["--require-toctou-safe", &src_remote, &dst_remote]);
     assert!(
-        log.contains("carries a POSIX ACL that this copy will NOT preserve"),
+        log.contains("does not preserve POSIX ACLs"),
         "the strict flag did not arm the source's root notice, so a remote user who reached for \
          --require-toctou-safe — and may well assume it carries source ACLs across — is told \
          nothing:\n{log}"
     );
     assert!(
-        log.contains("does not carry the SOURCE's"),
+        log.contains("does not carry source ACLs across"),
         "the notice reached the master with the generic wording, so the source rcpd did not know \
          it was running strict:\n{log}"
     );
@@ -8977,16 +8974,13 @@ fn test_remote_acl_round_trip_with_dereference() {
     assert_acl_fixture_copied(&dst_tree);
 }
 
-/// The remote reused-destination-directory lockdown, with `d:acl` ON — the case where the finalize
-/// re-stat verify has to reconcile a mode that comes from two places at once.
+/// The remote reused-destination-directory lockdown with `d:acl` ON.
 ///
 /// A `--require-toctou-safe --overwrite --preserve-settings=all+acl` remote copy into a PRE-EXISTING
 /// destination directory that carries its own ACLs. The source directory is SETGID and carries both
 /// an access and a default ACL, which is what makes this the sharp case: the destination's special
-/// bits come from the finalize chmod and its rwx bits from the source's ACL, and the verify checks
-/// both against `masked_mode` in one comparison. That only works because the source's own mode's rwx
-/// bits were themselves derived from that same ACL by the kernel — reasoning that is load-bearing
-/// enough to want a test rather than a comment.
+/// bits come from the finalize chmod and its rwx bits from the source's ACL. The source's own mode
+/// and ACL encode that same combined state, so the result must reproduce both.
 ///
 /// The lockdown's snapshot of the destination's original ACLs is DISCARDED here, because `d:acl`
 /// asked for the source's: a copy preserving ACLs must not resurrect whatever the destination
@@ -9042,8 +9036,7 @@ fn test_remote_strict_reused_dir_takes_the_source_acls_over_its_own() {
     assert_eq!(
         get_file_mode(&dst_tree),
         0o2755,
-        "setgid from the finalize chmod, rwx from the source's ACL — the reused-directory verify \
-         checks both against the source's mode in one comparison"
+        "setgid from the finalize chmod and rwx from the source's ACL must both survive"
     );
     let got_access = get_acl(&dst_tree, ACL_ACCESS);
     assert_eq!(

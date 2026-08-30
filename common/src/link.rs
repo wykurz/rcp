@@ -213,7 +213,7 @@ async fn hard_link_entry_fd(
                 dst_name,
                 dst_path,
                 dst_handle.into_removal_snapshot(),
-                &settings.copy_settings,
+                settings.copy_settings.fail_early,
             )
             .await
             .map_err(|err| {
@@ -269,22 +269,22 @@ pub async fn link(
 }
 
 #[cfg(test)]
-type AfterUpdatePrecheckHook = Box<dyn FnOnce() + Send>;
+type BeforeUpdateOpenHook = Box<dyn FnOnce() + Send>;
 
 #[cfg(test)]
-static AFTER_UPDATE_PRECHECK_HOOKS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, AfterUpdatePrecheckHook>>,
+static BEFORE_UPDATE_OPEN_HOOKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, BeforeUpdateOpenHook>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
-struct AfterUpdatePrecheckHookRegistration {
+struct BeforeUpdateOpenHookRegistration {
     update_path: std::path::PathBuf,
 }
 
 #[cfg(test)]
-impl Drop for AfterUpdatePrecheckHookRegistration {
+impl Drop for BeforeUpdateOpenHookRegistration {
     fn drop(&mut self) {
-        AFTER_UPDATE_PRECHECK_HOOKS
+        BEFORE_UPDATE_OPEN_HOOKS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.update_path);
@@ -292,21 +292,21 @@ impl Drop for AfterUpdatePrecheckHookRegistration {
 }
 
 #[cfg(test)]
-fn install_after_update_precheck_hook(
+fn install_before_update_open_hook(
     update_path: std::path::PathBuf,
-    hook: AfterUpdatePrecheckHook,
-) -> AfterUpdatePrecheckHookRegistration {
-    let replaced = AFTER_UPDATE_PRECHECK_HOOKS
+    hook: BeforeUpdateOpenHook,
+) -> BeforeUpdateOpenHookRegistration {
+    let replaced = BEFORE_UPDATE_OPEN_HOOKS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(update_path.clone(), hook);
-    assert!(replaced.is_none(), "update precheck hook already installed");
-    AfterUpdatePrecheckHookRegistration { update_path }
+    assert!(replaced.is_none(), "update-open hook already installed");
+    BeforeUpdateOpenHookRegistration { update_path }
 }
 
 #[cfg(test)]
-fn run_after_update_precheck_hook(update_path: &std::path::Path) {
-    let hook = AFTER_UPDATE_PRECHECK_HOOKS
+fn run_before_update_open_hook(update_path: &std::path::Path) {
+    let hook = BEFORE_UPDATE_OPEN_HOOKS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(update_path);
@@ -328,8 +328,8 @@ async fn link_inner(
     // reconstructs every path from the explicit roots, so it is no longer threaded into the walk.
     let _ = cwd;
     let update_root_requirement = UpdateRootRequirement::from_settings(settings);
-    // reserve root admission before any strict probe or operand-parent open, then transfer it into
-    // link_internal. an authoritative directory releases it before dual-tree descent.
+    // reserve root admission before any operand-parent open, then transfer it into link_internal.
+    // an authoritative directory releases it before dual-tree descent.
     let permit = walk::ensure_leaf_permit(PermitKind::OpenFile, None).await;
     enum LinkRootSetup {
         Complete(Summary),
@@ -343,67 +343,6 @@ async fn link_inner(
     }
     let setup_admission = permit.as_ref().map(LeafPermit::admission);
     let setup = safedir::with_optional_fd_admission(setup_admission, async move {
-        // a missing --update root is destructive under both --update-exclusive (materialized set =
-        // update set, so nothing materializes) AND --delete (the source-only keep_set makes any dst
-        // entry the missing update tree WOULD have protected look extraneous, and prune wipes it).
-        // in either case `link_internal` hits the recursive early-return / silent `None` fallback
-        // before that destruction would happen, so rlink reports success — silently preserving
-        // stale dst (--update-exclusive) or silently pruning would-be-protected entries (--delete).
-        // reject up front so the usual error ordering catches a typo'd --update before later operand
-        // work. The same typed requirement is retained through the authoritative root classification,
-        // closing the race after this probe. Plain "--update without --delete or --update-exclusive"
-        // still falls back to no-update mode, and recursive child-level "update missing" cases remain
-        // ordinary no-op/source-only decisions.
-        if let Some(update_path) = update.as_ref() {
-            if crate::safedir::strict_operand_resolution() {
-                // under strict operand resolution, validate the update operand prefix UP FRONT
-                // (fd-relative, `openat2(RESOLVE_NO_SYMLINKS)`), unconditionally for ALL --update — so a
-                // plain --update with an excluded source (which returns before the update parent would
-                // otherwise be opened) cannot slip a symlinked update prefix through. A symlink in a
-                // directory component fails closed (ELOOP); this also serves the destructive-mode
-                // existence check below.
-                let kind =
-                    crate::safedir::strict_probe_dst_kind(update_path, congestion::Side::Source)
-                        .await
-                        .map_err(|err| {
-                            Error::new(
-                                anyhow::Error::new(err).context(format!(
-                                    "failed reading metadata from update {update_path:?}"
-                                )),
-                                Default::default(),
-                            )
-                        })?;
-                if update_root_requirement.is_required() && kind.is_none() {
-                    return Err(missing_destructive_update_error(update_path));
-                }
-            } else if update_root_requirement.is_required() {
-                match crate::walk::run_metadata_probed(
-                    congestion::Side::Source,
-                    congestion::MetadataOp::Stat,
-                    tokio::fs::symlink_metadata(update_path),
-                )
-                .await
-                {
-                    Ok(_) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(missing_destructive_update_error(update_path));
-                    }
-                    Err(err) => {
-                        return Err(Error::new(
-                            anyhow::Error::new(err).context(format!(
-                                "failed reading metadata from update {:?}",
-                                update_path
-                            )),
-                            Default::default(),
-                        ));
-                    }
-                }
-            }
-        }
-        #[cfg(test)]
-        if let Some(update_path) = update.as_ref() {
-            run_after_update_precheck_hook(update_path);
-        }
         // source: decompose via the shared helper so `.`/`..` operands (e.g. `rlink . dst`, `rlink
         // tree/.. dst`) are canonicalized to a real directory + basename instead of being rejected; `/`
         // is still rejected. (The destination and `--update` operands keep their direct split below.)
@@ -432,48 +371,6 @@ async fn link_inner(
             Some(Arc::new(parent.into_tree()))
         } else {
             None
-        };
-        // the destination's parent path, split leniently for the up-front strict validation below (a
-        // `.`/`..`/`/` destination has no distinct parent+name; the authoritative split — which rejects
-        // such a destination — runs AFTER the filter, preserving default-mode ordering so a filtered-out
-        // source still skips cleanly). empty parent (a single-component relative path) means ".".
-        let dst_parent_path_opt: Option<&std::path::Path> = match (dst.parent(), dst.file_name()) {
-            (Some(parent), Some(_)) if parent.as_os_str().is_empty() => {
-                Some(std::path::Path::new("."))
-            }
-            (Some(parent), Some(_)) => Some(parent),
-            _ => None,
-        };
-        // under strict operand resolution, resolve the destination parent UP FRONT — before the source
-        // root-filter early-return, unconditionally — so a symlinked destination prefix fails closed in
-        // every mode regardless of filters/flags (see copy::copy for the same pattern). An absent parent
-        // (dry-run previewing into a not-yet-created tree, or a filtered-out root) is not a symlink
-        // violation; only a symlinked prefix component (ELOOP) fails closed here.
-        let strict_dst_parent: Option<Arc<Dir>> = match (
-            crate::safedir::strict_operand_resolution(),
-            dst_parent_path_opt,
-        ) {
-            (true, Some(dst_parent_path)) => {
-                match Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination).await {
-                    Ok(parent) => Some(Arc::new(parent.into_tree())),
-                    Err(err)
-                        if err.kind() == std::io::ErrorKind::NotFound
-                            || err.raw_os_error() == Some(libc::ENOTDIR) =>
-                    {
-                        None
-                    }
-                    Err(err) => {
-                        return Err(Error::new(
-                            anyhow::Error::new(err).context(format!(
-                                "cannot open destination parent directory {dst_parent_path:?}"
-                            )),
-                            Default::default(),
-                        ));
-                    }
-                }
-            }
-            // default mode, or a degenerate destination (rejected by the authoritative split below)
-            _ => None,
         };
         // in default mode a dual root may take the same metadata-only exclusion fast path as a
         // source-only root. Both physical operands are one logical item in the source namespace,
@@ -515,34 +412,20 @@ async fn link_inner(
         // a source-only root preserves the historical cheap early filter. a dual root that was not
         // conclusively excluded above defers to the joint fd-relative setup decision after both
         // handles are classified.
-        if update.is_none()
+        if strict_src_parent.is_none()
+            && update.is_none()
             && let Some(ref filter) = settings.filter
         {
-            let (kind, is_dir) = match &strict_src_parent {
-                // strict: classify via the held parent fd (O_NOFOLLOW), never by path
-                Some(parent) => {
-                    let root_handle = parent
-                        .child(src_name)
-                        .await
-                        .with_context(|| format!("failed reading metadata from {:?}", &src))
-                        .map_err(|err| Error::new(err, Default::default()))?;
-                    (root_handle.kind(), root_handle.kind() == EntryKind::Dir)
-                }
-                None => {
-                    let src_metadata = crate::walk::run_metadata_probed(
-                        congestion::Side::Source,
-                        congestion::MetadataOp::Stat,
-                        tokio::fs::symlink_metadata(src),
-                    )
-                    .await
-                    .with_context(|| format!("failed reading metadata from {:?}", &src))
-                    .map_err(|err| Error::new(err, Default::default()))?;
-                    (
-                        EntryKind::from_metadata(&src_metadata),
-                        src_metadata.is_dir(),
-                    )
-                }
-            };
+            let src_metadata = crate::walk::run_metadata_probed(
+                congestion::Side::Source,
+                congestion::MetadataOp::Stat,
+                tokio::fs::symlink_metadata(src),
+            )
+            .await
+            .with_context(|| format!("failed reading metadata from {:?}", &src))
+            .map_err(|err| Error::new(err, Default::default()))?;
+            let kind = EntryKind::from_metadata(&src_metadata);
+            let is_dir = src_metadata.is_dir();
             let result = filter.should_include_root_item(std::path::Path::new(src_name), is_dir);
             match result {
                 crate::filter::FilterResult::Included => {}
@@ -560,6 +443,7 @@ async fn link_inner(
         // fd-relative path every nested entry takes. The roots are then handed to `link_internal` by
         // their basenames, exactly like child entries. under strict operand resolution the source
         // parent was already opened and validated above, so reuse its held fd here.
+        let strict_source = strict_src_parent.is_some();
         let src_parent = match strict_src_parent {
             Some(parent) => parent,
             None => {
@@ -588,6 +472,10 @@ async fn link_inner(
         // applies to that case; the parent-open merely must not ENOENT-fail before `link_internal` can
         // apply it. Under `--delete` or `--update-exclusive`, parent failure propagates and root absence
         // is rejected again by whichever authoritative root classification site retains the handle.
+        #[cfg(test)]
+        if let Some(update_path) = update.as_ref() {
+            run_before_update_open_hook(update_path);
+        }
         let update_parent = match update.as_ref() {
             Some(update_path) => {
                 // decompose the update operand the same way as the source: the update tree is a READ
@@ -600,8 +488,8 @@ async fn link_inner(
                     .map_err(|err| Error::new(err, Default::default()))?;
                 let update_parent_path = update_operand.parent;
                 let update_name = update_operand.name;
-                // the update tree's TRUSTED parent prefix is resolved following symlinks (see the
-                // source parent above): a symlinked update container must be followed into the real dir.
+                // the update tree's trusted parent prefix follows symlinks in default mode, matching
+                // the source parent. strict operand resolution instead rejects a symlinked prefix.
                 let fallback_eligible = !update_root_requirement.is_required();
                 match Dir::open_parent_dir(&update_parent_path, congestion::Side::Source).await {
                     // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below).
@@ -622,6 +510,9 @@ async fn link_inner(
                             err
                         );
                         None
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(missing_destructive_update_error(update_path));
                     }
                     Err(err) => {
                         return Err(Error::new(
@@ -675,6 +566,27 @@ async fn link_inner(
                 }
                 LinkEntryAdmission::Filtered(entry)
             }
+            (Some(filter), None) if strict_source => {
+                let src_handle = src_parent
+                    .child(src_name)
+                    .await
+                    .with_context(|| format!("failed reading metadata from {src:?}"))
+                    .map_err(|err| Error::new(err, Default::default()))?;
+                let entry = AdmittedLinkEntry::new(src_handle, permit);
+                let kind = entry.src_handle.kind();
+                let result = filter.should_include_root_item(
+                    std::path::Path::new(src_name),
+                    kind == EntryKind::Dir,
+                );
+                if !matches!(result, crate::filter::FilterResult::Included) {
+                    if let Some(mode) = settings.dry_run {
+                        crate::dry_run::report_skip(src, &result, mode, kind.label_long());
+                    }
+                    kind.inc_skipped(prog_track);
+                    return Ok(LinkRootSetup::Complete(skipped_summary_for(kind)));
+                }
+                LinkEntryAdmission::Filtered(entry)
+            }
             _ => LinkEntryAdmission::from(EntryAdmission::from(permit)),
         };
         // authoritative destination split runs only after every applicable root filter. a `.`/`..`/`/`
@@ -694,65 +606,35 @@ async fn link_inner(
         } else {
             dst_parent_path
         };
-        // one `listxattr` on the source ROOT per run — a constant, not a per-entry probe — warning that
-        // a source root carrying an ACL is about to be linked by settings that drop it. WITHOUT
+        // warn from settings alone when ACL fidelity may be incomplete. WITHOUT
         // `--update`, files count as already safe whatever `f:acl` says: a hard-linked destination
         // file IS the source inode, so its ACL cannot be dropped (and must never be written through,
         // which is why `f:acl` applies only on rlink's real copy path). WITH `--update` that certainty
         // is gone — a changed file is materialized by COPYING the update-tree entry, which drops its
-        // acl unless `f:acl` is on — so the file half then defers to the setting like any copy. (the
-        // probe still examines the SOURCE root; whether the update entry differs — and so whether the
-        // copy path actually runs — is not known yet, matching the probe's documented
-        // root-only-heuristic character.) whether the notice is wanted AT ALL still comes from the
-        // preserve settings, which for rlink default to `all` — metadata fidelity is what the tool is
-        // for — so a bare `rlink` asks for it where a bare `rcp` does not.
-        let root_acl_notice = crate::safedir::RootAclNotice {
+        // acl unless `f:acl` is on — so the file half then defers to the setting like any copy.
+        // whether the notice is wanted at all still comes from the preserve settings, which for
+        // rlink default to `all`.
+        let acl_notice = crate::safedir::AclPreservationNotice {
             file_acl_preserved: update.is_none() || settings.preserve.file.acl,
-            ..crate::safedir::RootAclNotice::for_preserve(&settings.preserve)
+            ..crate::safedir::AclPreservationNotice::for_preserve(&settings.preserve)
         };
-        match &admission {
-            LinkEntryAdmission::Filtered(entry) => {
-                crate::safedir::warn_if_root_acl_unpreserved(
-                    &entry.src_handle,
-                    src,
-                    root_acl_notice,
-                )
-                .await;
-            }
-            LinkEntryAdmission::Unclassified { .. } => {
-                crate::safedir::warn_if_root_acl_unpreserved_at(
-                    &src_parent,
-                    src_name,
-                    src,
-                    root_acl_notice,
-                )
-                .await;
-            }
-        }
-        // in dry-run we never touch the destination, so we don't open its parent at all (it may not
-        // even exist). `dst_parent == None` is the signal throughout the walk that destination
-        // operations must be skipped. in a real link, reuse the strict-validated parent, or open it
-        // following symlinks (default mode; a symlinked destination container is followed into the real
-        // dir).
+        crate::safedir::warn_if_acls_may_be_unpreserved(acl_notice);
+        // in dry-run we never touch the destination, so we don't open its parent at all. in a real
+        // link this one parent open is both the strict prefix check (when armed) and the fd retained
+        // for destination actions.
         let dst_parent = if settings.dry_run.is_some() {
             None
         } else {
-            match strict_dst_parent {
-                Some(parent) => Some(parent),
-                None => {
-                    let dir = Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "cannot open destination parent directory {:?}",
-                                dst_parent_path
-                            )
-                        })
-                        .map_err(|err| Error::new(err, Default::default()))?;
-                    // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below).
-                    Some(Arc::new(dir.into_tree()))
-                }
-            }
+            let dir = Dir::open_parent_dir(dst_parent_path, congestion::Side::Destination)
+                .await
+                .with_context(|| {
+                    format!(
+                        "cannot open destination parent directory {:?}",
+                        dst_parent_path
+                    )
+                })
+                .map_err(|err| Error::new(err, Default::default()))?;
+            Some(Arc::new(dir.into_tree()))
         };
         Ok(LinkRootSetup::Ready {
             src_operand,
@@ -2418,17 +2300,17 @@ async fn link_dir_contents(
     // apply directory metadata regardless of whether all children linked successfully. the
     // directory itself was created/opened above. skipped in dry-run (no directory exists). prefer
     // the update directory's metadata when an update tree is present at this level (it is the
-    // materialized version, matching the old `update_metadata_opt` preference), else the source
-    // directory's. The metadata is read from the SAME fd whose contents were enumerated (read-side
+    // materialized version and therefore supplies this level's metadata), else the source
+    // directory's. the metadata is read from the SAME fd whose contents were enumerated (read-side
     // fidelity, docs/tocttou.md), not the classify handles.
     tracing::debug!("set 'dst' directory metadata");
     let metadata_result = match dst_dir {
         Some(dst_dir) => {
             let meta_dir = update_dir.unwrap_or(src_dir);
-            // for a reused directory locked down under strict mode, put back the ACLs the
-            // lockdown stripped and restore the original owner component-wise, then apply source
-            // metadata (see set_reused_dir_metadata_fd — no transient window hands the directory to
-            // a hostile prior owner); None for fresh dirs.
+            // for a reused directory locked down under strict mode, resolve its original default ACL
+            // state and restore the original owner component-wise, then apply source metadata
+            // (see set_reused_dir_metadata_fd — no transient window hands the directory to a
+            // hostile prior owner); None for fresh dirs.
             async {
                 let preserve_meta = meta_dir.meta().await?;
                 // the ACLs come from the same fd as the metadata, and only when `d:acl` was asked
@@ -2527,7 +2409,7 @@ mod link_tests {
 
     mod delete_keep_set_tests {
         //! Pure-logic unit tests for `DeleteKeepSet`. No filesystem needed — these pin exact
-        //! worker ownership so a future refactor cannot silently restore hint-based keeps.
+        //! worker ownership and reject hint-based keeps.
 
         use super::super::DeleteKeepSet;
         use crate::copy::DeleteSettings;
@@ -2661,22 +2543,20 @@ mod link_tests {
     }
 
     struct DisappearingUpdateRootHook {
-        _registration: AfterUpdatePrecheckHookRegistration,
+        _registration: BeforeUpdateOpenHookRegistration,
         _cleanup: std::sync::Arc<std::sync::Mutex<Option<RestoreRenamedUpdateRoot>>>,
     }
 
-    fn disappear_update_root_after_precheck(
-        update: &std::path::Path,
-    ) -> DisappearingUpdateRootHook {
+    fn disappear_update_root_before_open(update: &std::path::Path) -> DisappearingUpdateRootHook {
         let original = update.to_owned();
-        let renamed = update.with_extension("removed-after-precheck");
+        let renamed = update.with_extension("removed-before-open");
         let cleanup = std::sync::Arc::new(std::sync::Mutex::new(None));
         let hook_cleanup = Arc::clone(&cleanup);
-        let registration = install_after_update_precheck_hook(
+        let registration = install_before_update_open_hook(
             original.clone(),
             Box::new(move || {
                 std::fs::rename(&original, &renamed)
-                    .expect("rename update root after its early precheck");
+                    .expect("rename update root before its authoritative open");
                 *hook_cleanup
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -2721,10 +2601,10 @@ mod link_tests {
     }
 
     #[tokio::test]
-    async fn update_exclusive_errors_if_update_root_disappears_after_precheck()
+    async fn update_exclusive_errors_if_update_root_disappears_before_open()
     -> Result<(), anyhow::Error> {
         let (test_path, src, update, dst) = setup_disappearing_update_root_case().await?;
-        let _hook = disappear_update_root_after_precheck(&update);
+        let _hook = disappear_update_root_before_open(&update);
         let mut settings = common_settings(false, true);
         settings.update_exclusive = true;
         let result = link(
@@ -2751,10 +2631,10 @@ mod link_tests {
     }
 
     #[tokio::test]
-    async fn delete_update_does_not_prune_if_update_root_disappears_after_precheck()
+    async fn delete_update_does_not_prune_if_update_root_disappears_before_open()
     -> Result<(), anyhow::Error> {
         let (test_path, src, update, dst) = setup_disappearing_update_root_case().await?;
-        let _hook = disappear_update_root_after_precheck(&update);
+        let _hook = disappear_update_root_before_open(&update);
         let mut settings = common_settings(false, true);
         settings.copy_settings.delete = Some(copy::DeleteSettings {
             delete_excluded: false,
@@ -2784,10 +2664,10 @@ mod link_tests {
     }
 
     #[tokio::test]
-    async fn plain_update_falls_back_if_update_root_disappears_after_precheck()
+    async fn plain_update_falls_back_if_update_root_disappears_before_open()
     -> Result<(), anyhow::Error> {
         let (test_path, src, update, dst) = setup_disappearing_update_root_case().await?;
-        let _hook = disappear_update_root_after_precheck(&update);
+        let _hook = disappear_update_root_before_open(&update);
         link(
             &PROGRESS,
             &test_path,

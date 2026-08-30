@@ -201,20 +201,11 @@ fn all_does_not_pay_the_acl_probe() {
         src_sub.to_str().unwrap(),
         plain_dst.to_str().unwrap(),
     ]);
-    // `all` pays exactly ONE ACL syscall for the whole run: the constant source-root probe behind
-    // the "this copy drops the root's ACL" warning. The bound is on the CONSTANT rather than on
-    // zero, because what must never come back is a probe that scales with the tree.
     assert!(
-        traced.len() <= 1,
-        "`all` issued {} ACL probe syscall(s) — more than the one constant source-root probe, so \
-         every copy that does not want ACLs now pays per entry:\n{}",
+        traced.is_empty(),
+        "`all` issued {} ACL read syscall(s), even though neither ACL preservation nor an \
+         action-bound consumer requested one:\n{}",
         traced.len(),
-        traced.join("\n")
-    );
-    assert!(
-        traced.iter().all(|line| line.contains("/proc/self/fd/")),
-        "the ACL syscall `all` issued is not the constant source-root probe (which goes through \
-         the root handle's /proc/self/fd magic symlink):\n{}",
         traced.join("\n")
     );
     // and prove the counter is not vacuous: the same copy WITH `acl` must show the per-entry probe.
@@ -227,8 +218,7 @@ fn all_does_not_pay_the_acl_probe() {
     ]);
     assert!(
         traced.len() > 1,
-        "`all+acl` issued {} ACL syscall(s) — no more than the constant root probe `all` pays, so \
-         the counter proves nothing about `all`",
+        "`all+acl` issued {} ACL syscall(s), so the counter proves nothing about the ACL-off path",
         traced.len()
     );
     assert_eq!(
@@ -712,13 +702,10 @@ fn strict_mode_does_not_enable_acl_preservation() {
         src_tree.to_str().unwrap(),
         strict_dst.to_str().unwrap(),
     ]);
-    // one constant source-root probe is expected (the "this copy drops the root's ACL" warning);
-    // anything beyond it is the per-entry cost creeping in
     assert!(
-        traced.len() <= 1,
-        "--require-toctou-safe issued {} ACL probe syscall(s) — more than the one constant \
-         source-root probe, so it has started paying the per-entry cost that makes `acl` \
-         opt-in:\n{}",
+        traced.is_empty(),
+        "--require-toctou-safe issued {} ACL read syscall(s), even though strict containment does \
+         not request source ACL preservation:\n{}",
         traced.len(),
         traced.join("\n")
     );
@@ -737,9 +724,8 @@ fn strict_mode_does_not_enable_acl_preservation() {
     ]);
     assert!(
         traced.len() > 1,
-        "`--require-toctou-safe --preserve-settings=all+acl` issued {} ACL syscall(s) — no more \
-         than the constant root probe the run without `acl` pays, so the counter proves nothing \
-         about it",
+        "`--require-toctou-safe --preserve-settings=all+acl` issued {} ACL syscall(s), so the \
+         counter proves nothing about the ACL-off run",
         traced.len()
     );
     assert_eq!(
@@ -849,14 +835,10 @@ fn strict_mode_strips_once_per_directory_not_per_file() {
     );
 }
 
-// ── The source-root warning (§3.3) ─────────────────────────────────────────────────────────────
+// ── The ACL-preservation settings notice (§3.3) ───────────────────────────────────────────────
 //
 // `all` not preserving ACLs is only defensible if a user who did not read this document finds out.
-// One `listxattr` on the SOURCE ROOT per run — a constant, not a per-entry probe — says so.
-//
-// It is a HEURISTIC and the tests below say so: a root without an ACL proves nothing about its
-// children, and the alternative (probing enough entries to be sure) IS the per-entry cost that made
-// `acl` opt-in in the first place.
+// the notice follows from the requested settings and performs no opportunistic filesystem probe.
 
 /// Run `rcp` at the DEFAULT verbosity — no `-v` — and return everything it wrote.
 ///
@@ -876,31 +858,28 @@ fn rcp_log(args: &[&str]) -> String {
 
 /// The marker every form of the warning shares, so a wording change does not silently make these
 /// tests assert nothing.
-const ROOT_WARNING: &str = "carries a POSIX ACL that this copy will NOT preserve";
+const ACL_NOTICE: &str = "does not preserve POSIX ACLs";
 
 #[test]
-fn warns_when_the_source_root_carries_an_acl_that_is_not_preserved() {
+fn warns_when_requested_settings_may_omit_acls() {
     let (src_dir, dst_dir) = setup_test_env();
     let src_tree = build_aclless_source(src_dir.path());
-    set_acl(&src_tree, ACL_ACCESS, &denying_acl());
     let log = rcp_log(&[
         "--preserve-settings=all",
         src_tree.to_str().unwrap(),
         dst_dir.path().join("warned").to_str().unwrap(),
     ]);
     assert!(
-        log.contains(ROOT_WARNING),
-        "no warning for a source root carrying an ACL that `all` drops, so a user who does not \
-         know `all` excludes ACLs never finds out:\n{log}"
+        log.contains(ACL_NOTICE),
+        "no notice that `all` can omit ACLs:\n{log}"
     );
     assert!(
         log.contains("all+acl"),
         "the warning must name the fix:\n{log}"
     );
-    // and it names the root, so a multi-operand or nested run says WHICH path it is talking about
     assert!(
-        log.contains(src_tree.to_str().unwrap()),
-        "the warning must name the source root:\n{log}"
+        !log.contains(src_tree.to_str().unwrap()),
+        "the settings-only notice must not imply that the source root was inspected:\n{log}"
     );
 }
 
@@ -928,7 +907,7 @@ fn stays_silent_when_the_copy_asks_for_no_preservation() {
         argv.push(dst.to_str().unwrap());
         let log = rcp_log(&argv);
         assert!(
-            !log.contains(ROOT_WARNING),
+            !log.contains(ACL_NOTICE),
             "`{label}` asked for no preservation, so the ACL notice is noise about a fidelity the \
              copy never claimed:\n{log}"
         );
@@ -941,8 +920,8 @@ fn stays_silent_when_the_copy_asks_for_no_preservation() {
         dst_dir.path().join("asked").to_str().unwrap(),
     ]);
     assert!(
-        log.contains(ROOT_WARNING),
-        "the same root under `all` did not warn either, so the silence above proves nothing:\n{log}"
+        log.contains(ACL_NOTICE),
+        "the same settings under `all` did not warn either, so the silence above proves nothing:\n{log}"
     );
 }
 
@@ -960,7 +939,7 @@ fn any_attribute_worth_preserving_arms_the_root_notice() {
         dst_dir.path().join("uid_only").to_str().unwrap(),
     ]);
     assert!(
-        log.contains(ROOT_WARNING),
+        log.contains(ACL_NOTICE),
         "a run preserving one attribute did not arm the notice, so the gate is keyed to a preset \
          rather than to asking:\n{log}"
     );
@@ -985,12 +964,12 @@ fn strict_mode_arms_the_root_notice_without_any_preserve_flag() {
         dst_base.join("strict_only").to_str().unwrap(),
     ]);
     assert!(
-        log.contains(ROOT_WARNING),
+        log.contains(ACL_NOTICE),
         "--require-toctou-safe alone did not warn, so a user who reached for it — and may well \
          assume it carries source ACLs across — is told nothing:\n{log}"
     );
     assert!(
-        log.contains("does not carry the SOURCE's"),
+        log.contains("does not carry source ACLs across"),
         "the strict wording must survive being armed by the flag alone:\n{log}"
     );
 }
@@ -1010,8 +989,8 @@ fn quiet_suppresses_the_root_notice() {
         dst_dir.path().join("quiet").to_str().unwrap(),
     ]);
     assert!(
-        !log.contains(ROOT_WARNING),
-        "--quiet did not suppress the root notice:\n{log}"
+        !log.contains(ACL_NOTICE),
+        "--quiet did not suppress the ACL notice:\n{log}"
     );
 }
 
@@ -1054,7 +1033,7 @@ fn the_notice_target_does_not_unmute_ordinary_warnings() {
 }
 
 #[test]
-fn stays_silent_when_the_source_root_acl_is_preserved() {
+fn stays_silent_when_both_file_and_directory_acls_are_preserved() {
     let (src_dir, dst_dir) = setup_test_env();
     let src_tree = build_aclless_source(src_dir.path());
     set_acl(&src_tree, ACL_ACCESS, &denying_acl());
@@ -1064,27 +1043,25 @@ fn stays_silent_when_the_source_root_acl_is_preserved() {
         dst_dir.path().join("quiet").to_str().unwrap(),
     ]);
     assert!(
-        !log.contains(ROOT_WARNING),
-        "warned about an ACL the copy is preserving:\n{log}"
+        !log.contains(ACL_NOTICE),
+        "warned even though every supported ACL kind is preserved:\n{log}"
     );
 }
 
 #[test]
-fn the_root_warning_consults_the_setting_for_the_roots_own_kind() {
-    // `f:acl` and `d:acl` are independent, so the warning must ask about the kind the ROOT actually
-    // is. Getting this wrong in either direction is silent: one way it warns about an ACL the copy
-    // is preserving, the other it stays quiet about one being dropped.
+fn the_notice_names_each_entry_kind_whose_acls_may_be_omitted() {
+    // the settings-only notice covers the whole operation, not the root's current kind. preserving
+    // one kind still leaves the other worth naming.
     let (src_dir, dst_dir) = setup_test_env();
     let src_tree = build_aclless_source(src_dir.path());
-    set_acl(&src_tree, ACL_ACCESS, &denying_acl());
     let file_only = rcp_log(&[
         "--preserve-settings=f:uid,gid,time,acl,7777 d:uid,gid,time,7777",
         src_tree.to_str().unwrap(),
         dst_dir.path().join("file_only").to_str().unwrap(),
     ]);
     assert!(
-        file_only.contains(ROOT_WARNING),
-        "`f:acl` alone leaves a DIRECTORY root's ACL unpreserved, so the warning is still due:\n{file_only}"
+        file_only.contains(ACL_NOTICE) && file_only.contains("for directories"),
+        "`f:acl` alone must leave a notice about directory ACLs:\n{file_only}"
     );
     let dir_only = rcp_log(&[
         "--preserve-settings=f:uid,gid,time,7777 d:uid,gid,time,acl,7777",
@@ -1092,52 +1069,25 @@ fn the_root_warning_consults_the_setting_for_the_roots_own_kind() {
         dst_dir.path().join("dir_only").to_str().unwrap(),
     ]);
     assert!(
-        !dir_only.contains(ROOT_WARNING),
-        "`d:acl` preserves a DIRECTORY root's ACL, so there is nothing to warn about:\n{dir_only}"
+        dir_only.contains(ACL_NOTICE) && dir_only.contains("for files"),
+        "`d:acl` alone must leave a notice about file ACLs:\n{dir_only}"
     );
 }
 
 #[test]
-fn a_root_that_cannot_warn_does_not_spend_the_probe_budget() {
-    // The one probe per process is claimed AFTER the root's kind and the per-kind settings are
-    // known, so a root that could never produce a notice does not consume it. Here the first
-    // operand is a symlink — no ACL is possible on one — and the second is a directory that does
-    // carry an ACL. If the symlink burned the budget, the directory would be silent and a user
-    // copying several trees at once would be told nothing about any of them but the first.
+fn the_notice_performs_no_acl_read() {
     let (src_dir, dst_dir) = setup_test_env();
-    std::os::unix::fs::symlink("/nonexistent", src_dir.path().join("alink")).unwrap();
     let src_tree = build_aclless_source(src_dir.path());
     set_acl(&src_tree, ACL_ACCESS, &denying_acl());
-    let into = format!("{}/", dst_dir.path().to_str().unwrap());
-    let log = rcp_log(&[
-        "--preserve-settings=all",
-        src_dir.path().join("alink").to_str().unwrap(),
-        src_tree.to_str().unwrap(),
-        &into,
-    ]);
-    assert!(
-        log.contains(ROOT_WARNING),
-        "the symlink operand consumed the one per-process probe, so the directory operand that \
-         actually had an ACL to report was silenced:\n{log}"
-    );
-}
-
-#[test]
-fn stays_silent_when_the_source_root_has_no_acl() {
-    // the heuristic's own boundary: the root is what is probed, so a tree whose ACLs live BELOW the
-    // root produces no warning. Documented as a heuristic precisely because of this.
-    let (src_dir, dst_dir) = setup_test_env();
-    let src_tree = build_aclless_source(src_dir.path());
-    set_acl(&src_tree.join("a.txt"), ACL_ACCESS, &denying_acl());
-    let log = rcp_log(&[
+    let traced = count_xattr_syscalls(&[
         "--preserve-settings=all",
         src_tree.to_str().unwrap(),
-        dst_dir.path().join("unprobed").to_str().unwrap(),
+        dst_dir.path().join("no_probe").to_str().unwrap(),
     ]);
     assert!(
-        !log.contains(ROOT_WARNING),
-        "the probe is one syscall on the ROOT; warning about a child means it is walking the \
-         tree, which is the per-entry cost `acl` is opt-in to avoid:\n{log}"
+        traced.is_empty(),
+        "the settings notice performed an opportunistic ACL read:\n{}",
+        traced.join("\n")
     );
 }
 
@@ -1161,55 +1111,16 @@ fn the_strict_mode_warning_says_the_flag_does_not_preserve_source_acls() {
         dst_base.join("strict_warned").to_str().unwrap(),
     ]);
     assert!(
-        log.contains(ROOT_WARNING),
+        log.contains(ACL_NOTICE),
         "no warning under --require-toctou-safe:\n{log}"
     );
     assert!(
-        log.contains("does not carry the SOURCE's"),
+        log.contains("does not carry source ACLs across"),
         "the strict-mode warning must say the flag contains the DESTINATION's ACLs but does not \
          preserve the SOURCE's — otherwise it reads as though the flag covered both:\n{log}"
     );
     assert!(
         log.contains("all+acl"),
         "the strict-mode warning must name the fix:\n{log}"
-    );
-}
-
-#[test]
-fn the_root_warning_costs_one_syscall_whatever_the_tree_size() {
-    // The warning is only affordable on the default path because it is a CONSTANT. Hold the root
-    // fixed and vary the file count: the probe count must not move. (`all_does_not_pay_the_acl_probe`
-    // bounds the same number at 1; this one proves the bound is structural rather than a
-    // coincidence of that fixture's size.)
-    let (src_dir, dst_dir) = setup_test_env();
-    let mut counts = Vec::new();
-    for (name, files) in [("few", 2usize), ("many", 40usize)] {
-        let tree = src_dir.path().join(name);
-        std::fs::create_dir(&tree).unwrap();
-        for i in 0..files {
-            create_test_file(&tree.join(format!("f{i}.txt")), "x", 0o644);
-        }
-        set_acl(&tree, ACL_ACCESS, &denying_acl());
-        counts.push(count_xattr_syscalls(&[
-            "--preserve-settings=all",
-            tree.to_str().unwrap(),
-            dst_dir.path().join(name).to_str().unwrap(),
-        ]));
-    }
-    let (few, many) = (&counts[0], &counts[1]);
-    assert_eq!(
-        few.len(),
-        1,
-        "expected exactly the one root probe:\n{}",
-        few.join("\n")
-    );
-    assert_eq!(
-        many.len(),
-        few.len(),
-        "the ACL probe count grew from {} to {} when only the FILE count changed, so the root \
-         warning is no longer a constant:\n{}",
-        few.len(),
-        many.len(),
-        many.join("\n")
     );
 }

@@ -140,6 +140,40 @@ bugs. Thread the already-computed value through when that is the simpler shape; 
 redundancy when *it* is. Apply low-risk simplifications as part of the change; describe larger
 restructurings in the PR rather than bundling them.
 
+### TOCTOU Checks Must Bind the Action
+
+Before changing filesystem-race hardening, read [docs/tocttou.md](docs/tocttou.md), especially its
+scope and validation rule, and keep the implementation and documentation aligned.
+
+Treat a consistency check as security-bearing only when the checked object stays structurally bound
+to the action: the action uses the same held descriptor/open file description, subsequent work uses
+an already-open descriptor whose identity was verified, or one kernel primitive makes the condition
+and mutation atomic. A `stat`/`fstatat`/`openat`/`(dev, ino)` check followed by a separate by-name
+`unlinkat`, `rmdir`, rename, open, or chmod only moves the race; do not add such opportunistic
+checks or describe them as fail-closed.
+
+Do not justify an unbound check by saying that it narrows the race window or catches most swaps. An
+attacker who can repeat the operation can retry until the unguarded interval wins, so probabilistic
+detection does not justify added code, descriptors, or syscalls.
+
+Apply the same standard to advisory warnings and UX preflights. Prefer a settings-only notice or the
+authoritative action result over a raceable filesystem observation. Do not add `exists`, metadata,
+temporary-create, or open-and-close probes merely to predict what a later action will report.
+
+A held fd binds object identity, but it does not by itself make mutable metadata a durable
+postcondition. Once an actor regains permission to mutate that inode, it can race a final `fstat` or
+change the state immediately afterward. Retain verification when it gates later fd-bound work while
+the actor is excluded, or when a trusted consumer needs the observation; do not pay for a final
+observation whose only effect is probabilistic detection.
+
+For a deliberate by-name action through a pinned parent, document the actual contract: containment
+and syscall type bounds, with a compatible final-name replacement accepted. If correctness requires
+the exact object, use an exact/atomic primitive or decline the action. Point-in-time kind, size, and
+metadata may still drive filters, planning, dispatch, and accounting, but call them snapshots; they
+do not prove which object a later by-name syscall affects. Do not spend another fd or metadata
+syscall merely to make an advisory snapshot race-coherent when no subsequent fd-bound action or
+fidelity invariant consumes that exact observation.
+
 ### Prefer Structural Fixes Over Repeated Patching
 
 When code — especially delicate concurrency / teardown / error-handling code — accumulates repeated

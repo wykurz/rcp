@@ -553,11 +553,10 @@ async fn lockdown_reused_dir_never_loses_the_default_acl_when_cancelled() -> any
         let root =
             common::safedir::Dir::open_root_dir(&tmp, false, common::Side::Destination).await?;
         let entry = std::ffi::OsString::from(&name);
-        let handle = root.child(&entry).await?;
         let dir = root.open_dir(&entry).await?;
         // poll the lockdown at most `budget` times, then drop it mid-flight
         let outcome = {
-            let mut fut = Box::pin(common::safedir::lockdown_reused_dir(&dir, &handle));
+            let mut fut = Box::pin(common::safedir::lockdown_reused_dir(&dir));
             let mut polls = 0usize;
             std::future::poll_fn(move |cx| {
                 if polls >= budget {
@@ -670,9 +669,8 @@ async fn aborted_strict_finalize_removes_the_default_acl_it_installed() -> anyho
     common::safedir::enable_strict_operand_resolution();
     let root = common::safedir::Dir::open_root_dir(&tmp, false, common::Side::Destination).await?;
     let entry = std::ffi::OsString::from("reused_no_acl");
-    let handle = root.child(&entry).await?;
     let dir = root.open_dir(&entry).await?;
-    let lock = common::safedir::lockdown_reused_dir(&dir, &handle)
+    let lock = common::safedir::lockdown_reused_dir(&dir)
         .await?
         .expect("strict mode must lock a reused directory");
     // simulate the finalize's partial progress: the source's default ACL already landed...
@@ -713,9 +711,8 @@ async fn strict_finalize_installs_source_default_acl_and_keeps_it() -> anyhow::R
         .meta()
         .clone();
     let entry = std::ffi::OsString::from("reused_dst");
-    let handle = root.child(&entry).await?;
     let dir = root.open_dir(&entry).await?;
-    let lock = common::safedir::lockdown_reused_dir(&dir, &handle)
+    let lock = common::safedir::lockdown_reused_dir(&dir)
         .await?
         .expect("strict mode must lock a reused directory");
     let source_default = granting_acl();
@@ -771,9 +768,8 @@ async fn create_after_reused_dir_rollback_strips_inherited_acl() -> anyhow::Resu
     common::safedir::enable_strict_operand_resolution();
     let root = common::safedir::Dir::open_root_dir(&tmp, false, common::Side::Destination).await?;
     let entry = std::ffi::OsString::from("reused_rollback");
-    let handle = root.child(&entry).await?;
     let dir = root.open_dir(&entry).await?;
-    let lock = common::safedir::lockdown_reused_dir(&dir, &handle)
+    let lock = common::safedir::lockdown_reused_dir(&dir)
         .await?
         .expect("strict mode must lock a reused directory");
     // the copy aborts: the rollback restores the default ACL — and must re-arm the strip
@@ -793,11 +789,11 @@ async fn create_after_reused_dir_rollback_strips_inherited_acl() -> anyhow::Resu
 /// directory holding its OWN original default ACL — never the source's.
 ///
 /// The finalize installs the source's default ACL early (through the lockdown guard, while the
-/// copier still owns the directory) and then runs several more fallible steps: the owner restore,
-/// the inner metadata applier, and the final re-stat verification. A cancellation landing anywhere
-/// in that tail is a FAILED copy of this directory, and failing toward *unchanged* requires the
-/// guard to remain armed there so its `Drop` rolls the just-installed source ACL back. This includes
-/// cancellation at the re-stat await, an fstat error, or a verification failure.
+/// copier still owns the directory) and then runs the fallible/cancellable owner restore and inner
+/// metadata applier. A cancellation landing anywhere in that tail is a FAILED copy of this
+/// directory, and failing toward *unchanged* requires the guard to remain armed there so its `Drop`
+/// rolls the just-installed source ACL back. The guard is disarmed synchronously only after the
+/// applier succeeds.
 ///
 /// Cancellation is driven by POLL COUNT, exactly as in
 /// `lockdown_reused_dir_never_loses_the_default_acl_when_cancelled` (see there for why a
@@ -843,9 +839,8 @@ async fn cancelled_strict_finalize_restores_the_destinations_default_acl() -> an
         tokio::fs::create_dir(&dir_path).await?;
         set_acl(&dir_path, ACL_DEFAULT, &original);
         let entry = std::ffi::OsString::from(&name);
-        let handle = root.child(&entry).await?;
         let dir = root.open_dir(&entry).await?;
-        let lock = common::safedir::lockdown_reused_dir(&dir, &handle)
+        let lock = common::safedir::lockdown_reused_dir(&dir)
             .await?
             .expect("strict mode must lock a reused directory");
         // poll the finalize at most `budget` times, then drop it mid-flight (the dropped future
