@@ -32,16 +32,16 @@ flag into each rcpd's spawn arguments (via `RcpdConfig::to_args()`). Each rcpd t
 operand resolution before any filesystem work: its operand root/parent opens resolve with
 `openat2(RESOLVE_NO_SYMLINKS)`, and it refuses to run on kernels without `openat2` (Linux 5.6+) —
 the refusal is printed as a single line on stderr, where the master's handshake reader surfaces it.
-Strict resolution adds no operand field or flag to the wire protocol. The master lints each
-operand's strict form (absolute as written, lexically normal; `~`-relative forms are rejected)
-before spawning and carries the flag in each rcpd's process arguments. Note the asymmetry:
+The operands still travel as before — the master lints their strict form (absolute as written,
+lexically normal; `~`-relative forms are rejected) before spawning. Note the asymmetry: the source's
 `MasterHello::Source` carries both `src` and `dst`, so the source `rcpd` opens+validates its source
 parent up front, but `MasterHello::Destination` carries **no path** — the destination `rcpd` learns
 the destination only from the source's per-entry messages, so it validates its prefix only when it
 actually opens the destination to write (a `--dry-run` or fully-filtered source writes nothing and
 therefore does not separately validate it; see the strict-operand residual in
-[tocttou.md](tocttou.md)). Version-matched rcpd binaries (see binary discovery in
-[remote_copy.md](remote_copy.md)) understand the process argument.
+[tocttou.md](tocttou.md)). This is a spawn-argument change, not a wire-format change;
+version-matched rcpd binaries (see binary discovery in [remote_copy.md](remote_copy.md)) understand
+the flag.
 
 **Source-owned file-work ceiling:** Let `F` be the logical file ceiling, `M` the configured
 `--max-connections`, and `E = min(F, M)`. When `--max-files-in-flight` is omitted, the source `rcpd`
@@ -57,8 +57,8 @@ The resolved `E` and pending capacity `P = E × pending-writes-multiplier` use c
 must be nonzero, and must not exceed `tokio::sync::Semaphore::MAX_PERMITS`. Explicit capacity can be
 validated before remote-home expansion or SSH. For automatic capacity, the master validates the
 configured connection upper bound before remote side effects; the source resolves and validates the
-actual CPU-selected capacity before it announces readiness and before destination spawn. No
-`MasterHello` or data-message field carries these capacities. Wire revision 4 protects the extended
+actual CPU-selected capacity before it announces readiness and before destination spawn.
+`MasterHello` and data-message schemas remain unchanged. Wire revision 4 protects the extended
 readiness record, typed internal spawn arguments, and source-first bootstrap contract. Wire revision
 5 protects removal of the unreachable explicit-unlimited override and the positive remote-copy
 connection timeout. Wire revision 6 protects the public `--max-files-in-flight=unlimited` daemon
@@ -121,17 +121,14 @@ its per-job deadline and the invocation's shared final deadline. The common poll
 cannot spin forever on a child that never becomes reapable. The control directory is removed only
 after the retained master is confirmed exited; expiry preserves it rather than deleting the socket
 from under a possibly-live master. The master threads actual local operand roots through remote-HOME
-lookup and endpoint preparation. Candidate parents lexically inside those roots are skipped as an
-operational placement policy; aliases and concurrent namespace changes are not probed because that
-observation would not bind SSH's later path-based use. Selection creates the actual private control
-directory once and passes it to the launcher rather than using a disposable create/remove probe to
-predict a later create. Remote-to-remote copies do not infer an exclusion from the working
-directory. The filesystem root cannot exclude candidates because every absolute socket path lies
-beneath it. Nested cleanup runs inside its parent cleanup worker, and separate invocations cannot
-drain one another's workers. Before process exit, the CLI gives the scope one bounded budget to wait
-for its last resource owner, supervisor, and every cleanup job; work still blocked after that grace
-is abandoned with the process. Daemon waits run concurrently across endpoints while tracing
-receivers stay live, then any remaining receiver tasks share one final drain deadline.
+lookup and endpoint preparation; canonical control-directory candidates inside those trees are
+rejected, while remote-to-remote copies do not infer an exclusion from the working directory. The
+filesystem root cannot exclude candidates because every absolute socket path lies beneath it. Nested
+cleanup runs inside its parent cleanup worker, and separate invocations cannot drain one another's
+workers. Before process exit, the CLI gives the scope one bounded budget to wait for its last
+resource owner, supervisor, and every cleanup job; work still blocked after that grace is abandoned
+with the process. Daemon waits run concurrently across endpoints while tracing receivers stay live,
+then any remaining receiver tasks share one final drain deadline.
 
 Normal daemon discovery does not require `HOME`: when it is absent, the deployed-cache candidate is
 skipped and same-directory/PATH discovery continues. Remote `~` expansion and deployment into the
@@ -281,10 +278,10 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
       network traffic)
     - `dry_run`: Optional dry-run mode (brief, all, or explain) for previewing operations without
       transferring files
-    - `capture: ExtendedMetadataCapture { file_acl, dir_acl, root_acl_notice }`: which POSIX ACLs
-      the source must read beyond the `stat` it already does, plus the historically named settings
-      bit for the ACL-preservation notice. The first two fields authorize per-entry reads whose
-      bytes are sent; `root_acl_notice` authorizes no filesystem read. See §2.5.
+    - `capture: ExtendedMetadataCapture { file_acl, dir_acl, root_acl_notice }`: what EXTENDED
+      metadata the source must read beyond the `stat` it already does — currently POSIX ACLs. The
+      first two are per-entry reads whose bytes are sent; `root_acl_notice` buys one read on the
+      ROOT whose only product is a log line. See §2.5.
   - `Destination { source_control_addr, source_data_addr, server_name, preserve, source_cert_fingerprint }`:
     Tells destination where to connect (both control and data addresses). Note: empty directory
     cleanup decisions are communicated per-directory via `keep_if_empty` in `Directory` messages
@@ -326,14 +323,7 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
 
 - **Purpose**: Create symlink with metadata
 - **Fields**: `src`, `dst`, `target`, `metadata`, `is_root`
-- **Usage**: Sent during directory traversal when a symlink is encountered. Destination `symlink_at`
-  is create-only. On the newly-created post-create path, no requested symlink owner/time metadata
-  means no final-name reopen or stat. Otherwise `set_symlink_metadata_at` opens the current link
-  `O_PATH|O_NOFOLLOW`, reads its immutable target through that handle, and applies owner/timestamps
-  through the same handle only when the target matches this message. This binds target authorization
-  to the metadata recipient; it does not prove created or final-name identity, and a same-target
-  replacement is accepted. When comparing an existing destination symlink, `read_symlink_owned`
-  likewise returns the target with the same metadata-recipient handle and requires no fd duplicate.
+- **Usage**: Sent during directory traversal when symlink encountered
 
 **`DirStructureComplete`**
 
@@ -462,9 +452,9 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
   operation error over the connection-teardown symptom, and the master prefixes it `Destination:`.
   So a destination-side abort still fails the copy with the real cause named — on the destination's
   half of the aggregated error — while the source adds only the benign teardown symptom alongside
-  it. Once the peer has aborted, the source's own Pass-2 sends genuinely fail, and a benign
-  peer-abort is not reliably distinguishable there from a real transport fault; the source symptom
-  is therefore retained.
+  it. (Fully suppressing that source-side symptom is deferred: once the peer has aborted, the
+  source's own Pass-2 sends genuinely fail, and a benign peer-abort is not reliably distinguishable
+  there from a real transport fault.)
   - **A data-path abort is signaled by closing the control stream.** A fatal error on a *data*
     connection — a `--fail-early` file/metadata failure, or a corrupted data stream — propagates out
     of the data worker; the destination records it and closes its control send stream (the
@@ -514,11 +504,11 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
     as graceful regardless of whether `DestinationDone` preceded it. A benign LATE reconnect that
     fails after `DestinationDone` also stashes a cause, but the transfer completed (`is_done()`), so
     the gate never fires and it is dropped. (A destination-side gate failure is sufficient: the
-    master fails the copy if EITHER rcpd fails. The source distinguishes a close with vs. without a
-    prior `DestinationDone` — it warns on the latter, naming the abort-or-death, since a reader of
-    the source's log would otherwise see the early close reported as a clean finish. The source
-    still returns success for that branch because the master's read of the destination's
-    `RcpdResult` is mandatory and fails the copy either way.)
+    master fails the copy if EITHER rcpd fails. The source now DOES distinguish a close with vs.
+    without a prior `DestinationDone` — it warns on the latter, naming the abort-or-death, since a
+    reader of the source's log would otherwise see the early close reported as a clean finish. Only
+    the failing half remains deferred: the source still returns success for that branch, because the
+    master's read of the destination's `RcpdResult` is mandatory and fails the copy either way.)
   - **Every TLS handshake is bounded.** All of them go through `remote::tls::accept_bounded` /
     `connect_bounded`, which apply the timeout and are the only place a handshake is performed; a
     bare `TlsAcceptor::accept`/`TlsConnector::connect` elsewhere is rejected by
@@ -528,9 +518,9 @@ fingerprint pinning. TLS 1.3 is pinned in the config (TLS 1.2 is never negotiate
     connection's handshake (destination connect, source accept), each source-side DATA-accept
     handshake, the source's DRY-RUN control accept, and both master↔rcpd accepts (control and
     tracing) are bounded by `conn_timeout_sec` — a peer that establishes TCP then stalls the
-    handshake therefore cannot hang any of them. (Two of these bounds matter most: the data-accept
-    and the rcpd accepts run inline in a sequential accept loop, so a single stall would otherwise
-    block every further connection — for rcpd, including the legitimate master's.)
+    handshake can no longer hang any of them. (Two of these bounds matter most: the data-accept and
+    the rcpd accepts run inline in a sequential accept loop, so a single stall would otherwise block
+    every further connection — for rcpd, including the legitimate master's.)
 
 **`DestinationDone`**
 
@@ -576,26 +566,26 @@ uid, `GROUP_OBJ`, named groups by ascending gid, `MASK`, `OTHER`) and the kernel
 else with `EINVAL`, so passing through what the source kernel already validated sidesteps the
 problem entirely. The on-disk format is defined little-endian (`__le16`/`__le32`), so it is portable
 across hosts as-is; the destination kernel validates on `fsetxattr`. rcp requires an exact rcp/rcpd
-version match (see [remote_copy.md](remote_copy.md)), so the protocol requires no cross-version
-compatibility for these fields.
+version match (see [remote_copy.md](remote_copy.md)), so adding these fields has no back-compat
+cost.
 
 **`Captured` with `None` means "the source has no such ACL", which the destination reproduces by
 REMOVING the attribute — not by leaving the destination alone.** A destination directory's default
 ACL is inherited by every entry created beneath it, including ones rcp creates itself, so "do
 nothing when the source has no ACL" would hand the copy permissions the source never granted.
 
-**`Unknown` means the wire carries no ACL information and authorizes no source-derived ACL set or
-clear.** It arrives in exactly two situations: the master never asked for ACLs (`capture.file_acl` /
-`capture.dir_acl` both false — the destination's `preserve` then never applies them either;
-`capture.root_acl_notice` is irrelevant here, since it carries a settings notice bit and never
+**`Unknown` means the wire carries no ACL information, and the destination must NOT touch the
+destination entry's ACLs.** It arrives in exactly two situations: the master never asked for ACLs
+(`capture.file_acl` / `capture.dir_acl` both false — the destination's `preserve` then never applies
+them either; `capture.root_acl_notice` is irrelevant here, since it buys a log line and never
 populates a `Metadata`), or the source COULD NOT read them (a committed directory that failed to
 open — that entry's copy is already recorded as an error on the source). The distinction from
 `Captured` all-`None` is load-bearing: collapsing the two turns a source-side read failure into an
 authoritative clear, permanently stripping a REUSED destination directory's access and default ACLs
 on a copy that is already failing. The destination implements `Unknown` by disabling ACL
-preservation for that one entry's metadata application. Ordinary mode application can still rewrite
-an existing access-ACL mask, and strict reused-directory lockdown temporarily removes then restores
-the original default ACL — the same outcome as `d:acl` off.
+preservation for that one entry's metadata application; for a strict-mode locked reused directory
+that restores the directory's ORIGINAL default ACL (the lockdown snapshot) — the same outcome as
+`d:acl` off.
 
 **Which messages actually carry ACLs:**
 
@@ -604,7 +594,7 @@ the original default ACL — the same outcome as `d:acl` off.
 | `File`                                                               | access only, when captured | read from the SAME fd whose bytes are sent, so permissions and contents cannot desync                                         |
 | `Directory`                                                          | both, when captured        | read from the held `O_NOFOLLOW` fd whose children were enumerated; the default ACL is what the destination's children inherit |
 | a committed-but-unreadable directory whose ENUMERATION failed (§7.1) | both, when captured        | the directory itself was reachable — only `getdents` failed — so it answers the probe like any other                          |
-| a committed directory that could not be OPENED at all (§7.1)         | `Unknown`                  | no fd to read them from and no honest source-derived ACL update to apply                                                      |
+| a committed directory that could not be OPENED at all (§7.1)         | `Unknown`                  | no fd to read them from and no honest answer to give: the destination leaves the destination directory's ACLs untouched       |
 | `Symlink`                                                            | nothing                    | the kernel has no symlink ACL; the settings parser rejects `l:acl`                                                            |
 | `ExistingEntry` (manifest)                                           | `Unknown`                  | the manifest answers `--overwrite-compare`, which has no `acl` term — see the hole below                                      |
 
@@ -639,15 +629,20 @@ failure on a file takes the same `FileSkipped` route as a failed open.
 
 **`MasterHello::Source { capture: ExtendedMetadataCapture { file_acl, dir_acl, root_acl_notice } }`.**
 Only `MasterHello::Destination` carries `preserve`, so without this field the source could not know
-whether ACLs are wanted and would have to read them unconditionally — a syscall per entry that
-`stat` cannot fold in, on every remote copy including ones that do not want ACLs. With `file_acl`
-and `dir_acl` false, the source issues no ACL xattr read, including under `--require-toctou-safe`.
+whether ACLs are wanted and would have to probe unconditionally — a syscall per entry that `stat`
+cannot fold in, on every remote copy including ones that do not want ACLs. With every field false
+the source issues no xattr syscall at all — except under `--require-toctou-safe`, which arms the
+root notice from the source's own mirrored flag rather than from here, so a strict run still pays
+the one root `listxattr` on an all-false capture. Nothing per-entry is reachable that way: only
+`file_acl` and `dir_acl` open that door.
 
-`root_acl_notice` is the historical wire name for the settings bit behind the syscall-free notice in
-[acls.md](acls.md#the-acl-preservation-settings-notice). It is set when the master's `preserve`
-requests metadata fidelity at all, while the two read flags are set only when `acl` is requested. A
-remote copy with preserve-none settings clears all three. `--require-toctou-safe` arms the notice
-through its separately mirrored source-side flag; it still authorizes no ACL read.
+`root_acl_notice` arms the one-per-run source-root probe behind the notice in
+[acls.md](acls.md#the-source-root-warning), and is independent of the two per-entry flags in both
+directions: it is set when the master's `preserve` asks for metadata fidelity **at all**, whereas
+they are set when it asks for `acl` specifically — which is exactly the case where there is nothing
+to warn about. A remote copy left at the shipped default clears all three. `--require-toctou-safe`
+arms the notice too but does not travel here: it reaches the source `rcpd` as its own mirrored flag
+and is read from the process-global strict state on the host that runs the probe.
 
 `capture` is deliberately NOT the whole `preserve` struct. The source decides only what to **read**;
 the destination remains the sole authority on what is **applied**. Handing the source a `preserve`
@@ -655,8 +650,7 @@ would invite a later reader to act on, say, `preserve.file.mode_mask` source-sid
 bug. The master derives `capture` from the same `preserve` it sends the destination, at one call
 site, so the two cannot disagree — which matters, because the destination reads an all-`None`
 `Metadata` as "clear", so a capture that said `false` under a `preserve` that said `true` would
-strip every ACL instead of copying it. The `capture` value is part of the wire format, not a daemon
-spawn argument.
+strip every ACL instead of copying it. This is a wire-format change, not a spawn-argument one.
 
 **Application (destination).** File ACLs are applied through the created file's own fd in
 `process_single_file`, directory ACLs through the directory's own held fd when it completes
@@ -664,21 +658,18 @@ spawn argument.
 (`common::safedir::set_file_metadata_fd` / `set_reused_dir_metadata_fd`), so the remote path
 inherits the local one's ordering rule: an access ACL is the step that WIDENS the destination from
 its owner-only create mode, so it runs last and the `fchmod` before it is narrowed to carry only the
-special bits (see the create-mode note in §5.1 and [tocttou.md](tocttou.md)). No separate protocol
-message carries ACLs: transport is confined to the two `Metadata` fields and the `capture` field.
+special bits (see the create-mode note in §5.1 and [tocttou.md](tocttou.md)). Neither is a new
+protocol message: the wire change is confined to the two `Metadata` fields and the `capture` field.
 
 **Not on the wire: the destination's own containment.** Under `--require-toctou-safe` the
-destination `rcpd` also strips the ACLs of every directory it creates and snapshots/removes the
-default ACL of every directory it reuses, so nothing created beneath one inherits. Successful
-finalize restores the destination default ACL when `d:acl` is off, or replaces/clears both ACLs from
-the source when `d:acl` is on; an armed rollback guard restores the original default ACL on failure.
-This is destination-local behavior driven by the mirrored flag, not by any message, and it applies
-whether or not `capture` asked the source for anything. See [acls.md](acls.md) and
-[tocttou.md](tocttou.md).
+destination `rcpd` also strips the ACLs of every directory it creates and snapshots/restores the
+default ACL of every directory it reuses, so nothing created beneath one inherits. That is
+destination-local behavior driven by the mirrored flag, not by any message, and it applies whether
+or not `capture` asked the source for anything. See [acls.md](acls.md) and [tocttou.md](tocttou.md).
 
-**Known hole:** a file the manifest shows as identical under `--overwrite-compare` (default
-`size,mtime`) is not transferred and keeps its destination ACL. This is the same shape as `mode`,
-which the default comparison also ignores.
+**Known hole (unchanged by ACL transport):** a file the manifest shows as identical under
+`--overwrite-compare` (default `size,mtime`) is not transferred and keeps its old destination ACL.
+This is the same shape as `mode`, which the default comparison also ignores.
 
 The whole ACL model — both widening directions, the measured costs, the apply ordering and the
 strict-mode invariant — lives in [acls.md](acls.md); this section covers only what crosses the wire.
@@ -747,20 +738,20 @@ Root items require special handling to prevent protocol hangs:
 return an error rather than silently continuing. Otherwise, no messages would be sent for the root
 item, leaving destination waiting forever for `root_complete` to be set.
 
-**Protocol-shape classification and payload binding.** One root classification determines
-`has_root_item` and the file/directory/symlink protocol branch. The hardened walk classifies through
-the trusted parent's fd; `-L` uses its path stat. A directory branch then drops the classification
-handle and opens an authoritative `O_NOFOLLOW|O_DIRECTORY` fd through that parent. Metadata,
-enumeration, and all descendant reads stay bound to that fd. A compatible directory replacement is
-therefore accepted; exact identity relative to the protocol-shape snapshot is not required.
+**One classification, no re-stat.** The root is classified ONCE, and that single snapshot drives
+`has_root_item`, the file-vs-directory dispatch, and the walk — which is handed the classification
+rather than taking one of its own. Two reads would let the two answers disagree: a root that is a
+directory at the first and a regular file at the second announces `has_root_item: true` and then
+sends no root message at all, which is exactly the hang above, with both peers alive. The hardened
+walk classifies through the trusted parent's fd; `-L` uses the one path stat it already takes.
 
-If that directory open fails because the slot disappeared, became incompatible, or is unreadable,
-the root takes the committed-but-unreadable-directory route of §7.1 outside `--fail-early`: a
-0-entry `Directory` sets `root_complete`, the error is recorded, and the copy still terminates.
-Under `--fail-early`, the same failure returns `Err` before the 0-entry `Directory` is sent. Nothing
-has been committed for the root at that point, so the destination is torn down rather than left
-waiting. In either mode, the first classification fixes the message shape and prevents a later
-incompatible entry from silently changing the branch.
+A root that changes AFTER that classification is not a classification failure, and outside
+`--fail-early` it is not fatal either: the open/enumeration fails (`ENOTDIR`/`ENOENT`) and the root
+takes the committed-but-unreadable-directory route of §7.1 — a 0-entry `Directory`, which sets
+`root_complete` — with the error recorded, so the copy reports the failure and still terminates.
+Under `--fail-early` that same failure returns `Err` before the 0-entry `Directory` is sent, which
+is fatal per the invariant above; nothing has been committed for the root at that point, so the
+destination is torn down rather than left waiting for it.
 
 **Empty source case:** When no root item will be sent (dry-run mode or filtered root item), source
 sets `DirStructureComplete { has_root_item: false }`. Destination uses this flag to immediately mark
@@ -889,7 +880,7 @@ stream, preserve/fail-early settings, and an error collector:
 
 ```rust
 struct DirectoryTracker {
-    /// Directories waiting for children and/or their announce gate.
+    /// Directories waiting for entries (entries_expected known, entries_processed < entries_expected)
     pending_directories: HashMap<PathBuf, DirectoryState>,
 
     /// Directories that failed to create - their descendants are skipped
@@ -908,10 +899,10 @@ struct DirectoryTracker {
 struct DirectoryState {
     entries_expected: usize,    // set from Directory message's entry_count
     entries_processed: usize,   // incremented for each child (file, dir, symlink)
-    announced: bool,            // manifest chunks + DirectoryCreated reached the wire
     keep_if_empty: bool,        // whether to keep directory if it has no content
-    reused_lock: Option<ReusedDirLock>, // original owner + default-ACL rollback state for a reused
-                                        // strict-mode directory; destination-local, never on wire
+    restore_owner: Option<(u32, u32)>, // original (uid, gid) to restore at completion for a reused
+                                        // directory locked down under --require-toctou-safe; None
+                                        // otherwise. Destination-local — never sent on the wire.
 }
 ```
 
@@ -923,29 +914,23 @@ through `Dir::create_file`) and is destination-local: no protocol message carrie
 
 **Reused-directory lockdown (`--require-toctou-safe`).** When the destination REUSES an existing
 directory under strict operand resolution (the `AlreadyExisted` outcome of directory creation), it
-takes the directory over before any child is written. The compatible directory selected by
-`openat(O_NOFOLLOW|O_DIRECTORY)` is accepted; uid, gid, and mode are captured from that fd. It
-ensures the uid belongs to the copier (`fchown` only when the captured uid differs), pins the group
-to the captured value for a setgid directory, `fchmod`s it to `0o700` (preserving setgid), and
-re-stats the same fd to verify the takeover landed. Its `ReusedDirLock` carries the original uid
-only when it changed, the original default-ACL rollback state, and the held directory fd. At
-completion (§5.2), a changed uid is restored when the copy is not preserving the source uid; the
-group already remains at its captured value unless source metadata replaces it. The default ACL is
-restored or replaced with the requested source ACL. The destination access ACL stays present but
-masked during lockdown; successful finalize leaves it in place and rewrites its mask when `d:acl` is
-off, or replaces/clears it from the source when `d:acl` is on. The directory therefore finishes in
-the permission state specified by ordinary metadata application. This state is entirely
-destination-local and never travels on the wire. A lockdown failure (metadata read failure, an
-`fchown`/`fchmod` `EPERM`, an ACL failure, or a failed fd-bound takeover verification) is a
-directory-create failure, handled exactly like any other (§7): `DirectorySkipped` in collect mode,
-or an abort under `--fail-early`.
+takes the directory over before any child is written: it inode-rechecks the opened fd against the
+just-classified entry, `fchown`s its uid to the copier (pinning the group to the captured value for
+a setgid directory), `fchmod`s it to `0o700` (preserving setgid), and re-stats to verify the
+takeover landed. The directory's original `(uid, gid)` is captured into `restore_owner`. At
+completion (§5.2), before the source metadata is applied, that original owner is restored
+component-wise (only the components the copy is not preserving to the source), so a successful copy
+leaves the directory byte-identical to a run without this hardening. This is entirely
+destination-side: no protocol message carries `restore_owner`, and the wire format is unchanged. A
+lockdown failure (recheck mismatch, an `fchown`/`fchmod` `EPERM`, or a failed post-takeover
+verification) is a directory-create failure, handled exactly like any other (§7): `DirectorySkipped`
+in collect mode, or an abort under `--fail-early`.
 
 ### 5.2 Completion Conditions
 
 **Directory is complete when:**
 
 - `entries_processed >= entries_expected` (all children processed)
-- `announced == true` (manifest chunks and `DirectoryCreated` are on the wire)
 
 Note: `entries_processed` may exceed `entries_expected` when directory contents change during the
 copy (see Section 7.1 for handling of source modifications).
@@ -997,22 +982,6 @@ the one-response-per-`Directory` contract (§2.2).
 This means existing directories are always reusable - the `--overwrite` flag only controls whether
 non-directory items can be replaced.
 
-**Replacement and accounting semantics:** Destination classification produces a point-in-time kind
-and size snapshot for planning, dispatch, and removal accounting. Before a mutating overwrite, the
-classification fd is released; the shared removal helper acts on the final name through the tracked
-parent directory fd. A separate identity check could not bind that later by-name syscall. The
-kind-directed operation can therefore fail on an incompatible replacement or remove the compatible
-entry occupying the slot when it runs, but it cannot follow a symlink outside the parent.
-
-This slot contract also applies when the planned entry is a directory: a compatible directory in the
-slot can supply the entire subtree removed. Recursive removal accepts the compatible directory
-opened with `O_NOFOLLOW|O_DIRECTORY` and processes children through that fd; it does not compare the
-opened directory to an earlier classification. Its final `rmdir` removes the empty directory
-occupying the parent/name slot, so another replacement can be removed while the walked directory
-survives under another name. Child totals describe operations through the walked fd; leaf kind/byte
-totals use each leaf's planning/admission snapshot; and a successful final `rmdir` contributes one
-directory. These are operational summaries, not an atomic inode audit under concurrent replacement.
-
 **On directory completion (`complete_directory_single`):**
 
 - Apply stored metadata (permissions, owner, timestamps)
@@ -1024,22 +993,21 @@ directory. These are operational summaries, not an atomic inode audit under conc
 
 - If `is_root`: write file, set `root_complete = true`
 - Otherwise: call `process_file(parent)` which increments `entries_processed`
-- If `entries_processed >= entries_expected` and the directory is announced: apply stored metadata,
-  remove from `pending_directories`
+- If `entries_processed >= entries_expected`: apply stored metadata, remove from
+  `pending_directories`
 
 **On `FileSkipped` message:**
 
 - Call `process_file(parent)` which increments `entries_processed`
-- If `entries_processed >= entries_expected` and the directory is announced: apply stored metadata,
-  remove from `pending_directories`
+- If `entries_processed >= entries_expected`: apply stored metadata, remove from
+  `pending_directories`
 
 **On `Symlink` message:**
 
 - If ancestor in `failed_directories`: skip, log warning; call `process_child_entry(parent)` to
   count this entry
 - Create symlink; if `is_root`, set `root_complete = true` (regardless of success/failure)
-- If not root: call `process_child_entry(parent)` to count this symlink; parent completion still
-  requires its announce gate
+- If not root: call `process_child_entry(parent)` to count this symlink
 
 **On `SymlinkSkipped` message:**
 
@@ -1143,7 +1111,7 @@ EOF handshake.
   connection failure — deliberately, since version-matched binaries mean no legitimate master sends
   post-hello traffic.
 - If master dies unexpectedly, rcpd detects it and winds down through the normal return path (so
-  strict-mode lockdown guards restore reused-directory default ACL state)
+  strict-mode lockdown guards restore reused-directory ACLs)
 - No orphaned processes remain on remote hosts
 
 ## 7. Design Rationale
@@ -1262,15 +1230,16 @@ The protocol uses two sending primitives:
 **`send_batch_message()`:** Serializes one framed message and flushes it before returning.
 
 - Used for: Directories, symlinks during traversal
-- Despite the name, its `SinkExt::send` call includes `poll_flush`; this flush is load-bearing when
-  a budget-one source must receive a directory acknowledgement before it can send the next directory
+- Despite the historical name, its `SinkExt::send` call includes `poll_flush`; this flush is
+  load-bearing when a budget-one source must receive a directory acknowledgement before it can send
+  the next directory
 
 **`send_control_message()`:** Sends through `send_batch_message()` and then explicitly flushes
 again.
 
 - Used for: `DirStructureComplete`, `DestinationDone`, `DirectoryCreated`, `DirectorySkipped`
-- The second flush repeats the flush already performed by `send_batch_message`, keeping the
-  synchronization intent explicit at control boundaries
+- The second flush is normally redundant today, but keeps the synchronization intent explicit at
+  control boundaries
 
 ### 7.5 Data Connection Pooling
 
@@ -1403,10 +1372,10 @@ multiplier):**
   When omitted, the source chooses `max(std::thread::available_parallelism(), 4)` and the
   destination adopts that source-selected value. A finite ceiling also clamps data streams, while
   explicit or legacy unlimited input leaves `--max-connections` as their ceiling. Each endpoint
-  separately intersects the file ceiling with its own soft `RLIMIT_NOFILE` descriptor-safety
-  heuristic (80% / four modeled units, capped at 4096) for its local OpenFile and PendingMeta
-  admission. Those local pools remain independent and are not wire state. The hidden forwarded
-  legacy value `0` removes only the user ceiling; descriptor safety remains active. If the
+  separately intersects the file ceiling with its own unchanged current soft `RLIMIT_NOFILE`
+  descriptor-safety heuristic (80% / five modeled units, capped at 4096) for its local OpenFile and
+  PendingMeta admission. Those local pools remain independent and are not wire state. The hidden
+  forwarded legacy value `0` removes only the user ceiling; descriptor safety remains active. If the
   `RLIMIT_NOFILE` query itself fails, a finite user-supplied limit is used as the sole endpoint
   admission ceiling with a notice. Automatic or unlimited admission fails closed because it has no
   independent finite bound. A successful query returning a zero soft limit fails closed for every
@@ -1416,12 +1385,12 @@ The multiplier ensures work is always queued when connections become available, 
 between file transfers.
 
 **Cancellation-lifetime residual:** admitted remote source and destination payload-leaf streaming
-uses `tokio::fs::File`. A private Tokio blocking read or write job can retain an `Arc<StdFile>` that
-owns the same regular-file fd; it does not clone or duplicate the fd. Cancelling the high-level
-future can therefore drop its OpenFile guard while that job still retains the fd. Such jobs do not
-inherit the repository's weak admission scope. This residual is limited to admitted remote
-payload-leaf streaming: local copy's synchronous data move and filegen's bounded synchronous chunks
-use the admitted blocking runner, which retains a strong lease through cancellation and drops
+currently uses `tokio::fs::File`. A private Tokio blocking read or write job can retain an
+`Arc<StdFile>` that owns the same regular-file fd; it does not clone or duplicate the fd. Cancelling
+the high-level future can therefore drop its OpenFile guard while that job still retains the fd.
+Such jobs do not inherit the repository's weak admission scope. This residual is limited to admitted
+remote payload-leaf streaming: local copy's synchronous data move and filegen's bounded synchronous
+chunks use the admitted blocking runner, which retains a strong lease through cancellation and drops
 abandoned outputs before releasing it. Closing the remote residual requires a separate fd-owning
 bounded-I/O abstraction; it does not change the wire protocol described here or describe every Tokio
 filesystem operation.
@@ -1468,11 +1437,11 @@ that are already up to date.
 
 **TOCTOU/safety:** The manifest is built fd-relatively on the pinned directory handle. Each
 enumerated name is classified once relative to that handle; it is never resolved by full path or
-outside the pinned directory. A skip performs no filesystem mutation. Files the source sends use the
-destination slot/removal contract in §5.1: a compatible final-component replacement can be affected,
-but the operation cannot follow it outside the pinned parent. Exact final-name identity is outside
-the guarantee. Containment applies to both paths; permission fidelity applies to a transmitted
-payload/header pair, while an untouched skip is outside that guarantee.
+outside the pinned directory. A skip performs no filesystem mutation. For files the source does
+send, `process_single_file` removes the final component through its pinned parent fd; it never
+follows a symlink or escapes that parent. It does not recheck the component's `(dev, ino)` identity,
+so a replacement between separate syscalls can select a different final component. Exact final-name
+identity is outside the guarantee; containment and permission fidelity still apply.
 
 **Point-in-time observation (not a re-validation at send time):** the skip decision compares two
 snapshots captured during the *scan* — the source entry from the Pass-2 directory enumeration and
@@ -1483,11 +1452,13 @@ consequence is purely about freshness, not safety: a file the manifest shows as 
 untouched even if the source or destination entry is concurrently modified (or the destination entry
 removed) between the scan and the end of the copy. This is consistent with rcp's point-in-time,
 non-atomic copy semantics — concurrent external modification of the source or destination *during* a
-copy is never guaranteed to be reflected. Crucially, because a skip reads and writes nothing and
-emits no header describing un-sent bytes, it cannot violate containment; permission fidelity is
-inapplicable because Guarantee 2 governs a materialized data path and no data is sent. If a copy
-must reflect an actively-changing source or destination, do not rely on the skip optimization for
-that run (e.g. quiesce writers, or omit `--overwrite`/`--ignore-existing`).
+copy is never guaranteed to be reflected. The transfer path also operates on the final component
+present when it handles the name; it does not guarantee exact final-name identity across separate
+syscalls. Crucially, because a skip reads and writes nothing and emits no header describing un-sent
+bytes, it cannot violate the containment or permission-fidelity guarantees — Guarantee 2 governs the
+data path and does not apply when no data is sent. If a copy must reflect an actively-changing
+source or destination, do not rely on the skip optimization for that run (e.g. quiesce writers, or
+omit `--overwrite`/`--ignore-existing`).
 
 **Limitation — single root-file copy:** When copying a single file (e.g.
 `rcp h1:/a/file
@@ -1529,7 +1500,7 @@ upper bound before remote side effects; source readiness then supplies `F/E`, th
 its actual product before readiness, and the master gives the destination the same values and
 rejects a mismatch in destination readiness. A directly launched daemon validates before announcing
 its listener. This configuration travels only in version-sensitive rcpd spawn arguments and
-readiness; no `MasterHello` or data-message field carries it. Compatibility revision 4 protects this
+readiness: no `MasterHello` or data-message field changed. Compatibility revision 4 protects this
 contract. Revision 5 protects the final daemon CLI contract: removal of its unreachable
 explicit-unlimited override and rejection of a zero remote-copy connection timeout.
 
@@ -1593,10 +1564,10 @@ minutes. Applying the budget there would turn a copy that merely ran slow into a
 
 The consequence is stated rather than glossed: a host that vanishes **mid-transfer** on a data
 connection is detected only by the kernel's retransmission limit (`tcp_retries2`, roughly 15
-minutes), not by a 2-minute keepalive budget. An **idle** data connection is still caught by
-keepalive after idle + retries × interval. Note also that on Linux `TCP_USER_TIMEOUT` overrides the
-keepalive probe count, so `TCP_KEEPCNT` is inert on control connections and is what actually ends a
-dead data connection.
+minutes) — the behavior that predates this option, so no regression, but not a 2-minute detection
+either. An **idle** data connection is still caught by keepalive after idle + retries × interval.
+Note also that on Linux `TCP_USER_TIMEOUT` overrides the keepalive probe count, so `TCP_KEEPCNT` is
+inert on control connections and is what actually ends a dead data connection.
 
 Control connections are not entirely backpressure-free: the destination's control dispatch loop
 takes one ops token per message, so a pathological `--ops-throttle` could in principle stall a
@@ -1608,6 +1579,7 @@ relationship stays correct by construction. `N = 0` disables both, leaving no-de
 sizing.
 
 The master mirrors its value into each rcpd's spawn arguments (via `RcpdConfig::to_args()`, like
-`--require-toctou-safe` in §1.2), so the daemons use the same recovery bound as the master. The
-value is a spawn argument and is not carried by the wire protocol. Setting an option is best effort
-— one that a platform or container policy refuses is logged and tolerated, not a copy failure.
+`--require-toctou-safe` in §1.2); without that the master would recover from a vanished host while
+both rcpds kept hanging. This is a spawn-argument change, not a wire-format change. Setting an
+option is best effort — one that a platform or container policy refuses is logged and tolerated, not
+a copy failure.

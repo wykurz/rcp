@@ -157,7 +157,7 @@ impl Settings {
     /// The shipped default reproduces the source's `rwx` bits like `cp` and nothing else — no uid,
     /// no gid, no timestamps, no setuid/setgid/sticky. A run that stays there is not making a claim
     /// about the destination's metadata, so advice about metadata it also does not carry (see
-    /// [`crate::safedir::AclPreservationNotice`]) is noise. Asking for *anything* more — `--preserve`,
+    /// [`crate::safedir::RootAclNotice`]) is noise. Asking for *anything* more — `--preserve`,
     /// `all`, a bare `f:uid`, a `7777` mode mask — is that claim, and the advice becomes worth
     /// printing.
     ///

@@ -6,9 +6,9 @@ use crate::filter::TimeFilter;
 use crate::preserve::Metadata as _;
 use crate::progress::Progress;
 use crate::safedir::{self, Dir, FileMeta, Handle};
-use crate::walk::{AdmittedEntry, AdmittedLeaf, EntryKind, LeafPermit, PermitKind};
+use crate::walk::{AdmittedLeaf, EntryKind, LeafPermit, PermitKind};
 use crate::walk_driver::{
-    DirAction, DirPreResult, EntryCx, ProcessedChildren, WalkVisitor, process_admitted_entry,
+    DirAction, DirPreResult, EntryCx, ProcessedChildren, WalkVisitor, process_entry,
 };
 use anyhow::{Context, anyhow};
 use std::ffi::OsStr;
@@ -247,11 +247,14 @@ const GETENT_NOT_FOUND: i32 = 2;
 /// (LDAP/SSSD/NIS) that are invisible to the in-process lookup in static builds
 /// (musl has no NSS and reads only /etc/passwd and /etc/group).
 ///
-/// The binary to spawn comes from [`GetentResolver`]: an explicit `--getent-path`, direct attempts
-/// in trusted directories when privileged, or a normal PATH search when unprivileged. PATH is
-/// consulted only in that last case.
+/// The binary to spawn comes from `getent` (see [`GetentResolver`]): an explicit
+/// `--getent-path`, a trusted-directory probe when privileged, or a normal PATH
+/// search when unprivileged. PATH is consulted only in that last, unprivileged case.
 fn resolve_via_getent(token: &str, kind: IdKind, getent: &GetentResolver) -> anyhow::Result<u32> {
-    getent.resolve(token, kind)
+    match getent.program()? {
+        Some(path) => resolve_via_getent_cmd(path.as_os_str(), token, kind),
+        None => resolve_via_getent_cmd(OsStr::new("getent"), token, kind),
+    }
 }
 
 /// The [`resolve_via_getent`] body with the getent program injectable for tests.
@@ -273,34 +276,15 @@ fn resolve_via_getent_cmd(
     // key, not an option. Without it, GNU getent would honor the option, print the whole
     // database, and this parser would take the first line's id — silently resolving a bogus
     // name to uid/gid 0 instead of failing.
-    let output = run_getent(getent_program, token, kind).with_context(|| {
-        format!(
-            "cannot run `{prog} {database} {token}` to look up the {label} name; \
-                 use a numeric id instead"
-        )
-    })?;
-    resolve_getent_output(getent_program, token, kind, output)
-}
-
-fn run_getent(
-    getent_program: &OsStr,
-    token: &str,
-    kind: IdKind,
-) -> std::io::Result<std::process::Output> {
-    std::process::Command::new(getent_program)
-        .args(["--", kind.getent_database(), token])
+    let output = std::process::Command::new(getent_program)
+        .args(["--", database, token])
         .output()
-}
-
-fn resolve_getent_output(
-    getent_program: &OsStr,
-    token: &str,
-    kind: IdKind,
-    output: std::process::Output,
-) -> anyhow::Result<u32> {
-    let database = kind.getent_database();
-    let label = kind.label();
-    let prog = getent_program.to_string_lossy();
+        .with_context(|| {
+            format!(
+                "cannot run `{prog} {database} {token}` to look up the {label} name; \
+                 use a numeric id instead"
+            )
+        })?;
     if output.status.code() == Some(GETENT_NOT_FOUND) {
         return Err(anyhow!("unknown {label}: {token}"));
     }
@@ -348,13 +332,12 @@ pub fn is_privileged() -> bool {
 /// attacks when privileged. Built once from the CLI via [`GetentResolver::from_cli`].
 ///
 /// The decision is deliberately *not* made at construction time: a numeric-only
-/// invocation (`--owner 0`) never needs `getent`, so the trusted-directory attempts — and their
-/// "getent not found" error — must not run then. Commands are tried only when a name is looked up.
+/// invocation (`--owner 0`) never needs `getent`, so the trusted-directory probe — and
+/// its "getent not found" error — must not fire then. The probe runs only when a name is
+/// actually looked up.
 #[derive(Clone, Debug)]
 pub struct GetentResolver {
-    /// An explicit `--getent-path`, validated absolute. Used verbatim, bypassing PATH. The caller
-    /// must keep its entire resolution chain — every ancestor, symlink target, and final entry —
-    /// outside untrusted write control.
+    /// An explicit `--getent-path`, validated absolute. Used verbatim, bypassing PATH.
     explicit: Option<PathBuf>,
     /// Whether to harden the unset case (privileged → trusted-dir probe, not PATH).
     privileged: bool,
@@ -390,48 +373,34 @@ impl GetentResolver {
         })
     }
 
-    fn resolve(&self, token: &str, kind: IdKind) -> anyhow::Result<u32> {
-        self.resolve_in(token, kind, TRUSTED_GETENT_DIRS)
+    /// The `getent` binary to spawn, resolved on demand. `None` means "search PATH
+    /// normally" — returned only in the unprivileged, no-override case.
+    fn program(&self) -> anyhow::Result<Option<PathBuf>> {
+        self.program_in(TRUSTED_GETENT_DIRS)
     }
 
-    /// Resolve with the trusted-directory list injected for tests.
-    fn resolve_in(&self, token: &str, kind: IdKind, trusted_dirs: &[&str]) -> anyhow::Result<u32> {
+    /// [`Self::program`] with the trusted-directory list injected for tests.
+    fn program_in(&self, trusted_dirs: &[&str]) -> anyhow::Result<Option<PathBuf>> {
         if let Some(path) = &self.explicit {
-            return resolve_via_getent_cmd(path.as_os_str(), token, kind);
+            return Ok(Some(path.clone()));
         }
         if !self.privileged {
             // unprivileged: a normal PATH search is fine — there is no privilege boundary
             // to protect, and the caller's PATH (e.g. a nix profile) is what they expect.
-            return resolve_via_getent_cmd(OsStr::new("getent"), token, kind);
+            return Ok(None);
         }
-        // privileged: never consult PATH. Try the actual command in each trusted directory. A
-        // separate is_file/stat observation would not bind the later exec and would add a syscall.
+        // privileged: never consult PATH — find getent in a trusted, root-owned directory.
         for dir in trusted_dirs {
             let candidate = Path::new(dir).join("getent");
-            match run_getent(candidate.as_os_str(), token, kind) {
-                Ok(output) => {
-                    return resolve_getent_output(candidate.as_os_str(), token, kind, output);
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) => {}
-                Err(error) => {
-                    return Err(anyhow::Error::new(error).context(format!(
-                        "cannot run {:?} to look up the {} name; use a numeric id instead",
-                        candidate,
-                        kind.label()
-                    )));
-                }
+            if candidate.is_file() {
+                return Ok(Some(candidate));
             }
         }
         Err(anyhow!(
-            "running with elevated privilege and could not execute `getent` from any trusted \
-             directory ({}); each attempt returned ENOENT/ENOTDIR (which can also mean a missing \
-             or invalid interpreter). PATH is intentionally ignored when privileged so a name \
-             lookup cannot exec an attacker-controlled binary as root — pass an administrator-\
-             protected absolute --getent-path, or use numeric ids",
+            "running with elevated privilege and could not find `getent` in any trusted \
+             directory ({}); PATH is intentionally ignored when privileged so a name lookup \
+             cannot exec an attacker-controlled binary as root — pass an absolute \
+             --getent-path, or use numeric ids",
             trusted_dirs.join(", ")
         ))
     }
@@ -963,8 +932,8 @@ async fn apply_entry_change(
 /// relative to its parent directory and every entry is classified and mutated
 /// through file-descriptor-relative syscalls. A privileged `rchm` therefore cannot
 /// be redirected by a concurrent symlink swap into chmod/chown'ing a target outside
-/// the intended tree. Inode-bound mutations stay on their pinned `O_PATH` handle; directory descent
-/// accepts a compatible directory selected by `O_NOFOLLOW|O_DIRECTORY` and stays within its fd.
+/// the intended tree — the `O_NOFOLLOW` opens and the inode-pinned `O_PATH` handles
+/// catch the swap and fail closed.
 #[instrument(skip(prog_track, settings))]
 pub async fn chmod(
     prog_track: &'static Progress,
@@ -972,77 +941,73 @@ pub async fn chmod(
     settings: &Settings,
 ) -> Result<Summary, Error> {
     // command-line callers may run many root operands concurrently. admit each one before opening
-    // its parent, then transfer that same permit into the shared driver. an authoritative directory
-    // releases it before descent.
+    // its parent or performing the optional fd-based filter probe, then transfer that same permit
+    // into the shared driver. an authoritative directory releases it before descent.
     let permit = crate::walk::ensure_leaf_permit(PermitKind::PendingMeta, None).await;
     enum ChmodRootSetup {
         Complete(Summary),
         Ready {
             operand: crate::walk::RootOperand,
             parent: Arc<Dir>,
-            entry: AdmittedEntry,
         },
     }
-    let setup_admission = permit.as_ref().map(LeafPermit::admission);
-    let setup = safedir::with_optional_fd_admission(setup_admission, async move {
-        // decompose the operand into (parent dir, final component) so the root entry is opened and
-        // classified relative to a directory fd — the same fd-relative shape every nested entry takes.
-        // rchm mutates "the" tree in place, so the parent is opened on the Destination side. `.`/`..`
-        // operands (e.g. `rchm -R … .`) are canonicalized so they still name a directory; `/` is
-        // rejected.
-        let operand = crate::walk::split_root_operand(path)
-            .await
-            .map_err(|err| Error::new(err, Default::default()))?;
-        let parent_path = operand.parent.as_path();
-        // the operand's TRUSTED parent prefix is resolved following symlinks normally (the prefix is
-        // trusted up to and including the operand's container — only entries strictly below the named
-        // root are O_NOFOLLOW-hardened). a symlinked parent (e.g. `rchm symlinkdir/foo`) is followed; the
-        // operand itself is still classified via `child(name)` with O_NOFOLLOW (a symlink root is
-        // operated on as the link itself).
-        let parent = Dir::open_parent_dir(parent_path, congestion::Side::Destination)
-            .await
-            .with_context(|| format!("cannot open parent directory {parent_path:?}"))
-            .map_err(|err| Error::new(err, Default::default()))?;
-        // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
-        let parent = Arc::new(parent.into_tree());
-        // classify once, under the root admission, and transfer this exact handle into dispatch.
-        // a separate filter probe would only add another race window and another child lookup.
-        let entry = crate::walk::classify_admitted_entry(&parent, operand.name.as_os_str(), permit)
-            .await
-            .with_context(|| format!("failed reading metadata from {:?}", operand.display))
-            .map_err(|err| Error::new(err, Default::default()))?;
-        if let Some(filter) = settings.filter.as_ref() {
-            let result = filter.should_include_root_item(
-                std::path::Path::new(operand.name.as_os_str()),
-                entry.kind() == EntryKind::Dir,
-            );
-            if !matches!(result, crate::filter::FilterResult::Included) {
-                let kind = entry.kind();
-                if let Some(mode) = settings.dry_run {
-                    crate::dry_run::report_skip(&operand.display, &result, mode, kind.label_long());
+    let setup =
+        safedir::with_optional_fd_admission(permit.as_ref().map(LeafPermit::admission), async {
+            // decompose the operand into (parent dir, final component) so the root entry is opened and
+            // classified relative to a directory fd — the same fd-relative shape every nested entry takes.
+            // rchm mutates "the" tree in place, so the parent is opened on the Destination side. `.`/`..`
+            // operands (e.g. `rchm -R … .`) are canonicalized so they still name a directory; `/` is
+            // rejected.
+            let operand = crate::walk::split_root_operand(path)
+                .await
+                .map_err(|err| Error::new(err, Default::default()))?;
+            let parent_path = operand.parent.as_path();
+            let name = operand.name.as_os_str();
+            let path = operand.display.as_path();
+            // the operand's TRUSTED parent prefix is resolved following symlinks normally (the prefix is
+            // trusted up to and including the operand's container — only entries strictly below the named
+            // root are O_NOFOLLOW-hardened). a symlinked parent (e.g. `rchm symlinkdir/foo`) is followed; the
+            // operand itself is still classified via `child(name)` with O_NOFOLLOW (a symlink root is
+            // operated on as the link itself).
+            let parent = Dir::open_parent_dir(parent_path, congestion::Side::Destination)
+                .await
+                .with_context(|| format!("cannot open parent directory {parent_path:?}"))
+                .map_err(|err| Error::new(err, Default::default()))?;
+            // cross from the trusted parent prefix into the hardened tree (O_NOFOLLOW below here).
+            let parent = Arc::new(parent.into_tree());
+            if let Some(ref filter) = settings.filter {
+                // classify the root via its parent fd purely to evaluate the root filter; the driver
+                // re-classifies the root authoritatively in `process_entry`, so this handle is just a probe.
+                let root_handle = parent
+                    .child(name)
+                    .await
+                    .with_context(|| format!("failed reading metadata from {path:?}"))
+                    .map_err(|err| Error::new(err, Default::default()))?;
+                let name_path = std::path::Path::new(name);
+                match filter
+                    .should_include_root_item(name_path, root_handle.kind() == EntryKind::Dir)
+                {
+                    crate::filter::FilterResult::Included => {}
+                    result => {
+                        let kind = root_handle.kind();
+                        if let Some(mode) = settings.dry_run {
+                            crate::dry_run::report_skip(path, &result, mode, kind.label_long());
+                        }
+                        kind.inc_skipped(prog_track);
+                        return Ok(ChmodRootSetup::Complete(skipped_summary_for(kind)));
+                    }
                 }
-                kind.inc_skipped(prog_track);
-                return Ok(ChmodRootSetup::Complete(skipped_summary_for(kind)));
             }
-        }
-        Ok(ChmodRootSetup::Ready {
-            operand,
-            parent,
-            entry,
+            Ok(ChmodRootSetup::Ready { operand, parent })
         })
-    })
-    .await?;
-    let (operand, parent, entry) = match setup {
+        .await?;
+    let (operand, parent) = match setup {
         ChmodRootSetup::Complete(summary) => return Ok(summary),
-        ChmodRootSetup::Ready {
-            operand,
-            parent,
-            entry,
-        } => (operand, parent, entry),
+        ChmodRootSetup::Ready { operand, parent } => (operand, parent),
     };
     let name = operand.name.as_os_str();
     let path = operand.display.as_path();
-    run_chmod_root(prog_track, &parent, name, path, settings, entry).await
+    run_chmod_root(prog_track, &parent, name, path, settings, permit).await
 }
 
 /// Build the [`ChmodVisitor`] and process the root entry through the generic
@@ -1054,7 +1019,7 @@ async fn run_chmod_root(
     name: &OsStr,
     root: &std::path::Path,
     settings: &Settings,
-    entry: AdmittedEntry,
+    permit: Option<LeafPermit>,
 ) -> Result<Summary, Error> {
     let visitor = Arc::new(ChmodVisitor {
         prog_track,
@@ -1071,7 +1036,7 @@ async fn run_chmod_root(
         dry_run: settings.dry_run.is_some(),
         prog_track,
     };
-    process_admitted_entry(visitor, root_cx, (), entry).await
+    process_entry(visitor, root_cx, (), permit).await // chmod has no second tree → root context `()`
 }
 
 /// The chmod walk's [`WalkVisitor`]. The driver owns enumeration, the leaf-permit lifecycle,
@@ -1087,11 +1052,9 @@ struct ChmodVisitor {
 /// State threaded from [`WalkVisitor::dir_pre`] to [`WalkVisitor::dir_post`] (same task) — what
 /// `dir_post` needs to apply the directory's own change.
 struct ChmodDirState {
-    /// The directory's owned `O_PATH` handle when post-order changes are enabled for a directly
-    /// selected directory; the deferred chmod goes through its `/proc/self/fd` magic symlink,
-    /// inode-exact (works even on a `0000`-mode directory). Pre-order and traversal-only directories
-    /// retain no handle because `dir_post` has no fd-bound work for them.
-    handle: Option<Handle>,
+    /// The directory's owned `O_PATH` handle; the post-order chmod goes through its `/proc/self/fd`
+    /// magic symlink, inode-exact (works even on a `0000`-mode directory).
+    handle: Handle,
     /// Only traversed to find include-matches (not directly matched), so its own mode/owner is left
     /// unchanged (mirrors rm.rs).
     traversed_only: bool,
@@ -1192,30 +1155,27 @@ impl WalkVisitor for ChmodVisitor {
                 }
             }
         }
+        // dup the dir's O_PATH handle (a pure fd dup — no extra openat/fstatat) so `dir_post` can
+        // apply the deferred/post-order change inode-exact: the driver lends `&handle` only for
+        // `dir_pre`, so the post-order step needs its own owned handle to the same inode.
+        let dir_handle = handle
+            .try_clone()
+            .with_context(|| format!("cannot duplicate directory handle for {path:?}"))
+            .map_err(|err| Error::new(err, base))?;
         // open the directory's real fd for the driver to enumerate. in post-order the dir still has
         // its original mode, so the open succeeds and the held fd survives a later search-bit strip.
         // an open failure (restrictive pre-order change, or a pre-existing unreadable dir) is reported.
         match cx.parent.open_dir(&cx.name).await {
-            Ok(dir) => {
-                // the driver lends `&handle` only for dir_pre, so deferred/post-order work needs an
-                // owned handle to the same inode. Clone only on this branch: pre-order dir_post never
-                // uses it, and an open failure applies deferred work through the borrowed handle below.
-                let dir_handle = (self.settings.defer_dir_changes && !traversed_only)
-                    .then(|| handle.try_clone())
-                    .transpose()
-                    .with_context(|| format!("cannot duplicate directory handle for {path:?}"))
-                    .map_err(|err| Error::new(err, base))?;
-                Ok(DirAction::Descend {
-                    dir: Arc::new(dir),
-                    child_ctx: (),
-                    state: ChmodDirState {
-                        handle: dir_handle,
-                        traversed_only,
-                        base,
-                        pre_order_error,
-                    },
-                })
-            }
+            Ok(dir) => Ok(DirAction::Descend {
+                dir: Arc::new(dir),
+                child_ctx: (),
+                state: ChmodDirState {
+                    handle: dir_handle,
+                    traversed_only,
+                    base,
+                    pre_order_error,
+                },
+            }),
             Err(error) => {
                 let error = anyhow::Error::new(error)
                     .context(format!("cannot open directory {path:?} for reading"));
@@ -1290,15 +1250,15 @@ impl WalkVisitor for ChmodVisitor {
         // through the O_PATH handle. (`pre_order_error` is always `None` here, so the two are
         // mutually exclusive.)
         if self.settings.defer_dir_changes {
-            let dir_result = if traversed_only {
-                Ok(skip_traversed_dir(self.prog_track, path, &self.settings))
-            } else {
-                let handle = handle
-                    .as_ref()
-                    .expect("selected deferred directory must retain its classification handle");
-                apply_dir_self(self.prog_track, path, handle, false, &self.settings).await
-            };
-            match dir_result {
+            match apply_dir_self(
+                self.prog_track,
+                path,
+                &handle,
+                traversed_only,
+                &self.settings,
+            )
+            .await
+            {
                 Ok(dir_summary) => summary = summary + dir_summary,
                 Err(error) => {
                     if self.settings.fail_early {
@@ -1332,21 +1292,13 @@ async fn apply_dir_self(
     settings: &Settings,
 ) -> Result<Summary, Error> {
     if traversed_only {
-        return Ok(skip_traversed_dir(prog_track, path, settings));
+        if let Some(crate::config::DryRunMode::All) = settings.dry_run {
+            println!("skip dir {path:?} (only traversed for include matches)");
+        }
+        prog_track.directories_skipped.inc();
+        return Ok(skipped_summary_for(EntryKind::Dir));
     }
     apply_entry_change(prog_track, path, handle, EntryKind::Dir, settings).await
-}
-
-fn skip_traversed_dir(
-    prog_track: &'static Progress,
-    path: &std::path::Path,
-    settings: &Settings,
-) -> Summary {
-    if let Some(crate::config::DryRunMode::All) = settings.dry_run {
-        println!("skip dir {path:?} (only traversed for include matches)");
-    }
-    prog_track.directories_skipped.inc();
-    skipped_summary_for(EntryKind::Dir)
 }
 
 #[cfg(test)]
@@ -1627,57 +1579,29 @@ mod tests {
     }
     #[test]
     fn getent_source_explicit_absolute_used_even_when_privileged() {
-        let tmp = tempfile::tempdir().unwrap();
-        let explicit = write_stub_getent(
-            tmp.path(),
-            "chosen-getent",
-            "echo 'chosen:*:4242:4242::/:/bin/false'",
-        );
-        // an explicit absolute path is executed verbatim and bypasses the trusted-directory list.
-        let resolver = GetentResolver::from_cli(Some(explicit), true).unwrap();
+        // an explicit absolute path is honored verbatim and bypasses the trusted-dir probe.
+        let resolver =
+            GetentResolver::from_cli(Some(PathBuf::from("/opt/nss/getent")), true).unwrap();
         assert_eq!(
-            resolver
-                .resolve_in("chosen", IdKind::User, &["/definitely/missing"])
-                .unwrap(),
-            4242
+            resolver.program_in(&["/usr/bin"]).unwrap(),
+            Some(PathBuf::from("/opt/nss/getent"))
         );
     }
     #[test]
     fn getent_source_unprivileged_searches_path() {
-        // unprivileged + no override uses the system PATH, regardless of the injected trusted list.
+        // unprivileged + no override → None means "search PATH normally".
         let resolver = GetentResolver::from_cli(None, false).unwrap();
-        assert_eq!(
-            resolver
-                .resolve_in("root", IdKind::User, &["/definitely/missing"])
-                .unwrap(),
-            0
-        );
+        assert_eq!(resolver.program_in(&["/nonexistent"]).unwrap(), None);
     }
     #[test]
-    fn getent_source_privileged_falls_through_nonstartable_commands_without_path() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let missing = tempfile::tempdir().unwrap();
-        let bad_interpreter = tempfile::tempdir().unwrap();
-        let present = tempfile::tempdir().unwrap();
-        let bad_candidate = bad_interpreter.path().join("getent");
-        std::fs::write(&bad_candidate, "#!/definitely/missing/interpreter\n").unwrap();
-        std::fs::set_permissions(&bad_candidate, std::fs::Permissions::from_mode(0o755)).unwrap();
-        write_stub_getent(
-            present.path(),
-            "getent",
-            "echo 'trusted:*:4343:4343::/:/bin/false'",
-        );
+    fn getent_source_privileged_probes_trusted_dirs_not_path() {
+        // privileged + no override → use getent found in a trusted dir; PATH is never consulted.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("getent");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
         let resolver = GetentResolver::from_cli(None, true).unwrap();
-        let dirs = [
-            missing.path().to_str().unwrap(),
-            bad_interpreter.path().to_str().unwrap(),
-            present.path().to_str().unwrap(),
-        ];
-        assert_eq!(
-            resolver.resolve_in("trusted", IdKind::User, &dirs).unwrap(),
-            4343
-        );
+        let dirs = [tmp.path().to_str().unwrap()];
+        assert_eq!(resolver.program_in(&dirs).unwrap(), Some(bin));
     }
     #[test]
     fn getent_source_privileged_missing_getent_errors_not_path_fallback() {
@@ -1686,9 +1610,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap(); // empty: no getent inside
         let resolver = GetentResolver::from_cli(None, true).unwrap();
         let dir = tmp.path().to_str().unwrap();
-        let err = resolver
-            .resolve_in("missing", IdKind::User, &[dir])
-            .unwrap_err();
+        let err = resolver.program_in(&[dir]).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("PATH is intentionally ignored"),
@@ -1930,74 +1852,6 @@ mod tests {
 
     static RACE_PROGRESS: std::sync::LazyLock<Progress> = std::sync::LazyLock::new(Progress::new);
 
-    async fn directory_state(
-        defer_dir_changes: bool,
-        traversed_only: bool,
-    ) -> anyhow::Result<ChmodDirState> {
-        let tmp = crate::testutils::create_temp_dir().await?;
-        let entry = tmp.join("entry");
-        tokio::fs::create_dir(&entry).await?;
-        let parent =
-            Arc::new(Dir::open_root_dir(&tmp, false, congestion::Side::Destination).await?);
-        let handle = parent.child(OsStr::new("entry")).await?;
-        let mut settings = settings_with("", None, None);
-        settings.defer_dir_changes = defer_dir_changes;
-        if traversed_only {
-            let mut filter = crate::filter::FilterSettings::new();
-            filter.add_include("entry/child")?;
-            settings.filter = Some(filter);
-        }
-        let visitor = ChmodVisitor {
-            prog_track: &RACE_PROGRESS,
-            settings,
-        };
-        let cx = EntryCx {
-            parent,
-            name: OsStr::new("entry").to_owned(),
-            rel_path: PathBuf::from("entry"),
-            filter_path: PathBuf::from("entry"),
-            real_path: entry,
-            dry_run: false,
-            prog_track: &RACE_PROGRESS,
-        };
-        match visitor.dir_pre(&cx, &(), &handle).await? {
-            DirAction::Descend { state, .. } => Ok(state),
-            DirAction::Skip(_) => anyhow::bail!("directory fixture was skipped"),
-        }
-    }
-
-    #[tokio::test]
-    async fn pre_order_directory_state_does_not_retain_handle() -> anyhow::Result<()> {
-        let state = directory_state(false, false).await?;
-        assert!(
-            state.handle.is_none(),
-            "pre-order traversal retained a handle that dir_post never uses"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn deferred_directory_state_retains_handle() -> anyhow::Result<()> {
-        let state = directory_state(true, false).await?;
-        assert!(
-            state.handle.is_some(),
-            "deferred traversal did not retain the handle needed by dir_post"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn deferred_traversed_only_directory_state_does_not_retain_handle() -> anyhow::Result<()>
-    {
-        let state = directory_state(true, true).await?;
-        assert!(state.traversed_only);
-        assert!(
-            state.handle.is_none(),
-            "traversal-only directory retained a handle that dir_post never uses"
-        );
-        Ok(())
-    }
-
     // Repeatedly swap `dir/entry` between a real regular file (mode 0644) and a symlink
     // pointing at `sentinel`, using rename so each individual state is atomic. Two staging
     // names live alongside `entry` and are renamed over it in a tight loop until `stop` is
@@ -2105,12 +1959,13 @@ mod tests {
     /// Each test scopes process-wide admission changes with an `AdmissionLimit` guard.
     mod max_files_in_flight_tests {
         use super::*;
+        use crate::walk_driver::process_entry;
 
         static PROGRESS: std::sync::LazyLock<Progress> = std::sync::LazyLock::new(Progress::new);
 
         /// Public root setup must reserve metadata capacity before opening the operand parent or
-        /// classifying the root. Otherwise many CLI operands can bypass the shared driver's later
-        /// admission point concurrently.
+        /// performing the fd-based root filter probe. Otherwise many CLI operands can bypass the
+        /// shared driver's later admission point concurrently.
         #[tokio::test]
         async fn filtered_root_waits_for_admission_before_setup() -> anyhow::Result<()> {
             let root = crate::testutils::create_temp_dir().await?;
@@ -2212,7 +2067,7 @@ mod tests {
             let result = admission
                 .run_with_timeout(
                     std::time::Duration::from_secs(20),
-                    crate::walk_driver::process_entry(visitor, cx, (), permit),
+                    process_entry(visitor, cx, (), permit),
                 )
                 .await;
             let summary = result

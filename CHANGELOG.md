@@ -9,85 +9,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Local `rcp`/`rlink` and remote `rcp` overwrite removal now drop the destination's classification
-  handle after retaining only its kind and accounting size. The mutation already operates by name
-  through a pinned parent directory, so a `(dev, ino)` recheck could not bind the subsequent
-  `unlinkat` or `rmdir` to that inode and left the same final-component race. Removing it avoids an
-  `openat` plus `fstatat` per overwrite and avoids holding an extra `O_PATH` fd across throttle
-  waits. With that handle gone, the descriptor-safety model uses three OpenFile units plus one
-  independently overlapping PendingMeta unit instead of five total, permitting more admitted file
-  work at the same soft `RLIMIT_NOFILE`. The source data fd is dropped before destination metadata
-  takes its blocking duplicate, so those phases do not create a fourth OpenFile overlap. Containment
-  is unchanged: removal remains fd-relative and never follows a symlink, while exact final-name
-  identity remains outside the guarantee. A compatible entry occupying the slot when removal runs
-  can be removed, including an entire directory subtree; each removal syscall's type constraint
-  bounds what it can affect. Leaf counters use the snapshot that admitted that leaf operation, while
-  a recursive fallback can freshly classify a later slot occupant. Summaries are operational totals
-  rather than atomic inode audits under concurrent replacement.
-
-- Recursive removal no longer compares the opened descent directory to an earlier classification or
-  reopens and identity-checks it immediately before the separate by-name `rmdir`. Neither check can
-  keep a repeat writer from presenting the same replacement immediately outside its narrow window.
-  Removal instead accepts a compatible directory opened with `O_NOFOLLOW|O_DIRECTORY` and keeps all
-  child work bound to that fd. This saves one stat per traversed directory plus an `openat`, two
-  stats, two metadata-throttle waits, and a transient `O_PATH` fd per finalized directory. Final
-  `rmdir` remains contained to the pinned parent and can remove only the empty directory occupying
-  that slot; a compatible replacement can be removed, and removal accounting is an operational
-  summary rather than an atomic inode audit under a concurrent replacement. Ordinary unfiltered
-  removal also avoids duplicating and retaining a restoration handle for each permission-relaxed
-  directory; only filter/time-filter runs can retain a directory and need that handle, saving one
-  `F_DUPFD_CLOEXEC` syscall and one long-lived fd per relaxed directory on the common path.
-
-- Failed destination create/sanitization cleanup now performs one unconditional, kind-directed
-  removal of the current slot through its pinned parent, without a `(dev, ino)` observation that a
-  subsequent by-name syscall could outrun. The cleanup is explicitly best-effort: it can remove a
-  compatible replacement; an incompatible entry or non-empty directory can remain. Cleanup errors
-  are swallowed, and the original open or ACL-sanitization error is reported.
-
-- Symlink creation now avoids reopening and statting the new destination name when no symlink owner
-  or timestamp preservation is requested. With preservation enabled, the reopened link's immutable
-  target is read from its pinned fd and must match the intended target before metadata is applied
-  through that same fd; a same-target replacement is compatible, while a different-target
-  replacement fails without receiving source metadata. Existing-destination target comparison also
-  uses the already-open handle without duplicating it, keeping target, comparison metadata, and any
-  metadata update bound to one inode.
-
-- `rlink --update` no longer probes the update operand before independently opening and classifying
-  it for the joint source/update decision. Required destructive modes still reject a missing update
-  root at that authoritative classification, strict mode still opens the prefix with
-  `RESOLVE_NO_SYMLINKS`, and the resulting handles remain bound to filtering and dispatch; removing
-  the earlier observation saves redundant metadata work without weakening either decision.
-
-- Privileged `rchm` name resolution tries `getent` directly at each fixed trusted-system pathname
-  instead of first calling `is_file` and then executing the name separately. Exec attempts returning
-  `ENOENT`/`ENOTDIR` fall through (including a present candidate with a missing interpreter), while
-  every other launch error or started-process result is authoritative. This removes one stat on the
-  common named-owner/group lookup without weakening the PATH-injection defense. An explicit
-  `--getent-path` selects an absolute pathname, not a pinned inode; its entire resolution chain must
-  remain administrator-protected.
-
-- Local `rcp` and `rlink` no longer perform a generic destination-existence preflight. Compatible
-  existing directories are reused and merged without `--overwrite`; conflicting entries fail at the
-  authoritative engine classification or action unless overwrite permits replacement. A dry run or
-  filtered root that needs no destination-dependent decision leaves the destination prefix unopened.
-  Under `--require-toctou-safe`, each consumed operand is still opened with `RESOLVE_NO_SYMLINKS`,
-  and that same parent fd is threaded into the work that required it.
-
-- Strict reused-directory handling opens a compatible directory first with `O_NOFOLLOW|O_DIRECTORY`,
-  captures uid/gid/mode from that exact fd, and carries all lockdown, descent, and finalization
-  through it. It no longer opens an `O_PATH` classification handle and compares the later directory
-  open to that earlier name resolution, saving the extra open, stat, and transient fd for every
-  directory accepted by the common direct-reuse path; a concurrent type flip can take the bounded
-  classify-and-retry fallback instead. Lockdown skips uid takeover when the directory is already
-  copier-owned, reuses its first verified state when neither gid nor setgid needs mutation, and
-  carries an optional original uid so finalize restores only a takeover that actually happened. The
-  captured gid is already restored and verified before descent and is not redundantly written at
-  finalize. Directory-owned ACL reads also share the existing fd rather than duplicating it for the
-  blocking helper, saving one `F_DUPFD_CLOEXEC` per source-directory ACL capture and reused-dir
-  snapshot. Finalize also omits its concluding re-stat: once final ownership and mode are published,
-  their owner can race that observation or change the state immediately afterward, so it provided no
-  durable guarantee. The earlier fd-bound takeover verification remains because it excludes the
-  prior owner and gates all child work through that verified directory fd.
+- Removed inode comparisons that could not bind later by-name removal, including overwrite removal,
+  `rrm`'s final `rmdir`, and failed-create cleanup. The actions remain fd-relative through pinned
+  parents and never follow symlinks, but may affect a compatible replacement occupying the name. A
+  planned directory replacement can recursively remove a compatible directory occupying that slot
+  when removal begins. `--overwrite-filter`, `--overwrite-compare`, and direct-leaf accounting use
+  documented point-in-time metadata snapshots.
 
 - `--max-files-in-flight=N|unlimited` now controls applicable file-like work across the tools. A
   positive value (including `1`) sets a finite ceiling, `unlimited` removes the user ceiling, and
@@ -172,28 +99,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   than creating a thread per poll. Daemon waits run concurrently across endpoints while tracing
   receivers remain live; any receiver tasks left afterward share one final drain deadline.
   Control-directory selection tries runtime, temporary, state, and home locations before reporting
-  that no safe Unix-socket path is available. It creates and returns the actual private directory
-  from the first usable parent instead of creating and removing a disposable probe before a second
-  create. Remote daemon SSH exec-channel creation and readiness reads use that same configured
-  deadline; readiness records larger than 64 KiB are rejected. The master threads the actual local
-  operand roots through both remote-HOME lookup and endpoint preparation, so control-directory
-  selection skips candidate parents lexically inside a copied tree without treating the process
-  working directory as an operand. This is an operational placement policy, not a raceable
-  alias-validation claim. Remote-to-remote copies therefore retain normal runtime and temporary
-  candidates even when launched from `/`; the filesystem root itself is the sole non-excluding
-  operand because every absolute candidate lies beneath it. Daemon configuration refusals discovered
-  before tracing use the structured `RCP_ERROR` startup record, and unstructured startup failures
-  retain captured stdout/stderr in the error chain. Failed-startup reaping now keeps the SSH child
-  and both output drains lexically inside its bounded timeout future, so grace expiry or caller
-  cancellation releases the managed session instead of detaching ownership. The source tracing
-  receiver starts before destination bring-up and is drained on later startup failures, preserving
-  queued source notices beside the destination error. Source connection failures also wait for
-  daemon cleanup. Daemon stdout/stderr is forwarded live at debug verbosity while a bounded tail is
-  retained and joined for completion diagnostics; deployment likewise drains bounded diagnostics
-  while preferring the remote failure over a secondary stdin-shutdown error. An explicit connection
-  request clamped by the source file ceiling, or an automatic source file ceiling clamped by an
-  explicit connection request, now produces a default-visible notice; legacy file-limit notices
-  preserve the `--max-open-files` spelling the user supplied.
+  that no safe Unix-socket path is available. Remote daemon SSH exec-channel creation and readiness
+  reads use that same configured deadline; readiness records larger than 64 KiB are rejected. The
+  master threads the actual local operand roots through both remote-HOME lookup and endpoint
+  preparation, so control-directory selection rejects canonical temporary-directory aliases inside a
+  copied tree without treating the process working directory as an operand. Remote-to-remote copies
+  therefore retain normal runtime and temporary candidates even when launched from `/`; the
+  filesystem root itself is the sole non-excluding operand because every absolute candidate lies
+  beneath it. Daemon configuration refusals discovered before tracing use the structured `RCP_ERROR`
+  startup record, and unstructured startup failures retain captured stdout/stderr in the error
+  chain. Failed-startup reaping now keeps the SSH child and both output drains lexically inside its
+  bounded timeout future, so grace expiry or caller cancellation releases the managed session
+  instead of detaching ownership. The source tracing receiver starts before destination bring-up and
+  is drained on later startup failures, preserving queued source notices beside the destination
+  error. Source connection failures also wait for daemon cleanup. Daemon stdout/stderr is forwarded
+  live at debug verbosity while a bounded tail is retained and joined for completion diagnostics;
+  deployment likewise drains bounded diagnostics while preferring the remote failure over a
+  secondary stdin-shutdown error. An explicit connection request clamped by the source file ceiling,
+  or an automatic source file ceiling clamped by an explicit connection request, now produces a
+  default-visible notice; legacy file-limit notices preserve the `--max-open-files` spelling the
+  user supplied.
 
 - `remote::TcpConfig` now contains transport settings only; validated file/stream capacities are
   represented by `ResolvedRemoteConcurrency`. Its fluent setters were removed, and callers
@@ -233,14 +158,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   retained. With fail-early, the traversal stops after reporting only work completed before the
   failed entry.
 
-- The ACL-preservation notice is derived entirely from resolved settings and performs no source-root
-  or other filesystem probe. A raceable root observation would neither establish anything about
-  descendants nor remain true against a repeat writer. Runs that request metadata fidelity without
-  requesting every supported ACL kind receive a conditional, once-per-process notice; strict mode
-  also explains that inheritance containment does not carry source ACLs across. A bare `rcp` and
-  preserve-none remain silent, while bare `rlink` warns because its default is `all`. Remote copies
-  retain the historical `root_acl_notice` wire-field name as a settings bit, but it authorizes no
-  xattr read.
+- Recursive removal now verifies the walked directory before descent and again immediately before
+  its fd-relative `rmdir`. The syscall is contained to the held parent and can remove only the empty
+  directory at the final name, but it cannot eliminate the final-component race in which that name
+  is replaced after the check. Once `rmdir` succeeds, removal is final; `rrm` no longer probes the
+  walked fd's link count after the mutation, avoiding false failures from stale or non-portable
+  directory link metadata. A temporary `0o700` mode is restored through the pinned directory fd only
+  when filters deliberately retain the directory. Operation errors, cancellation, identity-check
+  failures, and unexpected `rmdir` failures do not attempt metadata rollback.
+
+- The source-root ACL notice now fires only when the run **asked** for the fidelity a dropped ACL
+  would undermine: `--preserve`/`--preserve-settings` requesting anything beyond the shipped
+  default, or `--require-toctou-safe`. A bare `rcp src dst` is silent, probe included — it pays not
+  even the one `listxattr`. Left at the default, `rcp` reproduces the source's `rwx` bits like `cp`
+  and drops uid, gid, timestamps and the setuid/setgid/sticky bits without a word, so warning about
+  one more attribute it also does not carry was the single loud omission among several silent ones.
+  The gate reads the resolved settings against the **shipped default**, so
+  `--preserve-settings=none` — and any spelling that lands back on that default, such as
+  `f:0777 d:0777` — counts as "did not ask" in every tool. A bare `rlink` is therefore unchanged,
+  since its CLI default is `all` rather than the shipped default; `rlink --preserve-settings=none`
+  goes quiet like everything else that asked for nothing.
 
 - `WIRE_REVISION` is now 6. Revision 2 remains the historical wire-schema change: carrying the
   arming flag to a remote source added a field to `MasterHello::Source`'s `capture`, which reshaped

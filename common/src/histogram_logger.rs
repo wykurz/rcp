@@ -35,8 +35,7 @@ pub struct LoggerUnit {
 /// Configuration for the logger task.
 pub struct LoggerConfig {
     pub interval: std::time::Duration,
-    /// The log file opened once during startup and held through the logger's lifetime.
-    pub log_file: Option<std::fs::File>,
+    pub log_path: Option<std::path::PathBuf>,
     pub header: LogHeader,
     /// Optional progress source. When set and a log file is open, the
     /// logger calls it once per tick and writes one Progress record
@@ -53,17 +52,35 @@ pub async fn run_logger(
     units: Vec<LoggerUnit>,
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut writer: Option<std::io::BufWriter<std::fs::File>> = match config.log_file {
-        Some(file) => {
-            let mut writer = std::io::BufWriter::new(file);
-            if let Err(err) = write_file_header(&mut writer, &config.header) {
-                tracing::warn!(
-                    "histogram-logger: failed to write file header: {err:#}; \
-                     disabling file output"
-                );
-                None
-            } else {
-                Some(writer)
+    let mut writer: Option<std::io::BufWriter<std::fs::File>> = match &config.log_path {
+        Some(path) => {
+            let mut open_options = std::fs::OpenOptions::new();
+            open_options.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                open_options.custom_flags(libc::O_NOFOLLOW);
+            }
+            match open_options.open(path) {
+                Ok(f) => {
+                    let mut w = std::io::BufWriter::new(f);
+                    if let Err(err) = write_file_header(&mut w, &config.header) {
+                        tracing::warn!(
+                            "histogram-logger: failed to write file header: {err:#}; \
+                                        disabling file output"
+                        );
+                        None
+                    } else {
+                        Some(w)
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "histogram-logger: failed to open {path:?}: {err:#}; \
+                                    disabling file output"
+                    );
+                    None
+                }
             }
         }
         None => None,
@@ -214,10 +231,6 @@ mod tests {
         }
     }
 
-    fn create_log_file(path: &std::path::Path) -> std::fs::File {
-        std::fs::File::create(path).unwrap()
-    }
-
     #[tokio::test]
     async fn writes_records_to_file_for_non_empty_snapshots() {
         let dir = tempfile::tempdir().unwrap();
@@ -243,7 +256,7 @@ mod tests {
             .record(std::time::Duration::from_micros(200));
         let config = LoggerConfig {
             interval: std::time::Duration::from_millis(50),
-            log_file: Some(create_log_file(&path)),
+            log_path: Some(path.clone()),
             header: header(),
             progress_source: None,
         };
@@ -286,7 +299,7 @@ mod tests {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let config = LoggerConfig {
             interval: std::time::Duration::from_millis(50),
-            log_file: Some(create_log_file(&path)),
+            log_path: Some(path.clone()),
             header: header(),
             progress_source: None,
         };
@@ -332,7 +345,7 @@ mod tests {
             // Long interval so the periodic tick definitely doesn't fire
             // before our cancel signal does.
             interval: std::time::Duration::from_secs(60),
-            log_file: Some(create_log_file(&path)),
+            log_path: Some(path.clone()),
             header: header(),
             progress_source: None,
         };
@@ -458,7 +471,7 @@ mod tests {
         let payload_for_closure = payload.clone();
         let config = LoggerConfig {
             interval: std::time::Duration::from_millis(50),
-            log_file: Some(create_log_file(&path)),
+            log_path: Some(path.clone()),
             header: header(),
             progress_source: Some(Box::new(move || payload_for_closure.clone())),
         };

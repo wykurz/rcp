@@ -1,10 +1,10 @@
 //! Safe, race-resistant directory traversal primitives.
 //!
 //! This module provides `O_NOFOLLOW`-based directory and file handle types that
-//! contain path-redirection TOCTOU races by using file-descriptor-relative
-//! syscalls (`openat`, `fstatat`) rather than multi-component path lookups. Every
-//! `open_dir`/`child` call refuses to follow symlinks, so an attacker who races a
-//! directory walk cannot redirect operations outside the intended tree.
+//! prevent TOCTOU races by using file-descriptor-relative syscalls (`openat`,
+//! `fstatat`) rather than path-based lookups. Every `open_dir`/`child` call
+//! refuses to follow symlinks, so an attacker who races a directory walk cannot
+//! redirect operations outside the intended tree.
 
 use std::ffi::{CStr, OsStr};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
-use nix::fcntl::{AT_FDCWD, AtFlags, OFlag, openat};
+use nix::fcntl::{AT_FDCWD, AtFlags, OFlag, openat, readlinkat};
 use nix::sys::stat::{FileStat, Mode, fchmod, fstat, fstatat, futimens, mkdirat};
 use nix::sys::time::TimeSpec;
 use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, fchownat, linkat, symlinkat, unlinkat};
@@ -290,11 +290,8 @@ pub struct Handle {
 /// Unlike [`Handle`], this snapshot does not keep an inode pinned. Overwrite removal operates by
 /// name through a pinned parent directory, so retaining the entry fd cannot bind the later by-name
 /// removal to that inode. Converting to this snapshot closes the classification fd while preserving
-/// the planning data used for syscall dispatch and direct-leaf accounting. A compatible concurrent
-/// replacement may be removed using this classification. Direct-leaf counters describe this
-/// snapshot rather than the replacement; recursive directory fallback freshly admits and accounts
-/// each entry it encounters.
-#[derive(Debug)]
+/// the accounting data the removal path needs.
+#[derive(Clone, Copy, Debug)]
 pub struct RemovalSnapshot {
     kind: EntryKind,
     size: u64,
@@ -303,13 +300,13 @@ pub struct RemovalSnapshot {
 impl RemovalSnapshot {
     /// The entry classification captured during overwrite planning.
     #[must_use]
-    pub(crate) fn kind(&self) -> EntryKind {
+    pub fn kind(self) -> EntryKind {
         self.kind
     }
 
     /// The entry size captured during overwrite planning.
     #[must_use]
-    pub(crate) fn size(&self) -> u64 {
+    pub fn size(self) -> u64 {
         self.size
     }
 }
@@ -339,7 +336,7 @@ impl Handle {
         &self.meta
     }
 
-    /// Consume this handle and retain only the planning data needed for overwrite removal.
+    /// Consume this handle and retain only the data needed for overwrite removal.
     #[must_use]
     pub fn into_removal_snapshot(self) -> RemovalSnapshot {
         RemovalSnapshot {
@@ -375,7 +372,7 @@ impl Handle {
     }
 
     /// Read this symlink's target and metadata from the one pinned `O_PATH` fd: the target via the
-    /// empty-path `readlinkat` and the metadata from this handle's `fstat`
+    /// empty-path `readlinkat` ([`read_link_handle`]) and the metadata from this handle's `fstat`
     /// snapshot. Both describe the same pinned inode, so they are a faithful pair (the symlink
     /// analogue of [`Dir::open_file_read`]'s `(File, FileMeta)`). Errors if the handle is not a
     /// symlink (the empty-path read requires a symlink fd).
@@ -386,52 +383,14 @@ impl Handle {
         let target = read_link_handle(self, side).await?;
         Ok((target, self.meta.clone()))
     }
-
-    /// Read this symlink's target from its pinned fd and return that same owned handle.
-    ///
-    /// Consuming the handle lets the blocking read own the existing fd without a `dup`. The returned
-    /// target and handle therefore still identify one inode, so an fd-bound action can safely use the
-    /// target as its authorization input.
-    pub async fn read_symlink_owned(
-        self,
-        side: congestion::Side,
-    ) -> std::io::Result<(std::path::PathBuf, Self)> {
-        run_metadata_probed_blocking(side, congestion::MetadataOp::ReadLink, move || {
-            let target = read_link_fd(self.as_fd())?;
-            Ok((target, self))
-        })
-        .await
-    }
-
-    /// Require this pinned symlink to contain `expected_target`, returning the same handle.
-    ///
-    /// This is intended to bind metadata application after a create-by-name operation: another
-    /// writer may replace the name before it is opened, but a mismatched replacement cannot
-    /// authorize owner or timestamp changes on the returned fd. The read consumes no duplicate fd.
-    async fn verify_symlink_target(
-        self,
-        expected_target: &Path,
-        side: congestion::Side,
-    ) -> std::io::Result<Self> {
-        let (actual_target, handle) = self.read_symlink_owned(side).await?;
-        if actual_target == expected_target {
-            Ok(handle)
-        } else {
-            Err(std::io::Error::other(format!(
-                "symlink target changed before metadata application (expected {expected_target:?}, \
-                 found {actual_target:?})"
-            )))
-        }
-    }
 }
 
 // ── Dir ───────────────────────────────────────────────────────────────────────
 
 /// A directory file descriptor opened `O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`.
 ///
-/// All entry-level operations are relative to this fd, preventing untrusted
-/// multi-component path redirection. A by-name operation can still select a
-/// compatible replacement in the fd's directory when its syscall runs.
+/// All entry-level operations are relative to this fd, preventing TOCTOU races
+/// that path-based lookups are vulnerable to.
 ///
 /// The fd is held behind an `Arc` so per-entry operations can move an owned
 /// reference into their `spawn_blocking` closure. Once a closure starts it is
@@ -699,12 +658,7 @@ impl Dir {
     /// the contents being copied. Callers gate this on `d:acl` — see [`read_acls_fd`] for what the
     /// probe costs.
     pub async fn read_acls(&self) -> std::io::Result<Acls> {
-        read_acls_owned(
-            Arc::clone(&self.fd),
-            self.side,
-            AclCapture::AccessAndDefault,
-        )
-        .await
+        read_acls_fd(self.fd.as_fd(), self.side, true).await
     }
 
     /// Open a child entry by name, classifying it without following symlinks.
@@ -747,63 +701,73 @@ impl Dir {
         .await
     }
 
-    /// Take uid ownership of this directory as the copier and restrict it to `mode` in one
-    /// non-cancellable blocking operation, with fd-bound postcondition verification. Used by the
-    /// reused-destination-directory lockdown under [`strict_operand_resolution`]: taking ownership
-    /// first means the directory's PRIOR owner can no longer `chmod` it back open while children
-    /// are written.
+    /// Confirm this directory's own held fd still refers to the same inode as
+    /// `handle` (same `dev` + `ino`), returning `ESTALE` on mismatch.
+    ///
+    /// This stats this [`Dir`]'s already-pinned fd (via [`Self::meta`]) against a classification
+    /// [`Handle`] taken for the same entry. It closes the classify-to-`open_dir` window in the
+    /// reused-destination-directory lockdown: `open_dir` re-resolves the name, so a concurrent
+    /// rename could substitute a different directory between classification and the open.
+    /// Comparing the opened fd's identity to the pinned classification handle catches that swap.
+    /// The handle keeps the classified inode number from being recycled during the comparison.
+    pub async fn verify_same_inode(&self, handle: &Handle) -> std::io::Result<()> {
+        let meta = self.meta().await?;
+        if meta.dev() == handle.dev() && meta.ino() == handle.ino() {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(libc::ESTALE))
+        }
+    }
+
+    /// Take uid ownership of this directory as the copier and restrict it to `mode`,
+    /// atomically and verified. Used by the reused-destination-directory lockdown under
+    /// [`strict_operand_resolution`]: taking ownership first means the directory's PRIOR
+    /// owner can no longer `chmod` it back open while children are written.
     ///
     /// The sequence — inside ONE `spawn_blocking` closure (which runs to completion once it
     /// starts) — is ordered so that **every failure exit leaves the directory no wider than a
     /// successful copy would**:
     ///
-    /// 1. When the opened directory's captured owner differs from the effective uid, `fchown` it to the
-    ///    effective uid (lock the prior owner out). An already-copier-owned directory needs no
-    ///    ownership syscall. Failing a required takeover leaves the directory untouched.
+    /// 1. `fchown` the owner to the effective uid (lock the prior owner out). Failing here
+    ///    leaves the directory untouched — transparent, fail-safe.
     /// 2. `fchmod` to a plain `0o700` IMMEDIATELY. From here on any failure leaves the
     ///    directory owner-only, i.e. no wider than success. If this `fchmod` fails, roll the
     ///    ownership back to `orig_uid` and CHECK the rollback: a clean rollback fully restores
     ///    the pre-lockdown state (the failed `chmod` changed nothing); a rollback that ALSO
     ///    fails is a genuinely stuck state (a read-only/failing backend) reported with both
     ///    errnos — the caller fails closed, so no child is ever written there.
-    /// 3. `fstat` verifies the effective uid and `0o700` mode before any further mutation.
-    /// 4. Reset the gid to `orig_gid` **only if it differs** (another process raced a `chgrp`
-    ///    after the metadata snapshot). This matters for a **setgid** directory: children
-    ///    inherit the directory's gid, and finalization cannot repair children already created.
-    ///    Writing only-when-different keeps the common case a no-op. The fd-bound write can fail
-    ///    with `EPERM` when a non-root copier cannot select the captured group; the caller then
-    ///    fails closed without descending.
-    /// 5. Re-add the setgid bit (`fchmod` to `mode`) when wanted, now that the gid is
+    /// 3. Reset the gid to `orig_gid` **only if it differs** (a prior owner raced a `chgrp`
+    ///    between classification and step 1). This matters for a **setgid** directory:
+    ///    children inherit the directory's gid, and finalization cannot repair children
+    ///    already created. Writing only-when-different keeps the common case a no-op — never
+    ///    an EPERM for a non-root copier that owns the directory but is not in its group — and
+    ///    a difference implies a foreign-owned directory, so the copier took ownership in step
+    ///    1 as root and can set any gid.
+    /// 4. Re-add the setgid bit (`fchmod` to `mode`) when wanted, now that the gid is
     ///    `orig_gid`. Doing this AFTER the gid reset stops a non-privileged copier's `chmod`
     ///    from silently dropping `S_ISGID`.
-    /// 6. When step 4 or 5 mutates the directory, a final `fstat` verifies the resulting gid and
-    ///    mode. Otherwise the verified `fstat` from step 3 is already the final state and is reused.
-    ///    A filesystem that reports a successful `chown`/`chmod` without honoring it (e.g. CIFS
-    ///    without unix extensions), or a dropped `S_ISGID`, is caught before descent. A verify
-    ///    failure still leaves the directory at the restrictive interim mode from step 2/5.
+    /// 5. Final `fstat` verifies the directory is owned by the effective uid, carries gid
+    ///    `orig_gid`, and carries exactly `mode`. A filesystem that reports a successful
+    ///    `chown`/`chmod` without honoring it (e.g. CIFS without unix extensions), or a
+    ///    dropped `S_ISGID`, is caught here rather than descending into a still-exposed
+    ///    directory. A verify failure still leaves the directory at the restrictive interim
+    ///    mode from step 2/4.
     ///
-    /// `orig_uid`/`orig_gid` are the owner/group captured from this opened directory fd. Returns
-    /// `orig_uid` only when the uid was changed, so finalize carries exactly the state it may need
-    /// to restore.
-    /// Fails (typically `EPERM`) when the copier neither owns the directory nor is privileged —
-    /// caller fails closed.
+    /// `orig_uid`/`orig_gid` are the owner/group captured at classification. Fails (typically
+    /// `EPERM`) when the copier neither owns the directory nor is privileged — caller fails closed.
     pub async fn secure_as_copier(
         &self,
         mode: u32,
         orig_uid: u32,
         orig_gid: u32,
-    ) -> std::io::Result<Option<u32>> {
+    ) -> std::io::Result<()> {
         let fd = self.fd.clone();
         let euid = nix::unistd::geteuid().as_raw();
         run_metadata_probed_blocking(self.side, congestion::MetadataOp::Chmod, move || {
             let raw = fd.as_fd();
-            // take uid ownership only when the fd-captured owner differs. a directory already owned
-            // by this effective uid has no prior owner to exclude, and a same-owner fchown adds no
-            // security boundary.
-            let restore_uid = (orig_uid != euid).then_some(orig_uid);
-            if restore_uid.is_some() {
-                fchown(raw, Some(Uid::from_raw(euid)), None).map_err(nix_to_io)?;
-            }
+            // Take uid ownership — this locks the prior owner out of any further chown/chmod. If it
+            // fails the directory is left untouched (transparent), which is fail-safe.
+            fchown(raw, Some(Uid::from_raw(euid)), None).map_err(nix_to_io)?;
             // Restrict to owner-only IMMEDIATELY, so EVERY later failure leaves the directory no wider
             // than a successful copy would. Drop to a plain 0o700 first — there is no special bit to
             // lose yet; the setgid bit (if wanted) is re-added below, once the gid is correct. If the
@@ -811,10 +775,6 @@ impl Dir {
             // the directory copier-owned at its original (possibly permissive) mode.
             if let Err(chmod_err) = fchmod(raw, Mode::from_bits_truncate(0o700)).map_err(nix_to_io)
             {
-                if restore_uid.is_none() {
-                    // no ownership mutation occurred, so there is nothing to roll back or verify.
-                    return Err(chmod_err);
-                }
                 // roll the ownership back AND VERIFY it landed with an fstat: a non-honoring backend
                 // can report a false chown success, so we must never claim a restore that did not
                 // happen.
@@ -874,12 +834,11 @@ impl Dir {
                 ));
             }
             // The directory is now VERIFIED copier-owned at 0o700 (restrictive); every exit below
-            // leaves it at least that restrictive. Reset the gid if another process raced a `chgrp`
-            // after the snapshot — only when it differs, so the unchanged common case issues no gid
-            // write. A setgid directory's children must inherit the captured gid, not the raced one;
-            // an unauthorized reset fails closed before descent.
-            let gid_changed = st.st_gid != orig_gid;
-            if gid_changed {
+            // leaves it at least that restrictive. Reset the gid if a prior owner raced a `chgrp`
+            // before the take — only when it differs, so the unchanged common case issues no gid write
+            // (never an EPERM for a non-root copier that owns the directory but is not in its group).
+            // A setgid directory's children must inherit the captured gid, not the raced one.
+            if st.st_gid != orig_gid {
                 fchown(raw, None, Some(Gid::from_raw(orig_gid))).map_err(nix_to_io)?;
             }
             // Re-add the setgid bit now that the gid is orig_gid (skipped when the interim mode is a
@@ -888,11 +847,6 @@ impl Dir {
             // one the copier is in (or the copier is root, with CAP_FSETID).
             if mode != 0o700 {
                 fchmod(raw, Mode::from_bits_truncate(mode)).map_err(nix_to_io)?;
-            }
-            if !gid_changed && mode == 0o700 {
-                // the first fstat already verified uid, gid, and final mode, and no syscall has
-                // changed the directory since. another fstat would observe the same bound fd.
-                return Ok(restore_uid);
             }
             // verify the whole takeover actually landed (uid, gid, mode); fail closed otherwise.
             let st = fstat(raw).map_err(nix_to_io)?;
@@ -914,7 +868,7 @@ impl Dir {
                     ),
                 ));
             }
-            Ok(restore_uid)
+            Ok(())
         })
         .await
     }
@@ -929,22 +883,13 @@ impl Dir {
     /// requirement, not packaging: a queued job can be reclaimed before doing anything, while a
     /// closure that takes it runs every step to completion, so there is NO await point at which the
     /// directory exists but its sanitization has not happened. Splitting the steps across separate
-    /// gated calls would let a `--fail-early` sibling abort abandon an rcp-created directory that
-    /// still carries the destination's inherited default ACL — inert at that moment (created
-    /// owner-only, `ACL_MASK` empty), but poisoning the containment invariant for anything created
-    /// under it later, including a rerun that cannot tell such an orphan from a user's own
-    /// directory.
-    /// For the same reason, an open or strip failure triggers best-effort cleanup inside the same
-    /// closure. Cleanup resolves the destination slot once relative to this directory fd; a
-    /// compatible empty replacement at that name may be removed, while a file, symlink, or
-    /// non-empty directory survives the directory cleanup. Cleanup errors are ignored so the
-    /// triggering open or strip error remains authoritative.
-    ///
-    /// The re-open is not an inode-identity proof. Production callers ensure the parent namespace
-    /// is not writable by the protected actor: the ambient parent by caller policy, and descendant
-    /// parents by owner-only creation or reused-directory lockdown. They also exclude peer writers.
-    /// Outside that contract, a compatible replacement may be opened and sanitized; this helper
-    /// does not take over its owner or mode.
+    /// gated calls (as an earlier version did) leaves windows a `--fail-early` sibling abort can
+    /// land in, abandoning an rcp-created directory that still carries the destination's inherited
+    /// default ACL — inert at that moment (created owner-only, `ACL_MASK` empty), but poisoning the
+    /// containment invariant for anything created under it later, including a rerun that cannot
+    /// tell such an orphan from a user's own directory. For the same reason, a directory whose open
+    /// or strip FAILS is removed (best-effort; it is empty and just created) inside the same closure
+    /// rather than left behind unsanitized.
     ///
     /// # Inherited ACLs, and why the strip lives here
     ///
@@ -954,11 +899,11 @@ impl Dir {
     /// [`strict_operand_resolution`] (`--require-toctou-safe`) that is contained by removing both
     /// ACLs from the new directory, which stops the chain for the directory's ENTIRE subtree:
     /// nothing created inside a stripped directory inherits anything. This is the containment half
-    /// of the `--require-toctou-safe` invariant — *no successfully completed destination entry that
-    /// rcp CREATES carries an ACL entry that did not come from its source* — and stripping per
-    /// DIRECTORY is what makes it 2 syscalls per directory and none per file created beneath one
-    /// ([`Self::create_file`] pays its own single strip only in a parent rcp did NOT sanitize — the
-    /// ambient parent of a direct file operand; see `children_may_inherit`).
+    /// of the `--require-toctou-safe` invariant — *no destination entry that rcp CREATES carries an
+    /// ACL entry that did not come from its source* — and stripping per DIRECTORY is what makes it
+    /// 2 syscalls per directory and none per file created beneath one ([`Self::create_file`] pays
+    /// its own single strip only in a parent rcp did NOT sanitize — the ambient parent of a direct
+    /// file operand; see `children_may_inherit`).
     ///
     /// The strip belongs HERE rather than at each caller because this is the only `mkdirat` in the
     /// crate, and therefore the single creation site for both the local (`copy`/`link`) and remote
@@ -968,7 +913,7 @@ impl Dir {
     ///
     /// `ENODATA` and `EOPNOTSUPP` are success for the strip (see `apply_one_acl`) — a directory
     /// with no inherited ACL, or on a filesystem that cannot hold one, already satisfies the
-    /// post-condition. Any other errno fails the create (after the cleanup attempt above), and
+    /// post-condition. Any other errno fails the create (after the best-effort removal above), and
     /// the caller must fail closed rather than descend: an un-strippable default ACL is one every
     /// child written afterwards would inherit.
     ///
@@ -1008,9 +953,10 @@ impl Dir {
                 {
                     Ok(fd) => fd,
                     Err(err) => {
-                        // clean up the destination slot best-effort. this resolves the name once
-                        // relative to the held parent; `RemoveDir` can remove an empty replacement,
-                        // but a file, symlink, or non-empty directory survives
+                        // could not open what was just created: remove it best-effort. No fd
+                        // exists to anchor an inode recheck on, but the exposure is bounded —
+                        // `RemoveDir` refuses anything but an empty directory, so a swapped-in
+                        // file or symlink fails it and a swapped-in populated directory survives
                         let _ =
                             unlinkat(dir.as_fd(), name_owned.as_bytes(), UnlinkatFlags::RemoveDir);
                         return Err(err);
@@ -1023,8 +969,8 @@ impl Dir {
                         .and_then(|()| apply_one_acl(fd.as_raw_fd(), ACL_ACCESS_XATTR, None))
                     {
                         // clean up the destination slot rather than leave inherited ACLs behind.
-                        // this name-based rmdir may remove a compatible empty replacement, but it
-                        // cannot remove a file, symlink, or non-empty directory
+                        // rmdir can remove only an empty directory and never follows a symlink; a
+                        // prior identity observation would not bind this by-name removal
                         let _ =
                             unlinkat(dir.as_fd(), name_owned.as_bytes(), UnlinkatFlags::RemoveDir);
                         return Err(err);
@@ -1047,10 +993,8 @@ impl Dir {
     ///
     /// Returns each entry's name and its `getdents` `d_type` as a best-effort
     /// `EntryKind` hint (`None` when the filesystem reports `DT_UNKNOWN`). The
-    /// hint is advisory only — callers perform type-sensitive planning from a
-    /// `child`/`fstat` classification. That snapshot binds later work only when
-    /// the work uses its fd; a by-name slot mutation relies on the syscall's own
-    /// type constraints and does not claim final-name identity.
+    /// hint is advisory only — callers MUST confirm type via `child`/`fstat`
+    /// before acting (TOCTOU safety).
     ///
     /// This method acquires only the static ops rate gate (not the congestion
     /// probe). Directory enumeration is deliberately not probed because buffered
@@ -1220,14 +1164,16 @@ impl Dir {
         .await
     }
 
-    /// Create a symlink `name` → `target` in this directory.
+    /// Create a symlink `name` → `target` in this directory, returning a
+    /// fd-pinned `Handle` to the just-created link.
     ///
-    /// `target` is the link contents — it is an arbitrary path and is not restricted to a single
-    /// component. This create-only form does not reopen the final name.
+    /// The returned handle has `kind() == EntryKind::Symlink` and can be used to
+    /// apply metadata to the link race-free. `target` is the link contents — it
+    /// is an arbitrary path and is not restricted to a single component.
     ///
     /// Fails with `EINVAL` if `name` is not a single path component, or `EEXIST`
     /// if an entry at `name` already exists.
-    pub async fn symlink_at(&self, name: &OsStr, target: &Path) -> std::io::Result<()> {
+    pub async fn symlink_at(&self, name: &OsStr, target: &Path) -> std::io::Result<Handle> {
         if !is_single_component(name) {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
@@ -1235,41 +1181,42 @@ impl Dir {
         let side = self.side;
         let name = name.to_owned();
         let target = target.to_owned();
+        // clone `name` so we can call self.child() after the closure consumes it
+        let name_for_child = name.clone();
         run_metadata_probed_blocking(side, congestion::MetadataOp::Symlink, move || {
             // symlinkat(target, dirfd, name): creates `name` → `target`
             symlinkat(target.as_os_str().as_bytes(), dir.as_fd(), name.as_bytes())
-                .map_err(nix_to_io)?;
-            #[cfg(test)]
-            let _gate_visit =
-                crate::testutils::wait_on_blocking_path_gate(&target, dir.as_fd().as_raw_fd());
-            Ok(())
+                .map_err(nix_to_io)
         })
-        .await
+        .await?;
+        // open the just-created link with O_PATH|O_NOFOLLOW so we get a Handle
+        // that is pinned to the symlink inode itself (not its target).
+        let handle = self.child(&name_for_child).await?;
+        if handle.kind() != EntryKind::Symlink {
+            // should never happen — we just created a symlink; if it somehow
+            // changed underneath us, report ENOENT to signal the caller.
+            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+        }
+        Ok(handle)
     }
 
-    /// Apply requested metadata to a same-target symlink through its pinned fd.
+    /// Read the target of a child symlink.
     ///
-    /// With no requested symlink metadata this performs no syscall. Otherwise the final name is
-    /// opened, its immutable target is read from that fd, and owner/timestamps are applied only if
-    /// that target equals `target`. This does not prove final-name identity: it binds the target
-    /// authorization to the exact metadata recipient, accepting a compatible same-target replacement
-    /// and rejecting a different-target one.
-    pub async fn set_symlink_metadata_at<Meta: crate::preserve::Metadata>(
-        &self,
-        name: &OsStr,
-        target: &Path,
-        settings: &crate::preserve::Settings,
-        meta: &Meta,
-    ) -> std::io::Result<()> {
-        if !settings.symlink.any() {
-            return Ok(());
+    /// Fails with `EINVAL` if `name` is not a single path component, or `EINVAL`
+    /// (from `readlinkat`) if `name` is not a symlink.
+    pub async fn read_link_at(&self, name: &OsStr) -> std::io::Result<std::path::PathBuf> {
+        if !is_single_component(name) {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
-        let handle = self.child(name).await?;
-        if handle.kind() != EntryKind::Symlink {
-            return Err(std::io::Error::from_raw_os_error(libc::ESTALE));
-        }
-        let handle = handle.verify_symlink_target(target, self.side).await?;
-        set_symlink_metadata_fd(settings, meta, &handle, self.side).await
+        let dir = self.fd.clone();
+        let side = self.side;
+        let name = name.to_owned();
+        run_metadata_probed_blocking(side, congestion::MetadataOp::ReadLink, move || {
+            readlinkat(dir.as_fd(), name.as_bytes())
+                .map(std::path::PathBuf::from)
+                .map_err(nix_to_io)
+        })
+        .await
     }
 
     /// Create a hard link at `dst`/`dst_name` pointing to this directory's `name`.
@@ -1405,11 +1352,8 @@ impl Dir {
     /// from the group bits and ACTIVATES them — a strict copy of a plain `0640` file granting a
     /// named user read access its source never did. Files created beneath a sanitized directory
     /// pay nothing: the parent-side strip already broke the inheritance chain, which is the flag's
-    /// whole point. A strip failure fails the create after best-effort cleanup of the destination
-    /// slot, because the caller's later chmod would otherwise publish the inherited entries. The
-    /// cleanup resolves the name once relative to this directory fd and may unlink a compatible
-    /// replacement, but it never follows a symlink and cannot remove a directory. Cleanup errors
-    /// are ignored so the ACL-strip error remains authoritative.
+    /// whole point. A strip failure fails the create (after a best-effort unlink of the empty
+    /// file), because the caller's later chmod would otherwise publish the inherited entries.
     ///
     /// Fails with `EINVAL` if `name` is not a single path component, or `EEXIST`
     /// if a file or symlink at `name` already exists.
@@ -1441,9 +1385,9 @@ impl Dir {
             if strict && may_inherit.load(std::sync::atomic::Ordering::SeqCst) {
                 // same-closure for the same reason as `make_dir`: queued work creates nothing,
                 // while work that starts runs to completion, so cancellation cannot abandon a
-                // created-but-unsanitized file. cleanup is a single name-based unlink relative to
-                // the ambient operand parent. it may remove a compatible replacement occupying the
-                // slot, but it never follows a symlink and cannot remove a directory
+                // created-but-unsanitized file. cleanup is a single unlink relative to the ambient
+                // operand parent; it never follows a symlink or removes a directory, and a prior
+                // identity observation would not bind the by-name removal
                 if let Err(err) = apply_one_acl(file.as_raw_fd(), ACL_ACCESS_XATTR, None) {
                     let _ = unlinkat(dir.as_fd(), name.as_bytes(), UnlinkatFlags::NoRemoveDir);
                     return Err(err);
@@ -1638,7 +1582,7 @@ pub async fn strict_probe_dst_kind(
     }
 }
 
-/// State a strict-mode reused-directory finalize must resolve and an abort must roll back.
+/// What a strict-mode reused-directory lockdown changed and finalize must put back.
 ///
 /// # This type is an RAII guard, and that is the point
 ///
@@ -1651,8 +1595,9 @@ pub async fn strict_probe_dst_kind(
 /// ever reaching `dir_post`, and aborts its in-flight siblings by dropping their `JoinSet` — so one
 /// failed leaf can end a dozen directories' lockdowns at once. `link_dir_contents` returns early on
 /// a failed `read_entries` with no flag needed at all. The remote destination can fail between
-/// locking a directory and registering it, or shut down with directories still pending. Restoring
-/// separately at every exit would make omission easy and the invariant difficult to verify.
+/// locking a directory and registering it, or shut down with directories still pending. Restoring at
+/// each of those sites is the shape `CLAUDE.md` warns about — a missed exit path is the recurring
+/// finding here, and there were six-plus of them.
 ///
 /// So the restore lives in [`Drop`] instead, and holds on every exit path that drops the value: an
 /// early return, a `?`, a `break`, and — the case the abort paths above actually need — a cancelled
@@ -1673,7 +1618,7 @@ pub async fn strict_probe_dst_kind(
 ///
 /// A panic (the workspace builds `panic = "abort"`, so nothing unwinds and no destructor runs), a
 /// signal, and `std::process::exit` — which, unlike the first two, is ordinary control flow in
-/// repository code. Every `process::exit` call site runs either before a copy starts (the TOCTOU
+/// shipped code. Every `process::exit` call site runs either before a copy starts (the TOCTOU
 /// linter, config validation) or after `common::run` has dropped the tokio runtime, which drops every
 /// task and therefore every guard; `rcpd`'s stdin watchdog follows the same lifetime rule. A call
 /// that exits mid-copy would reintroduce the hole. Closing it for panic and signal would need the
@@ -1688,8 +1633,7 @@ pub async fn strict_probe_dst_kind(
 /// one cheap syscall, because on a mass abort an operator otherwise gets N indistinguishable
 /// warnings and no target — along with the ACL bytes to rebuild it from. A SUCCESSFUL restore is
 /// logged at `debug!` so that "did the guard fire?" is observable rather than inferred. This is the
-/// backstop for an aborted copy. Successful finalize deliberately resolves the attribute to either
-/// the source default ACL (`d:acl` on) or this destination snapshot (`d:acl` off).
+/// backstop for an aborted copy; the finalize path is where a successful one restores.
 ///
 /// # What is deliberately NOT restored here
 ///
@@ -1726,9 +1670,8 @@ enum DefaultAclGuard {
 
 #[derive(Debug)]
 pub struct ReusedDirLock {
-    /// The original uid when lockdown changed it to the copier. Successful finalize restores this
-    /// only when source uid preservation is disabled. Lockdown already restores and verifies gid.
-    restore_uid: Option<u32>,
+    /// The directory's original `(uid, gid)`, taken from the classify handle before the takeover.
+    pub restore_owner: (u32, u32),
     /// The rollback state plus the original default ACL, shared (`Arc`) with in-flight guarded
     /// writes so the `Drop` restore serializes against them — see `DefaultAclGuard`.
     state: Arc<std::sync::Mutex<DefaultAclGuard>>,
@@ -1897,30 +1840,32 @@ fn rollback_default_acl(
     }
 }
 
-/// Lock down a REUSED destination directory under strict operand resolution, returning the state
-/// finalize must resolve and an abort must roll back — `Some` when locked, `None` (a pure no-op)
-/// when strict mode is off.
+/// Lock down a REUSED destination directory under strict operand resolution, returning what finalize
+/// must restore — `Some` when locked, `None` (a pure no-op) when strict mode is off.
 ///
-/// `dir` is the directory atomically selected by `open_dir(O_NOFOLLOW|O_DIRECTORY)`. While strict
-/// operand resolution is armed the lockdown:
+/// `dir` is the freshly `open_dir`'d handle to the reused directory; `handle` is the `O_PATH`
+/// classify [`Handle`] taken for the same entry BEFORE the open (still held, pinning the classified
+/// inode). While strict operand resolution is armed the lockdown:
 ///
-/// 1. captures the opened directory's original metadata;
-/// 2. [`Dir::secure_as_copier`] — takes ownership as the copier then restricts to `0o700`, so no
+/// 1. captures `handle`'s original `(uid, gid)` as the restore owner;
+/// 2. [`Dir::verify_same_inode`] — confirms `dir` is still that exact inode, failing closed
+///    (`ESTALE`) on a classify→open swap;
+/// 3. [`Dir::secure_as_copier`] — takes ownership as the copier then restricts to `0o700`, so no
 ///    child is written while the directory is world-readable/writable and the prior owner cannot
 ///    re-widen it mid-copy;
-/// 3. [`read_acls_fd`] — snapshots the DEFAULT ACL, and
-/// 4. removes it, so nothing created during the copy inherits it.
+/// 4. [`read_acls_fd`] — snapshots the DEFAULT ACL, and
+/// 5. removes it, so nothing created during the copy inherits it.
 ///
-/// Steps 3 and 4 both run after the takeover, and both for the same reason: only an owner (or a
-/// `CAP_FOWNER` copier) may write these attributes, so a strip issued before step 2 would leave the
+/// Steps 4 and 5 both run AFTER the takeover, and both for the same reason: only an owner (or a
+/// `CAP_FOWNER` copier) may write these attributes, so a strip issued before step 3 would leave the
 /// prior owner free to put the default ACL straight back, and a snapshot read before it could be
 /// raced by that same owner. `chmod` does not touch a default ACL (verified), so nothing about the
 /// recorded value depends on reading it first.
 ///
 /// # Why only the DEFAULT ACL
 ///
-/// The *access* ACL is deliberately left alone because stripping it buys no containment. Step 3's
-/// `chmod` rewrites `ACL_MASK` from the new group bits, so at
+/// The *access* ACL is deliberately left alone, and this is a narrowing of what an earlier version
+/// did. It buys no containment: step 3's `chmod` rewrites `ACL_MASK` from the new group bits, so at
 /// `0o700` the mask is `---` and every named `user:`/`group:` entry — and the owning group — grants
 /// nothing, while `OTHER` is `---` too. Only the copier, who now owns the directory, has any access
 /// at all (verified). And it needs no restoring, because finalize resolves it either way: with
@@ -1933,57 +1878,59 @@ fn rollback_default_acl(
 /// both — see [`Dir::make_dir`]: what it inherited is not its own, and with `d:acl` off nothing at
 /// finalize would remove an inherited access ACL, so the finalize `chmod` would make it effective.)
 ///
-/// Alias limitation: two source operands whose destinations alias the same directory can lock it
+/// KNOWN, PRE-EXISTING: two source operands whose destinations alias the same directory lock it
 /// twice, and the remote tracker's `pending_directories.insert` would drop the first guard mid-copy
-/// (restoring the default ACL while the second lockdown is still live). `--require-toctou-safe`
-/// refuses byte-equal duplicate destinations up front and serializes strict multi-source copies,
-/// which covers the reachable cases; filesystem-level aliasing (casefold, bind mount) is not
-/// detected.
+/// (restoring the ACL while the second lockdown is still live). `--require-toctou-safe` refuses
+/// byte-equal duplicate destinations up front and serializes strict multi-source copies, which
+/// covers the reachable cases; filesystem-level aliasing (casefold, bind mount) is not detected.
 ///
-/// [`set_reused_dir_metadata_fd`] resolves everything the lockdown changed: owner components not
-/// preserved from the source return to the destination owner; the default ACL returns to its
-/// destination state when `d:acl` is off or is replaced/cleared from the source when it is on; and
-/// source-derived mode/metadata is applied. A successful copy therefore has the same result as one
-/// without the interim lockdown. An `fchown`/`fchmod` `EPERM` (non-owner, non-privileged copier), a
-/// metadata read failure, or an ACL snapshot/strip failure propagates as `Err`; callers skip
-/// descent, so no child is written into an unsecured directory. Failing closed on the snapshot is
-/// why it is read before the strip: removing an ACL we could not record would permanently destroy
-/// the destination directory's own state. This is the single lockdown used by the local
-/// (`copy`/`link`) and remote (`rcpd`) reuse sites.
-pub async fn lockdown_reused_dir(dir: &Dir) -> std::io::Result<Option<ReusedDirLock>> {
+/// Everything the lockdown changed is put back at finalize by [`set_reused_dir_metadata_fd`] (the
+/// owner component-wise, so no transient window hands the directory back to a hostile prior owner)
+/// along with the source mode, so a successful copy leaves the directory byte-identical to a copy
+/// without this hardening. A recheck mismatch, an `fchown`/`fchmod` `EPERM` (non-owner,
+/// non-privileged copier), or an ACL snapshot/strip that fails propagates as `Err`; callers fail
+/// closed and skip descent, so no child is written into an unsecured directory. Failing closed on
+/// the snapshot is why it is read before the strip: removing an ACL we could not record would
+/// permanently destroy the destination directory's own. This is the single lockdown used by BOTH the
+/// local (`copy`/`link`) and remote (`rcpd`) reuse sites.
+pub async fn lockdown_reused_dir(
+    dir: &Dir,
+    handle: &Handle,
+) -> std::io::Result<Option<ReusedDirLock>> {
     if !strict_operand_resolution() {
         return Ok(None);
     }
     use crate::preserve::Metadata as _;
     use std::os::unix::fs::PermissionsExt as _;
-    let orig_meta = dir.meta().await?;
+    let orig_meta = handle.meta();
+    let restore_owner = (orig_meta.uid(), orig_meta.gid());
+    dir.verify_same_inode(handle).await?;
     // Restrict to 0o700 (owner-only) for the copy's duration, PRESERVING the setgid bit if the reused
     // directory had it (0o700 already denies all group/other access, so keeping setgid costs nothing
     // security-wise). Unlike the source mode applied at finalize, this INTERIM setgid bit governs the
     // group that every child created during the copy inherits — and finalization cannot repair those
     // children's GIDs under `preserve_none`. So a setgid directory must be locked down with BOTH its
-    // gid value and its S_ISGID bit intact: `secure_as_copier` (given the fd-captured gid) resets the
+    // gid value and its S_ISGID bit intact: `secure_as_copier` (given the classified gid) resets the
     // gid if a prior owner raced a `chgrp`, and re-stats to fail closed if `chmod` cleared S_ISGID (a
     // non-privileged copier not in the directory's group, lacking `CAP_FSETID`) or if the filesystem
     // did not honor the takeover at all. Root has `CAP_FSETID`, keeps the bit, and never trips this.
     let want_setgid = orig_meta.permissions().mode() & 0o2000 != 0;
     let interim_mode = if want_setgid { 0o2700 } else { 0o700 };
-    let restore_uid = dir
-        .secure_as_copier(interim_mode, orig_meta.uid(), orig_meta.gid())
+    dir.secure_as_copier(interim_mode, orig_meta.uid(), orig_meta.gid())
         .await?;
-    // snapshot only the default ACL, now that the directory is ours and the prior owner can no
-    // longer race the read (step 3). Nothing is destroyed yet, so cancellation here loses nothing.
-    let original = read_acls_owned(Arc::clone(&dir.fd), dir.side, AclCapture::Default)
-        .await?
-        .default;
+    // snapshot the default ACL, now that the directory is ours and the prior owner can no longer
+    // race the read (step 4). Mode-neutral. `read_acls_fd` also reads the access ACL when one is
+    // present, which is one wasted `fgetxattr` on a reused directory that has one — not worth a
+    // second read path for. Nothing is destroyed yet, so a cancellation here loses nothing.
+    let original = read_acls_fd(dir.fd.as_fd(), dir.side, true).await?.default;
     let needs_strip = original.is_some();
-    // arm the guard before destroying anything (step 4). the snapshot is the only copy of these
+    // ARM THE GUARD BEFORE DESTROYING ANYTHING (step 5). The snapshot is the only copy of these
     // bytes once the removal lands, so it must already be inside a value whose `Drop` puts it back
     // before the removal is issued — otherwise a task cancelled between the two loses it as a bare
     // `Option<Vec<u8>>` with no destructor. Armed even when the directory has no default ACL: the
     // rollback then means "keep it that way" — removing whatever a partial finalize installs.
     let lock = ReusedDirLock {
-        restore_uid,
+        restore_owner,
         state: Arc::new(std::sync::Mutex::new(DefaultAclGuard::Armed { original })),
         fd: Arc::clone(&dir.fd),
         children_may_inherit: Arc::clone(&dir.children_may_inherit),
@@ -2052,32 +1999,10 @@ pub struct Acls {
     pub default: Option<Vec<u8>>,
 }
 
-/// POSIX ACL attributes to capture from an already-open entry.
-#[derive(Clone, Copy, Debug)]
-pub enum AclCapture {
-    /// Capture only the access ACL used by files and other non-directory entries.
-    Access,
-    /// Capture both the access and default ACLs used by source directories.
-    AccessAndDefault,
-    /// Capture only the default ACL used by reused-directory lockdown.
-    Default,
-}
-
-impl AclCapture {
-    fn wants_access(self) -> bool {
-        matches!(self, Self::Access | Self::AccessAndDefault)
-    }
-
-    fn wants_default(self) -> bool {
-        matches!(self, Self::Default | Self::AccessAndDefault)
-    }
-}
-
 /// Read an entry's POSIX ACLs through an fd it is already open on.
 ///
-/// `capture` selects the attributes the caller consumes. Source files request access ACLs, source
-/// directories request both, and reused-directory lockdown requests only the default ACL it may
-/// need to roll back. An unrequested present attribute is not fetched.
+/// `want_default` is `true` for directories only — files have no default ACL, so asking for one
+/// would spend a syscall that can only miss.
 ///
 /// `flistxattr` runs FIRST and an `fgetxattr` is issued only for a name actually present. There is
 /// no bit in `stat` saying an entry has an ACL, so this probe is what ACL preservation costs per
@@ -2092,19 +2017,11 @@ impl AclCapture {
 pub async fn read_acls_fd(
     fd: BorrowedFd<'_>,
     side: congestion::Side,
-    capture: AclCapture,
+    want_default: bool,
 ) -> std::io::Result<Acls> {
-    read_acls_owned(Arc::new(fd.try_clone_to_owned()?), side, capture).await
-}
-
-/// Read ACLs using an already shareable owned fd, avoiding the borrowed-fd wrapper's duplicate.
-async fn read_acls_owned(
-    owned: Arc<OwnedFd>,
-    side: congestion::Side,
-    capture: AclCapture,
-) -> std::io::Result<Acls> {
-    // share the owned fd across the (up to three) gated syscalls: each runs in its own
+    // dup once and share the owned fd across the (up to three) gated syscalls: each runs in its own
     // `spawn_blocking` closure, which must own what it touches to be 'static.
+    let owned = Arc::new(fd.try_clone_to_owned()?);
     let names = {
         let owned = Arc::clone(&owned);
         run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
@@ -2113,14 +2030,14 @@ async fn read_acls_owned(
         .await?
     };
     let mut acls = Acls::default();
-    if capture.wants_access() && names_contain(&names, ACL_ACCESS_XATTR) {
+    if names_contain(&names, ACL_ACCESS_XATTR) {
         let owned = Arc::clone(&owned);
         acls.access = run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
             fgetxattr_blob(owned.as_raw_fd(), ACL_ACCESS_XATTR)
         })
         .await?;
     }
-    if capture.wants_default() && names_contain(&names, ACL_DEFAULT_XATTR) {
+    if want_default && names_contain(&names, ACL_DEFAULT_XATTR) {
         acls.default =
             run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
                 fgetxattr_blob(owned.as_raw_fd(), ACL_DEFAULT_XATTR)
@@ -2186,8 +2103,9 @@ async fn set_or_remove_acl_fd(
 /// the quiet lie ACL preservation exists to remove. Consolidated here so a reader verifies it once
 /// rather than at each applier.
 ///
-/// The local copy carries ACLs from the source fd and the remote destination carries them in the
-/// wire header. The error arm is a fail-closed backstop for any applier that omits that payload.
+/// No caller reaches that arm today: the local copy reads the source's ACLs from the fd it is about
+/// to copy, and the remote destination gets them from the wire header. It is kept as a fail-closed
+/// backstop for a future applier that forgets to — which would otherwise be silent.
 fn acls_to_apply(want: bool, acls: Option<&Acls>) -> std::io::Result<Option<&Acls>> {
     match (want, acls) {
         (false, _) => Ok(None),
@@ -2245,6 +2163,21 @@ fn flistxattr_names(fd: RawFd) -> std::io::Result<Vec<u8>> {
     // SAFETY: `fd` is a valid open descriptor for the duration of the call and the kernel writes
     // at most `len` bytes into `buf` (or nothing at all when `buf` is null and `len` is 0).
     listxattr_retry(|buf, len| unsafe { libc::flistxattr(fd, buf, len) })
+}
+
+/// `listxattr` on a PATH, following symlinks — used only for the `/proc/self/fd/N` magic symlink,
+/// which must be dereferenced to reach the inode an `O_PATH` handle pins.
+///
+/// See [`has_acl_via_proc_fd`] for why the probe cannot go through the handle's fd directly.
+fn listxattr_names_at_path(path: &CStr) -> std::io::Result<Vec<u8>> {
+    // SAFETY: `path` is a NUL-terminated C string that outlives the call and the kernel writes at
+    // most `len` bytes into `buf` (or nothing at all when `buf` is null and `len` is 0).
+    // the only caller passes /proc/self/fd/N for an fd it already holds, so this resolves to that
+    // PINNED inode: inode-exact, not a by-name lookup a swap could redirect.
+    let probe = |buf, len| {
+        unsafe { libc::listxattr(path.as_ptr(), buf, len) } // rcp-toctou-allow: /proc/self/fd magic symlink to a held fd
+    };
+    listxattr_retry(probe)
 }
 
 /// Whether the NUL-separated `list` produced by [`flistxattr_names`] contains `name`.
@@ -2338,36 +2271,53 @@ fn apply_one_acl(fd: RawFd, name: &CStr, blob: Option<&[u8]>) -> std::io::Result
     }
 }
 
-// ── The ACL-preservation settings notice ────────────────────────────────────────
+// ── The source-root ACL warning ─────────────────────────────────────────────────
 //
-// `all` does not preserve ACLs, which can silently make a destination wider than its source. The
-// useful warning follows directly from the requested settings; inspecting one mutable source root
-// would neither establish anything about its descendants nor provide a durable security fact. Keep
-// the notice syscall-free and conditional instead of paying for an opportunistic filesystem probe.
+// `all` does not preserve ACLs, and a user who asked for it and does not know
+// that gets a silently wider destination. Telling them costs one `listxattr` on
+// the SOURCE ROOT per run — a constant, not a per-entry probe, so it is
+// affordable on the very path whose whole point is that it pays nothing per
+// entry.
+//
+// armed by ASKING (`RootAclNotice`), not by an ACL merely existing: a run left at
+// the shipped default already drops uid, gid, timestamps and the special mode bits
+// without a word, so it is not the place to be loud about one more attribute it
+// also does not carry — and it pays nothing to find that out.
+//
+// It is a HEURISTIC and must be read as one: a root without an ACL says nothing
+// about its children. The alternative — probing enough entries to be sure — IS
+// the per-entry cost that made `acl` opt-in in the first place.
 
-/// Guards the settings notice so it runs at most once per process, no matter how many source
-/// operands or `--dereference` recursions reach a call site.
-static ROOT_ACL_NOTICE_EMITTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Guards the probe so it runs at most once per process, no matter how many source operands (or
+/// `--dereference` recursions into `copy`) reach a call site.
+static ROOT_ACL_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// What a run's settings say about the ACL-preservation notice.
+/// What a run's settings say about the source-root ACL notice: whether it is wanted at all, and
+/// which kinds are already covered.
+///
+/// The single home of the rule, so the two entry points below, the cheap pre-check a caller uses to
+/// skip work, and the remote source all decide the same way.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct AclPreservationNotice {
+pub struct RootAclNotice {
     /// Whether this run asked for the kind of fidelity a dropped ACL would undermine, normally
     /// [`crate::preserve::Settings::requests_preservation`].
     ///
-    /// `false` silences the notice unless strict mode arms it independently. A preserve-none copy
-    /// already declines metadata fidelity generally, so singling out ACLs there would promise a
-    /// completeness nobody requested.
+    /// `false` silences the notice outright — probe included, so a run that did not ask pays
+    /// nothing at all. A copy left at the shipped default already drops uid, gid, timestamps and
+    /// the setuid/setgid/sticky bits without a word; singling ACLs out there would be advice about
+    /// permission completeness nobody claimed. It is also independent of
+    /// [`strict_operand_resolution`], which arms the notice on its own: `--require-toctou-safe` is
+    /// a request about permissions whatever the preserve settings say, and it gets its own wording.
     pub wanted: bool,
-    /// Whether file ACLs are already safe. `rlink` also sets this for no-update hard links, whose
-    /// destination shares the source inode.
+    /// Whether a FILE root's ACL is already safe — normally the `acl` preserve setting for files,
+    /// but `true` also covers a kind whose ACL cannot be lost by construction (`rlink` passes it
+    /// for files without `--update`, which share the source inode through the hard link).
     pub file_acl_preserved: bool,
-    /// Whether directory ACLs (access and default) are already safe.
+    /// Whether a DIRECTORY root's ACLs (access and default) are already safe.
     pub dir_acl_preserved: bool,
 }
 
-impl AclPreservationNotice {
+impl RootAclNotice {
     /// The notice a copy governed by `preserve` wants.
     #[must_use]
     pub fn for_preserve(preserve: &crate::preserve::Settings) -> Self {
@@ -2378,43 +2328,175 @@ impl AclPreservationNotice {
         }
     }
 
-    fn could_warn(self, strict: bool) -> bool {
-        (self.wanted || strict) && (!self.file_acl_preserved || !self.dir_acl_preserved)
+    /// Whether a root of `kind` could produce a notice: the run wants one and that kind's ACLs are
+    /// not already being carried across.
+    ///
+    /// Symlinks and special files answer `false` without consulting anything — the kernel has no
+    /// symlink ACL (the settings parser rejects `l:acl`), and a special file is not copied as an
+    /// object whose permissions rcp reproduces.
+    ///
+    /// Reads the process-global strict flag, so it must not be called before
+    /// [`enable_strict_operand_resolution`] has run — every call site is well past the linter that
+    /// sets it.
+    fn could_warn_for(self, kind: EntryKind) -> bool {
+        self.could_warn_for_strict(kind, strict_operand_resolution())
+    }
+
+    /// [`could_warn_for`](Self::could_warn_for) with the strict flag passed in rather than read, so
+    /// the rule itself can be pinned without a process-global to arrange.
+    fn could_warn_for_strict(self, kind: EntryKind, strict: bool) -> bool {
+        (self.wanted || strict)
+            && match kind {
+                EntryKind::File => !self.file_acl_preserved,
+                EntryKind::Dir => !self.dir_acl_preserved,
+                EntryKind::Symlink | EntryKind::Special => false,
+            }
+    }
+
+    /// Whether ANY root could produce a notice — [`could_warn_for`](Self::could_warn_for) with the
+    /// root's kind not yet known, which is the only thing a caller holding just a path can ask.
+    fn could_warn(self) -> bool {
+        self.could_warn_for(EntryKind::File) || self.could_warn_for(EntryKind::Dir)
     }
 }
 
-/// Warn once per process when requested settings can omit POSIX ACLs.
+/// Whether the inode an `O_PATH` [`Handle`] pins carries either POSIX ACL, probed through its
+/// `/proc/self/fd/N` magic symlink.
 ///
-/// This is intentionally settings-only. A source-root observation could be raced and would say
-/// nothing about descendants, so it cannot justify filesystem syscalls or an identity claim.
-pub fn warn_if_acls_may_be_unpreserved(notice: AclPreservationNotice) {
-    let strict = strict_operand_resolution();
-    if !notice.could_warn(strict)
-        || ROOT_ACL_NOTICE_EMITTED.swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
+/// The `/proc` detour is not decoration: `flistxattr` on an `O_PATH` descriptor fails with `EBADF`,
+/// so the classify handle — the one fd every engine already holds for its root, whatever the entry
+/// kind — cannot answer the probe directly. Resolving the magic symlink reaches the pinned inode
+/// while staying inode-exact, exactly as [`chmod_via_proc_fd`] and [`stat_meta_via_proc_fd`] do,
+/// and it needs neither read permission on the entry nor a second `openat`. Requires `/proc`
+/// mounted (same precondition as [`chmod_via_proc_fd`]); a caller treats failure as "don't know"
+/// rather than as an error, since this only ever produces a warning.
+///
+/// Gated as `MetadataOp::Stat` like every other metadata read here.
+async fn has_acl_via_proc_fd(handle: &Handle, side: congestion::Side) -> std::io::Result<bool> {
+    // clone the O_PATH fd into an owned fd the blocking closure can hold, keeping the pinned inode
+    // alive for the syscall's full duration even if the originating Handle is dropped.
+    let owned = handle.as_fd().try_clone_to_owned()?;
+    let names = run_metadata_probed_blocking(side, congestion::MetadataOp::Stat, move || {
+        let proc_path = std::ffi::CString::new(format!("/proc/self/fd/{}", owned.as_raw_fd()))
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+        listxattr_names_at_path(&proc_path)
+    })
+    .await?;
+    Ok(names_contain(&names, ACL_ACCESS_XATTR) || names_contain(&names, ACL_DEFAULT_XATTR))
+}
+
+/// Whether it is worth *reaching* for the probe: something could still be warned about, and the
+/// one per-process run has not been taken yet.
+///
+/// Advisory only — it claims nothing, so the probe itself still goes through
+/// [`warn_if_root_acl_unpreserved`] / [`warn_if_root_acl_unpreserved_at`], which claim internally.
+/// Its job is to let a caller skip work it would otherwise do just to reach the probe: the two
+/// entry points below use it to skip an `openat`, and `rcp`'s remote `-L` source uses it to skip
+/// resolving and opening the root's parent, which it does not otherwise need.
+#[must_use]
+pub fn root_acl_probe_worth_reaching(notice: RootAclNotice) -> bool {
+    if !notice.could_warn() {
+        return false;
+    }
+    !ROOT_ACL_PROBED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Claim the single per-process probe run, returning `false` if someone already has it.
+///
+/// Called as LATE as possible — after the root's kind is known and after the per-kind settings
+/// check — so that a root which cannot produce a warning does not consume the budget and silence
+/// a later operand that could have. Two operands racing here can both pass
+/// [`root_acl_probe_worth_reaching`] and both open their root; only one wins the swap, and the
+/// loser has wasted one `openat`. Which one wins is therefore unspecified for concurrent operands;
+/// see the note on [`warn_if_root_acl_unpreserved`].
+fn claim_root_acl_probe() -> bool {
+    !ROOT_ACL_PROBED.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Probe `handle` and warn if it carries an ACL this copy will not carry across. The shared body
+/// of the two entry points below, so the message and the kind rule live in one place.
+///
+/// The root's kind is the LAST thing the rule needs, and the only one a caller cannot supply, so
+/// this is where [`RootAclNotice::could_warn_for`] is asked authoritatively — a symlink or special
+/// root, and a kind whose ACLs are already carried across, are turned away without a syscall.
+/// Failure to probe is logged at `debug!` and nothing else: this produces advice, so a missing
+/// `/proc` or an exotic filesystem must not turn into a copy error.
+async fn warn_root_acl(handle: &Handle, src_root: &Path, notice: RootAclNotice) {
+    if !notice.could_warn_for(handle.kind()) {
         return;
     }
-    let omitted = match (notice.file_acl_preserved, notice.dir_acl_preserved) {
-        (false, false) => "files and directories",
-        (false, true) => "files",
-        (true, false) => "directories",
-        (true, true) => unreachable!("could_warn rejects fully preserved ACL settings"),
-    };
-    if strict {
-        tracing::warn!(
+    // claim LAST. A root that could not have warned returns above without spending the one
+    // per-process run, so it cannot silence a later operand that had something to say.
+    if !claim_root_acl_probe() {
+        return;
+    }
+    // Both arms go to `crate::NOTICE_TARGET`, which the verbose filter renders at every verbosity
+    // INCLUDING the default: a notice about `all` silently dropping ACLs is useless if only a user
+    // who already passed `-v` — and therefore already suspects something — can see it.
+    match has_acl_via_proc_fd(handle, congestion::Side::Source).await {
+        Ok(false) => {}
+        Ok(true) if strict_operand_resolution() => tracing::warn!(
             target: crate::NOTICE_TARGET,
-            "This copy does not preserve POSIX ACLs for {omitted}. If such source entries carry \
-             ACLs, the destination may become more permissive. --require-toctou-safe prevents \
-             destination ACL inheritance but does not carry source ACLs across. Use \
-             `--preserve-settings=all+acl`."
-        );
-    } else {
-        tracing::warn!(
+            "Source root {src_root:?} carries a POSIX ACL that this copy will NOT preserve \
+             (`--preserve-settings` does not request `acl`). --require-toctou-safe stops the \
+             DESTINATION tree's ACLs from being inherited, but it does not carry the SOURCE's \
+             across, so the copy can still end up more permissive than what it copied. Use \
+             `--preserve-settings=all+acl`. Only the root was checked - entries beneath it may \
+             carry ACLs this says nothing about."
+        ),
+        Ok(true) => tracing::warn!(
             target: crate::NOTICE_TARGET,
-            "This copy does not preserve POSIX ACLs for {omitted}. If such source entries carry \
-             ACLs, the destination may become more permissive. Use \
-             `--preserve-settings=all+acl`."
-        );
+            "Source root {src_root:?} carries a POSIX ACL that this copy will NOT preserve \
+             (`--preserve-settings` does not request `acl`), so the destination may end up more \
+             permissive than its source. Use `--preserve-settings=all+acl`. Only the root was \
+             checked - entries beneath it may carry ACLs this says nothing about."
+        ),
+        Err(err) => {
+            tracing::debug!("cannot probe {src_root:?} for a POSIX ACL: {err:#}");
+        }
+    }
+}
+
+/// Warn once per run when the source ROOT carries a POSIX ACL that this copy will not carry across.
+///
+/// `handle` is the root's `O_PATH` classify handle and `src_root` its path, for the message;
+/// `notice` is what the run's settings say (see [`RootAclNotice`]). The probe consults whichever of
+/// its per-kind flags matches the root's own kind, so `f:acl` does not silence a directory root.
+///
+/// "Once" is per PROCESS, which is what makes this affordable: a `--dereference` walk recurses into
+/// `copy` per resolved symlink, and a multi-operand run has several roots. The first root that can
+/// carry an ACL spends the probe; the rest are silent even if they would have warned. That is the
+/// heuristic being cheap on purpose — the alternative is the per-entry cost that made `acl` opt-in.
+pub async fn warn_if_root_acl_unpreserved(handle: &Handle, src_root: &Path, notice: RootAclNotice) {
+    if !root_acl_probe_worth_reaching(notice) {
+        return;
+    }
+    warn_root_acl(handle, src_root, notice).await;
+}
+
+/// [`warn_if_root_acl_unpreserved`] for a caller that holds the root's PARENT rather than the root
+/// itself — the shape of the local `rcp`/`rlink` entry points, which open the root only inside the
+/// walk.
+///
+/// The `openat` is skipped when nothing could be warned about and when the per-process run is
+/// already spent, so a copy that did not ask for the notice or already preserves ACLs — and every
+/// call after the first — costs nothing at all. Two operands racing can both pass that check and
+/// both open their root; the loser of the claim has then spent one `openat` and nothing more. A
+/// root that cannot be opened is left to the walk to diagnose.
+pub async fn warn_if_root_acl_unpreserved_at(
+    parent: &Dir,
+    name: &OsStr,
+    src_root: &Path,
+    notice: RootAclNotice,
+) {
+    if !root_acl_probe_worth_reaching(notice) {
+        return;
+    }
+    match parent.child(name).await {
+        Ok(handle) => warn_root_acl(&handle, src_root, notice).await,
+        Err(err) => {
+            tracing::debug!("cannot open source root {src_root:?} for a POSIX ACL probe: {err:#}");
+        }
     }
 }
 
@@ -2619,37 +2701,32 @@ pub(crate) async fn stat_meta_via_proc_fd(
 ///
 /// Raw `libc::readlinkat` is required: nix's wrapper rejects the empty pathname that selects the
 /// fd's own link (the same reason `symlink_utimes_fd` uses raw `utimensat`).
-async fn read_link_handle(
+pub async fn read_link_handle(
     handle: &Handle,
     side: congestion::Side,
 ) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
     let owned = handle.as_fd().try_clone_to_owned()?;
     run_metadata_probed_blocking(side, congestion::MetadataOp::ReadLink, move || {
-        read_link_fd(owned.as_fd())
+        // a symlink target is bounded by PATH_MAX, so a single buffer of that size never truncates.
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: `owned` is a valid open fd for the duration of this call; the empty C string
+        // selects the fd's own symlink (it was opened O_PATH|O_NOFOLLOW); `buf` has `len()` bytes.
+        let n = unsafe {
+            libc::readlinkat(
+                owned.as_raw_fd(),
+                c"".as_ptr(),
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        buf.truncate(n as usize);
+        Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(buf)))
     })
     .await
-}
-
-fn read_link_fd(fd: BorrowedFd<'_>) -> std::io::Result<std::path::PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
-
-    // a symlink target is bounded by PATH_MAX, so a single buffer of that size never truncates.
-    let mut buf = vec![0u8; libc::PATH_MAX as usize];
-    // SAFETY: `fd` is valid for the duration of this call; the empty C string selects the fd's own
-    // symlink (it was opened O_PATH|O_NOFOLLOW); `buf` has `len()` bytes.
-    let n = unsafe {
-        libc::readlinkat(
-            fd.as_raw_fd(),
-            c"".as_ptr(),
-            buf.as_mut_ptr().cast::<libc::c_char>(),
-            buf.len(),
-        )
-    };
-    if n < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    buf.truncate(n as usize);
-    Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(buf)))
 }
 
 /// Set timestamps on a symlink `Handle`'s `O_PATH` fd, operating on the link
@@ -2868,16 +2945,19 @@ async fn set_dir_metadata_fd_inner<Meta: crate::preserve::Metadata>(
 }
 
 /// Apply directory metadata to a REUSED destination directory that may have been locked down under
-/// [`strict_operand_resolution`], restoring any uid takeover correctly and WITHOUT a transient
+/// [`strict_operand_resolution`], restoring the original owner correctly and WITHOUT a transient
 /// window in which a hostile prior owner regains control.
 ///
 /// `lock` is what [`lockdown_reused_dir`] recorded, or `None` for a freshly created directory
-/// (nothing to restore). When present, this restores the original uid only when uid is NOT being
-/// preserved from the source; otherwise [`set_dir_metadata_fd`] changes the copier uid directly to
-/// the source uid. The directory's transient owner is therefore always the copier or the final
-/// owner, never a prior owner who will not own the final directory. Lockdown already restored and
-/// verified the original gid on the same held fd, and nothing before final metadata mutates it, so a
-/// non-preserved gid needs no no-op write.
+/// (nothing to restore). When present, this restores ONLY the owner components that are NOT being
+/// preserved to the source — leaving each preserved component as the copier for
+/// [`set_dir_metadata_fd`] to set to the source owner. So the directory's transient owner is always
+/// the copier (for a preserved uid) or the final owner (a non-preserved uid equals the original) —
+/// NEVER a prior owner who will not own the final directory. This closes the brief re-grant window
+/// that a plain "chown to the original, then chown the preserved components to source" sequence
+/// would open for a preserving copy, and removes the "left owned by the original if the second chown
+/// fails" case. The non-preserved gid write, when issued, targets the directory's unchanged gid — a
+/// kernel-permitted set-to-current no-op, safe even for a non-root copier not in that group.
 ///
 /// # Resolving the two ACLs
 ///
@@ -2901,9 +2981,9 @@ async fn set_dir_metadata_fd_inner<Meta: crate::preserve::Metadata>(
 /// against the guard's `Drop` rollback: this future can be cancelled with the write already
 /// detached on the blocking pool, and an unserialized write could land AFTER the rollback and
 /// silently undo it (see `DefaultAclGuard`). The guard stays armed through every remaining
-/// fallible step and every cancellation point up to the successful return — and is disarmed only
-/// immediately before `Ok(())`, so a failure or a cancellation anywhere in between rolls the
-/// directory back to ITS OWN original default ACL —
+/// fallible step — INCLUDING the final re-stat verification and every cancellation point up to
+/// the successful return — and is disarmed only immediately before `Ok(())`, so a failure or a
+/// cancellation anywhere in between rolls the directory back to ITS OWN original default ACL —
 /// including the case where that original is "none" and the rollback must REMOVE a source ACL
 /// that was just installed.
 ///
@@ -2920,11 +3000,14 @@ async fn set_dir_metadata_fd_inner<Meta: crate::preserve::Metadata>(
 ///   an error rather than produce.
 ///
 /// The guarded write is mode-neutral, so unlike the SOURCE-ACL applies in the inner applier it
-/// does not compete with the finalize chmod for the widening slot: only a DEFAULT ACL goes through
-/// it, and a default ACL never moves its own directory's mode. Any implementation that also
-/// restores an ACCESS ACL must do so before chmod: the snapshot's `USER_OBJ`/`MASK`/`OTHER` agree
-/// with the destination directory's original mode, not the source's, so a later restore would
-/// install the wrong rwx bits.
+/// does not compete with the finalize chmod for the widening slot: only a DEFAULT ACL ever goes
+/// through it, and a default ACL never moves its own directory's mode. That is a consequence of
+/// the lockdown narrowing to the default ACL alone (see [`lockdown_reused_dir`]) and is worth
+/// stating, because it was not always true: while the lockdown also stripped the ACCESS ACL, the
+/// restore had to precede the chmod or it would install the DESTINATION's original rwx bits over
+/// the source's mode — the snapshot's `USER_OBJ`/`MASK`/`OTHER` agree with the directory's
+/// original mode, not the source's — and the re-stat verify below would then reject the copy.
+/// Anything that reintroduces an access-ACL restore here inherits that constraint.
 pub async fn set_reused_dir_metadata_fd<Meta: crate::preserve::Metadata>(
     settings: &crate::preserve::Settings,
     meta: &Meta,
@@ -2932,14 +3015,17 @@ pub async fn set_reused_dir_metadata_fd<Meta: crate::preserve::Metadata>(
     lock: Option<ReusedDirLock>,
     dir: &Dir,
 ) -> std::io::Result<()> {
-    // a fresh / non-strict directory (lock == None) uses the shared metadata applier directly. only a
-    // strict-mode locked reused directory needs the uid/default-ACL state below.
+    // A fresh / non-strict directory (lock == None) uses the shared best-effort applier UNVERIFIED —
+    // verifying it would regress legitimate non-root `--preserve` copies (which the kernel silently
+    // strips setgid from, best-effort). Only a strict-mode LOCKED reused directory (lock == Some)
+    // gets the restore + final verify below.
     // NB: `ReusedDirLock` is an RAII guard, so it cannot be destructured by move — and must not be,
     // since dropping its parts separately is exactly the bug it exists to prevent. It stays whole
     // until it is deliberately disarmed below.
     let Some(lock) = lock else {
         return set_dir_metadata_fd(settings, meta, acls, dir).await;
     };
+    let (orig_uid, orig_gid) = lock.restore_owner;
     // resolve the default ACL first, through the guard — see "Resolving the two ACLs" above for
     // the two cases, the serialization against the guard's rollback, and why a failure must leave
     // the guard armed (`Drop` then gets one synchronous rollback attempt rather than the bytes
@@ -2954,33 +3040,89 @@ pub async fn set_reused_dir_metadata_fd<Meta: crate::preserve::Metadata>(
         lock.write_default_acl_guarded(dir.side, blob).await?;
     }
     let ut = &settings.dir.user_and_time;
-    if !ut.uid
-        && let Some(orig_uid) = lock.restore_uid
     {
-        // lockdown already restored and verified orig_gid on this same fd, and nothing in the
-        // interim mutates the directory's gid. restore only the uid that lockdown actually changed;
-        // the inner applier handles either component selected from the source.
-        fchown_fd(dir.fd.as_fd(), dir.side, Some(orig_uid), None).await?;
+        let uid = (!ut.uid).then_some(orig_uid);
+        let gid = (!ut.gid).then_some(orig_gid);
+        if uid.is_some() || gid.is_some() {
+            fchown_fd(dir.fd.as_fd(), dir.side, uid, gid).await?;
+        }
     }
     // the default ACL is excluded (`apply_default: false`): it was resolved through the guard
     // above, and only the guard's serialized writer may touch it while the lockdown is live
     set_dir_metadata_fd_inner(settings, meta, acls, dir, false).await?;
-    // disarm only after the last fallible/cancellable finalize step. every earlier exit leaves the
-    // guard armed so its `Drop` restores the destination's original default ACL. a final re-stat
-    // would not strengthen this: handing back the final uid/mode also hands its owner the ability to
-    // race that observation or change the state immediately after it.
+    // The guard stays ARMED through the verify below: a re-stat error, a verification failure, or
+    // this future being cancelled at the `meta()` await all mean the copy of this directory FAILED,
+    // and failure must leave the directory as it was — the armed guard's `Drop` rolls the default
+    // ACL back to the destination's original (REMOVING a just-installed source ACL when the
+    // original was "none") rather than leaving the directory half-converted to the source.
+    // Disarming any earlier reopens exactly that window; see the disarm at the end.
+    //
+    // Re-stat and verify the finalize actually landed. A backend that reports chown/chmod success
+    // without honoring it (e.g. CIFS without unix extensions) would otherwise leave a strict reused
+    // directory silently owned by the copier or at the wrong mode. A lone dropped S_ISGID bit is a
+    // WARNING, not a failure: it is narrower than the source, child safety was already ensured by the
+    // INTERIM setgid held during the copy, and failing here would regress a legitimate non-root
+    // `--preserve` of a setgid directory (the kernel strips setgid when the copier is not in the
+    // group and lacks CAP_FSETID) — matching the best-effort behavior of a non-strict copy.
+    //
+    // `want_mode` stays `masked_mode` even when an access ACL was applied, because the two agree by
+    // construction: the destination's rwx bits come from the source's ACL (`fsetxattr` sets them
+    // from USER_OBJ/MASK/OTHER) and the source's own mode's rwx bits were derived from that same
+    // ACL by the kernel. The special bits come from the chmod either way. So for a setgid source
+    // directory with an ACL, `want_mode`'s S_ISGID is checked against the chmod's result and its
+    // rwx against the ACL's, with no double-counting.
+    use crate::preserve::Metadata as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let want_uid = if ut.uid { meta.uid() } else { orig_uid };
+    let want_gid = if ut.gid { meta.gid() } else { orig_gid };
+    let want_mode = crate::preserve::masked_mode(settings.dir.mode_mask, meta);
+    let got = dir.meta().await?;
+    let got_mode = got.permissions().mode() & 0o7777;
+    if got.uid() != want_uid || got.gid() != want_gid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "reused-directory finalize could not be verified: the directory shows uid={} gid={} \
+                 (expected uid={} gid={}); the filesystem may not honor chown/chmod",
+                got.uid(),
+                got.gid(),
+                want_uid,
+                want_gid,
+            ),
+        ));
+    }
+    if got_mode != want_mode {
+        if want_mode & 0o2000 != 0 && want_mode & !0o2000 == got_mode {
+            // the ONLY difference is a dropped setgid bit — warn, do not fail.
+            tracing::warn!(
+                "setgid not applied to reused directory (final mode {:#o} vs source {:#o}): the \
+                 copier is not in the directory's group and lacks CAP_FSETID",
+                got_mode,
+                want_mode,
+            );
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "reused-directory finalize could not be verified: the directory shows \
+                     mode={:#o} (expected {:#o}); the filesystem may not honor chmod",
+                    got_mode, want_mode,
+                ),
+            ));
+        }
+    }
+    // Disarm only here, with the finalize verified and nothing fallible (or cancellable) left
+    // before the successful return: every earlier exit — error or cancellation — leaves the guard
+    // armed so its `Drop` restores the destination's original default ACL.
     lock.disarm();
     Ok(())
 }
 
-/// Apply symlink metadata (owner and timestamps only — never mode) to a target-validated symlink
+/// Apply symlink metadata (owner and timestamps only — never mode) to a symlink
 /// [`Handle`], operating on the link itself via `AT_EMPTY_PATH`.
 ///
 /// Symlinks have no meaningful permission bits, so there is no chmod step;
-/// ordering is chown → utimens. Gates on `settings.symlink`. A caller that obtained the handle by a
-/// separate create/open sequence must use [`Dir::set_symlink_metadata_at`] to bind the intended
-/// target. A caller that read the target through [`Handle::read_symlink_owned`] may call this
-/// directly after comparing that observation.
+/// ordering is chown → utimens. Gates on `settings.symlink`.
 pub async fn set_symlink_metadata_fd<Meta: crate::preserve::Metadata>(
     settings: &crate::preserve::Settings,
     meta: &Meta,
@@ -3177,6 +3319,13 @@ mod tests {
     use crate::preserve::Metadata;
     use crate::testutils;
     use std::io::Read;
+
+    const EVERY_KIND: [EntryKind; 4] = [
+        EntryKind::File,
+        EntryKind::Dir,
+        EntryKind::Symlink,
+        EntryKind::Special,
+    ];
 
     #[tokio::test]
     async fn preview_operand_descent_rejects_a_symlink_in_the_relative_prefix() -> anyhow::Result<()>
@@ -3713,43 +3862,69 @@ mod tests {
 
     #[test]
     fn a_run_that_asked_for_nothing_wants_no_root_acl_notice() {
-        // the gate this whole type exists for: a copy at the preserve-none baseline drops uid,
+        // the gate this whole type exists for: a copy at the shipped default already drops uid,
         // gid, timestamps and the special mode bits silently, so an ACL notice there is advice
         // about a completeness nobody claimed — and it must cost nothing, kind unknown included.
-        let notice = AclPreservationNotice::for_preserve(&crate::preserve::preserve_none());
+        let notice = RootAclNotice::for_preserve(&crate::preserve::preserve_none());
         assert!(!notice.wanted);
-        assert!(!notice.could_warn(false));
+        for kind in EVERY_KIND {
+            assert!(
+                !notice.could_warn_for_strict(kind, false),
+                "a {kind:?} root warned under settings that asked for no preservation"
+            );
+        }
     }
 
     #[test]
     fn strict_resolution_arms_the_notice_on_its_own() {
         // `--require-toctou-safe` is a request ABOUT permissions whatever `--preserve-settings`
         // says, and the two flags deliberately do not imply each other, so it must arm the notice
-        // by itself — with its own wording.
-        let notice = AclPreservationNotice::for_preserve(&crate::preserve::preserve_none());
-        assert!(notice.could_warn(true));
+        // by itself — with its own wording, which `warn_root_acl` picks the same way.
+        let notice = RootAclNotice::for_preserve(&crate::preserve::preserve_none());
+        assert!(notice.could_warn_for_strict(EntryKind::Dir, true));
+        assert!(notice.could_warn_for_strict(EntryKind::File, true));
     }
 
     #[test]
-    fn the_notice_reports_when_either_entry_kind_omits_acls() {
-        // `f:acl` and `d:acl` are independent, so preserving files alone still leaves directory ACLs
-        // worth mentioning.
-        let file_only = AclPreservationNotice {
+    fn the_notice_consults_the_setting_for_the_roots_own_kind() {
+        // `f:acl` and `d:acl` are independent. Getting this wrong is silent in both directions:
+        // one way it warns about an ACL the copy is carrying across, the other it stays quiet
+        // about one being dropped.
+        let file_only = RootAclNotice {
             wanted: true,
             file_acl_preserved: true,
             dir_acl_preserved: false,
         };
-        assert!(file_only.could_warn(false));
+        assert!(!file_only.could_warn_for_strict(EntryKind::File, false));
+        assert!(file_only.could_warn_for_strict(EntryKind::Dir, false));
+        assert!(
+            file_only.could_warn(),
+            "a directory root can still warn, so the kind-unknown pre-check must not skip the probe"
+        );
+    }
+
+    #[test]
+    fn a_root_that_cannot_carry_an_acl_never_warns() {
+        // the kernel has no symlink ACL, and a special file is not copied as an object whose
+        // permissions rcp reproduces — so neither reaches the probe, armed or not
+        let armed = RootAclNotice {
+            wanted: true,
+            file_acl_preserved: false,
+            dir_acl_preserved: false,
+        };
+        for kind in [EntryKind::Symlink, EntryKind::Special] {
+            assert!(!armed.could_warn_for_strict(kind, true));
+        }
     }
 
     #[test]
     fn preserving_both_kinds_acls_leaves_nothing_to_warn_about() {
-        let notice =
-            AclPreservationNotice::for_preserve(&crate::preserve::preserve_all_with_acls());
+        let notice = RootAclNotice::for_preserve(&crate::preserve::preserve_all_with_acls());
         assert!(notice.wanted, "`all+acl` did ask for preservation");
         assert!(
-            !notice.could_warn(false) && !notice.could_warn(true),
-            "both kinds' ACLs are carried across, so even an armed run has nothing to say"
+            !notice.could_warn(),
+            "both kinds' ACLs are carried across, so even an armed run has nothing to say — and \
+             must not pay the probe to find that out"
         );
     }
 
@@ -3789,7 +3964,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn secure_as_copier_avoids_same_owner_chown_and_preserves_gid() -> anyhow::Result<()> {
+    async fn secure_as_copier_takes_ownership_restricts_mode_and_preserves_gid()
+    -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = testutils::setup_test_dir().await?;
         let root =
@@ -3799,13 +3975,9 @@ mod tests {
         // exactly 0o700, and the gid is unchanged (no race means no gid write at all).
         let plain = root.make_dir(OsStr::new("reused_plain"), 0o755).await?;
         let before = plain.meta().await?;
-        let restore_uid = plain
+        plain
             .secure_as_copier(0o700, before.uid(), before.gid())
             .await?;
-        assert!(
-            restore_uid.is_none(),
-            "an already-copier-owned directory needs no ownership change"
-        );
         let after = plain.meta().await?;
         assert_eq!(
             after.permissions().mode() & 0o7777,
@@ -3832,13 +4004,8 @@ mod tests {
             0o2000,
             "test setup: S_ISGID is set before lockdown"
         );
-        let restore_uid = sg
-            .secure_as_copier(0o2700, sg_before.uid(), sg_before.gid())
+        sg.secure_as_copier(0o2700, sg_before.uid(), sg_before.gid())
             .await?;
-        assert!(
-            restore_uid.is_none(),
-            "an already-copier-owned setgid directory needs no ownership change"
-        );
         let sg_after = sg.meta().await?;
         assert_eq!(
             sg_after.permissions().mode() & 0o7777,
@@ -4228,55 +4395,25 @@ mod tests {
         Ok(())
     }
 
-    // symlink_at creates a symlink fd-relative; a separate child/read verifies its result.
+    // symlink_at: creates a symlink and returns a Handle with kind Symlink;
+    // read_link_at then returns the original target path.
     #[tokio::test]
-    async fn symlink_at_creates_link_fd_relative() -> anyhow::Result<()> {
+    async fn symlink_at_creates_link_and_returns_pinned_handle() -> anyhow::Result<()> {
         let tmp = testutils::setup_test_dir().await?;
         let root =
             Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
         let target = std::path::Path::new("some/arbitrary/target");
-        root.symlink_at(OsStr::new("mylink"), target).await?;
-        let handle = root.child(OsStr::new("mylink")).await?;
-        assert_eq!(handle.kind(), EntryKind::Symlink);
-        let (read_back, _handle) = handle
-            .read_symlink_owned(congestion::Side::Destination)
-            .await?;
+        let handle = root.symlink_at(OsStr::new("mylink"), target).await?;
+        assert_eq!(
+            handle.kind(),
+            EntryKind::Symlink,
+            "symlink_at must return a Symlink handle"
+        );
+        // read_link_at must return the same target
+        let read_back = root.read_link_at(OsStr::new("mylink")).await?;
         assert_eq!(
             read_back, target,
-            "read_symlink_owned returned wrong target: {read_back:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn symlink_without_metadata_does_not_reopen_the_created_name() -> anyhow::Result<()> {
-        let admission = testutils::AdmissionLimit::new().await;
-        let tmp = testutils::setup_test_dir().await?;
-        let root =
-            Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
-        let metadata = tokio::fs::symlink_metadata(tmp.join("foo/0.txt")).await?;
-        let stat_resource =
-            throttle::Resource::meta(throttle::Side::Destination, throttle::MetadataOp::Stat);
-        admission.set_max_ops_in_flight(stat_resource, 1);
-        let held_stat = throttle::ops_in_flight_permit(stat_resource).await;
-
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            root.symlink_at(OsStr::new("plain-link"), std::path::Path::new("target"))
-                .await?;
-            root.set_symlink_metadata_at(
-                OsStr::new("plain-link"),
-                std::path::Path::new("target"),
-                &crate::preserve::preserve_none(),
-                &metadata,
-            )
-            .await
-        })
-        .await
-        .expect("a no-preserve symlink create must not wait for destination Stat")?;
-        drop(held_stat);
-        assert_eq!(
-            tokio::fs::read_link(tmp.join("foo/plain-link")).await?,
-            std::path::Path::new("target")
+            "read_link_at returned wrong target: {read_back:?}"
         );
         Ok(())
     }
@@ -4323,61 +4460,6 @@ mod tests {
         // metadata is the symlink's own, from the same handle.
         assert_eq!(meta.uid(), handle.meta().uid());
         assert_eq!(meta.mtime(), handle.meta().mtime());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_symlink_owned_keeps_the_target_bound_to_the_returned_handle_after_rename()
-    -> anyhow::Result<()> {
-        let tmp = testutils::setup_test_dir().await?;
-        let root =
-            Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
-        let link = tmp.join("foo/lnk");
-        let moved = tmp.join("foo/moved");
-        tokio::fs::symlink("original-target", &link).await?;
-        let handle = root.child(OsStr::new("lnk")).await?;
-        let original_ino = handle.ino();
-
-        tokio::fs::rename(&link, &moved).await?;
-        tokio::fs::symlink("replacement-target", &link).await?;
-
-        let (target, handle) = handle
-            .read_symlink_owned(congestion::Side::Destination)
-            .await?;
-        assert_eq!(target, std::path::Path::new("original-target"));
-        assert_eq!(handle.ino(), original_ino);
-        assert_eq!(tokio::fs::read_link(&moved).await?, target);
-        assert_eq!(
-            tokio::fs::read_link(&link).await?,
-            std::path::Path::new("replacement-target")
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn verify_symlink_target_checks_the_pinned_handle_not_the_current_name()
-    -> anyhow::Result<()> {
-        let tmp = testutils::setup_test_dir().await?;
-        let root =
-            Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
-        let link = tmp.join("foo/lnk");
-        tokio::fs::symlink("untrusted-target", &link).await?;
-        let handle = root.child(OsStr::new("lnk")).await?;
-
-        tokio::fs::rename(&link, tmp.join("foo/moved")).await?;
-        tokio::fs::symlink("intended-target", &link).await?;
-
-        let error = handle
-            .verify_symlink_target(
-                std::path::Path::new("intended-target"),
-                congestion::Side::Destination,
-            )
-            .await
-            .expect_err("the replacement name must not validate the pinned handle");
-        assert!(
-            error.to_string().contains("symlink target changed"),
-            "unexpected validation error: {error:#}"
-        );
         Ok(())
     }
 
@@ -4911,12 +4993,12 @@ mod tests {
         let target_before = std::fs::metadata(&target_path)?;
 
         // the link to apply metadata to
-        root.symlink_at(
-            OsStr::new("the_link"),
-            std::path::Path::new("sentinel_target.txt"),
-        )
-        .await?;
-        let link = root.child(OsStr::new("the_link")).await?;
+        let link = root
+            .symlink_at(
+                OsStr::new("the_link"),
+                std::path::Path::new("sentinel_target.txt"),
+            )
+            .await?;
 
         // desired link timestamps come from a source FileMeta; build one by
         // stating a second symlink we set up with a distinctive mtime.
@@ -4991,6 +5073,13 @@ mod tests {
                 err.raw_os_error(),
                 Some(libc::EINVAL),
                 "symlink_at(name): expected EINVAL for {bad:?}, got {err:#}"
+            );
+
+            let err = root.read_link_at(bad_os).await.unwrap_err();
+            assert_eq!(
+                err.raw_os_error(),
+                Some(libc::EINVAL),
+                "read_link_at: expected EINVAL for {bad:?}, got {err:#}"
             );
 
             // hard_link_at: both `name` and `dst_name` are guarded
@@ -5254,7 +5343,7 @@ mod tests {
         set_xattr_at(&src_path, ACL_ACCESS_XATTR, &blob);
         let root = Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Source).await?;
         let (file, _) = root.open_file_read(OsStr::new("acl_src")).await?;
-        let acls = read_acls_fd(file.as_fd(), congestion::Side::Source, AclCapture::Access).await?;
+        let acls = read_acls_fd(file.as_fd(), congestion::Side::Source, false).await?;
         // byte-identical: the blob is carried opaquely, never re-encoded
         assert_eq!(acls.access.as_deref(), Some(blob.as_slice()));
         assert_eq!(acls.default, None, "a file has no default ACL to read");
@@ -5289,7 +5378,7 @@ mod tests {
         }
         let root = Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Source).await?;
         let (file, _) = root.open_file_read(OsStr::new("big_acl")).await?;
-        let acls = read_acls_fd(file.as_fd(), congestion::Side::Source, AclCapture::Access).await?;
+        let acls = read_acls_fd(file.as_fd(), congestion::Side::Source, false).await?;
         assert_eq!(acls.access.as_deref(), Some(blob.as_slice()));
         Ok(())
     }
@@ -5299,7 +5388,7 @@ mod tests {
         let tmp = testutils::setup_test_dir().await?;
         let root = Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Source).await?;
         let (file, _) = root.open_file_read(OsStr::new("0.txt")).await?;
-        let acls = read_acls_fd(file.as_fd(), congestion::Side::Source, AclCapture::Access).await?;
+        let acls = read_acls_fd(file.as_fd(), congestion::Side::Source, false).await?;
         assert_eq!(acls, Acls::default(), "an entry with no xattrs has no ACL");
         Ok(())
     }
@@ -5317,19 +5406,10 @@ mod tests {
         let both = dir.read_acls().await?;
         assert_eq!(both.access.as_deref(), Some(access.as_slice()));
         assert_eq!(both.default.as_deref(), Some(default.as_slice()));
-        // the file path asks only for access, so it must not fetch the present default ACL.
-        let access_only =
-            read_acls_fd(dir.fd.as_fd(), congestion::Side::Source, AclCapture::Access).await?;
+        // `want_default: false` is what the file path passes; it must not spend the extra syscall
+        let access_only = read_acls_fd(dir.fd.as_fd(), congestion::Side::Source, false).await?;
         assert_eq!(access_only.access.as_deref(), Some(access.as_slice()));
         assert_eq!(access_only.default, None);
-        let default_only = read_acls_fd(
-            dir.fd.as_fd(),
-            congestion::Side::Source,
-            AclCapture::Default,
-        )
-        .await?;
-        assert_eq!(default_only.access, None);
-        assert_eq!(default_only.default.as_deref(), Some(default.as_slice()));
         Ok(())
     }
 
@@ -5621,10 +5701,14 @@ mod tests {
         Ok(())
     }
 
-    // the reused-directory finalize applies setgid and an access ACL through the same held fd;
-    // access entries supply rwx while chmod supplies special bits, so pin their combined result.
+    // The reused-directory finalize re-stats and verifies the mode it applied. Its `want_mode` is
+    // still `masked_mode`, which stays correct with an ACL in play only because the source's own
+    // rwx bits and its ACL are the same fact — worth a test rather than a comment, and worth doing
+    // it on a SETGID directory, where the special bit comes from the chmod and the rwx bits from
+    // the ACL.
     #[tokio::test]
-    async fn set_reused_dir_metadata_fd_applies_setgid_with_an_acl() -> anyhow::Result<()> {
+    async fn set_reused_dir_metadata_fd_verifies_a_setgid_source_with_an_acl() -> anyhow::Result<()>
+    {
         use std::os::unix::fs::PermissionsExt;
         let tmp = testutils::setup_test_dir().await?;
         let root =
@@ -5645,8 +5729,14 @@ mod tests {
             "fixture must keep setgid alongside the ACL (whose MASK set the group bits)"
         );
         let dst_dir = root.make_dir(OsStr::new("setgid_acl_dst"), 0o700).await?;
-        // the snapshot is empty and irrelevant here: `d:acl` is on, so the source's ACL wins and
-        // the snapshot is discarded.
+        let (uid, gid) = {
+            let meta = dst_dir.meta().await?;
+            use crate::preserve::Metadata as _;
+            (meta.uid(), meta.gid())
+        };
+        // `Some(lock)` is the strict-mode locked path — the one that verifies. The snapshot is
+        // empty and irrelevant here: `d:acl` is on, so the SOURCE's ACL wins and the snapshot is
+        // discarded.
         set_reused_dir_metadata_fd(
             &crate::preserve::preserve_all_with_acls(),
             &src_meta,
@@ -5655,7 +5745,7 @@ mod tests {
                 default: None,
             }),
             Some(ReusedDirLock {
-                restore_uid: None,
+                restore_owner: (uid, gid),
                 state: Arc::new(std::sync::Mutex::new(DefaultAclGuard::Armed {
                     original: None,
                 })),
@@ -5719,7 +5809,7 @@ mod tests {
         // dropped): a finalize write that already started on the blocking pool must observe that
         // and SKIP — landing it would silently overwrite the restore
         let lock = ReusedDirLock {
-            restore_uid: None,
+            restore_owner: (0, 0),
             state: Arc::new(std::sync::Mutex::new(DefaultAclGuard::Disarmed)),
             fd: Arc::clone(&dir.fd),
             children_may_inherit: Arc::new(std::sync::atomic::AtomicBool::new(false)),

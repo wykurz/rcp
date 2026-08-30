@@ -239,9 +239,7 @@ fn test_remote_direct_rcpd_automatic_capacity_failure_uses_stderr_startup_record
 #[test]
 fn test_remote_direct_rcpd_histogram_target_failure_uses_stderr_startup_record() {
     let target = tempfile::tempdir().unwrap();
-    let requested = target.path().join("log.hdr");
-    std::fs::create_dir(target.path().join("log.rcpd-source.hdr")).unwrap();
-    let target_arg = format!("--auto-meta-histogram-log={}", requested.display());
+    let target_arg = format!("--auto-meta-histogram-log={}", target.path().display());
     let output = rcpd()
         .args(["--role=source", "--no-encryption", &target_arg])
         .output()
@@ -256,7 +254,7 @@ fn test_remote_direct_rcpd_histogram_target_failure_uses_stderr_startup_record()
         "startup refusal must own the first stderr record: {stderr:?}"
     );
     assert!(
-        stderr.contains("histogram-log") && stderr.contains("log.rcpd-source.hdr"),
+        stderr.contains("is a directory; expected a file path"),
         "startup record must retain the histogram target cause: {stderr:?}"
     );
 }
@@ -1434,10 +1432,11 @@ fn symlinked_dst_prefix_fixture() -> tempfile::TempDir {
     tmp
 }
 
-/// A filtered source does not validate an unused destination prefix.
+/// A symlinked DESTINATION prefix fails closed even when the SOURCE root is filtered out
+/// (the up-front dst validation runs before the source-filter early-return).
 #[cfg(target_os = "linux")]
 #[test]
-fn require_toctou_safe_skips_unused_dst_prefix_when_source_filtered() {
+fn require_toctou_safe_refuses_symlinked_dst_prefix_when_source_filtered() {
     if !common::safedir::openat2_available() {
         return;
     }
@@ -1449,7 +1448,7 @@ fn require_toctou_safe_skips_unused_dst_prefix_when_source_filtered() {
         .arg(base.join("src"))
         .arg(base.join("link/out"))
         .assert()
-        .success();
+        .failure();
     assert!(!base.join("real/out").exists());
 }
 
@@ -1492,10 +1491,10 @@ fn require_toctou_safe_refuses_symlinked_dst_prefix_with_overwrite() {
     assert!(!base.join("real/out").exists());
 }
 
-/// A dry run does not validate a destination prefix it never opens or mutates.
+/// A symlinked DESTINATION prefix fails closed in --dry-run (which otherwise touches no dst).
 #[cfg(target_os = "linux")]
 #[test]
-fn require_toctou_safe_dry_run_skips_unused_dst_prefix() {
+fn require_toctou_safe_dry_run_refuses_symlinked_dst_prefix() {
     if !common::safedir::openat2_available() {
         return;
     }
@@ -1507,7 +1506,7 @@ fn require_toctou_safe_dry_run_skips_unused_dst_prefix() {
         .arg(base.join("src"))
         .arg(base.join("link/out"))
         .assert()
-        .success();
+        .failure();
 }
 
 /// `--dry-run --delete` onto a destination that is itself a final symlink must SUCCEED (the final

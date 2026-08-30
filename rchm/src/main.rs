@@ -100,13 +100,13 @@ struct Args {
     require_toctou_safe: bool,
     /// Absolute path to the `getent` binary used to resolve user/group names
     ///
-    /// When set, name lookups spawn this absolute pathname instead of searching PATH. A privileged
-    /// wrapper or exact sudo rule must protect its entire resolution chain — every ancestor,
-    /// symlink target, and final entry — from untrusted writes (e.g.
-    /// `--getent-path=/usr/bin/getent`). The option does not pin an inode. It may be given at most
-    /// once; duplicate rejection prevents an unsafe trailing-wildcard policy from appending an
-    /// attacker-controlled override. When unset and running privileged, rchm tries a fixed list of
-    /// trusted system pathnames instead of PATH; numeric ids never need getent.
+    /// When set, name lookups spawn exactly this binary instead of searching PATH. Pin it in a
+    /// privileged wrapper or exact sudo rule so rchm resolves names via a known-good getent
+    /// regardless of the caller's PATH (e.g. `--getent-path=/usr/bin/getent`). May be given at
+    /// most once — duplicate rejection prevents an unsafe trailing-wildcard policy from being
+    /// overridden with an attacker-controlled path. When unset and running privileged, rchm
+    /// searches a fixed list of trusted system directories instead of PATH; numeric ids never
+    /// need getent at all.
     #[arg(long, value_name = "PATH", action = clap::ArgAction::Append, help_heading = "Security")]
     getent_path: Vec<std::path::PathBuf>,
     /// Clear set-user-ID and set-group-ID bits on every selected non-symlink
