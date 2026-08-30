@@ -1999,9 +1999,9 @@ fn test_remote_copy_file_skipped_under_failed_parent_does_not_abort() {
 }
 
 /// Dereference (`-L`) copy of a directory tree, exercising the source-side path-keyed Pass-1
-/// entries (the destination no longer echoes the count, so `-L` retains each directory's contents
-/// and pacing credit). The directory is reached through a symlink and must be copied as a real
-/// directory with all files present.
+/// entries. Because `DirectoryCreated` does not carry the count, `-L` retains each directory's
+/// contents and pacing credit. The directory is reached through a symlink and must be copied as a
+/// real directory with all files present.
 #[test]
 fn test_remote_copy_dereference_directory_tree() {
     require_local_ssh();
@@ -6697,9 +6697,9 @@ fn test_remote_source_intermediate_dir_swap_never_escapes() {
 
 /// Best-effort race: while a remote copy WRITES into the destination, swap an intermediate
 /// DESTINATION directory between a real directory and a symlink pointing OUTSIDE the destination
-/// tree. The destination's fd-relative writes (pinned parent fd, `O_NOFOLLOW`, recheck-guarded)
-/// must never be redirected through the symlink to create/write outside the tree. Any file leaking
-/// into the out-of-tree "escape" directory is a true-positive failure; a clean run is expected.
+/// tree. The destination's fd-relative writes (pinned parent fd and `O_NOFOLLOW`) must never be
+/// redirected through the symlink to create or write outside the tree. Any file leaking into the
+/// out-of-tree "escape" directory is a true-positive failure; a clean run is expected.
 #[test]
 fn test_remote_dest_intermediate_dir_swap_never_escapes() {
     require_local_ssh();
@@ -7120,12 +7120,9 @@ fn test_remote_dereference_no_ack_subtree_over_budget_does_not_hang() {
 /// subdirectories) into the parent's `Directory { entry_count }`. A subdirectory is
 /// classified via the parent's fd (`fstatat`, which succeeds even for a `0o000`
 /// child), so it IS counted — but the later `dir.open_dir(child)` fails with EACCES
-/// for a `0o000` directory. Before the fix that failure only recorded an error and
-/// `continue`d, emitting NO protocol message for the counted child, so the
-/// destination's `DirectoryTracker` for the parent waited forever for that entry →
-/// `complete_directory` never fired → `DestinationDone` was never sent → the copy
-/// HUNG. The fix emits a `FileSkipped` for the unprocessable child so the parent's
-/// expected-entry count still reaches zero.
+/// for a `0o000` directory. That failure must emit `FileSkipped` for the
+/// unprocessable child; emitting no protocol message would leave the destination's
+/// parent tracker waiting forever and prevent `DestinationDone`.
 ///
 /// Here `blocked/` holds 16 subdirectories all mode `0o000`: each is counted in
 /// `blocked/`'s `entry_count` but every `open_dir` fails. Bounding/determinism is
@@ -7277,8 +7274,8 @@ fn run_rcp_with_log_trigger(
     assert_not_timeout(&output);
     assert!(
         mutate.is_none(),
-        "the copy finished without ever logging {trigger:?} x{occurrence} — the race window this \
-         test needs no longer exists, so it would have passed without testing anything"
+        "the copy finished without ever logging {trigger:?} x{occurrence}, so the required race \
+         window was not exercised"
     );
     output
 }
@@ -7286,15 +7283,11 @@ fn run_rcp_with_log_trigger(
 /// Regression for the `-L` ROOT hang: a root operand that is a directory when the source classifies
 /// it and a regular file by the time the walk descends into it must not hang the copy.
 ///
-/// `send_fs_objects_tcp` stats the root once to decide `has_root_item` and whether to walk it or
-/// send it as a file. The `-L` walk then used to stat it a SECOND time, and a dir→file swap in
-/// between made the two disagree: the walk returned early having sent nothing, the caller still
-/// announced `DirStructureComplete { has_root_item: true }` from its own (stale) snapshot, and the
-/// destination waited on `root_complete` forever — a hang with both peers alive that no timeout or
-/// keepalive ends. The fix hands the walk the caller's single classification, which is what
-/// `send_root_hardened` has always done for the hardened root; a root that changes type is then
-/// caught at the enumeration (`ENOTDIR`) and answered with the 0-entry `Directory` every other
-/// committed-but-unreadable directory gets.
+/// `send_fs_objects_tcp` classifies the root once to decide `has_root_item` and whether to walk it or
+/// send it as a file, then hands that authoritative classification to the `-L` walk. A root that
+/// changes from directory to file before descent is caught at enumeration (`ENOTDIR`) and answered
+/// with the 0-entry `Directory` every committed-but-unreadable directory receives. The source must
+/// not return having sent nothing while the destination waits on `root_complete`.
 ///
 /// The window is between the two stats, so the trigger is the walk's own entry log — the SECOND
 /// `Sending data from` for the root (the first is `send_fs_objects_tcp`'s, emitted before its stat).
@@ -7352,7 +7345,7 @@ fn test_remote_dereference_root_kind_swap_does_not_hang() {
     assert!(
         log.contains("Cannot open directory") && log.contains("Not a directory"),
         "expected the root's enumeration to fail ENOTDIR (the committed-but-unreadable route); \
-         the swap may no longer be landing inside the intended window"
+         the swap did not land inside the intended window"
     );
 }
 
@@ -7360,13 +7353,10 @@ fn test_remote_dereference_root_kind_swap_does_not_hang() {
 /// `Directory { entry_count }` that disappears before the walk recurses into it must not hang the
 /// copy.
 ///
-/// The parent pre-reads and counts every child, then recurses. A child that vanished in between
-/// fails the recursion's metadata read, which used to log, collect the error and return `Ok` having
-/// sent NOTHING — so the destination's parent never reached `entries_expected`,
-/// `DestinationDone` was never sent, and the copy hung with both peers alive. The hardened walk has
-/// compensated for its equivalent (a counted child whose `open_dir` fails) since PR #247 with a
-/// `FileSkipped`; this is the same compensation on the `-L` walk, applied in one funnel that covers
-/// every "counted but nothing sent" exit.
+/// The parent pre-reads and counts every child, then recurses. If a child vanishes in between, its
+/// failed metadata read must produce `FileSkipped` accounting rather than return after sending
+/// nothing. The same compensation funnel covers every counted child that cannot produce its normal
+/// protocol message, allowing the destination to reach `entries_expected` and complete.
 ///
 /// The window is between the parent's pre-read and the recursion, so the trigger is the parent's
 /// `Sending directory` log — emitted after the pre-read counted the child and before the first
@@ -7521,23 +7511,20 @@ fn test_remote_special_root_skipped_or_fatal() {
     assert!(!dst_socket.exists());
 }
 
-/// Regression for the `-L` NESTED hang, type-change variant, AND for the silent data loss the first
-/// fix for it introduced.
+/// Regression for the `-L` nested type-change accounting and sibling preservation.
 ///
 /// Same accounting contract as the vanish case, reached through the walk's other "counted but
-/// nothing sent" exits: a child that is now a regular FILE (the walk sends directories and symlinks),
-/// and one that is now a SPECIAL (sockets/FIFOs/devices never produce a protocol message at all).
-/// Both used to return `Ok` having sent nothing for an entry the parent had already counted, and
-/// either one alone hangs the copy.
+/// nothing sent" exits: a child that becomes a regular file (the walk sends directories and
+/// symlinks), and one that becomes special (sockets/FIFOs/devices never produce a protocol message
+/// at all). Each counted entry must receive accounting compensation so either case can complete.
 ///
 /// `sibling.txt` is what makes this also a DATA-LOSS test, and it must be asserted on contents
 /// rather than on the exit code, because the failure it guards is silent. Compensating the changed
-/// child with a `FileSkipped` is only half the fix: Pass 2 re-enumerates the parent by path, and a
-/// child that is a regular file by then reads as one of its expected files, taking a SECOND of the
-/// parent's entry slots. The `files_found > file_count` truncation then evicts a genuinely counted
-/// file — `sibling.txt` — to keep the total at `file_count`; the destination still completes, and
-/// the copy exits 0 having quietly not copied it. The two passes are now mutually exclusive by name
-/// (`Pass1Contents`), so the changed child cannot take a file slot at all.
+/// child with a `FileSkipped` is only half the requirement: Pass 2 re-enumerates the parent by path,
+/// so a child that is a regular file by then could consume a second entry slot and evict a genuinely
+/// counted file through `files_found > file_count` truncation. `Pass1Contents` makes the two passes
+/// mutually exclusive by name, so the changed child cannot take a file slot and `sibling.txt`
+/// remains included.
 #[test]
 fn test_remote_dereference_child_kind_swap_does_not_hang() {
     require_local_ssh();
@@ -7733,11 +7720,11 @@ fn test_remote_dest_symlink_at_intermediate_dir_not_followed_out_of_tree() {
     );
 }
 
-/// Companion to the test above with `--overwrite`: even when the destination is allowed to
-/// REPLACE the planted intermediate symlink, the replacement is fd-relative and recheck-guarded
-/// (it removes the symlink itself via `unlink_at`, never following it), then creates a real
-/// directory in its place. The file must end up inside the destination tree, and NOTHING must
-/// ever be written to the symlink's out-of-tree target.
+/// Companion to the test above with `--overwrite`: even when the destination may replace the
+/// planted intermediate symlink, removal is fd-relative and parent-contained (`unlink_at` removes
+/// the symlink itself without following it), then a real directory is created in its place. The
+/// file must end up inside the destination tree, and nothing may be written to the symlink's
+/// out-of-tree target.
 #[test]
 fn test_remote_dest_overwrite_replaces_intermediate_symlink_in_tree() {
     require_local_ssh();

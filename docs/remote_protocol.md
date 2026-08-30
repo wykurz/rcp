@@ -1372,10 +1372,10 @@ multiplier):**
   When omitted, the source chooses `max(std::thread::available_parallelism(), 4)` and the
   destination adopts that source-selected value. A finite ceiling also clamps data streams, while
   explicit or legacy unlimited input leaves `--max-connections` as their ceiling. Each endpoint
-  separately intersects the file ceiling with its own unchanged current soft `RLIMIT_NOFILE`
-  descriptor-safety heuristic (80% / five modeled units, capped at 4096) for its local OpenFile and
-  PendingMeta admission. Those local pools remain independent and are not wire state. The hidden
-  forwarded legacy value `0` removes only the user ceiling; descriptor safety remains active. If the
+  separately intersects the file ceiling with its own current soft `RLIMIT_NOFILE` descriptor-safety
+  heuristic (80% / four modeled units, capped at 4096) for its local OpenFile and PendingMeta
+  admission. Those local pools remain independent and are not wire state. The hidden forwarded
+  legacy value `0` removes only the user ceiling; descriptor safety remains active. If the
   `RLIMIT_NOFILE` query itself fails, a finite user-supplied limit is used as the sole endpoint
   admission ceiling with a notice. Automatic or unlimited admission fails closed because it has no
   independent finite bound. A successful query returning a zero soft limit fails closed for every
@@ -1435,27 +1435,30 @@ that are already up to date.
   limit. When exceeded, the manifest is omitted for that directory and the source
   transfers-and-drains all its files as usual.
 
-**TOCTOU/safety:** The manifest is built fd-relatively on the pinned directory handle, so names are
-never re-resolved. A skip performs no filesystem mutation; the destination's existing
-`process_single_file` overwrite path still runs for files the source does send. The design's
-containment and permission-fidelity guarantees are therefore unchanged.
+**TOCTOU/safety:** The manifest is built fd-relatively on the pinned directory handle. Each
+enumerated name is classified once relative to that handle; it is never resolved by full path or
+outside the pinned directory. A skip performs no filesystem mutation. For files the source does
+send, `process_single_file` removes the final component through its pinned parent fd; it never
+follows a symlink or escapes that parent. It does not recheck the component's `(dev, ino)` identity,
+so a replacement between separate syscalls can select a different final component. Exact final-name
+identity is outside the guarantee, while containment and permission fidelity remain unchanged.
 
 **Point-in-time observation (not a re-validation at send time):** the skip decision compares two
 snapshots captured during the *scan* — the source entry from the Pass-2 directory enumeration and
 the destination entry from the Pass-1 manifest build — rather than re-fstatting at the moment of the
 decision. This differs from the transfer path, which re-derives the source metadata from the opened
-fd (`docs/tocttou.md` Guarantee 2 — the wire header must describe the bytes actually sent) and
-re-checks the destination entry at receipt in `process_single_file`. The consequence is purely about
-freshness, not safety: a file the manifest shows as identical is left untouched even if the source
-or destination entry is concurrently modified (or the destination entry removed) between the scan
-and the end of the copy. This is consistent with rcp's point-in-time, non-atomic copy semantics —
-concurrent external modification of the source or destination *during* a copy is never guaranteed to
-be reflected (even the transfer path stops re-checking a file once it has handled it; the skip
-path's observation point is simply earlier). Crucially, because a skip reads and writes nothing and
-emits no header describing un-sent bytes, it cannot violate the containment or permission-fidelity
-guarantees — Guarantee 2 governs the data path and does not apply when no data is sent. If a copy
-must reflect an actively-changing source or destination, do not rely on the skip optimization for
-that run (e.g. quiesce writers, or omit `--overwrite`/`--ignore-existing`).
+fd (`docs/tocttou.md` Guarantee 2 — the wire header must describe the bytes actually sent). The
+consequence is purely about freshness, not safety: a file the manifest shows as identical is left
+untouched even if the source or destination entry is concurrently modified (or the destination entry
+removed) between the scan and the end of the copy. This is consistent with rcp's point-in-time,
+non-atomic copy semantics — concurrent external modification of the source or destination *during* a
+copy is never guaranteed to be reflected. The transfer path also operates on the final component
+present when it handles the name; it does not guarantee exact final-name identity across separate
+syscalls. Crucially, because a skip reads and writes nothing and emits no header describing un-sent
+bytes, it cannot violate the containment or permission-fidelity guarantees — Guarantee 2 governs the
+data path and does not apply when no data is sent. If a copy must reflect an actively-changing
+source or destination, do not rely on the skip optimization for that run (e.g. quiesce writers, or
+omit `--overwrite`/`--ignore-existing`).
 
 **Limitation — single root-file copy:** When copying a single file (e.g.
 `rcp h1:/a/file

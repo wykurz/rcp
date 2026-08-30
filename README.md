@@ -716,7 +716,7 @@ ulimit -n 65536
 ```
 
 `rcp` queries the current session's **soft** limit without changing it. It derives a descriptor
-safety ceiling from 80% of that limit, five modeled descriptor units, and a 4096-operation cap; that
+safety ceiling from 80% of that limit, four modeled descriptor units, and a 4096-operation cap; that
 ceiling is independently intersected with `--max-files-in-flight` for each file-work pool. Raising
 the soft limit can therefore raise safety headroom, but does not change the CPU-based default
 file-work ceiling. Neither setting is a literal count of every descriptor in the process.

@@ -363,10 +363,10 @@ fn assert_no_inherited_acls(dst_tree: &std::path::Path) {
 /// copy that never locked it down.
 ///
 /// The source directory's mode (`0o700`) is deliberately DIFFERENT from the mode the destination's
-/// own access ACL implies (`0o755`). The lockdown no longer touches the access ACL at all, so the
-/// two now differ only in what the finalize chmod does to its mask — but keep them unequal: equal
-/// modes make the twin comparison pass for the wrong reason, since a destination whose ACL already
-/// agrees with the source's mode survives almost any mishandling unchanged.
+/// own access ACL implies (`0o755`). Lockdown leaves the access ACL untouched, so the fixtures
+/// differ only in what the finalize chmod does to its mask — but keep them unequal: equal modes make
+/// the twin comparison pass for the wrong reason, since a destination whose ACL already agrees with
+/// the source's mode survives almost any mishandling unchanged.
 #[test]
 fn strict_mode_contains_and_restores_a_reused_directorys_acls() {
     if strict_mode_unusable() {

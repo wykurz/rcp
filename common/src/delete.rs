@@ -202,8 +202,8 @@ mod tests {
         DeleteSettings { delete_excluded }
     }
 
-    /// Open `dst` as the destination directory `Dir` the (now fd-relative) prune operates through,
-    /// mirroring what the copy/link call sites do (`O_NOFOLLOW|O_DIRECTORY`, Destination side).
+    /// Open `dst` as the destination directory `Dir` prune operates through, mirroring the copy/link
+    /// call sites (`O_NOFOLLOW|O_DIRECTORY`, Destination side).
     async fn open_dst(dst: &std::path::Path) -> anyhow::Result<Arc<Dir>> {
         Ok(Arc::new(
             Dir::open_root_dir(dst, false, congestion::Side::Destination).await?,
@@ -858,14 +858,13 @@ mod tests {
     #[tokio::test]
     #[traced_test]
     async fn opening_dst_symlink_to_directory_fails_closed() -> anyhow::Result<()> {
-        // prune is now fd-relative: it operates through a `Dir` the caller opens `O_NOFOLLOW`. In a
-        // real --delete run the create-or-overwrite step replaces any non-directory destination
-        // (including a symlink) before prune runs; in --dry-run that overwrite is skipped, so the
-        // destination path could still be a symlink-to-directory. Opening it `O_NOFOLLOW|O_DIRECTORY`
-        // (dereference=false) — exactly what the copy/link prune call sites do — must FAIL CLOSED on
-        // that symlink rather than follow it. This is the guarantee that replaces the old
-        // `symlink_metadata` pre-check: prune can never be handed a Dir that followed a dst symlink,
-        // so it can never preview/perform deletions OUTSIDE the destination tree.
+        // prune operates through a `Dir` the caller opens `O_NOFOLLOW`. In a real --delete run the
+        // create-or-overwrite step replaces any non-directory destination (including a symlink)
+        // before prune runs; in --dry-run that overwrite is skipped, so the destination path could
+        // still be a symlink-to-directory. Opening it `O_NOFOLLOW|O_DIRECTORY` (dereference=false) —
+        // exactly what the copy/link prune call sites do — must fail closed on that symlink rather
+        // than follow it. Prune can never receive a `Dir` that followed a destination symlink, so it
+        // cannot preview or perform deletions outside the destination tree.
         let tmp = tempfile::tempdir()?;
         let dst_parent = tmp.path().join("dst_parent");
         let outside = tmp.path().join("outside"); // outside the destination tree

@@ -427,17 +427,17 @@ pub(crate) fn install_tracing_subscriber(
 
 /// Derive a conservative leaf-operation count from the process descriptor limit.
 ///
-/// Local copy/link can overlap four OpenFile descriptors during overwrite recheck (source
-/// classification, destination planning, source data, and the fresh destination identity check)
-/// with one PendingMeta classification descriptor in recursive rm/delete work. Dividing an
-/// 80%-of-soft-`RLIMIT_NOFILE` budget by those five units gives the same admission count to each
-/// pool. Metadata-only tools can transiently hold two descriptors per PendingMeta operation, but do
-/// not use the four-descriptor OpenFile path concurrently. This is a heuristic for shipped tool
+/// Local copy/link can overlap three OpenFile descriptors during overwrite (source classification,
+/// destination planning, and source data) with one PendingMeta classification descriptor in
+/// recursive rm/delete work. Dividing an 80%-of-soft-`RLIMIT_NOFILE` budget by those four units gives
+/// the same admission count to each pool. Metadata-only tools can transiently hold two descriptors
+/// per PendingMeta operation, but do not use the three-descriptor OpenFile path concurrently. This
+/// is a heuristic for shipped tool
 /// workflows, not a hard process-wide ceiling: recursive directories and process support
 /// descriptors are outside leaf admission. A nonzero soft limit gets at least one operation so very
 /// small test/container limits do not silently disable backpressure.
 fn descriptor_admission_limit(soft_limit: std::num::NonZeroU64) -> ConcurrencyLimit {
-    const OPEN_FILE_DESCRIPTOR_UNITS: u64 = 4;
+    const OPEN_FILE_DESCRIPTOR_UNITS: u64 = 3;
     const OVERLAPPING_PENDING_META_DESCRIPTOR_UNITS: u64 = 1;
     const DESCRIPTOR_UNITS_PER_OPERATION: u64 =
         OPEN_FILE_DESCRIPTOR_UNITS + OVERLAPPING_PENDING_META_DESCRIPTOR_UNITS;
@@ -698,11 +698,11 @@ mod default_leaf_operation_limit_tests {
         let nonzero = |value| std::num::NonZeroU64::new(value).unwrap();
         assert_eq!(
             descriptor_admission_limit(nonzero(100)),
-            ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(16).unwrap())
+            ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(20).unwrap())
         );
         assert_eq!(
             descriptor_admission_limit(nonzero(4096)),
-            ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(655).unwrap())
+            ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(819).unwrap())
         );
         assert_eq!(
             descriptor_admission_limit(nonzero(1_000_000)),
@@ -1111,12 +1111,13 @@ mod default_leaf_operation_limit_tests {
         let (open_files, pending_meta) = runtime
             .block_on(async {
                 tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                    let mut open_files = Vec::with_capacity(40);
-                    let mut pending_meta = Vec::with_capacity(40);
-                    for _ in 0..40 {
+                    const EXPECTED_ADMISSION_LIMIT: usize = 51;
+                    let mut open_files = Vec::with_capacity(EXPECTED_ADMISSION_LIMIT);
+                    let mut pending_meta = Vec::with_capacity(EXPECTED_ADMISSION_LIMIT);
+                    for _ in 0..EXPECTED_ADMISSION_LIMIT {
                         open_files.push(throttle::open_file_permit().await);
                     }
-                    for _ in 0..40 {
+                    for _ in 0..EXPECTED_ADMISSION_LIMIT {
                         pending_meta.push(throttle::pending_meta_permit().await);
                     }
                     assert!(
@@ -1126,7 +1127,7 @@ mod default_leaf_operation_limit_tests {
                         )
                         .await
                         .is_err(),
-                        "the 41st OpenFile acquisition must wait at the derived limit"
+                        "the 52nd OpenFile acquisition must wait at the derived limit"
                     );
                     assert!(
                         tokio::time::timeout(
@@ -1135,7 +1136,7 @@ mod default_leaf_operation_limit_tests {
                         )
                         .await
                         .is_err(),
-                        "the 41st PendingMeta acquisition must wait at the derived limit"
+                        "the 52nd PendingMeta acquisition must wait at the derived limit"
                     );
                     (open_files, pending_meta)
                 })

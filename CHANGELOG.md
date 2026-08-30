@@ -9,6 +9,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Local and remote overwrite removal now drops the destination's classification handle after
+  retaining only its kind and accounting size. The mutation already operates by name through a
+  pinned parent directory, so a `(dev, ino)` recheck could not bind the subsequent `unlinkat` or
+  `rmdir` to that inode and left the same final-component race. Removing it avoids an `openat` plus
+  `fstatat` per overwrite and avoids holding an extra `O_PATH` fd across throttle waits. The
+  descriptor-safety model consequently uses four overlapping units instead of five, permitting more
+  admitted file work at the same soft `RLIMIT_NOFILE`. Containment is unchanged: removal remains
+  fd-relative and never follows a symlink, while exact final-name identity remains outside the
+  guarantee.
+
 - `--max-files-in-flight=N|unlimited` now controls applicable file-like work across the tools. A
   positive value (including `1`) sets a finite ceiling, `unlimited` removes the user ceiling, and
   numeric `0` is rejected; when omitted, the common default is
@@ -597,13 +607,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   — so a source that turned out to be unreadable or had been swapped away had already destroyed data
   the copy then could not replace, for a file it never held a single byte of. Deciding and doing are
   now separate steps: the destination is classified without being touched, the source open and
-  throttle wait happen next, and only then is the old entry removed — with an inode-recheck, so an
-  entry swapped in since the decision fails closed instead of being deleted. One visible
-  consequence: a copy that fails to read a source file no longer removes that file's destination, so
-  `rm_summary.files_removed` (and `--summary`) can be lower than before for a run with read errors.
-  The remote destination (`rcpd`) had the same shape — it unlinked and only then waited on the
-  throttle — and got the same treatment; it has no source open to reorder, so there the reordering
-  shortens the gap to the create syscall rather than removing a failure from it.
+  throttle wait happen next, and only then is the occupied entry removed fd-relatively through its
+  pinned parent. A compatible same-name replacement can be removed, but the operation cannot follow
+  it or escape that parent. One visible consequence: a copy that fails to read a source file no
+  longer removes that file's destination, so `rm_summary.files_removed` (and `--summary`) can be
+  lower than before for a run with read errors. The remote destination (`rcpd`) had the same shape —
+  it unlinked and only then waited on the throttle — and got the same treatment; it has no source
+  open to reorder, so there the reordering shortens the gap to the create syscall rather than
+  removing a failure from it.
 
   This is not atomic replacement and does not try to be. `rcp` copies are point-in-time and
   non-atomic: an interrupted or failed `--overwrite` can still leave the files it was overwriting

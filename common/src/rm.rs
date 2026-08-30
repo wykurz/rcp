@@ -296,7 +296,7 @@ pub async fn rm(
 /// entry's `rel_path`/`filter_path`/`real_path`, it both anchors include/exclude filter matching
 /// against the entry's destination-root-relative path and reconstructs the entry's display path for
 /// diagnostics / dry-run output. The caller is responsible for the top-level decision on `name`
-/// (keep-set membership, exclude-protection, overwrite-recheck); this only removes the subtree.
+/// (keep-set membership, exclude-protection, or overwrite policy); this only removes the subtree.
 pub async fn rm_child(
     prog_track: &'static progress::Progress,
     parent: &Arc<Dir>,

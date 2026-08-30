@@ -99,9 +99,9 @@ impl Pass1Contents {
 /// the hardened [`SourceDirMap`]. Its entries own a pacing credit instead of a pinned directory fd
 /// and fd-budget permit.
 ///
-/// With the destination no longer echoing `file_count` in `DirectoryCreated`, the
-/// `-L` path (which holds no fd-map) must retain its own Pass-1 bookkeeping: Pass 1
-/// inserts each directory's contents as it sends the `Directory` message, and
+/// Because `DirectoryCreated` does not carry `file_count`, the `-L` path (which holds no fd-map)
+/// retains its own Pass-1 bookkeeping: Pass 1 inserts each directory's contents as it sends the
+/// `Directory` message, and
 /// [`resolve_pass2_source`] takes it back when the matching `DirectoryCreated`
 /// triggers Pass 2. A missing entry is treated as empty contents with a debug log — `-L`
 /// is intentionally not hardened, so a miss is not a TOCTOU/fail-closed condition.
@@ -248,8 +248,8 @@ struct SourceDirMap {
 
 /// A consumed source-directory map entry, in one of two states; dropping it (after a
 /// take) releases any held fd-budget permit. Encoding the state as an enum makes the
-/// lifecycle explicit — the previous `Option`-triple had only two valid combinations
-/// (all-set vs. all-clear), which lived in comments rather than the type.
+/// lifecycle explicit and makes its only two valid combinations (all-set versus all-clear)
+/// representable by construction.
 ///
 /// # Tombstone entries (committed unreadable directories)
 ///
@@ -355,9 +355,9 @@ impl SourceDirMap {
         self.entries.lock().unwrap().remove(src).is_some()
     }
 
-    /// Close the dir-fd-in-flight semaphore so any pending or future
-    /// [`Self::insert`] fails immediately. Used to fail closed without hanging a
-    /// Pass-1 walk parked on the budget (see the struct-level docs).
+    /// Close the dir-fd-in-flight semaphore so any pending or future [`Self::insert`] fails
+    /// immediately, allowing fail-closed teardown without hanging a Pass-1 walk parked on the
+    /// budget (see the struct-level docs).
     fn close_fd_budget(&self) {
         self.fd_budget.close();
     }
@@ -1708,8 +1708,8 @@ async fn send_root_hardened(
     )
     .await;
     // ACLs stay UNKNOWN here: the classify handle's inode is not necessarily the one whose bytes
-    // will be sent (read-side fidelity — an ACL read now could describe an inode a same-name swap
-    // replaces before the copy), so every use below that needs them re-reads from the real fd it
+    // will be sent (an ACL read from it could describe an inode replaced before copy), so every use
+    // below that needs them re-reads from the real fd it
     // is about to use — a root FILE from its data fd in `send_file_tcp`, a root DIRECTORY from
     // the `O_NOFOLLOW` handle the fd-walk opens — and a root SYMLINK has no ACL to carry. The one
     // use that keeps this value is the unopenable-root-directory case, which has no fd to read
@@ -2137,9 +2137,8 @@ impl Pass2Source {
 }
 
 /// Resolve the owned Pass-2 input for a `DirectoryCreated { src, dst }`, applying
-/// the hardened fail-closed rule. This is the TOCTOU-safety seam. The destination
-/// no longer echoes a file count, so the count is recovered from the consumed source-side map entry
-/// in either mode.
+/// the hardened fail-closed rule. This is the TOCTOU-safety seam. The file count is recovered from
+/// the consumed source-side map entry in either mode.
 ///
 /// - `SourceRead::Hardened`: CONSUME the directory's held fd-map entry (one-shot
 ///   ownership) and use its stored Pass-1 `file_count`. The entry may be a real
@@ -3220,7 +3219,7 @@ async fn handle_connection(
     // pool. The `-L` variant instead carries a shared
     // path-keyed Pass-1 contents and an owned outstanding-directory credit with the same pacing
     // lifetime, so Pass 2 can recover each directory's count without an unbounded destination or
-    // task backlog (the destination no longer echoes the count over the wire).
+    // task backlog (`DirectoryCreated` does not carry the count over the wire).
     let source_read = if settings.dereference {
         SourceRead::DereferencePath(Arc::new(DereferenceWalkState::new(max_pending_files)))
     } else {

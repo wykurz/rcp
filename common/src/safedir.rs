@@ -35,11 +35,10 @@ use crate::walk::EntryKind;
 /// The sharper case needs the special bits preserved: a root copier holds `CAP_FSETID`, so writing
 /// does not clear `S_ISUID`, and the destination carries `setuid` root while the source's owner is
 /// still authoring its contents. That is not an exec window while the copy *runs* — our own write
-/// descriptor is open, and `execve` refuses a file any process holds open for writing with `ETXTBSY`.
-/// It is the copier's **death** that closes that descriptor and drops the protection, which is
-/// exactly when the old creation mode had already published a finished-looking setuid binary (see
-/// `docs/tocttou.md`). Withholding the owner execute bit is deliberate too — a half-written
-/// executable should not be executable.
+/// descriptor is open, and `execve` refuses a file any process holds open for writing with
+/// `ETXTBSY`. If the copier dies, closing that descriptor drops the protection; creation at the
+/// final mode would leave a finished-looking setuid binary (see `docs/tocttou.md`). Withholding the
+/// owner execute bit is deliberate too — a half-written executable should not be executable.
 ///
 /// This is a constant rather than a [`Dir::create_file`] parameter so that no call site, present or
 /// future, can create a destination file at a wide mode. Like any creation mode it is subject to
@@ -286,6 +285,32 @@ pub struct Handle {
     meta: FileMeta,
 }
 
+/// The classification and size needed to remove an occupied destination slot.
+///
+/// Unlike [`Handle`], this snapshot does not keep an inode pinned. Overwrite removal operates by
+/// name through a pinned parent directory, so retaining the entry fd cannot bind the later by-name
+/// removal to that inode. Converting to this snapshot closes the classification fd while preserving
+/// the accounting data the removal path needs.
+#[derive(Clone, Copy, Debug)]
+pub struct RemovalSnapshot {
+    kind: EntryKind,
+    size: u64,
+}
+
+impl RemovalSnapshot {
+    /// The entry classification captured during overwrite planning.
+    #[must_use]
+    pub fn kind(self) -> EntryKind {
+        self.kind
+    }
+
+    /// The entry size captured during overwrite planning.
+    #[must_use]
+    pub fn size(self) -> u64 {
+        self.size
+    }
+}
+
 impl Handle {
     /// The entry's classification (File / Dir / Symlink / Special).
     #[must_use]
@@ -309,6 +334,15 @@ impl Handle {
     #[must_use]
     pub fn meta(&self) -> &FileMeta {
         &self.meta
+    }
+
+    /// Consume this handle and retain only the data needed for overwrite removal.
+    #[must_use]
+    pub fn into_removal_snapshot(self) -> RemovalSnapshot {
+        RemovalSnapshot {
+            kind: self.kind,
+            size: self.meta.size,
+        }
     }
 
     /// Borrow the underlying file descriptor.
@@ -667,46 +701,15 @@ impl Dir {
         .await
     }
 
-    /// Re-open `name` and confirm it still refers to the same inode as `expected`
-    /// (same `dev` + `ino`). Returns the fresh [`Handle`] on match.
-    ///
-    /// On mismatch — the directory entry was swapped to a different inode between
-    /// when `expected` was obtained and this call — returns `ESTALE`. Callers fail
-    /// closed: they must not proceed with an operation that assumed a specific identity
-    /// for the entry.
-    ///
-    /// # Soundness
-    ///
-    /// `expected`'s `O_PATH` fd pins the old inode alive for the duration of the
-    /// call: as long as any fd referencing an inode is open, the kernel cannot
-    /// recycle that inode number. A matching `(dev, ino)` therefore genuinely
-    /// proves the two fds refer to the same inode — there is no window in which
-    /// the number could have been reused.
-    pub async fn recheck(&self, name: &OsStr, expected: &Handle) -> std::io::Result<Handle> {
-        if !is_single_component(name) {
-            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
-        }
-        let fresh = self.child(name).await?;
-        if fresh.dev() == expected.dev() && fresh.ino() == expected.ino() {
-            Ok(fresh)
-        } else {
-            Err(std::io::Error::from_raw_os_error(libc::ESTALE))
-        }
-    }
-
     /// Confirm this directory's own held fd still refers to the same inode as
     /// `handle` (same `dev` + `ino`), returning `ESTALE` on mismatch.
     ///
-    /// Unlike [`Self::recheck`], which re-opens a child BY NAME and compares, this
-    /// stats THIS `Dir`'s already-pinned fd (via [`Self::meta`]) against a classify
-    /// [`Handle`] taken earlier for the same entry. It closes the
-    /// classify→`open_dir` window in the reused-destination-directory lockdown:
-    /// `open_dir` re-resolves the name, so a concurrent `rename` could swap in a
-    /// DIFFERENT directory between classification and the open; comparing the opened
-    /// fd's identity to the pinned classify handle catches that swap and fails
-    /// closed. `handle`'s `O_PATH` fd pins the classified inode's number alive for
-    /// the call, so a matching `(dev, ino)` genuinely proves identity (there is no
-    /// ino-reuse window — same argument as [`Self::recheck`]).
+    /// This stats this [`Dir`]'s already-pinned fd (via [`Self::meta`]) against a classification
+    /// [`Handle`] taken for the same entry. It closes the classify-to-`open_dir` window in the
+    /// reused-destination-directory lockdown: `open_dir` re-resolves the name, so a concurrent
+    /// rename could substitute a different directory between classification and the open.
+    /// Comparing the opened fd's identity to the pinned classification handle catches that swap.
+    /// The handle keeps the classified inode number from being recycled during the comparison.
     pub async fn verify_same_inode(&self, handle: &Handle) -> std::io::Result<()> {
         let meta = self.meta().await?;
         if meta.dev() == handle.dev() && meta.ino() == handle.ino() {
@@ -1118,11 +1121,10 @@ impl Dir {
     /// Like [`Self::unlink_at`], but gates the `unlinkat` on an explicitly chosen congestion
     /// `side` rather than the directory's own side.
     ///
-    /// `rm` reads its tree on the `Source` side (its `Dir` handles are `Source`-sided, matching
-    /// the old path-based `symlink_metadata`/`read_dir`), but the destructive `unlinkat` must be
-    /// bucketed on `Destination` to match the side the path-based rm used for `remove_file` — so
-    /// it competes for the same metadata cwnd as other destructive work. The fd-relative TOCTOU
-    /// guarantee is unaffected: the syscall is still resolved against this directory's pinned fd.
+    /// `rm` reads its tree on the `Source` side because its `Dir` handles are source-sided, but the
+    /// destructive `unlinkat` is bucketed on `Destination` so it competes for the same metadata cwnd
+    /// as other destructive work. The fd-relative TOCTOU guarantee is unaffected: the syscall is
+    /// still resolved against this directory's pinned fd.
     pub(crate) async fn unlink_at_on(
         &self,
         name: &OsStr,
@@ -1619,20 +1621,19 @@ pub async fn strict_probe_dst_kind(
 /// restore twice.
 ///
 /// **The guard must exist before anything is destroyed, not after.** "Dropped on every exit path"
-/// says nothing about the window in which the value does not exist yet, and that window is where
-/// the destructive syscall used to sit — see [`lockdown_reused_dir`], which now arms first and
-/// removes the ACL synchronously, with no cancellation point in between.
+/// says nothing about the window in which the value does not exist. [`lockdown_reused_dir`] arms
+/// the guard before removing the ACL synchronously, with no cancellation point in between.
 ///
 /// # Exits it does NOT cover
 ///
 /// A panic (the workspace builds `panic = "abort"`, so nothing unwinds and no destructor runs), a
 /// signal, and `std::process::exit` — which, unlike the first two, is ordinary control flow in
-/// shipped code. Every remaining `process::exit` call site runs either before a copy starts (the
-/// TOCTOU linter, config validation) or after `common::run` has dropped the tokio runtime, which
-/// drops every task and therefore every guard; `rcpd`'s stdin watchdog used to be the exception and
-/// no longer is. Anything added later that exits mid-copy reintroduces the hole. Closing it for
-/// panic and signal would need the snapshot on disk rather than in memory — out of proportion to
-/// the risk, but worth knowing rather than assuming this is total.
+/// shipped code. Every `process::exit` call site runs either before a copy starts (the TOCTOU
+/// linter, config validation) or after `common::run` has dropped the tokio runtime, which drops every
+/// task and therefore every guard; `rcpd`'s stdin watchdog follows the same lifetime rule. A call
+/// that exits mid-copy would reintroduce the hole. Closing it for panic and signal would need the
+/// snapshot on disk rather than in memory — out of proportion to the risk, but worth knowing rather
+/// than assuming this is total.
 ///
 /// # The `Drop` restore is best-effort recovery, not a guarantee
 ///
@@ -1657,8 +1658,8 @@ pub async fn strict_probe_dst_kind(
 /// - **"Had no original ACL" is not "nothing to undo".** With `d:acl` on, finalize INSTALLS the
 ///   source's default ACL before later steps that can still fail; a directory that originally had
 ///   none must then get that installation REMOVED on rollback, or a failed copy leaves it carrying
-///   an ACL the destination never had. A bare `Option<Vec<u8>>` (the previous shape) could not
-///   express that arm: its `None` doubled as "disarmed", so the partial application survived.
+///   an ACL the destination never had. A bare `Option<Vec<u8>>` cannot express that arm because its
+///   `None` would have to mean both "no original ACL" and "disarmed".
 /// - **A detached write must not undo the restore.** A finalize ACL write still queued when its
 ///   waiter is dropped is reclaimed before it starts, but one already taken by a blocking worker
 ///   cannot be cancelled and may land AFTER the guard's `Drop` has put the original back.
@@ -2280,13 +2281,14 @@ fn apply_one_acl(fd: RawFd, name: &CStr, blob: Option<&[u8]>) -> std::io::Result
     }
 }
 
-/// Best-effort, recheck-guarded removal of a JUST-CREATED entry on a creation-closure failure
-/// path: remove `name` from `dir` only while the name still refers to the same inode as
-/// `created` — the name↔inode discipline every other removal here follows (`remove_existing_dst`
-/// in the engines re-checks the same way), so a concurrent swap of the name costs the swapper
-/// nothing: what rcp did not create, rcp does not remove. Sync, for use inside `spawn_blocking`
-/// creation closures; every error is swallowed — the caller is already failing with the creation
-/// error, and a survivor entry is the documented orphan case.
+/// Best-effort removal of a just-created entry on a creation-closure failure path.
+///
+/// The name is compared with the pinned `created` inode immediately before `unlinkat`. The final
+/// comparison-to-unlink window remains, but the check avoids removing a replacement already visible
+/// at cleanup time. This is useful on the rare error path because the intent is specifically to undo
+/// this creation, unlike ordinary overwrite removal of an occupied slot. Sync, for use inside
+/// `spawn_blocking` creation closures; every error is swallowed — the caller is already failing with
+/// the creation error, and a survivor entry is the documented orphan case.
 fn remove_created_if_same_inode(
     dir: BorrowedFd<'_>,
     name: &[u8],
@@ -4610,15 +4612,12 @@ mod tests {
         Ok(())
     }
 
-    // hard_link_handle_at (FIX 2, PR #247 review): links the EXACT inode the
-    // classified Handle pins, immune to a concurrent swap of the source name. This is
-    // deterministic — the swap happens (in fixed order) AFTER classification but
-    // BEFORE the link — so it directly demonstrates the TOCTOU fix.
+    // hard_link_handle_at links the exact inode the classified Handle pins, immune to a concurrent
+    // source-name swap. The deterministic swap occurs after classification but before the link.
     //
-    // The decoy is a DIFFERENT regular file with different content placed at the same
-    // name. The old by-name `hard_link_at(name, ..)` re-resolves `name` and would link
-    // the decoy inode (this test would fail against it). `hard_link_handle_at` links
-    // the pinned original inode regardless.
+    // the decoy is a different regular file with different content placed at the same name. A
+    // by-name link would re-resolve `name` and link the decoy; `hard_link_handle_at` links the pinned
+    // original inode regardless.
     #[tokio::test]
     async fn hard_link_handle_at_links_pinned_inode_after_name_swap() -> anyhow::Result<()> {
         use std::os::unix::fs::MetadataExt;
@@ -4703,13 +4702,10 @@ mod tests {
         Ok(())
     }
 
-    // hard_link_handle_at (FIX 2, PR #247 review): classify a regular File, then swap the
-    // source name to a FIFO (a special, a different kind AND inode) before linking. The
-    // old by-name `linkat(flags=0)` re-resolves the name and would hard-link the FIFO —
-    // surfacing a special at the destination that rlink would report as a hard-linked
-    // file (specials CAN be hard-linked, unlike directories). The inode-exact link must
-    // instead link the pinned regular file or fail closed: the destination must NEVER be
-    // a special. Deterministic (swap happens between classify and link).
+    // classify a regular file, then swap the source name to a FIFO before linking. A by-name
+    // `linkat(flags=0)` would re-resolve the name and hard-link the FIFO, surfacing a special at the
+    // destination that rlink reports as a hard-linked file. The inode-exact link must instead link
+    // the pinned regular file or fail closed, so the destination is never special.
     #[tokio::test]
     async fn hard_link_handle_at_never_links_swapped_in_fifo() -> anyhow::Result<()> {
         use std::os::unix::fs::FileTypeExt;
@@ -5075,80 +5071,7 @@ mod tests {
         Ok(())
     }
 
-    // recheck: returns a fresh Handle with the same dev/ino when the entry is unchanged.
-    #[tokio::test]
-    async fn recheck_succeeds_when_unchanged() -> anyhow::Result<()> {
-        let tmp = testutils::setup_test_dir().await?;
-        let root = Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Source).await?;
-        let h = root.child(OsStr::new("0.txt")).await?;
-        let fresh = root.recheck(OsStr::new("0.txt"), &h).await?;
-        assert_eq!(
-            fresh.dev(),
-            h.dev(),
-            "recheck: dev mismatch on unchanged entry"
-        );
-        assert_eq!(
-            fresh.ino(),
-            h.ino(),
-            "recheck: ino mismatch on unchanged entry"
-        );
-        Ok(())
-    }
-
-    // recheck: returns ESTALE when the entry's inode has been replaced.
-    #[tokio::test]
-    async fn recheck_fails_when_swapped_to_different_inode() -> anyhow::Result<()> {
-        let tmp = testutils::setup_test_dir().await?;
-        let root =
-            Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
-        // create a file whose Handle we will hold
-        tokio::fs::write(tmp.join("foo/f"), b"original").await?;
-        let h = root.child(OsStr::new("f")).await?;
-        let original_ino = h.ino();
-        // replace f with a completely new file (different inode)
-        root.unlink_at(OsStr::new("f")).await?;
-        root.create_file(OsStr::new("f")).await?;
-        // verify the replacement has a different inode
-        let fresh_via_child = root.child(OsStr::new("f")).await?;
-        assert_ne!(
-            fresh_via_child.ino(),
-            original_ino,
-            "test setup error: new file has same inode as old one"
-        );
-        // recheck must detect the swap and return ESTALE
-        let err = root.recheck(OsStr::new("f"), &h).await.unwrap_err();
-        assert_eq!(
-            err.raw_os_error(),
-            Some(libc::ESTALE),
-            "expected ESTALE on inode swap, got {err:#}"
-        );
-        Ok(())
-    }
-
-    // recheck: returns ESTALE when the entry has been swapped to a symlink.
-    #[tokio::test]
-    async fn recheck_fails_when_swapped_to_symlink() -> anyhow::Result<()> {
-        let tmp = testutils::setup_test_dir().await?;
-        let root =
-            Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
-        // create a regular file g
-        tokio::fs::write(tmp.join("foo/g"), b"regular").await?;
-        let h = root.child(OsStr::new("g")).await?;
-        // replace g with a symlink (different inode and kind)
-        root.unlink_at(OsStr::new("g")).await?;
-        root.symlink_at(OsStr::new("g"), std::path::Path::new("0.txt"))
-            .await?;
-        // recheck must detect the mismatch (different inode) and return ESTALE
-        let err = root.recheck(OsStr::new("g"), &h).await.unwrap_err();
-        assert_eq!(
-            err.raw_os_error(),
-            Some(libc::ESTALE),
-            "expected ESTALE on symlink swap, got {err:#}"
-        );
-        Ok(())
-    }
-
-    // rejects_multi_component_names: extend to cover the five new methods.
+    // rejects_multi_component_names: cover every by-name helper added with fd-relative mutation.
     #[tokio::test]
     async fn new_methods_reject_multi_component_names() -> anyhow::Result<()> {
         let tmp = testutils::setup_test_dir().await?;
@@ -5157,10 +5080,6 @@ mod tests {
         // a second Dir for hard_link_at's dst parameter
         let dst =
             Dir::open_root_dir(&tmp.join("foo"), false, congestion::Side::Destination).await?;
-        // a valid Handle to satisfy recheck's `expected` parameter; the bad `name`
-        // must be rejected before any dev/ino comparison is attempted.
-        let any_handle = root.child(OsStr::new("0.txt")).await?;
-
         for bad in ["a/b", "..", ".", ""] {
             let bad_os = OsStr::new(bad);
 
@@ -5215,14 +5134,6 @@ mod tests {
                 err.raw_os_error(),
                 Some(libc::EINVAL),
                 "hard_link_at(dst_name): expected EINVAL for {bad:?}, got {err:#}"
-            );
-
-            // recheck: bad `name` must be rejected before dev/ino comparison
-            let err = root.recheck(bad_os, &any_handle).await.unwrap_err();
-            assert_eq!(
-                err.raw_os_error(),
-                Some(libc::EINVAL),
-                "recheck(name): expected EINVAL for {bad:?}, got {err:#}"
             );
         }
         Ok(())

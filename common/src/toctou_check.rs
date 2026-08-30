@@ -61,8 +61,8 @@ impl Verdict {
 /// - `dereference` is true (`--dereference`/`-L` follows symlinks by request), or
 /// - the build target is non-Linux (the hardened path is Linux-only).
 ///
-/// All other flags (`--delete`, remote, filtering) are now hardened and do NOT
-/// affect the verdict.
+/// All other flags (`--delete`, remote, filtering) use the hardened walk and do NOT affect the
+/// verdict.
 ///
 /// The verdict reflects only whether the hardened walk is in use. It does NOT — and
 /// cannot — vouch for the trust of the operand path's prefix; that is the caller's
@@ -249,8 +249,8 @@ pub fn run_linter(
         };
     }
 
-    // arm strict operand resolution for the rest of the process: every operand
-    // root/parent open now resolves with openat2(RESOLVE_NO_SYMLINKS).
+    // arm strict operand resolution for the rest of the process: every operand root/parent open
+    // resolves with openat2(RESOLVE_NO_SYMLINKS).
     crate::safedir::enable_strict_operand_resolution();
     LinterAction::Proceed
 }
