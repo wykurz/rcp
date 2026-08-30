@@ -321,53 +321,6 @@ impl ThrottleConfig {
                     max.as_secs(),
                 ));
             }
-            if let Some(path) = &self.histogram_log_path {
-                // Path::parent() of "foo.hdr" returns Some("") — empty path,
-                // not None. Treat that the same as None (i.e. current dir).
-                let parent = match path.parent() {
-                    Some(p) if p.as_os_str().is_empty() => std::path::Path::new("."),
-                    Some(p) => p,
-                    None => std::path::Path::new("."),
-                };
-                if !parent.exists() {
-                    return Err(format!(
-                        "--auto-meta-histogram-log parent directory does not exist: {parent:?}",
-                    ));
-                }
-                if !parent.is_dir() {
-                    return Err(format!(
-                        "--auto-meta-histogram-log parent is not a directory: {parent:?}",
-                    ));
-                }
-                // Probe writability: try to create a tiny temp file in the parent.
-                // We don't pre-create the actual log file because the spawn step
-                // adds a trace-identifier suffix.
-                //
-                // Use create_new (O_EXCL) and a random suffix so:
-                //   1. a pre-created symlink with the predictable probe name
-                //      can't redirect the create to an attacker-chosen path, and
-                //   2. two concurrent validations never collide on the probe name.
-                let suffix: u64 = rand::random();
-                let probe = parent.join(format!(
-                    ".rcp-auto-meta-probe-{}-{:016x}",
-                    std::process::id(),
-                    suffix,
-                ));
-                match std::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(&probe)
-                {
-                    Ok(_) => {
-                        let _ = std::fs::remove_file(&probe);
-                    }
-                    Err(err) => {
-                        return Err(format!(
-                            "--auto-meta-histogram-log parent {parent:?} is not writable: {err:#}",
-                        ));
-                    }
-                }
-            }
         }
         Ok(())
     }
@@ -857,29 +810,15 @@ mod auto_meta_validation_tests {
     }
 
     #[test]
-    fn histogram_log_with_missing_parent_is_rejected() {
+    fn histogram_log_path_validation_does_not_probe_the_filesystem() {
         let mut config = config_with(valid_auto_meta());
         config.histogram_log_path = Some("/nonexistent-dir-12345/foo.hdr".into());
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.contains("histogram-log") && err.contains("parent"),
-            "got: {err}",
-        );
-    }
-
-    #[test]
-    fn histogram_log_with_writable_parent_is_accepted() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = config_with(valid_auto_meta());
-        config.histogram_log_path = Some(dir.path().join("foo.hdr"));
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn histogram_log_with_bare_filename_is_accepted() {
-        // Path::parent() of "foo.hdr" returns Some("") — empty path, not
-        // None. The validator must treat that as the current directory,
-        // not as a missing parent.
+        // path resolution and the authoritative open happen once during runtime setup.
         let mut config = config_with(valid_auto_meta());
         config.histogram_log_path = Some("bare-filename.hdr".into());
         assert!(
@@ -887,17 +826,5 @@ mod auto_meta_validation_tests {
             "validate err: {:?}",
             config.validate(),
         );
-    }
-
-    #[test]
-    fn histogram_log_validation_uses_unique_probe_per_call() {
-        // Two consecutive validations with the same path must succeed —
-        // proving the probe file is removed cleanly and the filename
-        // doesn't collide with itself.
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = config_with(valid_auto_meta());
-        config.histogram_log_path = Some(dir.path().join("log.hdr"));
-        assert!(config.validate().is_ok());
-        assert!(config.validate().is_ok());
     }
 }

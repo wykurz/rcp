@@ -544,9 +544,8 @@ fn missing_update_path_without_delete_or_exclusive_falls_back() {
     let dst = tmp.path().join("dst");
     std::fs::create_dir(&src).unwrap();
     std::fs::write(src.join("a.txt"), b"x").unwrap();
-    // intentionally do NOT pre-create dst — without --delete (which auto-overwrites) a pre-
-    // existing dst is rejected by rlink's "destination exists" guard, which would mask the
-    // behavior we're checking here.
+    // intentionally do NOT pre-create dst so this test exercises creation rather than compatible
+    // directory reuse; either shape supports the missing-update fallback checked here.
 
     // Without --delete or --update-exclusive, a missing --update path falls back to "no update"
     // mode: rlink links from src as if --update was never specified. This is the long-standing

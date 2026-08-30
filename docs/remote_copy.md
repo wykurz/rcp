@@ -246,11 +246,15 @@ exited when the budget expires, its private control directory is deliberately pr
 removed from under a possibly-live process.
 
 The master carries the actual local operand roots through both remote-HOME lookup and endpoint
-preparation. Control-directory candidates are canonicalized and rejected only when they lie inside
-one of those copied trees, including through a `TMPDIR` or other path alias. Remote-to-remote copies
-have no local exclusions, so launching them with `/` as the working directory still permits normal
-runtime and temporary locations. The filesystem root itself cannot be an exclusion because every
-absolute Unix-socket path lies beneath it.
+preparation. Candidate parents lexically inside a named local operand are skipped so the ordinary
+configuration does not put SSH artifacts into a copied tree. This is an operational placement
+policy, not a TOCTOU boundary: aliases and concurrent namespace changes are deliberately not probed,
+because such an observation would not bind SSH's later path-based use. The first remaining parent
+that successfully creates the actual private directory supplies that same directory to the launcher;
+there is no disposable writability probe and second create. Remote-to-remote copies have no local
+exclusions, so launching them with `/` as the working directory still permits normal runtime and
+temporary locations. The filesystem root itself cannot be an exclusion because every absolute
+Unix-socket path lies beneath it.
 
 The supervisor normally dispatches blocking cleanup to a worker. Worker-creation failure runs the
 job on the supervisor, not on the original resource-owning submitter. If the supervisor channel has

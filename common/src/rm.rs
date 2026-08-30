@@ -164,12 +164,12 @@ async fn restore_retained_dir(
 /// The walk is fd-based (see [`crate::safedir`]): the root operand is opened relative to its
 /// parent directory and every entry is classified and removed through file-descriptor-relative
 /// syscalls. A privileged `rrm` therefore cannot be redirected by a concurrent symlink swap
-/// into deleting a tree outside the intended target (the classic `rm -rf` symlink race) — the
-/// `O_NOFOLLOW|O_DIRECTORY` opens in [`Dir::open_dir`] catch a directory→symlink swap mid-walk
-/// and fail closed (ELOOP/ENOTDIR) rather than descending the link, and leaf removal uses
-/// `unlinkat` (never follows a symlink). The recursive walk skeleton — enumeration, the
-/// leaf-permit lifecycle, spawning, the single drop-before-recurse site, and the error fold —
-/// lives in the generic [`crate::walk_driver`]; this module supplies the remove visitor.
+/// into deleting a tree outside the intended target (the classic `rm -rf` symlink race): each
+/// descent accepts only a directory opened with `O_NOFOLLOW|O_DIRECTORY`, and all work below it is
+/// bound to that fd even if its name is replaced. Leaf removal uses `unlinkat` and never follows a
+/// symlink. The recursive walk skeleton — enumeration, the leaf-permit lifecycle, spawning, the
+/// single drop-before-recurse site, and the error fold — lives in the generic
+/// [`crate::walk_driver`]; this module supplies the remove visitor.
 #[instrument(skip(prog_track, settings))]
 pub async fn rm(
     prog_track: &'static progress::Progress,
@@ -177,7 +177,7 @@ pub async fn rm(
     settings: &Settings,
 ) -> Result<Summary, Error> {
     // command-line callers may run many root operands concurrently. admit each one before opening
-    // its parent or performing the optional fd-based filter probe, then transfer that same permit
+    // its parent and performing authoritative root classification, then transfer that same permit
     // into the shared driver. an authoritative directory releases it before descent.
     let permit = crate::walk::ensure_leaf_permit(PermitKind::PendingMeta, None).await;
     enum RmRootSetup {
@@ -276,14 +276,11 @@ pub async fn rm(
 
 /// Remove a single child entry of an already-open directory, fd-relative.
 ///
-/// This is the fd-based counterpart of path-based [`rm`]. It is used by two callers that
-/// already hold the relevant directory as an open [`Dir`] and want to remove one of its children
-/// through that pinned fd rather than re-resolving the entry by absolute path (the redirectable
-/// window):
-/// - `--delete` pruning (see [`crate::delete::prune_extraneous`]) removes each extraneous entry.
-/// - the remote-copy destination (`rcpd`) replaces a non-matching destination subtree (a
-///   directory/file/symlink in the way of the entry it must create) through the parent directory
-///   fd held in its directory tracker.
+/// This is the fd-based counterpart of path-based [`rm`]. It removes a child through an already-open
+/// [`Dir`] rather than re-resolving the entry by absolute path. The shared copy overwrite helper
+/// uses it for non-empty directories in local `rcp`, `rlink`, and the remote-copy destination.
+/// `--delete` pruning enters the same admitted fd-relative removal machinery directly; command-line
+/// `rrm` reaches it through path-based [`rm`].
 ///
 /// The entry is classified via `parent.child(name)` (`O_PATH|O_NOFOLLOW`, so a symlink is
 /// classified as a symlink, never followed) and then removed through the same fd-relative remove
@@ -376,9 +373,8 @@ async fn rm_child_with_source(
     // build the child's owned context rooted at `rel_path`: the display path and the filter path
     // then each equal `rel_path` (the destination-root-relative path), anchoring include/exclude
     // matching against the entry's full root-relative path, and each descendant extends it by one
-    // component (exactly the bare-roots behavior the old `WalkRoots { operand: "", filter: "" }`
-    // produced via `operand.join(rel_path)`). these paths are pure display/filter strings — they
-    // are never opened, so there is no dst path for an attacker to redirect.
+    // component. these paths are pure display/filter strings — they are never opened, so there is
+    // no destination path for an attacker to redirect.
     let visitor = Arc::new(RmVisitor {
         prog_track,
         settings: settings.clone(),
@@ -412,10 +408,6 @@ struct RmVisitor {
 /// State threaded from [`WalkVisitor::dir_pre`] to [`WalkVisitor::dir_post`] (same task) — what the
 /// post-order `rmdir` decision needs.
 struct RmDirState {
-    /// The directory fd opened and identity-checked against the classification handle. Retaining
-    /// this `Arc` costs no additional fd and lets `dir_post` verify the name still denotes the
-    /// directory whose filter decision and child walk it is about to finalize.
-    dir: Arc<Dir>,
     /// Restores the relaxed mode only if filtering deliberately retains this directory. `None` in
     /// dry-run and when the directory already had owner rwx, because neither case changes the mode.
     relaxed: Option<RelaxedDir>,
@@ -425,8 +417,8 @@ struct RmDirState {
     time_metadata: Option<anyhow::Result<std::fs::Metadata>>,
     /// Whether the directory does NOT directly match an include pattern while includes are active —
     /// the path-only half of the "traversed only" decision. Combined in `dir_post` with
-    /// "nothing was removed" (derived from the children's folded summary) to reproduce the old
-    /// `traversed_only` exactly.
+    /// "nothing was removed" (derived from the children's folded summary) to identify a directory
+    /// traversed only to search for included descendants.
     matches_no_include: bool,
 }
 
@@ -468,8 +460,8 @@ impl WalkVisitor for RmVisitor {
         kind: EntryKind,
         skip_result: &crate::filter::FilterResult,
     ) -> Summary {
-        // mirror the old spawn loop's inline filter-skip: the dry-run "skip ..." line plus the
-        // matching `*_skipped` counter. the driver already did the shared progress increment.
+        // report the dry-run "skip ..." line plus the matching `*_skipped` counter. the driver
+        // already did the shared progress increment.
         if let Some(mode) = self.settings.dry_run {
             crate::dry_run::report_skip(&cx.real_path, skip_result, mode, kind.label());
         }
@@ -596,10 +588,10 @@ impl WalkVisitor for RmVisitor {
         }
         // the filter decision depends only on path plus directory-vs-nondirectory. Every kind this
         // branch accepts has the same nondirectory decision, while unlinkat without AT_REMOVEDIR
-        // cannot remove a directory swapped into the name. Keep the classified handle for exact
-        // metadata/time/accounting, then perform the single fd-relative removal without opening a
-        // second PendingMeta descriptor. A same-class final-component replacement remains contained
-        // to the held parent, matching the documented best-effort residual.
+        // cannot remove a directory swapped into the name. Keep the classified handle so metadata
+        // and time decisions describe the admitted inode; removal counters describe that same
+        // admission snapshot if a compatible replacement occupies the slot at unlink time. Perform
+        // the single fd-relative removal without an identity observation that cannot bind it.
         //
         // unlink_at never follows a symlink and is resolved relative to the parent dir fd, so it
         // cannot be redirected outside the tree.
@@ -635,10 +627,10 @@ impl WalkVisitor for RmVisitor {
         // child. The directory's own time filter (evaluated in `dir_post`, after its children are
         // processed) must use these pristine timestamps: removing children bumps the directory's
         // mtime, so a fresh stat at the end would wrongly see the directory as "just modified".
-        // This mirrors the old code's `src_metadata` captured at entry. We read full std metadata
-        // (not just the fd snapshot) because `--created-before` needs btime; it's read inode-exact
-        // through the pinned handle. Only fetched when a time filter is configured. The relax below
-        // changes only mode/ctime, never mtime/btime, so taking the snapshot before it is correct.
+        // read full std metadata (not just the fd snapshot) because `--created-before` needs btime;
+        // it is read inode-exact through the pinned handle. Only fetch it when a time filter is
+        // configured. The relax below changes only mode/ctime, never mtime/btime, so taking the
+        // snapshot before it is correct.
         let time_metadata: Option<anyhow::Result<std::fs::Metadata>> =
             if settings.time_filter.is_some() {
                 Some(
@@ -673,13 +665,15 @@ impl WalkVisitor for RmVisitor {
                 crate::preserve::Metadata::permissions(handle.meta()).mode() & 0o7777;
             // relax unless the owner already has full r/w/x. read is needed to enumerate the dir
             // (open_dir + getdents), and write+execute to unlink/rmdir its entries. 0o700 = u+rwx.
-            // this is a superset of the old `readonly()` (no-write) trigger, and also covers dirs
-            // missing owner read/execute that the old path-based read_dir would have failed on.
+            // cover every directory missing owner read, write, or execute; all three are needed to
+            // enumerate it and remove children.
             if original_mode & 0o700 != 0o700 {
                 tracing::debug!("directory is not writable/traversable - relax the permissions");
-                // pin the inode before relaxing so a filter-retention branch can later restore that
-                // exact directory even if its name has changed.
-                let prepared = RelaxedDir::prepare(handle, original_mode)
+                // pin the inode before relaxing only when a filter-retention branch can later
+                // restore that exact directory even if its name has changed.
+                let prepared = (settings.filter.is_some() || settings.time_filter.is_some())
+                    .then(|| RelaxedDir::prepare(handle, original_mode))
+                    .transpose()
                     .with_context(|| format!("failed to pin relaxed directory {path:?}"))
                     .map_err(|err| Error::new(err, Default::default()))?;
                 // gated as a Destination Chmod: the relax is a permission mutation that enables the
@@ -690,30 +684,25 @@ impl WalkVisitor for RmVisitor {
                         format!("failed to make {path:?} directory readable and writable")
                     })
                     .map_err(|err| Error::new(err, Default::default()))?;
-                relaxed = Some(prepared);
+                relaxed = prepared;
             }
         }
-        // open the directory's real fd via the parent fd with O_NOFOLLOW|O_DIRECTORY: a directory
-        // entry swapped to a symlink mid-walk fails closed here (ELOOP/ENOTDIR) — descent never
-        // follows it outside the tree. this is the core rm -rf race closure.
+        // open the current directory in this name slot through the parent fd with a no-follow,
+        // directory-only open. an incompatible replacement fails here (ELOOP/ENOTDIR), while a
+        // compatible replacement is accepted and all descent stays bound to this opened fd. this
+        // selected directory is authoritative; exact identity relative to the earlier filter/kind
+        // snapshot is not part of the removal contract.
         let dir = cx
             .parent
             .open_dir(&cx.name)
             .await
             .with_context(|| format!("failed reading directory {path:?}"))
             .map_err(|err| Error::new(err, Default::default()))?;
-        dir.verify_same_inode(handle)
-            .await
-            .with_context(|| {
-                format!("directory {path:?} changed identity before descent (possible TOCTOU swap)")
-            })
-            .map_err(|err| Error::new(err, Default::default()))?;
         let dir = Arc::new(dir);
         Ok(DirAction::Descend {
-            dir: Arc::clone(&dir),
+            dir,
             child_ctx: (),
             state: RmDirState {
-                dir,
                 relaxed,
                 time_metadata,
                 matches_no_include,
@@ -732,7 +721,6 @@ impl WalkVisitor for RmVisitor {
         let settings = &self.settings;
         let path = cx.real_path.as_path();
         let RmDirState {
-            dir,
             relaxed,
             time_metadata,
             matches_no_include,
@@ -758,7 +746,7 @@ impl WalkVisitor for RmVisitor {
         // by their own recursive calls, so this decision only controls the final rmdir.
         // the metadata SNAPSHOT taken in `dir_pre` — before relaxing the mode or removing any
         // child — is used so those mutations (which bump the directory's mtime) don't change the
-        // answer. this mirrors the old code's `src_metadata` captured at entry.
+        // answer.
         let dir_passes_time_filter: bool = if let Some(ref time_filter) = settings.time_filter {
             // unwrap is safe: time_metadata is Some whenever time_filter is Some (both gated on
             // settings.time_filter.is_some()).
@@ -857,30 +845,10 @@ impl WalkVisitor for RmVisitor {
         }
         // when filtering is active, directories may not be empty because we only removed matching
         // files (includes) or skipped excluded files; use rmdir (not a recursive remove) so
-        // non-empty directories fail gracefully with ENOTEMPTY. fd-relative rmdir cannot escape the
-        // held parent, but a final-component race can still replace the checked directory before the
-        // syscall. rmdir can remove only the empty directory at that name; success is final because
-        // no post-mutation observation can undo or reliably qualify it. gate on the Destination side
-        // to match path-based rm.
-        let current = cx
-            .parent
-            .child(&cx.name)
-            .await
-            .with_context(|| {
-                format!("directory {path:?} changed identity before removal (possible TOCTOU swap)")
-            })
-            .map_err(|err| Error::new(err, rm_summary))?;
-        dir.verify_same_inode(&current)
-            .await
-            .with_context(|| {
-                format!("directory {path:?} changed identity before removal (possible TOCTOU swap)")
-            })
-            .map_err(|err| Error::new(err, rm_summary))?;
-        #[cfg(test)]
-        let _final_rmdir_gate_visit = {
-            let raw_fd = std::os::fd::AsRawFd::as_raw_fd(&current.as_fd());
-            crate::testutils::wait_on_blocking_path_gate(path, raw_fd)
-        };
+        // non-empty directories fail gracefully with ENOTEMPTY. fd-relative rmdir cannot escape
+        // the held parent and can remove only the empty directory occupying this name at syscall
+        // time. An identity check before this by-name syscall would only move the race and would not
+        // bind the mutation, so finalization intentionally performs the one removal syscall alone.
         let any_filter_active = settings.filter.is_some() || settings.time_filter.is_some();
         match cx
             .parent
@@ -2398,8 +2366,54 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn directory_replacement_is_not_descended_after_classification() -> anyhow::Result<()>
+        async fn leaf_slot_removal_uses_the_admitted_snapshot_for_accounting() -> anyhow::Result<()>
         {
+            let tmp = tempfile::tempdir()?;
+            let entry = tmp.path().join("entry");
+            let original = tmp.path().join("original");
+            tokio::fs::write(&entry, b"original").await?;
+            let parent = Arc::new(
+                Dir::open_parent_dir(tmp.path(), congestion::Side::Source)
+                    .await?
+                    .into_tree(),
+            );
+            let handle = parent.child(OsStr::new("entry")).await?;
+            let leaf = AdmittedLeaf::try_new(handle, None)
+                .map_err(|_| anyhow::anyhow!("file fixture classified as a directory"))?;
+            tokio::fs::rename(&entry, &original).await?;
+            tokio::fs::write(&entry, b"replacement payload").await?;
+            let visitor = RmVisitor {
+                prog_track: &RACE_PROGRESS,
+                settings: Settings {
+                    fail_early: true,
+                    filter: None,
+                    time_filter: None,
+                    dry_run: None,
+                },
+            };
+            let cx = EntryCx {
+                parent,
+                name: OsStr::new("entry").to_owned(),
+                rel_path: std::path::PathBuf::from("entry"),
+                filter_path: std::path::PathBuf::from("entry"),
+                real_path: entry.clone(),
+                dry_run: false,
+                prog_track: &RACE_PROGRESS,
+            };
+            let summary = visitor.visit_leaf(&cx, &(), leaf).await?;
+            assert_eq!(summary.files_removed, 1);
+            assert_eq!(summary.bytes_removed, 8);
+            assert!(
+                !entry.exists(),
+                "the current compatible slot entry survived"
+            );
+            assert_eq!(tokio::fs::read(&original).await?, b"original");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn compatible_directory_replacement_is_descended_by_its_opened_fd()
+        -> anyhow::Result<()> {
             let tmp = tempfile::tempdir()?;
             let entry = tmp.path().join("entry");
             let original = tmp.path().join("original");
@@ -2431,20 +2445,25 @@ mod tests {
                 dry_run: false,
                 prog_track: &RACE_PROGRESS,
             };
-            let error = match visitor.dir_pre(&cx, &(), &handle).await {
-                Ok(_) => anyhow::bail!("a replacement passed the directory identity check"),
-                Err(error) => error,
+            let opened = match visitor.dir_pre(&cx, &(), &handle).await? {
+                DirAction::Descend { dir, .. } => dir,
+                DirAction::Skip(_) => anyhow::bail!("the replacement directory was skipped"),
             };
-            assert!(format!("{:#}", error.source).contains("changed identity before descent"));
+            opened.child(OsStr::new("replacement-child")).await?;
             assert_eq!(
                 tokio::fs::read(entry.join("replacement-child")).await?,
                 b"replacement"
+            );
+            assert!(
+                !original.join("replacement-child").exists(),
+                "descent used the classified directory instead of the opened replacement"
             );
             Ok(())
         }
 
         #[tokio::test]
-        async fn directory_replacement_is_not_removed_after_child_walk() -> anyhow::Result<()> {
+        async fn final_rmdir_removes_an_empty_replacement_in_the_walked_slot() -> anyhow::Result<()>
+        {
             let tmp = tempfile::tempdir()?;
             let entry = tmp.path().join("entry");
             let original = tmp.path().join("original");
@@ -2479,23 +2498,23 @@ mod tests {
             };
             tokio::fs::rename(&entry, &original).await?;
             tokio::fs::create_dir(&entry).await?;
-            let error = visitor
+            let summary = visitor
                 .dir_post(
                     &cx,
                     state,
                     &ProcessedChildren::default(),
                     Ok(Summary::default()),
                 )
-                .await
-                .expect_err("a replacement must fail the final directory identity check");
-            assert!(format!("{:#}", error.source).contains("changed identity before removal"));
-            assert!(entry.is_dir());
+                .await?;
+            assert_eq!(summary.directories_removed, 1);
+            assert!(!entry.exists(), "the empty slot replacement survived rmdir");
             assert!(original.is_dir());
             Ok(())
         }
 
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn intended_removal_keeps_temporary_mode_until_rmdir() -> anyhow::Result<()> {
+        #[tokio::test]
+        async fn unfiltered_directory_relaxation_does_not_retain_restore_state()
+        -> anyhow::Result<()> {
             let tmp = tempfile::tempdir()?;
             let entry = tmp.path().join("entry");
             tokio::fs::create_dir(&entry).await?;
@@ -2531,60 +2550,12 @@ mod tests {
             assert_eq!(
                 tokio::fs::metadata(&entry).await?.permissions().mode() & 0o7777,
                 0o700,
-                "dir_pre must relax the directory before final removal"
+                "dir_pre did not relax the protected directory"
             );
-
-            let mut gate = testutils::BlockingPathGate::install(entry.clone());
-            let mut task = tokio::spawn(async move {
-                visitor
-                    .dir_post(
-                        &cx,
-                        state,
-                        &ProcessedChildren::default(),
-                        Ok(Summary::default()),
-                    )
-                    .await
-            });
-            let timeout = std::time::Duration::from_secs(20);
-            let gate_start = tokio::time::timeout(timeout, gate.wait_started()).await;
-            if !matches!(&gate_start, Ok(Ok(_))) {
-                gate.release_all();
-                task.abort();
-                let _ = task.await;
-                match gate_start {
-                    Ok(Err(error)) => {
-                        return Err(
-                            error.context("final rmdir did not reach its post-identity gate")
-                        );
-                    }
-                    Err(error) => {
-                        return Err(anyhow::Error::new(error)
-                            .context("final rmdir did not reach its post-identity gate"));
-                    }
-                    Ok(Ok(_)) => unreachable!(),
-                }
-            }
-            let checked_mode = tokio::fs::metadata(&entry)
-                .await
-                .map(|metadata| metadata.permissions().mode() & 0o7777);
-            gate.release_all();
-            let owner_join = match tokio::time::timeout(timeout, &mut task).await {
-                Ok(result) => result,
-                Err(error) => {
-                    task.abort();
-                    let _ = task.await;
-                    return Err(anyhow::Error::new(error)
-                        .context("final rmdir did not quiesce after its gate released"));
-                }
-            };
-            let result = owner_join.context("final rmdir task panicked")?;
-            let summary = result.map_err(|error| error.source)?;
-            assert_eq!(
-                checked_mode?, 0o700,
-                "the intended-removal path restored metadata before the rmdir boundary"
+            assert!(
+                state.relaxed.is_none(),
+                "unfiltered removal retained an unnecessary restoration handle"
             );
-            assert!(!entry.exists(), "the by-name rmdir left the directory name");
-            assert_eq!(summary.directories_removed, 1);
             Ok(())
         }
 

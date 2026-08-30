@@ -1670,13 +1670,13 @@ async fn setup_ssh_session_with_program(
     let cleanup = preparation.cleanup.clone();
     let control_directory_exclusions = preparation.control_directory_exclusions.clone();
     let connect = tokio::spawn(async move {
-        let control_dir =
+        let control_directory =
             run_disposable_blocking(cleanup.clone(), "rcp-ssh-control-select", move || {
                 ssh_control_directory(&control_directory_exclusions)
                     .context("no usable SSH control directory found outside local copy operands")
             })
             .await?;
-        launch_ssh_master(&session, &control_dir, &ssh_program, cleanup)
+        launch_ssh_master(&session, control_directory, &ssh_program, cleanup)
             .await
             .context("Failed to establish SSH connection")
     });
@@ -1685,11 +1685,41 @@ async fn setup_ssh_session_with_program(
         .await
 }
 
-/// Run filesystem preflight on a disposable OS thread.
+struct CleanupOwned<T: Send + 'static> {
+    value: Option<T>,
+    cleanup: RemoteCleanup,
+}
+
+impl<T: Send + 'static> CleanupOwned<T> {
+    fn new(value: T, cleanup: RemoteCleanup) -> Self {
+        Self {
+            value: Some(value),
+            cleanup,
+        }
+    }
+
+    fn into_inner(mut self) -> T {
+        self.value
+            .take()
+            .expect("cleanup-owned value is consumed once")
+    }
+}
+
+impl<T: Send + 'static> Drop for CleanupOwned<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            self.cleanup
+                .defer_drop(value, "rcp-disposable-result-dispose");
+        }
+    }
+}
+
+/// Run blocking filesystem preparation on a disposable OS thread.
 ///
 /// The caller may abandon the receiver at a bootstrap deadline without waiting for an uninterruptible
-/// filesystem syscall. These probes launch no process, and a value produced after abandonment is
-/// dropped on the worker thread.
+/// filesystem syscall. These operations launch no process, and a value produced after abandonment
+/// is dropped on a cleanup worker. A result queued just before receiver abandonment is wrapped so
+/// dropping the channel also defers its destructor rather than blocking the async worker.
 async fn run_disposable_blocking<T, F>(
     cleanup: RemoteCleanup,
     thread_name: &'static str,
@@ -1700,14 +1730,17 @@ where
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let result_cleanup = cleanup.clone();
     cleanup
         .submit_disposable(thread_name, move || {
-            let _ = result_tx.send(operation());
+            let result = CleanupOwned::new(operation(), result_cleanup);
+            let _ = result_tx.send(result);
         })
         .with_context(|| format!("failed to start {thread_name} worker"))?;
     result_rx
         .await
         .with_context(|| format!("{thread_name} worker exited without a result"))?
+        .into_inner()
 }
 
 struct StopSocketProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -1753,23 +1786,18 @@ fn ssh_master_launcher_command(ssh_program: &std::path::Path) -> tokio::process:
 
 async fn launch_ssh_master(
     session: &SshSession,
-    control_dir: &std::path::Path,
+    control_directory: tempfile::TempDir,
     ssh_program: &std::path::Path,
     cleanup: RemoteCleanup,
 ) -> anyhow::Result<ManagedSshSession> {
     tracing::debug!("Connecting to SSH destination: {}", session.host);
-    tracing::debug!("Using SSH control directory: {}", control_dir.display());
-    let control_dir = control_dir.to_path_buf();
-    let directory = run_disposable_blocking(cleanup.clone(), "rcp-ssh-control-create", move || {
-        let mut temp = tempfile::Builder::new();
-        temp.prefix(".ssh-connection");
-        temp.tempdir_in(control_dir)
-            .context("failed to create SSH control directory")
-    })
-    .await?;
-    // persist the TempDir only after the disposable worker returned it. If that wait is abandoned,
-    // tempfile cleanup stays on the worker; after persistence every exit is guarded below.
-    let mut preparing = PreparingSshMaster::new(directory.keep(), cleanup.clone());
+    tracing::debug!(
+        "Using SSH control directory: {}",
+        control_directory.path().display()
+    );
+    // selection already created the actual private directory. if its disposable worker was
+    // abandoned, TempDir cleanup stayed on that worker; once retained, every exit is guarded below.
+    let mut preparing = PreparingSshMaster::new(control_directory.keep(), cleanup.clone());
     let log = preparing.control_directory().join("log");
     let control_path = preparing.control_directory().join("master");
     let mut launcher = ssh_master_launcher_command(ssh_program);
@@ -1868,16 +1896,18 @@ async fn launch_ssh_master(
 /// `$XDG_RUNTIME_DIR`, so stopping at step 1 would have left the intended beneficiaries on the very
 /// `$HOME`-derived path this exists to avoid. The state candidate preserves the library's first
 /// fallback, while the shorter home alternative remains available when its `.local/state` path
-/// would be unusable. The launcher creates the socket directory through `tempfile`, which makes it
-/// mode 0700, so a shared parent is still private. Candidates inside a canonical local operand are
-/// deliberately excluded: an unreapable SSH master requires its private directory to survive until
-/// process exit, so that directory must not appear inside a copied tree. Remote-only operands impose
-/// no such exclusion, regardless of the master's working directory. The filesystem root is also
-/// omitted because no absolute socket candidate could otherwise be selected.
+/// would be unusable. Selection creates the actual socket directory through `tempfile`, which makes
+/// it mode 0700, so a shared parent is still private. Candidates lexically inside a named local
+/// operand are skipped: an unreapable SSH master requires its private directory to survive until
+/// process exit, so ordinarily that directory should not appear inside a copied tree. This is an
+/// operational placement policy, not a TOCTOU guarantee; resolving aliases here could be raced
+/// before the later path-based SSH use. Remote-only operands impose no exclusion, regardless of the
+/// master's working directory. The filesystem root is also omitted because no absolute socket
+/// candidate could otherwise be selected.
 ///
 /// Returns `None` only when none of the candidates can safely hold a control socket; callers then
 /// fail before launching SSH rather than selecting a path known to be broken.
-fn ssh_control_directory(excluded_roots: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+fn ssh_control_directory(excluded_roots: &[std::path::PathBuf]) -> Option<tempfile::TempDir> {
     select_ssh_control_directory_from_environment(
         std::env::var_os("XDG_RUNTIME_DIR").map(Into::into),
         std::env::temp_dir(),
@@ -1895,38 +1925,30 @@ fn select_ssh_control_directory_from_environment(
     state_dir: Option<std::path::PathBuf>,
     home: Option<std::path::PathBuf>,
     excluded_roots: &[std::path::PathBuf],
-) -> Option<std::path::PathBuf> {
+) -> Option<tempfile::TempDir> {
     let mut candidates = Vec::with_capacity(5);
     candidates.extend(runtime_dir);
     candidates.push(temp_dir);
     candidates.push(system_temp_dir);
     candidates.extend(state_dir);
     candidates.extend(home);
-    let excluded_roots: Vec<_> = excluded_roots
-        .iter()
-        .filter_map(|path| {
-            std::fs::canonicalize(path)
-                .ok()
-                .or_else(|| std::path::absolute(path).ok())
-        })
-        .filter(|path| path.parent().is_some())
-        .collect();
-    select_ssh_control_directory(candidates.into_iter().filter(|candidate| {
-        excluded_roots.is_empty()
-            || std::fs::canonicalize(candidate).is_ok_and(|candidate| {
-                excluded_roots
-                    .iter()
-                    .all(|excluded_root| !candidate.starts_with(excluded_root))
-            })
-    }))
+    select_ssh_control_directory_excluding(candidates, excluded_roots)
 }
 
+#[cfg(test)]
 fn select_ssh_control_directory(
     candidates: impl IntoIterator<Item = std::path::PathBuf>,
-) -> Option<std::path::PathBuf> {
+) -> Option<tempfile::TempDir> {
+    select_ssh_control_directory_excluding(candidates, &[])
+}
+
+fn select_ssh_control_directory_excluding(
+    candidates: impl IntoIterator<Item = std::path::PathBuf>,
+    excluded_roots: &[std::path::PathBuf],
+) -> Option<tempfile::TempDir> {
     candidates
         .into_iter()
-        .find(|dir| control_dir_is_usable(dir))
+        .find_map(|dir| create_ssh_control_directory(&dir, excluded_roots))
 }
 
 /// Longest socket path `sockaddr_un` can hold, counting the terminating NUL.
@@ -1939,42 +1961,49 @@ const SUN_PATH_MAX: usize = 108;
 /// - `.XXXXXXXXXXXXXXXX` (17) -- the temporary name ssh(1) creates it under before renaming
 const CONTROL_PATH_SUFFIX: usize = 22 + 7 + 17;
 
-/// Whether `dir` can actually host the control socket: short enough to leave room for everything
-/// appended to it, and writable by us.
+/// Create the actual private control directory in `dir` when it can host the socket.
 ///
-/// Both halves matter. Length is the original bug. Writability is what makes the candidate list
-/// above mean anything -- a directory that merely *exists* is not enough, and `$XDG_RUNTIME_DIR`
-/// surviving into a `su`/`sudo -u` session while pointing at the original user's `/run/user/<uid>`
-/// is a common way to get one that is present but unusable. Without this check we would select it
-/// confidently and fail, instead of moving on to `/tmp`.
-fn control_dir_is_usable(dir: &std::path::Path) -> bool {
-    if dir.as_os_str().is_empty() || !dir.is_dir() {
-        return false;
+/// The authoritative `tempdir_in` result decides existence and writability. No prior stat or
+/// disposable create/remove probe predicts this operation.
+fn create_ssh_control_directory(
+    dir: &std::path::Path,
+    excluded_roots: &[std::path::PathBuf],
+) -> Option<tempfile::TempDir> {
+    if dir.as_os_str().is_empty() {
+        return None;
     }
     if dir.as_os_str().len() + CONTROL_PATH_SUFFIX >= SUN_PATH_MAX {
         tracing::debug!(
             "skipping SSH control directory {}: too long to hold the socket path",
             dir.display()
         );
-        return false;
+        return None;
     }
-    // probe rather than inspect the mode: ownership, ACLs and read-only mounts all decide this,
-    // and creating a directory is exactly what `openssh` is about to do anyway.
-    match tempfile::Builder::new()
-        .prefix(".rcp-control-probe-")
-        .tempdir_in(dir)
+    // keep the ordinary, explicitly named self-tree case out of the copy. this is a lexical
+    // placement policy, not a security boundary: aliases and concurrent namespace changes are not
+    // resolved because such a check would not bind the later path-based SSH use.
+    if excluded_roots
+        .iter()
+        .filter(|root| root.parent().is_some())
+        .any(|root| dir.starts_with(root))
     {
-        Ok(probe) => {
-            drop(probe);
-            true
-        }
+        tracing::debug!(
+            "skipping SSH control directory {}: inside a local copy operand",
+            dir.display()
+        );
+        return None;
+    }
+    let mut temp = tempfile::Builder::new();
+    temp.prefix(".ssh-connection");
+    match temp.tempdir_in(dir) {
+        Ok(directory) => Some(directory),
         Err(error) => {
             tracing::debug!(
                 "skipping SSH control directory {}: not writable: {:#}",
                 dir.display(),
                 &error
             );
-            false
+            None
         }
     }
 }
@@ -4742,10 +4771,13 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let missing = home.path().join("missing");
         assert_eq!(
-            select_ssh_control_directory([missing.clone(), home.path().to_path_buf()]),
+            control_directory_parent(select_ssh_control_directory([
+                missing.clone(),
+                home.path().to_path_buf(),
+            ])),
             Some(home.path().to_path_buf())
         );
-        assert_eq!(select_ssh_control_directory([missing]), None);
+        assert!(select_ssh_control_directory([missing]).is_none());
     }
 
     #[test]
@@ -4755,7 +4787,7 @@ mod tests {
         std::fs::create_dir(&nested_temp).unwrap();
         let missing_system_temp = local_operand.path().join("missing-system-temp");
 
-        assert_eq!(
+        assert!(
             select_ssh_control_directory_from_environment(
                 None,
                 nested_temp,
@@ -4763,8 +4795,8 @@ mod tests {
                 None,
                 None,
                 &[local_operand.path().to_path_buf()],
-            ),
-            None,
+            )
+            .is_none(),
             "a usable directory inside a local operand is not an SSH artifact fallback"
         );
     }
@@ -4774,14 +4806,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
 
         assert_eq!(
-            select_ssh_control_directory_from_environment(
+            control_directory_parent(select_ssh_control_directory_from_environment(
                 None,
                 temp.path().to_path_buf(),
                 temp.path().to_path_buf(),
                 None,
                 None,
                 &[],
-            ),
+            )),
             Some(temp.path().to_path_buf()),
             "remote-to-remote copies have no local operand tree to exclude"
         );
@@ -4794,14 +4826,14 @@ mod tests {
         std::fs::create_dir(&local_operand).unwrap();
 
         assert_eq!(
-            select_ssh_control_directory_from_environment(
+            control_directory_parent(select_ssh_control_directory_from_environment(
                 None,
                 candidate.path().to_path_buf(),
                 candidate.path().to_path_buf(),
                 None,
                 None,
                 &[local_operand],
-            ),
+            )),
             Some(candidate.path().to_path_buf()),
             "a private sibling in the candidate directory is outside the copied subtree"
         );
@@ -4812,44 +4844,23 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
 
         assert_eq!(
-            select_ssh_control_directory_from_environment(
+            control_directory_parent(select_ssh_control_directory_from_environment(
                 None,
                 temp.path().to_path_buf(),
                 temp.path().to_path_buf(),
                 None,
                 None,
                 &[std::path::PathBuf::from("/")],
-            ),
+            )),
             Some(temp.path().to_path_buf()),
             "the root operand cannot exclude every absolute socket candidate"
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn control_directory_selection_resolves_aliases_into_a_local_operand_tree() {
-        use std::os::unix::fs::symlink;
-
-        let local_operand = tempfile::tempdir().unwrap();
-        let nested_temp = local_operand.path().join("tmp");
-        std::fs::create_dir(&nested_temp).unwrap();
-        let aliases = tempfile::tempdir().unwrap();
-        let nested_alias = aliases.path().join("tmp-alias");
-        symlink(&nested_temp, &nested_alias).unwrap();
-        let missing_system_temp = aliases.path().join("missing-system-temp");
-
-        assert_eq!(
-            select_ssh_control_directory_from_environment(
-                None,
-                nested_alias,
-                missing_system_temp,
-                None,
-                None,
-                &[local_operand.path().to_path_buf()],
-            ),
-            None,
-            "a path alias into a local operand is not an SSH artifact fallback"
-        );
+    fn control_directory_parent(
+        directory: Option<tempfile::TempDir>,
+    ) -> Option<std::path::PathBuf> {
+        directory.and_then(|directory| directory.path().parent().map(std::path::Path::to_path_buf))
     }
 
     #[test]
@@ -5819,6 +5830,53 @@ mod tests {
             .unwrap();
         assert_eq!(drop_thread, "rcp-owned-task-reap");
         drop(preparation);
+        cleanup.finish();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_disposable_result_is_dropped_on_a_cleanup_worker_after_receiver_abort() {
+        struct DropThreadReporter(Option<tokio::sync::oneshot::Sender<String>>);
+
+        impl Drop for DropThreadReporter {
+            fn drop(&mut self) {
+                if let Some(dropped) = self.0.take() {
+                    let thread_name = std::thread::current()
+                        .name()
+                        .unwrap_or("unnamed")
+                        .to_string();
+                    let _ = dropped.send(thread_name);
+                }
+            }
+        }
+
+        let cleanup = RemoteCleanup::new().unwrap();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let (waiter_started_tx, waiter_started_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            waiter_started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+            let _ = result_rx.await;
+        });
+        waiter_started_rx.await.unwrap();
+
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        assert!(
+            result_tx
+                .send(CleanupOwned::new(
+                    DropThreadReporter(Some(dropped_tx)),
+                    cleanup.clone(),
+                ))
+                .is_ok(),
+            "the result must be queued before receiver cancellation"
+        );
+        waiter.abort();
+        let _ = waiter.await;
+
+        let drop_thread = tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("abandoned queued result must be disposed")
+            .unwrap();
+        assert_eq!(drop_thread, "rcp-disposable-result-dispose");
         cleanup.finish();
     }
 
