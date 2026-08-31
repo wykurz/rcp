@@ -26,6 +26,9 @@ jobs:
       with:
         ref: ${{ inputs.ref || github.sha }}
 
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
     - name: Setup Rust
       uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
       with:
@@ -35,11 +38,16 @@ jobs:
     - name: Install musl toolchain deps
       run: |
         sudo apt-get update
-        sudo apt-get install -y musl-tools pkg-config
+        sudo apt-get install -y jq musl-tools pkg-config python3-yaml
         sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
 
+    - name: Install just
+      uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
+      with:
+        tool: just
+
     - name: Format
-      run: cargo fmt --check
+      run: ./scripts/cargo-host.sh fmt --check
 
     # The CLI version is pinned here for reproducibility, but formatting output
     # is determined by the plugin version + checksum pinned in dprint.json.
@@ -70,6 +78,16 @@ jobs:
     - name: Check rust version consistency
       run: ./scripts/check-rust-version.sh
 
+    - name: Check build target consistency
+      run: |
+        ./scripts/test-check-build-targets.sh
+        ./scripts/check-build-targets.sh
+
+    - name: Check build entrypoints
+      run: |
+        ./scripts/test-check-build-entrypoints.sh
+        ./scripts/check-build-entrypoints.sh
+
     - name: Check walk-driver usage
       run: ./scripts/check-walk-driver-usage.sh
 
@@ -95,16 +113,28 @@ jobs:
     - name: Test the update-deps MSRV report filter
       run: ./scripts/test-update-deps.sh
 
+    - name: Test host Cargo selection
+      run: ./scripts/test-cargo-host.sh
+
+    - name: Test Docker target selection
+      run: ./scripts/test-docker-target.sh
+
+    - name: Test Docker readiness behavior
+      run: ./scripts/test-docker-helpers.sh
+
+    - name: Test Depot CI helper
+      run: ./scripts/test-depot-ci.sh
+
     - name: Check package metadata
       run: ./scripts/check-package-metadata.sh
 
     - name: Lint
-      run: cargo clippy --workspace --all-targets -- -D warnings
+      run: ./scripts/cargo-host.sh clippy --workspace --all-targets -- -D warnings
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
 
     - name: Documentation
-      run: cargo doc --no-deps --workspace
+      run: ./scripts/cargo-host.sh doc --no-deps --workspace
       env:
         RUSTDOCFLAGS: --cfg tokio_unstable -D warnings
         PKG_CONFIG_ALLOW_CROSS: "1"
@@ -139,7 +169,7 @@ jobs:
     # cfg gates (e.g. common/src/filter.rs), so a single target would let an
     # MSRV regression in the other branch slip through.
     - name: Check workspace builds on MSRV (gnu + musl)
-      run: cargo check --workspace --locked --all-targets --target x86_64-unknown-linux-gnu --target x86_64-unknown-linux-musl
+      run: ./scripts/cargo-host.sh check --workspace --locked --all-targets --target x86_64-unknown-linux-gnu --target x86_64-unknown-linux-musl
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
 
@@ -184,7 +214,7 @@ jobs:
         sudo ssh -o BatchMode=yes localhost true
 
     - name: Install cargo-nextest
-      run: cargo install cargo-nextest --version 0.9.85 --locked
+      run: ./scripts/cargo-install-host.sh cargo-nextest --version 0.9.85 --locked
 
     - name: Test (musl debug)
       env:
@@ -192,7 +222,7 @@ jobs:
       run: |
         set -o pipefail
         # Run tests with nextest for better output
-        cargo nextest run --no-capture 2>&1 | tee test_output_musl_debug.log
+        ./scripts/cargo-host.sh nextest run --no-capture 2>&1 | tee test_output_musl_debug.log
 
     - name: Test sudo-required tests (musl debug)
       env:
@@ -202,12 +232,12 @@ jobs:
       run: |
         set -o pipefail
         # Run tests that require passwordless sudo (available in CI)
-        cargo nextest run --no-capture --run-ignored only -E 'test(~sudo)' 2>&1 | tee -a test_output_musl_debug.log
+        ./scripts/cargo-host.sh nextest run --no-capture --run-ignored only -E 'test(~sudo)' 2>&1 | tee -a test_output_musl_debug.log
 
     - name: Doctests (musl debug)
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
-      run: cargo test --doc
+      run: ./scripts/cargo-host.sh test --doc
 
     - name: Upload test logs
       if: always()
@@ -257,7 +287,7 @@ jobs:
         sudo ssh -o BatchMode=yes localhost true
 
     - name: Install cargo-nextest
-      run: cargo install cargo-nextest --version 0.9.85 --locked
+      run: ./scripts/cargo-install-host.sh cargo-nextest --version 0.9.85 --locked
 
     - name: Test (musl release)
       env:
@@ -265,7 +295,7 @@ jobs:
       run: |
         set -o pipefail
         # Run tests with nextest in release mode
-        cargo nextest run --release --no-capture 2>&1 | tee test_output_musl_release.log
+        ./scripts/cargo-host.sh nextest run --release --no-capture 2>&1 | tee test_output_musl_release.log
 
     - name: Test sudo-required tests (musl release)
       env:
@@ -275,12 +305,12 @@ jobs:
       run: |
         set -o pipefail
         # Run tests that require passwordless sudo (available in CI)
-        cargo nextest run --release --no-capture --run-ignored only -E 'test(~sudo)' 2>&1 | tee -a test_output_musl_release.log
+        ./scripts/cargo-host.sh nextest run --release --no-capture --run-ignored only -E 'test(~sudo)' 2>&1 | tee -a test_output_musl_release.log
 
     - name: Doctests (musl release)
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
-      run: cargo test --doc --release
+      run: ./scripts/cargo-host.sh test --doc --release
 
     - name: Upload test logs
       if: always()
@@ -318,58 +348,22 @@ jobs:
       with:
         tool: cargo-nextest@0.9.85
 
-    - name: Build binaries for Docker
+    - name: Start Docker test environment
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
-      run: cargo build --workspace
-
-    - name: Start Docker containers
-      run: |
-        cd tests/docker
-        docker compose up -d
-
-        # Wait for containers to be healthy and SSH to be ready
-        echo "Waiting for containers to start..."
-        sleep 3
-
-        # Check if SSH daemon is running in containers
-        echo "Checking SSH daemon status..."
-        docker exec rcp-test-master pgrep sshd || echo "SSH not running in master"
-        docker exec rcp-test-host-a pgrep sshd || echo "SSH not running in host-a"
-        docker exec rcp-test-host-b pgrep sshd || echo "SSH not running in host-b"
-
-        # Wait for SSH connectivity (with timeout)
-        echo "Testing SSH connectivity from master to host-a..."
-        TIMEOUT=60
-        ELAPSED=0
-        until docker exec -u testuser rcp-test-master ssh -o ConnectTimeout=5 host-a hostname &> /dev/null; do
-          if [ $ELAPSED -ge $TIMEOUT ]; then
-            echo "ERROR: SSH connectivity timeout after ${TIMEOUT}s"
-            docker exec -u testuser rcp-test-master ssh -v host-a hostname 2>&1 || true
-            docker compose logs
-            exit 1
-          fi
-          echo "Waiting for SSH... (${ELAPSED}s/${TIMEOUT}s)"
-          sleep 2
-          ELAPSED=$((ELAPSED + 2))
-        done
-        echo "SSH connectivity confirmed"
+      run: just docker-up
 
     - name: Run Docker multi-host tests
       # exclude chaos tests - they require SYS_ADMIN capability and run separately in chaos-tests.yml
-      run: cargo nextest run --profile docker --run-ignored only -E 'not test(~chaos)'
+      run: just docker-test-only -E 'not test(~chaos)'
 
     - name: Show Docker logs on failure
       if: failure()
-      run: |
-        cd tests/docker
-        docker compose logs
+      run: just docker-logs-once
 
     - name: Stop Docker containers
       if: always()
-      run: |
-        cd tests/docker
-        docker compose down
+      run: just docker-down
 
   build-glibc:
     runs-on: ubuntu-latest
@@ -383,7 +377,7 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
 
     - name: Build all binaries (glibc)
-      run: cargo build --workspace --release --target x86_64-unknown-linux-gnu
+      run: CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu ./scripts/cargo-host.sh build --workspace --release
 
   # Validate the Nix flake and its source-owned sandbox test selection. None of the jobs above
   # touch Nix, so a flake.lock bump (Dependabot opens grouped `nix` PRs) could break `nix build`
@@ -399,15 +393,17 @@ jobs:
     - name: Install Nix
       uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
-    # Determinate Nix's `nix flake check` only *evaluates* outputs (it skips the
-    # builds), so it covers cross-platform eval -- including the darwin/aarch64
-    # outputs this linux runner can't build -- while the explicit build + dev-shell
-    # steps catch build-level breakage on this system. `--no-update-lock-file` makes
+    - name: Test Nix target selection
+      run: ./scripts/test-nix-targets.sh
+
+    # `--no-build` keeps this an evaluation-only check, covering the darwin/aarch64
+    # outputs this linux runner can't build. The explicit build + dev-shell steps
+    # below catch build-level breakage on this system. `--no-update-lock-file` makes
     # each step validate the committed flake.lock as-is, so a flake.nix input change
     # that forgets to commit the regenerated lock fails here instead of passing
     # against a silently auto-updated lock.
     - name: Flake check (evaluate all systems)
-      run: nix flake check --all-systems --no-update-lock-file -L
+      run: nix flake check --all-systems --no-build --no-update-lock-file -L
     - name: Build the full suite with Nix sandbox test selection
       run: nix build --no-update-lock-file -L .#rcp-all
     - name: Build the dev shell

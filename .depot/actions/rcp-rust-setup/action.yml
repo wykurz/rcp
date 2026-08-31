@@ -26,18 +26,24 @@ inputs:
 runs:
   using: composite
   steps:
+  - name: Select runner architecture
+    id: architecture
+    shell: bash
+    run: |
+      "$GITHUB_ACTION_PATH/runner-architecture.sh" "$RUNNER_ARCH" >>"$GITHUB_OUTPUT"
+
   - name: Setup Rust
     uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
     with:
       components: rustfmt, clippy
-      target: x86_64-unknown-linux-musl
+      target: ${{ steps.architecture.outputs.rust_target }}
 
   - name: Install system dependencies
     shell: bash
     run: |
       set -euo pipefail
 
-      packages=(musl-tools pkg-config)
+      packages=(jq musl-tools pkg-config python3-yaml)
       if [[ "${{ inputs.install-test-deps }}" == "true" ]]; then
         packages+=(strace)
       fi
@@ -46,7 +52,8 @@ runs:
       fi
       sudo apt-get update
       sudo apt-get install -y --no-install-recommends "${packages[@]}"
-      sudo ln -sf /usr/bin/musl-gcc /usr/bin/x86_64-unknown-linux-musl-gcc
+      sudo ln -sf /usr/bin/musl-gcc \
+        "/usr/bin/${{ steps.architecture.outputs.linker_alias }}"
 
   - name: Set up Docker Compose compatibility
     if: inputs.docker-compose-compat == 'true'
@@ -149,13 +156,13 @@ runs:
       test "$remote_gid" = "$(id -g)"
 
   - name: Install just
-    uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+    uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
     with:
       tool: just
 
   - name: Install cargo-nextest
     if: inputs.install-nextest == 'true'
-    uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+    uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2
     with:
       tool: cargo-nextest@0.9.85
 
@@ -166,8 +173,8 @@ runs:
       set -euo pipefail
 
       curl -fsSL -o /tmp/dprint.zip \
-        https://github.com/dprint/dprint/releases/download/0.54.0/dprint-x86_64-unknown-linux-gnu.zip
-      echo "8cb5925a0d6d0d8aa74c82a00f76734577592dfa1eda9517c261a84fe06accd7  /tmp/dprint.zip" | \
+        "https://github.com/dprint/dprint/releases/download/0.54.0/${{ steps.architecture.outputs.dprint_asset }}"
+      echo "${{ steps.architecture.outputs.dprint_checksum }}  /tmp/dprint.zip" | \
         sha256sum -c -
       mkdir -p "$HOME/.local/bin"
       unzip -o -q /tmp/dprint.zip -d "$HOME/.local/bin"

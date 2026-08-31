@@ -4,10 +4,9 @@
 //!
 //! ## Prerequisites
 //!
-//! Before running these tests:
-//! 1. Install Docker and docker-compose
-//! 2. Start the test containers: `cd tests/docker && ./test-helpers.sh start`
-//! 3. Run tests: `cargo test --test docker_multi_host -- --ignored`
+//! From the repository root, run the full lifecycle with `just docker-test`. For repeated focused
+//! runs, use `just docker-up`, then
+//! `just docker-test-only -E 'binary(docker_multi_host)'`, and finish with `just docker-down`.
 //!
 //! ## Test Organization
 //!
@@ -23,7 +22,7 @@ use support::docker_env::{DockerEnv, Result};
 
 /// Test basic file copy between two remote hosts
 #[test]
-#[ignore = "requires Docker containers (run: cd tests/docker && ./test-helpers.sh start)"]
+#[ignore = "requires Docker containers (run: just docker-up)"]
 fn test_basic_multi_host_copy() -> Result<()> {
     let env = DockerEnv::new()?;
     // create test file on host-a
@@ -57,7 +56,7 @@ fn test_basic_multi_host_copy() -> Result<()> {
 
 /// Test that copying same file twice requires --overwrite flag
 #[test]
-#[ignore = "requires Docker containers (run: cd tests/docker && ./test-helpers.sh start)"]
+#[ignore = "requires Docker containers (run: just docker-up)"]
 fn test_overwrite_protection() -> Result<()> {
     let env = DockerEnv::new()?;
     // create test file
@@ -104,7 +103,7 @@ fn test_overwrite_protection() -> Result<()> {
 
 /// Test directory copy between hosts
 #[test]
-#[ignore = "requires Docker containers (run: cd tests/docker && ./test-helpers.sh start)"]
+#[ignore = "requires Docker containers (run: just docker-up)"]
 fn test_directory_copy() -> Result<()> {
     let env = DockerEnv::new()?;
     // cleanup any existing directories from previous runs first (as root for permissions)
@@ -156,7 +155,7 @@ fn test_directory_copy() -> Result<()> {
 /// This verifies the fix for the role-matching bug where source/destination
 /// roles could be swapped if rcpd connections arrived out of order.
 #[test]
-#[ignore = "requires Docker containers (run: cd tests/docker && ./test-helpers.sh start)"]
+#[ignore = "requires Docker containers (run: just docker-up)"]
 fn test_role_assignment_logging() -> Result<()> {
     let env = DockerEnv::new()?;
     // create test file
@@ -192,7 +191,7 @@ fn test_role_assignment_logging() -> Result<()> {
 
 /// Test copying a nonexistent file produces clear error
 #[test]
-#[ignore = "requires Docker containers (run: cd tests/docker && ./test-helpers.sh start)"]
+#[ignore = "requires Docker containers (run: just docker-up)"]
 fn test_nonexistent_source_file() -> Result<()> {
     let env = DockerEnv::new()?;
     // try to copy nonexistent file
@@ -223,7 +222,7 @@ fn test_nonexistent_source_file() -> Result<()> {
 /// - The tracing TCP connections work correctly across network boundaries
 /// - Progress output shows non-zero file counts
 #[test]
-#[ignore = "requires Docker containers (run: cd tests/docker && ./test-helpers.sh start)"]
+#[ignore = "requires Docker containers (run: just docker-up)"]
 fn test_progress_reporting_multi_host() -> Result<()> {
     let env = DockerEnv::new()?;
     // cleanup any existing directories from previous runs first (as root for permissions)

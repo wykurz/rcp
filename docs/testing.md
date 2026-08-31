@@ -12,6 +12,12 @@ The rcp test suite includes:
 
 ## Running Tests
 
+On supported Linux hosts, Just and `scripts/cargo-host.sh` select the host's musl target, and the
+default Nix shell supplies its matching toolchain. Raw `cargo` instead follows
+`.cargo/config.toml`'s fixed `x86_64-unknown-linux-musl` distribution default. Set
+`CARGO_BUILD_TARGET` explicitly when a different target is intentional; the wrapper preserves that
+override.
+
 ### Quick Reference
 
 ```bash
@@ -22,11 +28,11 @@ just doctest           # Run documentation tests
 just test-all          # Run all tests (debug + release + doctests)
 just ci                # Full CI checks (lint + doc + test-all + Docker tests)
 
-# Using cargo directly
-cargo nextest run                           # All tests
-cargo nextest run -p <package>              # Specific package
-cargo nextest run --no-capture <test_name>  # Specific test with output
-cargo test --doc                            # Documentation tests
+# Using cargo through the host wrapper
+./scripts/cargo-host.sh nextest run
+./scripts/cargo-host.sh nextest run -p <package>
+./scripts/cargo-host.sh nextest run --no-capture <test_name>
+./scripts/cargo-host.sh test --doc
 ```
 
 ### Test Profiles
@@ -41,13 +47,13 @@ contract. Do not add broad serialization for unrelated tests.
 
 ```bash
 # Default profile (debug tests)
-cargo nextest run
+./scripts/cargo-host.sh nextest run
 
 # Release profile
-cargo nextest run --release
+./scripts/cargo-host.sh nextest run --release
 
 # Docker profile (for multi-host tests)
-cargo nextest run --profile docker --run-ignored only
+./scripts/cargo-host.sh nextest run --profile docker --run-ignored only
 ```
 
 ### Nix sandbox test selection
@@ -140,12 +146,12 @@ Some tests require passwordless sudo (e.g., creating root-owned files):
 
 - **Naming convention**: Test name must contain `sudo`
 - **Marked with**: `#[ignore = "requires passwordless sudo"]`
-- **CI runs separately**: `cargo nextest run --run-ignored only -E 'test(~sudo)'`
+- **CI runs separately**: `./scripts/cargo-host.sh nextest run --run-ignored only -E 'test(~sudo)'`
 
 To run locally:
 
 ```bash
-cargo nextest run --run-ignored only -E 'test(~sudo)'
+./scripts/cargo-host.sh nextest run --run-ignored only -E 'test(~sudo)'
 ```
 
 Most of these use sudo only to plant root-owned inputs and still run `rcpd` as the normal user.
@@ -157,7 +163,7 @@ silently stop running:
 
 ```bash
 # run it with the preconditions enforced rather than skipped
-RCP_REQUIRE_ROOT_SSH=1 cargo nextest run --run-ignored only -E 'test(~sudo)'
+RCP_REQUIRE_ROOT_SSH=1 ./scripts/cargo-host.sh nextest run --run-ignored only -E 'test(~sudo)'
 ```
 
 ## Docker Multi-Host Testing
@@ -192,9 +198,20 @@ Three Alpine Linux containers simulate separate hosts:
 
 - Based on Alpine Linux 3.19
 - OpenSSH server configured with pre-installed SSH keys
-- rcp/rcpd binaries mounted from `target/x86_64-unknown-linux-musl/debug/`
+- rcp/rcpd binaries mounted from the Linux musl target matching the container architecture
 - All containers run as `testuser`
 - Containers can SSH to each other by hostname
+
+`scripts/docker-target.sh` resolves `DOCKER_DEFAULT_PLATFORM` first and otherwise queries the Docker
+daemon's architecture. The Docker build, binary check, and Compose mounts all use the corresponding
+Linux musl target. The helper overwrites `RCP_DOCKER_TARGET` with that resolved value when invoking
+Compose; it is internal plumbing, not a user override.
+
+Setup and no-cache rebuild each resolve that target once and do not return until `testuser` can
+reach both remote hosts from the master container within one readiness deadline. Rebuild also
+rebuilds the selected musl payload before starting the project. Failure diagnostics use the held
+target and finite logs without another daemon architecture query. Helper-owned local lifecycles and
+workflow-owned CI paths each have exactly one teardown owner.
 
 ### Running Docker Tests
 
@@ -214,22 +231,25 @@ just docker-logs         # View container logs
 just docker-clean        # Clean test files from containers
 ```
 
-**Using cargo directly**:
+**Using Cargo through the host wrapper**:
 
 ```bash
 just docker-up
-cargo nextest run --profile docker --run-ignored only
+./scripts/cargo-host.sh nextest run --profile docker --run-ignored only
 just docker-down
 ```
+
+The wrapper target is for the runnable host-side test binary. The container payload was built by
+`just docker-up` for Docker's independently selected platform.
 
 **Using helper script**:
 
 ```bash
-cd tests/docker
-./test-helpers.sh start      # Start containers
-./test-helpers.sh test-copy  # Quick smoke test
-./test-helpers.sh shell      # Open shell in master
-./test-helpers.sh stop       # Stop containers
+# From the repository root
+./tests/docker/test-helpers.sh setup      # Build payload and start containers
+./tests/docker/test-helpers.sh test-copy  # Quick smoke test
+./tests/docker/test-helpers.sh shell      # Open shell in master
+./tests/docker/test-helpers.sh stop       # Stop containers
 ```
 
 ### Test Coverage
@@ -276,16 +296,14 @@ source role is delayed.
 
 2. **Verify installation**:
    ```bash
-   docker --version          # Should show: Docker version 24.x.x
-   docker-compose --version  # Should show: Docker Compose version v2.x.x
-   docker info               # Should connect without errors
+   docker --version          # Docker CLI
+   docker compose version    # Preferred Compose v2 plugin
+   docker info               # Docker daemon connection
    ```
 
-3. **Install docker-compose if needed**:
-   ```bash
-   sudo apt update
-   sudo apt install docker-compose
-   ```
+3. **Install Compose if needed**: install the Docker Compose v2 plugin for `docker compose`. The
+   helper prefers that interface and falls back to the legacy standalone `docker-compose` command
+   when it is already installed.
 
 ### Manual Testing
 
@@ -326,16 +344,15 @@ chmod 600 tests/docker/ssh_keys/id_ed25519
 **Binaries not found**:
 
 ```bash
-cargo build  # Builds to musl target by default
+just docker-build
 ```
 
 **Containers fail to start**:
 
 ```bash
-cd tests/docker
-docker-compose logs     # Check for errors
-docker-compose down     # Clean up
-docker-compose up -d    # Restart
+just docker-logs  # Check for errors
+just docker-down  # Clean up
+just docker-up    # Restart
 ```
 
 For more troubleshooting, see `tests/docker/README.md`.
@@ -346,17 +363,19 @@ For more troubleshooting, see `tests/docker/README.md`.
 
 The `.github/workflows/validate.yml` workflow runs:
 
-1. **Debug tests**: `cargo nextest run`
-2. **Release tests**: `cargo nextest run --release` (catches optimization-related bugs)
-3. **Docker tests**: Multi-host tests in parallel with other jobs
-4. **Sudo tests**: `cargo nextest run --run-ignored only -E 'test(~sudo)'`
+1. **Lint, documentation, and policy checks** through the host wrapper and repository scripts
+2. **Debug and release tests plus doctests** against the x86_64-musl CI target
+3. **Sudo-gated debug and release tests** in their corresponding test jobs
+4. **Non-chaos Docker tests** in a separate multi-host job
+5. **MSRV, glibc release, and Nix shell/package checks** in dedicated jobs
 
 **Docker job details**:
 
-- Sets up musl toolchain and builds binaries
-- Starts Docker containers with `docker-compose`
-- Runs tests using nextest Docker profile
-- Shows container logs on failure
+- Sets up the x86_64-musl toolchain and lets `just docker-up` build the Docker-selected payload
+- Starts the Compose project through the repository helper (Compose v2 with legacy fallback) and
+  waits for both remote SSH hosts
+- Runs `just docker-test-only` with chaos excluded
+- Shows finite container logs on failure
 - Always cleans up containers (even on failure)
 
 ### Running CI Locally
@@ -374,11 +393,14 @@ it:
   step, in both debug and release. Run them yourself when a change touches sudo-only behavior:
 
   ```bash
-  cargo nextest run --run-ignored only -E 'test(~sudo)'   # add --release to also cover release
+  ./scripts/cargo-host.sh nextest run --run-ignored only -E 'test(~sudo)'
   ```
 
-- **glibc release build.** CI also builds the workspace for `x86_64-unknown-linux-gnu`; `just ci`
-  builds and tests only the default `x86_64-unknown-linux-musl` target.
+- **glibc release build.** CI also builds the workspace for `x86_64-unknown-linux-gnu`. On supported
+  Linux hosts, `just ci` selects the host architecture's musl target; on non-Linux it uses rustc's
+  host target. Raw Cargo's fixed x86_64-musl distribution default does not control these wrapped
+  commands. Docker payloads independently use `DOCKER_DEFAULT_PLATFORM` first, then the daemon
+  architecture.
 
 - **Chaos tests.** `just ci`'s Docker step runs the full `docker` profile *including* chaos (the
   compose containers are privileged, so they actually run), whereas CI excludes chaos from its main
@@ -398,7 +420,7 @@ just docker-chaos-test
 
 # Development workflow
 just docker-up
-cargo nextest run --profile docker --run-ignored only -E 'test(~chaos)'
+just docker-chaos-test-only
 just docker-down
 ```
 
@@ -486,9 +508,9 @@ causing hangs before the copy starts.
 
 **Why musl target?**
 
-- Static linking ensures binaries work in Alpine containers
+- Both supported musl configurations enable static CRT linking for their matching architecture
 - Avoids glibc version incompatibilities
-- Project default target anyway
+- Matches Alpine without making Docker payload selection depend on the developer's host target
 
 ## References
 

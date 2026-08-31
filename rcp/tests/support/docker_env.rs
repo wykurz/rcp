@@ -68,7 +68,7 @@ pub struct DockerEnv {
 impl DockerEnv {
     /// Create a new Docker test environment
     ///
-    /// Assumes containers are already running (via docker-compose up)
+    /// Assumes containers are already running (via `just docker-up` from the repository root).
     pub fn new() -> Result<Self> {
         // check if Docker is available
         let docker_check = Command::new("docker").arg("info").output();
@@ -82,7 +82,7 @@ impl DockerEnv {
         let running_containers = String::from_utf8_lossy(&containers_check.stdout);
         if !running_containers.contains("rcp-test-master") {
             return Err(
-                "Test containers are not running. Run: cd tests/docker && ./test-helpers.sh start"
+                "Test containers are not running. Run `just docker-up` from the repository root."
                     .into(),
             );
         }
@@ -412,7 +412,7 @@ chmod +x {}"#,
 
 // Note: Drop cleanup removed to avoid interference with concurrent tests.
 // Each test is responsible for cleaning up its own files.
-// For manual cleanup between test runs, use: cd tests/docker && ./test-helpers.sh cleanup
+// for manual cleanup between test runs, use `just docker-clean` from the repository root
 
 /// Network condition simulation for chaos testing.
 ///

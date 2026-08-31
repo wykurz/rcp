@@ -21,13 +21,13 @@ nix develop  # automatically includes just and all dev tools
 
 **Without nix:**
 
-Install `jq` with your system package manager (it is required by `just lint` and Depot recipes),
-then install the remaining tools:
+Install `jq` and the Python PyYAML package (often named `python3-yaml`) with your system package
+manager; both are required by `just lint`. Then install the remaining tools:
 
 ```bash
-cargo install just
-cargo install cargo-nextest  # required for `just test`, `just test-release`, `just test-all`, and `just ci`
-cargo install dprint  # required for `just fmt`, `just lint`, and `just ci`
+./scripts/cargo-install-host.sh just
+./scripts/cargo-install-host.sh cargo-nextest  # required for `just test`, `just test-release`, `just test-all`, and `just ci`
+./scripts/cargo-install-host.sh dprint  # required for `just fmt`, `just lint`, and `just ci`
 ```
 
 ### Common Commands

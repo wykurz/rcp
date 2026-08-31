@@ -245,16 +245,33 @@ be installed using `cargo install`:
 
 Starting with release `v0.10.1`, .deb and .rpm packages are available as part of each release.
 
-## Static musl builds
+## Linux musl builds
 
-The repository is configured to build static musl binaries by default via `.cargo/config.toml`.
-Simply run `cargo build` or `cargo build --release` to produce fully static binaries. To build glibc
-binaries instead, use `cargo build --target x86_64-unknown-linux-gnu`.
+For development on Linux, use Just or Nix. `just build` and the default `nix develop` shell select
+the host architecture's musl target: `x86_64-unknown-linux-musl` on x86_64 and
+`aarch64-unknown-linux-musl` on AArch64. The Nix shell supplies exactly the matching Rust target and
+musl C toolchain; explicit `nix develop .#x86_64-musl` and `nix develop .#aarch64-musl` shells are
+available for cross/distribution builds.
 
-For development, enter the nix environment (`nix develop`) to get all required tools including the
-musl toolchain. Outside nix shell, install the musl target with
-`rustup target add x86_64-unknown-linux-musl` and ensure you have musl-tools installed (e.g.,
-`apt-get install musl-tools` on Ubuntu/Debian).
+Raw Cargo has a deliberately different interface: `.cargo/config.toml` defaults it to the
+`x86_64-unknown-linux-musl` distribution target on every host. Both supported musl target sections
+select their `${target}-gcc` linker and enable static CRT linking. The resulting binaries live under
+`target/<target>/debug/` or `target/<target>/release/`.
+
+```bash
+# Runnable host-musl development build on supported Linux hosts
+./scripts/cargo-host.sh build --release
+
+# Raw-Cargo x86_64-musl distribution build, regardless of host architecture
+cargo build --release
+
+# Explicit caller-selected target; the wrapper preserves CARGO_BUILD_TARGET
+CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh build --release
+CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu ./scripts/cargo-host.sh build --release
+```
+
+Outside Nix, install the Rust target you select and provide the matching prefixed linker named in
+`.cargo/config.toml`.
 
 # General controls
 
@@ -881,10 +898,13 @@ Produces folded stack files convertible to SVG flamegraphs using
 [inferno](https://github.com/jonhoo/inferno).
 
 ```bash
+# Install Inferno for this host when working from the repository checkout
+./scripts/cargo-install-host.sh inferno
+
 # Profile and generate flamegraph data
 rcp --flamegraph=/tmp/flame /source /dest
 
-# Convert to SVG (requires: cargo install inferno)
+# Convert to SVG
 cat /tmp/flame-*.folded | inferno-flamegraph > flamegraph.svg
 
 # Or use inferno-flamechart to preserve chronological order
