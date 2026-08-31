@@ -115,6 +115,9 @@ Tests using localhost SSH (`rcp/tests/remote_tests.rs` and the real-session test
 **Requirements**: localhost SSH must be available and usable (running sshd, accessible via
 `ssh localhost`).
 
+`rcp/tests/remote_non_ssh_tests.rs` instead covers localhost-as-local behavior and validation
+failures that must occur before SSH setup, so it runs without that prerequisite.
+
 ### Sudo-Required Tests
 
 Some tests require passwordless sudo (e.g., creating root-owned files):

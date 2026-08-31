@@ -94,7 +94,10 @@
             muslTools.binutils
           ];
 
-        nixSandboxRustflags = ''target.'cfg(all())'.rustflags=["--cfg","rcp_nix_sandbox"]'';
+        # Cargo uses matching target rustflags instead of build.rustflags. Repeat the required
+        # global cfg here so every native Nix target keeps tokio_unstable; matching per-target
+        # entries still contribute target-specific flags such as musl's crt-static feature.
+        nixSandboxRustflags = ''target.'cfg(all())'.rustflags=["--cfg","tokio_unstable","--cfg","rcp_nix_sandbox"]'';
 
         # Package builder for RCP tools with custom binary names
         mkRcpPackage = { packageName, binaryName, description }: pkgs.rustPlatform.buildRustPackage {
