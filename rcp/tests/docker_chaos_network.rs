@@ -5,9 +5,8 @@
 //!
 //! ## Prerequisites
 //!
-//! Before running these tests:
-//! 1. Start containers: `just docker-up` (rebuilds containers with iproute2)
-//! 2. Run: `cargo nextest run --profile docker --run-ignored only -E 'test(~chaos)'`
+//! From the repository root, run the full chaos lifecycle with `just docker-chaos-test`. For
+//! repeated runs, use `just docker-up`, `just docker-chaos-test-only`, then `just docker-down`.
 //!
 //! ## Test Naming Convention
 //!

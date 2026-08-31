@@ -1,10 +1,15 @@
 let
   rust_overlay = import (builtins.fetchTarball https://github.com/oxalica/rust-overlay/archive/master.tar.gz);
   nixpkgs = import <nixpkgs> { overlays = [ rust_overlay ]; };
+  targetPlatform = import ./nix/target-platform.nix {
+    pkgs = nixpkgs;
+    system = nixpkgs.stdenv.hostPlatform.system;
+  };
   myrust = nixpkgs.rust-bin.stable."1.95.0".default.override {
     extensions = [ "rust-analysis" "rust-src" ];
-    targets = [ "x86_64-unknown-linux-musl" ];
+    targets = targetPlatform.rustTargets;
   };
+  pythonWithPyYAML = nixpkgs.python3.withPackages (pythonPackages: [ pythonPackages.pyyaml ]);
   msrvToolchain = nixpkgs.rust-bin.stable."1.91.1".minimal.override {
     targets = [ "x86_64-unknown-linux-gnu" "x86_64-unknown-linux-musl" ];
   };
@@ -31,13 +36,9 @@ let
     fi
     echo "msrv-check: using $pinned"
 
-    exec ${msrvToolchain}/bin/cargo check --workspace --locked --all-targets --target x86_64-unknown-linux-gnu --target x86_64-unknown-linux-musl "$@"
+    export CARGO="${msrvToolchain}/bin/cargo"
+    exec ${./scripts/cargo-host.sh} check --workspace --locked --all-targets --target x86_64-unknown-linux-gnu --target x86_64-unknown-linux-musl "$@"
   '';
-  muslTools =
-    if nixpkgs.stdenv.isLinux then {
-      gcc = nixpkgs.pkgsCross.musl64.buildPackages.gcc;
-      binutils = nixpkgs.pkgsCross.musl64.buildPackages.binutils;
-    } else null;
 in
   with nixpkgs;
   stdenv.mkDerivation (
@@ -66,19 +67,14 @@ in
             dprint
             gdb
             llvmPackages.bintools
+            pythonWithPyYAML
             tokio-console
           ]
-          ++ lib.optionals (muslTools != null) [
-            muslTools.gcc
-            muslTools.binutils
-          ];
+          ++ targetPlatform.buildTools;
         RUST_SRC_PATH = "${myrust}/lib/rustlib/src/rust/src";
+        passthru.cargoTarget = targetPlatform.cargoTarget;
+        shellHook = targetPlatform.cargoTargetShellHook;
       };
-      muslAttrs = if muslTools != null then {
-        CC_x86_64_unknown_linux_musl = "${muslTools.gcc}/bin/x86_64-unknown-linux-musl-gcc";
-        AR_x86_64_unknown_linux_musl = "${muslTools.binutils}/bin/x86_64-unknown-linux-musl-ar";
-        PKG_CONFIG_ALLOW_CROSS = "1";
-      } else {};
     in
-      baseAttrs // muslAttrs
+      baseAttrs // targetPlatform.shellEnvironment
   )

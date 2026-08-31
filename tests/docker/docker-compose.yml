@@ -1,3 +1,10 @@
+x-rcp-binary-mounts: &rcp-binary-mounts
+  - "../../target/${RCP_DOCKER_TARGET:?set RCP_DOCKER_TARGET}/debug/rcp:/home/testuser/.local/bin/rcp:ro"
+  - "../../target/${RCP_DOCKER_TARGET:?set RCP_DOCKER_TARGET}/debug/rcpd:/home/testuser/.local/bin/rcpd:ro"
+  - "../../target/${RCP_DOCKER_TARGET:?set RCP_DOCKER_TARGET}/debug/rrm:/home/testuser/.local/bin/rrm:ro"
+  - "../../target/${RCP_DOCKER_TARGET:?set RCP_DOCKER_TARGET}/debug/rlink:/home/testuser/.local/bin/rlink:ro"
+  - "../../target/${RCP_DOCKER_TARGET:?set RCP_DOCKER_TARGET}/debug/rcmp:/home/testuser/.local/bin/rcmp:ro"
+
 services:
   # Master node - where we run rcp commands from
   master:
@@ -11,15 +18,8 @@ services:
     privileged: true
     networks:
       - rcp-test-net
-    volumes:
-      # Mount compiled binaries (must be built first with: cargo build)
-      # Using musl target (project default) - musl binaries are required; no fallback is implemented
-      - ../../target/x86_64-unknown-linux-musl/debug/rcp:/home/testuser/.local/bin/rcp:ro
-      - ../../target/x86_64-unknown-linux-musl/debug/rcpd:/home/testuser/.local/bin/rcpd:ro
-      - ../../target/x86_64-unknown-linux-musl/debug/rrm:/home/testuser/.local/bin/rrm:ro
-      - ../../target/x86_64-unknown-linux-musl/debug/rlink:/home/testuser/.local/bin/rlink:ro
-      - ../../target/x86_64-unknown-linux-musl/debug/rcmp:/home/testuser/.local/bin/rcmp:ro
-      # SSH keys are copied in Dockerfile with correct permissions
+    # mount musl binaries built for the selected container architecture
+    volumes: *rcp-binary-mounts
     ports:
       # Expose SSH for debugging (ssh -p 2220 testuser@localhost)
       - "2220:22"
@@ -38,13 +38,7 @@ services:
     privileged: true
     networks:
       - rcp-test-net
-    volumes:
-      # Mount compiled binaries
-      - ../../target/x86_64-unknown-linux-musl/debug/rcp:/home/testuser/.local/bin/rcp:ro
-      - ../../target/x86_64-unknown-linux-musl/debug/rcpd:/home/testuser/.local/bin/rcpd:ro
-      - ../../target/x86_64-unknown-linux-musl/debug/rrm:/home/testuser/.local/bin/rrm:ro
-      - ../../target/x86_64-unknown-linux-musl/debug/rlink:/home/testuser/.local/bin/rlink:ro
-      - ../../target/x86_64-unknown-linux-musl/debug/rcmp:/home/testuser/.local/bin/rcmp:ro
+    volumes: *rcp-binary-mounts
     ports:
       # Expose SSH for debugging (ssh -p 2221 testuser@localhost)
       - "2221:22"
@@ -62,13 +56,7 @@ services:
     privileged: true
     networks:
       - rcp-test-net
-    volumes:
-      # Mount compiled binaries
-      - ../../target/x86_64-unknown-linux-musl/debug/rcp:/home/testuser/.local/bin/rcp:ro
-      - ../../target/x86_64-unknown-linux-musl/debug/rcpd:/home/testuser/.local/bin/rcpd:ro
-      - ../../target/x86_64-unknown-linux-musl/debug/rrm:/home/testuser/.local/bin/rrm:ro
-      - ../../target/x86_64-unknown-linux-musl/debug/rlink:/home/testuser/.local/bin/rlink:ro
-      - ../../target/x86_64-unknown-linux-musl/debug/rcmp:/home/testuser/.local/bin/rcmp:ro
+    volumes: *rcp-binary-mounts
     ports:
       # Expose SSH for debugging (ssh -p 2222 testuser@localhost)
       - "2222:22"

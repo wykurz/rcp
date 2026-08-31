@@ -355,7 +355,7 @@ Searched in:
 To use auto-deployment, ensure rcpd is available:
 - cargo install rcp-tools-rcp (installs to ~/.cargo/bin)
 - or add rcpd to PATH
-- or build with: cargo build --release --bin rcpd
+- or build for this host with: ./scripts/cargo-host.sh build --release --bin rcpd
 ```
 
 (A successful `command -v rcpd` adds the resolved `PATH:` candidate. An incompatible candidate
@@ -545,7 +545,9 @@ Useful when:
 
 ## Static Binary Distribution
 
-rcp builds static musl binaries by default for maximum portability.
+RCP's supported Linux musl targets enable static CRT linking for portable distribution binaries.
+Just and Nix choose the Linux host's musl architecture for development; raw Cargo retains the
+repository's x86_64-musl distribution default.
 
 ### Configuration
 
@@ -564,20 +566,24 @@ rustflags = ["--cfg", "tokio_unstable", "-C", "target-feature=+crt-static"]
 
 ### Benefits
 
-- No dynamic library dependencies (except kernel)
-- Works on all Linux distributions (glibc, musl, Alpine)
+- No glibc runtime dependency
+- Runs across glibc- and musl-based distributions on the matching CPU architecture
 - No libc version conflicts
-- Single binary deployable anywhere
-- Verified with `ldd` showing "not a dynamic executable"
+- One self-contained artifact per supported architecture
+- Static linkage can be verified on the produced artifact with `file` or `ldd`
 
 ### Building
 
 ```bash
-# Default (musl static binary)
-cargo build
+# Runnable host-musl build on x86_64 or AArch64 Linux
+./scripts/cargo-host.sh build --release
 
-# Glibc (if needed)
-cargo build --target x86_64-unknown-linux-gnu
+# Raw-Cargo x86_64-musl distribution build
+cargo build --release
+
+# Explicit AArch64-musl or x86_64-glibc distribution build
+CARGO_BUILD_TARGET=aarch64-unknown-linux-musl ./scripts/cargo-host.sh build --release
+CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu ./scripts/cargo-host.sh build --release
 ```
 
 ## CLI Reference
@@ -676,12 +682,12 @@ For comprehensive security analysis, see **[security.md](security.md)**.
 
 ### Musl as Default Target
 
-**Decision**: Build static musl binaries by default
+**Decision**: Use musl targets with static CRT linking for Linux builds
 
 **Rationale**:
 
 - Eliminates "works on my machine" issues
-- Single binary works everywhere
+- A matching x86_64 or AArch64 artifact works across Linux distributions
 - Critical for deployment simplicity
 - Small size increase (10-30%) acceptable
 

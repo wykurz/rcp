@@ -20,6 +20,7 @@ jobs:
     timeout-minutes: 45
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
     - uses: ./.depot/actions/rcp-rust-setup
       with:
         install-dprint: "true"
@@ -35,11 +36,23 @@ jobs:
     - run: just doc
 
   test:
-    name: Tests (debug)
-    runs-on: depot-ubuntu-24.04-16
+    name: Tests (debug, ${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+        - depot-ubuntu-24.04-16
+        - depot-ubuntu-24.04-arm-16
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Install Nix for native Arm package ABI smoke
+      if: runner.arch == 'ARM64'
+      uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+    - name: Verify native Arm Nix package ABI smoke
+      if: runner.arch == 'ARM64'
+      run: nix build --no-update-lock-file .#checks.aarch64-linux.package-abi-smoke
     - uses: ./.depot/actions/rcp-rust-setup
       with:
         install-nextest: "true"
@@ -79,8 +92,14 @@ jobs:
     - run: just doctest-release
 
   docker-test:
-    name: Docker tests
-    runs-on: depot-ubuntu-24.04-16
+    name: Docker tests (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+        - depot-ubuntu-24.04-16
+        - depot-ubuntu-24.04-arm-16
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -88,10 +107,11 @@ jobs:
       with:
         docker-compose-compat: "true"
         install-nextest: "true"
-    - run: just docker-test
+    - run: just docker-up
+    - run: just docker-test-only -E 'not test(~chaos)'
     - name: Show Docker logs on failure
       if: failure()
-      run: just docker-logs
+      run: just docker-logs-once
     - name: Stop Docker containers
       if: always()
       run: just docker-down
@@ -106,10 +126,11 @@ jobs:
       with:
         docker-compose-compat: "true"
         install-nextest: "true"
-    - run: just docker-chaos-test
+    - run: just docker-up
+    - run: just docker-chaos-test-only
     - name: Show Docker logs on failure
       if: failure()
-      run: just docker-logs
+      run: just docker-logs-once
     - name: Stop Docker containers
       if: always()
       run: just docker-down

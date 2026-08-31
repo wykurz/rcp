@@ -29,10 +29,10 @@ just docker-test-only    # Run tests again without setup (containers must be run
 just docker-down         # Stop containers when done
 ```
 
-**Note**: `just docker-test` automatically builds the required binaries (musl target) before
-starting containers. No manual build step needed!
+**Note**: `just docker-test` automatically builds the required binaries for Docker's selected musl
+target before starting containers. No manual build step is needed.
 
-### Option 2: Using `cargo nextest` Directly
+### Option 2: Using Nextest Through the Host Wrapper
 
 ```bash
 # From repo root
@@ -40,13 +40,22 @@ starting containers. No manual build step needed!
 just docker-up
 
 # 2. Run tests using nextest docker profile
-cargo nextest run --profile docker --run-ignored only
+./scripts/cargo-host.sh nextest run --profile docker --run-ignored only
 
 # 3. Stop containers when done
 just docker-down
 ```
 
-### Option 3: Using Standard `cargo test`
+The wrapper selects a runnable host target for the test process. The binaries mounted into the
+containers are separate payloads: `just docker-up` follows `DOCKER_DEFAULT_PLATFORM` first and the
+Docker daemon architecture otherwise.
+
+`just docker-up` returns only after `testuser` can reach both `host-a` and `host-b` from the master
+container within one bounded readiness deadline. A readiness failure captures the current logs
+without following them; full lifecycle commands then preserve the failure status while stopping the
+Compose project once.
+
+### Option 3: Using Libtest Through the Host Wrapper
 
 ```bash
 # From repo root
@@ -54,8 +63,8 @@ just docker-down
 just docker-up
 
 # 2. Run with --ignored flag to include Docker tests
-cargo test --test docker_multi_host -- --ignored
-cargo test --test docker_multi_host_role_ordering -- --ignored
+./scripts/cargo-host.sh test --test docker_multi_host -- --ignored
+./scripts/cargo-host.sh test --test docker_multi_host_role_ordering -- --ignored
 
 # 3. Stop containers
 just docker-down
@@ -70,12 +79,12 @@ For active development where you run tests multiple times:
 just docker-up
 
 # Run tests repeatedly (no rebuild needed if only changing tests)
-cargo nextest run --profile docker --run-ignored only
+just docker-test-only
 # ... make code changes to RCP source ...
-cargo build  # Rebuild if you changed rcp/rcpd source
-cargo nextest run --profile docker --run-ignored only
+just docker-build  # Rebuild if you changed rcp/rcpd source
+just docker-test-only
 # ... make more changes ...
-cargo nextest run --profile docker --run-ignored only
+just docker-test-only
 
 # Clean test files if needed (keeps containers running)
 just docker-clean
@@ -85,12 +94,12 @@ just docker-down
 ```
 
 **Tip**: If you only change test code (in `rcp/tests/`), you don't need to rebuild binaries. If you
-change RCP source code, run `cargo build` before running tests again.
+change RCP source code, run `just docker-build` before running tests again.
 
 ## Available `just` Commands
 
 ```bash
-just docker-build        # Build binaries for Docker (musl target)
+just docker-build        # Build binaries for Docker's selected musl target
 just docker-up           # Build binaries + start containers
 just docker-down         # Stop containers
 just docker-test         # Full cycle: build → start → test → stop
@@ -98,31 +107,31 @@ just docker-test-keep    # Build → start → test (keep containers running)
 just docker-test-only    # Run tests (containers must be running)
 just docker-clean        # Clean test files (keeps containers running)
 just docker-logs         # View container logs
+just docker-logs-once    # Capture current logs without following
 ```
 
 ## Low-Level Helper Script
 
-For more control, use `test-helpers.sh` directly:
+For more control, run `test-helpers.sh` from the repository root:
 
 ```bash
-cd tests/docker
-
 # Container lifecycle
-./test-helpers.sh start      # Start containers
-./test-helpers.sh stop       # Stop containers
-./test-helpers.sh restart    # Restart containers
-./test-helpers.sh status     # Show container status
+./tests/docker/test-helpers.sh setup      # Build payload and start containers
+./tests/docker/test-helpers.sh stop       # Stop containers
+./tests/docker/test-helpers.sh restart    # Restart containers
+./tests/docker/test-helpers.sh status     # Show container status
 
 # Testing and debugging
-./test-helpers.sh test-copy  # Quick copy test
-./test-helpers.sh test-ssh   # Test SSH connectivity
-./test-helpers.sh cleanup    # Remove test files
-./test-helpers.sh logs       # View current logs
-./test-helpers.sh shell      # Open shell in master
+./tests/docker/test-helpers.sh test-copy  # Quick copy test
+./tests/docker/test-helpers.sh test-ssh   # Test SSH connectivity
+./tests/docker/test-helpers.sh cleanup    # Remove test files
+./tests/docker/test-helpers.sh logs       # View logs (follow mode)
+./tests/docker/test-helpers.sh logs-once  # Capture current logs without following
+./tests/docker/test-helpers.sh shell      # Open shell in master
 
 # Maintenance
-./test-helpers.sh rebuild    # Rebuild from scratch
-./test-helpers.sh help       # Show all commands
+./tests/docker/test-helpers.sh rebuild    # Rebuild images/payloads and wait for both SSH hosts
+./tests/docker/test-helpers.sh help       # Show all commands
 ```
 
 ## Prerequisites
@@ -139,19 +148,17 @@ cd tests/docker
 2. **Verify Docker in WSL**:
    ```bash
    docker --version
-   docker-compose --version
+   docker compose version
+   docker info
    ```
 
-3. **Install docker-compose if needed**:
-   ```bash
-   # If docker-compose is not available:
-   sudo apt update
-   sudo apt install docker-compose
-   ```
+3. **Install Compose if needed**: install the Docker Compose v2 plugin for `docker compose`. The
+   helper prefers v2 and falls back to the legacy standalone `docker-compose` command when it is
+   already installed.
 
-**Note**: Binaries are automatically built when you run `just docker-test` or `just docker-up`. This
-project uses the musl target by default, and binaries are mounted from
-`target/x86_64-unknown-linux-musl/debug/` into the containers.
+**Note**: Binaries are automatically built when you run `just docker-test` or `just docker-up`.
+`DOCKER_DEFAULT_PLATFORM` wins when it is set; otherwise the Docker daemon architecture selects the
+Linux musl target. The same target path is passed to Compose for the bind mounts.
 
 ## Manual Testing Scenarios
 
@@ -214,11 +221,14 @@ Look for log lines showing:
 
 ```bash
 # All containers
-docker-compose logs
+just docker-logs
+
+# Unattended diagnostics (capture once and return)
+just docker-logs-once
 
 # Specific container
-docker-compose logs master
-docker-compose logs host-a
+./tests/docker/test-helpers.sh logs master
+./tests/docker/test-helpers.sh logs host-a
 ```
 
 ### SSH Directly from Host (WSL)
@@ -245,10 +255,11 @@ docker exec -it rcp-test-host-b /bin/bash
 If you modify the Dockerfile:
 
 ```bash
-docker-compose down
-docker-compose build --no-cache
-docker-compose up -d
+./tests/docker/test-helpers.sh rebuild
 ```
+
+Rebuild resolves the Docker architecture once, rebuilds the images and matching musl payloads, then
+waits for SSH readiness on both remote hosts before returning.
 
 ### Check Network Connectivity
 
@@ -288,8 +299,7 @@ chmod 644 tests/docker/ssh_keys/config
 **Solution**: Build the binaries first:
 
 ```bash
-cd /home/mateusz/projects/rcp
-cargo build
+just docker-build
 ```
 
 ### Containers fail to start
@@ -297,9 +307,9 @@ cargo build
 **Solution**: Check logs and rebuild:
 
 ```bash
-docker-compose logs
-docker-compose down
-docker-compose up --build
+just docker-logs-once
+just docker-down
+just docker-up
 ```
 
 ### "Connection refused" when SSH-ing between containers

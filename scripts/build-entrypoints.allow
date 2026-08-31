@@ -1,0 +1,29 @@
+# Exact active source lines approved by scripts/check-build-entrypoints.sh.
+.github/workflows/cargo-update.yml	--title "Update cargo dependencies" \
+.github/workflows/cargo-update.yml	git commit -m "Update cargo dependencies" \
+.github/workflows/publish.yml	cargo workspaces list --all >> $GITHUB_STEP_SUMMARY
+.github/workflows/publish.yml	cargo workspaces publish \
+.github/workflows/release.yml	- name: Build with cross
+.github/workflows/release.yml	- name: Build with cross
+.github/workflows/release.yml	- name: Install cross
+.github/workflows/release.yml	- name: Install cross
+.github/workflows/release.yml	run: ./scripts/cargo-install-host.sh cross --locked --version 0.2.5
+.github/workflows/release.yml	run: ./scripts/cargo-install-host.sh cross --locked --version 0.2.5
+.github/workflows/release.yml	run: cross build --release --target=aarch64-unknown-linux-musl
+.github/workflows/release.yml	run: cross build --release --target=aarch64-unknown-linux-musl
+scripts/cargo-host.sh	CARGO_BIN="${CARGO:-cargo}"
+scripts/cargo-install-host.sh	exec "${CARGO:-cargo}" install --target "$RUSTC_HOST" "$@"
+scripts/check-build-targets.sh	"CARGO=$bin_dir/cargo" \
+scripts/check-build-targets.sh	cat > "$bin_dir/cargo" <<'FAKE'
+scripts/check-build-targets.sh	chmod +x "$bin_dir/uname" "$bin_dir/cargo" "$bin_dir/docker"
+scripts/check-crates-published.sh	metadata="$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT_DIR/Cargo.toml")"
+scripts/update-deps.sh	Reads `cargo update --verbose` output; used by the tests.
+scripts/update-deps.sh	cargo update
+scripts/update-deps.sh	cargo update --dry-run
+scripts/update-deps.sh	cargo upgrade --dry-run --incompatible allow
+scripts/update-deps.sh	cargo upgrade --incompatible allow
+scripts/update-deps.sh	echo "cargo reported $raw_holdbacks package(s) held back for Rust-version reasons," >&2
+scripts/update-deps.sh	echo -e "${RED}ERROR: the MSRV report does not match cargo's output.${NC}" >&2
+scripts/update-deps.sh	for tool in cargo cargo-upgrade; do
+scripts/update-deps.sh	if ! update_output=$(cargo update --dry-run --verbose --color never 2>&1); then
+update-version.sh	cargo update --workspace

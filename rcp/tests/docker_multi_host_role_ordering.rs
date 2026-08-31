@@ -13,9 +13,10 @@
 //!
 //! ## Prerequisites
 //!
-//! Before running these tests:
-//! 1. Start containers: `cd tests/docker && ./test-helpers.sh start`
-//! 2. Run: `cargo test --test docker_multi_host_role_ordering -- --ignored`
+//! From the repository root, run the full lifecycle with `just docker-test`. For repeated focused
+//! runs, use `just docker-up`, then
+//! `just docker-test-only -E 'binary(docker_multi_host_role_ordering)'`, and finish with
+//! `just docker-down`.
 
 mod support;
 
@@ -27,7 +28,7 @@ use support::docker_env::{DockerEnv, Result};
 /// This test verifies that the basic multi-host scenario works correctly.
 /// It serves as a baseline for the more complex role ordering tests.
 #[test]
-#[ignore = "requires Docker containers (run: cd tests/docker && ./test-helpers.sh start)"]
+#[ignore = "requires Docker containers (run: just docker-up)"]
 fn test_baseline_multi_host_copy() -> Result<()> {
     let env = DockerEnv::new()?;
     // create unique test file to avoid conflicts
@@ -66,7 +67,7 @@ fn test_baseline_multi_host_copy() -> Result<()> {
 /// the role assignment logic. With the bug, connection timing issues could cause
 /// role confusion in rapid operations.
 #[test]
-#[ignore = "requires Docker containers (run: cd tests/docker && ./test-helpers.sh start)"]
+#[ignore = "requires Docker containers (run: just docker-up)"]
 fn test_rapid_multi_host_operations() -> Result<()> {
     let env = DockerEnv::new()?;
     let base_timestamp = std::time::SystemTime::now()
@@ -107,7 +108,7 @@ fn test_rapid_multi_host_operations() -> Result<()> {
 /// This test alternates copy direction (A->B, then B->A) to verify that
 /// role assignment correctly handles changing source/destination relationships.
 #[test]
-#[ignore = "requires Docker containers (run: cd tests/docker && ./test-helpers.sh start)"]
+#[ignore = "requires Docker containers (run: just docker-up)"]
 fn test_bidirectional_copies() -> Result<()> {
     let env = DockerEnv::new()?;
     let timestamp = std::time::SystemTime::now()
@@ -144,7 +145,7 @@ fn test_bidirectional_copies() -> Result<()> {
 /// The source daemon's role launch is deliberately delayed while version discovery remains prompt.
 /// Source-first bootstrap must wait for that source readiness record before starting destination.
 #[test]
-#[ignore = "requires Docker containers (run: cd tests/docker && ./test-helpers.sh start)"]
+#[ignore = "requires Docker containers (run: just docker-up)"]
 fn test_destination_waits_for_delayed_source_startup() -> Result<()> {
     let env = DockerEnv::new()?;
     let timestamp = std::time::SystemTime::now()
@@ -203,7 +204,7 @@ fn test_destination_waits_for_delayed_source_startup() -> Result<()> {
 /// Source-first startup makes the connection ordering deterministic; repeated operations retain
 /// regression coverage for the original role-assignment bug.
 #[test]
-#[ignore = "requires Docker containers (run: cd tests/docker && ./test-helpers.sh start)"]
+#[ignore = "requires Docker containers (run: just docker-up)"]
 fn test_consistent_role_assignment() -> Result<()> {
     let env = DockerEnv::new()?;
     // run multiple copies with slight delays to vary connection timing

@@ -45,44 +45,12 @@ jobs:
       with:
         tool: cargo-nextest@0.9.85
 
-    - name: Build binaries for Docker
+    - name: Start Docker test environment
       # debug build is sufficient for chaos tests since we're testing network behavior,
       # not performance. debug builds also provide better error messages on failure.
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
-      run: cargo build --workspace
-
-    - name: Start Docker containers
-      run: |
-        cd tests/docker
-        docker compose up -d
-
-        # Wait for containers to be healthy and SSH to be ready
-        echo "Waiting for containers to start..."
-        sleep 3
-
-        # Check if SSH daemon is running in containers
-        echo "Checking SSH daemon status..."
-        docker exec rcp-test-master pgrep sshd || echo "SSH not running in master"
-        docker exec rcp-test-host-a pgrep sshd || echo "SSH not running in host-a"
-        docker exec rcp-test-host-b pgrep sshd || echo "SSH not running in host-b"
-
-        # Wait for SSH connectivity (with timeout)
-        echo "Testing SSH connectivity from master to host-a..."
-        TIMEOUT=60
-        ELAPSED=0
-        until docker exec -u testuser rcp-test-master ssh -o ConnectTimeout=5 host-a hostname &> /dev/null; do
-          if [ $ELAPSED -ge $TIMEOUT ]; then
-            echo "ERROR: SSH connectivity timeout after ${TIMEOUT}s"
-            docker exec -u testuser rcp-test-master ssh -v host-a hostname 2>&1 || true
-            docker compose logs
-            exit 1
-          fi
-          echo "Waiting for SSH... (${ELAPSED}s/${TIMEOUT}s)"
-          sleep 2
-          ELAPSED=$((ELAPSED + 2))
-        done
-        echo "SSH connectivity confirmed"
+      run: just docker-up
 
     - name: Run chaos tests
       run: |
@@ -92,9 +60,7 @@ jobs:
 
     - name: Show Docker logs on failure
       if: failure()
-      run: |
-        cd tests/docker
-        docker compose logs
+      run: just docker-logs-once
 
     - name: Upload test logs
       if: always()
@@ -105,6 +71,4 @@ jobs:
 
     - name: Stop Docker containers
       if: always()
-      run: |
-        cd tests/docker
-        docker compose down
+      run: just docker-down

@@ -10,14 +10,33 @@ set positional-arguments
 default:
     @just --list
 
-# Run all lints (fmt, markdown formatting, clippy, error logging, anyhow error msg, rust version, package metadata, walk-driver usage, source-read fidelity, TLS handshake timeouts, TCP socket configuration)
-lint:
+# Run the build-tool-backed lint steps without recursively running the full lint suite.
+_lint-build:
     @echo "🔍 Checking formatting..."
-    cargo fmt --check
+    ./scripts/cargo-host.sh fmt --check
     @echo "🔍 Checking markdown formatting..."
     ./scripts/check-doc-format.sh
     @echo "🔍 Running clippy..."
-    cargo clippy --workspace --all-targets -- -D warnings
+    ./scripts/cargo-host.sh clippy --workspace --all-targets -- -D warnings
+
+# Run every target check when Nix is available, while retaining the documented non-Nix lint path.
+_lint-targets:
+    @set -e; if command -v "${NIX:-nix}" >/dev/null 2>&1; then \
+        echo "🔍 Testing build target consistency checker..."; \
+        ./scripts/test-check-build-targets.sh; \
+        echo "🔍 Checking build target consistency..."; \
+        ./scripts/check-build-targets.sh; \
+        echo "🔍 Testing Nix target selection..."; \
+        ./scripts/test-nix-targets.sh; \
+    else \
+        echo "⚠️  Nix is unavailable; running all non-Nix target checks."; \
+        RCP_BUILD_TARGET_TEST_SKIP_NIX_EVAL=1 ./scripts/test-check-build-targets.sh; \
+        ./scripts/check-build-targets.sh --skip-nix-eval; \
+        echo "⚠️  Skipped Nix evaluation and realization checks; CI runs them with Nix."; \
+    fi
+
+# Run all lints (formatting, clippy, policy checks, and helper behavior tests)
+lint: _lint-build _lint-targets
     @echo "🔍 Testing the Depot CI helper..."
     ./scripts/test-depot-ci.sh
     @echo "🔍 Testing the Docker helper..."
@@ -32,6 +51,10 @@ lint:
     ./scripts/check-anyhow-error-msg.sh
     @echo "🔍 Checking rust version consistency..."
     ./scripts/check-rust-version.sh
+    @echo "🔍 Testing build entrypoint inventory..."
+    ./scripts/test-check-build-entrypoints.sh
+    @echo "🔍 Checking build entrypoint inventory..."
+    ./scripts/check-build-entrypoints.sh
     @echo "🔍 Checking package metadata consistency..."
     ./scripts/check-package-metadata.sh
     @echo "🔍 Checking walk-driver usage..."
@@ -46,28 +69,34 @@ lint:
     ./scripts/check-tcp-socket-config.sh
     @echo "🔍 Testing the update-deps MSRV report filter..."
     ./scripts/test-update-deps.sh
+    @if [ "${CARGO_HOST_TEST_INTEGRATION:-}" != 1 ]; then \
+        echo "🔍 Testing host Cargo selection..."; \
+        ./scripts/test-cargo-host.sh; \
+    fi
+    @echo "🔍 Testing Docker target selection..."
+    ./scripts/test-docker-target.sh
     @echo "✅ All lints passed!"
 
 # Format code and markdown docs
 fmt:
-    cargo fmt
+    ./scripts/cargo-host.sh fmt
     dprint fmt
 
 # Run tests (debug mode, using nextest by default)
 test:
-    cargo nextest run
+    ./scripts/cargo-host.sh nextest run
 
 # Run tests in release mode
 test-release:
-    cargo nextest run --release
+    ./scripts/cargo-host.sh nextest run --release
 
 # Run doctests (debug mode)
 doctest:
-    cargo test --doc
+    ./scripts/cargo-host.sh test --doc
 
 # Run doctests in release mode
 doctest-release:
-    cargo test --doc --release
+    ./scripts/cargo-host.sh test --doc --release
 
 # Run all tests (both debug and release)
 test-all: test doctest test-release doctest-release
@@ -75,7 +104,7 @@ test-all: test doctest test-release doctest-release
 
 # Quick compilation check (faster than full build)
 check:
-    cargo check --workspace
+    ./scripts/cargo-host.sh check --workspace
 
 # Verify the workspace builds on the minimum supported Rust version (MSRV), for
 # both shipped targets (gnu + musl). Separate from `just ci`: needs the nix
@@ -92,15 +121,15 @@ update-deps *ARGS:
 
 # Build all packages
 build:
-    cargo build --workspace
+    ./scripts/cargo-host.sh build --workspace
 
 # Build release binaries
 build-release:
-    cargo build --workspace --release
+    ./scripts/cargo-host.sh build --workspace --release
 
 # Build and check documentation
 doc:
-    RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" cargo doc --no-deps --workspace
+    RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" ./scripts/cargo-host.sh doc --no-deps --workspace
 
 # Run the standard CI checks locally before pushing (lint, docs, tests + Docker).
 # The MSRV check is intentionally separate — run `just msrv` (it needs the nix
@@ -150,7 +179,7 @@ depot-ci: (_depot-ci-run "lint" "doc" "test" "doctest" "test-release" "doctest-r
 
 # Clean build artifacts
 clean:
-    cargo clean
+    ./scripts/cargo-host.sh clean
 
 # Docker multi-host integration tests
 # =====================================
@@ -158,12 +187,12 @@ clean:
 # Build binaries for Docker tests (musl target required)
 docker-build:
     @echo "🔨 Building binaries for Docker tests (musl target)..."
-    cargo build --workspace
+    ./tests/docker/test-helpers.sh build
 
 # Start Docker containers for multi-host tests
-docker-up: docker-build
+docker-up:
     @echo "🐳 Starting Docker test containers..."
-    cd tests/docker && ./test-helpers.sh start
+    ./tests/docker/test-helpers.sh setup
 
 # Stop Docker containers
 docker-down:
@@ -180,17 +209,24 @@ docker-logs:
     @echo "📋 Container logs:"
     cd tests/docker && ./test-helpers.sh logs
 
+# Show current container logs without following (for unattended diagnostics)
+docker-logs-once:
+    @echo "📋 Container logs:"
+    cd tests/docker && ./test-helpers.sh logs-once
+
 # Run Docker tests (requires containers already running)
-docker-test-only:
+docker-test-only *ARGS:
     @echo "🧪 Running Docker multi-host tests..."
-    cargo nextest run --profile docker --run-ignored only
+    ./scripts/cargo-host.sh nextest run --profile docker --run-ignored only "$@"
 
 # Run Docker tests with full lifecycle (setup -> test -> cleanup)
-docker-test: docker-up docker-test-only docker-down
+docker-test:
+    ./tests/docker/test-helpers.sh lifecycle just docker-test-only
     @echo "✅ Docker tests completed!"
 
 # Run Docker tests but keep containers running (useful for development)
-docker-test-keep: docker-up docker-test-only
+docker-test-keep:
+    ./tests/docker/test-helpers.sh lifecycle-keep just docker-test-only
     @echo "✅ Docker tests completed (containers still running)"
     @echo "💡 Run 'just docker-down' when finished"
 
@@ -217,14 +253,16 @@ docker-verify-caps:
 # Run chaos tests only (requires containers already running)
 docker-chaos-test-only: docker-verify-caps
     @echo "🌪️  Running chaos tests..."
-    cargo nextest run --profile docker --run-ignored only -E 'test(~chaos)'
+    ./scripts/cargo-host.sh nextest run --profile docker --run-ignored only -E 'test(~chaos)'
 
 # Run chaos tests with full lifecycle
-docker-chaos-test: docker-up docker-chaos-test-only docker-down
+docker-chaos-test:
+    ./tests/docker/test-helpers.sh lifecycle just docker-chaos-test-only
     @echo "✅ Chaos tests completed!"
 
 # Run chaos tests but keep containers running (useful for development)
-docker-chaos-test-keep: docker-up docker-chaos-test-only
+docker-chaos-test-keep:
+    ./tests/docker/test-helpers.sh lifecycle-keep just docker-chaos-test-only
     @echo "✅ Chaos tests completed (containers still running)"
     @echo "💡 Run 'just docker-down' when finished"
 
