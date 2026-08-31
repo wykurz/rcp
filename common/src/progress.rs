@@ -264,9 +264,10 @@ impl Default for SerializableProgress {
 impl From<&Progress> for SerializableProgress {
     /// Creates a `SerializableProgress` from a Progress, capturing the current time at the moment of conversion
     fn from(progress: &Progress) -> Self {
+        let ops = progress.ops.get();
         Self {
-            ops_started: progress.ops.started.get(),
-            ops_finished: progress.ops.finished.get(),
+            ops_started: ops.started,
+            ops_finished: ops.finished,
             bytes_copied: progress.bytes_copied.get(),
             hard_links_created: progress.hard_links_created.get(),
             files_copied: progress.files_copied.get(),
@@ -925,7 +926,9 @@ impl RcpdProgressPrinter {
             symlinks:    {:>10}\n\
             directories: {:>10}",
             // source section
-            source_progress.ops_started - source_progress.ops_finished, // pending
+            source_progress
+                .ops_started
+                .saturating_sub(source_progress.ops_finished), // pending
             source_ops_rate_avg,
             source_ops_rate_curr,
             bytesize::ByteSize(source_bytes_rate_avg as u64),
@@ -940,7 +943,9 @@ impl RcpdProgressPrinter {
             source_progress.directories_skipped,
             source_progress.specials_skipped,
             // destination section
-            dest_progress.ops_started - dest_progress.ops_finished, // pending
+            dest_progress
+                .ops_started
+                .saturating_sub(dest_progress.ops_finished), // pending
             dest_ops_rate_avg,
             dest_ops_rate_curr,
             bytesize::ByteSize(dest_bytes_rate_avg as u64),
@@ -1033,6 +1038,17 @@ mod tests {
     }
 
     #[test]
+    fn serializable_progress_never_reports_more_finished_than_started() {
+        let progress = Progress::new();
+        progress.ops.finished.inc();
+
+        let serializable = SerializableProgress::from(&progress);
+
+        assert_eq!(serializable.ops_started, 1);
+        assert_eq!(serializable.ops_finished, 1);
+    }
+
+    #[test]
     fn test_rcpd_progress_printer() -> Result<()> {
         let mut printer = RcpdProgressPrinter::new();
 
@@ -1104,6 +1120,31 @@ mod tests {
             .expect("skipped directories line missing");
         assert!(skipped_dirs_line.trim_start().ends_with("2"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn rcpd_progress_printer_treats_inverted_counts_as_no_pending_work() -> Result<()> {
+        let mut printer = RcpdProgressPrinter::new();
+        let source_progress = SerializableProgress {
+            ops_started: 2,
+            ops_finished: 3,
+            ..Default::default()
+        };
+        let dest_progress = SerializableProgress {
+            ops_started: 4,
+            ops_finished: 5,
+            ..Default::default()
+        };
+
+        let output = printer.print(&source_progress, &dest_progress)?;
+        let pending: Vec<_> = output
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("pending:"))
+            .map(str::trim)
+            .collect();
+
+        assert_eq!(pending, vec!["0", "0"]);
         Ok(())
     }
 
