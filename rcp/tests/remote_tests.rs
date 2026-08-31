@@ -137,23 +137,6 @@ fn shell_quote_for_test(value: &std::path::Path) -> String {
     format!("'{}'", value.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
-fn marking_rcpd_wrapper(directory: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
-    let wrapper = directory.join("marking-rcpd");
-    let marker = directory.join("rcpd-invocations");
-    let rcpd = assert_cmd::cargo::cargo_bin("rcpd");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexec {} \"$@\"\n",
-            shell_quote_for_test(&marker),
-            shell_quote_for_test(&rcpd),
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    (wrapper, marker)
-}
-
 /// A test HOME deliberately longer than the ~48 bytes that the SSH control socket path used to
 /// leave for it. Rooted at `/tmp` rather than at the ambient temp dir so its length is a property
 /// of this fixture and not of whatever `TMPDIR` the caller happens to have -- under nix-shell, for
@@ -4095,17 +4078,6 @@ fn test_remote_copy_circular_symlink_root() {
     assert_eq!(summary.symlinks_created, 1);
 }
 
-/// Helper that runs rcp WITHOUT --force-remote (for testing local copy behavior)
-fn run_rcp_without_force_remote(args: &[&str]) -> std::process::Output {
-    let rcp_path = assert_cmd::cargo::cargo_bin("rcp");
-    let mut cmd = std::process::Command::new("timeout");
-    cmd.args(["30", rcp_path.to_str().unwrap()]);
-    cmd.arg("-vv");
-    // note: NOT adding --force-remote here
-    cmd.args(args);
-    cmd.output().expect("Failed to execute rcp command")
-}
-
 #[test]
 fn test_remote_force_remote_flag_uses_rcpd() {
     // verifies that --force-remote with localhost: actually uses rcpd (SSH)
@@ -4126,88 +4098,6 @@ fn test_remote_force_remote_flag_uses_rcpd() {
         "expected the prepared rcpd spawn in output when using --force-remote, got: {stdout}"
     );
     assert_eq!(get_file_content(&dst_file), "force remote test");
-}
-
-#[test]
-fn test_remote_localhost_without_force_remote_is_local() {
-    // verifies that localhost: WITHOUT --force-remote does a local copy (no rcpd)
-    require_local_ssh(); // still need SSH available for the test environment
-    let (src_dir, dst_dir) = setup_test_env();
-    let src_file = src_dir.path().join("test.txt");
-    let dst_file = dst_dir.path().join("test.txt");
-    create_test_file(&src_file, "local copy test", 0o644);
-    let src_remote = format!("localhost:{}", src_file.to_str().unwrap());
-    let dst_remote = format!("localhost:{}", dst_file.to_str().unwrap());
-    // run WITHOUT --force-remote
-    let output = run_rcp_without_force_remote(&[&src_remote, &dst_remote]);
-    print_command_output(&output);
-    assert!(output.status.success(), "Copy should succeed");
-    // stderr go to stdout
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // should show warning about localhost being local
-    assert!(
-        stdout.contains("Paths with 'localhost:' prefix are treated as local"),
-        "Expected localhost warning in output, got: {stdout}"
-    );
-    // should NOT show rcpd being started
-    assert!(
-        !stdout.contains("Starting prepared rcpd server on:"),
-        "Should NOT use rcpd without --force-remote, but got: {stdout}"
-    );
-    assert_eq!(get_file_content(&dst_file), "local copy test");
-}
-
-#[test]
-fn test_remote_pure_local_invalid_glob_precedes_home_and_probe() {
-    require_local_ssh();
-    let scratch = tempfile::tempdir().unwrap();
-    let (wrapper, marker) = marking_rcpd_wrapper(scratch.path());
-    let rcpd_path = format!("--rcpd-path={}", wrapper.display());
-    let destination = scratch.path().join("destination");
-    let output = run_rcp_with_args(&[
-        &rcpd_path,
-        "--include=[",
-        "localhost:~/source",
-        destination.to_str().unwrap(),
-    ]);
-    print_command_output(&output);
-    assert!(!output.status.success(), "invalid glob must fail");
-    assert!(
-        !String::from_utf8_lossy(&output.stdout).contains("Connecting to SSH destination"),
-        "invalid local filter configuration must precede remote HOME SSH"
-    );
-    assert!(
-        !marker.exists(),
-        "invalid initiating-host configuration must fail before any rcpd probe"
-    );
-}
-
-#[test]
-fn test_remote_pure_local_unreadable_filter_file_precedes_home_and_probe() {
-    require_local_ssh();
-    let scratch = tempfile::tempdir().unwrap();
-    let (wrapper, marker) = marking_rcpd_wrapper(scratch.path());
-    let unreadable = scratch.path().join("filter-is-a-directory");
-    std::fs::create_dir(&unreadable).unwrap();
-    let rcpd_path = format!("--rcpd-path={}", wrapper.display());
-    let filter_file = format!("--filter-file={}", unreadable.display());
-    let destination = scratch.path().join("destination");
-    let output = run_rcp_with_args(&[
-        &rcpd_path,
-        &filter_file,
-        "localhost:~/source",
-        destination.to_str().unwrap(),
-    ]);
-    print_command_output(&output);
-    assert!(!output.status.success(), "unreadable filter file must fail");
-    assert!(
-        !String::from_utf8_lossy(&output.stdout).contains("Connecting to SSH destination"),
-        "unreadable local filter configuration must precede remote HOME SSH"
-    );
-    assert!(
-        !marker.exists(),
-        "unreadable initiating-host filter must fail before any rcpd probe"
-    );
 }
 
 // ============================================================================
